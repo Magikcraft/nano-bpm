@@ -15,64 +15,76 @@
 //! # The guard
 //!
 //! The signals to close the loop already exist (completion count, active
-//! backlog, actor liveness). This guard samples them ~1 Hz and drives two
-//! nested create-admission brakes, cheapest first:
+//! backlog, actor liveness). This guard samples them ~1 Hz and drives two nested
+//! create-admission brakes, cheapest first:
 //!
-//! * **Soft throttle (option 3).** When the completion drain is *falling behind*
-//!   a live create rate — the active backlog rising while creates keep arriving —
-//!   throttle new-instance admission (shed creates / dry up submission credit) so
-//!   intake self-limits to the sustainable drain *before* a wedge forms. Gated on
-//!   the backlog *derivative* with hysteresis, so it does not oscillate the way a
-//!   fixed backlog *level* floor does.
+//! * **Soft throttle (option 3) — a completion-paced admission servo.** While the
+//!   active backlog sits in a pressure band, new-instance admission is paced by a
+//!   *token bucket* refilled by completions: each completed job returns one create
+//!   token (bounded by a burst), and create-admission (submission-credit grants)
+//!   spends them. Intake therefore *structurally cannot outrun drain* — it
+//!   self-limits to the sustainable completion rate. Because it caps the create
+//!   *rate* (continuous) rather than hard-shedding at a backlog *level* (on/off),
+//!   it settles at intake≈drain instead of oscillating the way a fixed level floor
+//!   does. Below the band the bucket is pinned full, so healthy load is never
+//!   metered.
 //!
 //! * **Hard safety valve (option 4).** When the drain has genuinely *stalled*
-//!   (~0 completes/s) while the backlog is rising and the actor is still alive —
-//!   the wedge signature — force create admission to **0** until the drain
-//!   recovers. Defense in depth: guarantees no wedge even if the soft servo
-//!   mistunes.
+//!   (~0 completes/s) while a meaningful backlog is held and the actor is still
+//!   alive — the wedge signature — force create admission to **0** until the drain
+//!   recovers. Defense in depth: guarantees no wedge even if the servo mistunes.
 //!
-//! Blocking creates at admission (before they enter Raft) stops feeding create
-//! entries into the shared log, so the queued/arriving completions get the
-//! disk+commit bandwidth and the drain recovers. A blocked create is never
-//! journaled, so durability / at-least-once are intact — the client simply
-//! retries after a backoff, exactly like every other admission-shed rail.
+//! Pacing (or, for the hard valve, blocking) creates at admission — before they
+//! enter Raft — stops feeding create entries into the shared log faster than
+//! completions drain, so the queued/arriving completions get the disk+commit
+//! bandwidth and the drain keeps up. A create that is never admitted is never
+//! journaled, so durability / at-least-once are intact — the client's submission
+//! window simply stalls (or it retries after a backoff), exactly like every other
+//! backpressure signal.
 //!
 //! Both brakes are a **liveness rail, not a latency policy**, so they apply in
-//! *both* [`crate::backpressure::SlaMode`]s — even "start every process" cannot
-//! be allowed to wedge the partition.
+//! *both* [`crate::backpressure::SlaMode`]s — even "start every process" cannot be
+//! allowed to wedge the partition.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 /// Tunables for the drain-stall guard. Defaults are deliberately conservative so
-/// the guard only bites on a real drain collapse, never on healthy backlog
-/// churn. All are overridable via the environment (see
-/// [`from_env`](DrainGuardCfg::from_env)).
+/// the guard only bites on a real drain collapse, never on healthy backlog churn.
+/// All are overridable via the environment (see [`from_env`](DrainGuardCfg::from_env)).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DrainGuardCfg {
-    /// Master switch. `false` makes the guard inert (never blocks a create).
+    /// Master switch. `false` makes the guard inert (never paces or blocks a create).
     pub enabled: bool,
+
+    // ---- Soft throttle: the completion-paced admission servo (option 3) --------
+    /// Active backlog at or above which the servo *engages* (starts metering create
+    /// admission against the completion-fed token bucket). Chosen well above the
+    /// healthy steady-state backlog so normal load is never metered.
+    pub meter_engage_backlog: i64,
+    /// Active backlog at or below which an engaged servo *releases* (stops metering
+    /// and re-pins the bucket full). Strictly below `meter_engage_backlog` so the
+    /// band has hysteresis and the servo cannot flap on the boundary.
+    pub meter_release_backlog: i64,
+    /// Consecutive qualifying ticks before the servo engages (debounces a blip).
+    pub meter_engage_ticks: u32,
+    /// Consecutive qualifying ticks before the servo releases (hysteresis).
+    pub meter_release_ticks: u32,
+    /// Token-bucket burst: the most create tokens the servo will hold. While
+    /// metering, admitted-but-undrained creates can lead completions by at most
+    /// this much, so it bounds the backlog overshoot above the engage level.
+    pub burst: i64,
+
+    // ---- Hard safety valve (option 4) -----------------------------------------
     /// Completion rate (completes/s) at or below which the drain counts as
-    /// *stalled* for the hard valve. Effectively "~0"; a small positive value
-    /// tolerates a trickle without arming the hard halt (the soft throttle still
-    /// engages there).
+    /// *stalled* for the hard valve. Effectively "~0".
     pub halt_completes_floor: f64,
-    /// Completion rate (completes/s) at or above which a *halted* guard counts
-    /// the drain as recovered. Strictly greater than `halt_completes_floor`, so
+    /// Completion rate (completes/s) at or above which a *halted* guard counts the
+    /// drain as recovered. Strictly greater than `halt_completes_floor` so
     /// engage/release have a hysteresis band and the valve cannot flap.
     pub recover_completes_rate: f64,
-    /// Minimum active backlog before the hard valve may arm. Below this there is
-    /// no meaningful work to protect, so a `completes==0` sample is just an idle
-    /// engine, not a wedge.
+    /// Minimum active backlog before the hard valve may arm. Below this a
+    /// `completes==0` sample is just an idle engine, not a wedge.
     pub halt_min_backlog: i64,
-    /// Per-tick backlog rise (instances/tick) above which the backlog counts as
-    /// *rising* — the derivative signal both brakes key off. A small positive
-    /// threshold ignores single-instance jitter.
-    pub rising_threshold: i64,
-    /// Consecutive qualifying ticks before the soft throttle engages. Debounces a
-    /// one-tick blip.
-    pub throttle_engage_ticks: u32,
-    /// Consecutive non-rising ticks before the soft throttle releases (hysteresis).
-    pub throttle_release_ticks: u32,
     /// Consecutive qualifying ticks before the hard valve engages (~seconds of a
     /// sustained stall, not a momentary dip).
     pub halt_engage_ticks: u32,
@@ -84,20 +96,25 @@ impl Default for DrainGuardCfg {
     fn default() -> Self {
         Self {
             enabled: true,
-            // ~0 completes/s: a stalled drain. A trickle above this only trips the
-            // soft throttle, not the hard valve.
+
+            // Healthy per-node backlog stays in the low hundreds even at the 50KB
+            // knee; the create-flood wedge ran to tens of thousands. Engage the
+            // servo well above healthy churn, release with a wide hysteresis band.
+            meter_engage_backlog: 5_000,
+            meter_release_backlog: 2_000,
+            meter_engage_ticks: 2,
+            meter_release_ticks: 3,
+            // Allow a few thousand admitted creates to lead the drain before the
+            // bucket empties; bounds the backlog overshoot while metering.
+            burst: 4_000,
+
+            // ~0 completes/s: a stalled drain.
             halt_completes_floor: 1.0,
             // Well clear of the floor so release needs a genuine recovery.
             recover_completes_rate: 10.0,
-            // Enough live instances that a total completion stall is a real wedge,
-            // not a quiet engine.
-            halt_min_backlog: 200,
-            // Ignore 1-2 instance jitter; require a real climb.
-            rising_threshold: 4,
-            // Soft throttle reacts fast (2 s) — it is cheap and reversible.
-            throttle_engage_ticks: 2,
-            throttle_release_ticks: 3,
-            // Hard valve waits ~3 s of sustained stall before cutting intake.
+            // Enough live instances that a total completion stall is a real wedge.
+            halt_min_backlog: 2_000,
+            // Wait ~3 s of sustained stall before cutting intake entirely.
             halt_engage_ticks: 3,
             halt_release_ticks: 2,
         }
@@ -109,7 +126,9 @@ impl DrainGuardCfg {
     ///
     /// * `NANOBPMN_DRAIN_GUARD=off|false|no|0` disables the guard entirely.
     ///   Anything else (or unset) leaves it on with the tuned defaults.
-    /// * `NANOBPMN_DRAIN_GUARD_MIN_BACKLOG=<n>` overrides [`Self::halt_min_backlog`].
+    /// * `NANOBPMN_DRAIN_GUARD_ENGAGE_BACKLOG=<n>` overrides [`Self::meter_engage_backlog`]
+    ///   (and clamps [`Self::meter_release_backlog`]/[`Self::halt_min_backlog`] below it).
+    /// * `NANOBPMN_DRAIN_GUARD_BURST=<n>` overrides [`Self::burst`].
     /// * `NANOBPMN_DRAIN_GUARD_HALT_FLOOR=<f>` overrides [`Self::halt_completes_floor`].
     /// * `NANOBPMN_DRAIN_GUARD_RECOVER_RATE=<f>` overrides [`Self::recover_completes_rate`].
     ///
@@ -122,11 +141,20 @@ impl DrainGuardCfg {
                 cfg.enabled = false;
             }
         }
-        if let Ok(v) = std::env::var("NANOBPMN_DRAIN_GUARD_MIN_BACKLOG")
+        if let Ok(v) = std::env::var("NANOBPMN_DRAIN_GUARD_ENGAGE_BACKLOG")
             && let Ok(n) = v.trim().parse::<i64>()
-            && n >= 0
+            && n > 0
         {
-            cfg.halt_min_backlog = n;
+            cfg.meter_engage_backlog = n;
+            // Keep the release/halt levels sane relative to the engage level.
+            cfg.meter_release_backlog = cfg.meter_release_backlog.min(n / 2);
+            cfg.halt_min_backlog = cfg.halt_min_backlog.min(n);
+        }
+        if let Ok(v) = std::env::var("NANOBPMN_DRAIN_GUARD_BURST")
+            && let Ok(n) = v.trim().parse::<i64>()
+            && n > 0
+        {
+            cfg.burst = n;
         }
         if let Ok(v) = std::env::var("NANOBPMN_DRAIN_GUARD_HALT_FLOOR")
             && let Ok(f) = v.trim().parse::<f64>()
@@ -144,41 +172,69 @@ impl DrainGuardCfg {
     }
 }
 
-/// The live, lock-free state the create-admission hot path reads, plus the
-/// monotonic completion counter the drain rate is derived from.
+/// The live, lock-free state the create-admission hot path reads: the monotonic
+/// completion counter the drain rate is derived from, the completion-fed token
+/// bucket the servo spends, and the two monitor-published flags.
 ///
-/// The published `throttling`/`halted` flags are written *only* by the single
-/// ~1 Hz monitor supervisor (via [`Self::publish`]) and read with relaxed loads
-/// by the admission gates — no contention on the create/complete critical path.
+/// The `metering`/`halted` flags are written *only* by the single ~1 Hz monitor
+/// supervisor (via [`Self::publish`]); the token bucket is refilled on the
+/// completion path ([`Self::note_completion`]) and spent on the credit-grant path
+/// ([`Self::take_credits`]). All are relaxed atomics — no lock on the
+/// create/complete critical path.
 pub struct DrainGuard {
     /// Monotonic count of drain-side (completion-family) command applies —
     /// completes / fails / throws — across every protocol. Its rate of change is
     /// the engine's true drain throughput. Bumped next to the
     /// `nanobpm_job_completions_total` metric so the two never drift.
     completions: AtomicU64,
-    /// Soft throttle engaged (option 3): drain falling behind create rate.
-    throttling: AtomicBool,
-    /// Hard valve engaged (option 4): drain stalled, backlog rising, actor alive.
+    /// Completion-paced create-admission token bucket. Refilled +1 per completion
+    /// (clamped to `capacity`), spent by submission-credit grants while metering.
+    budget: AtomicI64,
+    /// Servo engaged (option 3): backlog in the pressure band; create admission is
+    /// paced against `budget`.
+    metering: AtomicBool,
+    /// Hard valve engaged (option 4): drain stalled with backlog held; create
+    /// admission is forced to 0.
     halted: AtomicBool,
+    /// Token-bucket capacity (burst). Fixed for the process lifetime.
+    capacity: i64,
     enabled: bool,
 }
 
 impl DrainGuard {
     /// Builds a guard from the resolved config. When disabled it is permanently
-    /// inert.
+    /// inert. The bucket starts full so a cold, healthy start is never metered
+    /// before the first monitor tick.
     pub fn new(cfg: DrainGuardCfg) -> Self {
         Self {
             completions: AtomicU64::new(0),
-            throttling: AtomicBool::new(false),
+            budget: AtomicI64::new(cfg.burst),
+            metering: AtomicBool::new(false),
             halted: AtomicBool::new(false),
+            capacity: cfg.burst,
             enabled: cfg.enabled,
         }
     }
 
-    /// Records one drain-side apply. Hot-path cheap (a single relaxed add).
+    /// Records one drain-side apply and returns one create token to the bucket
+    /// (clamped to capacity). Hot-path cheap (a relaxed add + a short CAS that
+    /// no-ops once the bucket is full — the common healthy case).
     #[inline]
     pub fn note_completion(&self) {
         self.completions.fetch_add(1, Ordering::Relaxed);
+        let cap = self.capacity;
+        let mut cur = self.budget.load(Ordering::Relaxed);
+        while cur < cap {
+            match self.budget.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(v) => cur = v,
+            }
+        }
     }
 
     /// Current monotonic completion count (the monitor samples this each tick).
@@ -187,12 +243,53 @@ impl DrainGuard {
         self.completions.load(Ordering::Relaxed)
     }
 
-    /// Whether new-instance admission should be blocked right now. `true` under
-    /// either brake; always `false` when the guard is disabled.
+    /// Spends up to `want` create tokens, returning how many were granted. Called
+    /// from the submission-credit grant path *only while metering* — it is the
+    /// point at which intake is paced to the completion-fed bucket. A CAS loop; no
+    /// lock.
+    #[inline]
+    pub fn take_credits(&self, want: i64) -> i64 {
+        if want <= 0 {
+            return 0;
+        }
+        let mut cur = self.budget.load(Ordering::Relaxed);
+        loop {
+            if cur <= 0 {
+                return 0;
+            }
+            let grant = want.min(cur);
+            match self.budget.compare_exchange_weak(
+                cur,
+                cur - grant,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return grant,
+                Err(v) => cur = v,
+            }
+        }
+    }
+
+    /// Re-pins the bucket to full capacity. Called by the monitor each tick the
+    /// servo is *not* metering, so entering the pressure band always starts with a
+    /// full burst rather than a stale (possibly empty) bucket.
+    #[inline]
+    pub fn refill_full(&self) {
+        self.budget.store(self.capacity, Ordering::Relaxed);
+    }
+
+    /// Current token-bucket level (for the metric).
+    #[inline]
+    pub fn budget(&self) -> i64 {
+        self.budget.load(Ordering::Relaxed)
+    }
+
+    /// Whether new-instance admission is *hard-blocked* right now — the hard valve
+    /// only. The soft servo does not block; it paces via [`Self::take_credits`].
+    /// Always `false` when the guard is disabled.
     #[inline]
     pub fn blocks_creates(&self) -> bool {
-        self.enabled
-            && (self.halted.load(Ordering::Relaxed) || self.throttling.load(Ordering::Relaxed))
+        self.enabled && self.halted.load(Ordering::Relaxed)
     }
 
     /// Whether the hard safety valve is engaged.
@@ -201,16 +298,17 @@ impl DrainGuard {
         self.enabled && self.halted.load(Ordering::Relaxed)
     }
 
-    /// Whether the soft throttle is engaged.
+    /// Whether the servo is metering create admission (pressure band active). When
+    /// `true`, credit grants must be sized via [`Self::take_credits`].
     #[inline]
-    pub fn is_throttling(&self) -> bool {
-        self.enabled && self.throttling.load(Ordering::Relaxed)
+    pub fn is_metering(&self) -> bool {
+        self.enabled && self.metering.load(Ordering::Relaxed)
     }
 
-    /// Publishes the supervisor's freshly computed decision. Called ~1 Hz from
-    /// the monitor tick only.
-    pub fn publish(&self, throttling: bool, halted: bool) {
-        self.throttling.store(throttling, Ordering::Relaxed);
+    /// Publishes the supervisor's freshly computed decision. Called ~1 Hz from the
+    /// monitor tick only.
+    pub fn publish(&self, metering: bool, halted: bool) {
+        self.metering.store(metering, Ordering::Relaxed);
         self.halted.store(halted, Ordering::Relaxed);
     }
 }
@@ -223,8 +321,6 @@ pub struct DrainSample {
     pub completes_per_sec: f64,
     /// Active (non-terminal) instance backlog right now.
     pub backlog: i64,
-    /// Backlog change since the previous tick (`backlog - prev_backlog`).
-    pub backlog_delta: i64,
     /// Whether at least one owned partition's engine actor is alive. A *dead*
     /// actor is a different failure (crash/panic) handled elsewhere; the valve
     /// must not fire on it (cutting creates would not revive a dead thread).
@@ -234,7 +330,9 @@ pub struct DrainSample {
 /// The published outcome of one observation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DrainDecision {
-    pub throttling: bool,
+    /// Servo metering create admission (option 3).
+    pub metering: bool,
+    /// Hard valve forcing create admission to 0 (option 4).
     pub halted: bool,
 }
 
@@ -244,12 +342,12 @@ pub struct DrainDecision {
 #[derive(Debug)]
 pub struct DrainStateMachine {
     cfg: DrainGuardCfg,
-    throttling: bool,
+    metering: bool,
     halted: bool,
-    /// Consecutive ticks the soft-throttle *engage* precondition held.
-    throttle_rise_ticks: u32,
-    /// Consecutive ticks the soft-throttle *release* precondition held.
-    throttle_calm_ticks: u32,
+    /// Consecutive ticks the servo *engage* precondition (backlog ≥ engage) held.
+    meter_engage_ticks: u32,
+    /// Consecutive ticks the servo *release* precondition (backlog ≤ release) held.
+    meter_release_ticks: u32,
     /// Consecutive ticks the hard-valve *engage* precondition held.
     halt_stall_ticks: u32,
     /// Consecutive ticks the hard-valve *release* precondition held.
@@ -260,10 +358,10 @@ impl DrainStateMachine {
     pub fn new(cfg: DrainGuardCfg) -> Self {
         Self {
             cfg,
-            throttling: false,
+            metering: false,
             halted: false,
-            throttle_rise_ticks: 0,
-            throttle_calm_ticks: 0,
+            meter_engage_ticks: 0,
+            meter_release_ticks: 0,
             halt_stall_ticks: 0,
             halt_recover_ticks: 0,
         }
@@ -272,42 +370,47 @@ impl DrainStateMachine {
     /// Folds one sample into the guard state and returns the decision to publish.
     ///
     /// Design notes:
-    /// * Both brakes key off the backlog *derivative* (`backlog_delta`), not a
-    ///   fixed level, so they track the imbalance between intake and drain
-    ///   instead of oscillating around a level floor.
-    /// * "Backlog rising" implies creates are being admitted (only a new instance
-    ///   grows the active backlog), so an explicit create-rate term is redundant.
-    /// * The hard valve is a strict subset of the soft throttle: whenever it
-    ///   engages, the throttle is engaged too.
+    /// * The servo engages/releases on the backlog *level* with a wide hysteresis
+    ///   band. Unlike a hard shed at a level, engaging does not stop intake — it
+    ///   switches admission onto the completion-fed token bucket, which paces the
+    ///   *rate* and therefore settles rather than oscillates.
+    /// * The hard valve is a strict superset action of the servo: whenever it
+    ///   engages, metering is asserted too (a stalled drain is, by definition,
+    ///   under pressure), so releasing the valve does not momentarily open the gate
+    ///   wide before the servo re-evaluates.
     pub fn observe(&mut self, s: DrainSample) -> DrainDecision {
         if !self.cfg.enabled {
             return DrainDecision {
-                throttling: false,
+                metering: false,
                 halted: false,
             };
         }
 
-        let rising = s.backlog_delta >= self.cfg.rising_threshold;
-
-        // ---- Soft throttle (option 3): drain falling behind a rising backlog. --
-        if rising {
-            self.throttle_rise_ticks = self.throttle_rise_ticks.saturating_add(1);
-            self.throttle_calm_ticks = 0;
-        } else {
-            self.throttle_calm_ticks = self.throttle_calm_ticks.saturating_add(1);
-            self.throttle_rise_ticks = 0;
-        }
-        if !self.throttling {
-            if self.throttle_rise_ticks >= self.cfg.throttle_engage_ticks {
-                self.throttling = true;
+        // ---- Soft throttle (option 3): completion-paced servo, banded. ---------
+        if !self.metering {
+            if s.backlog >= self.cfg.meter_engage_backlog {
+                self.meter_engage_ticks = self.meter_engage_ticks.saturating_add(1);
+            } else {
+                self.meter_engage_ticks = 0;
             }
-        } else if self.throttle_calm_ticks >= self.cfg.throttle_release_ticks {
-            self.throttling = false;
+            if self.meter_engage_ticks >= self.cfg.meter_engage_ticks {
+                self.metering = true;
+                self.meter_release_ticks = 0;
+            }
+        } else {
+            if s.backlog <= self.cfg.meter_release_backlog {
+                self.meter_release_ticks = self.meter_release_ticks.saturating_add(1);
+            } else {
+                self.meter_release_ticks = 0;
+            }
+            if self.meter_release_ticks >= self.cfg.meter_release_ticks {
+                self.metering = false;
+                self.meter_engage_ticks = 0;
+            }
         }
 
-        // ---- Hard valve (option 4): sustained drain stall while backlog rises. -
+        // ---- Hard valve (option 4): sustained drain stall with backlog held. ---
         let stalled = s.completes_per_sec <= self.cfg.halt_completes_floor
-            && rising
             && s.actor_alive
             && s.backlog >= self.cfg.halt_min_backlog;
         let recovered = s.completes_per_sec >= self.cfg.recover_completes_rate;
@@ -329,15 +432,13 @@ impl DrainStateMachine {
             self.halted = false;
         }
 
-        // A halted guard is, by definition, also throttling: keep the soft brake
-        // asserted so releasing the valve does not momentarily open the gate wide
-        // before the throttle re-evaluates.
+        // A halted guard is, by definition, also metering.
         if self.halted {
-            self.throttling = true;
+            self.metering = true;
         }
 
         DrainDecision {
-            throttling: self.throttling,
+            metering: self.metering,
             halted: self.halted,
         }
     }
@@ -345,7 +446,7 @@ impl DrainStateMachine {
     #[cfg(test)]
     fn decision(&self) -> DrainDecision {
         DrainDecision {
-            throttling: self.throttling,
+            metering: self.metering,
             halted: self.halted,
         }
     }
@@ -359,175 +460,247 @@ mod tests {
         DrainGuardCfg::default()
     }
 
-    fn sample(completes: f64, backlog: i64, delta: i64, alive: bool) -> DrainSample {
+    fn healthy(backlog: i64) -> DrainSample {
         DrainSample {
-            completes_per_sec: completes,
+            completes_per_sec: 800.0,
             backlog,
-            backlog_delta: delta,
-            actor_alive: alive,
+            actor_alive: true,
         }
     }
 
     #[test]
-    fn idle_engine_never_brakes() {
+    fn idle_and_healthy_never_engages() {
         let mut sm = DrainStateMachine::new(cfg());
-        // No work, no arrivals, flat backlog, zero completes: not a wedge.
         for _ in 0..20 {
-            let d = sm.observe(sample(0.0, 0, 0, true));
-            assert!(!d.throttling, "idle must not throttle");
-            assert!(!d.halted, "idle must not halt");
+            let d = sm.observe(healthy(0));
+            assert!(!d.metering && !d.halted);
         }
-    }
-
-    #[test]
-    fn healthy_high_throughput_never_brakes() {
-        let mut sm = DrainStateMachine::new(cfg());
-        // Big backlog but draining fast and stable: no rise, no brake.
+        // Healthy load with a modest backlog well below the engage level.
         for _ in 0..20 {
-            let d = sm.observe(sample(5000.0, 10_000, 0, true));
-            assert_eq!(
-                d,
-                DrainDecision {
-                    throttling: false,
-                    halted: false
-                }
-            );
+            let d = sm.observe(healthy(400));
+            assert!(!d.metering && !d.halted, "healthy churn must not meter");
         }
     }
 
     #[test]
-    fn rising_backlog_engages_then_releases_soft_throttle() {
-        let mut sm = DrainStateMachine::new(cfg());
-        // Backlog climbing while completes still trickle above the halt floor:
-        // soft throttle engages after throttle_engage_ticks, hard valve stays off.
-        for _ in 0..cfg().throttle_engage_ticks {
-            sm.observe(sample(50.0, 5_000, 100, true));
+    fn servo_engages_above_band_and_releases_below_with_hysteresis() {
+        let c = cfg();
+        let mut sm = DrainStateMachine::new(c);
+        // Cross the engage level: needs `meter_engage_ticks` consecutive ticks.
+        let mut d = sm.observe(healthy(c.meter_engage_backlog));
+        assert!(!d.metering, "one tick above must not engage");
+        for _ in 0..c.meter_engage_ticks {
+            d = sm.observe(healthy(c.meter_engage_backlog + 100));
         }
         assert!(
-            sm.decision().throttling,
-            "throttle should engage on sustained rise"
+            d.metering,
+            "sustained backlog above band must engage the servo"
         );
-        assert!(
-            !sm.decision().halted,
-            "trickle above halt floor must not halt"
-        );
-        // Backlog stops rising (drain caught up): throttle releases after hysteresis.
-        for _ in 0..cfg().throttle_release_ticks {
-            sm.observe(sample(50.0, 5_000, 0, true));
+
+        // Sitting inside the band (between release and engage) keeps it engaged
+        // (hysteresis — no flapping).
+        for _ in 0..10 {
+            d = sm.observe(healthy(
+                (c.meter_engage_backlog + c.meter_release_backlog) / 2,
+            ));
+            assert!(d.metering, "mid-band must not release");
+        }
+
+        // Drop below the release level for the dwell: releases.
+        for _ in 0..c.meter_release_ticks {
+            d = sm.observe(healthy(c.meter_release_backlog - 100));
         }
         assert!(
-            !sm.decision().throttling,
-            "throttle should release once backlog stabilises"
+            !d.metering,
+            "backlog below release band must release the servo"
         );
     }
 
     #[test]
-    fn sustained_stall_engages_hard_valve_and_recovers() {
-        let mut sm = DrainStateMachine::new(cfg());
-        // The wedge: completes ~0, backlog rising, actor alive, above min backlog.
-        for _ in 0..cfg().halt_engage_ticks {
-            sm.observe(sample(0.0, 5_000, 200, true));
+    fn hard_valve_engages_on_sustained_stall_and_releases_on_recovery() {
+        let c = cfg();
+        let mut sm = DrainStateMachine::new(c);
+        let stall = DrainSample {
+            completes_per_sec: 0.0,
+            backlog: c.halt_min_backlog + 5_000,
+            actor_alive: true,
+        };
+        let mut d = sm.observe(stall);
+        assert!(!d.halted, "one stalled tick must not halt");
+        for _ in 0..c.halt_engage_ticks {
+            d = sm.observe(stall);
         }
-        let d = sm.decision();
         assert!(d.halted, "sustained stall must engage the hard valve");
-        assert!(d.throttling, "halt implies throttle");
-        // Drain recovers well above the recover rate: valve releases after hysteresis.
-        for _ in 0..cfg().halt_release_ticks {
-            sm.observe(sample(1_000.0, 5_000, -200, true));
+        assert!(d.metering, "a halted guard is also metering");
+
+        // Recovery: completes climb back above the recover rate for the dwell.
+        let recover = DrainSample {
+            completes_per_sec: c.recover_completes_rate + 50.0,
+            backlog: c.halt_min_backlog + 5_000,
+            actor_alive: true,
+        };
+        for _ in 0..c.halt_release_ticks {
+            d = sm.observe(recover);
         }
-        assert!(
-            !sm.decision().halted,
-            "strong recovery must release the valve"
-        );
+        assert!(!d.halted, "sustained recovery must release the hard valve");
     }
 
     #[test]
-    fn one_tick_blip_does_not_engage_hard_valve() {
-        let mut sm = DrainStateMachine::new(cfg());
-        // A single stalled tick (< halt_engage_ticks) must not fire the valve.
-        assert!(cfg().halt_engage_ticks > 1);
-        let d = sm.observe(sample(0.0, 5_000, 200, true));
-        assert!(!d.halted, "a one-tick stall must not halt");
-    }
-
-    #[test]
-    fn dead_actor_does_not_engage_hard_valve() {
-        let mut sm = DrainStateMachine::new(cfg());
-        // Actor dead (crash) — cutting creates cannot revive it, so the valve
-        // must not fire; that failure is handled by the raft/actor supervisor.
-        for _ in 0..(cfg().halt_engage_ticks + 3) {
-            sm.observe(sample(0.0, 5_000, 200, false));
-        }
-        assert!(
-            !sm.decision().halted,
-            "dead actor must not engage the create valve"
-        );
-    }
-
-    #[test]
-    fn below_min_backlog_does_not_engage_hard_valve() {
-        let mut cfg = cfg();
-        cfg.halt_min_backlog = 200;
-        let mut sm = DrainStateMachine::new(cfg);
-        // Completes ~0 and a small rise, but backlog below the floor: a quiet
-        // engine, not a wedge.
-        for _ in 0..(cfg.halt_engage_ticks + 3) {
-            sm.observe(sample(0.0, 50, 10, true));
-        }
-        assert!(!sm.decision().halted, "sub-threshold backlog must not halt");
-    }
-
-    #[test]
-    fn disabled_guard_is_inert() {
-        let mut cfg = cfg();
-        cfg.enabled = false;
-        let mut sm = DrainStateMachine::new(cfg);
-        for _ in 0..20 {
-            let d = sm.observe(sample(0.0, 100_000, 1_000, true));
-            assert_eq!(
-                d,
-                DrainDecision {
-                    throttling: false,
-                    halted: false
-                }
+    fn hard_valve_ignores_a_dead_actor() {
+        let c = cfg();
+        let mut sm = DrainStateMachine::new(c);
+        let dead = DrainSample {
+            completes_per_sec: 0.0,
+            backlog: c.halt_min_backlog + 5_000,
+            actor_alive: false,
+        };
+        for _ in 0..(c.halt_engage_ticks + 5) {
+            let d = sm.observe(dead);
+            assert!(
+                !d.halted,
+                "a dead actor is a different failure; must not halt"
             );
         }
     }
 
     #[test]
-    fn guard_blocks_creates_reflects_published_state() {
-        let g = DrainGuard::new(cfg());
-        assert!(!g.blocks_creates());
-        g.publish(true, false);
-        assert!(g.blocks_creates() && g.is_throttling() && !g.is_halted());
-        g.publish(true, true);
-        assert!(g.blocks_creates() && g.is_halted());
-        g.publish(false, false);
-        assert!(!g.blocks_creates());
+    fn hard_valve_ignores_an_idle_engine_below_min_backlog() {
+        let c = cfg();
+        let mut sm = DrainStateMachine::new(c);
+        let idle = DrainSample {
+            completes_per_sec: 0.0,
+            backlog: c.halt_min_backlog - 1,
+            actor_alive: true,
+        };
+        for _ in 0..(c.halt_engage_ticks + 5) {
+            let d = sm.observe(idle);
+            assert!(!d.halted, "quiet engine below min backlog is not a wedge");
+        }
     }
 
     #[test]
-    fn disabled_guard_never_blocks_even_if_published() {
+    fn disabled_is_inert() {
+        let mut c = cfg();
+        c.enabled = false;
+        let mut sm = DrainStateMachine::new(c);
+        let stall = DrainSample {
+            completes_per_sec: 0.0,
+            backlog: 1_000_000,
+            actor_alive: true,
+        };
+        for _ in 0..20 {
+            let d = sm.observe(stall);
+            assert!(!d.metering && !d.halted, "disabled guard must stay inert");
+        }
+    }
+
+    #[test]
+    fn token_bucket_starts_full_and_paces_by_completion() {
+        let mut c = cfg();
+        c.burst = 10;
+        let g = DrainGuard::new(c);
+        assert_eq!(g.budget(), 10, "bucket starts full (burst)");
+
+        // Drain the whole burst.
+        assert_eq!(g.take_credits(4), 4);
+        assert_eq!(g.take_credits(100), 6, "clamped to remaining");
+        assert_eq!(g.take_credits(1), 0, "empty bucket grants nothing");
+
+        // Each completion returns exactly one token, clamped to capacity.
+        g.note_completion();
+        g.note_completion();
+        assert_eq!(g.budget(), 2, "two completions refill two tokens");
+        assert_eq!(
+            g.take_credits(5),
+            2,
+            "only the refilled tokens are grantable"
+        );
+
+        // Refill past capacity is clamped.
+        for _ in 0..100 {
+            g.note_completion();
+        }
+        assert_eq!(g.budget(), 10, "refill clamped to burst");
+    }
+
+    #[test]
+    fn refill_full_repins_the_bucket() {
+        let mut c = cfg();
+        c.burst = 8;
+        let g = DrainGuard::new(c);
+        assert_eq!(g.take_credits(8), 8);
+        assert_eq!(g.budget(), 0);
+        g.refill_full();
+        assert_eq!(g.budget(), 8, "refill_full re-pins to capacity");
+    }
+
+    #[test]
+    fn guard_flags_reflect_published_decision() {
+        let g = DrainGuard::new(cfg());
+        assert!(!g.is_metering() && !g.is_halted() && !g.blocks_creates());
+
+        g.publish(true, false); // metering only
+        assert!(g.is_metering());
+        assert!(!g.is_halted(), "metering is not a hard block");
+        assert!(!g.blocks_creates(), "servo paces, it does not block");
+
+        g.publish(true, true); // halted
+        assert!(g.is_halted() && g.blocks_creates());
+
+        g.publish(false, false);
+        assert!(!g.is_metering() && !g.is_halted() && !g.blocks_creates());
+    }
+
+    #[test]
+    fn disabled_guard_never_blocks_or_meters() {
         let mut c = cfg();
         c.enabled = false;
         let g = DrainGuard::new(c);
-        g.publish(true, true);
-        assert!(!g.blocks_creates(), "disabled guard must stay inert");
-        assert!(!g.is_halted() && !g.is_throttling());
+        g.publish(true, true); // even if (spuriously) published
+        assert!(!g.is_metering(), "disabled guard never meters");
+        assert!(
+            !g.is_halted() && !g.blocks_creates(),
+            "disabled guard never blocks"
+        );
+    }
+
+    #[test]
+    fn take_credits_is_a_noop_for_nonpositive_want() {
+        let g = DrainGuard::new(cfg());
+        let before = g.budget();
+        assert_eq!(g.take_credits(0), 0);
+        assert_eq!(g.take_credits(-5), 0);
+        assert_eq!(g.budget(), before, "no tokens spent");
     }
 
     #[test]
     fn completion_counter_is_monotonic() {
         let g = DrainGuard::new(cfg());
         assert_eq!(g.completions(), 0);
-        g.note_completion();
-        g.note_completion();
-        assert_eq!(g.completions(), 2);
+        for i in 1..=50 {
+            g.note_completion();
+            assert_eq!(g.completions(), i);
+        }
     }
 
     #[test]
-    fn from_env_defaults_enabled() {
-        // No env manipulation (tests run in-process): just assert the default is on.
-        assert!(DrainGuardCfg::default().enabled);
+    fn servo_stays_released_while_flapping_inside_the_band() {
+        // Backlog oscillating strictly inside (release, engage) must never engage.
+        let c = cfg();
+        let mut sm = DrainStateMachine::new(c);
+        let lo = c.meter_release_backlog + 1;
+        let hi = c.meter_engage_backlog - 1;
+        for i in 0..40 {
+            let b = if i % 2 == 0 { lo } else { hi };
+            let d = sm.observe(healthy(b));
+            assert!(!d.metering, "mid-band flap must not engage the servo");
+        }
+        assert_eq!(
+            sm.decision(),
+            DrainDecision {
+                metering: false,
+                halted: false
+            }
+        );
     }
 }

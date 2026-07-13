@@ -208,8 +208,8 @@ struct Metrics {
     /// their worker pools can self-size.
     active_worker_target: IntGauge,
     /// Drain-stall guard state (`nanobpm_drain_guard`), labelled by `state`
-    /// (`throttling` = soft create-admission throttle engaged; `halted` = hard
-    /// safety valve engaged, create admission forced to 0). `1` = engaged. The
+    /// (`metering` = completion-paced create-admission servo engaged; `halted` =
+    /// hard safety valve engaged, create admission forced to 0). `1` = engaged. The
     /// create-flood wedge protection (options 3+4); pair with
     /// `nanobpm_drain_completes_per_sec` and `nanobpm_active_backlog` to see the
     /// drain collapse the guard reacted to.
@@ -218,6 +218,11 @@ struct Metrics {
     /// drain-stall guard sampled this tick. Its collapse toward ~0 while the
     /// active backlog rises is the wedge signature the guard trips on.
     drain_completes_per_sec: prometheus::Gauge,
+    /// The drain-stall servo's completion-fed create-admission token bucket level
+    /// (`nanobpm_drain_credit_budget`). While metering, create submission credits
+    /// are granted from this bucket (refilled +1 per completion, capped at the
+    /// burst); its floor near 0 means intake is fully paced to the drain.
+    drain_credit_budget: prometheus::IntGauge,
     /// The configured admission thresholds the ceiling rails trip at, labelled by
     /// `limit` (`backlog`, `create_queue` — counts; `pipeline_bytes`,
     /// `mem_watermark` — bytes; `0` = rail disabled). Reference lines so a dashboard
@@ -581,7 +586,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let drain_guard_state = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_drain_guard",
-            "Drain-stall guard state (state=throttling|halted; 1=engaged). Create-flood wedge protection: throttling = soft create-admission throttle (drain falling behind); halted = hard safety valve (drain stalled, backlog rising) forcing create admission to 0.",
+            "Drain-stall guard state (state=metering|halted; 1=engaged). Create-flood wedge protection: metering = completion-paced create-admission servo (submission credits granted from a completion-fed token bucket); halted = hard safety valve (drain stalled ~0/s with a large backlog held) forcing create admission to 0.",
         ),
         &["state"],
     )
@@ -589,6 +594,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let drain_completes_per_sec = prometheus::Gauge::new(
         "nanobpm_drain_completes_per_sec",
         "Completion drain throughput (completes/s) the drain-stall guard sampled this tick; its collapse toward ~0 while active_backlog rises is the wedge signature.",
+    )
+    .expect("valid gauge");
+    let drain_credit_budget = prometheus::IntGauge::new(
+        "nanobpm_drain_credit_budget",
+        "Drain-stall servo token-bucket level: create submission credits available to grant. Refilled +1 per completion (capped at the burst); while metering, a floor near 0 means intake is fully paced to the completion drain.",
     )
     .expect("valid gauge");
     let admission_limit = prometheus::IntGaugeVec::new(
@@ -676,6 +686,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(active_worker_target.clone())))
         .and(registry.register(Box::new(drain_guard_state.clone())))
         .and(registry.register(Box::new(drain_completes_per_sec.clone())))
+        .and(registry.register(Box::new(drain_credit_budget.clone())))
         .and(registry.register(Box::new(admission_limit.clone())))
         .and(registry.register(Box::new(cmd_seconds.clone())))
         .and(registry.register(Box::new(cmd_alloc_bytes.clone())))
@@ -730,6 +741,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         active_worker_target,
         drain_guard_state,
         drain_completes_per_sec,
+        drain_credit_budget,
         admission_limit,
         cmd_seconds,
         cmd_alloc_bytes,
@@ -887,18 +899,20 @@ pub fn set_active_worker_target(width: i64) {
 }
 
 /// Publishes the drain-stall guard state and the sampled drain throughput
-/// (`nanobpm_drain_guard{state}` + `nanobpm_drain_completes_per_sec`). Called
-/// ~1 Hz from the monitor supervisor, off the hot path.
-pub fn set_drain_guard(throttling: bool, halted: bool, completes_per_sec: f64) {
+/// (`nanobpm_drain_guard{state}` + `nanobpm_drain_completes_per_sec` +
+/// `nanobpm_drain_credit_budget`). Called ~1 Hz from the monitor supervisor, off
+/// the hot path.
+pub fn set_drain_guard(metering: bool, halted: bool, completes_per_sec: f64, credit_budget: i64) {
     METRICS
         .drain_guard_state
-        .with_label_values(&["throttling"])
-        .set(i64::from(throttling));
+        .with_label_values(&["metering"])
+        .set(i64::from(metering));
     METRICS
         .drain_guard_state
         .with_label_values(&["halted"])
         .set(i64::from(halted));
     METRICS.drain_completes_per_sec.set(completes_per_sec);
+    METRICS.drain_credit_budget.set(credit_budget);
 }
 
 /// Publishes one configured admission threshold as a reference line

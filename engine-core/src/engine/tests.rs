@@ -793,6 +793,64 @@ fn terminating_an_instance_drops_its_variables_from_hot_state() {
 }
 
 #[test]
+fn live_job_count_excludes_completed_jobs_pending_eviction() {
+    // Regression: `runnable_backlog` (the admission/governor congestion signal)
+    // must count only *live* jobs — Created + Activated — never the terminal
+    // jobs that linger in `jobs` after their instance completes but before the
+    // exporter evicts it. A completed job is deindexed the instant it settles,
+    // yet its `Job` shell (and the completed instance shell) stay resident until
+    // eviction. If the exporter falls behind — or is stalled by a locked
+    // read-model store — those un-evicted terminal jobs accumulate; counting
+    // `jobs.len()` would fold that dead weight into the backpressure reading and
+    // shed legitimate new work, a self-inflicted freeze that never clears.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Job parked at the service task: one live (Created) job.
+    assert_eq!(
+        engine.state().live_job_count(),
+        1,
+        "a created-and-waiting job is live congestion"
+    );
+
+    // Activate (lease) it: still one live (now Activated) job.
+    let job = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].clone();
+    assert_eq!(
+        engine.state().live_job_count(),
+        1,
+        "a leased/in-flight job is still live congestion"
+    );
+
+    // Complete it. The instance reaches its end event and goes terminal, but its
+    // shell (and the completed job) stay resident until exporter-driven eviction.
+    engine
+        .apply_command(Command::complete_job(job.key))
+        .unwrap();
+    assert_eq!(
+        engine.instance(key).expect("shell still resident").state,
+        crate::state::ProcessInstanceState::Completed,
+        "instance is terminal but not yet evicted"
+    );
+    assert_eq!(
+        engine.state().jobs.len(),
+        1,
+        "the completed job shell lingers in `jobs` until eviction"
+    );
+    assert_eq!(
+        engine.state().live_job_count(),
+        0,
+        "a completed job is NOT live congestion — the admission signal must \
+         ignore it, or a lagging exporter would shed new work forever"
+    );
+}
+
+#[test]
 fn cold_spill_round_trips_a_job_parked_instance() {
     // Snapshotting a job-parked instance lifts it (and its job) entirely out
     // of hot state; rehydrating restores it so the job is activatable and the

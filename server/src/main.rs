@@ -9298,23 +9298,19 @@ impl ServerImpl {
     }
 
     /// Drain-stall guard admission rail: sheds a create while the guard's hard
-    /// valve or soft throttle is engaged. Evaluated in both SLA modes (it guards
-    /// liveness, not latency). Returns the client-facing retry reason.
+    /// valve is engaged. Evaluated in both SLA modes (it guards liveness, not
+    /// latency). The soft servo (option 3) does **not** shed here — it paces
+    /// intake at the submission-credit layer via
+    /// [`crate::drain_guard::DrainGuard::take_credits`], not by rejecting creates —
+    /// so only the hard valve surfaces as an admission shed. Returns the
+    /// client-facing retry reason.
     fn drain_guard_shed(&self) -> Option<String> {
         if self.drain_guard.is_halted() {
             crate::metrics::record_admission_shed("drain_halt");
             return Some(
-                "Admission control: completion drain stalled (active backlog rising with \
-                 ~0 completions/s); halting new instance creation until the drain recovers. \
-                 Retry after a backoff."
-                    .to_string(),
-            );
-        }
-        if self.drain_guard.is_throttling() {
-            crate::metrics::record_admission_shed("drain_throttle");
-            return Some(
-                "Admission control: completion drain falling behind the create rate; \
-                 throttling new instance creation. Retry after a backoff."
+                "Admission control: completion drain stalled (~0 completions/s while a \
+                 large active backlog is held); halting new instance creation until the \
+                 drain recovers. Retry after a backoff."
                     .to_string(),
             );
         }
@@ -9348,12 +9344,13 @@ impl ServerImpl {
     ///   disk, so in admission mode these rails bite far later than the
     ///   latency gate would have.
     pub(crate) fn admission_shed(&self) -> Option<String> {
-        // Drain-stall guard (always on, both SLA modes): the liveness rail. If the
-        // completion drain has stalled or is falling behind a create flood, shed
-        // new creates *first* — before any latency/memory rail — so create entries
-        // stop crowding completions out of the shared Raft log and the drain can
-        // recover. Cheapest possible check (relaxed atomic loads on flags the ~1 Hz
-        // monitor publishes), so it is safe at the head of the hot path.
+        // Drain-stall guard hard valve (always on, both SLA modes): the liveness
+        // rail. If the completion drain has fully stalled with a large backlog
+        // held, shed new creates *first* — before any latency/memory rail — so
+        // create entries stop crowding completions out of the shared Raft log and
+        // the drain can recover. (The soft servo does not shed here; it paces
+        // intake at the submission-credit layer.) Cheapest possible check (a
+        // relaxed atomic load on a flag the ~1 Hz monitor publishes).
         if let Some(reason) = self.drain_guard_shed() {
             return Some(reason);
         }
@@ -11509,17 +11506,16 @@ async fn main() {
                 std::collections::HashSet::new();
             // Drain-stall guard supervisor state (options 3+4). The state machine
             // owns the edge/hysteresis counters; here we track the deltas it needs:
-            // the completion count (rate = drain throughput) and active backlog
-            // (its derivative is the intake-vs-drain imbalance signal), plus the
-            // wall instant to turn the completion delta into a per-second rate even
-            // if a tick is skipped under load.
+            // the completion count (rate = drain throughput) and the active backlog
+            // level (the servo's pressure band), plus the wall instant to turn the
+            // completion delta into a per-second rate even if a tick is skipped
+            // under load.
             let mut drain_sm = crate::drain_guard::DrainStateMachine::new(
                 crate::drain_guard::DrainGuardCfg::from_env(),
             );
             let mut prev_completions = monitor_server.drain_guard().completions();
-            let mut prev_backlog = monitor_server.active_backlog();
             let mut prev_drain_instant = std::time::Instant::now();
-            let mut drain_throttle_lit = false;
+            let mut drain_meter_lit = false;
             let mut drain_halt_lit = false;
             loop {
                 interval.tick().await;
@@ -11610,11 +11606,10 @@ async fn main() {
                 }
 
                 // Drain-stall admission guard (options 3+4): derive the drain
-                // throughput (completions/s) and the active-backlog derivative,
-                // fold them into the guard state machine, and publish the
-                // create-admission brakes it decides on. Pure atomic reads off the
-                // hot path; the actual gating is a relaxed flag load in
-                // `admission_shed`/`create_admission_blocked`.
+                // throughput (completions/s) and read the active backlog, fold them
+                // into the guard state machine, publish the servo/valve decision,
+                // and (when not metering) re-pin the completion-paced token bucket
+                // full so entering the pressure band starts with a fresh burst.
                 {
                     let now = std::time::Instant::now();
                     let dt = now.duration_since(prev_drain_instant).as_secs_f64();
@@ -11624,22 +11619,25 @@ async fn main() {
                     prev_completions = completions_now;
                     let completes_per_sec = if dt > 0.0 { completed as f64 / dt } else { 0.0 };
                     let backlog = monitor_server.active_backlog();
-                    let backlog_delta = backlog - prev_backlog;
-                    prev_backlog = backlog;
 
                     let decision = drain_sm.observe(crate::drain_guard::DrainSample {
                         completes_per_sec,
                         backlog,
-                        backlog_delta,
                         actor_alive: any_actor_alive,
                     });
-                    monitor_server
-                        .drain_guard()
-                        .publish(decision.throttling, decision.halted);
+                    let guard = monitor_server.drain_guard();
+                    guard.publish(decision.metering, decision.halted);
+                    if !decision.metering {
+                        // Below the pressure band: keep the bucket topped up so the
+                        // servo never meters healthy load and always engages with a
+                        // full burst.
+                        guard.refill_full();
+                    }
                     crate::metrics::set_drain_guard(
-                        decision.throttling,
+                        decision.metering,
                         decision.halted,
                         completes_per_sec,
+                        guard.budget(),
                     );
                     // Log only on state transitions (edge-triggered) so a healthy
                     // server stays quiet and a wedge is a single, greppable event.
@@ -11648,10 +11646,9 @@ async fn main() {
                             tracing::warn!(
                                 completes_per_sec,
                                 backlog,
-                                backlog_delta,
                                 "drain-stall guard: HARD VALVE engaged — completion drain \
-                                 stalled with backlog rising; halting create admission until \
-                                 drain recovers"
+                                 stalled with a large backlog held; halting create admission \
+                                 until drain recovers"
                             );
                         } else {
                             tracing::info!(
@@ -11663,22 +11660,23 @@ async fn main() {
                         }
                         drain_halt_lit = decision.halted;
                     }
-                    if decision.throttling != drain_throttle_lit {
-                        if decision.throttling {
+                    if decision.metering != drain_meter_lit {
+                        if decision.metering {
                             tracing::info!(
                                 completes_per_sec,
                                 backlog,
-                                backlog_delta,
-                                "drain-stall guard: soft throttle engaged — drain falling \
-                                 behind create rate; throttling create admission"
+                                budget = guard.budget(),
+                                "drain-stall guard: servo engaged — backlog in the pressure \
+                                 band; pacing create admission to the completion rate"
                             );
                         } else {
                             tracing::info!(
                                 backlog,
-                                "drain-stall guard: soft throttle released — backlog stable"
+                                "drain-stall guard: servo released — backlog back below the \
+                                 pressure band"
                             );
                         }
-                        drain_throttle_lit = decision.throttling;
+                        drain_meter_lit = decision.metering;
                     }
                 }
 
@@ -13243,15 +13241,16 @@ mod clustered_startup_tests {
     #[test]
     fn drain_guard_gates_admission_when_engaged() {
         // Wiring test: the drain-stall guard's published state must actually gate
-        // the create-admission path (`admission_shed` / `create_admission_blocked`),
-        // and — because it is checked first — its reason must win over any other
-        // rail. State is published by the ~1 Hz monitor; here we publish directly.
+        // the create-admission path. The hard valve sheds via `admission_shed` /
+        // blocks via `create_admission_blocked`; the soft servo only *meters*
+        // (paces credits) and must NOT hard-block or shed. State is published by
+        // the ~1 Hz monitor; here we publish directly.
         let server = ServerImpl::default();
         let guard = server.drain_guard().clone();
 
         // Hard valve engaged: creates are shed with the halt reason and intake is
         // blocked, regardless of any other rail's state.
-        guard.publish(false, true);
+        guard.publish(true, true);
         assert!(guard.is_halted());
         assert!(server.create_admission_blocked());
         let reason = server.admission_shed().expect("halt must shed");
@@ -13260,14 +13259,16 @@ mod clustered_startup_tests {
             "halt reason should win: {reason}"
         );
 
-        // Soft throttle only: still blocked, with the throttle reason.
+        // Servo metering only (no halt): intake is paced, not blocked or shed.
         guard.publish(true, false);
-        assert!(!guard.is_halted() && guard.is_throttling());
-        assert!(server.create_admission_blocked());
-        let reason = server.admission_shed().expect("throttle must shed");
+        assert!(guard.is_metering() && !guard.is_halted());
         assert!(
-            reason.contains("throttling new instance creation"),
-            "throttle reason should win: {reason}"
+            !server.create_admission_blocked(),
+            "the servo paces credits; it must not hard-block creates"
+        );
+        assert!(
+            server.admission_shed().is_none(),
+            "the servo must not surface as an admission shed"
         );
 
         // Cleared: the guard no longer blocks creates.
