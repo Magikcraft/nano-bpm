@@ -3568,6 +3568,53 @@ fn build_subagent(
     }))
 }
 
+/// Build the optional drafter from a chat request. When enabled, the primary may call the
+/// `draft_ir` tool to commission grammar-constrained model IR from this (typically small, local)
+/// sidecar. A disabled/absent request ⇒ no drafter (the `draft_ir` tool is not offered). Errors
+/// only if explicitly enabled but the referenced profile can't resolve to a ready model.
+fn build_drafter(
+    state: &AppState,
+    req: &ChatSendRequest,
+) -> Result<Option<investigate::Drafter>, String> {
+    let Some(spec) = req.drafter.as_ref().filter(|s| s.enabled) else {
+        return Ok(None);
+    };
+    let cfg = resolve_llm_for_profile(state, spec.profile_id.as_deref(), spec.llm.as_ref())
+        .ok_or_else(|| {
+            format!(
+                "Drafter references unknown profile '{}'",
+                spec.profile_id.as_deref().unwrap_or("")
+            )
+        })?;
+    if !cfg.is_ready() {
+        return Err(
+            "Drafter is enabled but has no model configured — pick a profile for the \
+                    drafter, or disable it"
+                .to_string(),
+        );
+    }
+    let system = spec
+        .system
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default();
+    let name = spec
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| "drafter".to_string());
+    Ok(Some(investigate::Drafter {
+        cfg,
+        name,
+        system,
+        model: None,
+    }))
+}
+
 /// Resolve the loop-monitor config from a chat request, honouring an env default. Returns the
 /// `(LlmConfig, persona_system)` to run the monitor with, or `None` when monitoring is off or no
 /// model can be resolved (in which case the turn simply runs without a monitor).
@@ -4325,6 +4372,7 @@ async fn cockpit_workbench_review(
             &mut sink,
             &[],
             None,
+            None,
             Vec::new(),
             None,
             prior,
@@ -4798,6 +4846,10 @@ struct ChatSendRequest {
     /// context window. Off unless `enabled`; when on, the primary gets a `delegate` tool.
     #[serde(default)]
     subagent: Option<SubagentRequest>,
+    /// Drafter: a small local sidecar the primary can commission grammar-constrained model IR
+    /// from. Off unless `enabled`; when on, the primary gets a `draft_ir` tool.
+    #[serde(default)]
+    drafter: Option<DrafterRequest>,
     /// Optional allowlist of tool names the PRIMARY model may use this turn (the per-investigation
     /// "Configure tools" selection). `None`/empty = the full available surface.
     #[serde(default)]
@@ -4834,6 +4886,31 @@ struct SubagentRequest {
     /// Advanced: max chars of digest fed back to the primary (default 4000, clamped 500..20000).
     #[serde(default)]
     digest_cap: Option<usize>,
+}
+
+/// Drafter configuration for a chat turn. When `enabled`, the primary is offered a `draft_ir`
+/// tool; each call runs ONE grammar-constrained completion on the secondary (a small local model)
+/// that returns well-formed model IR. No tool loop / digest / round budget applies — the grammar
+/// carries the syntactic weight, so even a tiny model emits valid IR.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DrafterRequest {
+    #[serde(default)]
+    enabled: bool,
+    /// The saved LLM profile the drafter uses (ideally a small/fast local model). Env default if
+    /// absent.
+    #[serde(default)]
+    profile_id: Option<String>,
+    /// A one-off LLM override layered on top of the profile (rarely needed).
+    #[serde(default)]
+    llm: Option<LlmOverride>,
+    /// An inline system-prompt override (from a saved pairing). Empty ⇒ the built-in IR-writer
+    /// prompt is used.
+    #[serde(default)]
+    system: Option<String>,
+    /// An inline display name (from a saved pairing) shown on the drafter's outputs.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// One configured Pair AI reviewer in a chat request.
@@ -4956,6 +5033,10 @@ async fn cockpit_chat_send(
         Ok(s) => s,
         Err(e) => return unprocessable(e),
     };
+    let drafter = match build_drafter(&state, &req) {
+        Ok(d) => d,
+        Err(e) => return unprocessable(e),
+    };
     let custom_tools = state.tools.enabled();
     let primary_tools = req.tools.clone();
     let message = req.message;
@@ -4998,6 +5079,7 @@ async fn cockpit_chat_send(
                 &mut sink,
                 &pairs,
                 subagent,
+                drafter,
                 custom_tools,
                 primary_tools,
                 prior,
@@ -5097,6 +5179,10 @@ async fn cockpit_chat_stream(
     };
     let subagent = match build_subagent(&state, &req) {
         Ok(s) => s,
+        Err(e) => return unprocessable(e),
+    };
+    let drafter = match build_drafter(&state, &req) {
+        Ok(d) => d,
         Err(e) => return unprocessable(e),
     };
     let custom_tools = state.tools.enabled();
@@ -5266,6 +5352,7 @@ async fn cockpit_chat_stream(
             &mut sink,
             &pairs,
             subagent,
+            drafter,
             custom_tools,
             primary_tools,
             prior,

@@ -271,6 +271,42 @@ Not yet wired: threading `grammar` through `harness/llm.rs` so the write path
 is grammar-constrained automatically. `emit-gbnf` is the manual escape hatch
 in the meantime.
 
+### Status update: the drafting pair — grammar as a leveller
+
+The write path is now wired end to end. Three pieces landed on top of the
+grammar surface above:
+
+* **Per-call grammar in the harness.** `LlmConfig.grammar` /
+  `LlmOverride.grammar` + `apply_grammar()` inject a GBNF into the specific
+  request that should be constrained. Grammar is applied *per call*, never
+  per-profile — a config-wide grammar would break the prose / tool-call turns.
+  The IR grammar is checked into the repo at
+  [`processos/assets/ir.gbnf`](../../assets/ir.gbnf) (drift-tested against
+  `emit_gbnf()`) and served at `GET /api/ir/grammar.gbnf`.
+* **`PairMode::Drafter`** ([`pairings.rs`](../../src/pairings.rs)). A first-class
+  Pair AI mode: a small local sidecar paired to write model IR under grammar
+  constraint. It is the *app-level* sibling of `Speculator` (engine-level
+  speculative decoding) — the secondary contributes no prose and runs no tool
+  loop. Selecting a Drafter pairing in the composer offers the primary a
+  `draft_ir` tool.
+* **`draft_ir` tool** ([`investigate.rs`](../../src/investigate.rs)). One
+  grammar-constrained completion: load `ir_gbnf()` into the drafter's cfg, show
+  it the current model (as IR) + the primary's plain-language instruction (and
+  an optional `base` IR to revise), and return the drafted IR — already
+  parse-checked via `model_ir::analyze_ir` (GBNF guarantees the *form*; the
+  parser still catches missing-required-attr / unknown-ref slips). The primary
+  reviews the result and deploys it with `write_model_ir`.
+
+The insight the mode banks on: **the grammar is a leveller.** A 1.5B model with
+GBNF emits syntactically valid IR as reliably as an 8B without — the grammar
+carries the syntactic weight, so the small model spends its budget on the
+*modelling*, not on remembering IR syntax. That makes a tiny local drafter a
+credible partner to a larger local planner across one or two machines.
+
+Deferred to a follow-up: a retry-with-diagnostic loop when `analyze_ir` rejects
+a draft (currently the parse error is surfaced to the primary, which re-instructs);
+and a "draft with grammar" button in the Semantics Workbench.
+
 ### The desirability dimension: guided search against an externalized objective
 
 Legality and visibility (the two grammar maps above) constrain and illuminate the
