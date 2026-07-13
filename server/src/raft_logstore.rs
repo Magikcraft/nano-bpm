@@ -904,6 +904,28 @@ impl RaftLogReader<RaftConfig> for RaftLogStore {
                 len: usize,
             },
         }
+        // `BTreeMap::range` panics if the requested start > end (or start == end with
+        // both bounds excluded). openraft can ask for such an inverted/empty range while
+        // applying on a freshly-wiped node during bootstrap, so treat it as "no entries"
+        // instead of aborting the process (panic = abort in release builds).
+        {
+            use std::ops::Bound;
+            let empty = match (range.start_bound(), range.end_bound()) {
+                (
+                    Bound::Included(s) | Bound::Excluded(s),
+                    Bound::Included(e) | Bound::Excluded(e),
+                ) => {
+                    s > e
+                        || (s == e
+                            && matches!(range.start_bound(), Bound::Excluded(_))
+                            && matches!(range.end_bound(), Bound::Excluded(_)))
+                }
+                _ => false,
+            };
+            if empty {
+                return Ok(Vec::new());
+            }
+        }
         let planned: Vec<Resolved> = {
             let inner = self.inner.lock().unwrap();
             inner
@@ -1619,6 +1641,33 @@ mod tests {
         let got = store.try_get_log_entries(1..=2).await.unwrap();
         assert_eq!(got.len(), 2);
         assert!(matches!(got[0].payload, EntryPayload::Normal(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::reversed_empty_ranges)]
+    async fn try_get_log_entries_returns_empty_for_an_inverted_range() {
+        // openraft can request an inverted/empty range (start > end) while applying on a
+        // freshly-wiped node during bootstrap. `BTreeMap::range` panics on such a range;
+        // with panic = abort that would kill the process, so we must return empty instead.
+        let dir = tmp_dir("inverted-range");
+        write_segment(&dir, 0, &[0, 1, 2]);
+        let mut store = RaftLogStore::open(&dir).unwrap();
+
+        assert!(store.try_get_log_entries(3..1).await.unwrap().is_empty());
+        let got = store.try_get_log_entries(2..=1).await.unwrap();
+        assert!(got.is_empty());
+        // A normal range still works after the guard.
+        assert_eq!(
+            store
+                .try_get_log_entries(0..2)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
