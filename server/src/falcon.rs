@@ -1909,14 +1909,25 @@ fn spawn_await_completion(
     });
 }
 
-/// Grants `n` submission credits to a connection iff the engine is not shedding,
-/// keeping the client's intake window full under healthy load and letting it
-/// drain (the client stalls) under pressure.
+/// Grants `n` submission credits to a connection unless intake is hard-blocked,
+/// pacing the grant against the drain-stall guard's completion-fed token bucket
+/// while the servo is metering. Under a hard block (latency backpressure or the
+/// drain-stall hard valve) it grants nothing so the client's window drains; while
+/// metering it grants only as many tokens as the completion drain has returned,
+/// so intake self-limits to the sustainable rate; otherwise it grants the full
+/// request.
 fn grant_submission_credit_if_clear(server: &ServerImpl, conn: &Arc<Connection>, n: i64) {
     if n <= 0 || server.create_admission_blocked() {
         return;
     }
-    conn.grant_submission_credits(n);
+    let n = if server.drain_guard().is_metering() {
+        server.drain_guard().take_credits(n)
+    } else {
+        n
+    };
+    if n > 0 {
+        conn.grant_submission_credits(n);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -2465,18 +2476,34 @@ fn dispatch_concurrency() -> usize {
         .unwrap_or(DEFAULT_DISPATCH_CONCURRENCY)
 }
 
-/// Refills each connection's submission window when the engine has headroom, so a
-/// client that stalled under pressure resumes intake once pressure clears.
+/// Refills each connection's submission window when intake is clear, pacing the
+/// grant against the drain-stall guard's completion-fed token bucket while the
+/// servo is metering. Under a hard block it grants nothing (windows drain); while
+/// metering the total grant across connections is bounded by the tokens the
+/// completion drain has returned, so intake tracks drain; otherwise each window is
+/// topped back to full.
 fn topup_submission_credits(server: &ServerImpl, registry: &Arc<Registry>) {
     if server.create_admission_blocked() {
         return;
     }
+    let metering = server.drain_guard().is_metering();
     for conn in registry.all_connections() {
         if conn.closed.load(Ordering::Relaxed) {
             continue;
         }
         let outstanding = conn.submission_outstanding.load(Ordering::Relaxed);
-        let grant = conn.submission_window - outstanding;
+        let want = conn.submission_window - outstanding;
+        if want <= 0 {
+            continue;
+        }
+        // While metering, spend from the shared completion-fed bucket so the
+        // node-wide grant rate cannot outrun the drain; the bucket empties and
+        // later connections in this pass simply wait for the next tick's refill.
+        let grant = if metering {
+            server.drain_guard().take_credits(want)
+        } else {
+            want
+        };
         if grant > 0 {
             conn.grant_submission_credits(grant);
         }
