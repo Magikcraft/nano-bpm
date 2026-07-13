@@ -57,8 +57,8 @@ use nanobpmn_engine_core::{
 };
 
 use crate::backpressure::{
-    AdaptiveController, Backpressure, BackpressureSetting, SharedSlaMode, SlaMode,
-    parse_backpressure_setting, parse_sla_mode,
+    AdaptiveController, Backpressure, BackpressureSetting, CONGESTION_RATIO, GovernorObs,
+    SharedSlaMode, SlaMode, parse_backpressure_setting, parse_sla_mode,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -175,6 +175,14 @@ pub struct ServerImpl {
     /// knee. In `Fixed`/`Off` mode it is a constant. Read on the hot admission
     /// path with a relaxed load.
     backlog_cap: Arc<AtomicUsize>,
+    /// When the active-backlog cap is governed live (`AdmissionBacklog::Auto`),
+    /// the governor's static bounds (`floor` ≈ knee, `ceiling` = memory backstop)
+    /// and a [`GovernorObs`] read handle onto its self-calibrated latency baseline
+    /// and last-window latency. `None` in `Fixed`/`Off` mode (the cap is then a
+    /// plain constant). Surfaced by the ~1 Hz monitor as
+    /// `nanobpm_backlog_governor_*` metrics and used to explain the auto-tuned
+    /// cap in the `active_backlog` / `create_backlog` shed message.
+    backlog_gov: Option<BacklogGovernor>,
     /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
     /// completed *service-task* jobs, summed across owned partitions. This is the
     /// parked-excluded load signal the admission gate and the backlog governor
@@ -524,6 +532,9 @@ impl ServerImpl {
         //  - Fixed: a fixed operator-set cap.
         //  - Auto:  a self-optimizing governor tunes it between the knee floor and
         //           the memory-derived ceiling from the engine's latency signal.
+        // In Auto mode we also keep the governor's bounds + latency read handle
+        // (`backlog_gov`) so the monitor and shed message can explain the cap.
+        let mut backlog_gov: Option<BacklogGovernor> = None;
         let backlog_cap = match admission_backlog_from_env() {
             AdmissionBacklog::Off => Arc::new(AtomicUsize::new(0)),
             AdmissionBacklog::Fixed(n) => {
@@ -537,7 +548,14 @@ impl ServerImpl {
                     "admission control: on, self-optimizing active-backlog governor \
                      (floor {floor}, ceiling {ceiling} runnable jobs/node)"
                 );
-                controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone())
+                let (cap, obs) =
+                    controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone());
+                backlog_gov = Some(BacklogGovernor {
+                    floor,
+                    ceiling,
+                    obs,
+                });
+                cap
             }
         };
         // `active_worker_cap` is the live per-job-type active dispatch width the
@@ -713,6 +731,7 @@ impl ServerImpl {
             processing,
             activity: Arc::new(AtomicU64::new(0)),
             backlog_cap,
+            backlog_gov,
             runnable_backlog,
             active_worker_cap,
             admission_max_create_queue,
@@ -1668,6 +1687,18 @@ enum AdmissionBacklog {
     /// Self-optimizing: a latency-driven governor tunes the cap between `floor`
     /// (≈ the throughput knee) and `ceiling` (the memory-derived backstop).
     Auto { floor: usize, ceiling: usize },
+}
+
+/// Live state of the auto-mode active-backlog governor, kept on the [`Server`] so
+/// the monitor and the shed message can explain *why* the cap sits where it does.
+/// `floor`/`ceiling` are the static AIMD bounds; `obs` is the read side of the
+/// governor's self-calibrated latency baseline and last-window mean latency, which
+/// the engine thread republishes each window.
+#[derive(Clone)]
+struct BacklogGovernor {
+    floor: usize,
+    ceiling: usize,
+    obs: GovernorObs,
 }
 
 /// Resolves the active-backlog admission policy from `NANOBPMN_ADMISSION_MAX_BACKLOG`.
@@ -9384,6 +9415,44 @@ impl ServerImpl {
         self.inflight.load(Ordering::Relaxed) as i64
     }
 
+    /// Trailing sentence for an active-backlog / create-backlog shed message that
+    /// explains *why* the cap is what it is — so an operator isn't left staring at
+    /// a shed threshold they never configured. In `Auto` mode the cap is the live
+    /// output of the AIMD latency governor, so we name it as auto-tuned, give its
+    /// floor/ceiling bounds, and (once a window has folded) report the baseline vs
+    /// current per-command latency and the congestion threshold that drove the
+    /// last backoff. In `Fixed`/`Off` mode the cap is a plain operator setting, so
+    /// we just point at the tuning lever.
+    fn backlog_cap_explainer(&self) -> String {
+        let Some(gov) = &self.backlog_gov else {
+            return " This is a fixed cap (NANOBPMN_ADMISSION_MAX_BACKLOG); \
+                    raise it, or set NANOBPMN_SLA_MODE=admission to accept latency \
+                    instead of shedding. Retry after a backoff."
+                .to_string();
+        };
+        let baseline = gov.obs.baseline_us.load(Ordering::Relaxed);
+        let window = gov.obs.window_avg_us.load(Ordering::Relaxed);
+        let bounds = format!(
+            " This cap is auto-tuned by the latency governor (floor {}, ceiling {} \
+             runnable jobs) to hold per-command latency near its baseline",
+            gov.floor, gov.ceiling
+        );
+        let latency = if baseline > 0 {
+            let threshold = (baseline as f64 * CONGESTION_RATIO) as u64;
+            format!(
+                "; it backed the cap off because window latency {window}µs vs \
+                 baseline {baseline}µs neared the {threshold}µs congestion threshold."
+            )
+        } else {
+            ".".to_string()
+        };
+        format!(
+            "{bounds}{latency} Retry after a backoff, set NANOBPMN_ADMISSION_MAX_BACKLOG \
+             for a fixed cap, or NANOBPMN_SLA_MODE=admission to accept latency instead \
+             of shedding."
+        )
+    }
+
     /// Admission gate combining several signals. Returns `Some(reason)` once any
     /// active signal is at/above its limit (the create should be shed); `None`
     /// when all have headroom. Relaxed atomic loads — no engine round-trip; an
@@ -9459,14 +9528,16 @@ impl ServerImpl {
                 crate::metrics::record_admission_shed("active_backlog");
                 return Some(format!(
                     "Admission control: {backlog} runnable jobs at or above the \
-                     active-backlog cap of {backlog_limit}. Retry after a backoff."
+                     active-backlog cap of {backlog_limit}.{}",
+                    self.backlog_cap_explainer()
                 ));
             }
             if create_queue >= backlog_limit {
                 crate::metrics::record_admission_shed("create_backlog");
                 return Some(format!(
                     "Admission control: create backlog {create_queue} at or above the \
-                     configured latency backlog limit of {backlog_limit}. Retry after a backoff."
+                     active-backlog cap of {backlog_limit}.{}",
+                    self.backlog_cap_explainer()
                 ));
             }
         }
@@ -11622,6 +11693,21 @@ async fn main() {
                     "backlog",
                     monitor_server.backlog_cap.load(Ordering::Relaxed) as i64,
                 );
+                // In Auto mode, publish the governor's bounds + live latency signal
+                // so a dashboard (and the shed message) can explain where the cap
+                // sits and why it moved there, rather than only the bare cap value.
+                if let Some(gov) = &monitor_server.backlog_gov {
+                    crate::metrics::set_backlog_governor("floor", gov.floor as i64);
+                    crate::metrics::set_backlog_governor("ceiling", gov.ceiling as i64);
+                    crate::metrics::set_backlog_governor(
+                        "baseline_latency_us",
+                        gov.obs.baseline_us.load(Ordering::Relaxed) as i64,
+                    );
+                    crate::metrics::set_backlog_governor(
+                        "window_latency_us",
+                        gov.obs.window_avg_us.load(Ordering::Relaxed) as i64,
+                    );
+                }
                 crate::metrics::set_admission_limit(
                     "create_queue",
                     monitor_server.admission_max_create_queue as i64,
