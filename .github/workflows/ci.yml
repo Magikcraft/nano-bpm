@@ -226,22 +226,26 @@ jobs:
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost "$AGENT_TOOLSDIRECTORY"
           df -h /
-      # Key the DuckDB object cache on the libduckdb-sys version only: it's the one
-      # input to the C++ build that "doesn't change" between unrelated commits, so
-      # a matching key yields ~100% C/C++ sccache hits and only rotates on a real
-      # DuckDB bump. Restored *before* sccache starts its server.
+      # Key the DuckDB object cache on the libduckdb-sys version: it's the one C++
+      # build input that "doesn't change" between unrelated commits. The run-id
+      # suffix makes every saved entry unique, and the save step below only fires
+      # when DuckDB was actually (re)compiled — so warm-cache runs (where Swatinem
+      # served target/ and nothing hit sccache) never overwrite the entry with an
+      # empty dir. Restore falls back by prefix to the newest populated entry.
       - name: Resolve libduckdb-sys version
         id: duckdb
         run: |
           ver=$(awk -F'"' '/name = "libduckdb-sys"/{getline; print $2}' processos/Cargo.lock)
           echo "ver=$ver" >> "$GITHUB_OUTPUT"
           echo "libduckdb-sys=$ver"
-      - name: Cache DuckDB build (sccache objects, keyed on libduckdb-sys version)
-        uses: actions/cache@v4
+      - name: Restore DuckDB sccache
+        id: duckcache
+        uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/.sccache
-          key: sccache-duckdb-${{ runner.os }}-${{ steps.duckdb.outputs.ver }}
+          key: sccache-duckdb-${{ runner.os }}-${{ steps.duckdb.outputs.ver }}-${{ github.run_id }}
           restore-keys: |
+            sccache-duckdb-${{ runner.os }}-${{ steps.duckdb.outputs.ver }}-
             sccache-duckdb-${{ runner.os }}-
       - uses: mozilla-actions/sccache-action@v0.0.10
       - uses: dtolnay/rust-toolchain@stable
@@ -262,8 +266,26 @@ jobs:
         # loses no coverage and gains process isolation + retries.
         run: cargo nextest run
       - name: sccache stats
+        id: sccstats
         if: always()
-        run: sccache --show-stats
+        run: |
+          sccache --show-stats
+          # Count C/C++ objects compiled+stored this run. >0 means DuckDB was
+          # actually (re)built, so the sccache dir now holds fresh DuckDB objects
+          # worth persisting; ==0 means Swatinem served target/ and the dir is
+          # only whatever we restored — don't re-save it (avoids empty overwrites).
+          cpp=$(sccache --show-stats --stats-format=json \
+            | python3 -c "import sys,json;print(json.load(sys.stdin)['stats'].get('cache_misses',{}).get('counts',{}).get('C/C++',0))")
+          echo "cpp_writes=$cpp" >> "$GITHUB_OUTPUT"
+          echo "C/C++ objects compiled this run: $cpp"
+      - name: Save DuckDB sccache
+        # Only persist when DuckDB C++ actually compiled, and only if this exact
+        # run-id key isn't already stored.
+        if: ${{ always() && steps.sccstats.outputs.cpp_writes != '0' && steps.sccstats.outputs.cpp_writes != '' && steps.duckcache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/.sccache
+          key: sccache-duckdb-${{ runner.os }}-${{ steps.duckdb.outputs.ver }}-${{ github.run_id }}
 
   server:
     name: server (clippy + test)
