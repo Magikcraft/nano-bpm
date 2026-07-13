@@ -202,6 +202,20 @@ pub struct ServerImpl {
     /// single throttle both the client and server converge on. See
     /// [`Self::backlog_shed_level`].
     effective_backlog_cap: Arc<AtomicUsize>,
+    /// The live **memory-only** backlog backstop: the count of active instances the
+    /// remaining resident-memory headroom can hold before the watermark
+    /// (`active_backlog + (mem_watermark − resident)/NOMINAL_ACTIVE_BYTES`), clamped
+    /// to `[backlog_cap_floor, backlog_cap_ceiling]`. This is what the post-credit
+    /// active-backlog shed fires against — deliberately **not** the latency-clamped
+    /// `effective_backlog_cap`. The completion-paced credit servo owns the latency
+    /// operating band (it holds the backlog at `effective_backlog_cap` + its burst
+    /// envelope); the shed must sit *above* that envelope so it never collides with
+    /// the servo — it only bites when the servo has failed to hold and memory is
+    /// genuinely filling (or a create burst bypassed the credit window). When memory
+    /// is abundant this sits at the ceiling (shed effectively off, servo in charge);
+    /// as RAM fills it shrinks toward the current backlog (memory protection kicks
+    /// in). `0` when the backlog cap is disabled. Recomputed each ~1 Hz monitor tick.
+    backlog_shed_cap: Arc<AtomicUsize>,
     /// Lower bound for the unified setpoint (`effective_backlog_cap`): the memory
     /// clamp can pull the setpoint down, but never below this (the governor knee
     /// floor, or the fixed cap's floor). `0` when the backlog cap is disabled.
@@ -591,6 +605,10 @@ impl ServerImpl {
         // The unified setpoint, recomputed each monitor tick. Seed at 0 (no clamp)
         // until the first tick folds in the live latency + memory signals.
         let effective_backlog_cap = Arc::new(AtomicUsize::new(0));
+        // The memory-only shed backstop, recomputed each tick. Seed at the ceiling
+        // (shed effectively off) so the servo owns admission until the first memory
+        // sample lands — never shed before we know the live headroom.
+        let backlog_shed_cap = Arc::new(AtomicUsize::new(backlog_cap_ceiling));
         // `active_worker_cap` is the live per-job-type active dispatch width the
         // push dispatcher reads (0 = no cap). Resolved from one of three policies,
         // mirroring the backlog governor: Off (no cap), Fixed, or a self-optimizing
@@ -768,6 +786,7 @@ impl ServerImpl {
             backlog_cap_floor,
             backlog_cap_ceiling,
             effective_backlog_cap,
+            backlog_shed_cap,
             runnable_backlog,
             active_worker_cap,
             admission_max_create_queue,
@@ -1791,14 +1810,6 @@ fn admission_backlog_from_env() -> AdmissionBacklog {
 /// the governor holds the system just left of the congestion-collapse point
 /// without starving the workers or shedding a modest parked/burst backlog.
 const MIN_BACKLOG_GOVERNOR_CAP: usize = 2_000;
-
-/// Margin (percent of the unified setpoint) at which the post-credit active-backlog
-/// shed fires. The completion-paced credit servo holds intake at the setpoint
-/// ([`Server::effective_backlog_cap`]); this shed is a burst backstop above it, so
-/// it catches an overshoot the credit throttle could not (e.g. a REST create burst
-/// that bypasses the submission-credit window) without colliding with the servo and
-/// oscillating the way a shed *at* the setpoint did.
-const SHED_BACKSTOP_MARGIN_PCT: usize = 150;
 
 /// The resolved worker-concurrency (active dispatch width) policy — see
 /// [`worker_concurrency_from_env`]. Bounds how many subscribers the push
@@ -9459,26 +9470,37 @@ impl ServerImpl {
         self.inflight.load(Ordering::Relaxed) as i64
     }
 
-    /// Recomputes the unified admission setpoint from the live latency + memory
-    /// signals and stores it in [`Self::effective_backlog_cap`]. Called each ~1 Hz
-    /// monitor tick. This is the single throttle the whole system converges on:
+    /// Recomputes the unified admission caps from the live latency + memory signals
+    /// and stores them. Called each ~1 Hz monitor tick. Returns the servo setpoint
+    /// ([`Self::effective_backlog_cap`]). This is the single throttle the whole
+    /// system converges on:
     ///
     /// * `latency_cap` = the backlog governor's live output (the latency knee). Only
     ///   participates in `SlaMode::Latency`; admission mode prefers admitting over
-    ///   bounding latency, so it is bounded by memory alone.
+    ///   bounding latency, so there the servo paces on memory alone.
     /// * `memory_cap` = the current backlog plus the number of additional nominal
     ///   active instances that fit in the remaining memory headroom before the
-    ///   resident watermark. As RAM fills this shrinks toward the current backlog,
-    ///   pulling the setpoint down so intake paces to what memory can hold.
+    ///   resident watermark. As RAM fills this shrinks toward the current backlog.
     ///
-    /// The result is `min(latency_cap, memory_cap)` clamped to the configured
-    /// `[floor, ceiling]`. Returns the stored value. Returns `0` (no setpoint) when
-    /// the backlog cap is disabled, leaving the servo on its absolute band.
+    /// Two caps come out of it, and keeping them separate is what stops the servo
+    /// and the shed from colliding (the collision that caused the goodput collapse):
+    /// * **servo setpoint** = `min(latency_cap, memory_cap)` clamped to
+    ///   `[floor, ceiling]` — the completion-paced credit servo bands against this,
+    ///   so it owns the latency operating band.
+    /// * **shed backstop** = `memory_cap` alone, clamped — the post-credit shed fires
+    ///   against this. Because it excludes the (low, latency-pinned) latency term it
+    ///   sits *above* the servo's burst envelope, so the shed only bites when memory
+    ///   is genuinely filling or a burst bypassed the credit window — never inside
+    ///   the servo's normal operating range.
+    ///
+    /// Both are `0` (disabled) when the backlog cap is off, leaving the servo on its
+    /// absolute band and the shed following the raw governor cap.
     fn refresh_effective_backlog_cap(&self, active_backlog: i64) -> usize {
         let ceiling = self.backlog_cap_ceiling;
         if ceiling == 0 {
-            // Backlog cap disabled (Off): no unified setpoint.
+            // Backlog cap disabled (Off): no unified setpoint, no count-based shed.
             self.effective_backlog_cap.store(0, Ordering::Relaxed);
+            self.backlog_shed_cap.store(0, Ordering::Relaxed);
             return 0;
         }
         let latency_cap = self.backlog_cap.load(Ordering::Relaxed);
@@ -9495,22 +9517,27 @@ impl ServerImpl {
         } else {
             usize::MAX
         };
+        // Servo setpoint: latency ∧ memory. Shed backstop: memory only (sits above
+        // the servo's operating band so it cannot collide with the credit servo).
         let eff = latency_component
             .min(memory_cap)
             .clamp(self.backlog_cap_floor, ceiling);
+        let shed = memory_cap.clamp(self.backlog_cap_floor, ceiling);
         self.effective_backlog_cap.store(eff, Ordering::Relaxed);
+        self.backlog_shed_cap.store(shed, Ordering::Relaxed);
         eff
     }
 
-    /// The active-backlog / create-backlog shed threshold: a burst backstop set a
-    /// margin *above* the unified setpoint so the completion-paced credit servo owns
-    /// the operating band and the shed only catches an overshoot the credit throttle
-    /// could not. Falls back to the raw governor cap when there is no active setpoint
-    /// (backlog cap disabled or the first monitor tick has not run yet).
+    /// The active-backlog / create-backlog shed threshold: the live memory-only
+    /// backstop ([`Self::backlog_shed_cap`]), which sits above the completion-paced
+    /// credit servo's operating band so the shed is a memory/burst backstop, not a
+    /// latency rail that collides with the servo. Falls back to the raw governor cap
+    /// when there is no active backstop (backlog cap disabled, or the first monitor
+    /// tick has not run yet).
     fn backlog_shed_level(&self) -> usize {
-        let eff = self.effective_backlog_cap.load(Ordering::Relaxed);
-        if eff > 0 {
-            eff.saturating_mul(SHED_BACKSTOP_MARGIN_PCT) / 100
+        let shed = self.backlog_shed_cap.load(Ordering::Relaxed);
+        if shed > 0 {
+            shed
         } else {
             self.backlog_cap.load(Ordering::Relaxed)
         }
