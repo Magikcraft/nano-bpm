@@ -714,6 +714,56 @@ fn attr_type_label(t: AttrType) -> &'static str {
 // match here fails to compile; forgetting to update ELEMENT_KIND_SPECS → the parity test fails.
 // -------------------------------------------------------------------------------------------------
 
+/// **Exhaustive compile-time witness that every `ElementKind` variant is represented in this
+/// module.**
+///
+/// The purpose of this function is *not* to be called with useful data — it's to be a `match`
+/// over `&ElementKind` that the compiler must prove exhaustive. When someone adds a variant to
+/// `nanobpmn_engine_core::ElementKind`, this match fails to compile until they add an arm here
+/// — and the compiler drops them directly into `ir_spec.rs`, right next to
+/// [`ELEMENT_KIND_SPECS`], [`sample_instances`], and the parity test.
+///
+/// The doc-comment at the arm site is the checklist for a new variant:
+///
+/// 1. Add the arm below returning the IR keyword.
+/// 2. Add a `KindSpec { keyword, doc, attrs }` entry to [`ELEMENT_KIND_SPECS`].
+/// 3. Add a placeholder to [`sample_instances`] tagged with the same keyword.
+/// 4. Handle the variant in the three exhaustive matches in `model_ir.rs`
+///    (`kind_keyword`, `render_kind_attrs`, `build_kind`) — the Rust compiler forces this
+///    independently in that file.
+///
+/// If (2) or (3) is skipped, [`tests::specs_match_pretty_printer`] fails on a keyword-set
+/// mismatch. If (4) is skipped, the crate does not compile.
+#[cfg(test)]
+fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
+    use nanobpmn_engine_core::ElementKind::*;
+    // NEW VARIANT? Read the doc-comment above. Add an arm here returning the IR keyword,
+    // then update ELEMENT_KIND_SPECS + sample_instances (below) to match.
+    match k {
+        StartEvent => "startEvent",
+        EndEvent => "endEvent",
+        ServiceTask { .. } => "serviceTask",
+        UserTask(_) => "userTask",
+        ExclusiveGateway => "exclusiveGateway",
+        ParallelGateway => "parallelGateway",
+        ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
+        TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
+        TimerBoundaryEvent { .. } => "timerBoundaryEvent",
+        MessageIntermediateCatchEvent { .. } => "messageIntermediateCatchEvent",
+        MessageBoundaryEvent { .. } => "messageBoundaryEvent",
+        MessageStartEvent { .. } => "messageStartEvent",
+        TimerStartEvent { .. } => "timerStartEvent",
+        SubProcess { .. } => "subProcess",
+        IntermediateThrowEvent => "intermediateThrowEvent",
+        ScriptTask { .. } => "scriptTask",
+        CallActivity { .. } => "callActivity",
+        SignalIntermediateCatchEvent { .. } => "signalIntermediateCatchEvent",
+        SignalBoundaryEvent { .. } => "signalBoundaryEvent",
+        ConditionalIntermediateCatchEvent { .. } => "conditionalIntermediateCatchEvent",
+        ConditionalBoundaryEvent { .. } => "conditionalBoundaryEvent",
+    }
+}
+
 /// One dummy instance per `ElementKind` variant, tagged with the IR keyword we expect the
 /// pretty-printer to render for it. Field values are placeholders — enough to survive round-trip
 /// and produce every declared attribute line.
@@ -911,12 +961,20 @@ mod tests {
     fn specs_match_pretty_printer() {
         let samples = sample_instances();
         // Every sample's tag must match its ElementKind's actual IR keyword — protects against
-        // the sample table being copy-pasted with the wrong tag.
+        // the sample table being copy-pasted with the wrong tag. Cross-checked two ways:
+        //   * `kind_keyword` (the pretty-printer's own function) — what the printer will emit.
+        //   * `variant_witness` (this module's exhaustive match) — what this module asserts as
+        //     the canonical keyword. Divergence here means someone changed one without the other.
         for (expected_kw, kind) in &samples {
-            let actual = crate::model_ir::kind_keyword_for_test(kind);
+            let printed = crate::model_ir::kind_keyword_for_test(kind);
+            let witnessed = variant_witness(kind);
             assert_eq!(
-                actual, *expected_kw,
-                "sample_instances tag `{expected_kw}` does not match kind_keyword(`{actual}`)",
+                printed, *expected_kw,
+                "sample_instances tag `{expected_kw}` does not match kind_keyword(`{printed}`)",
+            );
+            assert_eq!(
+                witnessed, *expected_kw,
+                "variant_witness disagrees with sample_instances tag `{expected_kw}`",
             );
         }
 

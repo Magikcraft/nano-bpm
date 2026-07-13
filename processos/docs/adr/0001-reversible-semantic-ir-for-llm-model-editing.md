@@ -259,6 +259,13 @@ The grammar surface described above is implemented in
   `describe_returns_scoped_payloads`. All 21 variants are round-tripped
   through the real `render_kind_attrs` / `render_element_attrs` so drift
   fails loudly.
+* **Compile-time variant witness** — a `#[cfg(test)] fn variant_witness`
+  in `ir_spec.rs` is an exhaustive `match` over `ElementKind`. Adding a
+  variant to the engine surfaces as a compile error *in this file* (not
+  just in `model_ir.rs`), dropping the author directly onto the checklist
+  of sibling edits — SPECS entry, sample instance, engine matches. Closes
+  the gap where someone could add a variant + handle it in the engine
+  matches but silently omit the SPECS entry.
 
 Not yet wired: threading `grammar` through `harness/llm.rs` so the write path
 is grammar-constrained automatically. `emit-gbnf` is the manual escape hatch
