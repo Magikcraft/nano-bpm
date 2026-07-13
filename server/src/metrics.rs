@@ -201,6 +201,17 @@ struct Metrics {
     /// being parked. Also the value the server advertises to cooperating clients so
     /// their worker pools can self-size.
     active_worker_target: IntGauge,
+    /// Drain-stall guard state (`nanobpm_drain_guard`), labelled by `state`
+    /// (`throttling` = soft create-admission throttle engaged; `halted` = hard
+    /// safety valve engaged, create admission forced to 0). `1` = engaged. The
+    /// create-flood wedge protection (options 3+4); pair with
+    /// `nanobpm_drain_completes_per_sec` and `nanobpm_active_backlog` to see the
+    /// drain collapse the guard reacted to.
+    drain_guard_state: prometheus::IntGaugeVec,
+    /// The completion drain throughput (`nanobpm_drain_completes_per_sec`) the
+    /// drain-stall guard sampled this tick. Its collapse toward ~0 while the
+    /// active backlog rises is the wedge signature the guard trips on.
+    drain_completes_per_sec: prometheus::Gauge,
     /// The configured admission thresholds the ceiling rails trip at, labelled by
     /// `limit` (`backlog`, `create_queue` — counts; `pipeline_bytes`,
     /// `mem_watermark` — bytes; `0` = rail disabled). Reference lines so a dashboard
@@ -554,6 +565,19 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "Worker-concurrency governor's active dispatch width: max subscribers the push dispatcher fans each job type out to per pass (0 = no cap). Tracks the governor converging on the worker concurrency that maximizes completion throughput; also advertised to clients for self-sizing.",
     )
     .expect("valid gauge");
+    let drain_guard_state = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_drain_guard",
+            "Drain-stall guard state (state=throttling|halted; 1=engaged). Create-flood wedge protection: throttling = soft create-admission throttle (drain falling behind); halted = hard safety valve (drain stalled, backlog rising) forcing create admission to 0.",
+        ),
+        &["state"],
+    )
+    .expect("valid gauge vec");
+    let drain_completes_per_sec = prometheus::Gauge::new(
+        "nanobpm_drain_completes_per_sec",
+        "Completion drain throughput (completes/s) the drain-stall guard sampled this tick; its collapse toward ~0 while active_backlog rises is the wedge signature.",
+    )
+    .expect("valid gauge");
     let admission_limit = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_admission_limit",
@@ -636,6 +660,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(mem_pressure_bytes.clone())))
         .and(registry.register(Box::new(runnable_backlog.clone())))
         .and(registry.register(Box::new(active_worker_target.clone())))
+        .and(registry.register(Box::new(drain_guard_state.clone())))
+        .and(registry.register(Box::new(drain_completes_per_sec.clone())))
         .and(registry.register(Box::new(admission_limit.clone())))
         .and(registry.register(Box::new(cmd_seconds.clone())))
         .and(registry.register(Box::new(cmd_alloc_bytes.clone())))
@@ -687,6 +713,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         mem_pressure_bytes,
         runnable_backlog,
         active_worker_target,
+        drain_guard_state,
+        drain_completes_per_sec,
         admission_limit,
         cmd_seconds,
         cmd_alloc_bytes,
@@ -841,6 +869,21 @@ pub fn set_admission_signals(
 /// governor is parking, and export to cooperating clients for self-sizing.
 pub fn set_active_worker_target(width: i64) {
     METRICS.active_worker_target.set(width);
+}
+
+/// Publishes the drain-stall guard state and the sampled drain throughput
+/// (`nanobpm_drain_guard{state}` + `nanobpm_drain_completes_per_sec`). Called
+/// ~1 Hz from the monitor supervisor, off the hot path.
+pub fn set_drain_guard(throttling: bool, halted: bool, completes_per_sec: f64) {
+    METRICS
+        .drain_guard_state
+        .with_label_values(&["throttling"])
+        .set(i64::from(throttling));
+    METRICS
+        .drain_guard_state
+        .with_label_values(&["halted"])
+        .set(i64::from(halted));
+    METRICS.drain_completes_per_sec.set(completes_per_sec);
 }
 
 /// Publishes one configured admission threshold as a reference line

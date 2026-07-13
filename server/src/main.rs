@@ -16,6 +16,7 @@ mod coldspill;
 #[cfg(feature = "console")]
 mod console;
 mod deepthi;
+mod drain_guard;
 mod falcon;
 mod journal;
 mod memory;
@@ -235,6 +236,14 @@ pub struct ServerImpl {
     /// of the detected memory limit); `NANOBPMN_PIPELINE_BYTES_MB` overrides,
     /// `off` disables. Durability is unaffected: a shed create is never journaled.
     pipeline_bytes_watermark: u64,
+    /// Drain-stall admission guard — protection against the create-flood wedge
+    /// (creates and completes share one FIFO Raft log per partition; a create
+    /// flood can starve the completion drain into congestion collapse). Sampled
+    /// ~1 Hz by the monitor supervisor and read (relaxed) by the create-admission
+    /// gates: it blocks new-instance admission while the drain is falling behind
+    /// (soft throttle) or has stalled with the backlog rising (hard valve). A
+    /// liveness rail, so it applies in *both* SLA modes. See [`crate::drain_guard`].
+    drain_guard: Arc<crate::drain_guard::DrainGuard>,
     /// Falcon uplinks to this node's cluster peers, built from the
     /// [`Topology`]. Empty for a single-node cluster (zero overhead). The
     /// forwarding seam consults it to reach a partition's owning node.
@@ -718,6 +727,9 @@ impl ServerImpl {
             mem_pressure_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes: Arc::new(AtomicU64::new(0)),
             pipeline_bytes_watermark,
+            drain_guard: Arc::new(crate::drain_guard::DrainGuard::new(
+                crate::drain_guard::DrainGuardCfg::from_env(),
+            )),
             peers,
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -3071,8 +3083,8 @@ impl ServerImpl {
             .await;
         match result {
             Ok((events, commit)) => {
-                // Record REST job completion
-                crate::metrics::record_job_completion("rest");
+                // Record REST job completion (drain-side; also feeds the drain guard).
+                self.note_job_completion("rest");
                 // REST API: await fsync before replying (synchronous durability).
                 // Contrast with falcon::pipeline_job_command, which replies
                 // immediately and awaits fsync in a detached task for throughput.
@@ -3158,8 +3170,9 @@ impl ServerImpl {
             .await;
         match result {
             Ok((_, commit)) => {
-                // Record REST job completion (fail also completes the job lifecycle)
-                crate::metrics::record_job_completion("rest");
+                // Record REST job completion (fail also completes the job lifecycle;
+                // drain-side, so it feeds the drain guard too).
+                self.note_job_completion("rest");
                 commit.wait().await;
                 // Failing with retries left returns the job to the activatable
                 // pool, so wake any long-pollers.
@@ -9208,6 +9221,57 @@ impl ServerImpl {
         self.backpressure.should_shed(processing)
     }
 
+    /// Records one drain-side (completion-family) command apply: bumps the
+    /// `nanobpm_job_completions_total` metric *and* the drain-stall guard's
+    /// completion counter, so the guard's drain-rate estimate can never drift
+    /// from the exported metric. Called from every completion site (REST + Falcon
+    /// stream). Hot-path cheap (a metric inc + one relaxed atomic add).
+    #[inline]
+    pub(crate) fn note_job_completion(&self, protocol: &str) {
+        crate::metrics::record_job_completion(protocol);
+        self.drain_guard.note_completion();
+    }
+
+    /// Handle to the drain-stall guard (the monitor supervisor drives it; the
+    /// admission gates read it).
+    pub(crate) fn drain_guard(&self) -> &Arc<crate::drain_guard::DrainGuard> {
+        &self.drain_guard
+    }
+
+    /// Whether new-instance admission is currently blocked by *either* the
+    /// create-side latency backpressure ([`submission_pressure`](Self::submission_pressure))
+    /// or the drain-stall guard. The submission-credit lanes and the fleet
+    /// `Pressure` broadcast gate on this so create intake dries up under a drain
+    /// stall in **both** SLA modes (the guard is a liveness rail, not a latency
+    /// policy).
+    pub(crate) fn create_admission_blocked(&self) -> bool {
+        self.submission_pressure() || self.drain_guard.blocks_creates()
+    }
+
+    /// Drain-stall guard admission rail: sheds a create while the guard's hard
+    /// valve or soft throttle is engaged. Evaluated in both SLA modes (it guards
+    /// liveness, not latency). Returns the client-facing retry reason.
+    fn drain_guard_shed(&self) -> Option<String> {
+        if self.drain_guard.is_halted() {
+            crate::metrics::record_admission_shed("drain_halt");
+            return Some(
+                "Admission control: completion drain stalled (active backlog rising with \
+                 ~0 completions/s); halting new instance creation until the drain recovers. \
+                 Retry after a backoff."
+                    .to_string(),
+            );
+        }
+        if self.drain_guard.is_throttling() {
+            crate::metrics::record_admission_shed("drain_throttle");
+            return Some(
+                "Admission control: completion drain falling behind the create rate; \
+                 throttling new instance creation. Retry after a backoff."
+                    .to_string(),
+            );
+        }
+        None
+    }
+
     /// This node's active (non-terminal) instance count — the cheap, live gauge
     /// maintained for admission control. Used as a per-node backlog proxy for
     /// Stage 2 fairness routing (piggybacked to peers on activation responses). A
@@ -9235,6 +9299,15 @@ impl ServerImpl {
     ///   disk, so in admission mode these rails bite far later than the
     ///   latency gate would have.
     pub(crate) fn admission_shed(&self) -> Option<String> {
+        // Drain-stall guard (always on, both SLA modes): the liveness rail. If the
+        // completion drain has stalled or is falling behind a create flood, shed
+        // new creates *first* — before any latency/memory rail — so create entries
+        // stop crowding completions out of the shared Raft log and the drain can
+        // recover. Cheapest possible check (relaxed atomic loads on flags the ~1 Hz
+        // monitor publishes), so it is safe at the head of the hot path.
+        if let Some(reason) = self.drain_guard_shed() {
+            return Some(reason);
+        }
         let cq_limit = self.admission_max_create_queue;
         let backlog_limit = self.backlog_cap.load(Ordering::Relaxed);
         let latency_mode = self.sla_mode.get().sheds_for_latency();
@@ -11385,6 +11458,20 @@ async fn main() {
             let mut memory_lit = false;
             let mut seen_job_types: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // Drain-stall guard supervisor state (options 3+4). The state machine
+            // owns the edge/hysteresis counters; here we track the deltas it needs:
+            // the completion count (rate = drain throughput) and active backlog
+            // (its derivative is the intake-vs-drain imbalance signal), plus the
+            // wall instant to turn the completion delta into a per-second rate even
+            // if a tick is skipped under load.
+            let mut drain_sm = crate::drain_guard::DrainStateMachine::new(
+                crate::drain_guard::DrainGuardCfg::from_env(),
+            );
+            let mut prev_completions = monitor_server.drain_guard().completions();
+            let mut prev_backlog = monitor_server.active_backlog();
+            let mut prev_drain_instant = std::time::Instant::now();
+            let mut drain_throttle_lit = false;
+            let mut drain_halt_lit = false;
             loop {
                 interval.tick().await;
 
@@ -11458,16 +11545,92 @@ async fn main() {
                 // Engine-actor (deepthi) heartbeat per owned partition: the
                 // dead/wedged/idle discriminator for the sustained-load
                 // completion-freeze.
+                let mut any_actor_alive = false;
                 for handle in monitor_server.engine.all() {
                     let s = handle.stats();
+                    let alive = s.alive.load(std::sync::atomic::Ordering::Relaxed);
+                    any_actor_alive |= alive;
                     crate::metrics::set_actor_stats(
                         s.partition,
-                        s.alive.load(std::sync::atomic::Ordering::Relaxed),
+                        alive,
                         s.jobs.load(std::sync::atomic::Ordering::Relaxed),
                         s.current_job_ms(),
                         s.hi_depth.load(std::sync::atomic::Ordering::Relaxed),
                         s.lo_depth.load(std::sync::atomic::Ordering::Relaxed),
                     );
+                }
+
+                // Drain-stall admission guard (options 3+4): derive the drain
+                // throughput (completions/s) and the active-backlog derivative,
+                // fold them into the guard state machine, and publish the
+                // create-admission brakes it decides on. Pure atomic reads off the
+                // hot path; the actual gating is a relaxed flag load in
+                // `admission_shed`/`create_admission_blocked`.
+                {
+                    let now = std::time::Instant::now();
+                    let dt = now.duration_since(prev_drain_instant).as_secs_f64();
+                    prev_drain_instant = now;
+                    let completions_now = monitor_server.drain_guard().completions();
+                    let completed = completions_now.saturating_sub(prev_completions);
+                    prev_completions = completions_now;
+                    let completes_per_sec = if dt > 0.0 { completed as f64 / dt } else { 0.0 };
+                    let backlog = monitor_server.active_backlog();
+                    let backlog_delta = backlog - prev_backlog;
+                    prev_backlog = backlog;
+
+                    let decision = drain_sm.observe(crate::drain_guard::DrainSample {
+                        completes_per_sec,
+                        backlog,
+                        backlog_delta,
+                        actor_alive: any_actor_alive,
+                    });
+                    monitor_server
+                        .drain_guard()
+                        .publish(decision.throttling, decision.halted);
+                    crate::metrics::set_drain_guard(
+                        decision.throttling,
+                        decision.halted,
+                        completes_per_sec,
+                    );
+                    // Log only on state transitions (edge-triggered) so a healthy
+                    // server stays quiet and a wedge is a single, greppable event.
+                    if decision.halted != drain_halt_lit {
+                        if decision.halted {
+                            tracing::warn!(
+                                completes_per_sec,
+                                backlog,
+                                backlog_delta,
+                                "drain-stall guard: HARD VALVE engaged — completion drain \
+                                 stalled with backlog rising; halting create admission until \
+                                 drain recovers"
+                            );
+                        } else {
+                            tracing::info!(
+                                completes_per_sec,
+                                backlog,
+                                "drain-stall guard: hard valve released — drain recovered, \
+                                 resuming create admission"
+                            );
+                        }
+                        drain_halt_lit = decision.halted;
+                    }
+                    if decision.throttling != drain_throttle_lit {
+                        if decision.throttling {
+                            tracing::info!(
+                                completes_per_sec,
+                                backlog,
+                                backlog_delta,
+                                "drain-stall guard: soft throttle engaged — drain falling \
+                                 behind create rate; throttling create admission"
+                            );
+                        } else {
+                            tracing::info!(
+                                backlog,
+                                "drain-stall guard: soft throttle released — backlog stable"
+                            );
+                        }
+                        drain_throttle_lit = decision.throttling;
+                    }
                 }
 
                 // Engine-state cardinality per partition — the independent
@@ -12979,6 +13142,41 @@ mod clustered_startup_tests {
                 "single node must always place creates locally"
             );
         }
+    }
+
+    #[test]
+    fn drain_guard_gates_admission_when_engaged() {
+        // Wiring test: the drain-stall guard's published state must actually gate
+        // the create-admission path (`admission_shed` / `create_admission_blocked`),
+        // and — because it is checked first — its reason must win over any other
+        // rail. State is published by the ~1 Hz monitor; here we publish directly.
+        let server = ServerImpl::default();
+        let guard = server.drain_guard().clone();
+
+        // Hard valve engaged: creates are shed with the halt reason and intake is
+        // blocked, regardless of any other rail's state.
+        guard.publish(false, true);
+        assert!(guard.is_halted());
+        assert!(server.create_admission_blocked());
+        let reason = server.admission_shed().expect("halt must shed");
+        assert!(
+            reason.contains("halting new instance creation"),
+            "halt reason should win: {reason}"
+        );
+
+        // Soft throttle only: still blocked, with the throttle reason.
+        guard.publish(true, false);
+        assert!(!guard.is_halted() && guard.is_throttling());
+        assert!(server.create_admission_blocked());
+        let reason = server.admission_shed().expect("throttle must shed");
+        assert!(
+            reason.contains("throttling new instance creation"),
+            "throttle reason should win: {reason}"
+        );
+
+        // Cleared: the guard no longer blocks creates.
+        guard.publish(false, false);
+        assert!(!server.drain_guard().blocks_creates());
     }
 
     #[tokio::test]
