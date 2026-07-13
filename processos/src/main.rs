@@ -30,6 +30,7 @@ mod experiment;
 mod gguf;
 mod harness;
 mod investigate;
+mod ir_spec;
 mod layout;
 mod llama;
 mod model_ir;
@@ -325,7 +326,9 @@ fn usage() -> String {
          import-camunda <records.json|dir> <out-dir> [--no-tier2]\n  \
          {pad}Import a Camunda 8 record export\n  \
          layout <in.bpmn> <annotations.json> [--out out.bpmn] [--debug-svg out.svg] [--solver rowbias|field] [--side-by-side sxs.svg]\n  \
-         {pad}Run the semantic BPMN layout (see docs/layout.md)\n\n\
+         {pad}Run the semantic BPMN layout (see docs/layout.md)\n  \
+         emit-gbnf [--out ir.gbnf]                  Emit the reversible-IR GBNF for llama.cpp\n  \
+         {pad}(see docs/adr/0001; hand to `llama-server --grammar-file`)\n\n\
          OPTIONS:\n  \
          -h, --help       Print this help\n  \
          -V, --version    Print version\n",
@@ -363,6 +366,10 @@ async fn main() {
             }
             "layout" => {
                 run_cli_layout(&args[2..]);
+                return;
+            }
+            "emit-gbnf" => {
+                run_cli_emit_gbnf(&args[2..]);
                 return;
             }
             other => {
@@ -777,6 +784,32 @@ fn run_cli_import_camunda(args: &[String]) {
         "{}",
         serde_json::to_string_pretty(&summary).unwrap_or_default()
     );
+}
+
+/// `processos emit-gbnf [--out ir.gbnf]` — write the reversible-IR GBNF grammar (ADR 0001) to
+/// stdout, or to the given path. Hand this file to a llama.cpp server via
+/// `llama-server --grammar-file <ir.gbnf>` (or POST as the `grammar` field on `/completion`) to
+/// constrain the sampler so a local model literally cannot emit invalid IR. The grammar is
+/// generated from [`ir_spec::ELEMENT_KIND_SPECS`], which the parity test keeps in sync with the
+/// engine's `ElementKind` enum — regenerate on each processos release.
+fn run_cli_emit_gbnf(args: &[String]) {
+    let gbnf = ir_spec::emit_gbnf();
+    let out: Option<&String> = args
+        .iter()
+        .position(|a| a == "--out")
+        .and_then(|i| args.get(i + 1));
+    match out {
+        None => {
+            print!("{gbnf}");
+        }
+        Some(path) => {
+            if let Err(e) = std::fs::write(path, &gbnf) {
+                eprintln!("failed to write GBNF to {path}: {e}");
+                std::process::exit(1);
+            }
+            eprintln!("wrote {} bytes of GBNF to {path}", gbnf.len());
+        }
+    }
 }
 
 /// `processos layout <in.bpmn> <annotations.json> [--out out.bpmn] [--debug-svg out.svg]`

@@ -1149,6 +1149,27 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// Test hooks for `crate::ir_spec` parity harness — the private renderers exposed at pub(crate)
+// visibility (test-only) so the notation-table parity tests can drive exactly the same code paths
+// the real pretty-printer uses. Not part of the public API.
+// -------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) fn kind_keyword_for_test(kind: &ElementKind) -> &'static str {
+    kind_keyword(kind)
+}
+
+#[cfg(test)]
+pub(crate) fn render_kind_attrs_for_test(kind: &ElementKind, attrs: &mut Vec<String>) {
+    render_kind_attrs(kind, attrs);
+}
+
+#[cfg(test)]
+pub(crate) fn render_element_attrs_for_test(el: &Element, attrs: &mut Vec<String>) {
+    render_element_attrs(el, attrs);
+}
+
 #[cfg(test)]
 mod tests {
     use nanobpmn_engine_core::ProcessBuilder;

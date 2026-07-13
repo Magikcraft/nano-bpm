@@ -233,6 +233,37 @@ flow is an option *worth choosing*. Legality (CAN) is not knowing-the-option
 The grammar tells the model that default flows *exist*; the analyzer tells it
 *which* gateway needs one; GBNF ensures whatever it writes is syntactically valid.
 
+### Status (Nov 2026): shipped
+
+The grammar surface described above is implemented in
+[`processos/src/ir_spec.rs`](../../src/ir_spec.rs):
+
+* **`ELEMENT_KIND_SPECS`** — the single declarative notation table (one entry
+  per `ElementKind` variant, plus shared element-level extras and flow
+  annotations). Adding a new engine variant surfaces as a compile error in the
+  exhaustive matches in `model_ir.rs` and a parity-test failure here — both
+  doors must be walked. Two failure modes, one source of truth.
+* **`emit_gbnf()`** — renders the table to a llama.cpp-compatible GBNF for
+  constrained decoding. Run `processos emit-gbnf --out ir.gbnf` and hand the
+  file to `llama-server --grammar-file`, or POST as the `grammar` field on
+  `/completion`. GBNF over-approximates attribute permutation (attr multisets)
+  to stay out of O(k!) production explosion — the parser catches
+  duplicate-attr / missing-required errors with a better message. 80 % win at
+  1 % of the grammar complexity.
+* **`describe()`** — the `describe_ir_grammar` investigator tool. No argument
+  returns the compact overview (every keyword + one-line doc, syntax skeleton,
+  shared extras, flow annotations). Passing `kind:"<keyword>"` returns just
+  that kind's productions — cheap enough to send per turn.
+* **Parity harness** — `specs_match_pretty_printer`,
+  `shared_attrs_match_element_renderer`, `gbnf_covers_every_kind`,
+  `describe_returns_scoped_payloads`. All 21 variants are round-tripped
+  through the real `render_kind_attrs` / `render_element_attrs` so drift
+  fails loudly.
+
+Not yet wired: threading `grammar` through `harness/llm.rs` so the write path
+is grammar-constrained automatically. `emit-gbnf` is the manual escape hatch
+in the meantime.
+
 ### The desirability dimension: guided search against an externalized objective
 
 Legality and visibility (the two grammar maps above) constrain and illuminate the

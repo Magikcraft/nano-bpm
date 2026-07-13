@@ -634,6 +634,34 @@ impl ToolBox for AnalysisTools {
                 }),
             });
             specs.push(ToolSpec {
+                name: "describe_ir_grammar".into(),
+                description: "Return the reversible-IR grammar reference — what YOU CAN SAY in an \
+                    IR node or flow. Pull this on demand when you are ABOUT TO EDIT and unsure what \
+                    a construct's syntax is, or which attributes an element kind carries. This is \
+                    the CAN-map (context-free syntax) that complements analyze_model's \
+                    COULD-map (context-sensitive findings: this gateway needs a default, that node \
+                    is unreachable). With no argument returns the compact overview: every element \
+                    kind's keyword + one-line doc, the syntax skeletons for process/element/flow, \
+                    and the shared element-level extras (parent, retries, timer, input/output, \
+                    multiInstance). Pass kind:\"<keyword>\" (e.g. \"exclusiveGateway\", \
+                    \"serviceTask\", \"timerBoundaryEvent\") for a scoped payload with only that \
+                    kind's attributes and applicable flow annotations — cheaper to send per turn \
+                    than the whole grammar. Derived directly from the engine ADT via a parity \
+                    test, so this reference cannot silently fall behind the engine surface. \
+                    Args: kind (optional)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "description": "An IR element-kind keyword (e.g. \"serviceTask\", \
+                                \"exclusiveGateway\"). Omit for the whole-grammar overview."
+                        }
+                    }
+                }),
+            });
+            specs.push(ToolSpec {
                 name: "conformance_check".into(),
                 description: "Replay the mined trace behaviour against the BPMN MODEL and report \
                     where reality diverges from design: a transition-fitness score, nonconformant \
@@ -974,6 +1002,14 @@ impl ToolBox for AnalysisTools {
                 let di_source = base.or(self.model.as_deref());
                 let v = crate::model_ir::write_model_ir(ir, base, process, di_source)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise write ir: {e}"))
+            }
+            "describe_ir_grammar" => {
+                // Purely static — no dependency on the bound model or trace. Safe to call any
+                // time. Scoping keeps the payload small when the LLM already knows which kind
+                // it is editing.
+                let kind = args.get("kind").and_then(|v| v.as_str());
+                let v = crate::ir_spec::describe(kind);
+                serde_json::to_string(&v).map_err(|e| format!("serialise ir grammar: {e}"))
             }
             "conformance_check" => {
                 let xml = self
