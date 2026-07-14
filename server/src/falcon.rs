@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -2222,20 +2222,35 @@ async fn dispatch_to_connection(
             let start = (DISPATCH_ROTATION.fetch_add(1, Ordering::Relaxed) as usize) % num_sources;
             let plan = if mode == FairnessMode::Stage2 {
                 // Source backlogs: local is read live (cheap atomic); peers come
-                // from the value each piggybacked on its last activation response.
-                // A peer not yet probed is seeded with the local backlog so it is
-                // not starved before its first sample (the rotation/soak laps probe
-                // it and replace the seed with its real depth).
+                // from the value each piggybacked on its last activation response,
+                // but only while that sample is still fresh (see
+                // `read_peer_backlog`). A peer with a stale or absent hint — the
+                // signature of a node that was down and has just rejoined, whose
+                // reclaimed backlog postdates its last sample — is seeded to the
+                // deepest currently-known source so `fair_plan_weighted` gives it a
+                // real probe share this lap. That re-probe discovers its true depth
+                // (refreshing the hint) so the next lap weights it accurately and
+                // drains it; a genuinely-empty peer records 0 and stops being
+                // over-probed until its hint next goes stale. This is what re-engages
+                // a recovered node's stranded backlog without any client signal.
                 let local = server.active_backlog();
-                let hints: Vec<i64> = (0..num_sources)
+                let fresh: Vec<Option<i64>> = (0..num_sources)
                     .map(|s| {
                         if s == 0 {
-                            local
+                            Some(local)
                         } else {
-                            read_peer_backlog(source_node(s, &peers)).unwrap_or(local)
+                            read_peer_backlog(source_node(s, &peers))
                         }
                     })
                     .collect();
+                let probe_seed = fresh
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .max()
+                    .unwrap_or(local)
+                    .max(1);
+                let hints: Vec<i64> = fresh.iter().map(|h| h.unwrap_or(probe_seed)).collect();
                 fair_plan_weighted(want, &hints, start)
             } else {
                 fair_plan(want, num_sources, start)
@@ -2392,27 +2407,63 @@ fn source_node(src: usize, peers: &[u32]) -> u32 {
     }
 }
 
-/// Last-known per-peer backlog (active-instance count), refreshed every time we
-/// activate from that peer — the peer piggybacks its current backlog on the
-/// activation response, so this costs no extra round-trip. Process-global; a tiny
-/// critical section under a mutex is nothing next to the network hop that fills
-/// it. `None` for a peer we have not probed yet.
-fn peer_backlog_cache() -> &'static Mutex<HashMap<u32, i64>> {
-    static H: std::sync::OnceLock<Mutex<HashMap<u32, i64>>> = std::sync::OnceLock::new();
+/// Last-known per-peer backlog (active-instance count) **with the instant it was
+/// sampled**, refreshed every time we activate from that peer — the peer
+/// piggybacks its current backlog on the activation response, so this costs no
+/// extra round-trip. Process-global; a tiny critical section under a mutex is
+/// nothing next to the network hop that fills it. Absent for a peer we have not
+/// probed yet. The timestamp lets Stage-2 weighting treat a *stale* hint (e.g. a
+/// peer that was down and has just rejoined, so its last sample predates its
+/// reclaimed backlog) as "unknown → re-probe" rather than trusting a value that
+/// no longer reflects reality — this is the rebalance signal for a recovered node.
+fn peer_backlog_cache() -> &'static Mutex<HashMap<u32, (i64, Instant)>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<u32, (i64, Instant)>>> = std::sync::OnceLock::new();
     H.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Records a peer's piggybacked backlog. Called from `activate_from_peer` (in
-/// `main`) on every successful activation response.
+/// Records a peer's piggybacked backlog together with the sample instant. Called
+/// from `activate_from_peer` (in `main`) on every successful activation response.
 pub(crate) fn record_peer_backlog(node: u32, backlog: i64) {
     peer_backlog_cache()
         .lock()
         .unwrap()
-        .insert(node, backlog.max(0));
+        .insert(node, (backlog.max(0), Instant::now()));
 }
 
+/// Freshness window for a cached peer backlog hint, from
+/// `NANOBPMN_PEER_BACKLOG_FRESH_MS` (default 1000ms). A hint older than this is
+/// considered stale and forces a re-probe of that peer, so a node that was down
+/// and has just rejoined (its last sample now stale) is discovered promptly
+/// instead of being under-weighted by an obsolete shallow reading.
+fn peer_backlog_fresh_window() -> Duration {
+    static W: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        let ms = std::env::var("NANOBPMN_PEER_BACKLOG_FRESH_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1000);
+        Duration::from_millis(ms)
+    })
+}
+
+/// Reads a peer's cached backlog **only if the sample is still fresh**. Returns
+/// `None` for an unprobed peer OR one whose last sample has aged past
+/// [`peer_backlog_fresh_window`] — both cases mean "don't trust a stale/absent
+/// reading; probe it" to the Stage-2 weighter.
 fn read_peer_backlog(node: u32) -> Option<i64> {
-    peer_backlog_cache().lock().unwrap().get(&node).copied()
+    read_peer_backlog_within(node, peer_backlog_fresh_window())
+}
+
+/// Freshness-window-injected core of [`read_peer_backlog`], separated so the
+/// staleness policy is unit-testable without depending on the memoized global
+/// window or wall-clock sleeps.
+fn read_peer_backlog_within(node: u32, window: Duration) -> Option<i64> {
+    peer_backlog_cache()
+        .lock()
+        .unwrap()
+        .get(&node)
+        .filter(|(_, at)| at.elapsed() < window)
+        .map(|(b, _)| *b)
 }
 
 /// Stage 2 plan: spread a worker's lease budget (`want`) across `num_sources`
@@ -2808,6 +2859,67 @@ mod fair_plan_weighted_tests {
         let got = run(60, &[1000, 10, 10], &[5, 10_000, 10_000], 0);
         assert_eq!(got.iter().sum::<usize>(), 60);
         assert_eq!(got[0], 5, "drained the shallow-but-believed-deep source");
+    }
+}
+
+#[cfg(test)]
+mod peer_backlog_freshness_tests {
+    use std::time::Duration;
+
+    use super::{peer_backlog_cache, read_peer_backlog_within, record_peer_backlog};
+
+    /// A backlog sampled within the freshness window is trusted.
+    #[test]
+    fn fresh_hint_is_returned() {
+        let node = 90_001;
+        record_peer_backlog(node, 15_650);
+        assert_eq!(
+            read_peer_backlog_within(node, Duration::from_secs(3600)),
+            Some(15_650),
+            "a hint sampled just now is fresh"
+        );
+    }
+
+    /// A backlog sampled longer ago than the window reads as `None` — the signal
+    /// that forces the Stage-2 weighter to re-probe a node whose last sample is
+    /// stale (exactly the case for a node that was down and has just rejoined
+    /// holding a reclaimed backlog its old reading never saw).
+    #[test]
+    fn stale_hint_reads_as_none() {
+        let node = 90_002;
+        record_peer_backlog(node, 15_650);
+        // A zero-length window makes any prior sample immediately stale.
+        assert_eq!(
+            read_peer_backlog_within(node, Duration::ZERO),
+            None,
+            "a sample older than the window is not trusted"
+        );
+    }
+
+    /// An unprobed peer also reads as `None` (seeded high for a probe), and a
+    /// re-sample refreshes both value and timestamp.
+    #[test]
+    fn unprobed_reads_none_and_resample_refreshes() {
+        let node = 90_003;
+        assert_eq!(
+            read_peer_backlog_within(node, Duration::from_secs(3600)),
+            None,
+            "never-probed peer is unknown"
+        );
+        record_peer_backlog(node, 42);
+        assert_eq!(
+            read_peer_backlog_within(node, Duration::from_secs(3600)),
+            Some(42)
+        );
+        // A fresh empty sample stops the over-probing once the peer is drained.
+        record_peer_backlog(node, 0);
+        assert_eq!(
+            read_peer_backlog_within(node, Duration::from_secs(3600)),
+            Some(0),
+            "a drained peer records 0 fresh and is no longer over-probed"
+        );
+        // housekeeping so the process-global cache doesn't leak across tests.
+        peer_backlog_cache().lock().unwrap().remove(&node);
     }
 }
 
