@@ -57,8 +57,8 @@ use nanobpmn_engine_core::{
 };
 
 use crate::backpressure::{
-    AdaptiveController, Backpressure, BackpressureSetting, SharedSlaMode, SlaMode,
-    parse_backpressure_setting, parse_sla_mode,
+    AdaptiveController, Backpressure, BackpressureSetting, CONGESTION_RATIO, GovernorObs,
+    SharedSlaMode, SlaMode, parse_backpressure_setting, parse_sla_mode,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -175,6 +175,14 @@ pub struct ServerImpl {
     /// knee. In `Fixed`/`Off` mode it is a constant. Read on the hot admission
     /// path with a relaxed load.
     backlog_cap: Arc<AtomicUsize>,
+    /// When the active-backlog cap is governed live (`AdmissionBacklog::Auto`),
+    /// the governor's static bounds (`floor` ≈ knee, `ceiling` = memory backstop)
+    /// and a [`GovernorObs`] read handle onto its self-calibrated latency baseline
+    /// and last-window latency. `None` in `Fixed`/`Off` mode (the cap is then a
+    /// plain constant). Surfaced by the ~1 Hz monitor as
+    /// `nanobpm_backlog_governor_*` metrics and used to explain the auto-tuned
+    /// cap in the `active_backlog` / `create_backlog` shed message.
+    backlog_gov: Option<BacklogGovernor>,
     /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
     /// completed *service-task* jobs, summed across owned partitions. This is the
     /// parked-excluded load signal the admission gate and the backlog governor
@@ -262,6 +270,13 @@ pub struct ServerImpl {
     /// path (reads and job dispatch always go to the leader's owned actor). Empty
     /// unless per-partition Raft is enabled with RF>1 — zero overhead otherwise.
     raft_replicas: Arc<std::sync::Mutex<std::collections::HashMap<u64, DeepthiHandle>>>,
+    /// Spill-tier configuration (variable + cold) captured at startup, applied to
+    /// every engine actor this node hosts — owned partitions AND lazily-created
+    /// Raft replica engines. `None` when spill is disabled. Wiring it into replica
+    /// engines is what lets a follower reclaim hot RAM like its leader instead of
+    /// pinning the entire replicated working set resident (the RF>1 follower
+    /// memory imbalance). See [`SpillConfig`].
+    spill_config: Option<SpillConfig>,
     /// How the per-job activation lock is replicated ([`ActivationPolicy`], from
     /// `NANOBPMN_REPLICATE_ACTIVATION`). Resolved once at startup; the per-partition
     /// answer is [`Self::replicate_activation_for`].
@@ -517,6 +532,9 @@ impl ServerImpl {
         //  - Fixed: a fixed operator-set cap.
         //  - Auto:  a self-optimizing governor tunes it between the knee floor and
         //           the memory-derived ceiling from the engine's latency signal.
+        // In Auto mode we also keep the governor's bounds + latency read handle
+        // (`backlog_gov`) so the monitor and shed message can explain the cap.
+        let mut backlog_gov: Option<BacklogGovernor> = None;
         let backlog_cap = match admission_backlog_from_env() {
             AdmissionBacklog::Off => Arc::new(AtomicUsize::new(0)),
             AdmissionBacklog::Fixed(n) => {
@@ -530,7 +548,14 @@ impl ServerImpl {
                     "admission control: on, self-optimizing active-backlog governor \
                      (floor {floor}, ceiling {ceiling} runnable jobs/node)"
                 );
-                controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone())
+                let (cap, obs) =
+                    controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone());
+                backlog_gov = Some(BacklogGovernor {
+                    floor,
+                    ceiling,
+                    obs,
+                });
+                cap
             }
         };
         // `active_worker_cap` is the live per-job-type active dispatch width the
@@ -597,6 +622,10 @@ impl ServerImpl {
         // every partition without collision.
         let var_cfg = spill_from_env();
         let cold_cfg = cold_spill_from_env();
+        // Captured spill tiers, applied to owned journals below and re-applied to
+        // lazily-created Raft replica engines (see `replica_engine_for`) so a
+        // follower reclaims hot RAM exactly like its leader.
+        let mut spill_config: Option<SpillConfig> = None;
         if var_cfg.is_some() || cold_cfg.is_some() {
             let path = var_cfg.as_ref().and_then(|(p, _)| p.clone()).or_else(|| {
                 resolve_data_paths()
@@ -609,32 +638,16 @@ impl ServerImpl {
                 .unwrap_or_else(|| " (in-memory)".to_string());
             match varspill::VarSpillStore::open(path.as_deref()) {
                 Ok(store) => {
-                    let store = Arc::new(store);
-                    if let Some((_, cfg)) = var_cfg {
-                        for journal in journals.iter_mut() {
-                            match &cfg {
-                                VarSpillCfg::Budget(budget) => {
-                                    journal.set_spill(Arc::clone(&store), *budget);
-                                }
-                                VarSpillCfg::Adaptive {
-                                    floor,
-                                    high,
-                                    low,
-                                    reserve,
-                                    hard_cap,
-                                } => {
-                                    journal.set_var_spill_adaptive(
-                                        Arc::clone(&store),
-                                        *floor,
-                                        *high,
-                                        *low,
-                                        *reserve,
-                                        *hard_cap,
-                                    );
-                                }
-                            }
-                        }
-                        match &cfg {
+                    let config = SpillConfig {
+                        store: Arc::new(store),
+                        var: var_cfg.map(|(_, cfg)| cfg),
+                        cold: cold_cfg,
+                    };
+                    for journal in journals.iter_mut() {
+                        config.apply(journal);
+                    }
+                    if let Some(cfg) = &config.var {
+                        match cfg {
                             VarSpillCfg::Budget(budget) => tracing::info!(
                                 "variable spill: on (fixed budget), hot budget {budget} instance(s){location}"
                             ),
@@ -656,16 +669,14 @@ impl ServerImpl {
                             ),
                         }
                     }
-                    if let Some((high, low)) = cold_cfg {
-                        for journal in journals.iter_mut() {
-                            journal.set_cold_spill(Arc::clone(&store), high, low);
-                        }
+                    if let Some((high, low)) = config.cold {
                         tracing::info!(
                             "cold spill: on, high-water {:.0} MiB / low-water {:.0} MiB{location}",
                             high as f64 / (1024.0 * 1024.0),
                             low as f64 / (1024.0 * 1024.0),
                         );
                     }
+                    spill_config = Some(config);
                 }
                 Err(e) => tracing::error!("spill disabled: failed to open store: {e}"),
             }
@@ -720,6 +731,7 @@ impl ServerImpl {
             processing,
             activity: Arc::new(AtomicU64::new(0)),
             backlog_cap,
+            backlog_gov,
             runnable_backlog,
             active_worker_cap,
             admission_max_create_queue,
@@ -733,6 +745,7 @@ impl ServerImpl {
             peers,
             raft: crate::raft::RaftRegistry::new(),
             raft_replicas: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            spill_config,
             activation_policy,
             lease_digest,
             lease_digests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1435,7 +1448,7 @@ fn spawn_adaptive_pruner(store: Arc<ReadStore>, high_bytes: u64) {
                 if Arc::strong_count(&store) <= 1 {
                     break;
                 }
-                match ReadStore::adaptive_prune_once(
+                match store.adaptive_prune_once(
                     &mut conn,
                     high_bytes,
                     low_bytes,
@@ -1674,6 +1687,18 @@ enum AdmissionBacklog {
     /// Self-optimizing: a latency-driven governor tunes the cap between `floor`
     /// (≈ the throughput knee) and `ceiling` (the memory-derived backstop).
     Auto { floor: usize, ceiling: usize },
+}
+
+/// Live state of the auto-mode active-backlog governor, kept on the [`Server`] so
+/// the monitor and the shed message can explain *why* the cap sits where it does.
+/// `floor`/`ceiling` are the static AIMD bounds; `obs` is the read side of the
+/// governor's self-calibrated latency baseline and last-window mean latency, which
+/// the engine thread republishes each window.
+#[derive(Clone)]
+struct BacklogGovernor {
+    floor: usize,
+    ceiling: usize,
+    obs: GovernorObs,
 }
 
 /// Resolves the active-backlog admission policy from `NANOBPMN_ADMISSION_MAX_BACKLOG`.
@@ -2355,6 +2380,7 @@ fn exporter_queue_from_env() -> ExporterQueueCfg {
 }
 
 /// The resolved variable-spill mode (see [`spill_from_env`]).
+#[derive(Clone)]
 enum VarSpillCfg {
     /// Legacy fixed instance-count budget, checked per command.
     Budget(usize),
@@ -2369,6 +2395,62 @@ enum VarSpillCfg {
         reserve: u64,
         hard_cap: usize,
     },
+}
+
+/// The resolved spill-tier configuration (variable + cold), captured once at
+/// startup so it can be applied uniformly to **every** engine actor this node
+/// hosts — the statically owned partitions AND the lazily-created Raft replica
+/// engines for partitions this node only follows.
+///
+/// Spill (`maybe_var_spill_pressure` / `maybe_cold_spill`) is a purely LOCAL
+/// memory-reclamation operation: it mints no keys, emits no events and proposes
+/// nothing through Raft, so it is safe and correct on any replica. Historically
+/// only owned/led engines were configured with a spill store (and only the
+/// leader's clock tick ran the spill gate), so a follower held its entire
+/// replicated working set in hot RAM — the leader/follower memory imbalance
+/// where a follower of a hot partition ballooned while its leader stayed small.
+/// Wiring the same store into replica engines (and running the gate on followed
+/// partitions in the tick loop) lets a follower reclaim RAM exactly like its
+/// leader, rehydrating on demand when a replicated command targets a cold
+/// instance (see [`Journal::maybe_cold_spill`] / `ensure_resident_for_command`).
+#[derive(Clone)]
+struct SpillConfig {
+    store: Arc<varspill::VarSpillStore>,
+    var: Option<VarSpillCfg>,
+    cold: Option<(u64, u64)>,
+}
+
+impl SpillConfig {
+    /// Installs the configured spill tiers onto `journal`. Idempotent per
+    /// journal; call once per engine actor at construction.
+    fn apply(&self, journal: &mut Journal) {
+        if let Some(cfg) = &self.var {
+            match cfg {
+                VarSpillCfg::Budget(budget) => {
+                    journal.set_spill(Arc::clone(&self.store), *budget);
+                }
+                VarSpillCfg::Adaptive {
+                    floor,
+                    high,
+                    low,
+                    reserve,
+                    hard_cap,
+                } => {
+                    journal.set_var_spill_adaptive(
+                        Arc::clone(&self.store),
+                        *floor,
+                        *high,
+                        *low,
+                        *reserve,
+                        *hard_cap,
+                    );
+                }
+            }
+        }
+        if let Some((high, low)) = self.cold {
+            journal.set_cold_spill(Arc::clone(&self.store), high, low);
+        }
+    }
 }
 
 /// Resolves the variable-spill configuration from the environment, or `None` to
@@ -7686,6 +7768,14 @@ impl ServerImpl {
         if self.activation_policy.may_be_leader_local() {
             journal.set_lenient_completion(true);
         }
+        // Wire the same spill tiers the owned engines got, so this follower
+        // replica reclaims hot RAM under pressure instead of pinning the whole
+        // replicated working set resident. Spill is local memory management (no
+        // key mint / no events / no proposal); a replicated command rehydrates a
+        // cold instance on demand via `ensure_resident_for_command`.
+        if let Some(config) = &self.spill_config {
+            config.apply(&mut journal);
+        }
         let seed = self.current_deployment_events().await;
         if !seed.is_empty() {
             journal.install_deployment(&seed);
@@ -9325,6 +9415,44 @@ impl ServerImpl {
         self.inflight.load(Ordering::Relaxed) as i64
     }
 
+    /// Trailing sentence for an active-backlog / create-backlog shed message that
+    /// explains *why* the cap is what it is — so an operator isn't left staring at
+    /// a shed threshold they never configured. In `Auto` mode the cap is the live
+    /// output of the AIMD latency governor, so we name it as auto-tuned, give its
+    /// floor/ceiling bounds, and (once a window has folded) report the baseline vs
+    /// current per-command latency and the congestion threshold that drove the
+    /// last backoff. In `Fixed`/`Off` mode the cap is a plain operator setting, so
+    /// we just point at the tuning lever.
+    fn backlog_cap_explainer(&self) -> String {
+        let Some(gov) = &self.backlog_gov else {
+            return " This is a fixed cap (NANOBPMN_ADMISSION_MAX_BACKLOG); \
+                    raise it, or set NANOBPMN_SLA_MODE=admission to accept latency \
+                    instead of shedding. Retry after a backoff."
+                .to_string();
+        };
+        let baseline = gov.obs.baseline_us.load(Ordering::Relaxed);
+        let window = gov.obs.window_avg_us.load(Ordering::Relaxed);
+        let bounds = format!(
+            " This cap is auto-tuned by the latency governor (floor {}, ceiling {} \
+             runnable jobs) to hold per-command latency near its baseline",
+            gov.floor, gov.ceiling
+        );
+        let latency = if baseline > 0 {
+            let threshold = (baseline as f64 * CONGESTION_RATIO) as u64;
+            format!(
+                "; it backed the cap off because window latency {window}µs vs \
+                 baseline {baseline}µs neared the {threshold}µs congestion threshold."
+            )
+        } else {
+            ".".to_string()
+        };
+        format!(
+            "{bounds}{latency} Retry after a backoff, set NANOBPMN_ADMISSION_MAX_BACKLOG \
+             for a fixed cap, or NANOBPMN_SLA_MODE=admission to accept latency instead \
+             of shedding."
+        )
+    }
+
     /// Admission gate combining several signals. Returns `Some(reason)` once any
     /// active signal is at/above its limit (the create should be shed); `None`
     /// when all have headroom. Relaxed atomic loads — no engine round-trip; an
@@ -9400,14 +9528,16 @@ impl ServerImpl {
                 crate::metrics::record_admission_shed("active_backlog");
                 return Some(format!(
                     "Admission control: {backlog} runnable jobs at or above the \
-                     active-backlog cap of {backlog_limit}. Retry after a backoff."
+                     active-backlog cap of {backlog_limit}.{}",
+                    self.backlog_cap_explainer()
                 ));
             }
             if create_queue >= backlog_limit {
                 crate::metrics::record_admission_shed("create_backlog");
                 return Some(format!(
                     "Admission control: create backlog {create_queue} at or above the \
-                     configured latency backlog limit of {backlog_limit}. Retry after a backoff."
+                     active-backlog cap of {backlog_limit}.{}",
+                    self.backlog_cap_explainer()
                 ));
             }
         }
@@ -11418,6 +11548,30 @@ async fn main() {
                 // local path below, byte-identical to the pre-cluster behaviour.
                 let outcomes: Vec<(bool, Vec<Event>)> = if !tick_server.raft.is_empty() {
                     let led = tick_server.led_partitions();
+                    // Reclaim hot RAM on the partitions this node FOLLOWS (hosts a
+                    // replica of but does not currently lead). The leader spills its
+                    // led partitions inside `tick_partition_via_raft`'s precheck, but
+                    // a follower never proposes, so its replica engine would never run
+                    // the spill gate and would pin the entire replicated working set
+                    // resident — the leader/follower memory imbalance. Spill is a
+                    // pure-local memory op (no key mint, no events, no proposal), so it
+                    // is safe on any replica; a later replicated command rehydrates a
+                    // cold instance on demand. Fan out concurrently, off the led path.
+                    let led_set: std::collections::HashSet<u64> = led.iter().copied().collect();
+                    let followed: Vec<u64> = (0..tick_server.engine.topology().num_partitions)
+                        .filter(|p| !led_set.contains(p))
+                        .collect();
+                    futures_util::future::join_all(followed.into_iter().filter_map(|p| {
+                        tick_server.engine_handle_for(p).map(|handle| async move {
+                            handle
+                                .with(|journal| {
+                                    journal.maybe_var_spill_pressure();
+                                    journal.maybe_cold_spill();
+                                })
+                                .await;
+                        })
+                    }))
+                    .await;
                     futures_util::future::join_all(
                         led.iter()
                             .map(|&p| tick_server.tick_partition_via_raft(p, now, multi_partition)),
@@ -11539,6 +11693,21 @@ async fn main() {
                     "backlog",
                     monitor_server.backlog_cap.load(Ordering::Relaxed) as i64,
                 );
+                // In Auto mode, publish the governor's bounds + live latency signal
+                // so a dashboard (and the shed message) can explain where the cap
+                // sits and why it moved there, rather than only the bare cap value.
+                if let Some(gov) = &monitor_server.backlog_gov {
+                    crate::metrics::set_backlog_governor("floor", gov.floor as i64);
+                    crate::metrics::set_backlog_governor("ceiling", gov.ceiling as i64);
+                    crate::metrics::set_backlog_governor(
+                        "baseline_latency_us",
+                        gov.obs.baseline_us.load(Ordering::Relaxed) as i64,
+                    );
+                    crate::metrics::set_backlog_governor(
+                        "window_latency_us",
+                        gov.obs.window_avg_us.load(Ordering::Relaxed) as i64,
+                    );
+                }
                 crate::metrics::set_admission_limit(
                     "create_queue",
                     monitor_server.admission_max_create_queue as i64,
@@ -15668,6 +15837,56 @@ mod clustered_startup_tests {
         if let Some(part) = node0.raft_registry().get(1) {
             part.raft.shutdown().await.ok();
         }
+    }
+
+    /// A follower must reclaim hot RAM like its leader: the engine actor a node
+    /// builds for a partition it only REPLICATES has to inherit the same spill
+    /// tiers as an owned engine, otherwise it pins the entire replicated working
+    /// set resident (the RF>1 leader/follower memory imbalance). Regression for
+    /// the fix that threads `SpillConfig` into `replica_engine_for`.
+    #[tokio::test]
+    async fn a_replica_engine_inherits_the_configured_cold_spill() {
+        let topology = cluster::Topology {
+            node_id: 0,
+            peers: vec![
+                "http://127.0.0.1:1".into(),
+                "http://127.0.0.1:2".into(),
+                "http://127.0.0.1:3".into(),
+            ],
+            num_partitions: 3,
+            replication_factor: 3,
+        };
+        let journals: Vec<Journal> = topology
+            .local_partitions()
+            .iter()
+            .map(|p| Journal::in_memory_partition(*p))
+            .collect();
+        let mut node0 = build_server_in_memory(journals, topology);
+        node0.replication_mode = ReplicationMode::LeaderDurable;
+
+        // Without a configured spill tier, a replica engine has no cold store —
+        // exactly the pre-fix behaviour that stranded the follower working set
+        // in hot RAM.
+        let bare = node0.replica_engine_for(1).await;
+        assert!(
+            !bare.with(|j| j.cold_spill_configured()).await,
+            "no spill configured => replica has no cold store"
+        );
+
+        // Configure spill (in-memory store) as startup would, then a freshly
+        // built replica engine must carry the cold tier.
+        let store =
+            Arc::new(varspill::VarSpillStore::open(None).expect("in-memory var-spill store"));
+        node0.spill_config = Some(SpillConfig {
+            store,
+            var: None,
+            cold: Some((64 * 1024 * 1024, 32 * 1024 * 1024)),
+        });
+        let replica = node0.replica_engine_for(2).await;
+        assert!(
+            replica.with(|j| j.cold_spill_configured()).await,
+            "configured spill => replica engine inherits the cold store"
+        );
     }
 }
 
