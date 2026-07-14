@@ -53,8 +53,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
+use std::io::Write as _;
 use std::ops::RangeBounds;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -366,6 +367,94 @@ struct StoredSnapshot {
     path: PathBuf,
 }
 
+/// The durable pointer to a partition's current snapshot, persisted next to the
+/// snapshot `.bin` as `current-snapshot.json`.
+///
+/// # Why this exists (the rejoin-brick bug)
+///
+/// By the Raft model the log is the source of truth, and boot used to rebuild
+/// engine state by replaying the *full* durable log — so it unconditionally
+/// deleted every on-disk snapshot as dead. That is only sound while the log is
+/// never compacted. But openraft snapshots then **purges** the log (persisting a
+/// `last_purged` marker and dropping every covered entry). After a purge the
+/// snapshot is the ONLY source for the `[0, last_purged]` prefix; deleting it on
+/// the next boot left openraft with a `last_purged` marker but no snapshot and no
+/// entries below it, so hosting the partition failed with a degenerate
+/// `expected [0, N), got [None, None)` log read and the partition never formed
+/// its group (received zero traffic thereafter).
+///
+/// The pointer is written atomically once the `.bin` is fsync'd and **before**
+/// openraft is allowed to purge the log the snapshot subsumes, so a restart can
+/// always restore the exact state a subsequent purge relied on.
+#[derive(Serialize, Deserialize)]
+struct PersistedSnapshotPtr {
+    /// File name (not the full path) of the current snapshot `.bin`, resolved
+    /// against the snapshot dir so the pointer survives a data-dir move.
+    file: String,
+    last_log_id: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, BasicNode>,
+    snapshot_id: String,
+}
+
+fn snapshot_ptr_path(dir: &Path) -> PathBuf {
+    dir.join("current-snapshot.json")
+}
+
+/// Atomically persist the current-snapshot pointer (temp write + fsync + rename +
+/// directory fsync) so it is crash-durable before the caller returns.
+fn write_snapshot_ptr(dir: &Path, stored: &StoredSnapshot) -> std::io::Result<()> {
+    let file = stored
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "snapshot path has no file name",
+            )
+        })?
+        .to_string();
+    let ptr = PersistedSnapshotPtr {
+        file,
+        last_log_id: stored.meta.last_log_id,
+        last_membership: stored.meta.last_membership.clone(),
+        snapshot_id: stored.meta.snapshot_id.clone(),
+    };
+    let bytes = serde_json::to_vec(&ptr)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = dir.join(format!("current-snapshot.json.tmp-{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, snapshot_ptr_path(dir))?;
+    // fsync the directory so the rename (and any preceding unlink) is durable.
+    if let Ok(dirf) = std::fs::File::open(dir) {
+        let _ = dirf.sync_all();
+    }
+    Ok(())
+}
+
+/// Read the durable current-snapshot pointer, returning the [`StoredSnapshot`] it
+/// names iff the referenced `.bin` is physically present.
+fn read_snapshot_ptr(dir: &Path) -> Option<StoredSnapshot> {
+    let bytes = std::fs::read(snapshot_ptr_path(dir)).ok()?;
+    let ptr: PersistedSnapshotPtr = serde_json::from_slice(&bytes).ok()?;
+    let path = dir.join(&ptr.file);
+    if !path.is_file() {
+        return None;
+    }
+    Some(StoredSnapshot {
+        meta: SnapshotMeta {
+            last_log_id: ptr.last_log_id,
+            last_membership: ptr.last_membership,
+            snapshot_id: ptr.snapshot_id,
+        },
+        path,
+    })
+}
+
 /// Metadata held by the Raft state machine: the last applied log id and
 /// membership. The materialized engine state itself lives on the partition's
 /// [`DeepthiHandle`] (driven by [`apply`](RaftStateMachine::apply)) and is
@@ -428,14 +517,22 @@ impl PartitionStateMachine {
         leader: Arc<AtomicU64>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&snapshot_dir)?;
-        // Clear any stale snapshot files left by a previous process: on boot the
-        // engine state is reconstructed by replaying the durable log (or a fresh
-        // network install), and `current_snapshot` starts empty, so any file on
-        // disk here is dead. Removing it also reconciles a crash mid-install that
-        // left an orphan `incoming-*` file.
+        // Restore from the durable current-snapshot pointer if one is present.
+        // Once the log has been compacted (openraft persists a `last_purged`
+        // marker and drops the covered entries), the snapshot is the ONLY source
+        // for the purged prefix; deleting it here — as this used to
+        // unconditionally do — bricks the partition on restart (it fails to host
+        // with a degenerate `[0, N)` log read; see [`PersistedSnapshotPtr`]). So
+        // keep the pointed-at snapshot, adopt its applied metadata, and garbage
+        // collect only the OTHER (stale / orphan `incoming-*`) snapshot files.
+        let restored = read_snapshot_ptr(&snapshot_dir);
+        let keep = restored.as_ref().map(|s| s.path.clone());
         if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
+                if keep.as_deref() == Some(path.as_path()) {
+                    continue;
+                }
                 let ours = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -446,16 +543,25 @@ impl PartitionStateMachine {
                 }
             }
         }
+        if restored.is_none() {
+            // No durable snapshot: the pointer (if any) is dead — drop it so a
+            // later successful build writes a clean one.
+            let _ = std::fs::remove_file(snapshot_ptr_path(&snapshot_dir));
+        }
+        let (last_applied, last_membership) = restored
+            .as_ref()
+            .map(|s| (s.meta.last_log_id, s.meta.last_membership.clone()))
+            .unwrap_or_else(|| (None, StoredMembership::default()));
         Ok(Self {
             engine,
             inner: Mutex::new(SmMeta {
                 partition_id,
-                last_applied: None,
-                last_membership: StoredMembership::default(),
+                last_applied,
+                last_membership,
             }),
             snapshot_idx: AtomicU64::new(0),
             recv_idx: AtomicU64::new(0),
-            current_snapshot: Mutex::new(None),
+            current_snapshot: Mutex::new(restored),
             snapshot_dir,
             node_id,
             evict_eligible,
@@ -489,6 +595,37 @@ impl PartitionStateMachine {
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )
+    }
+
+    /// Restore the engine to the state captured by the durable current snapshot,
+    /// if any. Called once at boot (from
+    /// [`bootstrap_member`](RaftPartition::bootstrap_member)) BEFORE the openraft
+    /// [`Raft`](openraft::Raft) is constructed, so the state machine already
+    /// carries the snapshot's applied metadata (adopted in [`new`](Self::new))
+    /// and openraft only has to replay the post-snapshot log tail on top. A no-op
+    /// when there is no durable snapshot (the unpurged log replays in full, the
+    /// original recovery path).
+    async fn restore_from_current_snapshot(&self) -> anyhow::Result<()> {
+        let path = {
+            let guard = self.current_snapshot.lock().unwrap();
+            match guard.as_ref() {
+                Some(s) => s.path.clone(),
+                None => return Ok(()),
+            }
+        };
+        let captured: nanobpmn_engine_core::EngineSnapshot =
+            tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+                let f = std::fs::File::open(&path)?;
+                serde_json::from_reader(std::io::BufReader::new(f))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })
+            .await??;
+        self.engine
+            .with(move |journal| {
+                *journal = Journal::in_memory_from_snapshot(captured);
+            })
+            .await;
+        Ok(())
     }
 }
 
@@ -541,16 +678,19 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         file.sync_all()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
+        // Record the durable pointer to this snapshot BEFORE anything unlinks the
+        // one it replaces AND before build_snapshot returns: openraft may purge
+        // the log this snapshot subsumes as soon as it returns, so a restartable
+        // recovery point must already be on disk (see [`PersistedSnapshotPtr`]).
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            path: path.clone(),
+        };
+        write_snapshot_ptr(&self.sm.snapshot_dir, &stored)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+
         // Publish as the current snapshot and unlink the file it replaces.
-        let previous = self
-            .sm
-            .current_snapshot
-            .lock()
-            .unwrap()
-            .replace(StoredSnapshot {
-                meta: meta.clone(),
-                path: path.clone(),
-            });
+        let previous = self.sm.current_snapshot.lock().unwrap().replace(stored);
         if let Some(previous) = previous.filter(|p| p.path != path) {
             let _ = std::fs::remove_file(&previous.path);
         }
@@ -772,14 +912,20 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             .join(format!("snap-installed-{snapshot_idx}.bin"));
         std::fs::rename(&path, &current_path)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        let previous = self
-            .current_snapshot
-            .lock()
-            .unwrap()
-            .replace(StoredSnapshot {
-                meta: meta.clone(),
-                path: current_path,
-            });
+        // fsync the promoted file, then record it as the durable current snapshot
+        // BEFORE unlinking the one it replaces — an installed snapshot is just as
+        // much a restart recovery point as a locally-built one, and the log store
+        // will purge below it (see [`PersistedSnapshotPtr`]).
+        if let Ok(f) = std::fs::File::open(&current_path) {
+            let _ = f.sync_all();
+        }
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            path: current_path,
+        };
+        write_snapshot_ptr(&self.snapshot_dir, &stored)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        let previous = self.current_snapshot.lock().unwrap().replace(stored);
         if let Some(previous) = previous {
             let _ = std::fs::remove_file(&previous.path);
         }
@@ -1249,6 +1395,13 @@ impl RaftPartition {
             evict_eligible,
             leader.clone(),
         )?);
+        // Restore the engine from the durable current snapshot (if any) BEFORE
+        // openraft is constructed: with a compacted log the snapshot holds the
+        // purged prefix, and the state machine already carries its applied
+        // metadata, so openraft's `get_initial_state` reconciles cleanly and only
+        // replays the post-snapshot log tail. Without this a rejoining node whose
+        // log was purged fails to host the partition entirely.
+        state_machine.restore_from_current_snapshot().await?;
         let network = PartitionNetwork::new(transport, partition_id);
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
@@ -1750,6 +1903,93 @@ mod tests {
             "nanobpmn-raftlog-{}-{tag}-{nanos}",
             std::process::id()
         ))
+    }
+
+    /// A rejoining node whose log was compacted must restore engine state from the
+    /// durable snapshot instead of deleting it. Regression for the rejoin-brick
+    /// bug: boot used to unconditionally delete every on-disk snapshot and rebuild
+    /// state by full log replay, so once the log was purged the deleted snapshot
+    /// was the only source for the purged prefix and the partition failed to host
+    /// (`expected [0, N), got [None, None)`). The durable current-snapshot pointer
+    /// now survives the reboot, its applied metadata is adopted, and the engine is
+    /// restored from it.
+    #[tokio::test]
+    async fn boot_restores_engine_from_the_durable_snapshot_instead_of_deleting_it() {
+        use openraft::CommittedLeaderId;
+        let snap_dir = unique_log_dir("snap-reboot").join("snapshots");
+
+        // Boot 1: a state machine over an engine that has a deployed process.
+        // Simulate an applied index (as openraft's `apply` would), then snapshot —
+        // which writes the `.bin` AND the durable current-snapshot pointer.
+        let applied = LogId::new(CommittedLeaderId::new(1, 0), 42);
+        {
+            let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+            src.with(|j| {
+                let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+            })
+            .await;
+            let mut src_sm: Arc<PartitionStateMachine> = Arc::new(
+                PartitionStateMachine::new(
+                    src,
+                    0,
+                    snap_dir.clone(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("state machine"),
+            );
+            src_sm.inner.lock().unwrap().last_applied = Some(applied);
+            let mut builder = src_sm.get_snapshot_builder().await;
+            let _ = builder.build_snapshot().await.expect("build snapshot");
+        }
+
+        // The durable pointer and the snapshot body it names are both on disk.
+        assert!(
+            snapshot_ptr_path(&snap_dir).is_file(),
+            "the current-snapshot pointer is persisted"
+        );
+
+        // Boot 2: a BRAND-NEW, EMPTY engine + state machine reopens the same
+        // snapshot dir (the rejoin). The old code would delete the snapshot here.
+        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        assert!(
+            dst.with(|j| j.state().processes.is_empty()).await,
+            "the fresh engine starts empty"
+        );
+        let dst_sm: Arc<PartitionStateMachine> = Arc::new(
+            PartitionStateMachine::new(
+                dst.clone(),
+                0,
+                snap_dir.clone(),
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("reopen state machine"),
+        );
+
+        // The snapshot was RETAINED (not deleted) and its applied metadata adopted.
+        assert!(
+            read_snapshot_ptr(&snap_dir).is_some(),
+            "the snapshot survived the reboot"
+        );
+        let (last_applied, _) = dst_sm.clone().applied_state().await.expect("applied state");
+        assert_eq!(
+            last_applied,
+            Some(applied),
+            "boot adopts the snapshot's applied index (so openraft only replays the tail)"
+        );
+
+        // Restoring seeds the fresh engine with the snapshotted state.
+        dst_sm
+            .restore_from_current_snapshot()
+            .await
+            .expect("restore from snapshot");
+        assert!(
+            !dst.with(|j| j.state().processes.is_empty()).await,
+            "the deployed process is recovered from the snapshot, not from a (purged) log"
+        );
     }
 
     #[tokio::test]
