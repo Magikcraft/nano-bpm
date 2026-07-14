@@ -93,9 +93,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "camunda-orchestration-api-client"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9958111f76277997677f3c0cbb52b9d5c9efb650f95607187ba65590190883ac"
+checksum = "af5d77cc2a663ea403ecd47bfca83ddb5982083ee5939af9a33675a3c1290d58"
 dependencies = [
  "chrono",
  "regex",
@@ -111,9 +111,9 @@ dependencies = [
 
 [[package]]
 name = "camunda-orchestration-sdk"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "84ffe60b49cb49fc54f08696768ebfc3668a2be8ef5704a9bc9903816ed71d1f"
+checksum = "0d84711e2163be706c034ce8f99a4eb7166086bf754ed8eb799c64de139bfee1"
 dependencies = [
  "async-trait",
  "camunda-orchestration-api-client",
@@ -1043,10 +1043,8 @@ name = "rust-worker"
 version = "0.1.0"
 dependencies = [
  "camunda-orchestration-sdk",
- "futures-util",
  "serde_json",
  "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]
