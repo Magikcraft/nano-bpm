@@ -7703,10 +7703,34 @@ impl ServerImpl {
         }
     }
 
+    /// Whether this node is the **current raft leader** of partition `p` (its
+    /// openraft core reports `state == Leader` and names itself the leader). This
+    /// is the authoritative "am I actually serving writes for `p`" signal — as
+    /// opposed to the app-level `promotion_epoch` map, which can name a node that
+    /// has since been demoted (e.g. after a leadership hand-off). Callers that
+    /// advertise leadership to peers (solicit replies, promotion re-announcements)
+    /// MUST gate on this so a demoted learner never claims to lead — a stale claim
+    /// can make the real leader step back down and undo a completed hand-off.
+    fn i_lead_raft(&self, p: u64) -> bool {
+        let me = self.engine.topology().node_id as u64;
+        self.raft
+            .get(p)
+            .map(|part| {
+                let m = part.raft.metrics().borrow().clone();
+                m.state == openraft::ServerState::Leader && m.current_leader == Some(me)
+            })
+            .unwrap_or(false)
+    }
+
     /// Answer a peer's [`ClientFrame::SolicitPromotions`]: re-announce to `from_node`
     /// every partition this node currently app-leads (its `promotion_epoch` names
-    /// us), so a rejoining owner learns the incumbent epoch and reclaims at
-    /// `incumbent + 1`. A no-op if we lead nothing or the solicit is our own.
+    /// us) **and still actually raft-leads**, so a rejoining owner learns the
+    /// incumbent epoch and reclaims at `incumbent + 1`. A no-op if we lead nothing
+    /// or the solicit is our own. The raft-leadership gate ([`i_lead_raft`]) is
+    /// critical: after a leadership hand-off our `promotion_epoch` map may still
+    /// name us for `p` while openraft has moved leadership elsewhere — replying
+    /// then would make the returning owner adopt a stale epoch and re-demote the
+    /// new leader, undoing the hand-off.
     pub(crate) async fn answer_promotion_solicit(&self, from_node: u64) {
         let topology = self.engine.topology().clone();
         let me = topology.node_id as u64;
@@ -7720,6 +7744,12 @@ impl ServerImpl {
                 .map(|(p, (epoch, _))| (*p, *epoch))
                 .collect()
         };
+        // Only re-announce partitions we STILL raft-lead (a demoted learner must
+        // not advertise itself as leader).
+        let led: Vec<(u64, u64)> = led
+            .into_iter()
+            .filter(|(p, _)| self.i_lead_raft(*p))
+            .collect();
         if led.is_empty() {
             return;
         }
@@ -16383,25 +16413,44 @@ mod clustered_startup_tests {
         // links, isolated from the raft failover dance.
         let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
 
-        // The incumbent: node 1 records itself as the app-promoted leader of
-        // partition 0 at epoch 1 (as a failover would), without the full raft
-        // promotion — this test targets the solicit wiring, not group formation.
+        // The incumbent: node 1 becomes the REAL failover raft leader of partition 0
+        // at epoch 1 (as a failover would when node 0 was down) — a fresh single-voter
+        // group it actually leads, not just an app-map entry. The leadership gate on
+        // `answer_promotion_solicit` requires genuine raft leadership: a node that only
+        // has a stale `promotion_epoch` entry (e.g. one demoted by a later hand-off)
+        // must NOT advertise itself as leader, so the incumbent here must truly lead.
         assert_eq!(node1.next_promotion_epoch(0), 1);
         assert_eq!(
             node1.promotion_epoch.lock().unwrap().get(&0).copied(),
             Some((1, 1)),
             "node 1 is the incumbent leader of partition 0 at epoch 1"
         );
+        node1.promote_partition(0, 1).await;
+        let mut leads = false;
+        for _ in 0..300 {
+            if node1.i_lead_raft(0) {
+                leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leads, "the incumbent genuinely raft-leads partition 0");
 
-        // The rejoining owner starts with an EMPTY epoch map (restart wiped it): it
-        // has NOT heard the incumbent's original announcement.
-        assert!(
-            node0.promotion_epoch.lock().unwrap().get(&0).is_none(),
-            "the rejoined owner has no incumbent epoch before soliciting"
-        );
+        // Model the rejoined owner: promote_partition broadcast a Promote to node 0,
+        // which it may have adopted. Wait for that to drain, then RESET node 0's view
+        // so it has NOT heard the incumbent epoch — exactly the post-restart state
+        // (its in-memory map was wiped). The solicit round-trip below must re-deliver.
+        for _ in 0..300 {
+            if node0.promotion_epoch.lock().unwrap().get(&0).copied() == Some((1, 1)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        node0.promotion_epoch.lock().unwrap().remove(&0);
 
-        // Solicit the incumbent. node 1 answers with a Promote for the partition it
-        // leads; node 0's falcon handler adopts it via handle_promotion.
+        // Solicit the incumbent. node 1 STILL raft-leads, so the leadership gate lets
+        // it answer with a Promote for partition 0; node 0's falcon handler adopts it
+        // via handle_promotion.
         node0.solicit_promotions_from(1).await;
 
         let mut adopted = false;
@@ -16424,6 +16473,49 @@ mod clustered_startup_tests {
             2,
             "the owner reclaims at incumbent_epoch + 1 after soliciting, not epoch 1"
         );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn solicit_reply_is_gated_on_real_raft_leadership_not_a_stale_epoch_entry() {
+        // Regression for the leadership hand-off: after leadership moves off a node
+        // (e.g. it was demoted to a learner), its in-memory `promotion_epoch` map may
+        // STILL name it as the leader of a partition. If it answered a solicit on that
+        // stale entry it would make the returning owner adopt a dead epoch and could
+        // re-demote the genuine leader — undoing the hand-off. `answer_promotion_solicit`
+        // must therefore gate on ACTUAL raft leadership (`i_lead_raft`), not the map.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Forge a stale entry on node 1 claiming it leads partition 0 at epoch 1,
+        // WITHOUT it ever raft-leading partition 0 (node 0 is the real owner/leader).
+        node1.promotion_epoch.lock().unwrap().insert(0, (1, 1));
+        assert!(
+            !node1.i_lead_raft(0),
+            "node 1 does not actually raft-lead partition 0 despite the forged epoch entry"
+        );
+        node0.promotion_epoch.lock().unwrap().remove(&0);
+
+        // Solicit node 1. The gate must suppress the reply, so node 0 learns nothing.
+        node0.solicit_promotions_from(1).await;
+
+        for _ in 0..25 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                node0.promotion_epoch.lock().unwrap().get(&0).is_none(),
+                "the owner must NOT adopt an epoch from a node that only has a stale map \
+                 entry and does not actually raft-lead the partition"
+            );
+        }
 
         for node in [&node0, &node1, &node2] {
             for p in 0..3u64 {
