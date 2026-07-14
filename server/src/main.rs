@@ -7648,6 +7648,7 @@ impl ServerImpl {
             return;
         }
         self.raft.insert(part.clone());
+        metrics::record_promote(p);
         tracing::info!(
             "leader-durable: node {me} promoted itself leader of partition {p} (epoch {epoch})"
         );
@@ -10017,6 +10018,30 @@ impl ServerImpl {
             .map(|(load, _)| load)
     }
 
+    /// Diagnostic snapshot of this node's gossiped peer-pressure view: for each
+    /// peer we have ever heard from, `(node, load, age_ms, expired)` where
+    /// `expired` is true once the reading is older than [`peer_pressure_ttl`]
+    /// (i.e. placement now treats it as full headroom). Read-only; used by the
+    /// `/debug/peers` route to confirm whether a rejoining peer is being pinned
+    /// out of create placement by a stale SHED reading under sustained load.
+    pub(crate) fn peer_pressure_snapshot(&self) -> Vec<(u32, i64, u128, bool)> {
+        let ttl = peer_pressure_ttl();
+        let mut rows: Vec<(u32, i64, u128, bool)> = self
+            .peer_pressure
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .map(|(node, (load, at))| {
+                        let age = at.elapsed();
+                        (*node, *load, age.as_millis(), age >= ttl)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by_key(|(node, ..)| *node);
+        rows
+    }
+
     /// Test-only: record a peer's create-load index stamped at an explicit
     /// instant, so freshness/TTL expiry can be exercised deterministically
     /// without sleeping or racing the wall clock.
@@ -10662,6 +10687,43 @@ fn raft_debug_body(reg: &crate::raft::RaftRegistry) -> Response {
         .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Body::from(body))
         .expect("raft debug response builds")
+}
+
+/// Diagnostic dump of this node's gossiped peer-pressure (create-load) view, plus
+/// its own locally-computed create-load index. Read-only. Answers "is a rejoining
+/// healthy peer being pinned out of create placement by a stale/expired SHED
+/// reading?": each row is `peer=<node> load=<idx> age_ms=<ms> expired=<bool>
+/// weight=<placement_weight>`. A peer with `expired=true` is treated as full
+/// headroom by placement; a fresh `load=SHED` (weight 0) peer is steered away.
+fn peers_debug_body(server: &ServerImpl) -> Response {
+    use std::fmt::Write as _;
+    let me = server.engine.topology().node_id;
+    let my_load = server.create_load_index();
+    let ttl_ms = peer_pressure_ttl().as_millis();
+    let mut body = String::new();
+    let _ = writeln!(
+        body,
+        "node={me} self_load={my_load} self_weight={} peer_pressure_ttl_ms={ttl_ms}",
+        crate::placement::placement_weight(my_load),
+    );
+    for (node, load, age_ms, expired) in server.peer_pressure_snapshot() {
+        // Placement uses `peer_load` (TTL-filtered): an expired reading counts as
+        // full headroom, so its effective weight is the full-headroom weight.
+        let effective = if expired {
+            crate::placement::placement_weight(0)
+        } else {
+            crate::placement::placement_weight(load)
+        };
+        let _ = writeln!(
+            body,
+            "peer={node} load={load} age_ms={age_ms} expired={expired} effective_weight={effective}"
+        );
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .expect("peers debug response builds")
 }
 
 /// Diagnostic dump of non-terminal instance / job state, per partition this node
@@ -11728,6 +11790,10 @@ async fn main() {
     // job state breakdown per led partition — used to characterize wedged
     // instances that never reach a terminal state after load drains).
     let dbg_server = server.clone();
+    // Captured for the /debug/peers diagnostic route (this node's gossiped
+    // peer-pressure view + own create-load index — used to confirm whether a
+    // rejoining peer is pinned out of create placement by a stale SHED reading).
+    let peers_dbg = server.clone();
 
     // Raft partition-liveness supervisor. An openraft core can enter `Shutdown`
     // (e.g. on an unrecoverable storage error) and then silently stop applying,
@@ -11806,6 +11872,13 @@ async fn main() {
             axum::routing::get(move || {
                 let srv = dbg_server.clone();
                 async move { instances_debug_body(&srv).await }
+            }),
+        )
+        .route(
+            "/debug/peers",
+            axum::routing::get(move || {
+                let srv = peers_dbg.clone();
+                async move { peers_debug_body(&srv) }
             }),
         )
         .route(
@@ -13098,6 +13171,43 @@ mod clustered_startup_tests {
         assert!(
             recovered > 0,
             "a peer whose stale SHED expired must re-enter create placement ({recovered} creates)"
+        );
+    }
+
+    #[test]
+    fn peer_pressure_snapshot_flags_expired_readings_for_debug_peers() {
+        // The /debug/peers diagnostic must faithfully report whether a peer's
+        // gossiped reading has aged past the TTL — that expired flag is exactly
+        // what tells an operator "placement now treats this peer as headroom",
+        // distinguishing a still-pinned fresh SHED from an expired-and-eligible
+        // one during a rejoin soak.
+        let node0 = clustered_node(0);
+
+        // A fresh reading is present and not expired.
+        node0.record_peer_pressure(1, crate::placement::SHED_LOAD);
+        let snap = node0.peer_pressure_snapshot();
+        let row = snap
+            .iter()
+            .find(|(n, ..)| *n == 1)
+            .expect("peer 1 present in snapshot");
+        assert_eq!(row.1, crate::placement::SHED_LOAD, "load reported verbatim");
+        assert!(!row.3, "a fresh reading must not be flagged expired");
+
+        // Backdate it past the TTL: the snapshot must now flag it expired.
+        let stale = std::time::Instant::now() - (peer_pressure_ttl() + Duration::from_secs(1));
+        node0.record_peer_pressure_at(1, crate::placement::SHED_LOAD, stale);
+        let row = node0
+            .peer_pressure_snapshot()
+            .into_iter()
+            .find(|(n, ..)| *n == 1)
+            .expect("peer 1 still present in snapshot");
+        assert!(
+            row.3,
+            "a reading older than the TTL must be flagged expired in the debug snapshot"
+        );
+        assert!(
+            row.2 >= peer_pressure_ttl().as_millis(),
+            "reported age must reflect the backdated timestamp"
         );
     }
 

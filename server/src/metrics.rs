@@ -76,6 +76,13 @@ struct Metrics {
     /// propose_err|apply_err|forward_ok|forward_err).
     stream_complete_outcome_total: prometheus::IntCounterVec,
 
+    /// Per-partition count of leadership self-promotions (a rejoining owner or a
+    /// failover peer forming a fresh single-voter group via `promote_partition`).
+    /// A healthy cluster promotes each partition ~once; a climbing count under
+    /// load is the reclaim promote-ping-pong fingerprint (both the owner and the
+    /// failover leader repeatedly re-forming competing groups for one partition).
+    raft_promote_total: prometheus::IntCounterVec,
+
     /// Serialized bytes of all uncompacted Raft log entries currently held in the
     /// in-memory log indexes, summed across every owned partition. Under a burst
     /// this is byte-unbounded (snapshot policy counts entries, not bytes), so it
@@ -404,6 +411,15 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter vec");
 
+    let raft_promote_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_raft_promote_total",
+            "Per-partition leadership self-promotions (fresh single-voter group formed via promote_partition); a climbing count is the reclaim promote-ping-pong fingerprint.",
+        ),
+        &["partition"],
+    )
+    .expect("valid counter vec");
+
     let raft_log_bytes = IntGauge::new(
         "nanobpm_raft_log_bytes",
         "Serialized bytes of uncompacted in-memory Raft log entries (all partitions).",
@@ -673,6 +689,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(creates_total.clone())))
         .and(registry.register(Box::new(job_completions_total.clone())))
         .and(registry.register(Box::new(stream_complete_outcome_total.clone())))
+        .and(registry.register(Box::new(raft_promote_total.clone())))
         .and(registry.register(Box::new(raft_log_bytes.clone())))
         .and(registry.register(Box::new(raft_log_ram_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entries.clone())))
@@ -729,6 +746,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         creates_total,
         job_completions_total,
         stream_complete_outcome_total,
+        raft_promote_total,
         raft_log_bytes,
         raft_log_ram_bytes,
         raft_log_entries,
@@ -1160,6 +1178,16 @@ pub fn record_complete_outcome(outcome: &str) {
     METRICS
         .stream_complete_outcome_total
         .with_label_values(&[outcome])
+        .inc();
+}
+
+/// Diagnostic: counts a leadership self-promotion for `partition` (a fresh
+/// single-voter group formed via `promote_partition`). A steadily climbing
+/// per-partition count under load is the reclaim promote-ping-pong fingerprint.
+pub fn record_promote(partition: u64) {
+    METRICS
+        .raft_promote_total
+        .with_label_values(&[&partition.to_string()])
         .inc();
 }
 
