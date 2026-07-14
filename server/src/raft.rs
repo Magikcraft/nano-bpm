@@ -1573,6 +1573,17 @@ impl RaftPartition {
         self.log_bytes.load(Ordering::Relaxed)
     }
 
+    /// Whether this group's committed membership is a JOINT config (more than one
+    /// voter set) — the transient two-config state openraft passes through during
+    /// `change_membership`. A hand-off that fails while joint means the transfer
+    /// may be half-applied (needs a quorum of BOTH sets), so the requester must not
+    /// fall back to forming a competing group. Read from the metrics watch.
+    pub fn in_joint_config(&self) -> bool {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        m.membership_config.membership().get_joint_config().len() > 1
+    }
+
     /// Applied-log index and the index the last local snapshot covers, for the
     /// compaction governor. `unsnapshotted = last_applied − snapshot` is the log
     /// tail a snapshot would compact away.

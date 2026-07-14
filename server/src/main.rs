@@ -364,6 +364,28 @@ pub struct ServerImpl {
     /// a single leader. Empty (epoch 0 implied) unless leader-durable recovery has
     /// fired. Soft state, never journaled.
     promotion_epoch: Arc<std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>>,
+    /// Opt-in (`NANOBPMN_RECLAIM_HANDOFF=1`): on rejoin, reclaim a statically-owned
+    /// partition led by a reachable failover incumbent by REQUESTING an openraft
+    /// leadership hand-off (the incumbent adds us as a learner, catches us up, then
+    /// `change_membership`s leadership to us and steps down) instead of forming a
+    /// competing fresh single-voter group. One raft lineage throughout, so there is
+    /// no two-group election war (the term storm) under sustained load. Off by
+    /// default -> byte-identical to the legacy self-promote reclaim.
+    reclaim_via_handoff: bool,
+    /// Incumbent side of an in-flight leadership hand-off: the partitions for which
+    /// THIS node (the failover leader) is currently executing a hand-off to a
+    /// returning owner. Presence is both the per-partition hand-off LEASE (a second
+    /// concurrent request is declined) and the create WRITE-GATE (new creates are
+    /// steered off this partition while the learner catches up, so its raft log
+    /// quiesces and the catch-up can reach zero lag). Empty otherwise — zero
+    /// overhead on the hot path.
+    handoff_gated: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    /// Requester side of an in-flight leadership hand-off: partitions for which this
+    /// (rejoining owner) node has asked the incumbent to hand leadership back,
+    /// keyed by partition. Suppresses the legacy self-promote while the hand-off is
+    /// in flight so the two paths can't race into competing groups. See
+    /// [`HandoffPending`].
+    handoff_pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, HandoffPending>>>,
     /// Cluster create-placement mode (`NANOBPMN_CREATE_PLACEMENT`, ADR 0014).
     /// [`PlacementMode::Off`] (default) keeps blind round-robin placement with
     /// forwarded creates ungated — byte-identical to the historical path.
@@ -811,6 +833,13 @@ impl ServerImpl {
             lease_digests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             replication_mode,
             promotion_epoch: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            reclaim_via_handoff: std::env::var("NANOBPMN_RECLAIM_HANDOFF")
+                .ok()
+                .as_deref()
+                .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+                .unwrap_or(false),
+            handoff_gated: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_mode,
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1737,6 +1766,43 @@ fn leader_durable_recovery_grace_ticks() -> u32 {
 /// after the window, capping reclaim to ~one round per hold-down instead of a
 /// per-tick climb.
 const LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS: u32 = 2;
+
+/// Requester-side state for an in-flight leadership hand-off (see
+/// [`ServerImpl::handoff_pending`]). Tracks how long to keep suppressing the
+/// legacy self-promote while waiting for the incumbent to complete the openraft
+/// membership change, and whether the incumbent reported a *joint-config
+/// suspected* failure — in which case the owner must NOT fall back to forming a
+/// fresh competing group (that could diverge a partially-migrated lineage) and
+/// instead keeps waiting for the incumbent to finish or recover.
+#[derive(Default, Clone, Copy)]
+struct HandoffPending {
+    /// Recovery-tick passes remaining before giving up and falling back to the
+    /// legacy self-promote (only when NOT joint-suspected).
+    deadline_ticks: u32,
+    /// The incumbent reported it may have committed the joint config but not the
+    /// final uniform one; never self-promote over this — wait it out.
+    joint_suspected: bool,
+}
+
+/// Recovery-tick passes a returning owner waits for an in-flight hand-off before
+/// falling back to the legacy self-promote. At ~500 ms/pass this is ~6 s, safely
+/// longer than the incumbent's learner catch-up ([`HANDOFF_CATCHUP_TIMEOUT`]) plus
+/// the membership change, so a working hand-off is never pre-empted.
+const HANDOFF_PENDING_TICKS: u32 = 12;
+
+/// Max wall time the incumbent polls a hand-off learner toward zero replication
+/// lag before aborting (and letting the owner fall back to self-promote). Bounded
+/// so a learner that cannot catch up under load never blocks the hand-off forever.
+const HANDOFF_CATCHUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(4000);
+
+/// Poll interval for the incumbent's learner-lag catch-up loop.
+const HANDOFF_LAG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Replication lag (in log entries) at or below which a hand-off learner is
+/// considered caught up enough to promote to voter. Small non-zero slack so a
+/// steady trickle of writes (e.g. completions, which are not write-gated) doesn't
+/// make the loop chase a perpetually-moving last-log index.
+const HANDOFF_LAG_THRESHOLD: u64 = 64;
 
 /// Cross-pass state for the leader-durable recovery supervisor
 /// ([`ServerImpl::leader_durable_recovery_tick`]). One instance lives for the
@@ -7505,6 +7571,25 @@ impl ServerImpl {
                 state.misses.remove(&p);
                 continue;
             }
+            // Leadership hand-off reclaim (opt-in, NANOBPMN_RECLAIM_HANDOFF): a
+            // REACHABLE peer leads a partition we own — it is the failover
+            // incumbent. Rather than form a competing fresh single-voter group
+            // (two lineages fighting elections under load = the term storm), ask
+            // the incumbent to hand leadership back via an openraft membership
+            // change (it catches us up as a learner, then change_membership's the
+            // vote to us and steps down). While that is in flight we suppress the
+            // legacy self-promote below; if the incumbent declines or the hand-off
+            // times out (without a joint-config suspicion) we fall through to the
+            // legacy path.
+            if self.reclaim_via_handoff
+                && let Some(l) = leader
+                && l != me
+                && topology.is_local(p)
+                && self.peer_reachable(l as u32).await
+                && self.request_handoff_or_wait(p, l as u32).await
+            {
+                continue;
+            }
             // Reclaim solicitation (Option A): a peer leads a partition we own.
             // Solicit its promotion epoch NOW, during the grace window, so we adopt
             // it (via `handle_promotion`) before we promote — then `next_promotion_epoch`
@@ -7761,70 +7846,334 @@ impl ServerImpl {
         }
     }
 
-    /// Incumbent side of the leadership hand-off (Phase C fills this in). A
-    /// rejoining owner asked us to hand `partition` back to it via an openraft
-    /// membership change. Phase B stub: no behavior — the hand-off is not yet
-    /// driven by anything, so this only records the inbound request for tracing.
+    /// Incumbent side of the leadership hand-off. A rejoining owner asked us to
+    /// hand `partition` back via an openraft membership change instead of forming
+    /// a competing group. We must ACTUALLY raft-lead `partition` to hand it off;
+    /// we reserve the per-partition hand-off lease (also the create write-gate),
+    /// ack the requester, run [`perform_handoff`](Self::perform_handoff), then
+    /// report the terminal outcome. Concurrency-safe: a second request while one
+    /// is in flight is declined.
     pub(crate) async fn handle_handoff_request(
         &self,
         partition: u64,
         requester_node: u64,
         requester_addr: String,
     ) {
-        tracing::trace!(
-            partition,
-            requester_node,
-            %requester_addr,
-            "handoff request received (not yet handled — Phase C)"
-        );
+        // Must genuinely lead the group to hand it off.
+        if !self.i_lead_raft(partition) {
+            self.reply_handoff_ack(requester_node, partition, 0, false)
+                .await;
+            return;
+        }
+        // Reserve the per-partition hand-off lease (and engage the create
+        // write-gate). Declined if a hand-off for this partition is already in
+        // flight — never run two concurrent membership changes on one group.
+        if !self.acquire_handoff_lease(partition) {
+            let epoch = self.current_app_epoch(partition);
+            self.reply_handoff_ack(requester_node, partition, epoch, false)
+                .await;
+            return;
+        }
+        let incumbent_epoch = self.current_app_epoch(partition);
+        self.reply_handoff_ack(requester_node, partition, incumbent_epoch, true)
+            .await;
+
+        let result = self
+            .perform_handoff(partition, requester_node, requester_addr, incumbent_epoch)
+            .await;
+
+        // Release the lease / lift the write-gate regardless of outcome.
+        self.release_handoff_lease(partition);
+
+        match result {
+            Ok(new_epoch) => {
+                tracing::info!(
+                    partition,
+                    requester_node,
+                    new_epoch,
+                    "leadership hand-off complete: transferred to returning owner"
+                );
+                self.reply_handoff_complete(requester_node, partition, new_epoch)
+                    .await;
+            }
+            Err((joint_suspected, reason)) => {
+                tracing::warn!(
+                    partition,
+                    requester_node,
+                    joint_suspected,
+                    %reason,
+                    "leadership hand-off aborted"
+                );
+                self.reply_handoff_failed(requester_node, partition, joint_suspected, reason)
+                    .await;
+            }
+        }
+    }
+
+    /// Execute the leadership hand-off for `partition` to `requester_node`: add it
+    /// as a learner, poll it to within [`HANDOFF_LAG_THRESHOLD`] of our log (the
+    /// create write-gate is engaged so the log quiesces), then
+    /// `change_membership` the sole voter to it (which demotes us to a learner and
+    /// steps us down), and finally advance our epoch fence to `(incumbent + 1,
+    /// requester)` so a stale promote can't undo the transfer. Returns the new
+    /// epoch on success, or `(joint_suspected, reason)` on abort — where
+    /// `joint_suspected` means the membership change may be half-applied and the
+    /// requester must NOT fall back to forming a fresh group.
+    async fn perform_handoff(
+        &self,
+        partition: u64,
+        requester_node: u64,
+        requester_addr: String,
+        incumbent_epoch: u64,
+    ) -> Result<u64, (bool, String)> {
+        let Some(part) = self.raft.get(partition) else {
+            return Err((false, format!("no raft group for partition {partition}")));
+        };
+        let node = openraft::BasicNode::new(requester_addr);
+        // Set up replication to the returning owner (non-blocking).
+        if let Err(e) = part.add_learner(requester_node, node).await {
+            return Err((false, format!("add_learner: {e}")));
+        }
+        // Poll the learner toward zero lag, bounded by HANDOFF_CATCHUP_TIMEOUT.
+        // The write-gate keeps new creates off this partition so the log stops
+        // growing and the learner can converge.
+        let deadline = std::time::Instant::now() + HANDOFF_CATCHUP_TIMEOUT;
+        loop {
+            if !self.i_lead_raft(partition) {
+                return Err((false, "lost leadership during catch-up".to_string()));
+            }
+            if let Some(lag) = part.replication_lag(requester_node)
+                && lag <= HANDOFF_LAG_THRESHOLD
+            {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err((false, "learner catch-up timeout".to_string()));
+            }
+            tokio::time::sleep(HANDOFF_LAG_POLL).await;
+        }
+        // Transfer the vote to the requester. retain=true demotes us to a learner
+        // and steps us down; the requester becomes the sole voter/leader.
+        if let Err(e) = part.change_voters_to(vec![requester_node]).await {
+            // A failure may have left the group in the transient joint config
+            // (needs a quorum of BOTH voter sets) — flag it so the requester waits
+            // rather than diverging with a fresh group.
+            let joint = part.in_joint_config();
+            return Err((joint, format!("change_membership: {e}")));
+        }
+        // Advance our fence to (incumbent + 1, requester) so a later stale
+        // Promote/SolicitPromotions naming us can't re-adopt and undo the transfer.
+        let new_epoch = incumbent_epoch + 1;
+        {
+            let mut map = self.promotion_epoch.lock().unwrap();
+            let cur = map.get(&partition).map(|(e, _)| *e).unwrap_or(0);
+            if new_epoch >= cur {
+                map.insert(partition, (new_epoch, requester_node));
+            }
+        }
+        Ok(new_epoch)
     }
 
     /// Requester side: the incumbent acknowledged (or declined) our hand-off
-    /// request (Phase D fills this in). Phase B stub: no behavior.
+    /// request. On accept we rebuild our member for `partition` as a fresh receiver
+    /// so the incumbent can replicate to us as a learner (our own competing group
+    /// would otherwise reject its log, and the catch-up would never converge). On a
+    /// decline (`accepted = false`) we clear the pending marker so the recovery
+    /// tick's legacy self-promote can proceed.
     pub(crate) async fn handle_handoff_ack(
         &self,
         partition: u64,
         incumbent_epoch: u64,
         accepted: bool,
     ) {
-        tracing::trace!(
-            partition,
-            incumbent_epoch,
-            accepted,
-            "handoff ack received (not yet handled — Phase D)"
-        );
+        tracing::debug!(partition, incumbent_epoch, accepted, "hand-off ack");
+        if !accepted {
+            self.handoff_pending.lock().unwrap().remove(&partition);
+            return;
+        }
+        // We must not already lead: become a clean receiver of the incumbent so its
+        // add_learner + catch-up can converge to zero lag before it transfers the
+        // vote to us. Idempotent enough — a repeated ack rebuilds again harmlessly.
+        let incumbent = self
+            .promotion_epoch
+            .lock()
+            .unwrap()
+            .get(&partition)
+            .map(|(_, leader)| *leader)
+            .unwrap_or(u64::MAX);
+        self.rebuild_as_receiver(partition, incumbent).await;
     }
 
-    /// Requester side: the incumbent completed the hand-off; we now lead
-    /// `partition` (Phase D fills this in). Phase B stub: no behavior.
+    /// Requester side: the incumbent completed the hand-off — we are now the sole
+    /// voter/leader of `partition`. Adopt the new epoch fence (so a stale promote
+    /// can't undo it) and clear the pending marker.
     pub(crate) async fn handle_handoff_complete(
         &self,
         partition: u64,
         epoch: u64,
         new_leader: u64,
     ) {
-        tracing::trace!(
+        {
+            let mut map = self.promotion_epoch.lock().unwrap();
+            let cur = map.get(&partition).map(|(e, _)| *e).unwrap_or(0);
+            if epoch >= cur {
+                map.insert(partition, (epoch, new_leader));
+            }
+        }
+        self.handoff_pending.lock().unwrap().remove(&partition);
+        tracing::info!(
             partition,
             epoch,
-            new_leader,
-            "handoff complete received (not yet handled — Phase D)"
+            "leadership hand-off received: this node now leads the partition"
         );
     }
 
-    /// Requester side: the incumbent aborted the hand-off (Phase D fills this in).
-    /// Phase B stub: no behavior.
+    /// Requester side: the incumbent aborted the hand-off. If it may have left the
+    /// group in a joint config (`joint_suspected`), we keep the pending marker
+    /// (and flag it) so we do NOT fall back to a fresh self-promote over a
+    /// partially-migrated lineage; otherwise we clear it so the recovery tick's
+    /// legacy self-promote can proceed.
     pub(crate) async fn handle_handoff_failed(
         &self,
         partition: u64,
         joint_suspected: bool,
         reason: String,
     ) {
-        tracing::trace!(
-            partition,
-            joint_suspected,
-            %reason,
-            "handoff failed received (not yet handled — Phase D)"
-        );
+        tracing::warn!(partition, joint_suspected, %reason, "hand-off failed");
+        let mut pending = self.handoff_pending.lock().unwrap();
+        if joint_suspected {
+            if let Some(hp) = pending.get_mut(&partition) {
+                hp.joint_suspected = true;
+            }
+        } else {
+            pending.remove(&partition);
+        }
+    }
+
+    /// The app-promotion epoch this node currently holds for `partition` if it
+    /// names us as leader, else 0. Used by the incumbent to tell the requester
+    /// which epoch to fence above.
+    fn current_app_epoch(&self, partition: u64) -> u64 {
+        let me = self.engine.topology().node_id as u64;
+        self.promotion_epoch
+            .lock()
+            .unwrap()
+            .get(&partition)
+            .filter(|(_, leader)| *leader == me)
+            .map(|(e, _)| *e)
+            .unwrap_or(0)
+    }
+
+    /// Reserve the per-partition incumbent hand-off lease (and engage the create
+    /// write-gate). Returns `false` if a hand-off for `partition` is already in
+    /// flight.
+    fn acquire_handoff_lease(&self, partition: u64) -> bool {
+        self.handoff_gated.lock().unwrap().insert(partition)
+    }
+
+    /// Release the incumbent hand-off lease and lift the create write-gate for
+    /// `partition`.
+    fn release_handoff_lease(&self, partition: u64) {
+        self.handoff_gated.lock().unwrap().remove(&partition);
+    }
+
+    /// Whether `partition` is currently create-write-gated by an in-flight
+    /// incumbent hand-off (new creates are steered off it so its log quiesces).
+    fn handoff_write_gated(&self, partition: u64) -> bool {
+        let gated = self.handoff_gated.lock().unwrap();
+        !gated.is_empty() && gated.contains(&partition)
+    }
+
+    /// Fire-and-forget a hand-off ack to the requesting owner.
+    async fn reply_handoff_ack(
+        &self,
+        to: u64,
+        partition: u64,
+        incumbent_epoch: u64,
+        accepted: bool,
+    ) {
+        if let Ok(link) = self.peers.link(to as u32).await {
+            link.send_handoff_ack(partition, incumbent_epoch, accepted)
+                .await
+                .ok();
+        }
+    }
+
+    /// Fire-and-forget a hand-off completion to the requesting owner.
+    async fn reply_handoff_complete(&self, to: u64, partition: u64, epoch: u64) {
+        if let Ok(link) = self.peers.link(to as u32).await {
+            link.send_handoff_complete(partition, epoch, to).await.ok();
+        }
+    }
+
+    /// Fire-and-forget a hand-off failure to the requesting owner.
+    async fn reply_handoff_failed(
+        &self,
+        to: u64,
+        partition: u64,
+        joint_suspected: bool,
+        reason: String,
+    ) {
+        if let Ok(link) = self.peers.link(to as u32).await {
+            link.send_handoff_failed(partition, joint_suspected, reason)
+                .await
+                .ok();
+        }
+    }
+
+    /// Requester side, driven by the recovery tick: a reachable failover incumbent
+    /// `incumbent` leads our owned `partition`. Ask it for a leadership hand-off
+    /// and suppress the legacy self-promote while it is in flight. Returns `true`
+    /// if the caller should NOT self-promote this pass (a hand-off is in flight or
+    /// still catching up), `false` if it should fall back to the legacy path
+    /// (incumbent declined, or the hand-off timed out without a joint-config
+    /// suspicion).
+    async fn request_handoff_or_wait(&self, partition: u64, incumbent: u32) -> bool {
+        // Fast path: the transfer already landed and we now lead — clear and stop.
+        if self.i_lead_raft(partition) {
+            self.handoff_pending.lock().unwrap().remove(&partition);
+            return false;
+        }
+        let start = {
+            let mut pending = self.handoff_pending.lock().unwrap();
+            match pending.get_mut(&partition) {
+                None => {
+                    pending.insert(
+                        partition,
+                        HandoffPending {
+                            deadline_ticks: HANDOFF_PENDING_TICKS,
+                            joint_suspected: false,
+                        },
+                    );
+                    true
+                }
+                Some(hp) => {
+                    if hp.joint_suspected {
+                        // Never self-promote over a partially-migrated lineage.
+                        return true;
+                    }
+                    hp.deadline_ticks = hp.deadline_ticks.saturating_sub(1);
+                    if hp.deadline_ticks == 0 {
+                        pending.remove(&partition);
+                        return false; // give up -> legacy self-promote
+                    }
+                    false
+                }
+            }
+        };
+        if start {
+            let me = self.engine.topology().node_id as u64;
+            let addr = self
+                .engine
+                .topology()
+                .peer_addr(me as u32)
+                .unwrap_or("")
+                .to_string();
+            if let Ok(link) = self.peers.link(incumbent).await {
+                link.send_request_handoff(partition, me, addr).await.ok();
+            }
+        }
+        true
     }
 
     /// Switch the runtime SLA mode from an operator action on THIS node (the
@@ -7965,7 +8314,26 @@ impl ServerImpl {
         // Rebuild our member for `p` as a fresh receiver so the new leader can
         // replicate to us (a learner of the OLD group would reject the new leader's
         // lower-term, fresh log). No initialize: we only receive.
+        if self.rebuild_as_receiver(p, leader_node).await {
+            tracing::info!(
+                "leader-durable: node {me} rejoined partition {p} as a learner of node {leader_node} (epoch {epoch})"
+            );
+        } else {
+            tracing::error!(
+                "leader-durable: node {me} failed to rejoin partition {p} after promotion"
+            );
+        }
+    }
+
+    /// Rebuild this node's member for `p` as a fresh receiver (uninitialized —
+    /// receive-only) of `leader_node`'s group, replacing any existing member. A
+    /// learner of an OLD lineage would reject a new leader's lower-term fresh log,
+    /// so on adopting a new leader (a promotion or a leadership hand-off) we tear
+    /// our member down and rebuild it clean so replication resumes. Returns whether
+    /// the rebuild succeeded.
+    async fn rebuild_as_receiver(&self, p: u64, leader_node: u64) -> bool {
         use crate::raft::RaftPartition;
+        let me = self.engine.topology().node_id as u64;
         let engine = match self.engine_handle_for(p) {
             Some(h) => h,
             None => self.replica_engine_for(p).await,
@@ -7981,13 +8349,13 @@ impl ServerImpl {
         {
             Ok(part) => {
                 self.raft.insert(Arc::new(part));
-                tracing::info!(
-                    "leader-durable: node {me} rejoined partition {p} as a learner of node {leader_node} (epoch {epoch})"
-                );
+                let _ = leader_node;
+                true
             }
-            Err(e) => tracing::error!(
-                "leader-durable: node {me} failed to rejoin partition {p} after promotion: {e}"
-            ),
+            Err(e) => {
+                tracing::error!("node {me} failed to rebuild partition {p} as receiver: {e}");
+                false
+            }
         }
     }
 
@@ -9315,6 +9683,14 @@ impl ServerImpl {
         (u16, String),
     > {
         let led = self.led_partitions();
+        // Create write-gate: while this node (as a failover incumbent) is handing a
+        // partition back to its returning owner, steer new creates OFF that
+        // partition so its raft log quiesces and the hand-off learner can catch up
+        // to zero lag. Cheap: the gate set is empty on the hot path.
+        let led: Vec<u64> = led
+            .into_iter()
+            .filter(|&p| !self.handoff_write_gated(p))
+            .collect();
         let Some(p) = self.engine.for_create_among(&led) else {
             return Err((503, "this node leads no partition; retry".to_string()));
         };
@@ -16582,6 +16958,92 @@ mod clustered_startup_tests {
                  entry and does not actually raft-lead the partition"
             );
         }
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leadership_handoff_transfers_a_partition_back_to_the_returning_owner() {
+        // The leadership hand-off (NANOBPMN_RECLAIM_HANDOFF): when a rejoining owner
+        // reclaims a partition led by a reachable failover incumbent, the incumbent
+        // hands leadership back via an openraft membership change — ONE raft lineage
+        // throughout — instead of the owner forming a competing group. This proves
+        // the end-to-end incumbent path: add the owner as a learner, catch it up,
+        // change_membership the vote to it, step down, and advance the epoch fence.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // node 1 is the failover incumbent: it genuinely raft-leads partition 0 at
+        // epoch 1 (node 0, the static owner, is treated as having been down). The
+        // promote broadcast pulls node 0 in as a receiver of node 1's group.
+        assert_eq!(node1.next_promotion_epoch(0), 1);
+        node1.promote_partition(0, 1).await;
+        let mut leads = false;
+        for _ in 0..300 {
+            if node1.i_lead_raft(0) {
+                leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leads, "the incumbent genuinely raft-leads partition 0");
+
+        // The returning owner requests the hand-off (simulated: invoke the
+        // incumbent's request handler directly with node 0 as the requester).
+        let owner_addr = node0
+            .engine
+            .topology()
+            .peer_addr(0)
+            .expect("node 0 has an address")
+            .to_string();
+        node1.handle_handoff_request(0, 0, owner_addr).await;
+
+        // The owner ends up the sole voter/leader of partition 0.
+        let mut owner_leads = false;
+        for _ in 0..400 {
+            if node0.i_lead_raft(0) {
+                owner_leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            owner_leads,
+            "the returning owner leads partition 0 after the hand-off"
+        );
+
+        // The incumbent stepped down (no longer raft-leads) and both nodes fence at
+        // (incumbent_epoch + 1, owner) so a stale promote can't undo the transfer.
+        assert!(
+            !node1.i_lead_raft(0),
+            "the incumbent stepped down to a learner after handing off"
+        );
+        assert_eq!(
+            node1.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((2, 0)),
+            "the incumbent advanced its fence to (2, owner)"
+        );
+        let mut owner_fence = None;
+        for _ in 0..200 {
+            owner_fence = node0.promotion_epoch.lock().unwrap().get(&0).copied();
+            if owner_fence == Some((2, 0)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            owner_fence,
+            Some((2, 0)),
+            "the owner adopted the (2, owner) fence from the hand-off completion"
+        );
 
         for node in [&node0, &node1, &node2] {
             for p in 0..3u64 {
