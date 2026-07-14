@@ -7,16 +7,28 @@ import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 import {
-  projectsApi,
+  compileProject,
+  createProjectPath,
+  deleteProjectPath,
+  getProject,
+  listProjectFiles,
+  runProject,
+  saveProjectConfig,
+  saveProjectFile,
+  setActiveRunConfig,
+  stopProject,
+  type FileNode,
+  type ProjectDetail,
+  type ProjectConfig,
+  type RunState,
+} from "../gen";
+import {
   projectLogs,
   exportProject,
   deployXml,
   createProcessInstance,
   fetchDeployedXmlByProcessId,
-  type FileNode,
-  type ProjectDetail,
-  type ProjectConfig,
-  type RunState,
+  projectFileEx,
   type ProjectLogLine,
   type ProjectFile,
 } from "../lib/api";
@@ -81,7 +93,7 @@ export default function ProjectWorkspace() {
 
   const reloadFiles = useCallback(async () => {
     try {
-      const res = await projectsApi.projectFiles(name);
+      const res = (await listProjectFiles({ path: { name }, throwOnError: true })).data;
       setDetail((d) => (d ? { ...d, files: res.files } : d));
     } catch {
       /* ignore */
@@ -90,7 +102,7 @@ export default function ProjectWorkspace() {
 
   const load = useCallback(async () => {
     try {
-      const d = await projectsApi.project(name);
+      const d = (await getProject({ path: { name }, throwOnError: true })).data;
       setDetail(d);
       setRunState(d.runState);
       setError(null);
@@ -136,7 +148,7 @@ export default function ProjectWorkspace() {
     if (!active) return;
     const t = setInterval(async () => {
       try {
-        const d = await projectsApi.project(name);
+        const d = (await getProject({ path: { name }, throwOnError: true })).data;
         setRunState(d.runState);
       } catch {
         /* ignore */
@@ -169,7 +181,7 @@ export default function ProjectWorkspace() {
 
   const changeRunConfig = async (id: string | null) => {
     try {
-      await projectsApi.setActiveRunConfig(name, id);
+      await setActiveRunConfig({ path: { name }, body: { id }, throwOnError: true });
       void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -179,14 +191,14 @@ export default function ProjectWorkspace() {
   const run = async () => {
     setLogs([]);
     try {
-      setRunState(await projectsApi.runProject(name));
+      setRunState((await runProject({ path: { name }, throwOnError: true })).data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
   const stop = async () => {
     try {
-      setRunState(await projectsApi.stopProject(name));
+      setRunState((await stopProject({ path: { name }, throwOnError: true })).data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -212,7 +224,7 @@ export default function ProjectWorkspace() {
       (!detail?.config.lang || detail.config.lang === "deno");
     if (!isDenoProject) {
       try {
-        await projectsApi.compileProject(name, []);
+        await compileProject({ path: { name }, body: { targets: [] }, throwOnError: true });
         void load();
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -421,7 +433,7 @@ function FileBrowser({
     );
     if (!base) return;
     try {
-      await projectsApi.createProjectPath(name, base, dir);
+      await createProjectPath({ path: { name }, body: { path: base, dir }, throwOnError: true });
       onChanged();
       if (!dir) onSelect(base);
     } catch (e) {
@@ -431,7 +443,7 @@ function FileBrowser({
   const del = async (path: string) => {
     if (!confirm(`Delete ${path}?`)) return;
     try {
-      await projectsApi.deleteProjectPath(name, path);
+      await deleteProjectPath({ path: { name }, query: { path }, throwOnError: true });
       onChanged();
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
@@ -619,8 +631,7 @@ function EditorPane({
     setBpmnView("visual");
     setBpmnXml("");
     bpmnXmlDirtyRef.current = false;
-    projectsApi
-      .projectFileEx(name, path)
+    projectFileEx(name, path)
       .then((f) => {
         if (!alive) return;
         setMeta(f);
@@ -654,7 +665,7 @@ function EditorPane({
       else if (kind === "bpmn" && bpmnRef.current) body = await bpmnRef.current.getXml();
       else if (kind === "dmn" && dmnRef.current) body = await dmnRef.current.getXml();
       else if (kind === "form" && formRef.current) body = await formRef.current.getSchema();
-      await projectsApi.saveProjectFile(name, path, body);
+      await saveProjectFile({ path: { name }, query: { path }, body, throwOnError: true });
       setContent(body);
       setDirty(false);
       if (kind === "bpmn") {
@@ -1176,14 +1187,18 @@ function ConfigModal({
         const k = key.trim();
         if (k) env[k] = value;
       }
-      const cfg = await projectsApi.saveProjectConfig(name, {
-        ...config,
-        description: desc,
-        deployTarget,
-        main,
-        platforms: selected,
-        env,
-      });
+      const cfg = (await saveProjectConfig({
+        path: { name },
+        body: {
+          ...config,
+          description: desc,
+          deployTarget,
+          main,
+          platforms: selected,
+          env,
+        },
+        throwOnError: true,
+      })).data;
       onSaved(cfg);
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
@@ -1281,7 +1296,7 @@ function CompileModal({
   const compile = async () => {
     setBusy(true);
     try {
-      await projectsApi.compileProject(name, selected);
+      await compileProject({ path: { name }, body: { targets: selected }, throwOnError: true });
       onStarted();
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));

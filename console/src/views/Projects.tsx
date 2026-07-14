@@ -1,6 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { projectsApi, type ProjectSummary, type ProjectTemplate } from "../lib/api";
+import {
+  createProject,
+  deleteProject,
+  listProjects,
+  renameProject,
+  type ProjectSummary,
+  type ProjectTemplate,
+} from "../gen";
 import { Button, Card, EmptyState, Input, PageHeader, inputClass } from "../components/ui";
 
 /// Mirrors the server's `is_safe_name` (console/workspace.rs) so the New Project
@@ -40,7 +47,7 @@ export default function Projects() {
 
   const reload = useCallback(async () => {
     try {
-      const res = await projectsApi.projects();
+      const res = (await listProjects({ throwOnError: true })).data;
       setProjects(res.projects);
       setDenoAvailable(res.denoAvailable);
       setTemplates(res.templates ?? []);
@@ -61,7 +68,10 @@ export default function Projects() {
     if (!name || nameError) return;
     setBusy(true);
     try {
-      await projectsApi.createProject(name, newDesc.trim(), newTemplate);
+      await createProject({
+        body: { name, description: newDesc.trim(), template: newTemplate },
+        throwOnError: true,
+      });
       navigate(`/projects/${encodeURIComponent(name)}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -78,7 +88,7 @@ export default function Projects() {
   const remove = async (name: string) => {
     if (!confirm(`Delete project “${name}” and all its files? This cannot be undone.`)) return;
     try {
-      await projectsApi.deleteProject(name);
+      await deleteProject({ path: { name }, throwOnError: true });
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -89,7 +99,7 @@ export default function Projects() {
     const next = prompt(`Rename “${name}” to:`, name)?.trim();
     if (!next || next === name) return;
     try {
-      await projectsApi.renameProject(name, next);
+      await renameProject({ path: { name }, body: { newName: next }, throwOnError: true });
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));

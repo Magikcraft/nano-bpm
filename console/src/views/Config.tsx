@@ -1,12 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  configApi,
+  getIdeConfig,
+  getServerConfig,
+  setSlaMode,
   type ConfigDependency,
   type IdeConfig,
   type LangPackConfig,
   type ServerConfig,
   type SlaModeConfig,
-} from "../lib/api";
+} from "../gen";
 import { useTheme } from "../theme/ThemeProvider";
 import { TOKEN_KEYS, type ThemeSpec } from "../theme/themes";
 import { Button, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
@@ -235,7 +237,9 @@ function ServerPane() {
   const [mode, setMode] = useState<"basic" | "advanced">("basic");
 
   useEffect(() => {
-    configApi.server().then(setCfg).catch((e) => setErr(String(e)));
+    getServerConfig({ throwOnError: true })
+      .then(({ data }) => setCfg(data))
+      .catch((e) => setErr(String(e)));
   }, []);
 
   if (err) return <ErrorText>{err}</ErrorText>;
@@ -313,9 +317,8 @@ function SlaPedal({
     if (!sla.switchable) return;
     setApplyErr(null);
     setApplying(true);
-    configApi
-      .setSla(mode)
-      .then(onApplied)
+    setSlaMode({ body: { mode }, throwOnError: true })
+      .then(({ data }) => onApplied(data))
       .catch((e) => {
         setApplyErr(String(e));
         setPreview(sla.current);
@@ -550,7 +553,9 @@ function IdePane() {
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
-    configApi.ide().then(setCfg).catch((e) => setErr(String(e)));
+    getIdeConfig({ throwOnError: true })
+      .then(({ data }) => setCfg(data))
+      .catch((e) => setErr(String(e)));
   }, []);
 
   if (err) return <ErrorText>{err}</ErrorText>;

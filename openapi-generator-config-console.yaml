@@ -1,0 +1,7 @@
+# OpenAPI Generator configuration for the console API Rust (rust-axum) layer.
+# Mirrors openapi-generator-config.yaml (the main Camunda REST surface) but
+# emits a separate crate for the hand-authored console API under
+# spec-console/console-api.yaml.
+packageName: nanobpm-console-api
+packageVersion: 0.1.0
+hideGenerationTimestamp: true

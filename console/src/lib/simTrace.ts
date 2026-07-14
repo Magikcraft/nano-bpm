@@ -4,7 +4,7 @@ import type {
   TraceIncident,
   TraceJob,
   TraceOutcome,
-} from "./api";
+} from "../gen";
 
 /// A flattened wasm engine event: `{ seq, now, type, ...snake_case fields }`.
 /// Produced by `TestEngine.events()`.
