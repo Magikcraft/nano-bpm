@@ -441,6 +441,60 @@ pub enum ClientFrame {
     SolicitPromotions {
         from_node: u64,
     },
+    /// **Leadership hand-off — request (owner → incumbent).** A rejoining static
+    /// owner asks the current failover leader of `partition` to hand leadership
+    /// back via a real openraft membership change (add the owner as a learner,
+    /// catch it up, then `change_membership` to it) rather than the owner forming
+    /// a competing fresh single-voter group. This avoids the two-lineage election
+    /// war (competing groups driving each other's raft term up under load).
+    /// `requester_node`/`requester_addr` identify the returning owner so the
+    /// incumbent can add it as a learner. Answered with [`HandoffAck`] then a
+    /// terminal [`HandoffComplete`]/[`HandoffFailed`].
+    #[serde(rename_all = "camelCase")]
+    RequestHandoff {
+        partition: u64,
+        requester_node: u64,
+        requester_addr: String,
+    },
+    /// **Leadership hand-off — acknowledgement (incumbent → owner).** The incumbent
+    /// leader reserved its per-partition handoff lease and is starting the
+    /// hand-off (`accepted = true`), or declined because it does not raft-lead
+    /// `partition` or a hand-off/promotion is already in flight (`accepted =
+    /// false`). `incumbent_epoch` is the app-promotion epoch the incumbent holds,
+    /// so the owner can fence strictly above it if the hand-off later fails and it
+    /// must fall back to a self-promote.
+    #[serde(rename_all = "camelCase")]
+    HandoffAck {
+        partition: u64,
+        incumbent_epoch: u64,
+        accepted: bool,
+    },
+    /// **Leadership hand-off — success (incumbent → owner).** The incumbent's
+    /// `change_membership` committed the uniform config with the owner as the sole
+    /// voter; the incumbent has stepped down to a learner. `epoch` is the new
+    /// app-promotion epoch (`incumbent_epoch + 1`, naming the owner) the owner
+    /// must adopt so a later stale [`Promote`]/[`SolicitPromotions`] can't undo
+    /// the hand-off. After this the owner genuinely raft-leads `partition`.
+    #[serde(rename_all = "camelCase")]
+    HandoffComplete {
+        partition: u64,
+        epoch: u64,
+        new_leader: u64,
+    },
+    /// **Leadership hand-off — failure (incumbent → owner).** The incumbent
+    /// aborted the hand-off (learner catch-up timed out, it lost leadership, or a
+    /// membership step errored). `joint_suspected = true` means a
+    /// `change_membership` may have committed the JOINT config but not the final
+    /// uniform one, so the group could require a quorum of BOTH voter sets — the
+    /// owner MUST NOT fall back to forming a fresh competing group (that would
+    /// diverge), and should instead retry the hand-off / wait. `reason` is a short
+    /// human-readable diagnostic.
+    #[serde(rename_all = "camelCase")]
+    HandoffFailed {
+        partition: u64,
+        joint_suspected: bool,
+        reason: String,
+    },
 }
 
 /// The kind of entity a [`ClientFrame::GetByKey`] read targets, selecting which
@@ -1006,6 +1060,10 @@ async fn handle_client_frame(
         ClientFrame::SetSlaMode { .. } => "set_sla_mode",
         ClientFrame::PressureReport { .. } => "pressure_report",
         ClientFrame::SolicitPromotions { .. } => "solicit_promotions",
+        ClientFrame::RequestHandoff { .. } => "request_handoff",
+        ClientFrame::HandoffAck { .. } => "handoff_ack",
+        ClientFrame::HandoffComplete { .. } => "handoff_complete",
+        ClientFrame::HandoffFailed { .. } => "handoff_failed",
     };
     crate::metrics::record_stream_frame(frame_type);
 
@@ -1755,6 +1813,52 @@ async fn handle_client_frame(
             // incumbent+1 and fences us in one round. Re-announce our standing
             // promotions to it. Fire-and-forget: no reply.
             server.answer_promotion_solicit(from_node).await;
+        }
+        ClientFrame::RequestHandoff {
+            partition,
+            requester_node,
+            requester_addr,
+        } => {
+            // A rejoining owner asks us (the incumbent leader) to hand leadership
+            // of `partition` back via an openraft membership change instead of it
+            // forming a competing group. Replies with HandoffAck then a terminal
+            // HandoffComplete/HandoffFailed. (Incumbent side — Phase C.)
+            server
+                .handle_handoff_request(partition, requester_node, requester_addr)
+                .await;
+        }
+        ClientFrame::HandoffAck {
+            partition,
+            incumbent_epoch,
+            accepted,
+        } => {
+            // The incumbent acknowledged (or declined) our hand-off request.
+            // (Requester side — Phase D.)
+            server
+                .handle_handoff_ack(partition, incumbent_epoch, accepted)
+                .await;
+        }
+        ClientFrame::HandoffComplete {
+            partition,
+            epoch,
+            new_leader,
+        } => {
+            // The incumbent completed the hand-off; we now lead `partition`. Adopt
+            // the new epoch so a stale promote can't undo it. (Requester side —
+            // Phase D.)
+            server
+                .handle_handoff_complete(partition, epoch, new_leader)
+                .await;
+        }
+        ClientFrame::HandoffFailed {
+            partition,
+            joint_suspected,
+            reason,
+        } => {
+            // The incumbent aborted the hand-off. (Requester side — Phase D.)
+            server
+                .handle_handoff_failed(partition, joint_suspected, reason)
+                .await;
         }
     }
 

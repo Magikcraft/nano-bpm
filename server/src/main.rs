@@ -7761,6 +7761,72 @@ impl ServerImpl {
         }
     }
 
+    /// Incumbent side of the leadership hand-off (Phase C fills this in). A
+    /// rejoining owner asked us to hand `partition` back to it via an openraft
+    /// membership change. Phase B stub: no behavior — the hand-off is not yet
+    /// driven by anything, so this only records the inbound request for tracing.
+    pub(crate) async fn handle_handoff_request(
+        &self,
+        partition: u64,
+        requester_node: u64,
+        requester_addr: String,
+    ) {
+        tracing::trace!(
+            partition,
+            requester_node,
+            %requester_addr,
+            "handoff request received (not yet handled — Phase C)"
+        );
+    }
+
+    /// Requester side: the incumbent acknowledged (or declined) our hand-off
+    /// request (Phase D fills this in). Phase B stub: no behavior.
+    pub(crate) async fn handle_handoff_ack(
+        &self,
+        partition: u64,
+        incumbent_epoch: u64,
+        accepted: bool,
+    ) {
+        tracing::trace!(
+            partition,
+            incumbent_epoch,
+            accepted,
+            "handoff ack received (not yet handled — Phase D)"
+        );
+    }
+
+    /// Requester side: the incumbent completed the hand-off; we now lead
+    /// `partition` (Phase D fills this in). Phase B stub: no behavior.
+    pub(crate) async fn handle_handoff_complete(
+        &self,
+        partition: u64,
+        epoch: u64,
+        new_leader: u64,
+    ) {
+        tracing::trace!(
+            partition,
+            epoch,
+            new_leader,
+            "handoff complete received (not yet handled — Phase D)"
+        );
+    }
+
+    /// Requester side: the incumbent aborted the hand-off (Phase D fills this in).
+    /// Phase B stub: no behavior.
+    pub(crate) async fn handle_handoff_failed(
+        &self,
+        partition: u64,
+        joint_suspected: bool,
+        reason: String,
+    ) {
+        tracing::trace!(
+            partition,
+            joint_suspected,
+            %reason,
+            "handoff failed received (not yet handled — Phase D)"
+        );
+    }
+
     /// Switch the runtime SLA mode from an operator action on THIS node (the
     /// console SLA knob), then fan the new mode out to every peer so the whole
     /// cluster runs one uniform admission policy. Applied locally first (so the

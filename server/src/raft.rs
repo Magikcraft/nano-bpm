@@ -1474,6 +1474,69 @@ impl RaftPartition {
         }
     }
 
+    /// Adds `node` as a learner and **blocks until it has caught up** to the
+    /// leader's log (openraft `blocking = true`), so a subsequent
+    /// [`change_voters_to`](Self::change_voters_to) that promotes it to voter
+    /// won't stall the group on a lagging replica. Used by the leadership
+    /// hand-off: the incumbent leader brings the returning owner fully in sync
+    /// as a learner BEFORE transferring the voting membership to it.
+    ///
+    /// CAUTION: under a sustained high write rate the learner may never catch up
+    /// (the log grows faster than replication) and this call can block
+    /// indefinitely — callers MUST wrap it in a timeout and quiesce writes for
+    /// the partition while it runs (the Phase C hand-off write-gate). Idempotent
+    /// against an already-present member.
+    pub async fn add_learner_blocking(
+        &self,
+        node_id: NodeId,
+        node: BasicNode,
+    ) -> anyhow::Result<()> {
+        match self.raft.add_learner(node_id, node, true).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("already") => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("add_learner_blocking({node_id}): {e}")),
+        }
+    }
+
+    /// Replaces this group's voting membership with exactly `voters` (openraft
+    /// `change_membership(ReplaceAllVoters, retain = true)`). Every current voter
+    /// NOT in `voters` is demoted to a **learner** (retained, not removed), and
+    /// if the current leader is among the demoted it steps down — this is how the
+    /// hand-off transfers leadership to the returning owner without ever forming
+    /// a competing group. Every id in `voters` MUST already be a learner of this
+    /// group (call [`add_learner_blocking`](Self::add_learner_blocking) first) or
+    /// openraft rejects it with `LearnerNotFound`.
+    ///
+    /// CAUTION: openraft commits this as a two-step joint change; if the leader
+    /// loses leadership or crashes between the joint and the final uniform commit
+    /// the group is left in the JOINT config (needs a quorum of BOTH the old and
+    /// new voter sets). Callers must treat a mid-flight failure as "joint
+    /// suspected" and NOT fall back to forming a fresh competing group (Phase D).
+    pub async fn change_voters_to(&self, voters: Vec<NodeId>) -> anyhow::Result<()> {
+        self.raft
+            .change_membership(voters, true)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("change_voters_to: {e}"))
+    }
+
+    /// The replication lag (in log entries) of learner/voter `node_id` behind
+    /// this leader's last log index, or `None` if we are not the leader or have
+    /// no replication record for `node_id` yet. Used by the hand-off to poll a
+    /// learner toward zero lag before promoting it to voter. Cheap: reads the
+    /// openraft metrics watch.
+    pub fn replication_lag(&self, node_id: NodeId) -> Option<u64> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        if m.state != openraft::ServerState::Leader {
+            return None;
+        }
+        let last = m.last_log_index.unwrap_or(0);
+        let repl = m.replication.as_ref()?;
+        let matched = repl.get(&node_id)?.as_ref().map(|l| l.index).unwrap_or(0);
+        Some(last.saturating_sub(matched))
+    }
+
     /// Replicates `command` (stamped with `now`) through the Raft log and applies
     /// it once committed, returning the events it produced. At RF=1 this commits
     /// as soon as the local log write lands. Routed through the per-partition

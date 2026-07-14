@@ -334,6 +334,71 @@ impl PeerLink {
             .await
     }
 
+    /// Fire-and-forget a leadership-hand-off request to this peer (the incumbent
+    /// leader), asking it to hand `partition` back to `requester_node` via an
+    /// openraft membership change. See [`ClientFrame::RequestHandoff`].
+    pub async fn send_request_handoff(
+        &self,
+        partition: u64,
+        requester_node: u64,
+        requester_addr: String,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::RequestHandoff {
+            partition,
+            requester_node,
+            requester_addr,
+        })
+        .await
+    }
+
+    /// Fire-and-forget a hand-off acknowledgement to the requesting owner (accept
+    /// + our epoch, or decline). See [`ClientFrame::HandoffAck`].
+    pub async fn send_handoff_ack(
+        &self,
+        partition: u64,
+        incumbent_epoch: u64,
+        accepted: bool,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::HandoffAck {
+            partition,
+            incumbent_epoch,
+            accepted,
+        })
+        .await
+    }
+
+    /// Fire-and-forget a hand-off completion to the requesting owner (it now leads
+    /// `partition` at `epoch`). See [`ClientFrame::HandoffComplete`].
+    pub async fn send_handoff_complete(
+        &self,
+        partition: u64,
+        epoch: u64,
+        new_leader: u64,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::HandoffComplete {
+            partition,
+            epoch,
+            new_leader,
+        })
+        .await
+    }
+
+    /// Fire-and-forget a hand-off failure to the requesting owner. See
+    /// [`ClientFrame::HandoffFailed`].
+    pub async fn send_handoff_failed(
+        &self,
+        partition: u64,
+        joint_suspected: bool,
+        reason: String,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::HandoffFailed {
+            partition,
+            joint_suspected,
+            reason,
+        })
+        .await
+    }
+
     /// Forwards a `createProcessInstance` to this peer (it creates on one of its
     /// own partitions). `await_completion` is intentionally unsupported here —
     /// it resolves over an async `InstanceCompleted` frame, wired in a later
