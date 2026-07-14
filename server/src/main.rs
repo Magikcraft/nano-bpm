@@ -1804,6 +1804,17 @@ const HANDOFF_LAG_POLL: std::time::Duration = std::time::Duration::from_millis(5
 /// make the loop chase a perpetually-moving last-log index.
 const HANDOFF_LAG_THRESHOLD: u64 = 64;
 
+/// Phase E (boot-as-receiver) probe window: on (re)boot a node solicits its
+/// co-replicas for owned partitions a peer currently leads (a live failover
+/// incumbent) before forming its own groups. Bounded so a cold start — where no
+/// peer answers because none has promoted — proceeds to normal `initialize` after
+/// at most this delay. A rejoin discovers the incumbent well within it (a solicit
+/// reply is one partition-network RTT).
+const HANDOFF_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Poll/re-solicit interval for the Phase E boot incumbent probe.
+const HANDOFF_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Cross-pass state for the leader-durable recovery supervisor
 /// ([`ServerImpl::leader_durable_recovery_tick`]). One instance lives for the
 /// whole supervisor loop (or a test's drive sequence).
@@ -7308,6 +7319,21 @@ impl ServerImpl {
             // staggered boot into the simultaneous-boot case, which forms cleanly.
             server.settle_before_forming(&topology).await;
 
+            // Phase E (boot-as-receiver, NANOBPMN_RECLAIM_HANDOFF): before forming
+            // our own groups, probe co-replicas for owned partitions a peer
+            // currently leads (a live failover incumbent from a recent outage). For
+            // those we must NOT `initialize` a competing single-voter group — that
+            // is the two-lineage election war that spins raft terms up under load.
+            // We leave the member uninitialized (a receiver) so the recovery tick
+            // drives an openraft leadership hand-off back to us instead. Owned
+            // partitions with no incumbent (cold start / genuine ownership) are
+            // initialized normally. Empty (no skips) when the flag is off.
+            let handoff_incumbents = if server.reclaim_via_handoff {
+                server.probe_incumbents_for_owned(&topology).await
+            } else {
+                std::collections::HashSet::new()
+            };
+
             // Form each group this node leads from its replica set. `initialize`
             // is idempotent and does not require peers to be up (they catch up via
             // replication), but we retry to ride out a transient failure.
@@ -7325,6 +7351,16 @@ impl ServerImpl {
                 let Some(part) = server.raft_registry().get(p) else {
                     continue;
                 };
+                // Phase E: a reachable peer leads this owned partition — defer to a
+                // leadership hand-off (recovery tick) instead of forming a competing
+                // group. Leave the member an uninitialized receiver.
+                if handoff_incumbents.contains(&p) {
+                    tracing::info!(
+                        "raft: node {} deferring partition {p} to leadership hand-off (a peer leads it)",
+                        topology.node_id,
+                    );
+                    continue;
+                }
                 let all_replicas = topology.replicas_of(p);
                 // Voter set: every replica in `quorum`, leader-only in
                 // `leader-durable`.
@@ -7382,6 +7418,73 @@ impl ServerImpl {
             // (once per node) to bound the payload-bearing Raft log by bytes and
             // reclaim it at idle — beyond what the entry-count snapshot policy does.
             crate::raft::spawn_compaction_governor(server.raft_registry().clone());
+        }
+    }
+
+    /// Phase E boot incumbent probe (NANOBPMN_RECLAIM_HANDOFF). Before a (re)booting
+    /// node forms its own single-voter groups, it asks each co-replica for the
+    /// promotion epochs that peer currently raft-leads ([`solicit_promotions_from`]).
+    /// A reply naming a peer as leader of a partition WE own is a live failover
+    /// incumbent from our recent outage; adopting it ([`handle_promotion`]) also
+    /// rebuilds our member for that partition as a receiver. Returns the set of
+    /// owned partitions with a live, reachable incumbent — the caller skips
+    /// `initialize` for those so no competing lineage forms (the recovery tick then
+    /// requests an openraft leadership hand-off instead). Bounded by
+    /// [`HANDOFF_PROBE_WINDOW`]: on a cold start no peer answers (none has promoted),
+    /// so the set is empty and every owned group forms normally after the window.
+    async fn probe_incumbents_for_owned(
+        &self,
+        topology: &crate::cluster::Topology,
+    ) -> std::collections::HashSet<u64> {
+        use std::collections::HashSet;
+        let me = topology.node_id as u64;
+        let owned: Vec<u64> = topology
+            .replica_partitions()
+            .into_iter()
+            .filter(|&p| topology.leader_of(p) == topology.node_id)
+            .collect();
+        if owned.is_empty() {
+            return HashSet::new();
+        }
+        // Distinct co-replica peers to solicit for our owned partitions.
+        let mut targets: Vec<u32> = owned
+            .iter()
+            .flat_map(|&p| topology.replicas_of(p))
+            .filter(|&n| n != topology.node_id)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            return HashSet::new();
+        }
+        let deadline = std::time::Instant::now() + HANDOFF_PROBE_WINDOW;
+        loop {
+            for &t in &targets {
+                if self.peer_reachable(t).await {
+                    self.solicit_promotions_from(t).await;
+                }
+            }
+            tokio::time::sleep(HANDOFF_PROBE_POLL).await;
+            // Owned partitions whose adopted epoch names a peer (not us).
+            let candidates: Vec<(u64, u32)> = {
+                let map = self.promotion_epoch.lock().unwrap();
+                owned
+                    .iter()
+                    .filter_map(|&p| match map.get(&p) {
+                        Some(&(_, l)) if l != me => Some((p, l as u32)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let mut live = HashSet::new();
+            for (p, l) in candidates {
+                if self.peer_reachable(l).await {
+                    live.insert(p);
+                }
+            }
+            if live.len() == owned.len() || std::time::Instant::now() >= deadline {
+                return live;
+            }
         }
     }
 
@@ -7572,23 +7675,55 @@ impl ServerImpl {
                 continue;
             }
             // Leadership hand-off reclaim (opt-in, NANOBPMN_RECLAIM_HANDOFF): a
-            // REACHABLE peer leads a partition we own — it is the failover
-            // incumbent. Rather than form a competing fresh single-voter group
-            // (two lineages fighting elections under load = the term storm), ask
-            // the incumbent to hand leadership back via an openraft membership
-            // change (it catches us up as a learner, then change_membership's the
-            // vote to us and steps down). While that is in flight we suppress the
-            // legacy self-promote below; if the incumbent declines or the hand-off
-            // times out (without a joint-config suspicion) we fall through to the
-            // legacy path.
-            if self.reclaim_via_handoff
-                && let Some(l) = leader
-                && l != me
-                && topology.is_local(p)
-                && self.peer_reachable(l as u32).await
-                && self.request_handoff_or_wait(p, l as u32).await
-            {
-                continue;
+            // REACHABLE peer is the failover incumbent for a partition we own.
+            // Rather than form a competing fresh single-voter group (two lineages
+            // fighting elections under load = the term storm), ask the incumbent to
+            // hand leadership back via an openraft membership change (it catches us
+            // up as a learner, then change_membership's the vote to us and steps
+            // down). While that is in flight we suppress the legacy self-promote
+            // below; if the incumbent declines or the hand-off times out (without a
+            // joint-config suspicion) we fall through to the legacy path.
+            //
+            // The incumbent is the local raft leader if it is a reachable peer,
+            // ELSE the app-epoch map's named leader if reachable. The map covers the
+            // Phase E boot-as-receiver case: our member is an uninitialized receiver
+            // (no competing group formed at boot), so `current_leader` is not yet the
+            // peer — but the boot probe / solicit adopted the incumbent epoch, so the
+            // map names it. Without the map fallback the hand-off would never fire for
+            // a boot-deferred partition and it would self-promote a competing group.
+            if self.reclaim_via_handoff && topology.is_local(p) {
+                let candidate: Option<u32> = match leader {
+                    Some(l) if l != me => Some(l as u32),
+                    _ => self
+                        .promotion_epoch
+                        .lock()
+                        .unwrap()
+                        .get(&p)
+                        .map(|&(_, l)| l)
+                        .filter(|&l| l != me)
+                        .map(|l| l as u32),
+                };
+                let incumbent = match candidate {
+                    Some(l) if self.peer_reachable(l).await => Some(l),
+                    _ => None,
+                };
+                if let Some(inc) = incumbent {
+                    // Keep the incumbent epoch fresh, then request/await the hand-off.
+                    self.solicit_promotions_from(inc).await;
+                    if self.request_handoff_or_wait(p, inc).await {
+                        continue;
+                    }
+                } else if leader.is_none() {
+                    // Leaderless with no incumbent yet known: solicit ALL reachable
+                    // co-replicas so a live incumbent is discovered (and handed off
+                    // to) before we self-promote. Only if none answers across the
+                    // grace window do we fall through to a fresh self-promote.
+                    for n in topology.replicas_of(p) {
+                        if n != topology.node_id && self.peer_reachable(n).await {
+                            self.solicit_promotions_from(n).await;
+                        }
+                    }
+                }
             }
             // Reclaim solicitation (Option A): a peer leads a partition we own.
             // Solicit its promotion epoch NOW, during the grace window, so we adopt
@@ -17043,6 +17178,108 @@ mod clustered_startup_tests {
             owner_fence,
             Some((2, 0)),
             "the owner adopted the (2, owner) fence from the hand-off completion"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_tick_hands_off_a_boot_deferred_partition_from_the_epoch_map() {
+        // Phase E (boot-as-receiver): a rejoining owner that deferred forming its own
+        // group for an owned partition (a peer leads it) is a RECEIVER — its local
+        // raft member has no `current_leader` yet, but the boot probe/solicit adopted
+        // the incumbent epoch into the app map. The recovery tick must derive the
+        // incumbent FROM THE MAP (not just local `current_leader`) and drive an
+        // openraft leadership hand-off, NOT self-promote a competing group (the
+        // two-lineage election war). This proves the recovery tick reclaims a
+        // boot-deferred partition end-to-end via hand-off, with no fresh self-promote.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // node 1 is the failover incumbent: it genuinely raft-leads partition 0 at
+        // epoch 1 (node 0, the static owner, treated as having been down).
+        assert_eq!(node1.next_promotion_epoch(0), 1);
+        node1.promote_partition(0, 1).await;
+        let mut leads = false;
+        for _ in 0..300 {
+            if node1.i_lead_raft(0) {
+                leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leads, "the incumbent genuinely raft-leads partition 0");
+
+        // The promote broadcast makes node 0 adopt (1,1) and rebuild as a receiver —
+        // exactly the Phase E boot-deferred state: node 0 does NOT lead partition 0,
+        // its map names the incumbent, and it never formed a competing group.
+        for _ in 0..300 {
+            if node0.promotion_epoch.lock().unwrap().get(&0).copied() == Some((1, 1)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            node0.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((1, 1)),
+            "the returning owner adopted the incumbent epoch as a receiver"
+        );
+        assert!(
+            !node0.i_lead_raft(0),
+            "the returning owner is a receiver, not a competing leader, pre-reclaim"
+        );
+
+        // Drive node 0's recovery tick. With reclaim-via-handoff on, it derives the
+        // incumbent (node 1) from the map, requests the hand-off, and node 1 transfers
+        // leadership via an openraft membership change — no self-promote.
+        let mut state0 = RecoveryState::default();
+        let mut owner_leads = false;
+        for _ in 0..400 {
+            node0.leader_durable_recovery_tick(3, &mut state0).await;
+            if node0.i_lead_raft(0) {
+                owner_leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            owner_leads,
+            "the recovery tick reclaims the boot-deferred partition via hand-off"
+        );
+
+        // ONE lineage: the incumbent stepped down, and the fence advanced to
+        // (incumbent_epoch + 1, owner) — never a fresh self-promote at epoch 1.
+        assert!(
+            !node1.i_lead_raft(0),
+            "the incumbent stepped down to a learner after handing off"
+        );
+        assert_eq!(
+            node0
+                .promotion_epoch
+                .lock()
+                .unwrap()
+                .get(&0)
+                .map(|&(_, l)| l),
+            Some(0),
+            "the fence names the owner (node 0) as leader after the hand-off"
+        );
+        assert!(
+            node0
+                .promotion_epoch
+                .lock()
+                .unwrap()
+                .get(&0)
+                .map(|&(e, _)| e >= 2)
+                .unwrap_or(false),
+            "the owner reclaimed at incumbent_epoch + 1 (>= 2), not a fresh epoch-1 self-promote"
         );
 
         for node in [&node0, &node1, &node2] {
