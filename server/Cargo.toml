@@ -135,3 +135,13 @@ codegen-units = 16
 incremental = true
 strip = false
 
+
+# Vendored openraft 0.9.24 with a one-line correctness fix. Upstream 0.9.24 (the
+# latest 0.9.x) panics in `RaftCore::apply_to_state_machine` when a node rejoins a
+# loaded cluster: it guards only the `since == end` apply window, so a transient
+# degenerate `since > end` window indexes `entries[len - 1]` on an empty slice
+# (usize underflow) and permanently wedges that partition's Raft (leaderless).
+# The patch changes that guard to `since >= end`. See third_party/openraft-0.9.24
+# (only src/core/raft_core.rs differs from the crates.io release).
+[patch.crates-io]
+openraft = { path = "../third_party/openraft-0.9.24" }
