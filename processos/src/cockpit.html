@@ -352,6 +352,7 @@
   .pair-mode-badge.monitor { color: var(--po-warn); background: rgba(251,191,36,.14); }
   .pair-mode-badge.subagent { color: var(--po-info-soft); background: rgba(103,232,249,.14); }
   .pair-mode-badge.speculator { color: var(--po-accent-soft); background: rgba(240,171,252,.14); }
+  .pair-mode-badge.drafter { color: var(--po-ok); background: rgba(74,222,128,.14); }
   .tool-badge { font: 700 9.5px/1 inherit; text-transform: uppercase; letter-spacing: .05em; padding: 2px 7px; border-radius: 999px; vertical-align: 1px; }
   .tool-badge.python { color: var(--po-info-soft); background: rgba(56,189,248,.14); }
   .tool-badge.sql { color: var(--po-ok-soft); background: rgba(34,197,94,.14); }
@@ -1698,6 +1699,7 @@ const PAIR_MODES = [
   { v:'monitor', label:'Monitor — watches the live transcript & steers out of loops', kind:'monitor' },
   { v:'subagent', label:'Subagent — primary delegates research tasks to it', kind:'subagent' },
   { v:'speculator', label:'Speculator — drafts tokens to speed up the primary (speculative decoding)', kind:'pair' },
+  { v:'drafter', label:'Drafter — writes model IR under grammar constraint', kind:'drafter' },
 ];
 async function renderPairings(){
   STATE.view='pairings'; setActive(); main.innerHTML='Loading…';
@@ -1756,19 +1758,22 @@ function editPairing(id){
   const ro = p.builtin;
   const mode = p.mode||'pair';
   const spec = mode==='speculator';
+  const draft = mode==='drafter';
   let h = '<h2 style="margin-top:0">'+(isNew?'New pairing':'Edit pairing')+'</h2>';
   h += '<label class="lbl">Id</label><input id="prId" '+(isNew?'':'disabled')+' value="'+esc(p.id)+'" placeholder="e.g. skeptic-team" />';
   h += '<label class="lbl">Name</label><input id="prName" value="'+esc(p.name)+'" '+(ro?'disabled':'')+' placeholder="Shown in the composer" />';
   h += '<label class="lbl">Mode</label><select id="prMode" '+(ro?'disabled':'')+' onchange="onPairingModeChange()">'
     + PAIR_MODES.map(m=>'<option value="'+m.v+'"'+(m.v===mode?' selected':'')+'>'+esc(m.label)+'</option>').join('')
     + '</select>';
-  h += '<label class="lbl" id="prSecondaryLbl">'+(spec?'Draft model (must be a local sidecar)':'Second model (the paired LLM)')+'</label><select id="prSecondary" '+(ro?'disabled':'')+'>'
+  h += '<label class="lbl" id="prSecondaryLbl">'+(spec?'Draft model (must be a local sidecar)':(draft?'IR writer model (local sidecar)':'Second model (the paired LLM)'))+'</label><select id="prSecondary" '+(ro?'disabled':'')+'>'
     + pairProfileOptions(p.secondaryProfileId, PAIR_PROFILES.length?null:'No profiles configured') + '</select>';
   h += '<label class="lbl">Primary model <span class="muted" style="font-weight:400">(optional \u2014 set for a full team, or leave blank to keep your current model)</span></label><select id="prPrimary" '+(ro?'disabled':'')+'>'
     + pairProfileOptions(p.primaryProfileId||'', 'Use current / default primary') + '</select>';
   // Chat-collaboration config (prompt/templates/tools) \u2014 hidden for speculator pairings, whose
-  // second model never chats: it only drafts tokens inside the primary's llama-server.
-  h += '<div id="prChatCfg" style="display:'+(spec?'none':'block')+'">';
+  // second model never chats: it only drafts tokens inside the primary's llama-server. A drafter
+  // keeps a prompt (its IR-writer persona) but exposes no tool surface \u2014 it runs a single
+  // grammar-constrained completion, not a tool loop.
+  h += '<div id="prChatCfg" style="display:'+((spec)?'none':'block')+'">';
   // Inline prompt + a "start from template" picker drawn from built-in/authored personas of this mode.
   h += '<label class="lbl">Second model\u2019s prompt</label>';
   h += '<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px"><span class="muted" style="font-size:12px">Start from template:</span><select id="prTemplate" '+(ro?'disabled':'')+' onchange="applyPairingTemplate()"></select></div>';
@@ -1780,11 +1785,17 @@ function editPairing(id){
     + '<label class="muted" style="font-size:12px" title="Tool-loop budget per delegated task (1\u201330).">rounds <input type="number" id="prRounds" min="1" max="30" value="'+esc(p.maxRounds||8)+'" style="width:56px" '+(ro?'disabled':'')+'></label>'
     + '<label class="muted" style="font-size:12px" title="Max chars of digest fed back to the primary (500\u201320000).">digest <input type="number" id="prDigest" min="500" max="20000" step="500" value="'+esc(p.digestCap||4000)+'" style="width:72px" '+(ro?'disabled':'')+'></label>'
     + '</div></div>';
+  // Drafter-only note: no tools, output constrained by the checked-in IR grammar.
+  h += '<div id="prDraftNote" style="display:'+(draft?'block':'none')+';margin-top:10px">'
+    + '<div class="muted" style="font-size:12px">This model writes model IR under a formal grammar constraint \u2014 it runs a single completion (no tool loop) and contributes no prose. The primary gets a <code>draft_ir</code> tool that hands it a plain-language instruction and gets back well-formed IR to review and deploy. Output is constrained by the <a href="/api/ir/grammar.gbnf" target="_blank" style="color:var(--po-accent-strong)">IR grammar \u2192</a>. Leave the prompt blank to use the built-in IR-writer persona.</div>'
+    + '</div>';
   // Per-model tool selection: which tools each model in the pairing may use (empty = all).
+  h += '<div id="prToolsCfg" style="display:'+(draft?'none':'block')+'">';
   h += '<label class="lbl" style="margin-top:12px">Tools for the second model <span class="muted" style="font-weight:400">(none selected = all available)</span></label>'
     + toolMultiSelect('prSecondaryTools', p.secondaryTools);
   h += '<label class="lbl">Tools for the primary model <span class="muted" style="font-weight:400">(none selected = all available)</span></label>'
     + toolMultiSelect('prPrimaryTools', p.primaryTools);
+  h += '</div>';
   h += '</div>';
   // Speculator-only config: draft-token tuning + how the pairing is validated and applied.
   h += '<div id="prSpecAdv" style="display:'+(spec?'block':'none')+';margin-top:10px">'
@@ -1811,12 +1822,15 @@ function editPairing(id){
 function onPairingModeChange(){
   const mode = ($('#prMode')||{}).value || 'pair';
   const spec = mode==='speculator';
+  const draft = mode==='drafter';
   const show = (id, on) => { const el = document.getElementById(id); if(el) el.style.display = on?'block':'none'; };
   show('prChatCfg', !spec);
   show('prSpecAdv', spec);
   show('prSubAdv', mode==='subagent');
+  show('prDraftNote', draft);
+  show('prToolsCfg', !draft);
   const lbl = document.getElementById('prSecondaryLbl');
-  if(lbl) lbl.textContent = spec ? 'Draft model (must be a local sidecar)' : 'Second model (the paired LLM)';
+  if(lbl) lbl.textContent = spec ? 'Draft model (must be a local sidecar)' : (draft ? 'IR writer model (local sidecar)' : 'Second model (the paired LLM)');
   fillPairingTemplates(mode);
 }
 // Refresh the template dropdown to the personas matching the selected mode.
@@ -1883,8 +1897,14 @@ async function savePairing(){
     if(!isNaN(dmax)) body.draftMax = dmax;
     if(!isNaN(dmin)) body.draftMin = dmin;
   }
+  if(mode==='drafter'){
+    // A drafter carries a prompt (its IR-writer persona) but no tool surface \u2014 it runs a
+    // single grammar-constrained completion, not a tool loop.
+    body.primaryTools = null;
+    body.secondaryTools = null;
+  }
   if(!body.id){ alert('Id is required.'); return; }
-  if(!body.secondaryProfileId){ alert('Pick a '+(mode==='speculator'?'draft':'second')+' model for this pairing.'); return; }
+  if(!body.secondaryProfileId){ alert('Pick a '+(mode==='speculator'?'draft':(mode==='drafter'?'IR writer':'second'))+' model for this pairing.'); return; }
   try { await api('/api/pairings', {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}); }
   catch(e){ alert('Save failed: '+(e.message||e)); return; }
   const ps = await api('/api/pairings'); PAIRINGS = Array.isArray(ps)?ps:[]; drawPairings(body.id);
@@ -4349,6 +4369,13 @@ function subRequest(){
   if(!p || p.mode!=='subagent') return null;
   return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined, maxRounds: p.maxRounds || undefined, digestCap: p.digestCap || undefined, tools: (p.secondaryTools&&p.secondaryTools.length)?p.secondaryTools:undefined };
 }
+// The selected drafter pairing as a per-turn request, or null. A drafter offers the primary a
+// `draft_ir` tool backed by a small local IR writer running under grammar constraint.
+function drafterRequest(){
+  const p = selectedPairing();
+  if(!p || p.mode!=='drafter') return null;
+  return { enabled:true, profileId: p.secondaryProfileId || undefined, system: (p.system||'').trim() || undefined, name: p.name || undefined };
+}
 // The selected speculator pairing, or null. Unlike the chat-level modes above it produces no
 // per-turn request — it changes how the PRIMARY sidecar is *launched* (draft model attached via
 // --model-draft), so only the sidecar helpers consume it.
@@ -4376,6 +4403,7 @@ function partnerProfileIds(){
   const pr = pairRequest(); if(pr && pr.profileId) ids.add(pr.profileId);
   const mr = monitorRequest(); if(mr && mr.profileId) ids.add(mr.profileId);
   const sr = subRequest(); if(sr && sr.profileId) ids.add(sr.profileId);
+  const dr = drafterRequest(); if(dr && dr.profileId) ids.add(dr.profileId);
   return ids;
 }
 // Repaint the composer's pairing selector + active-model roster (e.g. after the primary changes).
@@ -4408,6 +4436,7 @@ async function refreshChatRoster(){
   const pr = pairRequest(); if(pr && pr.profileId && byId[pr.profileId]) parts.push(chip(byId[pr.profileId], 'pair'));
   const mr = monitorRequest(); if(mr && mr.profileId && byId[mr.profileId]) parts.push(chip(byId[mr.profileId], 'monitor'));
   const sr = subRequest(); if(sr && sr.profileId && byId[sr.profileId]) parts.push(chip(byId[sr.profileId], 'subagent'));
+  const dr = drafterRequest(); if(dr && dr.profileId && byId[dr.profileId]) parts.push(chip(byId[dr.profileId], 'drafter'));
   // Speculator: not a chat partner — it rides inside the primary's llama-server. Green ⚡ once
   // the primary is actually running with a draft model loaded; dim until then.
   const sp = speculatorRequest();
@@ -4433,7 +4462,7 @@ async function reconcileSidecars(){
   const needed = new Set();
   const primary = byId[s.activeProfile];
   if(primary && primary.sidecar) needed.add(primary.id);
-  [pairRequest(), monitorRequest(), subRequest()].forEach(req => {
+  [pairRequest(), monitorRequest(), subRequest(), drafterRequest()].forEach(req => {
     if(req && req.profileId){ const p = byId[req.profileId]; if(p && p.sidecar) needed.add(p.id); }
   });
   let st; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ return; }
@@ -4458,7 +4487,7 @@ async function ensureSidecarsReady(onProgress){
   const primary = byId[s.activeProfile];
   if(primary && primary.sidecar) needed.set(primary.id, primary);
   const addPartner = (req) => { if(req && req.profileId){ const p = byId[req.profileId]; if(p && p.sidecar) needed.set(p.id, p); } };
-  addPartner(pairRequest()); addPartner(monitorRequest()); addPartner(subRequest());
+  addPartner(pairRequest()); addPartner(monitorRequest()); addPartner(subRequest()); addPartner(drafterRequest());
   if(!needed.size) return true;   // nothing local to start
 
   let st; try { st = await api('/api/llama/status') || {sidecars:[]}; } catch(e){ return true; }
@@ -4611,7 +4640,7 @@ async function sendChat(ws, proc){
     onErrorRestore: () => { box.value = msg; },
     fetchStream: () => fetch('/api/workspaces/'+encodeURIComponent(ws)+'/processes/'+encodeURIComponent(proc)+'/chat/stream'+qs, {
       method:'POST', headers:{'content-type':'application/json'},
-      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined, monitor: monitorRequest() || undefined, subagent: subRequest() || undefined, tools: primaryToolsForTurn() })
+      body: JSON.stringify({ message: msg, allowPython, personaId: ($('#chatPersona')||{}).value || undefined, pair: pairRequest() || undefined, monitor: monitorRequest() || undefined, subagent: subRequest() || undefined, drafter: drafterRequest() || undefined, tools: primaryToolsForTurn() })
     }),
   });
 }

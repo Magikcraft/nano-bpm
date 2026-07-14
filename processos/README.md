@@ -180,6 +180,22 @@ refusing the launch otherwise. In the composer, selecting a speculator pairing s
 restart) the primary with the draft attached; the roster shows a **⚡ speculator** chip and the LLMs
 view a **⚡ speculating** pill while active.
 
+**Drafter pairings — a fifth pairing mode.** Alongside review/monitor/delegate/speculate, a pairing
+can be a **drafter**: a small local sidecar paired to **write model IR under grammar constraint**.
+It is the *app-level* sibling of the speculator — the drafter contributes no prose and runs no tool
+loop. Selecting a drafter pairing in the composer offers the primary a **`draft_ir`** tool: the
+primary hands it a plain-language modelling instruction (and, optionally, existing IR to revise via
+`base`), and the drafter fires **one grammar-constrained completion** (the checked-in
+[`assets/ir.gbnf`](assets/ir.gbnf), served at `GET /api/ir/grammar.gbnf`, loaded as the request's
+`grammar` field at temperature 0) that returns well-formed IR. The result is parse-checked before it
+comes back, then the primary reviews it and deploys with `write_model_ir`. The point: **the grammar
+is a leveller** — a tiny model with GBNF emits valid IR as reliably as a large one, so a small local
+drafter is a credible partner to a larger local planner. To try it: create a pairing with mode
+**Drafter**, pick a small local model as the IR writer (leave the prompt blank to use the built-in
+IR-writer persona), select it in the composer's **Pair AI** picker, then ask the primary to build or
+restructure a process — it will call `draft_ir` and propose the drafted model. The roster shows a
+**drafter** chip while selected.
+
 **Missing-tool preflight.** ProcessOS shells out to two optional CLI tools it does **not** bundle:
 **`llama-server`** (llama.cpp — the local LLM sidecars above) and **Deno** (which the supervised
 Nano engine uses to run its embedded job workers). On startup the Console checks both via

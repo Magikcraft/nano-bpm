@@ -98,6 +98,10 @@ impl LlmProfile {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             thinking_level: self.thinking_level,
+            // Profiles do not carry a grammar today — grammar is per-*turn*, not per-*profile*,
+            // because a profile-wide grammar would break tool-call and prose turns. The write
+            // path opts in explicitly via a separate override.
+            grammar: None,
         }
     }
 

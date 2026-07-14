@@ -539,6 +539,7 @@ impl OpenAiAgent {
             "reasoning_control": true,
         });
         crate::harness::llm::apply_thinking_budget(&mut body, &self.cfg);
+        crate::harness::llm::apply_grammar(&mut body, &self.cfg);
         body
     }
 
@@ -1546,6 +1547,7 @@ mod tests {
             temperature: 0.2,
             frequency_penalty: 0.0,
             thinking_level: None,
+            grammar: None,
         };
         let agent = OpenAiAgent { cfg };
         let body = agent.request_body(&[Msg::User("hi".into())], &[], true);
