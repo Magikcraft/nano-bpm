@@ -376,10 +376,15 @@ pub struct ServerImpl {
     /// Latest composite create-load index gossiped by each peer node, keyed by
     /// node id (see [`placement`](crate::placement)). Populated only in
     /// [`PlacementMode::Balanced`] by the pressure-gossip tick; weighted placement
-    /// reads it to steer creates toward nodes with headroom. A missing entry is
-    /// treated as full headroom (an unprobed peer still receives traffic). Empty
-    /// otherwise — zero overhead.
-    peer_pressure: Arc<std::sync::Mutex<std::collections::HashMap<u32, i64>>>,
+    /// reads it to steer creates toward nodes with headroom. A missing *or stale*
+    /// entry is treated as full headroom (an unprobed peer still receives
+    /// traffic). Each entry is stamped with its arrival [`Instant`] so a peer that
+    /// stops gossiping — dead, restarting, or its gossip link starved under load —
+    /// expires after [`peer_pressure_ttl`] instead of pinning weighted placement to
+    /// its last pre-silence value forever (the rejoin zero-creates trap: a node
+    /// that shed just before death would otherwise be steered away from
+    /// indefinitely). Empty otherwise — zero overhead.
+    peer_pressure: Arc<std::sync::Mutex<std::collections::HashMap<u32, (i64, std::time::Instant)>>>,
     /// Persistent smoothing state for the smooth weighted round-robin (SWRR) that
     /// drives load-aware create placement ([`PlacementMode::Balanced`]). One slot
     /// per partition; carried across placement decisions so equal weights yield an
@@ -9891,21 +9896,39 @@ impl ServerImpl {
     }
 
     /// Record a peer's gossiped create-load index (ADR 0014 pressure gossip).
-    /// Overwrites the previous value for that node; weighted placement reads the
-    /// latest. Only invoked in `PlacementMode::Balanced`.
+    /// Overwrites the previous value for that node and restamps its freshness;
+    /// weighted placement reads the latest within [`peer_pressure_ttl`]. Only
+    /// invoked in `PlacementMode::Balanced`.
     pub(crate) fn record_peer_pressure(&self, node: u32, load: i64) {
         if let Ok(mut map) = self.peer_pressure.lock() {
-            map.insert(node, load);
+            map.insert(node, (load, std::time::Instant::now()));
         }
     }
 
     /// The latest create-load index gossiped by peer `node`, or `None` if that
-    /// peer has not reported yet (treated by placement as full headroom).
+    /// peer has not reported *recently* (never reported, or its last report is
+    /// older than [`peer_pressure_ttl`]) — both cases treated by placement as
+    /// full headroom. The TTL is what lets a rejoining node re-enter create
+    /// placement within a couple of gossip intervals: its stale pre-death value
+    /// (often SHED) expires instead of steering all creates away forever.
     pub(crate) fn peer_load(&self, node: u32) -> Option<i64> {
+        let ttl = peer_pressure_ttl();
         self.peer_pressure
             .lock()
             .ok()
             .and_then(|m| m.get(&node).copied())
+            .filter(|(_, at)| at.elapsed() < ttl)
+            .map(|(load, _)| load)
+    }
+
+    /// Test-only: record a peer's create-load index stamped at an explicit
+    /// instant, so freshness/TTL expiry can be exercised deterministically
+    /// without sleeping or racing the wall clock.
+    #[cfg(test)]
+    pub(crate) fn record_peer_pressure_at(&self, node: u32, load: i64, at: std::time::Instant) {
+        if let Ok(mut map) = self.peer_pressure.lock() {
+            map.insert(node, (load, at));
+        }
     }
 
     /// `InstanceCompleted` frame. Reuses the REST await path verbatim.
@@ -10783,6 +10806,22 @@ fn placement_gossip_interval() -> std::time::Duration {
         .filter(|&n| n > 0)
         .unwrap_or(500);
     std::time::Duration::from_millis(ms)
+}
+
+/// Number of gossip intervals a peer-pressure reading stays authoritative.
+const PEER_PRESSURE_TTL_INTERVALS: u32 = 4;
+
+/// How long a gossiped peer-pressure reading stays authoritative before weighted
+/// placement reverts that peer to full-headroom. Derived from the gossip interval
+/// so it scales with the configured cadence: several intervals of tolerance so a
+/// single skipped tick (the gossip loop uses `MissedTickBehavior::Skip` under
+/// load) does not expire a live peer, yet a peer that truly goes silent — killed,
+/// restarting, or its gossip frame starved on a saturated link — clears within a
+/// second or two. This is the freshness guard that lets a rejoining node
+/// re-enter create placement promptly instead of being pinned out by the SHED
+/// value it gossiped just before it died.
+fn peer_pressure_ttl() -> std::time::Duration {
+    placement_gossip_interval().saturating_mul(PEER_PRESSURE_TTL_INTERVALS)
 }
 
 /// Renders a body as a single-line, length-prefixed preview for logging,
@@ -12925,6 +12964,44 @@ mod clustered_startup_tests {
         assert!(
             loaded < healthy,
             "a loaded peer ({loaded}) must receive fewer creates than a healthy one ({healthy})"
+        );
+    }
+
+    #[test]
+    fn stale_peer_pressure_expires_to_full_headroom_on_rejoin() {
+        // Rejoin regression (#1 zero-creates): a peer that shed (SHED_LOAD) just
+        // before it died must not be steered away from forever. Once its last
+        // gossip is older than the TTL, weighted placement reverts it to full
+        // headroom so a returning node re-enters create placement — even if its
+        // fresh post-restart gossip is briefly delayed on a saturated link.
+        let node0 = clustered_node(0);
+
+        // Fresh SHED reading → never placed on (baseline: the pre-death state).
+        node0.record_peer_pressure(1, crate::placement::SHED_LOAD);
+        assert_eq!(node0.peer_load(1), Some(crate::placement::SHED_LOAD));
+        assert_eq!(
+            node0.next_create_placement_weighted(&[]),
+            None,
+            "a freshly-shedding peer must not receive weighted placement"
+        );
+
+        // Backdate that SHED reading beyond the TTL: the peer has gone silent.
+        let stale = std::time::Instant::now() - (peer_pressure_ttl() + Duration::from_secs(1));
+        node0.record_peer_pressure_at(1, crate::placement::SHED_LOAD, stale);
+        assert_eq!(
+            node0.peer_load(1),
+            None,
+            "a peer-pressure reading older than the TTL must read as absent (full headroom)"
+        );
+
+        // With the stale SHED expired, the returning peer is treated as headroom
+        // and receives a meaningful share of creates again.
+        let recovered = (0..1_000)
+            .filter(|_| node0.next_create_placement_weighted(&[]) == Some(1))
+            .count();
+        assert!(
+            recovered > 0,
+            "a peer whose stale SHED expired must re-enter create placement ({recovered} creates)"
         );
     }
 
