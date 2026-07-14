@@ -7428,8 +7428,25 @@ impl ServerImpl {
             }
             // A live leader resets the counter. "Live" means present AND, if it is
             // a peer, reachable — a metric still naming a dead leader does not count.
+            //
+            // EXCEPTION — reclaim of a statically-owned partition: routing is
+            // static (`leader_of == owner_of`), so every create/activation for a
+            // partition this node owns is sent HERE regardless of who actually
+            // leads the Raft group. If a *peer* leads a partition we own, it is a
+            // stale failover leader from our recent outage: the owner is back but
+            // traffic routed to it hits a mere learner and is `leader_reject`ed —
+            // the partition takes zero creates and cannot drain (observed: a
+            // rejoined owner stranded a subset of its partitions because a race let
+            // the failover leader's replication reach it before it self-promoted).
+            // Treat "a peer leads a partition I own" as NOT live so the reclaim
+            // path below fires: the owner self-promotes at `incumbent_epoch + 1`
+            // (it adopted the failover leader's epoch as a learner, so its next
+            // epoch strictly wins the fence) and the old leader steps down. During
+            // normal operation the owner leads its own partitions (`l == me`), so
+            // this never triggers; it is purely a post-failover reclaim.
             let leader_live = match leader {
                 Some(l) if l == me => true,
+                Some(_) if topology.is_local(p) => false,
                 Some(l) => self.peer_reachable(l as u32).await,
                 None => false,
             };
@@ -15754,6 +15771,184 @@ mod clustered_startup_tests {
         );
 
         for node in [&node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rejoined_owner_reclaims_a_partition_a_peer_leads() {
+        // Reclaim on rejoin. Routing is static (`leader_of == owner_of`), so every
+        // create/activation for a partition is sent to its OWNER regardless of which
+        // node actually leads the Raft group. After an outage a survivor self-promotes
+        // the owner's partition (failover); when the owner comes back, a race can let
+        // that failover leader's replication reach the owner FIRST, so the owner
+        // rebuilds as a mere learner reporting the peer as leader. Static routing then
+        // funnels the partition's traffic to the owner, which `leader_reject`s it as a
+        // learner: the partition takes zero creates and cannot drain (observed on a
+        // rejoined node: a subset of its owned partitions stranded their backlog). The
+        // recovery supervisor must treat "a peer leads a partition I OWN" as not-live
+        // so the owner reclaims (self-promotes) it. This proves that reclaim fires.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Seed partition-0 state and ship it to node 1 so the survivor can promote
+        // from a warm replica engine.
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("leader-durable create acks on the sole voter");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        let node1_p0 = node1
+            .engine_handle_for(0)
+            .expect("node 1 materializes a replica engine for partition 0");
+        let mut shipped = false;
+        for _ in 0..400 {
+            if node1_p0
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
+                })
+                .await
+            {
+                shipped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(shipped, "the create ships to node 1 before the outage");
+
+        // Outage: node 0's Raft groups go down and it is fault-injected unreachable
+        // from the survivors so node 1 becomes the deterministic successor. Unlike the
+        // auto-recovery test we do NOT abort node 0's serve task: the owner must stay
+        // dial-able so it can rejoin as a learner when it comes back (modelling the
+        // rejoin race, not a permanent death).
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        node1.peers.fail_node(0).await;
+        node2.peers.fail_node(0).await;
+
+        // Survivors run recovery; node 1 self-promotes partition 0 (node 0 is owner but
+        // unreachable, so node 1 is the successor). node 0's tick is NOT driven during
+        // the outage.
+        let mut misses1 = std::collections::HashMap::new();
+        let mut misses2 = std::collections::HashMap::new();
+        let mut established1 = std::collections::HashSet::new();
+        let mut established2 = std::collections::HashSet::new();
+        let mut promoted = false;
+        for _ in 0..200 {
+            node1
+                .leader_durable_recovery_tick(1, &mut misses1, &mut established1)
+                .await;
+            node2
+                .leader_durable_recovery_tick(1, &mut misses2, &mut established2)
+                .await;
+            if node1
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(1)
+            {
+                promoted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(promoted, "node 1 fails over partition 0 during the outage");
+
+        // Rejoin: node 0 comes back. Restore reachability, then reproduce the losing
+        // side of the race — node 1's failover leadership reaches node 0 first, so
+        // node 0 rebuilds as a LEARNER of node 1 (adopts epoch (1,1)) and its metrics
+        // report node 1 as the leader of a partition node 0 OWNS.
+        node1.peers.heal_node(0).await;
+        node2.peers.heal_node(0).await;
+        node0.handle_promotion(0, 1, 1).await;
+        let node0_addr = node1
+            .engine
+            .topology()
+            .peer_addr(0)
+            .expect("node 0 address")
+            .to_string();
+        node1
+            .raft_registry()
+            .get(0)
+            .expect("node 1 leads partition 0")
+            .add_learner(0, openraft::BasicNode::new(node0_addr))
+            .await
+            .ok();
+        let mut learner_ready = false;
+        for _ in 0..600 {
+            if node0
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(1)
+            {
+                learner_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            learner_ready,
+            "the rejoined owner ends up a learner reporting the peer as leader (the strand)"
+        );
+
+        // Drive the owner's recovery tick. WITHOUT the reclaim fix it would see a
+        // reachable peer leader and reset the miss counter forever, leaving the
+        // partition stranded. WITH the fix, a peer leading an OWNED partition counts as
+        // not-live, so the owner self-promotes at the next epoch and reclaims it.
+        let mut misses0 = std::collections::HashMap::new();
+        // The recovery supervisor's `established` set persists for the whole process
+        // life: node 0 formed partition 0 before its outage, so it is already marked
+        // established when the reclaim ticks run. (Seeding it faithfully; otherwise a
+        // reclaim tick that momentarily reads a leaderless learner would trip the
+        // never-established cold-start guard.)
+        let mut established0 = std::collections::HashSet::from([0u64]);
+        let mut reclaimed = false;
+        for _ in 0..600 {
+            node0
+                .leader_durable_recovery_tick(1, &mut misses0, &mut established0)
+                .await;
+            if node0
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(0)
+            {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            reclaimed,
+            "the rejoined owner reclaims (self-promotes) the partition a peer was leading"
+        );
+        assert!(
+            node0.led_partitions().contains(&0),
+            "serving follows the reclaimed leadership on the owner"
+        );
+        // The reclaim used a strictly higher epoch than the failover leader's (1,1) ->
+        // (2,0), so the fence resolves cleanly in the owner's favour.
+        assert_eq!(
+            node0.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((2, 0)),
+            "the owner reclaims at incumbent_epoch + 1, naming itself"
+        );
+
+        for node in [&node0, &node1, &node2] {
             for p in 0..3u64 {
                 if let Some(part) = node.raft_registry().get(p) {
                     part.raft.shutdown().await.ok();

@@ -724,6 +724,13 @@ impl PeerSet {
         self.links.lock().await.remove(&node_id);
     }
 
+    /// Fault injection (tests only): clear a prior `fail_node`, restoring
+    /// reachability so the peer can be dialed again (models a node rejoining
+    /// after an outage). Production code never calls this.
+    pub async fn heal_node(&self, node_id: u32) {
+        self.unreachable.lock().await.remove(&node_id);
+    }
+
     /// Returns a live link to peer `node_id`, dialing it if there is no cached
     /// link or the cached one has dropped. Concurrent callers for the same peer
     /// share the single in-flight dial (serialized by the map lock).
