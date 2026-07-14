@@ -105,6 +105,12 @@ pub struct LlmConfig {
     /// `thinking_budget_tokens`/`reasoning_budget` sized at that fraction of `max_tokens`.
     /// `None` leaves the model's reasoning unconstrained (the historical behaviour).
     pub thinking_level: Option<ThinkingLevel>,
+    /// Optional GBNF grammar to constrain the sampler for THIS config's calls (llama.cpp / vLLM
+    /// with grammar support). Prefer setting this per-request via [`LlmOverride::grammar`] on the
+    /// specific turn that produces constrained output (e.g. an IR write); a config-wide grammar
+    /// forces every completion to conform and will break free-form / tool-call turns. See
+    /// [`crate::ir_spec::ir_gbnf`] for the reversible-IR grammar.
+    pub grammar: Option<String>,
 }
 
 /// Per-request overrides (any subset) accepted on the hypothesize endpoint.
@@ -118,6 +124,10 @@ pub struct LlmOverride {
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
     pub thinking_level: Option<ThinkingLevel>,
+    /// Per-request GBNF grammar. Overrides any `LlmConfig::grammar`. Empty string clears the
+    /// grammar for this call (useful when a config-wide default is set). Only honoured for the
+    /// Openai provider — Anthropic's API has no GBNF equivalent and the field is ignored there.
+    pub grammar: Option<String>,
 }
 
 impl LlmConfig {
@@ -169,6 +179,7 @@ impl LlmConfig {
             temperature,
             frequency_penalty,
             thinking_level,
+            grammar: None,
         }
     }
 
@@ -200,6 +211,11 @@ impl LlmConfig {
         }
         if let Some(l) = o.thinking_level {
             self.thinking_level = Some(l);
+        }
+        if let Some(g) = o.grammar.as_ref() {
+            // Empty string is a meaningful override: "clear the config-wide default for THIS
+            // call". Non-empty replaces the default. Absent (None) leaves the default alone.
+            self.grammar = if g.is_empty() { None } else { Some(g.clone()) };
         }
         self
     }
@@ -241,6 +257,26 @@ pub fn apply_thinking_budget(body: &mut serde_json::Value, cfg: &LlmConfig) {
     }
 }
 
+/// Attach a GBNF grammar to an OpenAI-style request body when `cfg.grammar` is set.
+///
+/// llama.cpp's `/v1/chat/completions` (and `/completion`) accept a top-level `grammar` field —
+/// when present, the sampler is constrained to only produce tokens legal under that grammar.
+/// Unknown to a server that doesn't understand the field, it's harmless (ignored). The Openai
+/// hosted API does not support GBNF; setting `grammar` against it is a no-op there (the field
+/// is silently discarded server-side).
+///
+/// **This is a per-call constraint by design.** Use it on the specific turn that must produce
+/// constrained output (e.g. a write path emitting reversible IR); a config-wide grammar will
+/// break free-form / tool-call turns.
+pub fn apply_grammar(body: &mut serde_json::Value, cfg: &LlmConfig) {
+    let Some(g) = cfg.grammar.as_deref().filter(|s| !s.is_empty()) else {
+        return;
+    };
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("grammar".into(), json!(g));
+    }
+}
+
 /// Send a system+user prompt and return the model's text completion.
 pub async fn complete(cfg: &LlmConfig, system: &str, user: &str) -> Result<String, String> {
     if !cfg.is_ready() {
@@ -278,6 +314,7 @@ async fn complete_openai(
         ],
     });
     apply_thinking_budget(&mut body, cfg);
+    apply_grammar(&mut body, cfg);
     let mut req = client.post(&url).json(&body);
     if let Some(key) = &cfg.api_key {
         req = req.bearer_auth(key);
@@ -393,6 +430,7 @@ where
         ],
     });
     apply_thinking_budget(&mut body, cfg);
+    apply_grammar(&mut body, cfg);
     let mut req = client.post(&url).json(&body);
     if let Some(key) = &cfg.api_key {
         req = req.bearer_auth(key);
@@ -651,6 +689,7 @@ mod tests {
             temperature: 0.2,
             frequency_penalty: 0.0,
             thinking_level: None,
+            grammar: None,
         };
         let o = LlmOverride {
             provider: Some("anthropic".into()),
@@ -674,6 +713,7 @@ mod tests {
             temperature: 0.2,
             frequency_penalty: 0.0,
             thinking_level: None,
+            grammar: None,
         };
         let o = LlmOverride {
             base_url: Some("http://gpu-box.lan:8000/v1".into()),
@@ -710,6 +750,7 @@ mod tests {
             temperature: 0.2,
             frequency_penalty: 0.0,
             thinking_level: None,
+            grammar: None,
         };
         // No level → no fields added.
         let mut body = json!({ "model": "m" });
@@ -755,6 +796,7 @@ mod tests {
             temperature: 0.2,
             frequency_penalty: 0.0,
             thinking_level: None,
+            grammar: None,
         };
         let err = complete_streaming(&cfg, "sys", "user", |_| {}, |_| {})
             .await
@@ -773,6 +815,7 @@ mod tests {
             temperature: 0.2,
             frequency_penalty: 0.0,
             thinking_level: None,
+            grammar: None,
         };
         let err = complete_streaming(&cfg, "sys", "user", |_| {}, |_| {})
             .await

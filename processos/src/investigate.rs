@@ -62,6 +62,31 @@ pub struct SubAgent {
     pub model: Option<String>,
 }
 
+/// Configuration for the `draft_ir` tool: the primary can hand a plain-language modelling
+/// instruction to a small local sidecar that emits **model IR under GBNF grammar constraint**.
+/// Unlike [`SubAgent`] this runs NO tool loop — it is a single grammar-constrained completion,
+/// so the drafter needs only its connection + prompt. `None` ⇒ the tool is not offered.
+pub struct Drafter {
+    /// The drafter's LLM connection (its own profile — typically a small/fast local model). The
+    /// IR grammar is injected as `cfg.grammar` at call time, so the caller need not preset it.
+    pub cfg: LlmConfig,
+    /// Display name for provenance (cockpit attribution).
+    pub name: String,
+    /// The drafter's system prompt (empty ⇒ a built-in IR-writer default is used).
+    pub system: String,
+    /// The current BPMN model XML, if any, so the drafter can be shown the IR it is revising.
+    /// Filled in by [`run_chat_turn`] from the bound model; the request builder leaves it `None`.
+    pub model: Option<String>,
+}
+
+/// The default IR-writer prompt used when a [`Drafter`] pairing leaves `system` blank.
+const DRAFTER_SYSTEM: &str = "You are an IR writer for BPMN process models. You output ONLY a \
+    model-IR document — the compact textual form the engine round-trips to BPMN. Your output is \
+    constrained by a formal grammar, so every token you emit must be valid IR: emit the IR and \
+    NOTHING else (no prose, no code fences, no commentary). Honour the operator's instruction \
+    faithfully; when revising an existing IR keep unrelated elements intact. Give every node a \
+    stable id and a human-readable name.";
+
 /// A [`ToolBox`] exposing the read-only trace-analysis surface to the model, and
 /// optionally a (trusted) Python escape hatch and the BPMN model-analysis tools.
 pub struct AnalysisTools {
@@ -75,6 +100,8 @@ pub struct AnalysisTools {
     recorded: Option<crate::experiment::RecordedDataset>,
     /// When set, exposes the `delegate` tool so the primary can spawn a subagent.
     sub: Option<SubAgent>,
+    /// When set, exposes the `draft_ir` tool so the primary can commission grammar-constrained IR.
+    drafter: Option<Drafter>,
     /// Operator-authored custom tools (enabled defs) offered alongside the built-ins.
     custom: Vec<ToolDef>,
     /// A private CSV export dir for `subprocess` custom tools (`PROCESSOS_DATASET`). Built lazily
@@ -111,6 +138,7 @@ impl AnalysisTools {
             model: None,
             recorded: None,
             sub: None,
+            drafter: None,
             custom: Vec::new(),
             custom_data: None,
             model_path: None,
@@ -143,6 +171,7 @@ impl AnalysisTools {
             model: None,
             recorded: None,
             sub: None,
+            drafter: None,
             custom: Vec::new(),
             custom_data: None,
             model_path: None,
@@ -153,6 +182,11 @@ impl AnalysisTools {
     /// Attach a subagent so the `delegate` tool becomes available. A `None` leaves it off.
     pub fn set_subagent(&mut self, sub: Option<SubAgent>) {
         self.sub = sub;
+    }
+
+    /// Attach a drafter so the `draft_ir` tool becomes available. A `None` leaves it off.
+    pub fn set_drafter(&mut self, drafter: Option<Drafter>) {
+        self.drafter = drafter;
     }
 
     /// Attach the operator-authored custom tools (already filtered to enabled). For `subprocess`
@@ -634,6 +668,34 @@ impl ToolBox for AnalysisTools {
                 }),
             });
             specs.push(ToolSpec {
+                name: "describe_ir_grammar".into(),
+                description: "Return the reversible-IR grammar reference — what YOU CAN SAY in an \
+                    IR node or flow. Pull this on demand when you are ABOUT TO EDIT and unsure what \
+                    a construct's syntax is, or which attributes an element kind carries. This is \
+                    the CAN-map (context-free syntax) that complements analyze_model's \
+                    COULD-map (context-sensitive findings: this gateway needs a default, that node \
+                    is unreachable). With no argument returns the compact overview: every element \
+                    kind's keyword + one-line doc, the syntax skeletons for process/element/flow, \
+                    and the shared element-level extras (parent, retries, timer, input/output, \
+                    multiInstance). Pass kind:\"<keyword>\" (e.g. \"exclusiveGateway\", \
+                    \"serviceTask\", \"timerBoundaryEvent\") for a scoped payload with only that \
+                    kind's attributes and applicable flow annotations — cheaper to send per turn \
+                    than the whole grammar. Derived directly from the engine ADT via a parity \
+                    test, so this reference cannot silently fall behind the engine surface. \
+                    Args: kind (optional)."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "kind": {
+                            "type": "string",
+                            "description": "An IR element-kind keyword (e.g. \"serviceTask\", \
+                                \"exclusiveGateway\"). Omit for the whole-grammar overview."
+                        }
+                    }
+                }),
+            });
+            specs.push(ToolSpec {
                 name: "conformance_check".into(),
                 description: "Replay the mined trace behaviour against the BPMN MODEL and report \
                     where reality diverges from design: a transition-fitness score, nonconformant \
@@ -818,6 +880,37 @@ impl ToolBox for AnalysisTools {
                 }),
             });
         }
+        if self.drafter.is_some() {
+            specs.push(ToolSpec {
+                name: "draft_ir".into(),
+                description: "Commission a well-formed model-IR document from a small local IR \
+                    writer that emits under a formal GRAMMAR constraint (so its output is always \
+                    syntactically valid IR). Use this to WRITE or heavily EDIT a process from a \
+                    plain-language description — the drafter returns IR text you then review and \
+                    deploy with write_model_ir. Give a crisp modelling instruction; optionally \
+                    pass the current IR (from read_model_ir) as `base` to revise it in place. \
+                    Returns { ir, analysis } where `ir` is the drafted document (already \
+                    parse-checked) and `analysis` is its element/flow summary."
+                    .into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "instruction": {
+                            "type": "string",
+                            "description": "What to model, in plain language, with enough detail \
+                                to draft without your transcript (the flow, tasks, gateways, \
+                                events you want)."
+                        },
+                        "base": {
+                            "type": "string",
+                            "description": "Optional existing IR to revise (e.g. the text from \
+                                read_model_ir). Omit to draft from scratch."
+                        }
+                    },
+                    "required": ["instruction"]
+                }),
+            });
+        }
         // Operator-authored custom tools (already filtered to enabled).
         for def in &self.custom {
             specs.push(ToolSpec {
@@ -975,6 +1068,14 @@ impl ToolBox for AnalysisTools {
                 let v = crate::model_ir::write_model_ir(ir, base, process, di_source)?;
                 serde_json::to_string(&v).map_err(|e| format!("serialise write ir: {e}"))
             }
+            "describe_ir_grammar" => {
+                // Purely static — no dependency on the bound model or trace. Safe to call any
+                // time. Scoping keeps the payload small when the LLM already knows which kind
+                // it is editing.
+                let kind = args.get("kind").and_then(|v| v.as_str());
+                let v = crate::ir_spec::describe(kind);
+                serde_json::to_string(&v).map_err(|e| format!("serialise ir grammar: {e}"))
+            }
             "conformance_check" => {
                 let xml = self
                     .model
@@ -1069,6 +1170,70 @@ impl ToolBox for AnalysisTools {
                 })
                 .to_string())
             }
+            "draft_ir" => {
+                let drafter = self
+                    .drafter
+                    .as_ref()
+                    .ok_or("draft_ir is not enabled for this investigation")?;
+                let instruction = args["instruction"]
+                    .as_str()
+                    .ok_or("draft_ir requires a string 'instruction' argument")?
+                    .trim();
+                if instruction.is_empty() {
+                    return Err("draft_ir requires a non-empty 'instruction'".into());
+                }
+                let base = args.get("base").and_then(|v| v.as_str()).map(str::trim);
+                // The drafter runs as a SINGLE grammar-constrained completion (no tool loop):
+                // load the IR grammar into its cfg so llama-server rejects any non-IR token, use
+                // a near-deterministic temperature, and show it the current model + optional base
+                // IR. Runs on a fresh thread+runtime so it works under either runtime flavour.
+                let mut cfg = drafter.cfg.clone();
+                cfg.grammar = Some(crate::ir_spec::ir_gbnf().to_string());
+                cfg.temperature = 0.0;
+                let system = if drafter.system.trim().is_empty() {
+                    DRAFTER_SYSTEM.to_string()
+                } else {
+                    drafter.system.clone()
+                };
+                let mut user = String::new();
+                if let Some(b) = base.filter(|b| !b.is_empty()) {
+                    user.push_str("Revise this existing model IR:\n\n");
+                    user.push_str(b);
+                    user.push_str("\n\n");
+                } else if let Some(xml) = self.model.as_deref() {
+                    if let Ok(ir) = crate::model_ir::xml_to_ir(xml) {
+                        user.push_str("The current model, as IR, for reference:\n\n");
+                        user.push_str(&ir);
+                        user.push_str("\n\n");
+                    }
+                }
+                user.push_str("Instruction: ");
+                user.push_str(instruction);
+                user.push_str("\n\nEmit the complete model IR now.");
+                let drafted = std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| format!("drafter runtime: {e}"))?;
+                    rt.block_on(
+                        async move { crate::harness::llm::complete(&cfg, &system, &user).await },
+                    )
+                })
+                .join()
+                .map_err(|_| "drafter thread panicked".to_string())??;
+                let drafted = strip_ir_fences(&drafted);
+                // Belt-and-braces: GBNF guarantees the FORM, but the parser still catches
+                // semantic slips (missing required attrs, unknown flow refs). Surface a clear
+                // error to the primary so it can re-instruct rather than deploy broken IR.
+                let analysis = crate::model_ir::analyze_ir(&drafted)
+                    .map_err(|e| format!("drafted IR did not parse: {e}"))?;
+                Ok(serde_json::json!({
+                    "drafter": drafter.name,
+                    "ir": drafted,
+                    "analysis": analysis,
+                })
+                .to_string())
+            }
             other => {
                 if let Some(def) = self.custom.iter().find(|d| d.name == other) {
                     self.call_custom(def, args)
@@ -1090,6 +1255,22 @@ fn clip_digest(s: &str, cap: usize) -> String {
         end -= 1;
     }
     format!("{}\n…[digest truncated to {cap} chars]", &s[..end])
+}
+
+/// Strip a markdown code fence a chattier drafter may wrap its IR in despite the grammar (some
+/// runtimes let a leading ```/```ir slip in before grammar enforcement kicks in). Returns the
+/// inner body when a single fenced block is present, else the trimmed input unchanged.
+fn strip_ir_fences(s: &str) -> String {
+    let t = s.trim();
+    if let Some(rest) = t.strip_prefix("```") {
+        // Drop an optional language tag on the opening fence, then the trailing fence.
+        let rest = rest.split_once('\n').map(|x| x.1).unwrap_or("");
+        if let Some(body) = rest.rsplit_once("```") {
+            return body.0.trim().to_string();
+        }
+        return rest.trim().to_string();
+    }
+    t.to_string()
 }
 
 /// A lightweight [`ToolBox`] adapter that scopes a shared [`AnalysisTools`] to an **allowlist** of
@@ -1360,6 +1541,7 @@ pub async fn run_chat_turn(
     sink: &mut dyn FnMut(AgentEvent),
     pairs: &[PairStage],
     subagent: Option<SubAgent>,
+    drafter: Option<Drafter>,
     custom_tools: Vec<ToolDef>,
     primary_tools: Option<Vec<String>>,
     mut messages: Vec<Msg>,
@@ -1385,6 +1567,7 @@ pub async fn run_chat_turn(
         .map(|x| !x.trim().is_empty())
         .unwrap_or(false);
     let model_for_sub = model_xml.clone();
+    let model_for_drafter = model_xml.clone();
     tools.set_model(model_xml);
     if has_model {
         let cap = crate::experiment::recorded_cap(src);
@@ -1396,6 +1579,10 @@ pub async fn run_chat_turn(
         s.limit = limit;
         s.model = model_for_sub;
         s
+    }));
+    tools.set_drafter(drafter.map(|mut d| {
+        d.model = model_for_drafter;
+        d
     }));
     tools.set_custom_tools(custom_tools);
     tools.set_annotations(annotations);
@@ -1637,6 +1824,61 @@ mod tests {
     #[allow(dead_code)]
     fn _unused(_p: &Path) {}
 
+    fn dummy_cfg() -> LlmConfig {
+        LlmConfig {
+            provider: crate::harness::llm::Provider::Openai,
+            base_url: "http://127.0.0.1:8080/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            max_tokens: 256,
+            temperature: 0.2,
+            frequency_penalty: 0.0,
+            thinking_level: None,
+            grammar: None,
+        }
+    }
+
+    #[test]
+    fn draft_ir_tool_is_gated_on_an_attached_drafter() {
+        let mut tools = corpus_tools();
+        assert!(
+            !tools.specs().iter().any(|s| s.name == "draft_ir"),
+            "draft_ir must not be offered without a drafter"
+        );
+        tools.set_drafter(Some(Drafter {
+            cfg: dummy_cfg(),
+            name: "ir-writer".into(),
+            system: String::new(),
+            model: None,
+        }));
+        assert!(
+            tools.specs().iter().any(|s| s.name == "draft_ir"),
+            "draft_ir should be offered once a drafter is attached"
+        );
+        // Its schema requires the plain-language instruction.
+        let spec = tools
+            .specs()
+            .into_iter()
+            .find(|s| s.name == "draft_ir")
+            .unwrap();
+        let required = spec.parameters["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "instruction"));
+        // With no instruction the dispatch rejects before any network call.
+        assert!(tools.call("draft_ir", &json!({})).is_err());
+    }
+
+    #[test]
+    fn strip_ir_fences_unwraps_a_fenced_block() {
+        assert_eq!(strip_ir_fences("process \"p\" {}"), "process \"p\" {}");
+        assert_eq!(
+            strip_ir_fences("```ir\nprocess \"p\" {}\n```"),
+            "process \"p\" {}"
+        );
+        assert_eq!(
+            strip_ir_fences("```\nprocess \"p\" {}\n```"),
+            "process \"p\" {}"
+        );
+    }
     /// Build the python-enabled toolbox over the same real corpus.
     fn corpus_tools_py() -> AnalysisTools {
         let def = corpus::tests::loan_def();

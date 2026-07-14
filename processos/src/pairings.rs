@@ -43,6 +43,14 @@ pub enum PairMode {
     /// local sidecar GGUFs with compatible tokenizers/vocab; the API validates and refuses
     /// incompatible configs (see `gguf::speculator_compatible`).
     Speculator,
+    /// A small local sidecar that writes **model IR under GBNF grammar constraint**: the primary
+    /// gets a `draft_ir` tool; calling it fires ONE grammar-constrained completion on the secondary
+    /// (temperature ~0, the emitted `ir.gbnf` loaded as the `grammar` field) that returns a
+    /// well-formed IR document, which the primary reviews and deploys via `write_model_ir`. This is
+    /// the *app-level* sibling of [`PairMode::Speculator`]: the secondary contributes no prose and
+    /// runs no tool loop — the grammar is a "leveller" that lets a tiny model emit syntactically
+    /// valid IR as reliably as a large one. No `maxRounds` / `digestCap` / draft-token tuning apply.
+    Drafter,
 }
 
 /// One saved Pair AI configuration.
@@ -286,6 +294,56 @@ mod tests {
 
         store2.delete("skeptic-pair").expect("delete ok");
         assert!(store2.list().into_iter().all(|x| x.id != "skeptic-pair"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn drafter_pairing_round_trips_and_needs_secondary() {
+        let path =
+            std::env::temp_dir().join(format!("pairings-drafter-test-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let store = PairingStore::open(&path);
+        // A drafter must still name a second (IR-writer) model.
+        let no_secondary = Pairing {
+            id: "ir-drafter".into(),
+            name: "IR Drafter".into(),
+            mode: PairMode::Drafter,
+            secondary_profile_id: "  ".into(),
+            primary_profile_id: None,
+            system: String::new(),
+            max_rounds: None,
+            digest_cap: None,
+            draft_max: None,
+            draft_min: None,
+            primary_tools: None,
+            secondary_tools: None,
+            builtin: false,
+        };
+        assert!(store.upsert(no_secondary).is_err());
+        // A well-formed drafter saves and round-trips its mode through serde (lowercase tag).
+        let ok = Pairing {
+            id: "ir-drafter".into(),
+            name: "IR Drafter".into(),
+            mode: PairMode::Drafter,
+            secondary_profile_id: "qwen3-1_7b-local".into(),
+            primary_profile_id: None,
+            system: String::new(),
+            max_rounds: None,
+            digest_cap: None,
+            draft_max: None,
+            draft_min: None,
+            primary_tools: None,
+            secondary_tools: None,
+            builtin: false,
+        };
+        store.upsert(ok).expect("drafter upsert ok");
+        let store2 = PairingStore::open(&path);
+        let reloaded = store2
+            .list()
+            .into_iter()
+            .find(|x| x.id == "ir-drafter")
+            .expect("drafter persisted");
+        assert_eq!(reloaded.mode, PairMode::Drafter);
         let _ = std::fs::remove_file(&path);
     }
 }
