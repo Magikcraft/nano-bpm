@@ -2,7 +2,7 @@
 name = "rust-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Native Rust saturation driver (loadgen) + over-provisioning job worker for the nanobpmn load-testing harness, built on the camunda-orchestration-sdk."
+description = "Native Rust load-testing harness for nanobpmn: a saturation driver (loadgen) and an over-provisioning job worker (worker-unit), both built on the camunda-orchestration-sdk."
 
 [[bin]]
 name = "worker-unit"
@@ -13,18 +13,15 @@ name = "loadgen"
 path = "src/loadgen.rs"
 
 [dependencies]
-# The loadgen (src/loadgen.rs) drives instance creation + job completion through
-# the published Rust SDK, which transparently selects the Falcon command stream
-# or REST long-poll based on the gateway's advertised capabilities.
-camunda-orchestration-sdk = "0.2.1"
+# Both binaries drive the gateway through the published Rust SDK, which
+# transparently selects the Falcon command stream or REST long-poll based on the
+# gateway's advertised capabilities:
+#   - loadgen (src/loadgen.rs): instance creation + job completion,
+#   - worker-unit (src/main.rs): job activation + completion for the node-scaling
+#     harness, gated on the SDK's on_ready subscription signal (>= 0.2.2).
+camunda-orchestration-sdk = "0.2.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 serde_json = "1"
-
-# worker-unit (src/main.rs) still speaks the raw command-stream protocol directly
-# over a WebSocket (it predates the SDK and is driven by the file-barrier matrix
-# harness); it keeps these low-level deps.
-futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-tokio-tungstenite = "0.24"
 
 [profile.release]
 opt-level = 3
