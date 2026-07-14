@@ -1,4 +1,4 @@
-import { api, type ClusterMetrics, type MetricsSnapshot } from "./api";
+import { getClusterMetrics, getMetrics, type ClusterMetrics, type MetricsSnapshot } from "../gen";
 
 /// Module-level metrics collector. It polls continuously for the lifetime of the
 /// app (not just while the Metrics view is mounted) so users can navigate away
@@ -51,7 +51,7 @@ function emit() {
 async function pollLocal() {
   if (state.paused) return;
   try {
-    const data = await api.metrics();
+    const data = (await getMetrics({ throwOnError: true })).data;
     const p = prev;
     prev = data;
     let samples = state.samples;
@@ -80,7 +80,7 @@ async function pollLocal() {
 async function pollCluster() {
   if (state.paused) return;
   try {
-    const cluster = await api.clusterMetrics();
+    const cluster = (await getClusterMetrics({ throwOnError: true })).data;
     const agg = cluster.aggregate;
     const p = clusterPrev;
     clusterPrev = {

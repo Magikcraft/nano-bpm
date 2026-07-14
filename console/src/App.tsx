@@ -8,7 +8,7 @@ import {
 } from "react-router-dom";
 import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
-import { api, projectsApi } from "./lib/api";
+import { getExtensions, getMarketplace, getTopology } from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
@@ -195,10 +195,9 @@ export default function App() {
   const [serverVersion, setServerVersion] = useState<string | null>(null);
   useEffect(() => {
     let cancelled = false;
-    api
-      .topology()
-      .then((t) => {
-        if (!cancelled) setServerVersion(t.gateway_version);
+    getTopology({ throwOnError: true })
+      .then(({ data }) => {
+        if (!cancelled) setServerVersion(data.gateway_version);
       })
       .catch(() => {
         /* leave hidden — sidebar is not the place to surface a probe error */
@@ -219,11 +218,10 @@ export default function App() {
     let cancelled = false;
     const poll = () => {
       if (typeof document !== "undefined" && document.hidden) return;
-      projectsApi
-        .marketplace()
-        .then((m) => {
+      getMarketplace({ throwOnError: true })
+        .then(({ data }) => {
           if (cancelled) return;
-          setUpdateCount(m.entries.filter((e) => e.updateAvailable).length);
+          setUpdateCount(data.entries.filter((e) => e.updateAvailable).length);
         })
         .catch(() => {
           /* offline or npm missing — leave the badge as-is */
@@ -250,9 +248,8 @@ export default function App() {
   // fast path; this navigation-triggered refetch is the safety net for any
   // other codepath that might mutate the extension set.
   useEffect(() => {
-    projectsApi
-      .extensions()
-      .then(registerFileTypesFromOverview)
+    getExtensions({ throwOnError: true })
+      .then(({ data }) => registerFileTypesFromOverview(data))
       .catch(() => {
         /* ignore — the static fallback table still covers the common cases */
       });

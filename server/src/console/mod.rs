@@ -24,7 +24,7 @@ use axum::{
         IntoResponse, Json, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::{get, put},
+    routing::get,
 };
 use futures_util::stream::{Stream, unfold};
 use nanobpmn_engine_core::bpmn::parse_bpmn;
@@ -37,6 +37,7 @@ use crate::backpressure::SlaMode;
 
 pub mod config;
 pub mod extensions;
+mod generated_api;
 pub mod projects;
 pub mod trace;
 pub mod worker_export;
@@ -60,6 +61,11 @@ const FEATURES_HTML: &str = include_str!("features.html");
 /// The standalone runtime process-optimization explainer (self-contained,
 /// inline SVG diagrams), served at `/optimization`.
 const OPTIMIZATION_HTML: &str = include_str!("optimization.html");
+
+/// Result of a console API core handler: a JSON body on success, or an HTTP
+/// status + message on failure. The generated trait layer (`generated_api`)
+/// maps these onto the spec's typed response variants.
+pub(super) type ApiResult = Result<serde_json::Value, (StatusCode, String)>;
 
 /// Mounts the console SPA and its JSON API onto the gateway.
 pub fn router(server: ServerImpl) -> Router {
@@ -86,121 +92,21 @@ pub fn router(server: ServerImpl) -> Router {
                 .delete(gateway_proxy)
                 .patch(gateway_proxy),
         )
-        .route("/console/api/topology", get(topology))
-        .route("/console/api/cluster/health", get(cluster_health))
-        .route("/console/api/metrics", get(metrics_snapshot))
-        .route("/console/api/cluster/metrics", get(cluster_metrics))
-        .route("/console/api/instances", get(instances))
-        .route("/console/api/instances/{key}", get(instance_detail))
+        // Streaming / binary / static routes that are intentionally excluded
+        // from the console OpenAPI spec stay hand-wired here. Every typed
+        // `/console/api/*` operation is served by the generated rust-axum router
+        // (see `generated_api` and the merge in `main.rs`).
         .route("/console/api/stream", get(stream))
-        .route("/console/api/traces", get(traces))
-        .route("/console/api/traces/{key}", get(trace_detail))
-        .route("/console/api/traces/{key}/otel", get(trace_otel))
-        .route("/console/api/models", get(models).post(model_create))
-        .route(
-            "/console/api/models/{name}",
-            get(model_get).put(model_save).delete(model_delete),
-        )
-        .route(
-            "/console/api/workers",
-            get(workers_list).post(worker_create),
-        )
-        .route("/console/api/worker-sdk", get(worker_sdk_source))
-        .route("/console/api/deno-types", get(deno_types_source))
-        .route("/console/api/config/server", get(config_server))
-        .route("/console/api/config/server/sla", put(config_server_sla))
-        .route("/console/api/config/ide", get(config_ide))
-        .route("/console/api/lib", get(lib_list).post(lib_file_create))
-        .route(
-            "/console/api/lib/file",
-            get(lib_file_get).put(lib_file_save).delete(lib_file_delete),
-        )
+        .route("/console/api/workers/{name}/logs", get(worker_logs))
+        // GET on this path returns text OR a binary descriptor via `X-File-*`
+        // headers, so it stays hand-wired; PUT/POST/DELETE are owned by the
+        // generated router (axum merges the differing methods on the same path).
+        .route("/console/api/projects/{name}/file", get(project_file_get))
+        .route("/console/api/projects/{name}/logs", get(project_logs))
+        .route("/console/api/projects/{name}/export", get(project_export))
         .route(
             "/console/api/export-workers-app",
             axum::routing::post(workers_export),
-        )
-        .route(
-            "/console/api/workers/{name}",
-            get(worker_get).delete(worker_delete),
-        )
-        .route(
-            "/console/api/workers/{name}/file",
-            get(worker_file_get)
-                .put(worker_file_save)
-                .post(worker_file_create)
-                .delete(worker_file_delete),
-        )
-        .route(
-            "/console/api/workers/{name}/start",
-            axum::routing::post(worker_start),
-        )
-        .route(
-            "/console/api/workers/{name}/stop",
-            axum::routing::post(worker_stop),
-        )
-        .route("/console/api/workers/{name}/logs", get(worker_logs))
-        .route(
-            "/console/api/projects",
-            get(projects_list).post(project_create),
-        )
-        .route(
-            "/console/api/projects/{name}",
-            get(project_get).delete(project_delete),
-        )
-        .route(
-            "/console/api/projects/{name}/config",
-            get(project_config_get).put(project_config_put),
-        )
-        .route("/console/api/projects/{name}/files", get(project_files))
-        .route(
-            "/console/api/projects/{name}/file",
-            get(project_file_get)
-                .put(project_file_save)
-                .post(project_path_create)
-                .delete(project_path_delete),
-        )
-        .route(
-            "/console/api/projects/{name}/run",
-            axum::routing::post(project_run),
-        )
-        .route(
-            "/console/api/projects/{name}/rename",
-            axum::routing::post(project_rename),
-        )
-        .route(
-            "/console/api/projects/{name}/stop",
-            axum::routing::post(project_stop),
-        )
-        .route("/console/api/projects/{name}/logs", get(project_logs))
-        .route(
-            "/console/api/projects/{name}/compile",
-            axum::routing::post(project_compile),
-        )
-        .route(
-            "/console/api/projects/{name}/run-configs",
-            get(project_run_configs_list),
-        )
-        .route(
-            "/console/api/projects/{name}/active-run-config",
-            axum::routing::put(project_active_run_config_put),
-        )
-        .route("/console/api/projects/{name}/export", get(project_export))
-        .route("/console/api/extensions", get(extensions_list))
-        .route(
-            "/console/api/extensions/marketplace",
-            get(extensions_marketplace),
-        )
-        .route(
-            "/console/api/extensions/install",
-            axum::routing::post(extensions_install),
-        )
-        .route(
-            "/console/api/extensions/remove",
-            axum::routing::post(extensions_remove),
-        )
-        .route(
-            "/console/api/extensions/trust",
-            axum::routing::post(extensions_trust),
         )
         .route("/console", get(spa_index))
         .route("/console/", get(spa_index))
@@ -419,7 +325,7 @@ async fn whitepaper_index(headers: HeaderMap) -> Response {
 }
 
 #[derive(Serialize)]
-struct TopologyDto {
+pub(super) struct TopologyDto {
     /// This gateway node's id.
     node_id: u32,
     num_nodes: u32,
@@ -454,7 +360,7 @@ struct PartitionDto {
 }
 
 /// `GET /console/api/topology` — the cluster/topology view's data source.
-async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
+pub(super) fn topology(server: &ServerImpl) -> TopologyDto {
     let topology = server.engine.topology();
     let num_nodes = topology.num_nodes();
     let num_partitions = topology.num_partitions;
@@ -489,7 +395,7 @@ async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
         })
         .collect();
 
-    Json(TopologyDto {
+    TopologyDto {
         node_id: topology.node_id,
         num_nodes,
         num_partitions,
@@ -498,7 +404,7 @@ async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
         gateway_version: env!("NANOBPM_VERSION").to_string(),
         nodes,
         partitions,
-    })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +417,7 @@ async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
 /// reachable right now, its gateway version, and the round-trip latency.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClusterHealthDto {
+pub(super) struct ClusterHealthDto {
     checked_at_ms: u64,
     nodes: Vec<NodeHealthDto>,
 }
@@ -541,7 +447,7 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// `GET /console/api/cluster/health` — probes every peer concurrently and
 /// reports live reachability/version/latency. Self is reported without a network
 /// round-trip (it is, by definition, up and serving this request).
-async fn cluster_health(State(server): State<ServerImpl>) -> Json<ClusterHealthDto> {
+pub(super) async fn cluster_health(server: &ServerImpl) -> ClusterHealthDto {
     let topology = server.engine.topology();
     let self_id = topology.node_id;
     let self_version = env!("NANOBPM_VERSION").to_string();
@@ -596,6 +502,7 @@ async fn cluster_health(State(server): State<ServerImpl>) -> Json<ClusterHealthD
         checked_at_ms,
         nodes,
     })
+    .0
 }
 
 /// Probes one peer's `GET {base_url}/v2/topology`, returning its reported
@@ -904,12 +811,8 @@ fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
     }
 }
 
-/// `GET /console/api/metrics` — the metrics dashboard's data source. Reads the
-/// process-global Prometheus handles in one pass plus the live active-instance
-/// count, and maps them to a camelCase DTO with a few convenience means.
-async fn metrics_snapshot(State(server): State<ServerImpl>) -> Json<MetricsDto> {
-    Json(build_local_metrics(&server))
-}
+// The metrics snapshot DTO is built by `build_local_metrics`; the typed
+// `GET /console/api/metrics` operation is served by the generated router.
 
 // ---------------------------------------------------------------------------
 // Cluster-wide metrics (per-node aggregation)
@@ -921,7 +824,7 @@ async fn metrics_snapshot(State(server): State<ServerImpl>) -> Json<MetricsDto> 
 /// aggregate. Self is read locally (no round-trip).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ClusterMetricsDto {
+pub(super) struct ClusterMetricsDto {
     checked_at_ms: u64,
     nodes: Vec<NodeMetricsDto>,
     aggregate: AggregateMetricsDto,
@@ -955,7 +858,7 @@ struct AggregateMetricsDto {
 
 /// `GET /console/api/cluster/metrics` — probes every node's metrics and returns
 /// the per-node breakdown plus a reachable-node aggregate.
-async fn cluster_metrics(State(server): State<ServerImpl>) -> Json<ClusterMetricsDto> {
+pub(super) async fn cluster_metrics(server: &ServerImpl) -> ClusterMetricsDto {
     let topology = server.engine.topology();
     let self_id = topology.node_id;
     let num_nodes = topology.num_nodes();
@@ -1024,6 +927,7 @@ async fn cluster_metrics(State(server): State<ServerImpl>) -> Json<ClusterMetric
         nodes,
         aggregate,
     })
+    .0
 }
 
 /// Probes one peer's `GET {base_url}/console/api/metrics` and parses its
@@ -1106,20 +1010,11 @@ impl From<&crate::readstore::ProcessInstanceRow> for InstanceDto {
     }
 }
 
-/// Query string for the paginated instance list (`?page=&pageSize=`). Both are
-/// optional; defaults are applied (and `pageSize` clamped) in the handler.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct InstanceListQuery {
-    page: Option<i64>,
-    page_size: Option<i64>,
-}
-
 /// One page of process instances plus the total row count, so the console can
 /// render a pager without a second request.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct InstancePage {
+pub(super) struct InstancePage {
     items: Vec<InstanceDto>,
     total: i64,
     page: i64,
@@ -1156,7 +1051,7 @@ struct IncidentDto {
 }
 
 #[derive(Serialize)]
-struct InstanceDetailDto {
+pub(super) struct InstanceDetailDto {
     instance: InstanceDto,
     variables: Vec<VariableDto>,
     jobs: Vec<JobDto>,
@@ -1168,33 +1063,26 @@ struct InstanceDetailDto {
 /// pushed into SQLite (`process_instances_page`) so a node with a large read
 /// model returns a bounded page instead of materializing and sorting every row
 /// (which made the Process Explorer hang).
-async fn instances(
-    State(server): State<ServerImpl>,
-    Query(q): Query<InstanceListQuery>,
-) -> Json<InstancePage> {
-    let page = q.page.unwrap_or(0).max(0);
-    let page_size = q.page_size.unwrap_or(50).clamp(1, 500);
+pub(super) fn instances(server: &ServerImpl, page: i64, page_size: i64) -> InstancePage {
+    let page = page.max(0);
+    let page_size = page_size.clamp(1, 500);
     let total = server.store.process_instance_count();
     let rows = server
         .store
         .process_instances_page(page_size, page.saturating_mul(page_size));
-    Json(InstancePage {
+    InstancePage {
         items: rows.iter().map(InstanceDto::from).collect(),
         total,
         page,
         page_size,
-    })
+    }
 }
 
 /// `GET /console/api/instances/{key}` — one instance with its variables, jobs,
-/// and incidents. 404 when the key is malformed or unknown.
-async fn instance_detail(State(server): State<ServerImpl>, Path(key): Path<String>) -> Response {
-    let Ok(key) = key.parse::<u64>() else {
-        return (StatusCode::NOT_FOUND, "invalid instance key").into_response();
-    };
-    let Some(row) = server.store.process_instance(key) else {
-        return (StatusCode::NOT_FOUND, "no such process instance").into_response();
-    };
+/// and incidents. Returns `None` when the key is malformed or unknown (404).
+pub(super) fn instance_detail(server: &ServerImpl, key: &str) -> Option<InstanceDetailDto> {
+    let key = key.parse::<u64>().ok()?;
+    let row = server.store.process_instance(key)?;
 
     let variables: Vec<VariableDto> = server
         .store
@@ -1238,54 +1126,35 @@ async fn instance_detail(State(server): State<ServerImpl>, Path(key): Path<Strin
         })
         .collect();
 
-    Json(InstanceDetailDto {
+    Some(InstanceDetailDto {
         instance: InstanceDto::from(&row),
         variables,
         jobs,
         incidents,
     })
-    .into_response()
 }
 
 /// `GET /console/api/traces?limit=N` — recent execution-trace summaries
 /// (most-recent first). Backed by the in-memory [`trace::TraceStore`] folded
 /// off the engine event stream (process-optimization design doc §3, Tier A).
-async fn traces(
-    State(server): State<ServerImpl>,
-    Query(q): Query<TraceListQuery>,
-) -> Json<Vec<trace::TraceSummaryDto>> {
-    let limit = q.limit.unwrap_or(100).clamp(1, 1000);
-    Json(server.trace_store.list(limit))
+pub(super) fn traces(server: &ServerImpl, limit: usize) -> Vec<trace::TraceSummaryDto> {
+    let limit = limit.clamp(1, 1000);
+    server.trace_store.list(limit)
 }
 
 /// `GET /console/api/traces/{key}` — the full per-element trace for one
-/// instance. 404 when the key is malformed or no longer retained in the ring.
-async fn trace_detail(State(server): State<ServerImpl>, Path(key): Path<String>) -> Response {
-    let Ok(key) = key.parse::<u64>() else {
-        return (StatusCode::NOT_FOUND, "invalid instance key").into_response();
-    };
-    match server.trace_store.get(key) {
-        Some(t) => Json(t).into_response(),
-        None => (StatusCode::NOT_FOUND, "no such trace").into_response(),
-    }
+/// instance. `None` when the key is malformed or no longer retained in the ring.
+pub(super) fn trace_detail(server: &ServerImpl, key: &str) -> Option<trace::InstanceTraceDto> {
+    let key = key.parse::<u64>().ok()?;
+    server.trace_store.get(key)
 }
 
 /// `GET /console/api/traces/{key}/otel` — the instance trace rendered as an
 /// OTLP/JSON trace document (root process span + per-element + per-job spans),
 /// ingestible by an OpenTelemetry collector.
-async fn trace_otel(State(server): State<ServerImpl>, Path(key): Path<String>) -> Response {
-    let Ok(key) = key.parse::<u64>() else {
-        return (StatusCode::NOT_FOUND, "invalid instance key").into_response();
-    };
-    match server.trace_store.otel(key) {
-        Some(v) => Json(v).into_response(),
-        None => (StatusCode::NOT_FOUND, "no such trace").into_response(),
-    }
-}
-
-#[derive(Deserialize)]
-struct TraceListQuery {
-    limit: Option<usize>,
+pub(super) fn trace_otel(server: &ServerImpl, key: &str) -> Option<serde_json::Value> {
+    let key = key.parse::<u64>().ok()?;
+    server.trace_store.otel(key)
 }
 
 /// `GET /console/api/stream` — Server-Sent Events feed for live updates.
@@ -1406,26 +1275,15 @@ struct ModelDto {
     deployed_key: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct CreateModelBody {
-    name: String,
-    /// Initial BPMN XML; the frontend supplies a blank diagram from bpmn-js.
-    xml: String,
-}
-
 /// `GET /console/api/models` — the model library, with each model's deploy
 /// status relative to the engine. Sorted by name.
-async fn models(State(server): State<ServerImpl>) -> Response {
-    let names = match workspace::list_model_names() {
-        Ok(n) => n,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not read workspace: {e}"),
-            )
-                .into_response();
-        }
-    };
+pub(super) fn models(server: &ServerImpl) -> ApiResult {
+    let names = workspace::list_model_names().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read workspace: {e}"),
+        )
+    })?;
     let mut out = Vec::with_capacity(names.len());
     for name in names {
         let Some(path) = workspace::model_path(&name) else {
@@ -1433,7 +1291,7 @@ async fn models(State(server): State<ServerImpl>) -> Response {
         };
         let xml = std::fs::read_to_string(&path).unwrap_or_default();
         let (updated_at_ms, size) = workspace::file_meta(&path);
-        let status = deploy_status_of(&server, &xml);
+        let status = deploy_status_of(server, &xml);
         out.push(ModelSummaryDto {
             name,
             process_ids: status.process_ids,
@@ -1444,52 +1302,84 @@ async fn models(State(server): State<ServerImpl>) -> Response {
             size,
         });
     }
-    Json(out).into_response()
+    Ok(serde_json::to_value(out).unwrap())
 }
 
 /// `GET /console/api/models/{name}` — one model's XML and deploy status.
-async fn model_get(State(server): State<ServerImpl>, Path(name): Path<String>) -> Response {
-    let Some(path) = workspace::model_path(&name) else {
-        return (StatusCode::BAD_REQUEST, "invalid model name").into_response();
+pub(super) fn model_get(server: &ServerImpl, name: &str) -> ApiResult {
+    let Some(path) = workspace::model_path(name) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid model name".to_string()));
     };
-    let xml = match std::fs::read_to_string(&path) {
-        Ok(x) => x,
-        Err(_) => return (StatusCode::NOT_FOUND, "no such model").into_response(),
-    };
-    let status = deploy_status_of(&server, &xml);
-    Json(ModelDto {
-        name,
+    let xml = std::fs::read_to_string(&path)
+        .map_err(|_| (StatusCode::NOT_FOUND, "no such model".to_string()))?;
+    let status = deploy_status_of(server, &xml);
+    Ok(serde_json::to_value(ModelDto {
+        name: name.to_string(),
         xml,
         process_ids: status.process_ids,
         deploy_status: status.deploy_status,
         deployed_version: status.deployed_version,
         deployed_key: status.deployed_key,
     })
-    .into_response()
+    .unwrap())
 }
 
 /// `PUT /console/api/models/{name}` — overwrite (save) a model's XML. The body
 /// is the raw BPMN XML. The model must already exist (use POST to create).
-async fn model_save(
-    State(server): State<ServerImpl>,
-    Path(name): Path<String>,
-    xml: String,
-) -> Response {
-    let Some(path) = workspace::model_path(&name) else {
-        return (StatusCode::BAD_REQUEST, "invalid model name").into_response();
+pub(super) fn model_save(server: &ServerImpl, name: &str, xml: String) -> ApiResult {
+    let Some(path) = workspace::model_path(name) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid model name".to_string()));
     };
     if !path.exists() {
-        return (StatusCode::NOT_FOUND, "no such model — create it first").into_response();
+        return Err((
+            StatusCode::NOT_FOUND,
+            "no such model — create it first".to_string(),
+        ));
     }
     if let Err(e) = std::fs::write(&path, &xml) {
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save model: {e}"),
-        )
-            .into_response();
+        ));
     }
-    let status = deploy_status_of(&server, &xml);
-    Json(ModelDto {
+    let status = deploy_status_of(server, &xml);
+    Ok(serde_json::to_value(ModelDto {
+        name: name.to_string(),
+        xml,
+        process_ids: status.process_ids,
+        deploy_status: status.deploy_status,
+        deployed_version: status.deployed_version,
+        deployed_key: status.deployed_key,
+    })
+    .unwrap())
+}
+
+/// `POST /console/api/models` — create a new model. 409 if a model with the
+/// same name already exists.
+pub(super) fn model_create(server: &ServerImpl, name: String, xml: String) -> ApiResult {
+    let Some(path) = workspace::model_path(&name) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid model name".to_string()));
+    };
+    if let Err(e) = workspace::ensure_models_dir() {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create workspace: {e}"),
+        ));
+    }
+    if path.exists() {
+        return Err((
+            StatusCode::CONFLICT,
+            "a model with that name already exists".to_string(),
+        ));
+    }
+    if let Err(e) = std::fs::write(&path, &xml) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not create model: {e}"),
+        ));
+    }
+    let status = deploy_status_of(server, &xml);
+    Ok(serde_json::to_value(ModelDto {
         name,
         xml,
         process_ids: status.process_ids,
@@ -1497,70 +1387,24 @@ async fn model_save(
         deployed_version: status.deployed_version,
         deployed_key: status.deployed_key,
     })
-    .into_response()
-}
-
-/// `POST /console/api/models` — create a new model. 409 if a model with the
-/// same name already exists.
-async fn model_create(
-    State(server): State<ServerImpl>,
-    Json(body): Json<CreateModelBody>,
-) -> Response {
-    let Some(path) = workspace::model_path(&body.name) else {
-        return (StatusCode::BAD_REQUEST, "invalid model name").into_response();
-    };
-    if let Err(e) = workspace::ensure_models_dir() {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not create workspace: {e}"),
-        )
-            .into_response();
-    }
-    if path.exists() {
-        return (
-            StatusCode::CONFLICT,
-            "a model with that name already exists",
-        )
-            .into_response();
-    }
-    if let Err(e) = std::fs::write(&path, &body.xml) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not create model: {e}"),
-        )
-            .into_response();
-    }
-    let status = deploy_status_of(&server, &body.xml);
-    (
-        StatusCode::CREATED,
-        Json(ModelDto {
-            name: body.name,
-            xml: body.xml,
-            process_ids: status.process_ids,
-            deploy_status: status.deploy_status,
-            deployed_version: status.deployed_version,
-            deployed_key: status.deployed_key,
-        }),
-    )
-        .into_response()
+    .unwrap())
 }
 
 /// `DELETE /console/api/models/{name}` — remove a model from the workspace.
 /// This never touches the engine; an already-deployed definition stays deployed.
-async fn model_delete(Path(name): Path<String>) -> Response {
-    let Some(path) = workspace::model_path(&name) else {
-        return (StatusCode::BAD_REQUEST, "invalid model name").into_response();
+pub(super) fn model_delete(name: &str) -> ApiResult {
+    let Some(path) = workspace::model_path(name) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid model name".to_string()));
     };
     match std::fs::remove_file(&path) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => Ok(serde_json::Value::Null),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "no such model").into_response()
+            Err((StatusCode::NOT_FOUND, "no such model".to_string()))
         }
-        Err(e) => (
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not delete model: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
@@ -1610,7 +1454,7 @@ const WORKER_DENO_JSON: &str = r#"{
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct WorkerSummaryDto {
+pub(super) struct WorkerSummaryDto {
     name: String,
     files: Vec<String>,
     updated_at_ms: u64,
@@ -1618,25 +1462,11 @@ struct WorkerSummaryDto {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateWorkerBody {
-    name: String,
-    /// Job type the scaffolded worker subscribes to. Defaults to the name.
-    #[serde(default)]
-    job_type: Option<String>,
-}
-
-#[derive(Deserialize)]
 struct FilePathQuery {
     path: String,
 }
 
-#[derive(Deserialize)]
-struct CreateFileBody {
-    path: String,
-}
-
-async fn worker_summary(name: &str) -> Option<WorkerSummaryDto> {
+pub(super) async fn worker_summary(name: &str) -> Option<WorkerSummaryDto> {
     let dir = workspace::worker_dir(name)?;
     if !dir.is_dir() {
         return None;
@@ -1653,88 +1483,67 @@ async fn worker_summary(name: &str) -> Option<WorkerSummaryDto> {
 }
 
 /// `GET /console/api/workers` — list workers with files and runtime status.
-async fn workers_list() -> Response {
-    let names = match workspace::list_worker_names() {
-        Ok(n) => n,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not read workspace: {e}"),
-            )
-                .into_response();
-        }
-    };
+pub(super) async fn workers_list() -> ApiResult {
+    let names = workspace::list_worker_names().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read workspace: {e}"),
+        )
+    })?;
     let mut out = Vec::with_capacity(names.len());
     for name in names {
         if let Some(s) = worker_summary(&name).await {
             out.push(s);
         }
     }
-    Json(serde_json::json!({
+    Ok(serde_json::json!({
         "workers": out,
         "denoAvailable": workers::supervisor().deno_available(),
     }))
-    .into_response()
 }
 
 /// `POST /console/api/workers` — scaffold a new worker directory.
-async fn worker_create(Json(body): Json<CreateWorkerBody>) -> Response {
-    let Some(dir) = workspace::worker_dir(&body.name) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+pub(super) async fn worker_create(name: String, job_type: Option<String>) -> ApiResult {
+    let Some(dir) = workspace::worker_dir(&name) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid worker name".to_string()));
     };
     if dir.exists() {
-        return (
+        return Err((
             StatusCode::CONFLICT,
-            "a worker with that name already exists",
-        )
-            .into_response();
+            "a worker with that name already exists".to_string(),
+        ));
     }
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not create worker: {e}"),
-        )
-            .into_response();
+        ));
     }
-    let job_type = body.job_type.unwrap_or_else(|| body.name.clone());
+    let job_type = job_type.unwrap_or_else(|| name.clone());
     if let Err(e) = std::fs::write(dir.join("worker.ts"), worker_scaffold_ts(&job_type)) {
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not write worker.ts: {e}"),
-        )
-            .into_response();
+        ));
     }
     let _ = std::fs::write(dir.join("deno.json"), WORKER_DENO_JSON);
-    match worker_summary(&body.name).await {
-        Some(s) => (StatusCode::CREATED, Json(s)).into_response(),
-        None => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    match worker_summary(&name).await {
+        Some(s) => Ok(serde_json::to_value(s).unwrap()),
+        None => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not read worker".to_string(),
+        )),
     }
 }
 
-/// `GET /console/api/worker-sdk` — the embedded worker SDK TypeScript source,
-/// served so the console editor can register it as a Monaco extra-lib and offer
-/// full IntelliSense for `@nanobpm/worker` (types, JSDoc, signatures).
-async fn worker_sdk_source() -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        worker_export::worker_sdk_source(),
-    )
-        .into_response()
+/// `GET /console/api/worker-sdk` — the embedded worker SDK TypeScript source.
+pub(super) fn worker_sdk_source() -> String {
+    worker_export::worker_sdk_source().to_string()
 }
 
-/// `GET /console/api/deno-types` — the embedded Deno namespace ambient types,
-/// served so the console editor can register them as a Monaco extra-lib. This
-/// makes `Deno.env`, `Deno.readDir`, `Deno.serve`, etc. resolve in worker and
-/// `main.ts` code instead of erroring with "Cannot find name 'Deno'". Fully
-/// offline (embedded in the gateway binary).
-async fn deno_types_source() -> Response {
-    (
-        StatusCode::OK,
-        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-        worker_export::deno_namespace_types(),
-    )
-        .into_response()
+/// `GET /console/api/deno-types` — the embedded Deno namespace ambient types.
+pub(super) fn deno_types_source() -> String {
+    worker_export::deno_namespace_types().to_string()
 }
 
 /// Body for `POST /console/api/export-workers-app`.
@@ -1768,122 +1577,114 @@ async fn workers_export(Json(body): Json<ExportWorkersBody>) -> Response {
 }
 
 /// `GET /console/api/workers/{name}` — one worker's files and runtime status.
-async fn worker_get(Path(name): Path<String>) -> Response {
-    match worker_summary(&name).await {
-        Some(s) => Json(s).into_response(),
-        None => (StatusCode::NOT_FOUND, "no such worker").into_response(),
+pub(super) async fn worker_get(name: &str) -> ApiResult {
+    match worker_summary(name).await {
+        Some(s) => Ok(serde_json::to_value(s).unwrap()),
+        None => Err((StatusCode::NOT_FOUND, "no such worker".to_string())),
     }
 }
 
 /// `DELETE /console/api/workers/{name}` — remove a worker (must be stopped).
-async fn worker_delete(Path(name): Path<String>) -> Response {
-    let Some(dir) = workspace::worker_dir(&name) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+pub(super) async fn worker_delete(name: &str) -> ApiResult {
+    let Some(dir) = workspace::worker_dir(name) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid worker name".to_string()));
     };
-    if workers::supervisor().is_active(&name).await {
-        return (StatusCode::CONFLICT, "stop the worker before deleting it").into_response();
+    if workers::supervisor().is_active(name).await {
+        return Err((
+            StatusCode::CONFLICT,
+            "stop the worker before deleting it".to_string(),
+        ));
     }
     match std::fs::remove_dir_all(&dir) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => Ok(serde_json::Value::Null),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "no such worker").into_response()
+            Err((StatusCode::NOT_FOUND, "no such worker".to_string()))
         }
-        Err(e) => (
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not delete worker: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `GET /console/api/workers/{name}/file?path=worker.ts` — read a worker file.
-async fn worker_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuery>) -> Response {
-    let Some(path) = workspace::worker_file_path(&name, &q.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+pub(super) fn worker_file_get(name: &str, rel: &str) -> Result<String, (StatusCode, String)> {
+    let Some(path) = workspace::worker_file_path(name, rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => text.into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "no such file").into_response(),
-    }
+    std::fs::read_to_string(&path).map_err(|_| (StatusCode::NOT_FOUND, "no such file".to_string()))
 }
 
 /// `PUT /console/api/workers/{name}/file?path=worker.ts` — save (create or
 /// overwrite) a worker file. Body is the raw file content.
-async fn worker_file_save(
-    Path(name): Path<String>,
-    Query(q): Query<FilePathQuery>,
-    body: String,
-) -> Response {
-    let Some(dir) = workspace::worker_dir(&name) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+pub(super) fn worker_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
+    let Some(dir) = workspace::worker_dir(name) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid worker name".to_string()));
     };
     if !dir.is_dir() {
-        return (StatusCode::NOT_FOUND, "no such worker").into_response();
+        return Err((StatusCode::NOT_FOUND, "no such worker".to_string()));
     }
-    let Some(path) = workspace::worker_file_path(&name, &q.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    let Some(path) = workspace::worker_file_path(name, rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
-    match std::fs::write(&path, &body) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
+    match std::fs::write(&path, body) {
+        Ok(()) => Ok(serde_json::Value::Null),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save file: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `POST /console/api/workers/{name}/file` — create a new empty worker file.
-async fn worker_file_create(
-    Path(name): Path<String>,
-    Json(body): Json<CreateFileBody>,
-) -> Response {
-    let Some(dir) = workspace::worker_dir(&name) else {
-        return (StatusCode::BAD_REQUEST, "invalid worker name").into_response();
+pub(super) fn worker_file_create(name: &str, rel: &str) -> ApiResult {
+    let Some(dir) = workspace::worker_dir(name) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid worker name".to_string()));
     };
     if !dir.is_dir() {
-        return (StatusCode::NOT_FOUND, "no such worker").into_response();
+        return Err((StatusCode::NOT_FOUND, "no such worker".to_string()));
     }
-    let Some(path) = workspace::worker_file_path(&name, &body.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    let Some(path) = workspace::worker_file_path(name, rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
     if path.exists() {
-        return (StatusCode::CONFLICT, "a file with that name already exists").into_response();
+        return Err((
+            StatusCode::CONFLICT,
+            "a file with that name already exists".to_string(),
+        ));
     }
     match std::fs::write(&path, "") {
-        Ok(()) => StatusCode::CREATED.into_response(),
-        Err(e) => (
+        Ok(()) => Ok(serde_json::Value::Null),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not create file: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `DELETE /console/api/workers/{name}/file?path=...` — remove a worker file.
-async fn worker_file_delete(Path(name): Path<String>, Query(q): Query<FilePathQuery>) -> Response {
-    let Some(path) = workspace::worker_file_path(&name, &q.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+pub(super) fn worker_file_delete(name: &str, rel: &str) -> ApiResult {
+    let Some(path) = workspace::worker_file_path(name, rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
     match std::fs::remove_file(&path) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => Ok(serde_json::Value::Null),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "no such file").into_response()
+            Err((StatusCode::NOT_FOUND, "no such file".to_string()))
         }
-        Err(e) => (
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not delete file: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `POST /console/api/workers/{name}/start` — start the worker subprocess.
-async fn worker_start(Path(name): Path<String>) -> Response {
+pub(super) async fn worker_start(name: &str) -> ApiResult {
     let sup = workers::supervisor();
-    match sup.start(&name).await {
-        Ok(()) => Json(sup.runtime(&name).await).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    match sup.start(name).await {
+        Ok(()) => Ok(serde_json::to_value(sup.runtime(name).await).unwrap()),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
 
@@ -1894,100 +1695,94 @@ async fn worker_start(Path(name): Path<String>) -> Response {
 // ---------------------------------------------------------------------------
 
 /// `GET /console/api/lib` — list the shared library files.
-async fn lib_list() -> Response {
+pub(super) fn lib_list() -> ApiResult {
     match workspace::list_lib_files() {
-        Ok(files) => Json(serde_json::json!({ "files": files })).into_response(),
-        Err(e) => (
+        Ok(files) => Ok(serde_json::json!({ "files": files })),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not read library: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `GET /console/api/lib/file?path=money.ts` — read a shared library file.
-async fn lib_file_get(Query(q): Query<FilePathQuery>) -> Response {
-    let Some(path) = workspace::lib_file_path(&q.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+pub(super) fn lib_file_get(rel: &str) -> Result<String, (StatusCode, String)> {
+    let Some(path) = workspace::lib_file_path(rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
-    match std::fs::read_to_string(&path) {
-        Ok(text) => text.into_response(),
-        Err(_) => (StatusCode::NOT_FOUND, "no such file").into_response(),
-    }
+    std::fs::read_to_string(&path).map_err(|_| (StatusCode::NOT_FOUND, "no such file".to_string()))
 }
 
 /// `PUT /console/api/lib/file?path=money.ts` — save (create or overwrite) a
 /// shared library file. Body is the raw file content.
-async fn lib_file_save(Query(q): Query<FilePathQuery>, body: String) -> Response {
+pub(super) fn lib_file_save(rel: &str, body: &str) -> ApiResult {
     let Ok(_) = workspace::ensure_lib_dir() else {
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            "could not create library dir",
-        )
-            .into_response();
+            "could not create library dir".to_string(),
+        ));
     };
-    let Some(path) = workspace::lib_file_path(&q.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    let Some(path) = workspace::lib_file_path(rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
-    match std::fs::write(&path, &body) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
+    match std::fs::write(&path, body) {
+        Ok(()) => Ok(serde_json::Value::Null),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save file: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `POST /console/api/lib/file` — create a new empty shared library file.
-async fn lib_file_create(Json(body): Json<CreateFileBody>) -> Response {
+pub(super) fn lib_file_create(rel: &str) -> ApiResult {
     let Ok(_) = workspace::ensure_lib_dir() else {
-        return (
+        return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            "could not create library dir",
-        )
-            .into_response();
+            "could not create library dir".to_string(),
+        ));
     };
-    let Some(path) = workspace::lib_file_path(&body.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+    let Some(path) = workspace::lib_file_path(rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
     if path.exists() {
-        return (StatusCode::CONFLICT, "a file with that name already exists").into_response();
+        return Err((
+            StatusCode::CONFLICT,
+            "a file with that name already exists".to_string(),
+        ));
     }
     match std::fs::write(&path, "") {
-        Ok(()) => StatusCode::CREATED.into_response(),
-        Err(e) => (
+        Ok(()) => Ok(serde_json::Value::Null),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not create file: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `DELETE /console/api/lib/file?path=...` — remove a shared library file.
-async fn lib_file_delete(Query(q): Query<FilePathQuery>) -> Response {
-    let Some(path) = workspace::lib_file_path(&q.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+pub(super) fn lib_file_delete(rel: &str) -> ApiResult {
+    let Some(path) = workspace::lib_file_path(rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
     match std::fs::remove_file(&path) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => Ok(serde_json::Value::Null),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "no such file").into_response()
+            Err((StatusCode::NOT_FOUND, "no such file".to_string()))
         }
-        Err(e) => (
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not delete file: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `POST /console/api/workers/{name}/stop` — stop the worker subprocess.
-async fn worker_stop(Path(name): Path<String>) -> Response {
+pub(super) async fn worker_stop(name: &str) -> ApiResult {
     let sup = workers::supervisor();
-    match sup.stop(&name).await {
-        Ok(()) => Json(sup.runtime(&name).await).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    match sup.stop(name).await {
+        Ok(()) => Ok(serde_json::to_value(sup.runtime(name).await).unwrap()),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
 
@@ -2051,35 +1846,30 @@ async fn recv_live(
 
 /// `GET /console/api/projects` — list projects (tiles) with resource counts and
 /// live run status.
-async fn projects_list() -> Response {
-    let mut list = match projects::list_projects() {
-        Ok(l) => l,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("could not read projects: {e}"),
-            )
-                .into_response();
-        }
-    };
+pub(super) async fn projects_list() -> ApiResult {
+    let mut list = projects::list_projects().map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("could not read projects: {e}"),
+        )
+    })?;
     let sup = projects::supervisor();
     let mut out = Vec::with_capacity(list.len());
     for mut p in list.drain(..) {
         p.running = sup.is_running(&p.name).await;
         out.push(p);
     }
-    Json(serde_json::json!({
+    Ok(serde_json::json!({
         "projects": out,
         "denoAvailable": sup.deno_available(),
         "platforms": projects::PLATFORMS,
         "templates": projects::project_templates(),
         "extensions": extensions_overview(),
     }))
-    .into_response()
 }
 
 /// Extensions + which lang/app packs are usable on this machine.
-fn extensions_overview() -> serde_json::Value {
+pub(super) fn extensions_overview() -> serde_json::Value {
     let exts = extensions::all_extensions();
     let trust = extensions::load_trust();
     let list: Vec<_> = exts
@@ -2097,144 +1887,110 @@ fn extensions_overview() -> serde_json::Value {
     serde_json::json!({ "extensions": list, "yolo": trust.yolo })
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateProjectBody {
-    name: String,
-    #[serde(default)]
-    description: String,
-    #[serde(default)]
-    template: Option<String>,
-}
-
 /// `POST /console/api/projects` — scaffold a new project.
-async fn project_create(Json(body): Json<CreateProjectBody>) -> Response {
-    let template = body.template.as_deref().unwrap_or("starter");
-    match projects::create_project(&body.name, &body.description, template) {
-        Ok(cfg) => (StatusCode::CREATED, Json(cfg)).into_response(),
-        Err(e) if e.contains("already exists") => (StatusCode::CONFLICT, e).into_response(),
-        Err(e) if e.contains("invalid") => (StatusCode::BAD_REQUEST, e).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+pub(super) fn project_create(name: &str, description: &str, template: &str) -> ApiResult {
+    match projects::create_project(name, description, template) {
+        Ok(cfg) => Ok(serde_json::to_value(cfg).unwrap()),
+        Err(e) if e.contains("already exists") => Err((StatusCode::CONFLICT, e)),
+        Err(e) if e.contains("invalid") => Err((StatusCode::BAD_REQUEST, e)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
 }
 
-/// `GET /console/api/projects/{name}` — config + file tree + run state.
-async fn project_get(Path(name): Path<String>) -> Response {
-    project_detail(&name).await
-}
-
 /// `GET /console/api/extensions` — installed + built-in packs and trust state.
-async fn extensions_list() -> Response {
-    Json(extensions_overview()).into_response()
+pub(super) fn extensions_list() -> serde_json::Value {
+    extensions_overview()
 }
 
 /// `GET /console/api/config/server` — SLA mode + read-only env-parameter registry.
-async fn config_server(State(server): State<ServerImpl>) -> Response {
-    Json(config::server_config_json(server.sla_mode())).into_response()
+pub(super) fn config_server(server: &ServerImpl) -> serde_json::Value {
+    config::server_config_json(server.sla_mode())
 }
 
 /// `PUT /console/api/config/server/sla` — switch the SLA mode at runtime. Body
 /// `{"mode":"latency"|"admission"}`. An unrecognised mode is rejected (400)
 /// rather than silently fail-safing, so an operator gets clear feedback; the
 /// updated config is returned on success.
-async fn config_server_sla(
-    State(server): State<ServerImpl>,
-    Json(body): Json<SlaModeBody>,
-) -> Response {
-    let mode = match body.mode.trim().to_ascii_lowercase().as_str() {
+pub(super) async fn config_server_sla(server: &ServerImpl, mode: &str) -> ApiResult {
+    let mode = match mode.trim().to_ascii_lowercase().as_str() {
         "latency" => SlaMode::Latency,
         "admission" => SlaMode::Admission,
         other => {
-            return (
+            return Err((
                 StatusCode::BAD_REQUEST,
                 format!("unknown SLA mode {other:?}; expected \"latency\" or \"admission\""),
-            )
-                .into_response();
+            ));
         }
     };
     server.switch_sla_mode(mode).await;
-    Json(config::server_config_json(server.sla_mode())).into_response()
-}
-
-#[derive(Deserialize)]
-struct SlaModeBody {
-    mode: String,
+    Ok(config::server_config_json(server.sla_mode()))
 }
 
 /// `GET /console/api/config/ide` — toolchain dependencies + language-pack config.
 /// Probing toolchains shells out (`<bin> --version`), so run it off the async
 /// runtime's worker threads.
-async fn config_ide() -> Response {
+pub(super) async fn config_ide() -> ApiResult {
     match tokio::task::spawn_blocking(config::ide_config_json).await {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(v) => Ok(v),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
 /// `GET /console/api/extensions/marketplace` — packs on npm tagged `nano-ide-ext`,
 /// categorised by language/app/example, with installed status.
-async fn extensions_marketplace() -> Response {
+pub(super) async fn extensions_marketplace() -> ApiResult {
     match tokio::task::spawn_blocking(extensions::marketplace).await {
-        Ok(Ok(list)) => Json(serde_json::json!({ "entries": list })).into_response(),
-        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, e).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(Ok(list)) => Ok(serde_json::json!({ "entries": list })),
+        Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
-#[derive(Deserialize)]
-struct ExtPkgBody {
-    pkg: String,
-}
-
 /// `POST /console/api/extensions/install` — install a `nano-ide-ext-*` pkg from npm.
-async fn extensions_install(Json(b): Json<ExtPkgBody>) -> Response {
-    match tokio::task::spawn_blocking(move || extensions::install_from_npm(&b.pkg)).await {
-        Ok(Ok(m)) => (StatusCode::CREATED, Json(m)).into_response(),
-        Ok(Err(e)) => (StatusCode::BAD_REQUEST, e).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+pub(super) async fn extensions_install(pkg: String) -> ApiResult {
+    match tokio::task::spawn_blocking(move || extensions::install_from_npm(&pkg)).await {
+        Ok(Ok(m)) => Ok(serde_json::to_value(m).unwrap()),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
 /// `POST /console/api/extensions/remove` — uninstall an installed pack.
-async fn extensions_remove(Json(b): Json<ExtPkgBody>) -> Response {
-    match extensions::remove(&b.pkg) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+pub(super) fn extensions_remove(pkg: &str) -> ApiResult {
+    match extensions::remove(pkg) {
+        Ok(()) => Ok(serde_json::Value::Null),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TrustBody {
-    #[serde(default)]
-    yolo: Option<bool>,
-    #[serde(default)]
-    approve: Option<String>,
-    #[serde(default)]
-    revoke: Option<String>,
 }
 
 /// `POST /console/api/extensions/trust` — toggle yolo / approve-always per pack.
-async fn extensions_trust(Json(b): Json<TrustBody>) -> Response {
+pub(super) fn extensions_trust(
+    yolo: Option<bool>,
+    approve: Option<String>,
+    revoke: Option<String>,
+) -> ApiResult {
     let mut t = extensions::load_trust();
-    if let Some(y) = b.yolo {
+    if let Some(y) = yolo {
         t.yolo = y;
     }
-    if let Some(id) = b.approve {
+    if let Some(id) = approve {
         t.approved.insert(id);
     }
-    if let Some(id) = b.revoke {
+    if let Some(id) = revoke {
         t.approved.remove(&id);
     }
     match extensions::save_trust(&t) {
-        Ok(()) => Json(extensions_overview()).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(()) => Ok(extensions_overview()),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
 }
 
-async fn project_detail(name: &str) -> Response {
+/// `GET /console/api/projects/{name}` — config + file tree + run state. The
+/// `runState.status` here can be `crashed`, which the generated layer maps to
+/// the spec's `error` run status.
+pub(super) async fn project_detail(name: &str) -> ApiResult {
     let Some(cfg) = projects::read_config(name) else {
-        return (StatusCode::NOT_FOUND, "no such project").into_response();
+        return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     };
     let tree = projects::file_tree(name).unwrap_or_default();
     let sup = projects::supervisor();
@@ -2247,7 +2003,7 @@ async fn project_detail(name: &str) -> Response {
             .map(|p| extensions::toolchain_available(&p))
             .unwrap_or(false)
     };
-    Json(serde_json::json!({
+    Ok(serde_json::json!({
         "config": cfg,
         "files": tree,
         "runState": sup.run_state(name).await,
@@ -2255,80 +2011,66 @@ async fn project_detail(name: &str) -> Response {
         "runnable": runnable,
         "platforms": projects::PLATFORMS,
     }))
-    .into_response()
 }
 
 /// `DELETE /console/api/projects/{name}` — remove a project (must be stopped).
-async fn project_delete(Path(name): Path<String>) -> Response {
-    if projects::supervisor().is_running(&name).await {
-        return (
+pub(super) async fn project_delete(name: &str) -> ApiResult {
+    if projects::supervisor().is_running(name).await {
+        return Err((
             StatusCode::CONFLICT,
-            "stop the application before deleting it",
-        )
-            .into_response();
+            "stop the application before deleting it".to_string(),
+        ));
     }
-    match projects::delete_project(&name) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+    match projects::delete_project(name) {
+        Ok(()) => Ok(serde_json::Value::Null),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "no such project").into_response()
+            Err((StatusCode::NOT_FOUND, "no such project".to_string()))
         }
-        Err(e) => (
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not delete project: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `POST /console/api/projects/{name}/rename` — rename a project (must be stopped).
-async fn project_rename(Path(name): Path<String>, Json(body): Json<RenameProjectBody>) -> Response {
-    if projects::supervisor().is_running(&name).await {
-        return (
+pub(super) async fn project_rename(name: &str, new_name: &str) -> ApiResult {
+    if projects::supervisor().is_running(name).await {
+        return Err((
             StatusCode::CONFLICT,
-            "stop the application before renaming it",
-        )
-            .into_response();
+            "stop the application before renaming it".to_string(),
+        ));
     }
-    match projects::rename_project(&name, body.new_name.trim()) {
-        Ok(cfg) => (StatusCode::OK, Json(cfg)).into_response(),
-        Err(e) if e.contains("already exists") => (StatusCode::CONFLICT, e).into_response(),
-        Err(e) if e.contains("no such") => (StatusCode::NOT_FOUND, e).into_response(),
-        Err(e) if e.contains("invalid") => (StatusCode::BAD_REQUEST, e).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    match projects::rename_project(name, new_name.trim()) {
+        Ok(cfg) => Ok(serde_json::to_value(cfg).unwrap()),
+        Err(e) if e.contains("already exists") => Err((StatusCode::CONFLICT, e)),
+        Err(e) if e.contains("no such") => Err((StatusCode::NOT_FOUND, e)),
+        Err(e) if e.contains("invalid") => Err((StatusCode::BAD_REQUEST, e)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e)),
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RenameProjectBody {
-    new_name: String,
 }
 
 /// `GET /console/api/projects/{name}/config` — the project config.
-async fn project_config_get(Path(name): Path<String>) -> Response {
-    match projects::read_config(&name) {
-        Some(cfg) => Json(cfg).into_response(),
-        None => (StatusCode::NOT_FOUND, "no such project").into_response(),
+pub(super) fn project_config_get(name: &str) -> ApiResult {
+    match projects::read_config(name) {
+        Some(cfg) => Ok(serde_json::to_value(cfg).unwrap()),
+        None => Err((StatusCode::NOT_FOUND, "no such project".to_string())),
     }
 }
 
 /// `PUT /console/api/projects/{name}/config` — update the project config.
-async fn project_config_put(
-    Path(name): Path<String>,
-    Json(mut cfg): Json<projects::ProjectConfig>,
-) -> Response {
-    if projects::read_config(&name).is_none() {
-        return (StatusCode::NOT_FOUND, "no such project").into_response();
+pub(super) fn project_config_put(name: &str, mut cfg: projects::ProjectConfig) -> ApiResult {
+    if projects::read_config(name).is_none() {
+        return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     }
-    cfg.name = name.clone();
+    cfg.name = name.to_string();
     cfg.updated_ms = now_ms_proj();
-    match projects::write_config(&name, &cfg) {
-        Ok(()) => Json(cfg).into_response(),
-        Err(e) => (
+    match projects::write_config(name, &cfg) {
+        Ok(()) => Ok(serde_json::to_value(cfg).unwrap()),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save config: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
@@ -2336,66 +2078,53 @@ async fn project_config_put(
 /// configurations snapshotted from the scaffolding pack and the id of the
 /// active one (or `null` when none is set — in which case the resolver picks
 /// the `default: true` entry, else the first).
-async fn project_run_configs_list(Path(name): Path<String>) -> Response {
-    let Some(cfg) = projects::read_config(&name) else {
-        return (StatusCode::NOT_FOUND, "no such project").into_response();
+pub(super) fn project_run_configs_list(name: &str) -> ApiResult {
+    let Some(cfg) = projects::read_config(name) else {
+        return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     };
     let (configs, active) = match cfg.toolchain.as_ref() {
         Some(tc) => (tc.run_configs.clone(), tc.active_run_config.clone()),
         None => (vec![], None),
     };
-    Json(serde_json::json!({ "runConfigs": configs, "active": active })).into_response()
-}
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ActiveRunConfigBody {
-    id: Option<String>,
+    Ok(serde_json::json!({ "runConfigs": configs, "active": active }))
 }
 
 /// `PUT /console/api/projects/{name}/active-run-config` — set which run config
 /// the Run/Compile buttons should use. Body: `{ "id": "stock-rest" }`; pass
 /// `null` (or omit) to clear the pin and revert to `default: true` / first.
 /// Rejects unknown ids so the picker can't silently persist a typo.
-async fn project_active_run_config_put(
-    Path(name): Path<String>,
-    Json(body): Json<ActiveRunConfigBody>,
-) -> Response {
-    let Some(mut cfg) = projects::read_config(&name) else {
-        return (StatusCode::NOT_FOUND, "no such project").into_response();
+pub(super) fn project_active_run_config_put(name: &str, id: Option<String>) -> ApiResult {
+    let Some(mut cfg) = projects::read_config(name) else {
+        return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     };
     let Some(tc) = cfg.toolchain.as_mut() else {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
-            "project has no toolchain (no run configs to select)",
-        )
-            .into_response();
+            "project has no toolchain (no run configs to select)".to_string(),
+        ));
     };
-    if let Some(id) = body.id.as_deref()
+    if let Some(id) = id.as_deref()
         && !tc.run_configs.iter().any(|rc| rc.id == id)
     {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             format!("no run config with id '{id}'"),
-        )
-            .into_response();
+        ));
     }
-    tc.active_run_config = body.id;
+    tc.active_run_config = id;
     cfg.updated_ms = now_ms_proj();
-    match projects::write_config(&name, &cfg) {
-        Ok(()) => Json(serde_json::json!({
+    match projects::write_config(name, &cfg) {
+        Ok(()) => Ok(serde_json::json!({
             "active": cfg.toolchain.as_ref().and_then(|t| t.active_run_config.clone()),
-        }))
-        .into_response(),
-        Err(e) => (
+        })),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save config: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
-fn now_ms_proj() -> u64 {
+pub(super) fn now_ms_proj() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -2403,10 +2132,10 @@ fn now_ms_proj() -> u64 {
 }
 
 /// `GET /console/api/projects/{name}/files` — the recursive file tree.
-async fn project_files(Path(name): Path<String>) -> Response {
-    match projects::file_tree(&name) {
-        Some(tree) => Json(serde_json::json!({ "files": tree })).into_response(),
-        None => (StatusCode::NOT_FOUND, "no such project").into_response(),
+pub(super) fn project_files(name: &str) -> ApiResult {
+    match projects::file_tree(name) {
+        Some(tree) => Ok(serde_json::json!({ "files": tree })),
+        None => Err((StatusCode::NOT_FOUND, "no such project".to_string())),
     }
 }
 
@@ -2466,48 +2195,31 @@ async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuer
 }
 
 /// `PUT /console/api/projects/{name}/file?path=...` — save (create/overwrite).
-async fn project_file_save(
-    Path(name): Path<String>,
-    Query(q): Query<FilePathQuery>,
-    body: String,
-) -> Response {
-    let Some(path) = projects::safe_project_path(&name, &q.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+pub(super) fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
+    let Some(path) = projects::safe_project_path(name, rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    match std::fs::write(&path, &body) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (
+    match std::fs::write(&path, body) {
+        Ok(()) => Ok(serde_json::Value::Null),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not save file: {e}"),
-        )
-            .into_response(),
+        )),
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateProjectPathBody {
-    path: String,
-    /// Create a directory instead of an empty file.
-    #[serde(default)]
-    dir: bool,
 }
 
 /// `POST /console/api/projects/{name}/file` — create an empty file or a folder.
-async fn project_path_create(
-    Path(name): Path<String>,
-    Json(body): Json<CreateProjectPathBody>,
-) -> Response {
-    let Some(path) = projects::safe_project_path(&name, &body.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+pub(super) fn project_path_create(name: &str, rel: &str, dir: bool) -> ApiResult {
+    let Some(path) = projects::safe_project_path(name, rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
     if path.exists() {
-        return (StatusCode::CONFLICT, "that path already exists").into_response();
+        return Err((StatusCode::CONFLICT, "that path already exists".to_string()));
     }
-    let res = if body.dir {
+    let res = if dir {
         std::fs::create_dir_all(&path)
     } else {
         if let Some(parent) = path.parent() {
@@ -2516,19 +2228,18 @@ async fn project_path_create(
         std::fs::write(&path, "")
     };
     match res {
-        Ok(()) => StatusCode::CREATED.into_response(),
-        Err(e) => (
+        Ok(()) => Ok(serde_json::Value::Null),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not create: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `DELETE /console/api/projects/{name}/file?path=...` — remove a file or folder.
-async fn project_path_delete(Path(name): Path<String>, Query(q): Query<FilePathQuery>) -> Response {
-    let Some(path) = projects::safe_project_path(&name, &q.path) else {
-        return (StatusCode::BAD_REQUEST, "invalid path").into_response();
+pub(super) fn project_path_delete(name: &str, rel: &str) -> ApiResult {
+    let Some(path) = projects::safe_project_path(name, rel) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
     };
     let res = if path.is_dir() {
         std::fs::remove_dir_all(&path)
@@ -2536,59 +2247,46 @@ async fn project_path_delete(Path(name): Path<String>, Query(q): Query<FilePathQ
         std::fs::remove_file(&path)
     };
     match res {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(()) => Ok(serde_json::Value::Null),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            (StatusCode::NOT_FOUND, "no such path").into_response()
+            Err((StatusCode::NOT_FOUND, "no such path".to_string()))
         }
-        Err(e) => (
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not delete: {e}"),
-        )
-            .into_response(),
+        )),
     }
 }
 
 /// `POST /console/api/projects/{name}/run` — deploy + start the application.
-async fn project_run(Path(name): Path<String>) -> Response {
+pub(super) async fn project_run(name: &str) -> ApiResult {
     let sup = projects::supervisor();
-    match sup.run(&name).await {
-        Ok(()) => Json(sup.run_state(&name).await).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    match sup.run(name).await {
+        Ok(()) => Ok(serde_json::to_value(sup.run_state(name).await).unwrap()),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
 }
 
 /// `POST /console/api/projects/{name}/stop` — stop the application.
-async fn project_stop(Path(name): Path<String>) -> Response {
+pub(super) async fn project_stop(name: &str) -> ApiResult {
     let sup = projects::supervisor();
-    match sup.stop(&name).await {
-        Ok(()) => Json(sup.run_state(&name).await).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    match sup.stop(name).await {
+        Ok(()) => Ok(serde_json::to_value(sup.run_state(name).await).unwrap()),
+        Err(e) => Err((StatusCode::BAD_REQUEST, e)),
     }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CompileBody {
-    /// Deno target triples to cross-compile for. Empty = host only.
-    #[serde(default)]
-    targets: Vec<String>,
 }
 
 /// `POST /console/api/projects/{name}/compile` — compile the project (host or
 /// cross-compile). Runs in the background; progress streams over the log SSE.
-async fn project_compile(Path(name): Path<String>, Json(body): Json<CompileBody>) -> Response {
-    if projects::read_config(&name).is_none() {
-        return (StatusCode::NOT_FOUND, "no such project").into_response();
+pub(super) fn project_compile(name: &str, targets: Vec<String>) -> ApiResult {
+    if projects::read_config(name).is_none() {
+        return Err((StatusCode::NOT_FOUND, "no such project".to_string()));
     }
-    let targets = body.targets;
+    let name = name.to_string();
     tokio::spawn(async move {
         let _ = projects::supervisor().compile(&name, &targets).await;
     });
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "started": true })),
-    )
-        .into_response()
+    Ok(serde_json::json!({ "started": true }))
 }
 
 /// Query for `project_export`: include compiled `dist/` binaries (default off,

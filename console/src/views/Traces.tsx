@@ -2,11 +2,12 @@ import { useState } from "react";
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
-  api,
+  getTrace,
+  listTraces,
   type InstanceTrace,
   type TraceOutcome,
   type TraceSummary,
-} from "../lib/api";
+} from "../gen";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import { TraceTimeline, fmtClock, fmtDuration } from "../components/TraceTimeline";
 import { Badge, ErrorText } from "../components/ui";
@@ -28,7 +29,8 @@ export default function Traces() {
   useLiveInvalidation(["traces"]);
   const { data, isLoading, error } = useQuery({
     queryKey: ["traces"],
-    queryFn: () => api.traces(200),
+    queryFn: async () =>
+      (await listTraces({ query: { limit: 200 }, throwOnError: true })).data,
   });
 
   return (
@@ -102,7 +104,8 @@ function TraceDetail({ traceKey }: { traceKey: string }) {
   useLiveInvalidation(["trace"]);
   const { data, isLoading, error } = useQuery({
     queryKey: ["trace", traceKey],
-    queryFn: () => api.trace(traceKey),
+    queryFn: async () =>
+      (await getTrace({ path: { key: traceKey }, throwOnError: true })).data,
   });
 
   if (isLoading) return <p className="p-8 text-fg-muted">Loading…</p>;

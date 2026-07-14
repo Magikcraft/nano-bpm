@@ -1,12 +1,24 @@
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  api,
-  exportWorkersApp,
-  type WorkerLogLine,
+  createLibFile,
+  createWorker,
+  createWorkerFile,
+  deleteLibFile,
+  deleteWorker,
+  deleteWorkerFile,
+  getLibFile,
+  getWorkerFile,
+  listLibFiles,
+  listWorkers,
+  saveLibFile,
+  saveWorkerFile,
+  startWorker,
+  stopWorker,
   type WorkerPhase,
   type WorkerSummary,
-} from "../lib/api";
+} from "../gen";
+import { exportWorkersApp, type WorkerLogLine } from "../lib/api";
 import { languageForFile } from "../lib/editorLang";
 import type { ExtraModel } from "../components/CodeEditor";
 import { Button, PageHeader } from "../components/ui";
@@ -52,7 +64,7 @@ export default function Workers() {
   // Poll worker runtime while the page is open so status/metrics stay live.
   const { data } = useQuery({
     queryKey: ["workers"],
-    queryFn: api.workers,
+    queryFn: async () => (await listWorkers({ throwOnError: true })).data,
     refetchInterval: 1500,
   });
   const workers = data?.workers ?? [];
@@ -71,7 +83,7 @@ export default function Workers() {
     const jobType = prompt("BPMN job type this worker handles:", name)?.trim() || name;
     setBusy(true);
     try {
-      await api.createWorker(name, jobType);
+      await createWorker({ body: { name, jobType }, throwOnError: true });
       await refresh();
       setSelected(name);
       flash("ok", `Created worker '${name}'.`);
@@ -86,7 +98,7 @@ export default function Workers() {
     if (!confirm(`Delete worker '${name}'? Its code will be removed from the workspace.`)) return;
     setBusy(true);
     try {
-      await api.deleteWorker(name);
+      await deleteWorker({ path: { name }, throwOnError: true });
       if (selected === name) setSelected(null);
       await refresh();
       flash("ok", `Deleted '${name}'.`);
@@ -100,7 +112,7 @@ export default function Workers() {
   async function start(name: string) {
     setBusy(true);
     try {
-      await api.startWorker(name);
+      await startWorker({ path: { name }, throwOnError: true });
       await refresh();
       flash("ok", `Starting '${name}'.`);
     } catch (e) {
@@ -113,7 +125,7 @@ export default function Workers() {
   async function stop(name: string) {
     setBusy(true);
     try {
-      await api.stopWorker(name);
+      await stopWorker({ path: { name }, throwOnError: true });
       await refresh();
       flash("ok", `Stopping '${name}'.`);
     } catch (e) {
@@ -469,7 +481,7 @@ function WorkerEditor({
       await Promise.all(
         worker.files.map(async (f) => {
           try {
-            const text = await api.workerFile(worker.name, f);
+            const text = (await getWorkerFile({ path: { name: worker.name }, query: { path: f }, throwOnError: true })).data;
             models.push({ path: `file:///workers/${worker.name}/${f}`, content: text });
           } catch {
             /* ignore unreadable sibling */
@@ -478,11 +490,11 @@ function WorkerEditor({
       );
       // Shared library modules (importable as `@lib/<file>`).
       try {
-        const { files } = await api.libFiles();
+        const { files } = (await listLibFiles({ throwOnError: true })).data;
         await Promise.all(
           files.map(async (f) => {
             try {
-              const text = await api.libFile(f);
+              const text = (await getLibFile({ query: { path: f }, throwOnError: true })).data;
               models.push({ path: `file:///lib/${f}`, content: text });
             } catch {
               /* ignore */
@@ -504,9 +516,8 @@ function WorkerEditor({
   useEffect(() => {
     let cancelled = false;
     setLoadedFile(null);
-    api
-      .workerFile(worker.name, file)
-      .then((text) => {
+    getWorkerFile({ path: { name: worker.name }, query: { path: file }, throwOnError: true })
+      .then(({ data: text }) => {
         if (!cancelled) {
           setContent(text);
           setLoadedFile(file);
@@ -522,7 +533,7 @@ function WorkerEditor({
 
   async function save() {
     try {
-      await api.saveWorkerFile(worker.name, file, content);
+      await saveWorkerFile({ path: { name: worker.name }, query: { path: file }, body: content, throwOnError: true });
       setDirty(false);
       flash("ok", `Saved ${file}.`);
     } catch (e) {
@@ -534,7 +545,7 @@ function WorkerEditor({
     const path = prompt("New file name (e.g. helper.ts):")?.trim();
     if (!path) return;
     try {
-      await api.createWorkerFile(worker.name, path);
+      await createWorkerFile({ path: { name: worker.name }, body: { path }, throwOnError: true });
       onChanged();
       setFile(path);
       flash("ok", `Created ${path}.`);
@@ -546,7 +557,7 @@ function WorkerEditor({
   async function deleteFile() {
     if (!confirm(`Delete file '${file}'?`)) return;
     try {
-      await api.deleteWorkerFile(worker.name, file);
+      await deleteWorkerFile({ path: { name: worker.name }, query: { path: file }, throwOnError: true });
       onChanged();
       setFile(worker.files.find((f) => f !== file) ?? "worker.ts");
       flash("ok", `Deleted ${file}.`);
@@ -670,14 +681,14 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
 
   async function loadList(select?: string) {
     try {
-      const { files } = await api.libFiles();
+      const { files } = (await listLibFiles({ throwOnError: true })).data;
       setFiles(files);
       // Background models for cross-module IntelliSense within the library.
       const models: ExtraModel[] = [];
       await Promise.all(
         files.map(async (f) => {
           try {
-            models.push({ path: `file:///lib/${f}`, content: await api.libFile(f) });
+            models.push({ path: `file:///lib/${f}`, content: (await getLibFile({ query: { path: f }, throwOnError: true })).data });
           } catch {
             /* ignore */
           }
@@ -705,9 +716,8 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
     }
     let cancelled = false;
     setLoadedFile(null);
-    api
-      .libFile(file)
-      .then((text) => {
+    getLibFile({ query: { path: file }, throwOnError: true })
+      .then(({ data: text }) => {
         if (!cancelled) {
           setContent(text);
           setLoadedFile(file);
@@ -724,7 +734,7 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
   async function save() {
     if (!file) return;
     try {
-      await api.saveLibFile(file, content);
+      await saveLibFile({ query: { path: file }, body: content, throwOnError: true });
       setDirty(false);
       flash("ok", `Saved @lib/${file}.`);
       void loadList(file);
@@ -737,7 +747,7 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
     const path = prompt("New library file name (e.g. money.ts):")?.trim();
     if (!path) return;
     try {
-      await api.createLibFile(path);
+      await createLibFile({ body: { path }, throwOnError: true });
       await loadList(path);
       flash("ok", `Created @lib/${path}.`);
     } catch (e) {
@@ -749,7 +759,7 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
     if (!file) return;
     if (!confirm(`Delete shared library file '@lib/${file}'?`)) return;
     try {
-      await api.deleteLibFile(file);
+      await deleteLibFile({ query: { path: file }, throwOnError: true });
       flash("ok", `Deleted @lib/${file}.`);
       setFile(null);
       await loadList();

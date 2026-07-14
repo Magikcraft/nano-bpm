@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
-import { projectsApi, type ExtensionsOverview, type MarketEntry } from "../lib/api";
+import {
+  getExtensions,
+  getMarketplace,
+  installExtension,
+  removeExtension,
+  trustExtension,
+  type ExtensionsOverview,
+  type MarketEntry,
+} from "../gen";
 import { registerFileTypesFromOverview } from "../lib/editorLang";
 import { useTheme } from "../theme/ThemeProvider";
 import { isThemeSpec } from "../theme/themes";
@@ -25,7 +33,7 @@ export default function Extensions() {
   const { selection, select } = useTheme();
 
   const load = async () => {
-    const next = await projectsApi.extensions();
+    const next = (await getExtensions({ throwOnError: true })).data;
     setOv(next);
     // Refresh Monaco's ext→language map so a pack installed just now lights
     // up in the editor without a page reload.
@@ -33,7 +41,7 @@ export default function Extensions() {
   };
   const loadMarket = async () => {
     setMarketErr(null);
-    try { setMarket((await projectsApi.marketplace()).entries); }
+    try { setMarket((await getMarketplace({ throwOnError: true })).data.entries); }
     catch (e) { setMarketErr(String(e)); }
   };
   useEffect(() => { void load(); void loadMarket(); }, []);
@@ -58,20 +66,23 @@ export default function Extensions() {
 
   const install = async (pkg: string) => {
     setBusy(pkg); setErr(null);
-    try { await projectsApi.installExtension(pkg); await load(); await loadMarket(); }
+    try { await installExtension({ body: { pkg }, throwOnError: true }); await load(); await loadMarket(); }
     catch (e) { setErr(String(e)); }
     finally { setBusy(null); }
   };
-  const toggleYolo = async () => setOv(await projectsApi.trustExtension({ yolo: !ov?.yolo }));
+  const toggleYolo = async () =>
+    setOv((await trustExtension({ body: { yolo: !ov?.yolo }, throwOnError: true })).data);
   const approve = async (id: string, on: boolean) =>
-    setOv(await projectsApi.trustExtension(on ? { approve: id } : { revoke: id }));
+    setOv(
+      (await trustExtension({ body: on ? { approve: id } : { revoke: id }, throwOnError: true })).data,
+    );
   const remove = async (id: string, label: string) => {
     if (!window.confirm(`Uninstall extension "${label}"?\n\nProjects scaffolded from it will keep their files but lose their toolchain (Run/Compile may fall back to Deno).`)) {
       return;
     }
     setErr(null);
     try {
-      await projectsApi.removeExtension(id);
+      await removeExtension({ body: { pkg: id }, throwOnError: true });
       await load();
       await loadMarket();
     } catch (e) {

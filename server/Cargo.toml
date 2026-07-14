@@ -7,6 +7,9 @@ description = "NanoBPM gateway: stub server for the generated Camunda 8 Orchestr
 
 [dependencies]
 nanobpm-gateway-rest = { path = "../generated" }
+# Generated console API layer (models + axum router + per-tag Api traits) from
+# spec-console/console-api.yaml. Only needed with the `console` feature.
+nanobpm-console-api = { path = "../generated-console", optional = true }
 nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
@@ -82,7 +85,7 @@ serde_json = "1"
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/process", "tokio/io-util"]
+console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/process", "tokio/io-util"]
 # Diagnostic-only: builds jemalloc with heap profiling (--enable-prof) and turns
 # on sampled allocation-backtrace capture at startup. Adds per-allocation
 # sampling overhead, so it is NEVER enabled in a production build — it exists to

@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 import type { ReactNode } from "react";
-import type { InstanceTrace, TraceElement } from "../lib/api";
+import type { InstanceTrace, TraceElement } from "../gen";
 import { SectionLabel } from "./ui";
 
 /** Format a duration given in milliseconds. */
