@@ -1889,6 +1889,13 @@ fn worker_concurrency_from_env() -> WorkerConcurrency {
 /// more resting state; deliberately conservative so the derived count is a
 /// generous safety backstop rather than a tight throughput clip.
 const NOMINAL_ACTIVE_BYTES: u64 = 16 * 1024;
+/// Full-scale value of the graded create-acceptance headroom index
+/// ([`ServerImpl::create_occupancy_index`]). Chosen to sit in the numeric band
+/// [`crate::placement::placement_weight`] is tuned for (`WEIGHT_SCALE/(load+1)`):
+/// `0` (idle) → weight `1e6`; `~CREATE_OCCUPANCY_SCALE` (near-saturation) → a few
+/// hundred — a strong-but-smooth steer toward headroom, while genuine saturation
+/// is caught by the hard `SHED_LOAD` shed (weight 0) rather than this graded band.
+const CREATE_OCCUPANCY_SCALE: i64 = 4096;
 /// Never auto-derive a backlog cap below this — a lower floor would shed against a
 /// legitimately large parked population (timers/messages) or a modest burst on a
 /// small host. Well above the create-queue floor because parked instances are a
@@ -9821,17 +9828,65 @@ impl ServerImpl {
         (throughput, memory)
     }
 
+    /// Graded **create-acceptance headroom** occupancy in `[0, CREATE_OCCUPANCY_SCALE]`
+    /// — `0` = full headroom, higher = tighter. It is the MAX over the configured
+    /// create-admission rails of how full each is *right now*:
+    /// * create-processing concurrency vs the AIMD watermark
+    ///   ([`Backpressure::current_limit`](crate::backpressure::Backpressure::current_limit)),
+    /// * standing create-queue depth vs [`Self::admission_max_create_queue`],
+    /// * resident memory vs [`Self::mem_watermark_bytes`].
+    ///
+    /// It deliberately does **not** include the resident active-instance backlog:
+    /// a recovered node holding a deep but idle backlog (workers not yet draining
+    /// it) has full create-acceptance capacity and must stay eligible for new
+    /// creates. The hard shed rails (memory watermark / create-queue / submission
+    /// pressure, via [`create_should_shed`](Self::create_should_shed)) remain the
+    /// OOM/liveness backstop; this index only steers *below* the shed line. Cheap:
+    /// a few relaxed atomic loads plus one create-queue read.
+    pub(crate) fn create_occupancy_index(&self) -> i64 {
+        // occ(num, den) = fraction of `den` used, scaled to CREATE_OCCUPANCY_SCALE,
+        // clamped to the scale (the >=1.0 case is the shed rails' job, not the
+        // graded steer). A rail with no configured limit contributes nothing.
+        fn occ(num: u64, den: u64) -> i64 {
+            if den == 0 {
+                return 0;
+            }
+            let n = num.min(den) as u128;
+            ((n * CREATE_OCCUPANCY_SCALE as u128) / den as u128) as i64
+        }
+        let mut load = 0i64;
+        // Create-processing concurrency vs the adaptive/fixed watermark.
+        if let Some(limit) = self.backpressure.current_limit() {
+            let processing = self.processing.load(Ordering::Relaxed) as u64;
+            load = load.max(occ(processing, limit as u64));
+        }
+        // Standing create-queue depth vs its memory-safety cap.
+        if self.admission_max_create_queue > 0 {
+            let create_queue = self.engine.pending_create_queue() as u64;
+            load = load.max(occ(create_queue, self.admission_max_create_queue as u64));
+        }
+        // Resident memory vs the watermark.
+        if self.mem_watermark_bytes > 0 {
+            let used = self.mem_pressure_bytes.load(Ordering::Relaxed);
+            load = load.max(occ(used, self.mem_watermark_bytes));
+        }
+        load
+    }
+
     /// This node's composite create-load index for load-aware placement (ADR
     /// 0014, `PlacementMode::Balanced`). A shedding node reports
     /// [`SHED_LOAD`](crate::placement::SHED_LOAD) (weight 0 — never placed on);
-    /// otherwise it reports its active backlog, so weighted placement steers
-    /// creates toward nodes with the shallowest backlog. Cheap: a couple of
-    /// relaxed atomic loads plus the admission-gate checks, no engine round-trip.
+    /// otherwise it reports its [`create_occupancy_index`](Self::create_occupancy_index)
+    /// — create-acceptance headroom, *not* accumulated active backlog — so
+    /// weighted placement steers creates toward nodes with real intake capacity
+    /// (a recovered node draining a deep backlog stays eligible). Cheap: a couple
+    /// of relaxed atomic loads plus the admission-gate checks, no engine
+    /// round-trip beyond the create-queue gauge.
     pub(crate) fn create_load_index(&self) -> i64 {
         if self.create_should_shed().is_some() {
             crate::placement::SHED_LOAD
         } else {
-            self.active_backlog()
+            self.create_occupancy_index()
         }
     }
 
@@ -12783,6 +12838,59 @@ mod clustered_startup_tests {
         assert!(
             saw_remote,
             "without exclusions the remote owner is still a placement target"
+        );
+    }
+
+    #[test]
+    fn create_load_index_reflects_intake_headroom_not_resident_backlog() {
+        use super::CREATE_OCCUPANCY_SCALE;
+
+        // A recovered node holding a HUGE resident active-instance backlog but
+        // with an idle create pipeline and RAM below any watermark has full
+        // create-acceptance capacity: its load index must be ~0 (eligible for
+        // creates), NOT the raw backlog count that would freeze it out of
+        // weighted placement.
+        let mut node = clustered_node(0);
+        node.inflight.store(5_000_000, Ordering::Relaxed);
+        assert_eq!(
+            node.active_backlog(),
+            5_000_000,
+            "active_backlog still reports the raw resident count (unchanged)"
+        );
+        let idle = node.create_load_index();
+        assert!(
+            idle < CREATE_OCCUPANCY_SCALE && idle < node.active_backlog(),
+            "a deep-but-idle backlog must yield a low intake-headroom index \
+             (got {idle}), not the resident backlog"
+        );
+        assert_ne!(
+            idle,
+            crate::placement::SHED_LOAD,
+            "an idle recovered node must not be shed out of placement"
+        );
+
+        // Graded steer: at ~50% of the memory watermark the index sits mid-band
+        // (between full headroom and the hard shed), so placement steers *some*
+        // creates away without freezing the node.
+        node.mem_watermark_bytes = 1000;
+        node.mem_pressure_bytes.store(500, Ordering::Relaxed);
+        let mid = node.create_load_index();
+        assert_eq!(
+            mid,
+            CREATE_OCCUPANCY_SCALE / 2,
+            "50% memory occupancy must map to half the occupancy scale"
+        );
+        assert!(mid > 0 && mid < crate::placement::SHED_LOAD);
+
+        // The hard OOM backstop is unchanged: resident at/above the watermark
+        // reports SHED_LOAD (weight 0 — never placed on), regardless of intake
+        // headroom.
+        node.mem_watermark_bytes = 1;
+        node.mem_pressure_bytes.store(1 << 20, Ordering::Relaxed);
+        assert_eq!(
+            node.create_load_index(),
+            crate::placement::SHED_LOAD,
+            "a node past its memory watermark must still hard-shed"
         );
     }
 
