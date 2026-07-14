@@ -69,6 +69,15 @@ pub struct DrainGuardCfg {
     pub meter_engage_ticks: u32,
     /// Consecutive qualifying ticks before the servo releases (hysteresis).
     pub meter_release_ticks: u32,
+    /// When the unified setpoint ([`DrainSample::backlog_cap`]) is active (`> 0`),
+    /// the servo *engages* at this percentage of it (tracking the live cap instead
+    /// of the absolute `meter_engage_backlog`). Chosen below 100% so the
+    /// completion-paced credit servo starts pacing *before* the backlog reaches the
+    /// cap, holding it at the setpoint rather than overshooting into the shed.
+    pub meter_engage_frac_pct: u32,
+    /// When the setpoint is active, the servo *releases* below this percentage of
+    /// it. Strictly below `meter_engage_frac_pct` for hysteresis.
+    pub meter_release_frac_pct: u32,
     /// Token-bucket burst: the most create tokens the servo will hold. While
     /// metering, admitted-but-undrained creates can lead completions by at most
     /// this much, so it bounds the backlog overshoot above the engage level.
@@ -85,6 +94,12 @@ pub struct DrainGuardCfg {
     /// Minimum active backlog before the hard valve may arm. Below this a
     /// `completes==0` sample is just an idle engine, not a wedge.
     pub halt_min_backlog: i64,
+    /// When the unified setpoint ([`DrainSample::backlog_cap`]) is active, the hard
+    /// valve only arms once the backlog reaches this percentage of it (floored at
+    /// `halt_min_backlog`). Kept well above 100% so the completion-paced servo owns
+    /// the normal operating band and the hard valve is a genuine-wedge backstop
+    /// only — it never fires just because the backlog sits at the setpoint.
+    pub halt_arm_mult_pct: u32,
     /// Consecutive qualifying ticks before the hard valve engages (~seconds of a
     /// sustained stall, not a momentary dip).
     pub halt_engage_ticks: u32,
@@ -104,6 +119,11 @@ impl Default for DrainGuardCfg {
             meter_release_backlog: 2_000,
             meter_engage_ticks: 2,
             meter_release_ticks: 3,
+            // When the unified setpoint is live the band tracks it: engage the
+            // completion-paced servo at 75% of the cap and release below 50%, so
+            // intake is paced to drain *before* the backlog reaches the cap.
+            meter_engage_frac_pct: 75,
+            meter_release_frac_pct: 50,
             // Allow a few thousand admitted creates to lead the drain before the
             // bucket empties; bounds the backlog overshoot while metering.
             burst: 4_000,
@@ -114,6 +134,10 @@ impl Default for DrainGuardCfg {
             recover_completes_rate: 10.0,
             // Enough live instances that a total completion stall is a real wedge.
             halt_min_backlog: 2_000,
+            // When a setpoint is live, only arm the hard valve at 4x the cap — far
+            // above the servo's operating band — so it is a genuine-wedge backstop,
+            // not a level that fires whenever the backlog sits at the setpoint.
+            halt_arm_mult_pct: 400,
             // Wait ~3 s of sustained stall before cutting intake entirely.
             halt_engage_ticks: 3,
             halt_release_ticks: 2,
@@ -321,6 +345,14 @@ pub struct DrainSample {
     pub completes_per_sec: f64,
     /// Active (non-terminal) instance backlog right now.
     pub backlog: i64,
+    /// The live unified admission setpoint (the effective active-backlog cap the
+    /// throttle converges intake to — `min(latency, memory)` clamped). When `> 0`
+    /// the servo's engage/release band and the hard valve's arm level track it as
+    /// fractions/multiples, so the completion-paced credit servo holds the backlog
+    /// at the setpoint in *both* SLA modes (that is what makes intake converge on
+    /// drain instead of the post-credit shed oscillating). `0` (no active cap)
+    /// falls back to the absolute `meter_*_backlog` / `halt_min_backlog` levels.
+    pub backlog_cap: i64,
     /// Whether at least one owned partition's engine actor is alive. A *dead*
     /// actor is a different failure (crash/panic) handled elsewhere; the valve
     /// must not fire on it (cutting creates would not revive a dead thread).
@@ -386,9 +418,29 @@ impl DrainStateMachine {
             };
         }
 
+        // ---- Resolve the operating levels against the live unified setpoint. ----
+        // When a setpoint is active (`backlog_cap > 0`) the servo band and the hard
+        // valve arm level track it (as fractions/multiple), so the throttle paces
+        // intake to the *current* memory/latency-clamped cap in both SLA modes.
+        // With no active cap (`0`) we fall back to the absolute configured levels.
+        let (engage_level, release_level, halt_min) = if s.backlog_cap > 0 {
+            let cap = s.backlog_cap as i128;
+            let engage = (cap * self.cfg.meter_engage_frac_pct as i128 / 100) as i64;
+            let release = (cap * self.cfg.meter_release_frac_pct as i128 / 100) as i64;
+            let halt = ((cap * self.cfg.halt_arm_mult_pct as i128 / 100) as i64)
+                .max(self.cfg.halt_min_backlog);
+            (engage, release, halt)
+        } else {
+            (
+                self.cfg.meter_engage_backlog,
+                self.cfg.meter_release_backlog,
+                self.cfg.halt_min_backlog,
+            )
+        };
+
         // ---- Soft throttle (option 3): completion-paced servo, banded. ---------
         if !self.metering {
-            if s.backlog >= self.cfg.meter_engage_backlog {
+            if s.backlog >= engage_level {
                 self.meter_engage_ticks = self.meter_engage_ticks.saturating_add(1);
             } else {
                 self.meter_engage_ticks = 0;
@@ -398,7 +450,7 @@ impl DrainStateMachine {
                 self.meter_release_ticks = 0;
             }
         } else {
-            if s.backlog <= self.cfg.meter_release_backlog {
+            if s.backlog <= release_level {
                 self.meter_release_ticks = self.meter_release_ticks.saturating_add(1);
             } else {
                 self.meter_release_ticks = 0;
@@ -412,7 +464,7 @@ impl DrainStateMachine {
         // ---- Hard valve (option 4): sustained drain stall with backlog held. ---
         let stalled = s.completes_per_sec <= self.cfg.halt_completes_floor
             && s.actor_alive
-            && s.backlog >= self.cfg.halt_min_backlog;
+            && s.backlog >= halt_min;
         let recovered = s.completes_per_sec >= self.cfg.recover_completes_rate;
         if stalled {
             self.halt_stall_ticks = self.halt_stall_ticks.saturating_add(1);
@@ -464,6 +516,18 @@ mod tests {
         DrainSample {
             completes_per_sec: 800.0,
             backlog,
+            backlog_cap: 0,
+            actor_alive: true,
+        }
+    }
+
+    /// A healthy sample carrying a live unified setpoint (`backlog_cap`), used to
+    /// exercise the cap-tracking servo band / hard-valve arm level.
+    fn healthy_capped(backlog: i64, cap: i64) -> DrainSample {
+        DrainSample {
+            completes_per_sec: 800.0,
+            backlog,
+            backlog_cap: cap,
             actor_alive: true,
         }
     }
@@ -517,12 +581,88 @@ mod tests {
     }
 
     #[test]
+    fn servo_band_tracks_the_live_setpoint() {
+        // With a live unified setpoint the band is a fraction of the *cap*, not the
+        // absolute meter_*_backlog levels. Pick a cap whose 75%/50% band sits well
+        // below the absolute defaults so we know the cap path (not the fallback) is
+        // driving the decision.
+        let c = cfg();
+        let cap = 1_000; // engage @750, release @500 — both < absolute 5000/2000.
+        let engage = cap * c.meter_engage_frac_pct as i64 / 100;
+        let release = cap * c.meter_release_frac_pct as i64 / 100;
+        let mut sm = DrainStateMachine::new(c);
+
+        // Backlog above the absolute release floor but below the cap's engage band
+        // must NOT meter (proves we track the cap, not the 5000 absolute level).
+        for _ in 0..(c.meter_engage_ticks + 3) {
+            let d = sm.observe(healthy_capped(release + 10, cap));
+            assert!(!d.metering, "below the cap's engage band must not meter");
+        }
+
+        // Cross the cap's engage band for the dwell: engages.
+        let mut d = healthy_capped(engage + 50, cap);
+        let mut out = sm.observe(d);
+        for _ in 0..c.meter_engage_ticks {
+            out = sm.observe(d);
+        }
+        assert!(
+            out.metering,
+            "backlog above the cap's engage band must meter"
+        );
+
+        // Drop below the cap's release band for the dwell: releases.
+        d = healthy_capped(release - 10, cap);
+        for _ in 0..c.meter_release_ticks {
+            out = sm.observe(d);
+        }
+        assert!(!out.metering, "below the cap's release band must release");
+    }
+
+    #[test]
+    fn hard_valve_only_arms_above_the_cap_multiple_not_at_the_setpoint() {
+        // A stalled drain sitting *at* the setpoint (backlog == cap) must NOT halt:
+        // the completion-paced servo owns that band. The hard valve is a backstop
+        // that only fires once the backlog blows well past the cap.
+        let c = cfg();
+        let cap = 3_000; // arm level = cap * 4 = 12_000.
+        let mut sm = DrainStateMachine::new(c);
+
+        let stalled_at_cap = DrainSample {
+            completes_per_sec: 0.0,
+            backlog: cap,
+            backlog_cap: cap,
+            actor_alive: true,
+        };
+        for _ in 0..(c.halt_engage_ticks + 5) {
+            let d = sm.observe(stalled_at_cap);
+            assert!(!d.halted, "a stall at the setpoint must not trip the valve");
+        }
+
+        // Blow past the arm multiple: now it is a genuine wedge and must halt.
+        let wedged = DrainSample {
+            completes_per_sec: 0.0,
+            backlog: cap * c.halt_arm_mult_pct as i64 / 100 + 1_000,
+            backlog_cap: cap,
+            actor_alive: true,
+        };
+        let mut d = sm.observe(wedged);
+        for _ in 0..c.halt_engage_ticks {
+            d = sm.observe(wedged);
+        }
+        assert!(
+            d.halted,
+            "a stall well above the cap multiple is a real wedge"
+        );
+    }
+
+    #[test]
     fn hard_valve_engages_on_sustained_stall_and_releases_on_recovery() {
         let c = cfg();
         let mut sm = DrainStateMachine::new(c);
         let stall = DrainSample {
             completes_per_sec: 0.0,
             backlog: c.halt_min_backlog + 5_000,
+            backlog_cap: 0,
             actor_alive: true,
         };
         let mut d = sm.observe(stall);
@@ -537,6 +677,7 @@ mod tests {
         let recover = DrainSample {
             completes_per_sec: c.recover_completes_rate + 50.0,
             backlog: c.halt_min_backlog + 5_000,
+            backlog_cap: 0,
             actor_alive: true,
         };
         for _ in 0..c.halt_release_ticks {
@@ -552,6 +693,7 @@ mod tests {
         let dead = DrainSample {
             completes_per_sec: 0.0,
             backlog: c.halt_min_backlog + 5_000,
+            backlog_cap: 0,
             actor_alive: false,
         };
         for _ in 0..(c.halt_engage_ticks + 5) {
@@ -570,6 +712,7 @@ mod tests {
         let idle = DrainSample {
             completes_per_sec: 0.0,
             backlog: c.halt_min_backlog - 1,
+            backlog_cap: 0,
             actor_alive: true,
         };
         for _ in 0..(c.halt_engage_ticks + 5) {
@@ -586,6 +729,7 @@ mod tests {
         let stall = DrainSample {
             completes_per_sec: 0.0,
             backlog: 1_000_000,
+            backlog_cap: 0,
             actor_alive: true,
         };
         for _ in 0..20 {
