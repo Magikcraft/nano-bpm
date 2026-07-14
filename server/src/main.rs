@@ -1726,6 +1726,32 @@ fn leader_durable_recovery_grace_ticks() -> u32 {
         .max(1)
 }
 
+/// Recovery-tick passes to hold a partition down after a self-promote before it is
+/// eligible to promote again. Damps the reclaim epoch-climb: once this node
+/// promotes partition `p` at epoch E, a lagging metrics view (the fresh group's
+/// self-election not yet reflected, or the failover leader not yet stepped down)
+/// must not trigger an immediate re-promote at E+1 — the tight climb loop that,
+/// under sustained writes, spun the raft term up and produced the `leader_reject`
+/// storm. A promote that genuinely took clears the hold-down early (leadership
+/// reads as ours); one that is still contested simply re-solicits and retries
+/// after the window, capping reclaim to ~one round per hold-down instead of a
+/// per-tick climb.
+const LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS: u32 = 2;
+
+/// Cross-pass state for the leader-durable recovery supervisor
+/// ([`ServerImpl::leader_durable_recovery_tick`]). One instance lives for the
+/// whole supervisor loop (or a test's drive sequence).
+#[derive(Default)]
+struct RecoveryState {
+    /// Per-partition consecutive-leaderless counter (reset by a live leader).
+    misses: std::collections::HashMap<u64, u32>,
+    /// Partitions observed with a real (formed) leader at least once — only an
+    /// established partition is a genuine failover candidate (cold-start guard).
+    established: std::collections::HashSet<u64>,
+    /// Per-partition post-promote hold-down countdown (Option C damping).
+    holddown: std::collections::HashMap<u64, u32>,
+}
+
 /// The latest lease digest received from a partition's leader: the leases it held
 /// `(job_key, deadline)`. Held in the soft lease table and consumed by a
 /// newly-promoted leader to recover in-flight leases.
@@ -7392,19 +7418,11 @@ impl ServerImpl {
             // A few consecutive leaderless observations before acting, so a brief
             // election/heartbeat flutter never triggers a needless promotion.
             let grace_ticks = leader_durable_recovery_grace_ticks();
-            let mut leaderless: std::collections::HashMap<u64, u32> =
-                std::collections::HashMap::new();
-            // Partitions this node has observed with a real (formed) leader at
-            // least once. Recovery only fails a partition OVER to a successor once
-            // it has been established — a partition that has NEVER had a leader is
-            // still in initial formation (its owner may just be booting), not a
-            // failover, so promoting it would race the owner's `initialize` into a
-            // split-brain (two committed leaders in one term -> openraft wedge).
-            let mut established: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut state = RecoveryState::default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 server
-                    .leader_durable_recovery_tick(grace_ticks, &mut leaderless, &mut established)
+                    .leader_durable_recovery_tick(grace_ticks, &mut state)
                     .await;
             }
         });
@@ -7415,9 +7433,9 @@ impl ServerImpl {
     /// original leader's peer link is down) for `grace_ticks` consecutive passes,
     /// the partition has already been ESTABLISHED (seen a real leader at least
     /// once), and this node is the deterministic surviving successor, promote it.
-    /// `misses` carries the per-partition consecutive-leaderless counter and
-    /// `established` the set of partitions ever seen with a leader, both across
-    /// passes.
+    /// `state` carries, across passes: the per-partition consecutive-leaderless
+    /// counter, the set of partitions ever seen with a leader, and the
+    /// post-promote hold-down countdowns (see [`RecoveryState`]).
     ///
     /// The establishment gate is what keeps recovery from firing during a
     /// staggered cold start: before a partition's owner has formed the group,
@@ -7427,12 +7445,7 @@ impl ServerImpl {
     ///
     /// Factored out (and not gated on the env) so a test can drive recovery
     /// deterministically without spawning the loop.
-    async fn leader_durable_recovery_tick(
-        &self,
-        grace_ticks: u32,
-        misses: &mut std::collections::HashMap<u64, u32>,
-        established: &mut std::collections::HashSet<u64>,
-    ) {
+    async fn leader_durable_recovery_tick(&self, grace_ticks: u32, state: &mut RecoveryState) {
         let topology = self.engine.topology().clone();
         let me = topology.node_id as u64;
         for p in topology.replica_partitions() {
@@ -7443,7 +7456,26 @@ impl ServerImpl {
             // Any named leader (live or since-dead) proves the group was formed
             // once -> this partition is established and thus a failover candidate.
             if leader.is_some() {
-                established.insert(p);
+                state.established.insert(p);
+            }
+            // Post-promote hold-down (Option C): after we self-promote `p`, damp the
+            // reclaim epoch-climb. If leadership now reads as ours the promote took —
+            // clear everything and move on. Otherwise it is still settling (or the
+            // failover leader is contesting): wait out the window before acting again
+            // instead of immediately re-promoting at the next epoch (the climb that
+            // spun the term up under load). A dropped/contested promote simply
+            // re-solicits and retries after the window.
+            if let Some(hd) = state.holddown.get_mut(&p) {
+                if leader == Some(me) {
+                    state.holddown.remove(&p);
+                    state.misses.remove(&p);
+                    continue;
+                }
+                *hd = hd.saturating_sub(1);
+                if *hd > 0 {
+                    continue;
+                }
+                state.holddown.remove(&p);
             }
             // A live leader resets the counter. "Live" means present AND, if it is
             // a peer, reachable — a metric still naming a dead leader does not count.
@@ -7470,10 +7502,25 @@ impl ServerImpl {
                 None => false,
             };
             if leader_live {
-                misses.remove(&p);
+                state.misses.remove(&p);
                 continue;
             }
-            let n = misses.entry(p).or_insert(0);
+            // Reclaim solicitation (Option A): a peer leads a partition we own.
+            // Solicit its promotion epoch NOW, during the grace window, so we adopt
+            // it (via `handle_promotion`) before we promote — then `next_promotion_epoch`
+            // yields `incumbent + 1`, winning the fence in a single round. Without
+            // this the epoch (in-memory, reset on restart) starts at 1, loses to the
+            // higher-epoch failover leader, and we climb one epoch per tick — the
+            // load-sensitive `leader_reject` storm. Re-solicited each grace pass (at
+            // most `grace_ticks` fire-and-forget frames) so a dropped or pre-link
+            // solicit still lands before promotion.
+            if let Some(l) = leader
+                && l != me
+                && topology.is_local(p)
+            {
+                self.solicit_promotions_from(l as u32).await;
+            }
+            let n = state.misses.entry(p).or_insert(0);
             *n += 1;
             if *n < grace_ticks {
                 continue;
@@ -7481,7 +7528,7 @@ impl ServerImpl {
             // Never fail over a partition still in initial formation: only an
             // established group (its owner formed it, then its leader was lost) is
             // a genuine failover. This is the cold-start split-brain guard.
-            if !established.contains(&p) {
+            if !state.established.contains(&p) {
                 continue;
             }
             // Leaderless past the grace window. Promote iff this node is the
@@ -7492,7 +7539,12 @@ impl ServerImpl {
                     "leader-durable: partition {p} leaderless; node {me} self-promoting (epoch {next_epoch})"
                 );
                 self.promote_partition(p, next_epoch).await;
-                misses.remove(&p);
+                state.misses.remove(&p);
+                // Hold the partition down for a settle window so a lagging metrics
+                // view cannot trigger an immediate re-promote at the next epoch.
+                state
+                    .holddown
+                    .insert(p, LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS);
             }
         }
     }
@@ -7630,6 +7682,50 @@ impl ServerImpl {
                 link.send_promote(p, epoch, me as u64, addr.clone())
                     .await
                     .ok();
+            }
+        }
+    }
+
+    /// Ask peer `target` to re-announce the promotion epochs it currently leads
+    /// (leader-durable reclaim, [`ClientFrame::SolicitPromotions`]). Fire-and-forget:
+    /// the peer replies with its standing [`ClientFrame::Promote`] frames, which we
+    /// adopt in [`handle_promotion`](Self::handle_promotion) — seeding the incumbent
+    /// epoch so the next reclaim promote lands at `incumbent + 1` and wins the fence
+    /// in one round instead of climbing epochs under load.
+    async fn solicit_promotions_from(&self, target: u32) {
+        let me = self.engine.topology().node_id;
+        if target == me {
+            return;
+        }
+        if let Ok(link) = self.peers.link(target).await {
+            link.send_solicit_promotions(me as u64).await.ok();
+        }
+    }
+
+    /// Answer a peer's [`ClientFrame::SolicitPromotions`]: re-announce to `from_node`
+    /// every partition this node currently app-leads (its `promotion_epoch` names
+    /// us), so a rejoining owner learns the incumbent epoch and reclaims at
+    /// `incumbent + 1`. A no-op if we lead nothing or the solicit is our own.
+    pub(crate) async fn answer_promotion_solicit(&self, from_node: u64) {
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id as u64;
+        if from_node == me {
+            return;
+        }
+        let led: Vec<(u64, u64)> = {
+            let map = self.promotion_epoch.lock().unwrap();
+            map.iter()
+                .filter(|(_, (_, leader))| *leader == me)
+                .map(|(p, (epoch, _))| (*p, *epoch))
+                .collect()
+        };
+        if led.is_empty() {
+            return;
+        }
+        let addr = topology.peer_addr(me as u32).unwrap_or("").to_string();
+        if let Ok(link) = self.peers.link(from_node as u32).await {
+            for (p, epoch) in led {
+                link.send_promote(p, epoch, me, addr.clone()).await.ok();
             }
         }
     }
@@ -15905,18 +16001,12 @@ mod clustered_startup_tests {
         // started in-test). node 1 is the deterministic successor for partition 0
         // (replicas_of(0) = [0,1,2]; node 0 is down), so it self-promotes; node 2
         // sees node 1 alive and stands down. Use grace_ticks = 1 for a prompt test.
-        let mut misses1 = std::collections::HashMap::new();
-        let mut misses2 = std::collections::HashMap::new();
-        let mut established1 = std::collections::HashSet::new();
-        let mut established2 = std::collections::HashSet::new();
+        let mut state1 = RecoveryState::default();
+        let mut state2 = RecoveryState::default();
         let mut promoted = false;
         for _ in 0..200 {
-            node1
-                .leader_durable_recovery_tick(1, &mut misses1, &mut established1)
-                .await;
-            node2
-                .leader_durable_recovery_tick(1, &mut misses2, &mut established2)
-                .await;
+            node1.leader_durable_recovery_tick(1, &mut state1).await;
+            node2.leader_durable_recovery_tick(1, &mut state2).await;
             if node1
                 .raft_registry()
                 .get(0)
@@ -16058,18 +16148,12 @@ mod clustered_startup_tests {
         // Survivors run recovery; node 1 self-promotes partition 0 (node 0 is owner but
         // unreachable, so node 1 is the successor). node 0's tick is NOT driven during
         // the outage.
-        let mut misses1 = std::collections::HashMap::new();
-        let mut misses2 = std::collections::HashMap::new();
-        let mut established1 = std::collections::HashSet::new();
-        let mut established2 = std::collections::HashSet::new();
+        let mut state1 = RecoveryState::default();
+        let mut state2 = RecoveryState::default();
         let mut promoted = false;
         for _ in 0..200 {
-            node1
-                .leader_durable_recovery_tick(1, &mut misses1, &mut established1)
-                .await;
-            node2
-                .leader_durable_recovery_tick(1, &mut misses2, &mut established2)
-                .await;
+            node1.leader_durable_recovery_tick(1, &mut state1).await;
+            node2.leader_durable_recovery_tick(1, &mut state2).await;
             if node1
                 .raft_registry()
                 .get(0)
@@ -16125,18 +16209,16 @@ mod clustered_startup_tests {
         // reachable peer leader and reset the miss counter forever, leaving the
         // partition stranded. WITH the fix, a peer leading an OWNED partition counts as
         // not-live, so the owner self-promotes at the next epoch and reclaims it.
-        let mut misses0 = std::collections::HashMap::new();
+        let mut state0 = RecoveryState::default();
         // The recovery supervisor's `established` set persists for the whole process
         // life: node 0 formed partition 0 before its outage, so it is already marked
         // established when the reclaim ticks run. (Seeding it faithfully; otherwise a
         // reclaim tick that momentarily reads a leaderless learner would trip the
         // never-established cold-start guard.)
-        let mut established0 = std::collections::HashSet::from([0u64]);
+        state0.established.insert(0u64);
         let mut reclaimed = false;
         for _ in 0..600 {
-            node0
-                .leader_durable_recovery_tick(1, &mut misses0, &mut established0)
-                .await;
+            node0.leader_durable_recovery_tick(1, &mut state0).await;
             if node0
                 .raft_registry()
                 .get(0)
@@ -16162,6 +16244,75 @@ mod clustered_startup_tests {
             node0.promotion_epoch.lock().unwrap().get(&0).copied(),
             Some((2, 0)),
             "the owner reclaims at incumbent_epoch + 1, naming itself"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rejoined_owner_solicits_incumbent_epoch_for_single_round_reclaim() {
+        // Option A wiring: the reclaim epoch fence only resolves in one round if the
+        // rejoining owner knows the incumbent (failover) epoch before it promotes.
+        // That epoch is in-memory and reset on restart, and the failover leader's
+        // original Promote was broadcast while the owner was DOWN — so on rejoin the
+        // owner's map is empty and, without help, it would promote at epoch 1, lose
+        // the fence to the higher-epoch incumbent, and climb one epoch per tick (the
+        // load-sensitive leader_reject storm). The owner therefore SOLICITS the
+        // incumbent on rejoin; the incumbent re-announces the promotions it leads;
+        // the owner adopts the epoch and its next promote lands at incumbent + 1.
+        // This proves the solicit -> answer -> adopt round-trip over the real peer
+        // links, isolated from the raft failover dance.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // The incumbent: node 1 records itself as the app-promoted leader of
+        // partition 0 at epoch 1 (as a failover would), without the full raft
+        // promotion — this test targets the solicit wiring, not group formation.
+        assert_eq!(node1.next_promotion_epoch(0), 1);
+        assert_eq!(
+            node1.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((1, 1)),
+            "node 1 is the incumbent leader of partition 0 at epoch 1"
+        );
+
+        // The rejoining owner starts with an EMPTY epoch map (restart wiped it): it
+        // has NOT heard the incumbent's original announcement.
+        assert!(
+            node0.promotion_epoch.lock().unwrap().get(&0).is_none(),
+            "the rejoined owner has no incumbent epoch before soliciting"
+        );
+
+        // Solicit the incumbent. node 1 answers with a Promote for the partition it
+        // leads; node 0's falcon handler adopts it via handle_promotion.
+        node0.solicit_promotions_from(1).await;
+
+        let mut adopted = false;
+        for _ in 0..300 {
+            if node0.promotion_epoch.lock().unwrap().get(&0).copied() == Some((1, 1)) {
+                adopted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            adopted,
+            "the owner adopts the incumbent epoch (1,1) from the solicited re-announcement"
+        );
+
+        // With the incumbent epoch adopted, the owner's next promote lands at
+        // incumbent + 1 (epoch 2, naming itself) — winning the fence in one round.
+        assert_eq!(
+            node0.next_promotion_epoch(0),
+            2,
+            "the owner reclaims at incumbent_epoch + 1 after soliciting, not epoch 1"
         );
 
         for node in [&node0, &node1, &node2] {
@@ -16236,10 +16387,8 @@ mod clustered_startup_tests {
         // Drive recovery on both: each promotes partition 0 at epoch 1. (Broadcasts
         // can't cross the split — the peers are fault-injected down — so no
         // cross-delivery happens yet; both end up leaders. That is the split-brain.)
-        let mut m1 = std::collections::HashMap::new();
-        let mut m2 = std::collections::HashMap::new();
-        let mut est1 = std::collections::HashSet::new();
-        let mut est2 = std::collections::HashSet::new();
+        let mut state1 = RecoveryState::default();
+        let mut state2 = RecoveryState::default();
         let leads = |node: &ServerImpl, who: u64| -> bool {
             node.raft_registry()
                 .get(0)
@@ -16248,12 +16397,8 @@ mod clustered_startup_tests {
         };
         let mut both = false;
         for _ in 0..200 {
-            node1
-                .leader_durable_recovery_tick(1, &mut m1, &mut est1)
-                .await;
-            node2
-                .leader_durable_recovery_tick(1, &mut m2, &mut est2)
-                .await;
+            node1.leader_durable_recovery_tick(1, &mut state1).await;
+            node2.leader_durable_recovery_tick(1, &mut state2).await;
             if leads(&node1, 1) && leads(&node2, 2) {
                 both = true;
                 break;
@@ -16357,17 +16502,14 @@ mod clustered_startup_tests {
         node0.peers.fail_node(1).await;
         node0.peers.fail_node(2).await;
 
-        let mut misses = std::collections::HashMap::new();
-        let mut established = std::collections::HashSet::new();
+        let mut state = RecoveryState::default();
         for _ in 0..50 {
-            node0
-                .leader_durable_recovery_tick(1, &mut misses, &mut established)
-                .await;
+            node0.leader_durable_recovery_tick(1, &mut state).await;
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
         assert!(
-            !established.contains(&1),
+            !state.established.contains(&1),
             "a never-led partition is never marked established"
         );
         assert!(

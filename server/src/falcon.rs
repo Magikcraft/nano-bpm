@@ -425,6 +425,22 @@ pub enum ClientFrame {
         node: u32,
         load: i64,
     },
+    /// Leader-durable reclaim solicitation (ADR 0003): a node that just (re)joined
+    /// asks its peers to re-announce the promotion epochs they currently lead, so
+    /// the rejoining owner can reclaim its statically-owned partitions at
+    /// `incumbent_epoch + 1` and fence the failover leader in a SINGLE round. The
+    /// promotion epoch is in-memory and resets on restart, so without this the
+    /// rejoined owner starts at epoch 1, loses the fence to the higher-epoch
+    /// failover leader, and must climb one epoch per recovery tick — each climb a
+    /// fresh election that, under sustained writes, produces the `leader_reject`
+    /// storm. `from_node` is the soliciting node's id. Fire-and-forget (no `corr`):
+    /// the recipient replies with its standing [`Promote`](ClientFrame::Promote)
+    /// frames for the partitions it leads; a dropped solicit is retried on the next
+    /// recovery tick within the grace window.
+    #[serde(rename_all = "camelCase")]
+    SolicitPromotions {
+        from_node: u64,
+    },
 }
 
 /// The kind of entity a [`ClientFrame::GetByKey`] read targets, selecting which
@@ -989,6 +1005,7 @@ async fn handle_client_frame(
         ClientFrame::Promote { .. } => "promote",
         ClientFrame::SetSlaMode { .. } => "set_sla_mode",
         ClientFrame::PressureReport { .. } => "pressure_report",
+        ClientFrame::SolicitPromotions { .. } => "solicit_promotions",
     };
     crate::metrics::record_stream_frame(frame_type);
 
@@ -1731,6 +1748,13 @@ async fn handle_client_frame(
             // Record it for weighted placement. Fire-and-forget: no reply, no
             // re-broadcast (each node gossips to every peer directly).
             server.record_peer_pressure(node, load);
+        }
+        ClientFrame::SolicitPromotions { from_node } => {
+            // A (re)joining peer is reclaiming its owned partitions and needs the
+            // promotion epochs we currently lead, so its reclaim promote lands at
+            // incumbent+1 and fences us in one round. Re-announce our standing
+            // promotions to it. Fire-and-forget: no reply.
+            server.answer_promotion_solicit(from_node).await;
         }
     }
 

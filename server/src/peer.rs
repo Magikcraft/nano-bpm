@@ -325,6 +325,15 @@ impl PeerLink {
             .await
     }
 
+    /// Fire-and-forget a promotion-epoch solicitation to this peer (leader-durable
+    /// reclaim): ask it to re-announce the promotion epochs it currently leads so
+    /// this node can reclaim its owned partitions at incumbent+1. See
+    /// [`ClientFrame::SolicitPromotions`].
+    pub async fn send_solicit_promotions(&self, from_node: u64) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::SolicitPromotions { from_node })
+            .await
+    }
+
     /// Forwards a `createProcessInstance` to this peer (it creates on one of its
     /// own partitions). `await_completion` is intentionally unsupported here —
     /// it resolves over an async `InstanceCompleted` frame, wired in a later
