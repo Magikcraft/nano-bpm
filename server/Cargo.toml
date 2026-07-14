@@ -91,25 +91,27 @@ heapprof = ["tikv-jemallocator/profiling", "tikv-jemalloc-sys/profiling"]
 
 # Optimized for a small production binary. `strip` removes ~8 MB of symbols;
 # fat LTO + a single codegen unit let the linker drop dead code across crate
-# boundaries; `panic = "abort"` removes the unwinding tables and landing pads
-# (the server treats a panic as fatal anyway). opt-level stays at 3 so request
-# handling keeps its speed.
+# boundaries. opt-level stays at 3 so request handling keeps its speed.
+#
+# `panic = "unwind"` (NOT abort): this is a *clustered* server — each node hosts
+# many partitions, each an independent openraft group running on its own task.
+# A panic in one partition's Raft task (e.g. openraft 0.9.24's degenerate
+# apply-range edge case during a rejoin) must unwind *that task* only, never
+# abort the process and take the other partitions — and the cluster's quorum —
+# down with it. Genuine unrecoverable corruption still fails fast via the
+# explicit `std::process::abort()` guards in `journal.rs`, which are unaffected
+# by the panic strategy. (The unwinding tables cost a little binary size; node
+# availability during a single-partition fault is worth it.)
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 
-# Profile for running the test suite with release-level optimizations.
-# `cargo test --release` fails against `panic = "abort"`: the test harness
-# requires stack unwinding (`#[test]` uses `catch_unwind`), so cargo compiles
-# the dependency graph twice (abort + unwind). Under fat LTO this yields two
-# codegen instantiations of the *same* `serde_core`, and derive-generated impls
-# (one panic mode) no longer satisfy `serde_json`'s bounds (the other) — the
-# "multiple different versions of crate `serde_core`" error. Inheriting release
-# with `panic = "unwind"` gives a single, consistent graph. The shipped binary
-# (built via `cargo build --release`) keeps `panic = "abort"`, untouched.
-# Run optimized tests with: cargo test --profile release-test
+# Profile for running the test suite with release-level optimizations. Inherits
+# `release` (already `panic = "unwind"`, which `#[test]`'s `catch_unwind`
+# requires); kept as a named profile so `cargo test --profile release-test`
+# stays a stable entry point in the Makefile/CI.
 [profile.release-test]
 inherits = "release"
 panic = "unwind"
