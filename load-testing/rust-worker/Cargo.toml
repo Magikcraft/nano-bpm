@@ -1,0 +1,31 @@
+[package]
+name = "rust-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust saturation driver (loadgen) + over-provisioning job worker for the nanobpmn load-testing harness, built on the camunda-orchestration-sdk."
+
+[[bin]]
+name = "worker-unit"
+path = "src/main.rs"
+
+[[bin]]
+name = "loadgen"
+path = "src/loadgen.rs"
+
+[dependencies]
+# The loadgen (src/loadgen.rs) drives instance creation + job completion through
+# the published Rust SDK, which transparently selects the Falcon command stream
+# or REST long-poll based on the gateway's advertised capabilities.
+camunda-orchestration-sdk = "0.2.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
+serde_json = "1"
+
+# worker-unit (src/main.rs) still speaks the raw command-stream protocol directly
+# over a WebSocket (it predates the SDK and is driven by the file-barrier matrix
+# harness); it keeps these low-level deps.
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = "0.24"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
