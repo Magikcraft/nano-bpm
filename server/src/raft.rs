@@ -172,13 +172,50 @@ struct MemLogInner {
     vote: Option<Vote<NodeId>>,
 }
 
+/// Normalize an openraft log-entry range request into an inclusive `lo..=hi`,
+/// or `None` when the request is empty.
+///
+/// openraft 0.9.24 can hand the log reader a **degenerate** range (`start >
+/// end`, or an exclusive end of `0`) during a promoted single-voter group's
+/// rejoin/snapshot-send race: the leader keeps applying at full rate while it
+/// retries an `InstallSnapshot` to the returning member, and the apply loop's
+/// `(last_applied, committed]` window can momentarily invert. Passing such a
+/// range straight to [`BTreeMap::range`] **panics** ("range start is greater
+/// than range end in BTreeMap"). That panic used to abort the whole node (every
+/// partition it hosts) under the old fatal-panic build; even now it would
+/// needlessly unwind this partition's raft task. Clamping to an empty result
+/// here keeps a single partition's storage read total, so a transient openraft
+/// edge case can never destabilize the process.
+pub(crate) fn clamp_log_range<RB: RangeBounds<u64>>(
+    range: &RB,
+) -> Option<std::ops::RangeInclusive<u64>> {
+    use std::ops::Bound;
+    let lo = match range.start_bound() {
+        Bound::Included(&i) => i,
+        Bound::Excluded(&i) => i.checked_add(1)?,
+        Bound::Unbounded => u64::MIN,
+    };
+    let hi = match range.end_bound() {
+        Bound::Included(&i) => i,
+        Bound::Excluded(&i) => i.checked_sub(1)?, // exclusive end of 0 => empty
+        Bound::Unbounded => u64::MAX,
+    };
+    if lo <= hi { Some(lo..=hi) } else { None }
+}
+
 impl RaftLogReader<RaftConfig> for MemLogStore {
     async fn try_get_log_entries<RB: RangeBounds<u64> + Clone + Debug + OptionalSend>(
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<RaftConfig>>, StorageError<NodeId>> {
+        // Guard against a degenerate (inverted/empty) range before touching the
+        // BTreeMap, which would otherwise panic and unwind this partition's raft
+        // task (losing the partition on this node). See `clamp_log_range`.
+        let Some(bounds) = clamp_log_range(&range) else {
+            return Ok(Vec::new());
+        };
         let inner = self.inner.lock().unwrap();
-        Ok(inner.log.range(range).map(|(_, e)| e.clone()).collect())
+        Ok(inner.log.range(bounds).map(|(_, e)| e.clone()).collect())
     }
 }
 
@@ -1974,5 +2011,56 @@ mod tests {
         for p in parts {
             p.raft.shutdown().await.expect("clean shutdown");
         }
+    }
+
+    #[test]
+    fn clamp_log_range_rejects_degenerate_ranges() {
+        use std::ops::Bound;
+        // Normal half-open range -> inclusive equivalent.
+        assert_eq!(clamp_log_range(&(5u64..9)), Some(5..=8));
+        // Inclusive range passes through.
+        assert_eq!(clamp_log_range(&(5u64..=8)), Some(5..=8));
+        // Unbounded ends map to the full domain.
+        assert_eq!(clamp_log_range(&(..)), Some(u64::MIN..=u64::MAX));
+        assert_eq!(clamp_log_range(&(3u64..)), Some(3..=u64::MAX));
+        // Single-element half-open range.
+        assert_eq!(clamp_log_range(&(7u64..8)), Some(7..=7));
+        // Empty half-open range (start == end) -> None, never panics.
+        assert_eq!(clamp_log_range(&(5u64..5)), None);
+        // Inverted range (the openraft rejoin/snapshot-race case) -> None.
+        // Built from values (not literals) to mirror openraft's computed
+        // `(last_applied, committed]` window.
+        let (hi, lo) = (9u64, 5u64);
+        assert_eq!(clamp_log_range(&(hi..lo)), None);
+        assert_eq!(
+            clamp_log_range(&(Bound::Included(9u64), Bound::Excluded(5u64))),
+            None
+        );
+        // Exclusive end of 0 is empty, not an underflow panic.
+        assert_eq!(clamp_log_range(&(0u64..0)), None);
+    }
+
+    #[tokio::test]
+    async fn try_get_log_entries_never_panics_on_inverted_range() {
+        // Regression for the node-rejoin crash: openraft can request an
+        // inverted `(last_applied, committed]` window during a promoted
+        // group's snapshot-send race. `BTreeMap::range` would panic and, under
+        // the fatal-panic build, abort the whole node. The guard must instead
+        // return no entries.
+        let mut store = MemLogStore::default();
+        // Values, not literals, so this mirrors openraft's computed window
+        // (and isn't a compile-time reversed-range lint).
+        let (hi, lo) = (9u64, 5u64);
+        let inverted = store
+            .try_get_log_entries(hi..lo)
+            .await
+            .expect("inverted range returns Ok, not a panic");
+        assert!(inverted.is_empty());
+        let same = 5u64;
+        let empty = store
+            .try_get_log_entries(same..same)
+            .await
+            .expect("empty range returns Ok");
+        assert!(empty.is_empty());
     }
 }

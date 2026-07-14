@@ -906,9 +906,15 @@ impl RaftLogReader<RaftConfig> for RaftLogStore {
         }
         let planned: Vec<Resolved> = {
             let inner = self.inner.lock().unwrap();
+            // Guard against a degenerate (inverted/empty) range before touching
+            // the BTreeMap, which would otherwise panic and take the node down.
+            // See `crate::raft::clamp_log_range`.
+            let Some(bounds) = crate::raft::clamp_log_range(&range) else {
+                return Ok(Vec::new());
+            };
             inner
                 .log
-                .range(range)
+                .range(bounds)
                 .map(|(_, s)| match &s.entry {
                     Some(e) => Resolved::Ram(e.clone()),
                     None => Resolved::Disk {
