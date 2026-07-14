@@ -4444,10 +4444,9 @@ impl ServerImpl {
 
     /// Shared by-key routing that follows the partition's CURRENT Raft leader
     /// when this node hosts the group, falling back to the static owner map
-    /// otherwise. `None` = handle locally (this node is the leader, or there is
-    /// no leader yet — a transient window), `Some(node)` = forward to peer
-    /// `node`. With Raft off this is exactly `remote_owner_of`, so the non-Raft
-    /// path is byte-identical.
+    /// otherwise. `None` = handle locally, `Some(node)` = forward to peer `node`.
+    /// With Raft off this is exactly `remote_owner_of`, so the non-Raft path is
+    /// byte-identical.
     fn route_by_leader(&self, key: u64) -> Option<u32> {
         if !self.raft.is_empty() {
             let p = partition_of(key);
@@ -4455,8 +4454,16 @@ impl ServerImpl {
                 let node_id = self.engine.topology().node_id as u64;
                 return match part.raft.metrics().borrow().current_leader {
                     Some(l) if l == node_id => None,
-                    None => None,
                     Some(l) => Some(l as u32),
+                    // Leader momentarily unknown (an election in flight during a
+                    // failover). "Handle locally" (`None`) is only safe when THIS
+                    // node actually hosts the partition's engine; for a partition it
+                    // does not own, `None` would drive a by-key op onto the wrong
+                    // engine (`local_for` panics under debug_assert, or silently
+                    // targets partition 0 in release). Fall back to the static-owner
+                    // forward so the op leaves this node instead of mis-applying;
+                    // the caller/client retries until the new leader is known.
+                    None => self.remote_owner_of(key),
                 };
             }
         }
@@ -14986,6 +14993,30 @@ mod clustered_startup_tests {
         } else {
             &node1
         };
+
+        // `other` (the survivor we drive the REST mutation through) may momentarily
+        // lag the election: its partition-0 view can still read leaderless right after
+        // `wait_new_leader` observed the leader on the other survivor. Issuing the
+        // by-key mutation in that window would route it nowhere useful (the owner is
+        // dead). Wait until `other` agrees on the new leader so `route_by_leader`
+        // forwards to it — the exact behaviour this test asserts.
+        let mut other_converged = false;
+        for _ in 0..400 {
+            if other
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(new_leader_id as u64)
+            {
+                other_converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            other_converged,
+            "the follower survivor converges on the new leader before the REST mutation"
+        );
 
         // Activate the parked job on the new leader to obtain its key.
         let mut job_key = None;
