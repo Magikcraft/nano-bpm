@@ -211,6 +211,18 @@ restore@120, sample to 420, `HANDOFF=1`).
   zero-lag against a ~28k/s moving head cannot fit the 10s catch-up window.
   Leader-side retention does not help a *from-empty* learner skip that initial
   install (its match starts at 0, below the leader's retained/purged floor).
+- **Sharper post-soak finding — the learner replication itself STALLS, not just
+  "head too fast".** ~9 min after load fully stopped, p11 was still failing every
+  cycle with only a **51-entry gap** (n19 `last_log=426825`, node18 frozen at
+  `last_log=snapshot=purged=426774`, receiving nothing). So the returning owner's
+  learner does not advance past its installed-snapshot point even at near-zero lag
+  and zero load — pointing at a learner-replication stall across the hand-off
+  **add_learner → 10s timeout → abort/remove → re-add** cycle (the aborted attempt
+  tears the learner out of the leader's membership, and the re-add never
+  re-establishes sustained AppendEntries before the next timeout). This is deeper
+  than catch-up throughput and is the real completion blocker; it also explains why
+  only the partitions that happened to be mid-transfer at the load-stop instant
+  (2,5,8) completed while p11 stayed stuck.
 - **Converges cleanly on load-ease:** once load stopped, 3/4 owned partitions
   (2,5,8) transferred node18→Leader at term 2–3; p11 needed one more requester
   cycle. This is Zeebe-aligned best-effort reclaim: no storm, completes when the
