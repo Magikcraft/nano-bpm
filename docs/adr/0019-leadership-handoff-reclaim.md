@@ -361,3 +361,43 @@ therefore needs a vendored-openraft replication change (graceful purge-hole →
 snapshot fallback) plus a way to host the on-disk prefix as a non-voting receiver
 — PR #108-class work that must be soak-iterated, not landed under local-only
 gates.
+
+## Parallel per-partition hand-offs (commit `00aa1ee`) — SHIPPED + A/B validated
+
+The reclaim was **orchestration-bound, not transfer-bound**. `falcon.rs`'s
+connection read loop `await`s `handle_client_frame` inline, so all frames on a
+peer link process serially. `handle_handoff_request` → `perform_handoff` runs the
+full ~30 s catch-up inline before returning, head-of-line-blocking sibling
+`RequestHandoff` frames. So a returning owner's four owned partitions handed off
+**one at a time**, each waiting a full ~30 s catch-up window behind the previous.
+
+Fix: the `ClientFrame::RequestHandoff` arm now `tokio::spawn`s the handler
+(with `server.clone()`) instead of awaiting inline. It is concurrency-safe — the
+per-partition hand-off lease declines duplicates and replies route via
+`peers.link`, not the connection — so the four partitions catch up and transfer
+concurrently.
+
+### A/B validation (repeatable harness `ab-reclaim.sh`, load sustained through recovery)
+
+Controlled A/B, 2 trials each, DOWNTIME_S=90, RATE=0 (~10–11k/s), forced
+full-snapshot install, loadgen sized to outlive recovery:
+
+| Variant | backlog@rejoin | total reclaim | snap-RPC-timeouts | aborts |
+|---|---|---|---|---|
+| **serial** (baseline `04d32f2`) t1 | 204 | 131.3 s | 325 | 2 |
+| **serial** (baseline `04d32f2`) t2 | 117 | 211.1 s | 745 | 5 |
+| **parallel** (`00aa1ee`) t1 | 150 | 46.5 s | 330 | 1 |
+| **parallel** (`00aa1ee`) t2 | 137 | 41.9 s | 355 | 1 |
+
+Serial reclaims stagger ~30 s apart (30 → 44 → 103 → 131; 32 → 122 → 152 → 211)
+— the round-robin HOL signature. Parallel reclaims three partitions concurrently
+(all @ ~32 s) with the fourth one cycle later (~42–47 s). Net: **worst-case
+reclaim ~171 s (mean) → ~44 s, ~3.9× faster and far tighter** (42–47 s vs
+131–211 s), with fewer aborts. The adaptive deadline (commit `04d32f2`) still
+guarantees eventual completion; parallelism removes the serialization cost.
+
+`InstallSnapshot RPC timed out` counts track backlog/SM size, not the serial↔
+parallel axis — they stayed ~325–355 when backlog was small and spiked to 745
+only on the higher-backlog serial trial. That remains the next lever when the
+resident state machine is large (raise openraft `install_snapshot_timeout`), but
+it did not dominate at these SM sizes.
