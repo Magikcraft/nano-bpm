@@ -1823,9 +1823,24 @@ async fn handle_client_frame(
             // of `partition` back via an openraft membership change instead of it
             // forming a competing group. Replies with HandoffAck then a terminal
             // HandoffComplete/HandoffFailed. (Incumbent side — Phase C.)
-            server
-                .handle_handoff_request(partition, requester_node, requester_addr)
-                .await;
+            //
+            // SPAWNED, not awaited inline: `handle_handoff_request` runs the whole
+            // catch-up loop (up to the ~30 s ceiling) before returning. Awaiting it
+            // on the connection read loop head-of-line-blocks every other frame on
+            // this peer link — including the sibling `RequestHandoff`s for the
+            // returning owner's OTHER partitions — so a node reclaiming its {p,q,r,s}
+            // would hand them off strictly one-at-a-time, ~30 s apart (observed:
+            // 4 partitions took ~196 s under load). Each hand-off is independent and
+            // already concurrency-safe (per-partition lease in
+            // `handle_handoff_request` declines a duplicate for the same partition;
+            // replies go via `peers.link`, not this `conn`), so run them off-thread
+            // and let siblings proceed in parallel.
+            let server = server.clone();
+            tokio::spawn(async move {
+                server
+                    .handle_handoff_request(partition, requester_node, requester_addr)
+                    .await;
+            });
         }
         ClientFrame::HandoffAck {
             partition,
