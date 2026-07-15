@@ -67,13 +67,46 @@ fn test_calc_purge_upto() -> anyhow::Result<()> {
             eng.state.purged_next = last_purged.index + 1;
         }
         eng.state.snapshot_meta.last_log_id = snapshot_last_log_id;
-        let got = eng.log_handler().calc_purge_upto();
+        let got = eng.log_handler().calc_purge_upto(None);
 
         assert_eq!(
             want, got,
             "case: last_purged: {:?}, snapshot_last_log_id: {:?}, max_keep: {}",
             last_purged, snapshot_last_log_id, max_keep
         );
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_calc_purge_upto_retains_lagging_tail() -> anyhow::Result<()> {
+    // snapshot head at index 4, max_keep=1 => stock purge point is index 3
+    // (purge upto log_id(3,3)). A `retain_from_index` clamps the purge point below
+    // the first index a lagging target still needs, so the retained tail can be
+    // streamed to it instead of a snapshot install.
+    let cases = vec![
+        // retain_from, want
+        // retain_from above the stock purge point: no effect (stock behavior).
+        (Some(4), Some(log_id(3, 3))),
+        // retain_from at/below the stock purge point: clamp down, retaining more.
+        (Some(3), Some(log_id(1, 2))),
+        (Some(2), Some(log_id(1, 1))),
+        (Some(1), Some(log_id(0, 0))),
+        // retain everything already applied: nothing to purge.
+        (Some(0), None),
+        // disabled (None): stock purge point.
+        (None, Some(log_id(3, 3))),
+    ];
+
+    for (retain_from, want) in cases {
+        let mut eng = eng();
+        eng.config.max_in_snapshot_log_to_keep = 1;
+        eng.config.purge_batch_size = 1;
+        eng.state.snapshot_meta.last_log_id = Some(log_id(3, 4));
+
+        let got = eng.log_handler().calc_purge_upto(retain_from);
+        assert_eq!(want, got, "case: retain_from: {:?}", retain_from);
     }
 
     Ok(())

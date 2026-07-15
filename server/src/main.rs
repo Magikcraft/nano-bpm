@@ -7317,6 +7317,12 @@ impl ServerImpl {
     /// for every partition this node replicates, then forms the groups it leads.
     async fn raft_bootstrap(&self) {
         let server = self;
+        // Reclaim orphaned snapshot staging dirs from dead nano processes before
+        // hosting any partition, so a receiver/failover member's temp snapshots
+        // (and any multi-GB aborted-install partials) from prior boots don't
+        // accumulate on disk. Off the hot path; runs on a blocking thread so a
+        // large `remove_dir_all` never stalls the runtime.
+        tokio::task::spawn_blocking(crate::raft::sweep_orphaned_snapshot_dirs);
         {
             let topology = server.engine.topology().clone();
             let transport = server.raft_transport();

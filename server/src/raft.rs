@@ -578,7 +578,7 @@ impl PartitionStateMachine {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!(
-            "nanobpmn-raftsnap-{}-p{partition_id}-{nanos}",
+            "{RAFT_SNAPSHOT_DIR_PREFIX}{}-p{partition_id}-{nanos}",
             std::process::id()
         ))
     }
@@ -626,6 +626,63 @@ impl PartitionStateMachine {
             })
             .await;
         Ok(())
+    }
+}
+
+/// Filename prefix for the per-process, per-partition snapshot staging dirs a
+/// volatile-log member anchors its snapshots under (see
+/// [`PartitionStateMachine::temp_snapshot_dir`]). Shared with
+/// [`sweep_orphaned_snapshot_dirs`] so creation and cleanup never drift.
+const RAFT_SNAPSHOT_DIR_PREFIX: &str = "nanobpmn-raftsnap-";
+
+/// Whether `pid` names a live process. Linux-only signal via `/proc/<pid>`; on
+/// other platforms (dev/test) we conservatively report "alive" so the sweep
+/// never removes a dir it cannot prove is orphaned.
+fn pid_is_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    } else {
+        true
+    }
+}
+
+/// Remove orphaned per-process snapshot staging dirs left in the system temp dir
+/// by dead nano processes. Each volatile-log (receiver / failover) member anchors
+/// its snapshots under `nanobpmn-raftsnap-<pid>-p<part>-<ts>`; a member rebuild
+/// (new ts) or a process restart (new pid) orphans the old dir, and an aborted
+/// `InstallSnapshot` can leave a multi-GB partial inside it. Nothing else ever
+/// reclaims them, so across restarts they can fill the disk (observed: 175+ GB on
+/// a soak node, tripping the deploy disk preflight). Swept once at raft bootstrap:
+/// a dir is removed only when its embedded pid is neither this process nor a live
+/// one, so a co-located nano instance is never disturbed.
+pub fn sweep_orphaned_snapshot_dirs() {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(RAFT_SNAPSHOT_DIR_PREFIX))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me || pid_is_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        tracing::info!(
+            ?path,
+            orphaned_pid = pid,
+            "reclaiming orphaned raft snapshot staging dir"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
@@ -847,6 +904,24 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
+        // Reclaim any orphaned partials from previously-aborted installs in this
+        // dir before starting a fresh receive. openraft never resumes a prior
+        // `begin_receiving_snapshot` file, so any leftover `incoming-*.tmp` is dead
+        // weight: under a catch-up-timeout retry loop (ADR 0019 snapshot churn)
+        // each aborted InstallSnapshot would otherwise leave a multi-GB partial
+        // behind, and they accumulate until the disk fills. Sweeping here bounds
+        // the in-flight partials for this partition to one.
+        if let Ok(entries) = std::fs::read_dir(&self.snapshot_dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("incoming-"))
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         // A fresh, empty on-disk file that openraft streams the incoming snapshot
         // chunks into (AsyncWrite + AsyncSeek), so the receiving side never buffers
         // the whole snapshot in RAM either.
@@ -1042,6 +1117,19 @@ fn raft_config(partition_id: u64) -> Config {
         // catches up from the (lean) snapshot, which for big payloads is cheaper
         // than shipping the retained log tail.
         max_in_snapshot_log_to_keep: raft_env_u64("NANOBPMN_RAFT_KEEP_LOGS", 1000),
+        // Retention accelerator for the reclaim hand-off (ADR 0019): retain up to
+        // this many extra already-snapshotted entries when a replication target is
+        // behind, so a returning owner (added as a learner on rejoin) catches up by
+        // STREAMING the retained tail instead of installing a full state-machine
+        // snapshot — which under sustained load cannot finish inside the hand-off
+        // catch-up window, so the transfer would otherwise only complete once load
+        // eased. Bounded, so a stuck/dead target cannot pin the log without bound.
+        // `0` disables it (pure `max_in_snapshot_log_to_keep` purging). Sized to
+        // cover a realistic rejoin gap (downtime × per-partition write rate); under
+        // large variable payloads a deployment should shrink it (each retained
+        // entry can be ~1 MB), trading a snapshot install for retained-log memory.
+        // (`NANOBPMN_RAFT_LAGGING_RETAIN`, default 400_000.)
+        max_extra_log_to_keep_for_lagging: raft_env_u64("NANOBPMN_RAFT_LAGGING_RETAIN", 400_000),
         // Cap on entries coalesced into one AppendEntries RPC. openraft's default
         // is 300; combined with large (50 KB-variable) batched entries a single
         // catch-up RPC would carry hundreds of MB and blow the ~250 ms

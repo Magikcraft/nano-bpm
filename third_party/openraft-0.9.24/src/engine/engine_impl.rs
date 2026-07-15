@@ -47,6 +47,7 @@ use crate::type_config::alias::SnapshotDataOf;
 use crate::type_config::TypeConfigExt;
 use crate::AsyncRuntime;
 use crate::LogId;
+use crate::progress::Progress;
 use crate::LogIdOptionExt;
 use crate::Membership;
 use crate::RaftLogId;
@@ -566,9 +567,30 @@ where C: RaftTypeConfig
             return false;
         }
 
-        self.log_handler().schedule_policy_based_purge();
+        let retain_from = self.lagging_retain_floor();
+        self.log_handler().schedule_policy_based_purge(retain_from);
         self.try_purge_log();
         true
+    }
+
+    /// Compute the log-retention floor for a lagging replication target, or `None`
+    /// to disable retention (stock purge behavior).
+    ///
+    /// When [`crate::Config::max_extra_log_to_keep_for_lagging`] is non-zero and this
+    /// node is leading, return the lowest log index any replication target still
+    /// needs (its `matching.next_index()`), but never retain more than `cap` entries
+    /// below the snapshot head — so a stuck or dead target cannot pin the log without
+    /// bound. Callers pass the result to [`LogHandler::calc_purge_upto`], which clamps
+    /// the purge point below it.
+    fn lagging_retain_floor(&self) -> Option<u64> {
+        let cap = self.config.max_extra_log_to_keep_for_lagging;
+        if cap == 0 {
+            return None;
+        }
+        let leader = self.leader.as_ref()?;
+        let min_needed = leader.progress.iter().map(|(_, e)| e.matching.next_index()).min()?;
+        let head_next = self.state.snapshot_meta.last_log_id.next_index();
+        Some(min_needed.max(head_next.saturating_sub(cap)))
     }
 
     /// Try to purge logs up to the expected position.
