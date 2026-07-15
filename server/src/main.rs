@@ -9871,20 +9871,51 @@ impl ServerImpl {
         Ok((instance_key, sync_completed))
     }
 
-    /// The Raft create path (experimental): pick a partition this node currently
-    /// LEADS and replicate `CreateInstance` through its Raft log. The state
-    /// machine applies the committed command to the same engine actor the rest of
-    /// the server reads from, so durability and serving share one materialized
-    /// copy. Returns the minted instance key and whether it completed
+    /// The Raft create path (experimental): place the create cluster-wide across
+    /// EVERY partition (leader-aware, via [`Self::stream_leader_placement`]) and
+    /// replicate `CreateInstance` through the chosen partition's Raft log. The
+    /// state machine applies the committed command to the same engine actor the
+    /// rest of the server reads from, so durability and serving share one
+    /// materialized copy. Returns the minted instance key and whether it completed
     /// synchronously (no async jobs), matching [`Self::create_for_stream`].
     ///
-    /// Choosing among the *led* partitions (rather than the statically owned set)
-    /// means a create commits locally whenever this node leads any partition —
-    /// after a failover it routes to a partition this node was elected to lead
-    /// instead of shedding a 503 on a partition whose leadership moved away. When
-    /// this node leads NO partition (a transient window right after losing every
-    /// leadership), the create is FORWARDED to a peer that leads one rather than
-    /// returning a retryable 503.
+    /// Placement forwards each create to the partition's CURRENT leader, so a
+    /// producer attached to one gateway drives the whole cluster — not just the
+    /// partitions this node happens to lead (the RF>=2 stream imbalance that left a
+    /// recovered node with no attached producer receiving zero creates). When a
+    /// placement lands on a partition THIS node leads it commits locally among the
+    /// *led* partitions (`for_create_among`); when this node leads NO partition (a
+    /// transient window right after losing every leadership) the create is
+    /// FORWARDED to a peer that leads one rather than returning a retryable 503.
+    /// Cluster-wide, leader-aware create placement for the Raft stream create
+    /// path. Advances the shared round-robin cursor to a partition and resolves
+    /// its CURRENT Raft leader: returns `Some(node)` when a *remote* node leads it
+    /// (forward the create there), or `None` when this node leads it, its leader
+    /// is unknown, or the cluster is single-partition (create locally).
+    ///
+    /// Routing to the live LEADER — not the static owner ([`stream_create_placement`]
+    /// / `next_create_placement`) — is what keeps placement failover-safe: while an
+    /// owner is down its partitions resolve to the incumbent leader, and once the
+    /// owner returns and reclaims leadership they resolve back to it. This closes
+    /// the RF>=2 stream-create imbalance where a producer attached to ONE gateway
+    /// only ever committed on the partitions THIS node led, starving peer-led
+    /// partitions — most visibly a freshly recovered node with no directly
+    /// attached producer, which reclaimed leadership but received zero creates.
+    /// The REST path already spreads via `next_create_placement`; this gives the
+    /// falcon stream path the same spread, but leader-aware.
+    fn stream_leader_placement(&self) -> Option<u32> {
+        let p = self.engine.next_create_partition()?;
+        let node_id = self.engine.topology().node_id as u64;
+        match self
+            .raft
+            .get(p)
+            .and_then(|part| part.raft.metrics().borrow().current_leader)
+        {
+            Some(leader) if leader != node_id => Some(leader as u32),
+            _ => None,
+        }
+    }
+
     async fn create_via_raft(
         &self,
         by_id: Option<String>,
@@ -9893,6 +9924,38 @@ impl ServerImpl {
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
+        }
+        // Cluster-wide, leader-aware placement (see `stream_leader_placement`):
+        // spread stream creates across EVERY partition and forward each to its
+        // current leader, so a producer on one gateway drives the whole cluster —
+        // including a recovered node that reclaimed leadership but has no directly
+        // attached producer. A local/own-leader placement (`None`) falls through to
+        // the local propose below.
+        if let Some(leader) = self.stream_leader_placement() {
+            let wire_vars = if variables.is_empty() {
+                None
+            } else {
+                Some(
+                    variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), value_to_json(v)))
+                        .collect(),
+                )
+            };
+            return match self
+                .create_forwarded_stream(leader, by_id.clone(), by_key.clone(), wire_vars)
+                .await
+            {
+                Ok(res) => Ok(res),
+                // A genuine client rejection is returned as-is; any other failure
+                // (an unreachable or just-lost leader) becomes a retryable 503 so
+                // the client re-places onto a healthy leader. We deliberately do
+                // NOT fall through to a local create here, so an ambiguous
+                // post-send transport error can never mint a duplicate instance.
+                Err((400, m)) => Err((400, m)),
+                Err((409, m)) => Err((409, m)),
+                Err((_, m)) => Err((503, m)),
+            };
         }
         // This node leads nothing right now: forward to a peer leader instead of
         // shedding a 503 the client would have to retry.
@@ -14902,6 +14965,44 @@ mod clustered_startup_tests {
         }
         assert_eq!(local, 4, "half of 8 placements (partitions 0,2) are local");
         assert_eq!(remote_to_1, 4, "half (partitions 1,3) forward to node 1");
+    }
+
+    #[test]
+    fn next_create_partition_round_robins_every_partition() {
+        // The leader-aware stream create placement (`stream_leader_placement`)
+        // rides this cursor: it must sweep EVERY partition in the cluster, not
+        // just the ones this node owns, so a producer on one gateway can drive
+        // instances on peer-led partitions (incl. a recovered node's). node 0 of a
+        // 2-node, 4-partition cluster still sees all four ids come round.
+        let node0 = clustered_node(0);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(
+                node0
+                    .engine
+                    .next_create_partition()
+                    .expect("multi-partition cluster yields a placement partition"),
+            );
+        }
+        assert_eq!(
+            seen,
+            std::collections::HashSet::from([0, 1, 2, 3]),
+            "placement sweeps every partition in the cluster"
+        );
+    }
+
+    #[test]
+    fn single_node_next_create_partition_is_local() {
+        // A single-node cluster owns every partition, so the leader-aware stream
+        // placement is always local (None) — no forwarding, byte-identical fast
+        // path.
+        let solo = ServerImpl::default();
+        for _ in 0..16 {
+            assert!(
+                solo.engine.next_create_partition().is_none(),
+                "single node never forwards a stream create"
+            );
+        }
     }
 
     #[test]

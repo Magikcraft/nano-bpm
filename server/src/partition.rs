@@ -434,6 +434,23 @@ impl Partitions {
         }
     }
 
+    /// The next global partition id for cluster-wide create placement, advancing
+    /// the shared round-robin cursor. Returns `None` for a single-partition
+    /// cluster (placement is always local). Unlike [`next_create_placement`],
+    /// which resolves the chosen partition to its *static owner*, this returns the
+    /// raw partition id so a leader-aware caller (the Raft stream create path in
+    /// `stream_leader_placement`) can route to the partition's current Raft
+    /// **leader** instead of its owner — correct across failover, where leadership
+    /// has moved off the owner (a down node's partitions lead from the incumbent;
+    /// a recovered node reclaims them).
+    pub fn next_create_partition(&self) -> Option<u64> {
+        let n = self.router.partition_count();
+        if n <= 1 {
+            return None;
+        }
+        Some((self.next_place.fetch_add(1, Ordering::Relaxed) % n) as u64)
+    }
+
     /// Number of partitions in the whole cluster (local + remote). Used by the
     /// create-placement protection layer (ADR 0014) to bound its reroute loop and
     /// to enumerate placement slots for load-aware weighting.
