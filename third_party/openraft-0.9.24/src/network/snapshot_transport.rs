@@ -195,8 +195,30 @@ where C::SnapshotData: tokio::io::AsyncRead + tokio::io::AsyncWrite + tokio::io:
                 "sending snapshot chunk"
             );
 
+            // Derive the per-segment RPC deadline from the snapshot SIZE instead
+            // of using a single fixed wall-clock timeout for every segment.
+            //
+            // `option.hard_ttl()` (from `Config::install_snapshot_timeout`) is the
+            // budget to transfer+install ONE chunk. A non-final segment only writes
+            // its chunk on the receiver, so one unit suffices. The FINAL segment's
+            // RPC, however, only returns after the receiver installs the ENTIRE
+            // snapshot (deserialize + apply the whole state machine), whose cost
+            // scales with the total snapshot size `end`, not with one chunk. Using
+            // the single per-chunk timeout there makes a large snapshot's final RPC
+            // time out and the whole transfer restart forever. So budget the final
+            // segment `n_chunks` units — i.e. `end / chunk_size` — which scales
+            // linearly with snapshot size and needs no future re-guessing as the
+            // resident state grows.
+            let per_chunk_ttl = option.hard_ttl();
+            let rpc_ttl = if done {
+                let n_chunks = (end + chunk_size as u64 - 1) / (chunk_size as u64).max(1);
+                per_chunk_ttl.saturating_mul(n_chunks.max(1) as u32)
+            } else {
+                per_chunk_ttl
+            };
+
             #[allow(deprecated)]
-            let res = C::timeout(option.hard_ttl(), net.install_snapshot(req, option.clone())).await;
+            let res = C::timeout(rpc_ttl, net.install_snapshot(req, option.clone())).await;
 
             let resp = match res {
                 Err(outer_err) => {
@@ -775,6 +797,115 @@ mod tests {
 
         assert!(matches!(err, StreamingError::Network(_)));
         assert_eq!(net.received_offset, vec![0]);
+    }
+
+    /// A network where only the FINAL (`done`) InstallSnapshot segment is slow,
+    /// mimicking a receiver that deserializes+applies the whole state machine on
+    /// the last chunk. Non-final chunks return quickly.
+    struct FinalSegmentSlowNetwork {
+        received_offset: Vec<u64>,
+        chunk_delay: Duration,
+        final_delay: Duration,
+    }
+
+    impl<C> RaftNetwork<C> for FinalSegmentSlowNetwork
+    where C: RaftTypeConfig<NodeId = u64>
+    {
+        async fn append_entries(
+            &mut self,
+            _rpc: AppendEntriesRequest<C>,
+            _option: RPCOption,
+        ) -> Result<AppendEntriesResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+            unimplemented!()
+        }
+
+        async fn vote(
+            &mut self,
+            _rpc: VoteRequest<C::NodeId>,
+            _option: RPCOption,
+        ) -> Result<VoteResponse<C::NodeId>, RPCError<C::NodeId, C::Node, RaftError<C::NodeId>>> {
+            unimplemented!()
+        }
+
+        async fn full_snapshot(
+            &mut self,
+            _vote: Vote<C::NodeId>,
+            _snapshot: Snapshot<C>,
+            _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+            _option: RPCOption,
+        ) -> Result<SnapshotResponse<C::NodeId>, StreamingError<C, Fatal<C::NodeId>>> {
+            unimplemented!()
+        }
+
+        async fn install_snapshot(
+            &mut self,
+            rpc: InstallSnapshotRequest<C>,
+            _option: RPCOption,
+        ) -> Result<
+            InstallSnapshotResponse<C::NodeId>,
+            RPCError<C::NodeId, C::Node, RaftError<C::NodeId, InstallSnapshotError>>,
+        > {
+            self.received_offset.push(rpc.offset);
+            let delay = if rpc.done { self.final_delay } else { self.chunk_delay };
+            sleep(delay).await;
+            Ok(InstallSnapshotResponse { vote: rpc.vote })
+        }
+    }
+
+    async fn run_final_segment(
+        per_chunk_ttl: Duration,
+        chunk_delay: Duration,
+        final_delay: Duration,
+    ) -> (Result<SnapshotResponse<u64>, StreamingError<UTConfig, Fatal<u64>>>, Vec<u64>) {
+        let mut net = FinalSegmentSlowNetwork {
+            received_offset: vec![],
+            chunk_delay,
+            final_delay,
+        };
+
+        let mut opt = RPCOption::new(per_chunk_ttl);
+        opt.snapshot_chunk_size = Some(1);
+        let cancel = futures::future::pending();
+
+        // 3 bytes @ chunk_size=1 => 3 segments; the 3rd is `done`.
+        let res = Chunked::send_snapshot(
+            &mut net,
+            Vote::new(1, 0),
+            Snapshot::<UTConfig>::new(
+                SnapshotMeta {
+                    last_log_id: None,
+                    last_membership: StoredMembership::default(),
+                    snapshot_id: "1-1-1-final".to_string(),
+                },
+                Box::new(Cursor::new(vec![1, 2, 3])),
+            ),
+            cancel,
+            opt,
+        )
+        .await;
+
+        (res, net.received_offset)
+    }
+
+    /// The final segment's RPC deadline must scale with snapshot SIZE
+    /// (`ceil(bytes/chunk_size)` per-chunk units), not use a single per-chunk unit.
+    #[tokio::test]
+    async fn test_final_segment_deadline_scales_with_snapshot_size() {
+        // per-chunk unit = 15ms; 3 segments. Non-final chunks are fast (2ms).
+        // The final install takes 30ms — LONGER than one 15ms unit, so a
+        // non-scaling transport would time the final RPC out. With size scaling
+        // its budget is 3*15ms = 45ms > 30ms, so it must SUCCEED and deliver all
+        // three segments (offsets 0,1,2).
+        let (res, offsets) =
+            run_final_segment(Duration::from_millis(15), Duration::from_millis(2), Duration::from_millis(30)).await;
+        assert!(res.is_ok(), "final segment should fit the size-scaled deadline: {res:?}");
+        assert_eq!(offsets, vec![0, 1, 2]);
+
+        // Sanity: the scaled budget is still FINITE — a final install slower than
+        // the whole 3*15ms=45ms budget still times out (not an unbounded wait).
+        let (res_slow, _) =
+            run_final_segment(Duration::from_millis(15), Duration::from_millis(2), Duration::from_millis(120)).await;
+        assert!(matches!(res_slow, Err(StreamingError::Network(_))), "an over-budget install must still time out");
     }
 
     struct PayloadTooLargeNetwork {

@@ -1191,6 +1191,28 @@ fn raft_config(partition_id: u64) -> Config {
         // entries from the propose batcher) keeps each AppendEntries shippable
         // within the timeout. Env-tunable (`NANOBPMN_RAFT_MAX_PAYLOAD_ENTRIES`).
         max_payload_entries: raft_env_u64("NANOBPMN_RAFT_MAX_PAYLOAD_ENTRIES", 16),
+        // PER-CHUNK budget for an InstallSnapshot segment RPC. openraft's default
+        // is a mere 200 ms, and because `send_snapshot_timeout` is 0 that same
+        // value also bounds the FINAL segment — whose RPC only returns after the
+        // receiver deserializes and applies the ENTIRE snapshot body
+        // (PartitionStateMachine install_snapshot does a full serde_json read of
+        // the resident engine state: every active process instance). For a large
+        // state machine (millions of instances after a long-downtime rejoin under
+        // load) that install takes seconds to tens of seconds, so the 200 ms
+        // deadline elapses and openraft aborts + restarts the whole snapshot
+        // forever (`InstallSnapshot RPC timed out: deadline has elapsed`,
+        // request_id Snapshot(N) climbing) — the transfer never lands and a
+        // returning owner can never catch up via snapshot install under load.
+        //
+        // We DON'T fix this with a bigger fixed guess (that rots as state grows).
+        // The vendored snapshot transport derives the FINAL segment's deadline
+        // from the snapshot SIZE: it budgets `ceil(snapshot_bytes / chunk_size)`
+        // of THIS value, so the whole-install deadline auto-scales linearly with
+        // the snapshot. This knob is therefore the per-chunk unit (transfer +
+        // apply of one `snapshot_max_chunk_size` chunk); pick it generously (the
+        // final install is slower per byte than raw transfer). Env-tunable.
+        // (`NANOBPMN_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS`, 2s per chunk.)
+        install_snapshot_timeout: raft_env_u64("NANOBPMN_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS", 2_000),
         ..Default::default()
     }
 }
