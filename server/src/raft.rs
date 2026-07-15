@@ -455,6 +455,59 @@ fn read_snapshot_ptr(dir: &Path) -> Option<StoredSnapshot> {
     })
 }
 
+/// Whether hosting `log_dir`'s durable on-disk log would hit a **purge-hole** —
+/// the case where a node that was down longer than the leader's log-retention
+/// window rejoins with a committed index beyond what its local snapshot covers,
+/// while the log entries needed to replay that gap have already been purged.
+///
+/// # Why this exists (purge-hole → snapshot fallback, issue #111)
+///
+/// On boot openraft's `get_initial_state` replays `(last_applied, committed]` from
+/// the log to rebuild the state machine up to the durable commit point. `apply`'s
+/// snapshot restores `last_applied`; the durable store filters every entry at or
+/// below `last_purged` on open. So when `last_purged >= last_applied.next_index()`
+/// **and** `committed > last_applied`, the very first entry the reapply needs is
+/// physically gone: openraft raises a defensive `LogIndexNotFound (want:N …)` and
+/// the partition **fails to host** (a rejoining node then silently runs its owned
+/// groups only, dropping its replica groups — degraded RF + a peer AppendEntries
+/// storm). The Raft-correct recovery is to discard the unusable local log and
+/// **install a fresh snapshot from the current leader**, so the caller hosts the
+/// member as an empty receiver (`log_dir = None`) instead of resuming on-disk.
+///
+/// This is a server-side detection that maps cleanly onto openraft 0.10's
+/// `loosen-follower-log-revert` + app-side snapshot transport (issue #111): once
+/// migrated, the follower may revert to an empty log without panicking the leader,
+/// and this helper becomes deletable.
+///
+/// Returns `false` (host on-disk normally) when there is no committed marker, when
+/// the snapshot already covers the committed point (no gap to replay), or when the
+/// retained log tail still holds the reapply range (the common brief-restart case).
+pub fn durable_log_has_purge_hole(log_dir: &Path) -> bool {
+    let (committed, last_purged) = crate::raft_logstore::peek_committed_and_purged(log_dir);
+    // A fresh/empty durable dir (nothing committed) hosts normally.
+    let Some(committed) = committed else {
+        return false;
+    };
+    // The snapshot `apply` will restore covers `[.., last_applied]`.
+    let last_applied =
+        read_snapshot_ptr(&log_dir.join("snapshots")).and_then(|s| s.meta.last_log_id);
+    // Snapshot already at/after the commit point ⇒ boot reapply is a no-op ⇒ no hole.
+    if last_applied
+        .map(|a| a.index >= committed.index)
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    // The reapply needs `[last_applied.next_index() .. committed]`; its first entry
+    // is `last_applied.index + 1` (or `0` when there is no snapshot). Those entries
+    // are physically absent iff the durable purge marker has advanced to or past
+    // that first index (the store drops everything `<= last_purged` on open).
+    let needed_first = last_applied.map(|a| a.index + 1).unwrap_or(0);
+    last_purged
+        .map(|p| p.index >= needed_first)
+        .unwrap_or(false)
+}
+
 /// Metadata held by the Raft state machine: the last applied log id and
 /// membership. The materialized engine state itself lives on the partition's
 /// [`DeepthiHandle`] (driven by [`apply`](RaftStateMachine::apply)) and is
@@ -2170,6 +2223,103 @@ mod tests {
         assert!(
             !dst.with(|j| j.state().processes.is_empty()).await,
             "the deployed process is recovered from the snapshot, not from a (purged) log"
+        );
+    }
+
+    /// The purge-hole → snapshot-fallback boot detector (issue #111): a node that
+    /// rejoins after being down longer than the leader's log-retention window has
+    /// a committed index beyond what its local snapshot covers, and the log entries
+    /// needed to replay that gap have been purged. Hosting from such a log trips
+    /// openraft's defensive `LogIndexNotFound`, so the caller must host a fresh
+    /// receiver instead. This pins the exact boundary: a hole is flagged only when
+    /// `committed` is beyond the snapshot AND the reapply range is purged; a
+    /// snapshot that already covers `committed`, a retained tail that still holds
+    /// the range, and an empty/uncommitted dir are all NOT holes.
+    #[tokio::test]
+    async fn durable_log_purge_hole_detection_pins_the_boundary() {
+        use openraft::CommittedLeaderId;
+        use openraft::storage::RaftLogStorage;
+
+        fn lid(index: u64) -> LogId<NodeId> {
+            LogId::new(CommittedLeaderId::new(1, 0), index)
+        }
+
+        // Build a durable dir with the given committed/last_purged markers (via the
+        // real log store, which persists `state.json`) and, when `snap_last` is
+        // Some, a durable current-snapshot pointer covering that index.
+        async fn setup(
+            committed: Option<u64>,
+            purged: Option<u64>,
+            snap_last: Option<u64>,
+        ) -> PathBuf {
+            let dir = unique_log_dir("purge-hole");
+            {
+                let mut store = crate::raft_logstore::RaftLogStore::open(&dir).expect("open store");
+                if let Some(c) = committed {
+                    store
+                        .save_committed(Some(lid(c)))
+                        .await
+                        .expect("save committed");
+                }
+                if let Some(p) = purged {
+                    // `purge` persists `state.json` with BOTH markers, so committing
+                    // first then purging leaves a durable (committed, last_purged).
+                    store.purge(lid(p)).await.expect("purge");
+                }
+            }
+            if let Some(s) = snap_last {
+                let snap_dir = dir.join("snapshots");
+                std::fs::create_dir_all(&snap_dir).expect("snap dir");
+                let bin = snap_dir.join("snap-test.bin");
+                std::fs::write(&bin, b"x").expect("snap body");
+                let stored = StoredSnapshot {
+                    meta: SnapshotMeta {
+                        last_log_id: Some(lid(s)),
+                        last_membership: StoredMembership::default(),
+                        snapshot_id: "test-snap".to_string(),
+                    },
+                    path: bin,
+                };
+                write_snapshot_ptr(&snap_dir, &stored).expect("write snapshot ptr");
+            }
+            dir
+        }
+
+        // HOLE: committed=100 is beyond snapshot=10, and the reapply range (10,100]
+        // is purged (last_purged=50). Hosting on-disk would trip LogIndexNotFound.
+        let hole = setup(Some(100), Some(50), Some(10)).await;
+        assert!(
+            durable_log_has_purge_hole(&hole),
+            "purged reapply range is a hole"
+        );
+
+        // HOLE: no snapshot at all, and the log is purged below the commit point.
+        let no_snap = setup(Some(100), Some(50), None).await;
+        assert!(
+            durable_log_has_purge_hole(&no_snap),
+            "no snapshot + purged log is a hole"
+        );
+
+        // NOT a hole: the snapshot already covers the committed point (reapply no-op).
+        let covered = setup(Some(100), Some(50), Some(100)).await;
+        assert!(
+            !durable_log_has_purge_hole(&covered),
+            "snapshot covers committed"
+        );
+
+        // NOT a hole: the retained tail still holds the reapply range
+        // (last_purged=10 <= last_applied=10, so entries (10,100] are present).
+        let retained = setup(Some(100), Some(10), Some(10)).await;
+        assert!(
+            !durable_log_has_purge_hole(&retained),
+            "retained tail covers the range"
+        );
+
+        // NOT a hole: a fresh/empty dir with nothing committed hosts normally.
+        let empty = setup(None, None, None).await;
+        assert!(
+            !durable_log_has_purge_hole(&empty),
+            "no committed marker is not a hole"
         );
     }
 
