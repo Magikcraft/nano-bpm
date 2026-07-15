@@ -374,12 +374,23 @@ pub struct ServerImpl {
     reclaim_via_handoff: bool,
     /// Incumbent side of an in-flight leadership hand-off: the partitions for which
     /// THIS node (the failover leader) is currently executing a hand-off to a
-    /// returning owner. Presence is both the per-partition hand-off LEASE (a second
-    /// concurrent request is declined) and the create WRITE-GATE (new creates are
-    /// steered off this partition while the learner catches up, so its raft log
-    /// quiesces and the catch-up can reach zero lag). Empty otherwise — zero
-    /// overhead on the hot path.
-    handoff_gated: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    /// returning owner, each mapped to its completion-pause deadline (ADR 0019).
+    /// Presence is both the per-partition hand-off LEASE (a second concurrent
+    /// request is declined) and the create WRITE-GATE (new creates are steered off
+    /// this partition while the learner catches up). Until the mapped deadline,
+    /// job-mutation writes (completions/fails/errors) to the partition are also
+    /// paused (retryable) so the raft log fully quiesces and the catch-up can reach
+    /// zero lag; the deadline bounds that pause (`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`).
+    /// Empty otherwise — zero overhead on the hot path.
+    handoff_gated: Arc<std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>>,
+    /// Bounded ceiling (milliseconds) on the per-partition completion write-pause
+    /// during a leadership hand-off catch-up (`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`,
+    /// default 2000; `0` disables the completion pause, leaving only the
+    /// create-steer = Zeebe-style best-effort). Paused completions are retryable
+    /// (at-least-once), so no work is lost — the log just stops growing long enough
+    /// to converge. Atomic only so tests can set a short deterministic window; it is
+    /// read once per hand-off (cold path).
+    handoff_write_pause_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Requester side of an in-flight leadership hand-off: partitions for which this
     /// (rejoining owner) node has asked the incumbent to hand leadership back,
     /// keyed by partition. Suppresses the legacy self-promote while the hand-off is
@@ -838,7 +849,10 @@ impl ServerImpl {
                 .as_deref()
                 .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
                 .unwrap_or(false),
-            handoff_gated: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            handoff_gated: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            handoff_write_pause_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                handoff_write_pause_from_env().as_millis() as u64,
+            )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_mode,
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -1800,8 +1814,9 @@ const HANDOFF_LAG_POLL: std::time::Duration = std::time::Duration::from_millis(5
 
 /// Replication lag (in log entries) at or below which a hand-off learner is
 /// considered caught up enough to promote to voter. Small non-zero slack so a
-/// steady trickle of writes (e.g. completions, which are not write-gated) doesn't
-/// make the loop chase a perpetually-moving last-log index.
+/// steady trickle of writes doesn't make the loop chase a perpetually-moving
+/// last-log index. During the bounded completion write-pause (ADR 0019) the log
+/// fully quiesces, so the learner converges well inside this slack.
 const HANDOFF_LAG_THRESHOLD: u64 = 64;
 
 /// Phase E (boot-as-receiver) probe window: on (re)boot a node solicits its
@@ -1814,6 +1829,33 @@ const HANDOFF_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_mill
 
 /// Poll/re-solicit interval for the Phase E boot incumbent probe.
 const HANDOFF_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Default bounded ceiling on the per-partition completion write-pause during a
+/// leadership hand-off catch-up (ADR 0019). Overridable via
+/// `NANOBPMN_HANDOFF_WRITE_PAUSE_MS`; `0` disables the completion pause (leaving
+/// only the create-steer = Zeebe-style best-effort reclaim).
+const HANDOFF_WRITE_PAUSE_DEFAULT_MS: u64 = 2000;
+
+/// Resolve the leadership hand-off completion write-pause ceiling from
+/// `NANOBPMN_HANDOFF_WRITE_PAUSE_MS` (default [`HANDOFF_WRITE_PAUSE_DEFAULT_MS`],
+/// on by default). A non-numeric value falls back to the default; `0` disables it.
+fn handoff_write_pause_from_env() -> std::time::Duration {
+    parse_handoff_write_pause(
+        std::env::var("NANOBPMN_HANDOFF_WRITE_PAUSE_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser for [`handoff_write_pause_from_env`]: `None`/blank/non-numeric →
+/// the default; a numeric value (incl. `0`, which disables the pause) → that many
+/// milliseconds.
+fn parse_handoff_write_pause(v: Option<&str>) -> std::time::Duration {
+    let ms = v
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(HANDOFF_WRITE_PAUSE_DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
 
 /// Cross-pass state for the leader-durable recovery supervisor
 /// ([`ServerImpl::leader_durable_recovery_tick`]). One instance lives for the
@@ -7272,6 +7314,19 @@ impl ServerImpl {
             // replica engine actor here (seeded with the current deployments) for
             // the state machine to apply the replicated log into.
             for p in topology.replica_partitions() {
+                // Phase E hand-off (NANOBPMN_RECLAIM_HANDOFF): defer hosting a
+                // partition this node OWNS until AFTER the incumbent probe below.
+                // Hosting it now with its restored on-disk log resurrects node's
+                // OLD single-voter lineage, which (a) immediately campaigns against
+                // a live failover incumbent (the "lost leadership during catch-up"
+                // symptom) and (b) cannot be reconciled with the incumbent's newer
+                // lineage by AppendEntries. For an incumbent-led partition we host a
+                // FRESH receiver (empty log) after the probe instead; a partition
+                // with no incumbent resumes its on-disk lineage there. Followers
+                // (non-owned replicas) host now — a learner never campaigns.
+                if server.reclaim_via_handoff && topology.leader_of(p) == topology.node_id {
+                    continue;
+                }
                 // A partition this node OWNS is served + exported locally; its
                 // exporter drives terminal-instance eviction. A partition this
                 // node only REPLICATES (follower under RF>1) has no exporter, so
@@ -7333,6 +7388,61 @@ impl ServerImpl {
             } else {
                 std::collections::HashSet::new()
             };
+
+            // Phase E: now host each OWNED partition that was deferred past the
+            // probe (skipped in the loop above when the flag is on). An owned
+            // partition a reachable incumbent leads is hosted as a FRESH receiver
+            // (empty in-memory log) so the incumbent's authoritative lineage
+            // replicates cleanly via the hand-off — the divergent on-disk log is
+            // discarded (sound in leader-durable: the sole voter's un-shipped tail
+            // was already accepted bounded loss at failover). An owned partition
+            // with NO incumbent resumes its durable on-disk lineage and is
+            // initialized by the loop below. Skipped entirely when the flag is off
+            // (those partitions were already hosted above).
+            if server.reclaim_via_handoff {
+                for p in topology.replica_partitions() {
+                    if topology.leader_of(p) != topology.node_id {
+                        continue;
+                    }
+                    // `handle_promotion` (adopting the incumbent's epoch during the
+                    // probe) may already have hosted a deferred partition as a fresh
+                    // receiver — don't clobber it.
+                    if server.raft_registry().get(p).is_some() {
+                        continue;
+                    }
+                    let Some(engine) = server.engine.local_for_partition(p).cloned() else {
+                        continue;
+                    };
+                    let deferred = handoff_incumbents.contains(&p);
+                    let log_dir = if deferred { None } else { raft_log_dir_for(p) };
+                    match crate::raft::RaftPartition::bootstrap_member(
+                        topology.node_id as u64,
+                        p,
+                        engine,
+                        transport.clone(),
+                        log_dir,
+                        false, // owned: has an exporter, never evicts in `apply`
+                    )
+                    .await
+                    {
+                        Ok(part) => {
+                            server.raft_registry().insert(Arc::new(part));
+                            tracing::info!(
+                                "raft: node {} hosting owned partition {p} ({})",
+                                topology.node_id,
+                                if deferred {
+                                    "fresh receiver, deferred to leadership hand-off"
+                                } else {
+                                    "resuming on-disk lineage"
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("raft: failed to host owned partition {p}: {e}");
+                        }
+                    }
+                }
+            }
 
             // Form each group this node leads from its replica set. `initialize`
             // is idempotent and does not require peers to be up (they catch up via
@@ -7708,11 +7818,17 @@ impl ServerImpl {
                     _ => None,
                 };
                 if let Some(inc) = incumbent {
-                    // Keep the incumbent epoch fresh, then request/await the hand-off.
+                    // Best-effort reclaim (ADR 0019, Zeebe-aligned): while a
+                    // REACHABLE incumbent still leads this owned partition, keep
+                    // requesting the leadership hand-off and NEVER fall back to a
+                    // competing self-promote — that fallback is the two-lineage
+                    // election storm. If a bounded attempt lapses,
+                    // `request_handoff_or_wait` re-arms and resends. We only reach
+                    // the self-promote path when NO reachable incumbent leads `p`
+                    // (a genuine failover / cold owner).
                     self.solicit_promotions_from(inc).await;
-                    if self.request_handoff_or_wait(p, inc).await {
-                        continue;
-                    }
+                    self.request_handoff_or_wait(p, inc).await;
+                    continue;
                 } else if leader.is_none() {
                     // Leaderless with no incumbent yet known: solicit ALL reachable
                     // co-replicas so a live incumbent is discovered (and handed off
@@ -7760,6 +7876,9 @@ impl ServerImpl {
                 );
                 self.promote_partition(p, next_epoch).await;
                 state.misses.remove(&p);
+                // No reachable incumbent remained, so any stale hand-off request
+                // for `p` is moot — clear it so a later rejoin starts clean.
+                self.handoff_pending.lock().unwrap().remove(&p);
                 // Hold the partition down for a settle window so a lagging metrics
                 // view cannot trigger an immediate re-promote at the next epoch.
                 state
@@ -8070,8 +8189,9 @@ impl ServerImpl {
             return Err((false, format!("add_learner: {e}")));
         }
         // Poll the learner toward zero lag, bounded by HANDOFF_CATCHUP_TIMEOUT.
-        // The write-gate keeps new creates off this partition so the log stops
-        // growing and the learner can converge.
+        // The write-gate keeps new creates off this partition and the bounded
+        // completion write-pause (ADR 0019) holds off job-mutation writes, so the
+        // log stops growing and the learner can converge to zero lag.
         let deadline = std::time::Instant::now() + HANDOFF_CATCHUP_TIMEOUT;
         loop {
             if !self.i_lead_raft(partition) {
@@ -8200,13 +8320,31 @@ impl ServerImpl {
     }
 
     /// Reserve the per-partition incumbent hand-off lease (and engage the create
-    /// write-gate). Returns `false` if a hand-off for `partition` is already in
-    /// flight.
+    /// write-gate + the bounded completion write-pause). Returns `false` if a
+    /// hand-off for `partition` is already in flight.
     fn acquire_handoff_lease(&self, partition: u64) -> bool {
-        self.handoff_gated.lock().unwrap().insert(partition)
+        let pause = std::time::Duration::from_millis(
+            self.handoff_write_pause_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let deadline = std::time::Instant::now() + pause;
+        let mut gated = self.handoff_gated.lock().unwrap();
+        if gated.contains_key(&partition) {
+            return false;
+        }
+        gated.insert(partition, deadline);
+        true
     }
 
-    /// Release the incumbent hand-off lease and lift the create write-gate for
+    /// Test hook: set the completion write-pause ceiling to a short, deterministic
+    /// window so a hand-off test isn't at the mercy of the 2 s production default.
+    #[cfg(test)]
+    fn set_handoff_write_pause_for_test(&self, d: std::time::Duration) {
+        self.handoff_write_pause_ms
+            .store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Release the incumbent hand-off lease and lift the write-gate/pause for
     /// `partition`.
     fn release_handoff_lease(&self, partition: u64) {
         self.handoff_gated.lock().unwrap().remove(&partition);
@@ -8216,7 +8354,19 @@ impl ServerImpl {
     /// incumbent hand-off (new creates are steered off it so its log quiesces).
     fn handoff_write_gated(&self, partition: u64) -> bool {
         let gated = self.handoff_gated.lock().unwrap();
-        !gated.is_empty() && gated.contains(&partition)
+        !gated.is_empty() && gated.contains_key(&partition)
+    }
+
+    /// Whether job-mutation writes (completions/fails/errors) to `partition` are
+    /// currently paused by an in-flight incumbent hand-off — true only while the
+    /// bounded pause window (`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`) is open. Rejected
+    /// writes are retryable; the pause lets the catch-up learner reach zero lag.
+    fn handoff_completion_paused(&self, partition: u64) -> bool {
+        let gated = self.handoff_gated.lock().unwrap();
+        if gated.is_empty() {
+            return false;
+        }
+        matches!(gated.get(&partition), Some(&deadline) if std::time::Instant::now() < deadline)
     }
 
     /// Fire-and-forget a hand-off ack to the requesting owner.
@@ -8257,19 +8407,18 @@ impl ServerImpl {
     }
 
     /// Requester side, driven by the recovery tick: a reachable failover incumbent
-    /// `incumbent` leads our owned `partition`. Ask it for a leadership hand-off
-    /// and suppress the legacy self-promote while it is in flight. Returns `true`
-    /// if the caller should NOT self-promote this pass (a hand-off is in flight or
-    /// still catching up), `false` if it should fall back to the legacy path
-    /// (incumbent declined, or the hand-off timed out without a joint-config
-    /// suspicion).
-    async fn request_handoff_or_wait(&self, partition: u64, incumbent: u32) -> bool {
+    /// `incumbent` leads our owned `partition`. Ask it for a leadership hand-off,
+    /// or re-send a fresh request if a prior bounded attempt lapsed. Best-effort
+    /// (ADR 0019): as long as a reachable incumbent leads the partition the caller
+    /// keeps calling this and never self-promotes, so this never "gives up" — it
+    /// re-arms the deadline and resends instead.
+    async fn request_handoff_or_wait(&self, partition: u64, incumbent: u32) {
         // Fast path: the transfer already landed and we now lead — clear and stop.
         if self.i_lead_raft(partition) {
             self.handoff_pending.lock().unwrap().remove(&partition);
-            return false;
+            return;
         }
-        let start = {
+        let resend = {
             let mut pending = self.handoff_pending.lock().unwrap();
             match pending.get_mut(&partition) {
                 None => {
@@ -8284,19 +8433,25 @@ impl ServerImpl {
                 }
                 Some(hp) => {
                     if hp.joint_suspected {
-                        // Never self-promote over a partially-migrated lineage.
-                        return true;
+                        // A membership change may be half-applied; wait it out
+                        // quietly rather than resend or diverge.
+                        false
+                    } else {
+                        hp.deadline_ticks = hp.deadline_ticks.saturating_sub(1);
+                        if hp.deadline_ticks == 0 {
+                            // The prior attempt lapsed. Re-arm and resend rather
+                            // than give up — the incumbent is still reachable and
+                            // leading, so self-promote would restart the storm.
+                            hp.deadline_ticks = HANDOFF_PENDING_TICKS;
+                            true
+                        } else {
+                            false
+                        }
                     }
-                    hp.deadline_ticks = hp.deadline_ticks.saturating_sub(1);
-                    if hp.deadline_ticks == 0 {
-                        pending.remove(&partition);
-                        return false; // give up -> legacy self-promote
-                    }
-                    false
                 }
             }
         };
-        if start {
+        if resend {
             let me = self.engine.topology().node_id as u64;
             let addr = self
                 .engine
@@ -8308,7 +8463,6 @@ impl ServerImpl {
                 link.send_request_handoff(partition, me, addr).await.ok();
             }
         }
-        true
     }
 
     /// Switch the runtime SLA mode from an operator action on THIS node (the
@@ -9981,6 +10135,14 @@ impl ServerImpl {
         command: Command,
     ) -> Result<Commit, (u16, String)> {
         let p = partition_of(job_key);
+        // Bounded completion write-pause (ADR 0019): while this node is handing
+        // `p` back to its returning owner, pause job-mutation writes so the raft
+        // log fully quiesces and the catch-up learner can reach zero lag. Retryable
+        // (at-least-once) — the worker redelivers once the brief pause lifts.
+        if self.handoff_completion_paused(p) {
+            crate::metrics::record_complete_outcome("handoff_pause");
+            return Err((503, format!("partition {p} handing off; retry")));
+        }
         let Some(part) = self.raft.get(p) else {
             return Err((500, format!("partition {p} has no Raft group")));
         };
@@ -17289,6 +17451,108 @@ mod clustered_startup_tests {
                 }
             }
         }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[test]
+    fn handoff_write_pause_parses_env_with_a_default_and_a_disable() {
+        use std::time::Duration;
+        // Absent / blank / non-numeric -> the on-by-default ceiling.
+        assert_eq!(
+            parse_handoff_write_pause(None),
+            Duration::from_millis(HANDOFF_WRITE_PAUSE_DEFAULT_MS),
+            "absent -> default (on by default)"
+        );
+        assert_eq!(
+            parse_handoff_write_pause(Some("   ")),
+            Duration::from_millis(HANDOFF_WRITE_PAUSE_DEFAULT_MS),
+            "blank -> default"
+        );
+        assert_eq!(
+            parse_handoff_write_pause(Some("nope")),
+            Duration::from_millis(HANDOFF_WRITE_PAUSE_DEFAULT_MS),
+            "non-numeric -> default"
+        );
+        // Explicit values, including 0 which disables the completion pause.
+        assert_eq!(
+            parse_handoff_write_pause(Some("500")),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_handoff_write_pause(Some(" 1500 ")),
+            Duration::from_millis(1500),
+            "surrounding whitespace is trimmed"
+        );
+        assert_eq!(
+            parse_handoff_write_pause(Some("0")),
+            Duration::ZERO,
+            "0 disables the completion pause (Zeebe-style best-effort)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_lease_engages_create_gate_and_a_bounded_completion_pause() {
+        // The incumbent hand-off lease must engage BOTH the create write-gate and a
+        // bounded completion write-pause (ADR 0019). The create-gate holds for the
+        // whole lease (creates steer off the partition); the completion-pause is
+        // time-bounded by the pause ceiling and lifts on its own so job-mutation
+        // writes resume even if the lease lingers. Release clears both.
+        let (node0, _n1, _n2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Deterministic short pause so the test is fast and non-flaky.
+        let short = std::time::Duration::from_millis(120);
+        node0.set_handoff_write_pause_for_test(short);
+
+        assert!(
+            !node0.handoff_write_gated(7),
+            "no gate before acquiring the lease"
+        );
+        assert!(
+            !node0.handoff_completion_paused(7),
+            "no pause before acquiring the lease"
+        );
+
+        assert!(
+            node0.acquire_handoff_lease(7),
+            "first acquire wins the lease"
+        );
+        assert!(
+            !node0.acquire_handoff_lease(7),
+            "a second concurrent hand-off for the same partition is declined"
+        );
+        assert!(
+            node0.handoff_write_gated(7),
+            "create-gate engaged while the lease is held"
+        );
+        assert!(
+            node0.handoff_completion_paused(7),
+            "completion-pause engaged inside the bounded window"
+        );
+
+        // After the bounded window the completion-pause lifts, but the create-gate
+        // (the lease) still holds until release.
+        tokio::time::sleep(short + std::time::Duration::from_millis(60)).await;
+        assert!(
+            !node0.handoff_completion_paused(7),
+            "completion-pause lifts once the bounded window elapses"
+        );
+        assert!(
+            node0.handoff_write_gated(7),
+            "the create-gate still holds until the lease is released"
+        );
+
+        node0.release_handoff_lease(7);
+        assert!(
+            !node0.handoff_write_gated(7),
+            "release lifts the create-gate"
+        );
+        assert!(
+            !node0.handoff_completion_paused(7),
+            "release lifts the completion-pause"
+        );
+
         for h in handles.drain(..) {
             h.abort();
         }
