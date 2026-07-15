@@ -16286,12 +16286,32 @@ mod clustered_startup_tests {
         let (node0, node1, node2) = boot_rf3_intake_cluster().await;
 
         const N: usize = 12;
+        // Pin every create to partition 0 by proposing directly to its Raft
+        // group. Cluster-wide leader-aware placement now spreads stream creates
+        // across EVERY partition (a producer on one gateway drives the whole
+        // cluster), so `create_for_stream` no longer lands all creates on
+        // partition 0. This test specifically exercises failover durability for
+        // the instances committed through partition 0's leader, so it targets
+        // that partition explicitly.
+        let part0 = node0
+            .raft_registry()
+            .get(0)
+            .expect("node0 leads partition 0");
         let mut instances = Vec::new();
         for _ in 0..N {
-            let (key, _c) = node0
-                .create_for_stream(Some("intake".into()), None, Default::default())
+            let item = part0
+                .propose_result(
+                    Command::create_instance_full("intake", Default::default(), Vec::new(), None),
+                    now_millis(),
+                )
                 .await
                 .expect("raft-routed create commits via quorum");
+            assert!(item.error.is_none(), "create rejected: {:?}", item.error);
+            let key = item
+                .events
+                .iter()
+                .find_map(Event::instance_key)
+                .expect("create produced an instance key");
             assert_eq!(nanobpmn_engine_core::partition_of(key), 0);
             instances.push(key);
         }
