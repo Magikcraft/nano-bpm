@@ -446,11 +446,19 @@ struct PartitionDto {
     partition_id: u64,
     /// Nodes replicating this partition.
     replicas: Vec<u32>,
+    /// The static owner (preferred leader) of this partition.
+    owner: u32,
     /// The current serving leader: the live Raft leader when Raft is active,
     /// otherwise the static owner.
     leader: Option<u32>,
     /// Live Raft term for this partition's group (when Raft is active here).
     raft_term: Option<u64>,
+    /// `true` when the partition is being served by a failover incumbent rather
+    /// than its owner (the live leader differs from the owner). While `true` the
+    /// owner is down or catching up — the cluster is not fully rebalanced. Only
+    /// meaningful for partitions this node hosts a Raft group for; `false`
+    /// otherwise (this node can't observe their live leader).
+    recovering: bool,
 }
 
 /// `GET /console/api/topology` — the cluster/topology view's data source.
@@ -470,21 +478,32 @@ async fn topology(State(server): State<ServerImpl>) -> Json<TopologyDto> {
 
     let partitions: Vec<PartitionDto> = (0..num_partitions)
         .map(|p| {
+            let owner = topology.owner_of(p);
             // Prefer the live Raft leader/term when this node hosts the group;
             // fall back to the static topology leader otherwise.
             let raft_part = server.raft_registry().get(p);
-            let (leader, term) = match raft_part {
+            let (leader, term, hosted) = match raft_part {
                 Some(part) => {
                     let m = part.raft.metrics().borrow().clone();
-                    (m.current_leader.map(|id| id as u32), Some(m.current_term))
+                    (
+                        m.current_leader.map(|id| id as u32),
+                        Some(m.current_term),
+                        true,
+                    )
                 }
-                None => (Some(topology.leader_of(p)), None),
+                None => (Some(topology.leader_of(p)), None, false),
             };
+            // A partition is "recovering" when we can see its live leader (we host
+            // the group) and it is not its owner — a failover incumbent is serving
+            // it while the owner is down or catching up.
+            let recovering = hosted && leader != Some(owner);
             PartitionDto {
                 partition_id: p + 1,
                 replicas: topology.replicas_of(p),
+                owner,
                 leader,
                 raft_term: term,
+                recovering,
             }
         })
         .collect();
@@ -836,6 +855,104 @@ struct MetricsDto {
     admission_create_queue_limit: i64,
     /// Cumulative admissions shed since boot (summed across all rails).
     admission_shed_total: u64,
+
+    /// This node's Raft recovery/leadership state — surfaces whether the node is
+    /// catching up after a restart (owns partitions a peer is still leading) or is
+    /// acting as a failover incumbent handing leadership back. `null`-equivalent
+    /// (all-zero, `recovering=false`) in steady state and on single-node/off-Raft.
+    recovery: RecoveryDto,
+}
+
+/// Per-node Raft recovery summary for the console cluster view. Lets the UI show
+/// "up but catching up" instead of a bare "up" while a restarted node reclaims
+/// leadership of its owned partitions (and the incumbent hands it back).
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryDto {
+    /// This node owns one or more partitions it does not yet lead — it is still
+    /// catching up after a restart before reclaiming leadership. While `true` the
+    /// cluster is not fully rebalanced back onto this node.
+    recovering: bool,
+    /// Partitions this node statically owns (its steady-state leadership set).
+    owned: u32,
+    /// Owned partitions this node currently leads again (reclaimed / steady).
+    reclaimed: u32,
+    /// Owned partitions currently led by a peer failover incumbent — the ones
+    /// this node is still catching up on.
+    catching_up: u32,
+    /// Partitions this node leads on behalf of a peer owner (this node is the
+    /// failover incumbent, handing leadership back as the owner catches up).
+    handing_off: u32,
+    /// Largest replication lag (in log entries) of a returning owner this node is
+    /// handing a partition back to, when known (incumbent side only).
+    handoff_lag_entries: Option<u64>,
+    /// Short human-readable summary, e.g. "reclaiming 2/4 partitions" or
+    /// "handing back 3 (lag 12k)". Empty in steady state.
+    detail: String,
+}
+
+/// Computes this node's [`RecoveryDto`] from the live Raft metrics of the groups
+/// it hosts. Cheap: a borrow of each hosted partition's metrics watch.
+fn build_recovery(server: &ServerImpl) -> RecoveryDto {
+    let topology = server.engine.topology();
+    let me = topology.node_id;
+    let num_partitions = topology.num_partitions;
+
+    let mut owned = 0u32;
+    let mut reclaimed = 0u32;
+    let mut catching_up = 0u32;
+    let mut handing_off = 0u32;
+    let mut handoff_lag: Option<u64> = None;
+
+    if crate::raft_enabled() && topology.num_nodes() > 1 {
+        for p in 0..num_partitions {
+            let owner = topology.owner_of(p);
+            let part = server.raft_registry().get(p);
+            let live_leader = part
+                .as_ref()
+                .and_then(|part| part.raft.metrics().borrow().current_leader);
+            if owner == me {
+                owned += 1;
+                match live_leader {
+                    Some(l) if l as u32 == me => reclaimed += 1,
+                    // Owned but led by a peer (or no leader yet) => still catching up.
+                    _ => catching_up += 1,
+                }
+            } else if matches!(live_leader, Some(l) if l as u32 == me) {
+                // We lead a partition we don't own: a failover incumbent handing
+                // leadership back to `owner` once it has caught up.
+                handing_off += 1;
+                if let Some(lag) = part
+                    .as_ref()
+                    .and_then(|part| part.replication_lag(owner as u64))
+                {
+                    handoff_lag = Some(handoff_lag.map_or(lag, |m| m.max(lag)));
+                }
+            }
+        }
+    }
+
+    let recovering = catching_up > 0;
+    let detail = if recovering {
+        format!("reclaiming {catching_up}/{owned} partitions")
+    } else if handing_off > 0 {
+        match handoff_lag {
+            Some(lag) => format!("handing back {handing_off} (lag {lag})"),
+            None => format!("handing back {handing_off}"),
+        }
+    } else {
+        String::new()
+    };
+
+    RecoveryDto {
+        recovering,
+        owned,
+        reclaimed,
+        catching_up,
+        handing_off,
+        handoff_lag_entries: handoff_lag,
+        detail,
+    }
 }
 
 /// Builds this node's metrics snapshot DTO. Shared by `GET /console/api/metrics`
@@ -901,6 +1018,8 @@ fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
         admission_backlog_limit: s.admission_backlog_limit,
         admission_create_queue_limit: s.admission_create_queue_limit,
         admission_shed_total: s.admission_shed_total,
+
+        recovery: build_recovery(server),
     }
 }
 

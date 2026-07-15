@@ -28,8 +28,13 @@ export function nodeConsoleUrl(
 export interface PartitionInfo {
   partition_id: number;
   replicas: number[];
+  owner: number;
   leader: number | null;
   raft_term: number | null;
+  /// True when a failover incumbent (not the owner) is serving this partition —
+  /// the owner is down or catching up. Only observable for partitions the queried
+  /// node hosts a Raft group for.
+  recovering: boolean;
 }
 
 export interface Topology {
@@ -299,6 +304,29 @@ export interface MetricsSnapshot {
   admissionBacklogLimit: number;
   admissionCreateQueueLimit: number;
   admissionShedTotal: number;
+
+  /// This node's Raft recovery/leadership state (catching up after a restart, or
+  /// acting as a failover incumbent handing leadership back).
+  recovery: Recovery;
+}
+
+/// Per-node Raft recovery summary — drives the "up · catching up" console status.
+export interface Recovery {
+  /// This node owns partitions it does not yet lead — still catching up after a
+  /// restart before reclaiming leadership.
+  recovering: boolean;
+  /// Partitions this node statically owns.
+  owned: number;
+  /// Owned partitions this node currently leads again (reclaimed / steady).
+  reclaimed: number;
+  /// Owned partitions currently led by a peer incumbent — still catching up.
+  catchingUp: number;
+  /// Partitions this node leads on behalf of a peer owner (incumbent side).
+  handingOff: number;
+  /// Largest replication lag (log entries) of a returning owner, when known.
+  handoffLagEntries: number | null;
+  /// Short human-readable summary, e.g. "reclaiming 2/4 partitions".
+  detail: string;
 }
 
 /// Per-node metrics + cluster aggregate from `/console/api/cluster/metrics`.

@@ -54,6 +54,14 @@ export default function Topology() {
               {data.nodes.map((n) => {
                 const h = healthOf(n.node_id);
                 const down = h && !h.reachable && !n.is_self;
+                // A node is "catching up" when it owns a partition currently served
+                // by a failover incumbent (leader != owner). Observable for any
+                // partition this (queried) node hosts a Raft group for.
+                const recovering =
+                  !down &&
+                  data.partitions.some(
+                    (p) => p.owner === n.node_id && p.recovering,
+                  );
                 // Other nodes link to the equivalent page on their own IP; the
                 // self node (empty address) is the current page, so not a link.
                 const href = n.is_self
@@ -62,9 +70,11 @@ export default function Topology() {
                 const cls = `block min-w-[12rem] rounded-lg border px-4 py-3 ${
                   down
                     ? "border-danger/40 bg-danger/10"
-                    : n.is_self
-                      ? "border-ok/40 bg-ok/10"
-                      : "border-edge bg-raised"
+                    : recovering
+                      ? "border-warn/40 bg-warn/10"
+                      : n.is_self
+                        ? "border-ok/40 bg-ok/10"
+                        : "border-edge bg-raised"
                 }${
                   href
                     ? " cursor-pointer transition-colors hover:border-info hover:bg-hover"
@@ -77,20 +87,25 @@ export default function Topology() {
                         className={`inline-block h-2 w-2 shrink-0 rounded-full ${
                           h
                             ? h.reachable
-                              ? "bg-ok"
+                              ? recovering
+                                ? "bg-warn"
+                                : "bg-ok"
                               : "bg-danger"
                             : "bg-fg-faint"
                         }`}
                         title={
                           h
                             ? h.reachable
-                              ? "reachable"
+                              ? recovering
+                                ? "catching up after restart"
+                                : "reachable"
                               : `unreachable: ${h.error ?? "no response"}`
                             : "probing…"
                         }
                       />
                       <span className="font-medium">node {n.node_id}</span>
                       {n.is_self && <Badge tone="ok">this</Badge>}
+                      {recovering && <Badge tone="warn">catching up</Badge>}
                       {href && (
                         <span
                           className="ml-auto text-xs text-info"
@@ -112,8 +127,12 @@ export default function Topology() {
                           {h.latencyMs != null && !n.is_self && (
                             <span className="text-fg-faint">{h.latencyMs} ms</span>
                           )}
-                          {n.is_self && (
-                            <span className="text-ok">healthy</span>
+                          {recovering ? (
+                            <span className="text-warn">
+                              reclaiming leadership
+                            </span>
+                          ) : (
+                            n.is_self && <span className="text-ok">healthy</span>
                           )}
                         </>
                       ) : h ? (
@@ -152,6 +171,7 @@ export default function Topology() {
               <thead>
                 <tr className="border-b border-edge text-left text-fg-faint">
                   <th className="py-2 pr-4 font-medium">Partition</th>
+                  <th className="py-2 pr-4 font-medium">Owner</th>
                   <th className="py-2 pr-4 font-medium">Leader</th>
                   <th className="py-2 pr-4 font-medium">Replicas</th>
                   <th className="py-2 pr-4 font-medium">Raft term</th>
@@ -161,9 +181,17 @@ export default function Topology() {
                 {data.partitions.map((p) => (
                   <tr key={p.partition_id} className="border-b border-edge">
                     <td className="py-2 pr-4">{p.partition_id}</td>
+                    <td className="py-2 pr-4 text-fg-muted">node {p.owner}</td>
                     <td className="py-2 pr-4">
                       {p.leader === null ? (
                         <span className="text-warn">no leader</span>
+                      ) : p.recovering ? (
+                        <span
+                          className="text-warn"
+                          title={`served by failover incumbent node ${p.leader}; owner node ${p.owner} is catching up`}
+                        >
+                          node {p.leader} · recovering
+                        </span>
                       ) : (
                         `node ${p.leader}`
                       )}
