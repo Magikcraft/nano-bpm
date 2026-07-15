@@ -189,3 +189,49 @@ real stall is only as long as the catch-up actually takes.
   single-voter two-lineage hazard entirely, at the ADR 0003 latency cost — or to
   soften the single-voter log-purge threshold during an active hand-off so the
   learner can stream instead of re-snapshotting — out of scope here.
+
+### Soak 4 (binsha 9e323cd8, commit 96c7890) — storm ELIMINATED, completion still load-gated
+
+Added part 5 (**leader log-retention accelerator**,
+`NANOBPMN_RAFT_LAGGING_RETAIN`, default 400_000) + the `/tmp` snapshot-dir
+disk-leak fix, then ran the high-load nodefail rejoin (28k/s, kill node18@60,
+restore@120, sample to 420, `HANDOFF=1`).
+
+- **Storm fully eliminated — cleanest soak yet.** node18 booted as a deferring
+  receiver on all 4 owned partitions; `leader_reject=0` for the *entire* load
+  window (vs 173k pre-fix, 100k Phase C, 22k Phase E), terms flat (converged at
+  2–3), zero self-promote, zero election war, **0 panics, NRestarts=0**.
+- **Retention confirmed working leader-side:** n19 p2 held `purged=163044` under a
+  `last_log=357530` head (~194k retained) instead of purging to ~356530.
+- **Hand-off still does NOT complete under sustained load.** Every attempt aborts
+  with `learner catch-up timeout`; node18 stays a clean Learner (creates correctly
+  route to the incumbent). Root cause: Phase E boots node18 as an **empty**
+  receiver (to avoid the divergent-lineage resurrection bug), so it must
+  snapshot-install from index 0 on each attempt; the install + streaming to
+  zero-lag against a ~28k/s moving head cannot fit the 10s catch-up window.
+  Leader-side retention does not help a *from-empty* learner skip that initial
+  install (its match starts at 0, below the leader's retained/purged floor).
+- **Converges cleanly on load-ease:** once load stopped, 3/4 owned partitions
+  (2,5,8) transferred node18→Leader at term 2–3; p11 needed one more requester
+  cycle. This is Zeebe-aligned best-effort reclaim: no storm, completes when the
+  firehose eases.
+- **Disk leak fixed (validated live):** the bootstrap `sweep_orphaned_snapshot_dirs`
+  reclaimed the pre-existing multi-GB `/tmp/nanobpmn-raftsnap-*` dirs on restart;
+  `/tmp` stayed bounded to the 4 live per-partition dirs (160–182G free) with no
+  accumulation across the run.
+
+**Remaining design fork for "complete UNDER load"** (both split-brain-critical,
+need a decision):
+1. *Accept Zeebe-style best-effort* (ship as-is): storm is gone, reclaim completes
+   on load-ease; the retention + disk-leak fixes stand on their own.
+2. *Head-freeze that actually stops the log* for the whole install+stream: the
+   current per-partition write-pause pauses completions but the partition head
+   still advances (new creates via other paths), so the learner never reaches
+   zero-lag. Would need the pause to fully quiesce the owned partition's raft log
+   for the catch-up duration.
+3. *Avoid the from-empty install*: on rejoin, host the owned partition from its
+   on-disk log's committed **common prefix** (as a normal follower that lets
+   AppendEntries truncate the divergent suffix) so the learner starts near its
+   pre-death index and only streams the bounded downtime gap the leader now
+   retains — no snapshot install. More correct but reintroduces the divergent-log
+   handling Phase E sidestepped.
