@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { api, type Instance } from "../lib/api";
+import { listInstances, type Instance } from "../gen";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import InstanceDetail from "./InstanceDetail";
 import { Badge, Button } from "../components/ui";
@@ -47,7 +47,8 @@ export default function Explorer() {
   useLiveInvalidation(["instances"]);
   const { data, isLoading, error } = useQuery({
     queryKey: ["instances", page],
-    queryFn: () => api.instances(page, PAGE_SIZE),
+    queryFn: async () =>
+      (await listInstances({ query: { page, pageSize: PAGE_SIZE }, throwOnError: true })).data,
     // Keep the current page visible while the next one loads, so paging and the
     // live SSE refetch don't flash an empty list.
     placeholderData: keepPreviousData,

@@ -1,0 +1,1613 @@
+openapi: 3.0.3
+info:
+  title: Nano Console API
+  description: >-
+    Internal HTTP API backing the Nano web console (served by the gateway under
+    /console/api, separate from the generated Camunda REST surface). This spec is
+    the single source of truth for both the Rust (rust-axum) server trait and the
+    TypeScript client used by the console SPA. Streaming (SSE) endpoints, the
+    gateway reverse-proxy, binary file/zip downloads and static SPA assets are
+    intentionally omitted here and remain hand-wired in the server.
+  version: 0.1.0
+servers:
+  - url: /console/api
+    description: Console API mounted on the gateway
+tags:
+  - name: cluster
+    description: Topology, health and metrics
+  - name: instances
+    description: Process-instance explorer
+  - name: traces
+    description: Execution traces
+  - name: models
+    description: Workspace-backed BPMN models (modeler)
+  - name: workers
+    description: Embedded Deno job workers
+  - name: lib
+    description: Shared worker library files
+  - name: projects
+    description: RAD project lifecycle
+  - name: extensions
+    description: Extension packs and marketplace
+  - name: config
+    description: Server and IDE configuration
+
+paths:
+  /topology:
+    get:
+      operationId: getTopology
+      tags: [cluster]
+      summary: Cluster topology
+      responses:
+        '200':
+          description: Cluster topology
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Topology' }
+
+  /cluster/health:
+    get:
+      operationId: getClusterHealth
+      tags: [cluster]
+      summary: Per-node liveness probe
+      responses:
+        '200':
+          description: Cluster health
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClusterHealth' }
+
+  /metrics:
+    get:
+      operationId: getMetrics
+      tags: [cluster]
+      summary: Point-in-time metrics snapshot for this node
+      responses:
+        '200':
+          description: Metrics snapshot
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MetricsSnapshot' }
+
+  /cluster/metrics:
+    get:
+      operationId: getClusterMetrics
+      tags: [cluster]
+      summary: Per-node metrics plus cluster aggregate
+      responses:
+        '200':
+          description: Cluster metrics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ClusterMetrics' }
+
+  /instances:
+    get:
+      operationId: listInstances
+      tags: [instances]
+      summary: List process instances (paged)
+      parameters:
+        - { name: page, in: query, required: false, schema: { type: integer, format: int32, default: 0 } }
+        - { name: pageSize, in: query, required: false, schema: { type: integer, format: int32, default: 50 } }
+      responses:
+        '200':
+          description: One page of process instances
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstancePage' }
+
+  /instances/{key}:
+    get:
+      operationId: getInstance
+      tags: [instances]
+      summary: Process-instance detail
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Instance detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstanceDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /traces:
+    get:
+      operationId: listTraces
+      tags: [traces]
+      summary: Recent execution traces
+      parameters:
+        - { name: limit, in: query, required: false, schema: { type: integer, format: int32, default: 100 } }
+      responses:
+        '200':
+          description: Trace summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/TraceSummary' }
+
+  /traces/{key}:
+    get:
+      operationId: getTrace
+      tags: [traces]
+      summary: Full execution trace for one instance
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Instance trace
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InstanceTrace' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /traces/{key}/otel:
+    get:
+      operationId: getTraceOtel
+      tags: [traces]
+      summary: OpenTelemetry trace export for one instance
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '200':
+          description: Opaque OTLP/OpenTelemetry trace document
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /models:
+    get:
+      operationId: listModels
+      tags: [models]
+      summary: List BPMN models in the workspace
+      responses:
+        '200':
+          description: Model summaries
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ModelSummary' }
+    post:
+      operationId: createModel
+      tags: [models]
+      summary: Create a new BPMN model
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateModelRequest' }
+      responses:
+        '201':
+          description: Model created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /models/{name}:
+    get:
+      operationId: getModel
+      tags: [models]
+      summary: Get one BPMN model
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Model
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: saveModel
+      tags: [models]
+      summary: Save (overwrite) a BPMN model's XML
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          text/xml:
+            schema: { type: string }
+      responses:
+        '200':
+          description: Saved model
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Model' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    delete:
+      operationId: deleteModel
+      tags: [models]
+      summary: Delete a BPMN model
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /workers:
+    get:
+      operationId: listWorkers
+      tags: [workers]
+      summary: List embedded workers
+      responses:
+        '200':
+          description: Workers plus runtime availability
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkersResponse' }
+    post:
+      operationId: createWorker
+      tags: [workers]
+      summary: Scaffold a new worker
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateWorkerRequest' }
+      responses:
+        '201':
+          description: Worker created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerSummary' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /workers/{name}:
+    get:
+      operationId: getWorker
+      tags: [workers]
+      summary: Get one worker
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Worker summary
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerSummary' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteWorker
+      tags: [workers]
+      summary: Delete a worker
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /workers/{name}/file:
+    get:
+      operationId: getWorkerFile
+      tags: [workers]
+      summary: Read a worker source file
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/PathQuery' }
+      responses:
+        '200':
+          description: File contents
+          content:
+            text/plain:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: saveWorkerFile
+      tags: [workers]
+      summary: Write a worker source file
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/PathQuery' }
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema: { type: string }
+      responses:
+        '204': { description: Saved }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    post:
+      operationId: createWorkerFile
+      tags: [workers]
+      summary: Create an empty worker file
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateFileRequest' }
+      responses:
+        '201': { description: Created }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      operationId: deleteWorkerFile
+      tags: [workers]
+      summary: Delete a worker file
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/PathQuery' }
+      responses:
+        '204': { description: Deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /workers/{name}/start:
+    post:
+      operationId: startWorker
+      tags: [workers]
+      summary: Start a worker process
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Worker runtime state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerRuntime' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /workers/{name}/stop:
+    post:
+      operationId: stopWorker
+      tags: [workers]
+      summary: Stop a worker process
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Worker runtime state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkerRuntime' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /worker-sdk:
+    get:
+      operationId: getWorkerSdk
+      tags: [workers]
+      summary: Embedded worker SDK source (text)
+      responses:
+        '200':
+          description: Worker SDK source
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /deno-types:
+    get:
+      operationId: getDenoTypes
+      tags: [workers]
+      summary: Ambient Deno type declarations (text)
+      responses:
+        '200':
+          description: Deno type declarations
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /lib:
+    get:
+      operationId: listLibFiles
+      tags: [lib]
+      summary: List shared library files
+      responses:
+        '200':
+          description: Library file paths
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LibFilesResponse' }
+
+  /lib/file:
+    get:
+      operationId: getLibFile
+      tags: [lib]
+      summary: Read a shared library file
+      parameters: [ { $ref: '#/components/parameters/PathQuery' } ]
+      responses:
+        '200':
+          description: File contents
+          content:
+            text/plain:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: saveLibFile
+      tags: [lib]
+      summary: Write a shared library file
+      parameters: [ { $ref: '#/components/parameters/PathQuery' } ]
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema: { type: string }
+      responses:
+        '204': { description: Saved }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    post:
+      operationId: createLibFile
+      tags: [lib]
+      summary: Create an empty shared library file
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateFileRequest' }
+      responses:
+        '201': { description: Created }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      operationId: deleteLibFile
+      tags: [lib]
+      summary: Delete a shared library file
+      parameters: [ { $ref: '#/components/parameters/PathQuery' } ]
+      responses:
+        '204': { description: Deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /config/server:
+    get:
+      operationId: getServerConfig
+      tags: [config]
+      summary: Server configuration (SLA mode + parameters)
+      responses:
+        '200':
+          description: Server config
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServerConfig' }
+
+  /config/server/sla:
+    put:
+      operationId: setSlaMode
+      tags: [config]
+      summary: Switch the runtime SLA mode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetSlaRequest' }
+      responses:
+        '200':
+          description: Updated server config
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServerConfig' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /config/ide:
+    get:
+      operationId: getIdeConfig
+      tags: [config]
+      summary: IDE configuration (dependencies + language packs)
+      responses:
+        '200':
+          description: IDE config
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IdeConfig' }
+
+  /projects:
+    get:
+      operationId: listProjects
+      tags: [projects]
+      summary: List RAD projects
+      responses:
+        '200':
+          description: Projects plus runtime availability
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectsResponse' }
+    post:
+      operationId: createProject
+      tags: [projects]
+      summary: Scaffold a new project
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectRequest' }
+      responses:
+        '201':
+          description: Project created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConfig' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /projects/{name}:
+    get:
+      operationId: getProject
+      tags: [projects]
+      summary: Project detail
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Project detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectDetail' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      operationId: deleteProject
+      tags: [projects]
+      summary: Delete a project
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/config:
+    get:
+      operationId: getProjectConfig
+      tags: [projects]
+      summary: Project configuration
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Project config
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConfig' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      operationId: saveProjectConfig
+      tags: [projects]
+      summary: Save project configuration
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectConfig' }
+      responses:
+        '200':
+          description: Saved project config
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConfig' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /projects/{name}/files:
+    get:
+      operationId: listProjectFiles
+      tags: [projects]
+      summary: Project file tree
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: File tree
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectFilesResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/file:
+    put:
+      operationId: saveProjectFile
+      tags: [projects]
+      summary: Write a project file
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/PathQuery' }
+      requestBody:
+        required: true
+        content:
+          text/plain:
+            schema: { type: string }
+      responses:
+        '204': { description: Saved }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    post:
+      operationId: createProjectPath
+      tags: [projects]
+      summary: Create an empty file or directory in a project
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateProjectPathRequest' }
+      responses:
+        '201': { description: Created }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+    delete:
+      operationId: deleteProjectPath
+      tags: [projects]
+      summary: Delete a project file or directory
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/PathQuery' }
+      responses:
+        '204': { description: Deleted }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /projects/{name}/run:
+    post:
+      operationId: runProject
+      tags: [projects]
+      summary: Run a project's application
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Run state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunState' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/stop:
+    post:
+      operationId: stopProject
+      tags: [projects]
+      summary: Stop a running project
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Run state
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunState' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/rename:
+    post:
+      operationId: renameProject
+      tags: [projects]
+      summary: Rename a project
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RenameProjectRequest' }
+      responses:
+        '200':
+          description: Updated project config
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectConfig' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /projects/{name}/compile:
+    post:
+      operationId: compileProject
+      tags: [projects]
+      summary: Compile a project (optionally cross-platform)
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CompileRequest' }
+      responses:
+        '200':
+          description: Whether a compile was started
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CompileStarted' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/run-configs:
+    get:
+      operationId: getRunConfigs
+      tags: [projects]
+      summary: List a project's run configurations
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Run configurations plus the active id
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectRunConfigsResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/active-run-config:
+    put:
+      operationId: setActiveRunConfig
+      tags: [projects]
+      summary: Pin (or clear) the active run configuration
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ActiveRunConfigRequest' }
+      responses:
+        '200':
+          description: The active run-config id (or null)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ActiveRunConfigResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /extensions:
+    get:
+      operationId: getExtensions
+      tags: [extensions]
+      summary: Installed extensions overview
+      responses:
+        '200':
+          description: Extensions overview
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtensionsOverview' }
+
+  /extensions/marketplace:
+    get:
+      operationId: getMarketplace
+      tags: [extensions]
+      summary: Marketplace of installable extension packs
+      responses:
+        '200':
+          description: Marketplace listing
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Marketplace' }
+
+  /extensions/install:
+    post:
+      operationId: installExtension
+      tags: [extensions]
+      summary: Install an extension pack from npm
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExtPkgRequest' }
+      responses:
+        '201':
+          description: Installed extension
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Extension' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /extensions/remove:
+    post:
+      operationId: removeExtension
+      tags: [extensions]
+      summary: Remove an installed extension pack
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ExtPkgRequest' }
+      responses:
+        '204': { description: Removed }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /extensions/trust:
+    post:
+      operationId: trustExtension
+      tags: [extensions]
+      summary: Approve or revoke trust for extension toolchains
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TrustRequest' }
+      responses:
+        '200':
+          description: Updated extensions overview
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtensionsOverview' }
+
+components:
+  parameters:
+    NamePath:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+    PathQuery:
+      name: path
+      in: query
+      required: true
+      description: Project/worker-relative, forward-slash separated file path.
+      schema: { type: string }
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        text/plain:
+          schema: { type: string }
+    NotFound:
+      description: Not found
+      content:
+        text/plain:
+          schema: { type: string }
+    Conflict:
+      description: Already exists
+      content:
+        text/plain:
+          schema: { type: string }
+
+  schemas:
+    # ---- Cluster / topology (snake_case wire fields) ----------------------
+    NodeInfo:
+      type: object
+      required: [node_id, address, is_self]
+      properties:
+        node_id: { type: integer, format: int64 }
+        address: { type: string }
+        is_self: { type: boolean }
+    PartitionInfo:
+      type: object
+      required: [partition_id, replicas, owner, leader, raft_term, recovering]
+      properties:
+        partition_id: { type: integer, format: int64 }
+        replicas:
+          type: array
+          items: { type: integer, format: int64 }
+        owner: { type: integer, format: int64 }
+        leader: { type: integer, format: int64, nullable: true }
+        raft_term: { type: integer, format: int64, nullable: true }
+        recovering: { type: boolean }
+    Topology:
+      type: object
+      required: [node_id, num_nodes, num_partitions, replication_factor, raft_enabled, gateway_version, nodes, partitions]
+      properties:
+        node_id: { type: integer, format: int64 }
+        num_nodes: { type: integer, format: int64 }
+        num_partitions: { type: integer, format: int64 }
+        replication_factor: { type: integer, format: int64 }
+        raft_enabled: { type: boolean }
+        gateway_version: { type: string }
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/NodeInfo' }
+        partitions:
+          type: array
+          items: { $ref: '#/components/schemas/PartitionInfo' }
+
+    # ---- Cluster health (camelCase wire fields) --------------------------
+    NodeHealth:
+      type: object
+      required: [nodeId, address, isSelf, reachable, version, latencyMs, error]
+      properties:
+        nodeId: { type: integer, format: int64 }
+        address: { type: string }
+        isSelf: { type: boolean }
+        reachable: { type: boolean }
+        version: { type: string, nullable: true }
+        latencyMs: { type: number, format: double, nullable: true }
+        error: { type: string, nullable: true }
+    ClusterHealth:
+      type: object
+      required: [checkedAtMs, nodes]
+      properties:
+        checkedAtMs: { type: integer, format: int64 }
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/NodeHealth' }
+
+    # ---- Instances (snake_case wire fields) ------------------------------
+    Instance:
+      type: object
+      required: [key, process_id, process_definition_key, version, state, start_date_ms, has_incident, business_id, tags]
+      properties:
+        key: { type: string }
+        process_id: { type: string }
+        process_definition_key: { type: string }
+        version: { type: integer, format: int64 }
+        state: { type: string }
+        start_date_ms: { type: integer, format: int64 }
+        has_incident: { type: boolean }
+        business_id: { type: string, nullable: true }
+        tags:
+          type: array
+          items: { type: string }
+    Variable:
+      type: object
+      required: [name, value, scope_key]
+      properties:
+        name: { type: string }
+        value: { type: string }
+        scope_key: { type: string }
+    Job:
+      type: object
+      required: [key, element_id, job_type, state, retries, worker, deadline_ms]
+      properties:
+        key: { type: string }
+        element_id: { type: string }
+        job_type: { type: string }
+        state: { type: string }
+        retries: { type: integer, format: int32 }
+        worker: { type: string, nullable: true }
+        deadline_ms: { type: integer, format: int64, nullable: true }
+    Incident:
+      type: object
+      required: [key, element_id, kind, state, reason, created_at_ms]
+      properties:
+        key: { type: string }
+        element_id: { type: string }
+        kind: { type: string }
+        state: { type: string }
+        reason: { type: string }
+        created_at_ms: { type: integer, format: int64 }
+    InstancePage:
+      type: object
+      required: [items, total, page, pageSize]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Instance' }
+        total: { type: integer, format: int64 }
+        page: { type: integer, format: int32 }
+        pageSize: { type: integer, format: int32 }
+    InstanceDetail:
+      type: object
+      required: [instance, variables, jobs, incidents]
+      properties:
+        instance: { $ref: '#/components/schemas/Instance' }
+        variables:
+          type: array
+          items: { $ref: '#/components/schemas/Variable' }
+        jobs:
+          type: array
+          items: { $ref: '#/components/schemas/Job' }
+        incidents:
+          type: array
+          items: { $ref: '#/components/schemas/Incident' }
+
+    # ---- Traces (camelCase wire fields) ----------------------------------
+    TraceOutcome:
+      type: string
+      enum: [active, completed, terminated]
+    TraceSummary:
+      type: object
+      required: [instanceKey, processId, version, businessId, outcome, startedAt, endedAt, durationMs, elementCount, incidentCount]
+      properties:
+        instanceKey: { type: string }
+        processId: { type: string }
+        version: { type: integer, format: int64, nullable: true }
+        businessId: { type: string, nullable: true }
+        outcome: { $ref: '#/components/schemas/TraceOutcome' }
+        startedAt: { type: integer, format: int64 }
+        endedAt: { type: integer, format: int64, nullable: true }
+        durationMs: { type: integer, format: int64, nullable: true }
+        elementCount: { type: integer, format: int32 }
+        incidentCount: { type: integer, format: int32 }
+    TraceJob:
+      type: object
+      required: [type, worker, createdAt, activatedAt, completedAt, waitMs, queueMs, serviceMs, attempts, failures]
+      properties:
+        type: { type: string }
+        worker: { type: string, nullable: true }
+        createdAt: { type: integer, format: int64 }
+        activatedAt: { type: integer, format: int64, nullable: true }
+        completedAt: { type: integer, format: int64, nullable: true }
+        waitMs: { type: integer, format: int64, nullable: true }
+        queueMs: { type: integer, format: int64, nullable: true }
+        serviceMs: { type: integer, format: int64, nullable: true }
+        attempts: { type: integer, format: int32 }
+        failures: { type: integer, format: int32 }
+    TraceElement:
+      type: object
+      required: [elementId, elementInstanceKey, scope, enteredAt, exitedAt, durationMs, incidents, job]
+      properties:
+        elementId: { type: string }
+        elementInstanceKey: { type: string }
+        scope: { type: string }
+        enteredAt: { type: integer, format: int64 }
+        exitedAt: { type: integer, format: int64, nullable: true }
+        durationMs: { type: integer, format: int64, nullable: true }
+        incidents: { type: integer, format: int32 }
+        job:
+          allOf: [ { $ref: '#/components/schemas/TraceJob' } ]
+          nullable: true
+    TraceIncident:
+      type: object
+      required: [elementId, elementInstanceKey, kind, reason, raisedAt, resolvedAt]
+      properties:
+        elementId: { type: string }
+        elementInstanceKey: { type: string }
+        kind: { type: string }
+        reason: { type: string }
+        raisedAt: { type: integer, format: int64 }
+        resolvedAt: { type: integer, format: int64, nullable: true }
+    InstanceTrace:
+      type: object
+      required: [instanceKey, processId, version, businessId, tags, startedAt, endedAt, durationMs, outcome, elements, incidents, path]
+      properties:
+        instanceKey: { type: string }
+        processId: { type: string }
+        version: { type: integer, format: int64, nullable: true }
+        businessId: { type: string, nullable: true }
+        tags:
+          type: array
+          items: { type: string }
+        startedAt: { type: integer, format: int64 }
+        endedAt: { type: integer, format: int64, nullable: true }
+        durationMs: { type: integer, format: int64, nullable: true }
+        outcome: { $ref: '#/components/schemas/TraceOutcome' }
+        elements:
+          type: array
+          items: { $ref: '#/components/schemas/TraceElement' }
+        incidents:
+          type: array
+          items: { $ref: '#/components/schemas/TraceIncident' }
+        path:
+          type: array
+          items: { type: string }
+
+    # ---- Metrics (camelCase wire fields) ---------------------------------
+    MetricsSnapshot:
+      type: object
+      required:
+        - timestampMs
+        - activeInstances
+        - createsRest
+        - createsStream
+        - createsTotal
+        - completionsRest
+        - completionsStream
+        - completionsTotal
+        - connectionsActive
+        - commitInflight
+        - commitsTotal
+        - writesTotal
+        - bytesTotal
+        - creditStallsTotal
+        - fsyncMeanMs
+        - commitWaitMeanMs
+        - commitBatchMean
+        - frameProcessingMeanMs
+        - writerBusyRatio
+        - residentBytes
+        - ceilingThroughput
+        - ceilingMemory
+        - pendingCreateQueue
+        - activeBacklog
+        - admissionBacklogLimit
+        - admissionCreateQueueLimit
+        - admissionShedTotal
+        - recovery
+      properties:
+        timestampMs: { type: integer, format: int64 }
+        activeInstances: { type: integer, format: int64 }
+        createsRest: { type: integer, format: int64 }
+        createsStream: { type: integer, format: int64 }
+        createsTotal: { type: integer, format: int64 }
+        completionsRest: { type: integer, format: int64 }
+        completionsStream: { type: integer, format: int64 }
+        completionsTotal: { type: integer, format: int64 }
+        connectionsActive: { type: integer, format: int64 }
+        commitInflight: { type: integer, format: int64 }
+        commitsTotal: { type: integer, format: int64 }
+        writesTotal: { type: integer, format: int64 }
+        bytesTotal: { type: integer, format: int64 }
+        creditStallsTotal: { type: integer, format: int64 }
+        fsyncMeanMs: { type: number, format: double }
+        commitWaitMeanMs: { type: number, format: double }
+        commitBatchMean: { type: number, format: double }
+        frameProcessingMeanMs: { type: number, format: double }
+        writerBusyRatio: { type: number, format: double }
+        residentBytes: { type: integer, format: int64, nullable: true }
+        ceilingThroughput: { type: boolean }
+        ceilingMemory: { type: boolean }
+        pendingCreateQueue: { type: integer, format: int64 }
+        activeBacklog: { type: integer, format: int64 }
+        admissionBacklogLimit: { type: integer, format: int64 }
+        admissionCreateQueueLimit: { type: integer, format: int64 }
+        admissionShedTotal: { type: integer, format: int64 }
+        recovery: { $ref: '#/components/schemas/Recovery' }
+    Recovery:
+      type: object
+      description: >-
+        Per-node Raft recovery/leadership state so the cluster view can show
+        "up but catching up" while a restarted owner reclaims its partitions
+        (and the failover incumbent hands leadership back).
+      required: [recovering, owned, reclaimed, catchingUp, handingOff, detail]
+      properties:
+        recovering: { type: boolean }
+        owned: { type: integer, format: int64 }
+        reclaimed: { type: integer, format: int64 }
+        catchingUp: { type: integer, format: int64 }
+        handingOff: { type: integer, format: int64 }
+        handoffLagEntries: { type: integer, format: int64, nullable: true }
+        detail: { type: string }
+    NodeMetrics:
+      type: object
+      required: [nodeId, address, isSelf, reachable, error, metrics]
+      properties:
+        nodeId: { type: integer, format: int64 }
+        address: { type: string }
+        isSelf: { type: boolean }
+        reachable: { type: boolean }
+        error: { type: string, nullable: true }
+        metrics:
+          allOf: [ { $ref: '#/components/schemas/MetricsSnapshot' } ]
+          nullable: true
+    AggregateMetrics:
+      type: object
+      required: [reachableNodes, totalNodes, activeInstances, createsTotal, completionsTotal, connectionsActive, commitInflight, residentBytes]
+      properties:
+        reachableNodes: { type: integer, format: int64 }
+        totalNodes: { type: integer, format: int64 }
+        activeInstances: { type: integer, format: int64 }
+        createsTotal: { type: integer, format: int64 }
+        completionsTotal: { type: integer, format: int64 }
+        connectionsActive: { type: integer, format: int64 }
+        commitInflight: { type: integer, format: int64 }
+        residentBytes: { type: integer, format: int64 }
+    ClusterMetrics:
+      type: object
+      required: [checkedAtMs, nodes, aggregate]
+      properties:
+        checkedAtMs: { type: integer, format: int64 }
+        nodes:
+          type: array
+          items: { $ref: '#/components/schemas/NodeMetrics' }
+        aggregate: { $ref: '#/components/schemas/AggregateMetrics' }
+
+    # ---- Models (snake_case wire fields) ---------------------------------
+    DeployStatus:
+      type: string
+      enum: [not_deployed, in_sync, modified, unparsable]
+    ModelSummary:
+      type: object
+      required: [name, process_ids, deploy_status, deployed_version, deployed_key, updated_at_ms, size]
+      properties:
+        name: { type: string }
+        process_ids:
+          type: array
+          items: { type: string }
+        deploy_status: { $ref: '#/components/schemas/DeployStatus' }
+        deployed_version: { type: integer, format: int64, nullable: true }
+        deployed_key: { type: string, nullable: true }
+        updated_at_ms: { type: integer, format: int64 }
+        size: { type: integer, format: int64 }
+    Model:
+      type: object
+      required: [name, xml, process_ids, deploy_status, deployed_version, deployed_key]
+      properties:
+        name: { type: string }
+        xml: { type: string }
+        process_ids:
+          type: array
+          items: { type: string }
+        deploy_status: { $ref: '#/components/schemas/DeployStatus' }
+        deployed_version: { type: integer, format: int64, nullable: true }
+        deployed_key: { type: string, nullable: true }
+    CreateModelRequest:
+      type: object
+      required: [name, xml]
+      properties:
+        name: { type: string }
+        xml: { type: string }
+
+    # ---- Workers (camelCase wire fields) ---------------------------------
+    WorkerPhase:
+      type: string
+      enum: [stopped, starting, running, crashed]
+    WorkerMetrics:
+      type: object
+      required: [completed, failed, inFlight, throughput, uptimeMs, connected]
+      properties:
+        completed: { type: integer, format: int64 }
+        failed: { type: integer, format: int64 }
+        inFlight: { type: integer, format: int64 }
+        throughput: { type: number, format: double }
+        uptimeMs: { type: integer, format: int64 }
+        connected: { type: boolean }
+    WorkerRuntime:
+      type: object
+      required: [status, pid, startedAtMs, restarts, lastError, metrics]
+      properties:
+        status: { $ref: '#/components/schemas/WorkerPhase' }
+        pid: { type: integer, format: int64, nullable: true }
+        startedAtMs: { type: integer, format: int64, nullable: true }
+        restarts: { type: integer, format: int32 }
+        lastError: { type: string, nullable: true }
+        metrics: { $ref: '#/components/schemas/WorkerMetrics' }
+    WorkerSummary:
+      type: object
+      required: [name, files, updatedAtMs, runtime]
+      properties:
+        name: { type: string }
+        files:
+          type: array
+          items: { type: string }
+        updatedAtMs: { type: integer, format: int64 }
+        runtime: { $ref: '#/components/schemas/WorkerRuntime' }
+    WorkersResponse:
+      type: object
+      required: [workers, denoAvailable]
+      properties:
+        workers:
+          type: array
+          items: { $ref: '#/components/schemas/WorkerSummary' }
+        denoAvailable: { type: boolean }
+    CreateWorkerRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        jobType: { type: string, nullable: true }
+
+    # ---- Shared library --------------------------------------------------
+    LibFilesResponse:
+      type: object
+      required: [files]
+      properties:
+        files:
+          type: array
+          items: { type: string }
+
+    # ---- Generic file-create bodies --------------------------------------
+    CreateFileRequest:
+      type: object
+      required: [path]
+      properties:
+        path: { type: string }
+    CreateProjectPathRequest:
+      type: object
+      required: [path]
+      properties:
+        path: { type: string }
+        dir: { type: boolean, default: false }
+
+    # ---- Config (camelCase wire fields) ----------------------------------
+    SlaOption:
+      type: object
+      required: [id, label, tagline, description]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        tagline: { type: string }
+        description: { type: string }
+    SlaModeConfig:
+      type: object
+      required: [current, description, source, options]
+      properties:
+        current: { type: string }
+        description: { type: string }
+        source: { type: string }
+        switchable: { type: boolean }
+        options:
+          type: array
+          items: { $ref: '#/components/schemas/SlaOption' }
+    ServerParam:
+      type: object
+      required: [key, category, label, description, default, value]
+      properties:
+        key: { type: string }
+        category: { type: string }
+        label: { type: string }
+        description: { type: string }
+        default: { type: string }
+        value: { type: string, nullable: true }
+    ServerConfig:
+      type: object
+      required: [slaMode, readOnly, params]
+      properties:
+        slaMode: { $ref: '#/components/schemas/SlaModeConfig' }
+        readOnly: { type: boolean }
+        params:
+          type: array
+          items: { $ref: '#/components/schemas/ServerParam' }
+    SetSlaRequest:
+      type: object
+      required: [mode]
+      properties:
+        mode: { type: string }
+    ConfigDependency:
+      type: object
+      required: [id, name, purpose, bin, present, version, installUrl, hint]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        purpose: { type: string }
+        bin: { type: string }
+        present: { type: boolean }
+        version: { type: string, nullable: true }
+        installUrl: { type: string }
+        hint: { type: string }
+    PackConfigField:
+      type: object
+      required: [key, label, description, env, default, value]
+      properties:
+        key: { type: string }
+        label: { type: string }
+        description: { type: string, nullable: true }
+        env: { type: string, nullable: true }
+        default: { type: string, nullable: true }
+        value: { type: string, nullable: true }
+    LangPackConfig:
+      type: object
+      required: [id, displayName, builtin, detect, available, configFields]
+      properties:
+        id: { type: string }
+        displayName: { type: string }
+        builtin: { type: boolean }
+        detect:
+          type: array
+          items: { type: string }
+        available: { type: boolean }
+        configFields:
+          type: array
+          items: { $ref: '#/components/schemas/PackConfigField' }
+    IdeConfig:
+      type: object
+      required: [dependencies, langPacks]
+      properties:
+        dependencies:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigDependency' }
+        langPacks:
+          type: array
+          items: { $ref: '#/components/schemas/LangPackConfig' }
+
+    # ---- Projects (camelCase wire fields) --------------------------------
+    ProjectSummary:
+      type: object
+      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        deployTarget: { type: string }
+        updatedMs: { type: integer, format: int64 }
+        processes: { type: integer, format: int32 }
+        decisions: { type: integer, format: int32 }
+        forms: { type: integer, format: int32 }
+        workers: { type: integer, format: int32 }
+        running: { type: boolean }
+    ProjectRunConfig:
+      type: object
+      required: [id, label, run, compile]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        default: { type: boolean }
+        run:
+          type: array
+          items: { type: string }
+        compile:
+          type: array
+          items: { type: string }
+        env:
+          type: object
+          additionalProperties: { type: string }
+    ProjectRunConfigsResponse:
+      type: object
+      required: [runConfigs, active]
+      properties:
+        runConfigs:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectRunConfig' }
+        active: { type: string, nullable: true }
+    ProjectToolchain:
+      type: object
+      required: [run, compile]
+      properties:
+        run:
+          type: array
+          items: { type: string }
+        compile:
+          type: array
+          items: { type: string }
+        runConfigs:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectRunConfig' }
+        activeRunConfig: { type: string, nullable: true }
+    ProjectScaffoldedFrom:
+      type: object
+      required: [pack]
+      properties:
+        pack: { type: string }
+        version: { type: string }
+    ProjectConfig:
+      type: object
+      required: [name, description, deployTarget, main, platforms, lang, app, createdMs, updatedMs]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        deployTarget: { type: string }
+        main: { type: string }
+        platforms:
+          type: array
+          items: { type: string }
+        lang: { type: string }
+        app: { type: string }
+        env:
+          type: object
+          additionalProperties: { type: string }
+        toolchain: { $ref: '#/components/schemas/ProjectToolchain' }
+        scaffoldedFrom: { $ref: '#/components/schemas/ProjectScaffoldedFrom' }
+        createdMs: { type: integer, format: int64 }
+        updatedMs: { type: integer, format: int64 }
+    FileNode:
+      type: object
+      required: [name, path, kind]
+      properties:
+        name: { type: string }
+        path: { type: string }
+        kind:
+          type: string
+          enum: [dir, file]
+        children:
+          type: array
+          items: { $ref: '#/components/schemas/FileNode' }
+    ProjectFilesResponse:
+      type: object
+      required: [files]
+      properties:
+        files:
+          type: array
+          items: { $ref: '#/components/schemas/FileNode' }
+    RunStatus:
+      type: string
+      enum: [stopped, starting, running, stopping, error]
+    RunState:
+      type: object
+      required: [status, pid, startedAtMs, lastError, compiling]
+      properties:
+        status: { $ref: '#/components/schemas/RunStatus' }
+        pid: { type: integer, format: int64, nullable: true }
+        startedAtMs: { type: integer, format: int64, nullable: true }
+        lastError: { type: string, nullable: true }
+        compiling: { type: boolean }
+    ProjectTemplate:
+      type: object
+      required: [id, label]
+      properties:
+        id: { type: string }
+        label: { type: string }
+    ProjectDetail:
+      type: object
+      required: [config, files, runState, denoAvailable, runnable, platforms]
+      properties:
+        config: { $ref: '#/components/schemas/ProjectConfig' }
+        files:
+          type: array
+          items: { $ref: '#/components/schemas/FileNode' }
+        runState: { $ref: '#/components/schemas/RunState' }
+        denoAvailable: { type: boolean }
+        runnable: { type: boolean }
+        platforms:
+          type: array
+          items: { type: string }
+    ProjectsResponse:
+      type: object
+      required: [projects, denoAvailable, platforms]
+      properties:
+        projects:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectSummary' }
+        denoAvailable: { type: boolean }
+        platforms:
+          type: array
+          items: { type: string }
+        templates:
+          type: array
+          items: { $ref: '#/components/schemas/ProjectTemplate' }
+        extensions: { $ref: '#/components/schemas/ExtensionsOverview' }
+    CreateProjectRequest:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string }
+        description: { type: string }
+        template: { type: string, nullable: true }
+    RenameProjectRequest:
+      type: object
+      required: [newName]
+      properties:
+        newName: { type: string }
+    CompileRequest:
+      type: object
+      properties:
+        targets:
+          type: array
+          items: { type: string }
+    CompileStarted:
+      type: object
+      required: [started]
+      properties:
+        started: { type: boolean }
+    ActiveRunConfigRequest:
+      type: object
+      properties:
+        id: { type: string, nullable: true }
+    ActiveRunConfigResponse:
+      type: object
+      required: [active]
+      properties:
+        active: { type: string, nullable: true }
+
+    # ---- Extensions (camelCase wire fields) ------------------------------
+    ExtensionFileType:
+      type: object
+      required: [ext, monacoLang]
+      properties:
+        ext: { type: string }
+        monacoLang: { type: string }
+    ExtensionTheme:
+      type: object
+      required: [id, label, appearance, tokens]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        appearance:
+          type: string
+          enum: [light, dark]
+        tokens:
+          type: object
+          additionalProperties: { type: string }
+    ExtensionTemplate:
+      type: object
+      required: [id, label]
+      properties:
+        id: { type: string }
+        label: { type: string }
+    Extension:
+      type: object
+      required: [id, kind, displayName, builtin, fileTypes, templates, toolchainAvailable, trusted]
+      properties:
+        id: { type: string }
+        kind:
+          type: string
+          enum: [lang, app, example, theme]
+        displayName: { type: string }
+        builtin: { type: boolean }
+        fileTypes:
+          type: array
+          items: { $ref: '#/components/schemas/ExtensionFileType' }
+        templates:
+          type: array
+          items: { $ref: '#/components/schemas/ExtensionTemplate' }
+        themes:
+          type: array
+          items: { $ref: '#/components/schemas/ExtensionTheme' }
+        toolchainAvailable: { type: boolean }
+        trusted: { type: boolean }
+    ExtensionsOverview:
+      type: object
+      required: [extensions, yolo]
+      properties:
+        extensions:
+          type: array
+          items: { $ref: '#/components/schemas/Extension' }
+        yolo: { type: boolean }
+    MarketEntry:
+      type: object
+      required: [name, version, description, category, installed, updateAvailable]
+      properties:
+        name: { type: string }
+        version: { type: string }
+        description: { type: string }
+        category:
+          type: string
+          enum: [lang, app, example, theme, other]
+        installed: { type: boolean }
+        installedVersion: { type: string }
+        updateAvailable: { type: boolean }
+    Marketplace:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/MarketEntry' }
+    ExtPkgRequest:
+      type: object
+      required: [pkg]
+      properties:
+        pkg: { type: string }
+    TrustRequest:
+      type: object
+      properties:
+        yolo: { type: boolean, nullable: true }
+        approve: { type: string, nullable: true }
+        revoke: { type: string, nullable: true }

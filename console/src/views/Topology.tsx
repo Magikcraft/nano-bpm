@@ -1,12 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
-import { api, nodeConsoleUrl, type NodeHealth } from "../lib/api";
+import { getClusterHealth, getTopology, type NodeHealth } from "../gen";
+import { nodeConsoleUrl } from "../lib/api";
 import { Badge, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
 
 export default function Topology() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["topology"],
-    queryFn: api.topology,
+    queryFn: async () => (await getTopology({ throwOnError: true })).data,
     refetchInterval: 2000,
   });
 
@@ -14,7 +15,7 @@ export default function Topology() {
   // probes every peer over the network).
   const { data: health } = useQuery({
     queryKey: ["clusterHealth"],
-    queryFn: api.clusterHealth,
+    queryFn: async () => (await getClusterHealth({ throwOnError: true })).data,
     refetchInterval: 5000,
   });
 

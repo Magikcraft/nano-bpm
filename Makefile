@@ -14,6 +14,7 @@
 SHELL := /usr/bin/env bash
 PROJECT_ROOT := $(patsubst %/,%,$(dir $(abspath $(lastword $(MAKEFILE_LIST)))))
 GENERATED_DIR := $(PROJECT_ROOT)/generated
+CONSOLE_GENERATED_DIR := $(PROJECT_ROOT)/generated-console
 STUB_IMPLS := $(PROJECT_ROOT)/server/src/stub_impls.rs
 ENGINE_DIR := $(PROJECT_ROOT)/engine-core
 CONSOLE_DIR := $(PROJECT_ROOT)/console
@@ -82,9 +83,13 @@ all-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build optimized releas
 .PHONY: generate
 generate: ## Generate the Rust REST layer + server stub impls from spec/ (needs local Java)
 	./scripts/generate.sh
+	./scripts/generate-console.sh
 
 $(GENERATED_DIR)/Cargo.toml:
 	$(MAKE) generate
+
+$(CONSOLE_GENERATED_DIR)/Cargo.toml:
+	./scripts/generate-console.sh
 
 $(STUB_IMPLS):
 	$(MAKE) generate
@@ -95,7 +100,7 @@ build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Compile the generated crate 
 	cd $(PROJECT_ROOT)/server && cargo build
 
 .PHONY: release
-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend ## Build the optimized self-contained distribution (gateway + embedded console + Swagger)
+release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend ## Build the optimized self-contained distribution (gateway + embedded console + Swagger)
 	@# Force the RustEmbed derive to re-run so the just-built console/dist (which
 	@# release builds bake in at compile time) is embedded, even if the gateway
 	@# sources are otherwise unchanged.
@@ -139,7 +144,7 @@ server-test: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Test the stub server (
 	cd $(PROJECT_ROOT)/server && cargo test
 
 .PHONY: server-test-release
-server-test-release: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Test the stub server with release optimizations (uses the release-test profile to avoid the panic=abort double-compile)
+server-test-release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Test the stub server with release optimizations (uses the release-test profile to avoid the panic=abort double-compile)
 	cd $(PROJECT_ROOT)/server && cargo test --profile release-test --features console
 
 .PHONY: engine-build

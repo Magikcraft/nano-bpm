@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { api, fetchProcessXml } from "../lib/api";
+import { getInstance } from "../gen";
+import { fetchProcessXml } from "../lib/api";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import BpmnViewer from "../components/BpmnViewer";
 import { Badge, SectionLabel } from "../components/ui";
@@ -14,7 +15,8 @@ export default function InstanceDetail({
   useLiveInvalidation(["instance"]);
   const { data, isLoading, error } = useQuery({
     queryKey: ["instance", instanceKey],
-    queryFn: () => api.instanceDetail(instanceKey),
+    queryFn: async () =>
+      (await getInstance({ path: { key: instanceKey }, throwOnError: true })).data,
   });
 
   const defKey = data?.instance.process_definition_key;

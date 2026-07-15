@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { projectsApi } from "../lib/api";
+import { getExtensions } from "../gen";
 import {
   applySelection,
   isThemeSpec,
@@ -45,10 +45,9 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
 
   // Themes contributed by installed `kind: "theme"` extension packs.
   useEffect(() => {
-    projectsApi
-      .extensions()
-      .then((ov) =>
-        setPackThemes(ov.extensions.flatMap((e) => (e.themes ?? []).filter(isThemeSpec))),
+    getExtensions({ throwOnError: true })
+      .then(({ data }) =>
+        setPackThemes(data.extensions.flatMap((e) => (e.themes ?? []).filter(isThemeSpec))),
       )
       .catch(() => {}); // offline/dev — built-ins and imports still work
   }, []);

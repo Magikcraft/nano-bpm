@@ -1392,6 +1392,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "nanobpm-console-api"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "async-trait",
+ "axum",
+ "axum-extra",
+ "base64",
+ "bytes",
+ "chrono",
+ "headers",
+ "http",
+ "lazy_static",
+ "regex",
+ "serde",
+ "serde_html_form",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+ "validator",
+]
+
+[[package]]
 name = "nanobpm-gateway-rest"
 version = "0.1.0"
 dependencies = [
@@ -1436,6 +1460,7 @@ dependencies = [
  "hyper-util",
  "libc",
  "mime_guess",
+ "nanobpm-console-api",
  "nanobpm-gateway-rest",
  "nanobpmn-engine-core",
  "openraft",

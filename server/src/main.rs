@@ -12802,6 +12802,11 @@ async fn main() {
     // non-console path keeps consuming `server` directly (byte-identical).
     #[cfg(feature = "console")]
     let console_router = crate::console::router(server.clone());
+    // Build the generated (spec-first) console router while `server` is still
+    // available — it is moved into the gateway router below.
+    #[cfg(feature = "console")]
+    let gen_console_router =
+        nanobpm_console_api::server::new::<ServerImpl, ServerImpl, ()>(server.clone());
 
     // Captured for the /debug/raft diagnostic route before `server` is moved into
     // the generated router below.
@@ -12927,7 +12932,13 @@ async fn main() {
 
     #[cfg(feature = "console")]
     {
-        app = app.merge(console_router);
+        // The spec-first typed `/console/api/*` routes are served by the
+        // generated rust-axum router; the reduced hand-written `console_router`
+        // keeps only the streaming/binary/proxy/static routes excluded from the
+        // spec. axum merges the two: they only share the
+        // `/console/api/projects/{name}/file` path, on disjoint methods (GET is
+        // hand-wired; PUT/POST/DELETE are generated), so there is no collision.
+        app = app.merge(console_router).merge(gen_console_router);
         tracing::info!("console enabled: web UI at /console, API under /console/api");
     }
 
