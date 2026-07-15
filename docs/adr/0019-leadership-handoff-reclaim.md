@@ -247,3 +247,62 @@ need a decision):
    pre-death index and only streams the bounded downtime gap the leader now
    retains — no snapshot install. More correct but reintroduces the divergent-log
    handling Phase E sidestepped.
+
+## Root-cause investigation (controlled harness, debug logging) — DEFINITIVE
+
+The "learner replication stall / permanent 51-entry-gap freeze" framing above is
+**refuted**. Three controlled zero-load repros on the same binary (binsha
+`9e323cd8`, `NANOBPMN_RECLAIM_HANDOFF=1`), with tiny purge thresholds
+(`NANOBPMN_RAFT_KEEP_LOGS=200`, `..._LAGGING_RETAIN=800`) to force the
+snapshot-install path cheaply, plus `openraft::replication`/`snapshot_transport`
+debug logging:
+
+1. **Small / drained state → hand-off completes in ~1s.** node18 boots empty,
+   installs n19's small snapshot, streams the tiny tail; membership change commits
+   and node18 leads all 4 owned partitions at `term=2` within one 10s window.
+2. **Large *undrained* backlog (`active_backlog≈16.7k`, 16 KB vars) → completes in
+   ~52–63s, not never.** All 4 owned partitions transfer, but only after several
+   abort/re-request cycles. There is **no permanent freeze** at zero load — the
+   learner is *kept* across retries (`perform_handoff` does not remove it on
+   timeout; `handle_handoff_ack` only rebuilds a competing group, never an existing
+   receiver), so replication progress accumulates until lag reaches threshold.
+
+**The mechanism (smoking gun):** node18's `receive_snapshot` for partition 11
+streamed a **~165 MB** `InstallSnapshotRequest` (`offset` reached 163,577,856 +
+1,777,669) in 3 MB chunks throttled to ~30 MB/s → ~5.5 s of transfer for a single
+partition holding only ~4 k active instances × 16 KB. The snapshot **is the entire
+resident active-instance state machine**, not the raft log. Therefore:
+
+- Because node18 boots **empty** (Phase E fresh receiver), catch-up requires a
+  *full state-machine snapshot install*, whose size = the incumbent's resident
+  active-instance backlog for that partition.
+- Under Soak-4 load (~2 M active instances) that snapshot is **gigabytes**; at
+  ~30 MB/s the transfer alone is minutes — vastly beyond `HANDOFF_CATCHUP_TIMEOUT`
+  (10 s). Each cycle times out; under *sustained* load the state keeps growing so
+  the install never fits a window → completes only when load eases (the observed
+  Soak-4 behaviour). At zero load it always converges, just slowly for big state.
+- The 51-entry gap seen post-Soak-4 was the *tail after* an install of a huge,
+  never-draining snapshot; the freeze was transfer time, not a replication stall.
+
+**Secondary finding (separate issue):** after rejoin node18's `/debug/raft` shows
+only its 4 *owned* partition groups (cleanly `Leader term=2`); it does **not**
+re-form learner-replica groups for the 8 partitions owned by n19/n20. Those leaders
+then re-send the same `AppendEntries` batch to `target=2` every ~500 ms forever
+(no group to receive them) — wasted control-plane traffic and degraded failover
+redundancy (RF effectively < 3 for those partitions on this node). Worth fixing
+independently of the hand-off.
+
+### Revised recommendation
+Option 3 is now clearly the right fix and is strongly motivated by the evidence:
+node18 **already holds** almost all of this state on disk from before it died.
+Booting empty discards it and forces a multi-GB re-transfer that cannot fit the
+window under load. Hosting the owned partition from its on-disk committed
+**common prefix** means node18 only needs the **bounded downtime delta** (the log
+entries since it died — kilobytes) streamed via AppendEntries after truncating any
+divergent suffix (safe in leader-durable mode: the incumbent is authoritative). No
+giant snapshot, converges in ~1 RTT even under sustained load. Pair with an
+adaptive catch-up deadline (do not abort while the learner's match index is
+advancing) so a single attempt rides the delta to completion. Option 2 (true
+head-freeze) is an accelerator but insufficient alone (the from-empty install is
+the real cost). Option 1 (Zeebe-style best-effort) remains the safe ship state
+already achieved.
