@@ -73,7 +73,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::deepthi::DeepthiHandle;
 use crate::journal::Journal;
-use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport};
+use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport, SnapshotSendProgress};
 
 /// Raft node id. We key the cluster by the topology's `node_id` (a `u32`),
 /// widened to openraft's expected `u64`.
@@ -1410,6 +1410,12 @@ pub struct RaftPartition {
     /// compaction governor simply never byte-triggers. Read by the governor to
     /// decide byte-based snapshots — see [`snapshot_bytes_threshold`].
     log_bytes: Arc<AtomicI64>,
+    /// Cumulative bytes this member (as leader) has streamed to each replication
+    /// target during an `InstallSnapshot`. Shared with the partition's
+    /// [`PartitionNetwork`]. Read by the hand-off catch-up loop
+    /// ([`snapshot_bytes_sent`](Self::snapshot_bytes_sent)) to extend the deadline
+    /// while a snapshot install is actively transferring.
+    snapshot_progress: Arc<SnapshotSendProgress>,
 }
 
 impl RaftPartition {
@@ -1430,7 +1436,12 @@ impl RaftPartition {
 
         let log_store = MemLogStore::default();
         let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
-        let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
+        let snapshot_progress = Arc::new(SnapshotSendProgress::default());
+        let network = PartitionNetwork::new(
+            Arc::new(NullTransport),
+            partition_id,
+            snapshot_progress.clone(),
+        );
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         let mut members = BTreeMap::new();
@@ -1444,6 +1455,7 @@ impl RaftPartition {
             partition_id,
             batcher,
             log_bytes: Arc::new(AtomicI64::new(0)),
+            snapshot_progress,
         })
     }
 
@@ -1473,7 +1485,12 @@ impl RaftPartition {
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )?);
-        let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
+        let snapshot_progress = Arc::new(SnapshotSendProgress::default());
+        let network = PartitionNetwork::new(
+            Arc::new(NullTransport),
+            partition_id,
+            snapshot_progress.clone(),
+        );
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         // A fresh log needs the one-shot membership bootstrap; a recovered log
@@ -1491,6 +1508,7 @@ impl RaftPartition {
             partition_id,
             batcher,
             log_bytes,
+            snapshot_progress,
         })
     }
 
@@ -1543,7 +1561,8 @@ impl RaftPartition {
         // replays the post-snapshot log tail. Without this a rejoining node whose
         // log was purged fails to host the partition entirely.
         state_machine.restore_from_current_snapshot().await?;
-        let network = PartitionNetwork::new(transport, partition_id);
+        let snapshot_progress = Arc::new(SnapshotSendProgress::default());
+        let network = PartitionNetwork::new(transport, partition_id, snapshot_progress.clone());
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
         // `Raft` inside each arm avoids needing a common concrete store type. The
@@ -1586,6 +1605,7 @@ impl RaftPartition {
             partition_id,
             batcher,
             log_bytes,
+            snapshot_progress,
         })
     }
 
@@ -1695,6 +1715,21 @@ impl RaftPartition {
         }
         let repl = m.replication.as_ref()?;
         repl.get(&node_id)?.as_ref().map(|l| l.index)
+    }
+
+    /// Cumulative bytes this leader has streamed to `node_id` during an
+    /// `InstallSnapshot`, or `None` if no snapshot chunk has been sent to it yet.
+    ///
+    /// openraft's leader metrics report only a matched `LogId` per target, which
+    /// stays `None` for the *entire* snapshot install — so
+    /// [`learner_matched`](Self::learner_matched) cannot distinguish a large
+    /// install that is actively transferring from a wedged/dead learner. This
+    /// byte counter (bumped per acknowledged chunk in the partition network) is
+    /// that missing signal: the hand-off catch-up loop watches it to **extend** the
+    /// deadline while an install streams, and to detect a genuinely stalled
+    /// transfer (bytes stop advancing) — see `evaluate_catchup`.
+    pub fn snapshot_bytes_sent(&self, node_id: NodeId) -> Option<u64> {
+        self.snapshot_progress.bytes_sent(node_id)
     }
 
     /// Replicates `command` (stamped with `now`) through the Raft log and applies

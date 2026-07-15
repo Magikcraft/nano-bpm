@@ -327,24 +327,44 @@ the pure, unit-tested `evaluate_catchup`):
   lag can't distinguish progress from a stall. A snapshot install still in flight
   reports `matched = None`; that phase is bounded only by the absolute ceiling
   (never killed early).
-- **Abort early** only once matching has begun (`best_matched.is_some()`) and
-  then goes quiet for `NANOBPMN_HANDOFF_STALL_MS` (default 8 s) — a genuinely
-  stuck learner frees the write-pause fast instead of holding it for the full
+- **Abort early** only once progress has begun (`best_matched.is_some()` OR
+  snapshot bytes have started flowing) and then goes quiet for
+  `NANOBPMN_HANDOFF_STALL_MS` (default 8 s) — a genuinely stuck learner (matched
+  frozen, or a *wedged* snapshot transfer whose bytes flatline) frees the
+  write-pause fast instead of holding it for the full ceiling.
+- **Soft ceiling** `NANOBPMN_HANDOFF_CATCHUP_MS` (default 30 s) is the *normal*
+  budget, sized to cover one full state-machine install under load.
+- **Snapshot-transfer-aware extension** (enhancement): past the soft ceiling the
+  attempt keeps going **only while a snapshot install is actively transferring** —
+  i.e. the leader-observed cumulative install bytes to the learner
+  (`RaftPartition::snapshot_bytes_sent`, fed by per-chunk counters in
+  `PartitionConnection::install_snapshot`) advanced within the stall grace. This
+  avoids guillotining a large-but-progressing install whose transfer alone exceeds
+  30 s. A plain log-tail catch-up (no install bytes) still aborts at the soft
   ceiling.
-- **Absolute ceiling** `NANOBPMN_HANDOFF_CATCHUP_MS` (default 30 s) as the safety
-  cap, sized to cover one full state-machine install under load.
+- **Absolute hard cap** `NANOBPMN_HANDOFF_CATCHUP_MAX_MS` (default 180 s, `≥` the
+  soft ceiling) bounds even an actively-streaming install, so a pathologically
+  slow/huge transfer can't hold the completion write-pause forever.
 
-The completion write-pause is **clamped up to the ceiling** in
-`acquire_handoff_lease` (unless explicitly disabled with `..._WRITE_PAUSE_MS=0`),
-so the log head stays frozen for the *whole* adaptive window — the two windows
-can no longer drift out of order and unfreeze the head mid-install (which would
-restart the install forever). The default write-pause is 32 s (≥ ceiling).
+Why the byte signal is needed: openraft's leader metrics report only a matched
+`LogId` per target, which stays `None` for the *entire* install — so lag/matched
+alone cannot tell a 60 s-but-healthy install from a dead learner. The per-chunk
+byte counter is the missing "install is moving" signal.
+
+The completion write-pause is **clamped up to the soft ceiling** in
+`acquire_handoff_lease` (unless disabled with `..._WRITE_PAUSE_MS=0`) and, when a
+catch-up crosses the soft ceiling while an install is still streaming, is
+**extended in lockstep up to the hard cap** (`extend_handoff_pause`), so the log
+head stays frozen for the *whole* extended window — the two windows can no longer
+drift out of order and unfreeze the head mid-install (which would restart the
+install forever). The default write-pause is 32 s (≥ soft ceiling).
 `HANDOFF_PENDING_TICKS` raised to ~45 s so the requester never resends
 mid-attempt (it still never self-promotes while a reachable incumbent leads).
 
 Net: a single hand-off attempt now rides a from-empty install to completion under
-sustained load without teardown/re-add churn, while a dead learner still aborts
-promptly. Local gates green (251 server-bin tests incl.
+sustained load — even one whose transfer exceeds the soft ceiling — without
+teardown/re-add churn, while a dead or wedged learner still aborts promptly. Local
+gates green (256 server-bin tests incl.
 `evaluate_catchup_succeeds_extends_on_progress_and_aborts_on_stall_or_ceiling`,
 clippy 0, fmt). **Requires a GCP soak to confirm end-to-end under ~28k/s.**
 

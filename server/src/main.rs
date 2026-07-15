@@ -1867,6 +1867,30 @@ fn handoff_catchup_stall_from_env() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// Absolute HARD cap on a hand-off catch-up, past which the attempt aborts even
+/// while a snapshot install is actively transferring. The [soft ceiling]
+/// ([`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`]) is the *normal* budget; when a
+/// snapshot install is still streaming bytes at the soft ceiling
+/// ([`RaftPartition::snapshot_bytes_sent`](crate::raft::RaftPartition::snapshot_bytes_sent)
+/// advancing), the deadline EXTENDS up to this hard cap instead of guillotining a
+/// large-but-progressing install — the snapshot-transfer-aware adaptive deadline
+/// (ADR 0019). Bounds a pathologically slow/huge transfer so it can't hold the
+/// completion write-pause forever. Default 6× the soft ceiling; must be `>=` it.
+/// Overridable via `NANOBPMN_HANDOFF_CATCHUP_MAX_MS`.
+const HANDOFF_CATCHUP_MAX_DEFAULT_MS: u64 = 180000;
+
+/// Resolve the hand-off catch-up absolute hard cap from
+/// `NANOBPMN_HANDOFF_CATCHUP_MAX_MS`, clamped to at least the soft ceiling so the
+/// extension window is never negative.
+fn handoff_catchup_max_from_env(ceiling: std::time::Duration) -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_HANDOFF_CATCHUP_MAX_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(HANDOFF_CATCHUP_MAX_DEFAULT_MS);
+    std::time::Duration::from_millis(ms).max(ceiling)
+}
+
 /// One decision of the hand-off catch-up loop, computed by the pure
 /// [`evaluate_catchup`] from the learner's current replication signals.
 #[derive(Debug, PartialEq, Eq)]
@@ -1886,20 +1910,30 @@ enum CatchupStep {
 /// - `lag`: current replication lag in entries (`None` = no record / a snapshot
 ///   install still in flight); at/under `threshold` ⇒ [`CatchupStep::Done`].
 /// - `matched`: the learner's matched index (`None` until an install lands). Each
-///   time it advances past `best_matched`, `last_advance` is reset to `now` — so
-///   a steadily-draining tail keeps the attempt alive even under a moving head.
-/// - Aborts EARLY (`"learner stalled"`) only once matching has begun
-///   (`best_matched.is_some()`) and then goes quiet for `stall_grace`, so a
-///   long-but-progressing snapshot install (matched still `None`) is never
-///   killed prematurely — it is bounded only by the absolute `deadline`.
+///   time it advances past `best_matched`, `last_advance` is reset to `now`.
+/// - `snapshot_bytes`: cumulative bytes streamed to the learner during an
+///   `InstallSnapshot` (`None` = no install started). This is the signal that a
+///   large install is *actively transferring* even while `matched` is still
+///   `None` — each time it advances past `best_bytes`, `last_advance` resets too.
+/// - Aborts EARLY (`"learner stalled"`) only once progress has begun (matching
+///   started OR bytes flowing) and then goes quiet for `stall_grace`, so a
+///   healthy-but-slow install is never killed prematurely.
+/// - `soft_deadline` is the normal budget. Past it the attempt CONTINUES only
+///   while a snapshot install is actively streaming (bytes advanced within
+///   `stall_grace`) — the snapshot-transfer-aware extension — bounded by the
+///   absolute `hard_deadline`. A plain log-tail catch-up (no install bytes) still
+///   aborts at the soft deadline; every attempt aborts at the hard deadline.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_catchup(
     lag: Option<u64>,
     matched: Option<u64>,
+    snapshot_bytes: Option<u64>,
     best_matched: &mut Option<u64>,
+    best_bytes: &mut u64,
     last_advance: &mut std::time::Instant,
     now: std::time::Instant,
-    deadline: std::time::Instant,
+    soft_deadline: std::time::Instant,
+    hard_deadline: std::time::Instant,
     threshold: u64,
     stall_grace: std::time::Duration,
 ) -> CatchupStep {
@@ -1908,17 +1942,38 @@ fn evaluate_catchup(
     {
         return CatchupStep::Done;
     }
+    // Any forward progress — a growing matched index (tail streaming) or a growing
+    // snapshot byte count (install streaming) — resets the stall clock.
     if let Some(m) = matched
         && best_matched.map(|b| m > b).unwrap_or(true)
     {
         *best_matched = Some(m);
         *last_advance = now;
     }
-    if now >= deadline {
+    if let Some(b) = snapshot_bytes
+        && b > *best_bytes
+    {
+        *best_bytes = b;
+        *last_advance = now;
+    }
+    // Absolute hard cap: never extend past this, even mid-transfer, so a
+    // pathological install can't pin the completion write-pause forever.
+    if now >= hard_deadline {
         return CatchupStep::Abort("learner catch-up ceiling exceeded");
     }
-    if best_matched.is_some() && now.duration_since(*last_advance) >= stall_grace {
+    // Genuine stall: progress had begun (matched or bytes) then went quiet.
+    let progress_began = best_matched.is_some() || *best_bytes > 0;
+    if progress_began && now.duration_since(*last_advance) >= stall_grace {
         return CatchupStep::Abort("learner catch-up stalled");
+    }
+    // Soft ceiling: past the normal budget, keep going ONLY while a snapshot
+    // install is actively streaming (bytes advanced within the stall grace);
+    // otherwise abort. This is the snapshot-transfer-aware extension.
+    if now >= soft_deadline {
+        let streaming = *best_bytes > 0 && now.duration_since(*last_advance) < stall_grace;
+        if !streaming {
+            return CatchupStep::Abort("learner catch-up ceiling exceeded");
+        }
     }
     CatchupStep::Continue
 }
@@ -8328,32 +8383,51 @@ impl ServerImpl {
         if let Err(e) = part.add_learner(requester_node, node).await {
             return Err((false, format!("add_learner: {e}")));
         }
-        // Poll the learner toward zero lag with an ADAPTIVE deadline: succeed the
-        // instant it reaches HANDOFF_LAG_THRESHOLD, keep going while it is still
-        // installing/streaming (making progress), and abort only on a genuine
-        // stall or the absolute ceiling (see [`evaluate_catchup`]). The write-gate
-        // keeps new creates off this partition and the completion write-pause (ADR
-        // 0019, clamped >= the ceiling) holds off job-mutation writes for the whole
-        // attempt, so the log head stays frozen and a from-empty snapshot install
-        // can land and its tail drain — without a blind fixed cutoff guillotining a
-        // progressing learner and re-triggering the install forever.
-        let deadline = std::time::Instant::now() + self.handoff_catchup_ceiling();
+        // Poll the learner toward zero lag with an ADAPTIVE, snapshot-transfer-aware
+        // deadline: succeed the instant it reaches HANDOFF_LAG_THRESHOLD; keep going
+        // while it is still installing/streaming (matched OR snapshot bytes making
+        // progress); abort on a genuine stall or the absolute hard cap (see
+        // [`evaluate_catchup`]). The soft ceiling is the normal budget; while a
+        // snapshot install is actively transferring at the soft ceiling we EXTEND
+        // (up to the hard cap) rather than guillotine a large-but-progressing
+        // install — and extend the completion write-pause in lockstep so the log
+        // head stays frozen for the whole extended install (else the snapshot point
+        // moves and the learner re-snapshots forever). The write-gate keeps new
+        // creates off this partition throughout.
+        let soft_deadline = std::time::Instant::now() + self.handoff_catchup_ceiling();
+        let hard_deadline = std::time::Instant::now()
+            + handoff_catchup_max_from_env(self.handoff_catchup_ceiling());
         let stall_grace = handoff_catchup_stall_from_env();
         let mut best_matched: Option<u64> = None;
+        let mut best_bytes: u64 = 0;
         let mut last_advance = std::time::Instant::now();
+        let mut pause_extended = false;
         loop {
             if !self.i_lead_raft(partition) {
                 return Err((false, "lost leadership during catch-up".to_string()));
             }
             let lag = part.replication_lag(requester_node);
             let matched = part.learner_matched(requester_node);
+            let snapshot_bytes = part.snapshot_bytes_sent(requester_node);
+            let now = std::time::Instant::now();
+            // Once we cross the soft ceiling while an install is still streaming,
+            // the catch-up may run up to the hard cap — so extend the completion
+            // write-pause to cover it (idempotent), keeping the log head frozen for
+            // the whole extended install so the snapshot point can't move.
+            if !pause_extended && now >= soft_deadline && snapshot_bytes.is_some() {
+                self.extend_handoff_pause(partition, hard_deadline);
+                pause_extended = true;
+            }
             match evaluate_catchup(
                 lag,
                 matched,
+                snapshot_bytes,
                 &mut best_matched,
+                &mut best_bytes,
                 &mut last_advance,
-                std::time::Instant::now(),
-                deadline,
+                now,
+                soft_deadline,
+                hard_deadline,
                 HANDOFF_LAG_THRESHOLD,
                 stall_grace,
             ) {
@@ -8515,6 +8589,22 @@ impl ServerImpl {
         }
         gated.insert(partition, deadline);
         true
+    }
+
+    /// Extend the completion write-pause for `partition` to at least `until`, so
+    /// the log head stays frozen while a snapshot-transfer-aware catch-up runs past
+    /// the soft ceiling (up to the hard cap). Idempotent and monotonic — only ever
+    /// pushes the pause deadline later, never earlier, and is a no-op if the lease
+    /// was released or the pause is disabled (no entry present). Without this a
+    /// hand-off that extends its catch-up would outlive its write-pause, the head
+    /// would move mid-install, and the learner would re-snapshot forever.
+    fn extend_handoff_pause(&self, partition: u64, until: std::time::Instant) {
+        let mut gated = self.handoff_gated.lock().unwrap();
+        if let Some(deadline) = gated.get_mut(&partition)
+            && until > *deadline
+        {
+            *deadline = until;
+        }
     }
 
     /// Test hook: set the completion write-pause ceiling to a short, deterministic
@@ -17867,20 +17957,25 @@ mod clustered_startup_tests {
         let threshold = HANDOFF_LAG_THRESHOLD;
         let stall = Duration::from_millis(8000);
         let t0 = Instant::now();
-        let deadline = t0 + Duration::from_millis(30000);
+        let soft = t0 + Duration::from_millis(30000);
+        let hard = t0 + Duration::from_millis(180000);
 
         // Caught up (lag within threshold) -> Done, regardless of matched.
         {
             let mut best = None;
+            let mut bytes = 0u64;
             let mut adv = t0;
             assert_eq!(
                 evaluate_catchup(
                     Some(threshold),
                     Some(100),
+                    None,
                     &mut best,
+                    &mut bytes,
                     &mut adv,
                     t0,
-                    deadline,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
@@ -17888,25 +17983,110 @@ mod clustered_startup_tests {
             );
         }
 
-        // Snapshot install in flight (matched None, big lag): NOT stalled even far
-        // past the stall grace, because matching has not begun — bounded only by
-        // the absolute ceiling. This is the old-10s-cutoff bug the change fixes.
+        // Snapshot install in flight (matched None, no bytes yet, big lag): NOT
+        // stalled even far past the stall grace, because progress has not begun —
+        // bounded only by the deadlines. The old-10s-cutoff bug the change fixes.
         {
             let mut best = None;
+            let mut bytes = 0u64;
             let mut adv = t0;
             assert_eq!(
                 evaluate_catchup(
                     Some(1_000_000),
                     None,
+                    None,
                     &mut best,
+                    &mut bytes,
                     &mut adv,
                     t0 + Duration::from_millis(20000),
-                    deadline,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
                 CatchupStep::Continue,
-                "a long-but-still-installing learner (matched None) is not killed early"
+                "a long-but-still-installing learner (no progress yet) is not killed early"
+            );
+        }
+
+        // Snapshot bytes streaming: cumulative bytes advance -> Continue, and the
+        // stall clock resets on the byte advance even though matched is still None.
+        {
+            let mut best = None;
+            let mut bytes = 50_000_000u64;
+            let mut adv = t0;
+            let now = t0 + Duration::from_millis(7000);
+            assert_eq!(
+                evaluate_catchup(
+                    Some(1_000_000),
+                    None,
+                    Some(90_000_000),
+                    &mut best,
+                    &mut bytes,
+                    &mut adv,
+                    now,
+                    soft,
+                    hard,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Continue
+            );
+            assert_eq!(bytes, 90_000_000, "best bytes advanced");
+            assert_eq!(adv, now, "the stall clock reset on the byte advance");
+        }
+
+        // Snapshot-transfer-aware EXTENSION: past the soft ceiling but bytes are
+        // still advancing (within the stall grace) -> Continue, not Abort. This is
+        // the enhancement: a large install that outlasts the soft ceiling keeps
+        // going toward the hard cap instead of being guillotined.
+        {
+            let mut best = None;
+            let mut bytes = 100_000_000u64;
+            let now = soft + Duration::from_millis(5000);
+            let mut adv = now; // bytes just advanced -> actively streaming
+            assert_eq!(
+                evaluate_catchup(
+                    Some(1_000_000),
+                    None,
+                    Some(120_000_000),
+                    &mut best,
+                    &mut bytes,
+                    &mut adv,
+                    now,
+                    soft,
+                    hard,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Continue,
+                "an actively-streaming install extends past the soft ceiling"
+            );
+        }
+
+        // Past the soft ceiling with NO install bytes (plain log-tail catch-up)
+        // -> abort at the soft ceiling (only snapshot installs get the extension).
+        {
+            let mut best = Some(1200u64);
+            let mut bytes = 0u64;
+            let now = soft + Duration::from_millis(1);
+            let mut adv = now; // matched just advanced (not a stall) yet no bytes
+            assert_eq!(
+                evaluate_catchup(
+                    Some(200),
+                    Some(1201),
+                    None,
+                    &mut best,
+                    &mut bytes,
+                    &mut adv,
+                    now,
+                    soft,
+                    hard,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Abort("learner catch-up ceiling exceeded"),
+                "a non-install catch-up is not extended past the soft ceiling"
             );
         }
 
@@ -17914,16 +18094,20 @@ mod clustered_startup_tests {
         // the stall clock restarts from each advance.
         {
             let mut best = Some(500u64);
+            let mut bytes = 0u64;
             let mut adv = t0;
             let now = t0 + Duration::from_millis(7000);
             assert_eq!(
                 evaluate_catchup(
                     Some(200),
                     Some(1200),
+                    None,
                     &mut best,
+                    &mut bytes,
                     &mut adv,
                     now,
-                    deadline,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
@@ -17933,19 +18117,24 @@ mod clustered_startup_tests {
             assert_eq!(adv, now, "the stall clock reset on the advance");
         }
 
-        // Post-install stall: matched began (best is Some) but has not advanced for
-        // >= stall_grace -> abort EARLY (free the write-pause), before the ceiling.
+        // Post-install stall: progress began (matched Some) but has not advanced
+        // for >= stall_grace -> abort EARLY (free the write-pause), before the soft
+        // ceiling. Also fires for a wedged snapshot transfer (bytes stop flowing).
         {
             let mut best = Some(1200u64);
+            let mut bytes = 0u64;
             let mut adv = t0;
             assert_eq!(
                 evaluate_catchup(
                     Some(200),
                     Some(1200),
+                    None,
                     &mut best,
+                    &mut bytes,
                     &mut adv,
                     t0 + stall,
-                    deadline,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
@@ -17953,22 +18142,52 @@ mod clustered_startup_tests {
             );
         }
 
-        // Absolute ceiling wins even while matching (safety cap).
+        // Wedged snapshot transfer: bytes began then went quiet for >= stall_grace
+        // (matched still None) -> abort (a stuck install must not extend forever).
         {
-            let mut best = Some(1200u64);
-            let mut adv = deadline; // "just advanced" — not a stall
+            let mut best = None;
+            let mut bytes = 100_000_000u64;
+            let mut adv = t0;
             assert_eq!(
                 evaluate_catchup(
-                    Some(200),
-                    Some(1201),
+                    Some(1_000_000),
+                    None,
+                    Some(100_000_000), // no advance since best_bytes
                     &mut best,
+                    &mut bytes,
                     &mut adv,
-                    deadline,
-                    deadline,
+                    t0 + stall,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
-                CatchupStep::Abort("learner catch-up ceiling exceeded")
+                CatchupStep::Abort("learner catch-up stalled"),
+                "a wedged install (bytes flatlined) aborts on the stall grace"
+            );
+        }
+
+        // Absolute HARD cap wins even while actively streaming (safety cap).
+        {
+            let mut best = None;
+            let mut bytes = 100_000_000u64;
+            let mut adv = hard; // "just advanced" — not a stall
+            assert_eq!(
+                evaluate_catchup(
+                    Some(1_000_000),
+                    None,
+                    Some(200_000_000),
+                    &mut best,
+                    &mut bytes,
+                    &mut adv,
+                    hard,
+                    soft,
+                    hard,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Abort("learner catch-up ceiling exceeded"),
+                "the hard cap bounds even an actively-streaming install"
             );
         }
     }

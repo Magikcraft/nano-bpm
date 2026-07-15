@@ -162,19 +162,56 @@ pub async fn dispatch(
     })
 }
 
+/// Cumulative bytes streamed to each replication target during `InstallSnapshot`,
+/// keyed by target node id. openraft's leader-side metrics only expose a matched
+/// `LogId` for a target, which stays `None` for the *whole* snapshot install — so
+/// a large install that outlasts the fixed catch-up ceiling looks indistinguishable
+/// from a dead learner and gets guillotined. This byte counter gives the hand-off
+/// catch-up loop a leader-observable "install is actively transferring" signal, so
+/// it can *extend* the deadline while bytes flow instead of aborting (ADR 0019
+/// snapshot-transfer-aware deadline). Written by
+/// [`PartitionConnection::install_snapshot`] after each acknowledged chunk; read
+/// via [`crate::raft::RaftPartition::snapshot_bytes_sent`].
+#[derive(Default)]
+pub struct SnapshotSendProgress {
+    bytes: Mutex<HashMap<NodeId, u64>>,
+}
+
+impl SnapshotSendProgress {
+    /// Add an acknowledged chunk's byte count to `target`'s running total.
+    fn record(&self, target: NodeId, chunk_len: usize) {
+        let mut m = self.bytes.lock().unwrap();
+        *m.entry(target).or_insert(0) += chunk_len as u64;
+    }
+
+    /// Cumulative bytes streamed to `target` so far, or `None` if no snapshot
+    /// chunk has ever been sent to it (no install in progress).
+    pub fn bytes_sent(&self, target: NodeId) -> Option<u64> {
+        self.bytes.lock().unwrap().get(&target).copied()
+    }
+}
+
 /// The openraft [`RaftNetworkFactory`] for one partition: every connection it
 /// mints carries that partition's RPCs over the shared [`RaftTransport`].
 #[derive(Clone)]
 pub struct PartitionNetwork {
     transport: Arc<dyn RaftTransport>,
     partition: u64,
+    /// Shared with the owning [`RaftPartition`](crate::raft::RaftPartition) so the
+    /// hand-off catch-up loop can observe snapshot-transfer byte progress.
+    snapshot_progress: Arc<SnapshotSendProgress>,
 }
 
 impl PartitionNetwork {
-    pub fn new(transport: Arc<dyn RaftTransport>, partition: u64) -> Self {
+    pub fn new(
+        transport: Arc<dyn RaftTransport>,
+        partition: u64,
+        snapshot_progress: Arc<SnapshotSendProgress>,
+    ) -> Self {
         Self {
             transport,
             partition,
+            snapshot_progress,
         }
     }
 }
@@ -187,6 +224,7 @@ impl RaftNetworkFactory<RaftConfig> for PartitionNetwork {
             transport: self.transport.clone(),
             partition: self.partition,
             target,
+            snapshot_progress: self.snapshot_progress.clone(),
         }
     }
 }
@@ -196,6 +234,7 @@ pub struct PartitionConnection {
     transport: Arc<dyn RaftTransport>,
     partition: u64,
     target: NodeId,
+    snapshot_progress: Arc<SnapshotSendProgress>,
 }
 
 impl PartitionConnection {
@@ -265,6 +304,7 @@ impl RaftNetwork<RaftConfig> for PartitionConnection {
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, openraft::error::InstallSnapshotError>>,
     > {
+        let chunk_len = req.data.len();
         let resp = self
             .transport
             .send(
@@ -275,7 +315,12 @@ impl RaftNetwork<RaftConfig> for PartitionConnection {
             .await
             .map_err(|e| self.unreachable(e))?;
         match resp {
-            RaftRpcResponse::InstallSnapshot(r) => Ok(r),
+            RaftRpcResponse::InstallSnapshot(r) => {
+                // Record the acknowledged chunk so the hand-off catch-up loop sees
+                // the install actively transferring and extends its deadline.
+                self.snapshot_progress.record(self.target, chunk_len);
+                Ok(r)
+            }
             _ => Err(self.mismatch()),
         }
     }
