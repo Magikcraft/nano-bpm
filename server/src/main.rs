@@ -391,6 +391,13 @@ pub struct ServerImpl {
     /// to converge. Atomic only so tests can set a short deterministic window; it is
     /// read once per hand-off (cold path).
     handoff_write_pause_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Absolute ceiling (milliseconds) on the hand-off catch-up loop
+    /// (`NANOBPMN_HANDOFF_CATCHUP_MS`, default 30000 — see
+    /// [`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`]). Also the floor the completion
+    /// write-pause is clamped up to in [`ServerImpl::acquire_handoff_lease`], so
+    /// the head stays frozen for the whole catch-up. Atomic only so tests can set
+    /// a short deterministic window; read on the cold hand-off path.
+    handoff_catchup_ceiling_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Requester side of an in-flight leadership hand-off: partitions for which this
     /// (rejoining owner) node has asked the incumbent to hand leadership back,
     /// keyed by partition. Suppresses the legacy self-promote while the hand-off is
@@ -852,6 +859,9 @@ impl ServerImpl {
             handoff_gated: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             handoff_write_pause_ms: Arc::new(std::sync::atomic::AtomicU64::new(
                 handoff_write_pause_from_env().as_millis() as u64,
+            )),
+            handoff_catchup_ceiling_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                handoff_catchup_ceiling_from_env().as_millis() as u64,
             )),
             handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_mode,
@@ -1799,24 +1809,119 @@ struct HandoffPending {
 }
 
 /// Recovery-tick passes a returning owner waits for an in-flight hand-off before
-/// falling back to the legacy self-promote. At ~500 ms/pass this is ~15 s, safely
-/// longer than the incumbent's learner catch-up ([`HANDOFF_CATCHUP_TIMEOUT`]) plus
-/// the membership change, so a working hand-off is never pre-empted or resent
-/// mid-catch-up.
-const HANDOFF_PENDING_TICKS: u32 = 30;
+/// re-sending (it never self-promotes while a reachable incumbent leads the
+/// partition — see [`ServerImpl::request_handoff_or_wait`]). At ~500 ms/pass this
+/// is ~45 s, kept safely longer than the incumbent's catch-up absolute ceiling
+/// ([`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`]) plus the membership change, so a
+/// progressing hand-off is never pre-empted or needlessly resent mid-catch-up.
+const HANDOFF_PENDING_TICKS: u32 = 90;
 
-/// Max wall time the incumbent polls a hand-off learner toward zero replication
-/// lag before aborting (and letting the owner fall back to self-promote). Bounded
-/// so a learner that cannot catch up under load never blocks the hand-off forever.
+/// Absolute ceiling on how long the incumbent polls a hand-off learner toward
+/// zero replication lag before aborting. This is a *safety cap*, not the normal
+/// exit: the catch-up loop ([`ServerImpl::perform_handoff`], via
+/// [`evaluate_catchup`]) succeeds the instant the learner reaches
+/// [`HANDOFF_LAG_THRESHOLD`] and aborts EARLY the instant a post-install learner
+/// stops advancing for [`HANDOFF_CATCHUP_STALL_DEFAULT_MS`] — so a dead learner
+/// never holds the write-pause for the full ceiling, and a *progressing* one is
+/// never guillotined mid-stream by a blind fixed cutoff (the old 10 s bug: a
+/// from-empty snapshot install under load can't land in 10 s, so every attempt
+/// aborted and re-added the learner, re-triggering the install forever).
 ///
-/// Sized to cover ONE snapshot install: under sustained load the single-voter
-/// leader retains only ~1 s of log (it snapshots+purges aggressively), so a
-/// returning owner that missed tens of seconds is far outside the retained window
-/// and must catch up via a full snapshot install, not log streaming. The
+/// Sized to cover ONE full state-machine snapshot install under sustained load
+/// (the returning owner boots empty, so catch-up streams the incumbent's whole
+/// resident state, chunked at the snapshot transport rate — see ADR 0019). The
 /// completion write-pause freezes the log head for the whole of this window (see
-/// [`HANDOFF_WRITE_PAUSE_DEFAULT_MS`]) so the snapshot point stops moving and the
-/// install can finish and the tail drain to within [`HANDOFF_LAG_THRESHOLD`].
-const HANDOFF_CATCHUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10000);
+/// [`HANDOFF_WRITE_PAUSE_DEFAULT_MS`], clamped `>=` this ceiling in
+/// [`ServerImpl::acquire_handoff_lease`]) so the snapshot point stops moving and
+/// the install can finish and the tail drain to within the threshold.
+/// Overridable via `NANOBPMN_HANDOFF_CATCHUP_MS`.
+const HANDOFF_CATCHUP_CEILING_DEFAULT_MS: u64 = 30000;
+
+/// How long a hand-off learner that has *started* matching (a snapshot install
+/// landed, tail streaming) may go WITHOUT advancing its matched index before the
+/// catch-up aborts early. Distinguishes a genuinely stuck learner (abort, free
+/// the write-pause) from one still installing a snapshot (matched not yet
+/// reported — bounded only by [`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`]) or steadily
+/// draining a tail (advancing — keep going). Overridable via
+/// `NANOBPMN_HANDOFF_STALL_MS`.
+const HANDOFF_CATCHUP_STALL_DEFAULT_MS: u64 = 8000;
+
+/// Resolve the hand-off catch-up absolute ceiling from `NANOBPMN_HANDOFF_CATCHUP_MS`.
+fn handoff_catchup_ceiling_from_env() -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_HANDOFF_CATCHUP_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(HANDOFF_CATCHUP_CEILING_DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Resolve the hand-off catch-up post-install stall grace from
+/// `NANOBPMN_HANDOFF_STALL_MS`.
+fn handoff_catchup_stall_from_env() -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_HANDOFF_STALL_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(HANDOFF_CATCHUP_STALL_DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// One decision of the hand-off catch-up loop, computed by the pure
+/// [`evaluate_catchup`] from the learner's current replication signals.
+#[derive(Debug, PartialEq, Eq)]
+enum CatchupStep {
+    /// Learner is within threshold — promote it to voter.
+    Done,
+    /// Keep polling; the learner is installing/streaming and making progress.
+    Continue,
+    /// Give up this attempt with a reason (learner stalled or ceiling hit).
+    Abort(&'static str),
+}
+
+/// Pure catch-up decision for [`ServerImpl::perform_handoff`] — kept side-effect
+/// free (all clock/metric reads happen in the caller) so the adaptive
+/// deadline/stall logic is deterministically unit-testable.
+///
+/// - `lag`: current replication lag in entries (`None` = no record / a snapshot
+///   install still in flight); at/under `threshold` ⇒ [`CatchupStep::Done`].
+/// - `matched`: the learner's matched index (`None` until an install lands). Each
+///   time it advances past `best_matched`, `last_advance` is reset to `now` — so
+///   a steadily-draining tail keeps the attempt alive even under a moving head.
+/// - Aborts EARLY (`"learner stalled"`) only once matching has begun
+///   (`best_matched.is_some()`) and then goes quiet for `stall_grace`, so a
+///   long-but-progressing snapshot install (matched still `None`) is never
+///   killed prematurely — it is bounded only by the absolute `deadline`.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_catchup(
+    lag: Option<u64>,
+    matched: Option<u64>,
+    best_matched: &mut Option<u64>,
+    last_advance: &mut std::time::Instant,
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+    threshold: u64,
+    stall_grace: std::time::Duration,
+) -> CatchupStep {
+    if let Some(l) = lag
+        && l <= threshold
+    {
+        return CatchupStep::Done;
+    }
+    if let Some(m) = matched
+        && best_matched.map(|b| m > b).unwrap_or(true)
+    {
+        *best_matched = Some(m);
+        *last_advance = now;
+    }
+    if now >= deadline {
+        return CatchupStep::Abort("learner catch-up ceiling exceeded");
+    }
+    if best_matched.is_some() && now.duration_since(*last_advance) >= stall_grace {
+        return CatchupStep::Abort("learner catch-up stalled");
+    }
+    CatchupStep::Continue
+}
 
 /// Poll interval for the incumbent's learner-lag catch-up loop.
 const HANDOFF_LAG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1844,13 +1949,15 @@ const HANDOFF_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis
 /// `NANOBPMN_HANDOFF_WRITE_PAUSE_MS`; `0` disables the completion pause (leaving
 /// only the create-steer = Zeebe-style best-effort reclaim).
 ///
-/// Set a hair above [`HANDOFF_CATCHUP_TIMEOUT`] so completions stay paused for the
-/// ENTIRE catch-up attempt: the log head must stay frozen through the whole
-/// snapshot install, or the leader's snapshot point keeps advancing and the
-/// learner re-snapshots forever (a catch-up livelock). The lease is released the
-/// instant the hand-off completes or aborts, so the real stall is only as long as
-/// the catch-up actually takes — this is just the safety ceiling.
-const HANDOFF_WRITE_PAUSE_DEFAULT_MS: u64 = 12000;
+/// Set at/above the [`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`] so completions stay
+/// paused for the ENTIRE catch-up attempt: the log head must stay frozen through
+/// the whole snapshot install, or the leader's snapshot point keeps advancing and
+/// the learner re-snapshots forever (a catch-up livelock). The lease is released
+/// the instant the hand-off completes or aborts, so the real stall is only as
+/// long as the catch-up actually takes — this is just the safety ceiling.
+/// [`ServerImpl::acquire_handoff_lease`] additionally clamps the effective pause
+/// up to the catch-up ceiling so the two can never drift out of order.
+const HANDOFF_WRITE_PAUSE_DEFAULT_MS: u64 = 32000;
 
 /// Resolve the leadership hand-off completion write-pause ceiling from
 /// `NANOBPMN_HANDOFF_WRITE_PAUSE_MS` (default [`HANDOFF_WRITE_PAUSE_DEFAULT_MS`],
@@ -8210,22 +8317,38 @@ impl ServerImpl {
         if let Err(e) = part.add_learner(requester_node, node).await {
             return Err((false, format!("add_learner: {e}")));
         }
-        // Poll the learner toward zero lag, bounded by HANDOFF_CATCHUP_TIMEOUT.
-        // The write-gate keeps new creates off this partition and the bounded
-        // completion write-pause (ADR 0019) holds off job-mutation writes, so the
-        // log stops growing and the learner can converge to zero lag.
-        let deadline = std::time::Instant::now() + HANDOFF_CATCHUP_TIMEOUT;
+        // Poll the learner toward zero lag with an ADAPTIVE deadline: succeed the
+        // instant it reaches HANDOFF_LAG_THRESHOLD, keep going while it is still
+        // installing/streaming (making progress), and abort only on a genuine
+        // stall or the absolute ceiling (see [`evaluate_catchup`]). The write-gate
+        // keeps new creates off this partition and the completion write-pause (ADR
+        // 0019, clamped >= the ceiling) holds off job-mutation writes for the whole
+        // attempt, so the log head stays frozen and a from-empty snapshot install
+        // can land and its tail drain — without a blind fixed cutoff guillotining a
+        // progressing learner and re-triggering the install forever.
+        let deadline = std::time::Instant::now() + self.handoff_catchup_ceiling();
+        let stall_grace = handoff_catchup_stall_from_env();
+        let mut best_matched: Option<u64> = None;
+        let mut last_advance = std::time::Instant::now();
         loop {
             if !self.i_lead_raft(partition) {
                 return Err((false, "lost leadership during catch-up".to_string()));
             }
-            if let Some(lag) = part.replication_lag(requester_node)
-                && lag <= HANDOFF_LAG_THRESHOLD
-            {
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err((false, "learner catch-up timeout".to_string()));
+            let lag = part.replication_lag(requester_node);
+            let matched = part.learner_matched(requester_node);
+            match evaluate_catchup(
+                lag,
+                matched,
+                &mut best_matched,
+                &mut last_advance,
+                std::time::Instant::now(),
+                deadline,
+                HANDOFF_LAG_THRESHOLD,
+                stall_grace,
+            ) {
+                CatchupStep::Done => break,
+                CatchupStep::Abort(reason) => return Err((false, reason.to_string())),
+                CatchupStep::Continue => {}
             }
             tokio::time::sleep(HANDOFF_LAG_POLL).await;
         }
@@ -8360,10 +8483,20 @@ impl ServerImpl {
     /// write-gate + the bounded completion write-pause). Returns `false` if a
     /// hand-off for `partition` is already in flight.
     fn acquire_handoff_lease(&self, partition: u64) -> bool {
-        let pause = std::time::Duration::from_millis(
+        let configured = std::time::Duration::from_millis(
             self.handoff_write_pause_ms
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
+        // Clamp the pause up to the catch-up ceiling (unless explicitly disabled
+        // with 0): completions must stay paused for the WHOLE catch-up, or the log
+        // head unfreezes mid-install and the learner re-snapshots forever. This
+        // keeps the two windows from drifting out of order even if the pause env
+        // is set below the ceiling.
+        let pause = if configured.is_zero() {
+            configured
+        } else {
+            configured.max(self.handoff_catchup_ceiling())
+        };
         let deadline = std::time::Instant::now() + pause;
         let mut gated = self.handoff_gated.lock().unwrap();
         if gated.contains_key(&partition) {
@@ -8378,6 +8511,24 @@ impl ServerImpl {
     #[cfg(test)]
     fn set_handoff_write_pause_for_test(&self, d: std::time::Duration) {
         self.handoff_write_pause_ms
+            .store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hand-off catch-up absolute ceiling (per-instance, seeded from
+    /// `NANOBPMN_HANDOFF_CATCHUP_MS`). Read on the cold hand-off path by both the
+    /// catch-up loop and the write-pause clamp so the two windows stay ordered.
+    fn handoff_catchup_ceiling(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.handoff_catchup_ceiling_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Test hook: shrink the catch-up ceiling to a short deterministic window so a
+    /// hand-off test (and the write-pause clamp) isn't gated on the 30 s default.
+    #[cfg(test)]
+    fn set_handoff_catchup_ceiling_for_test(&self, d: std::time::Duration) {
+        self.handoff_catchup_ceiling_ms
             .store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -17529,6 +17680,118 @@ mod clustered_startup_tests {
         );
     }
 
+    #[test]
+    fn evaluate_catchup_succeeds_extends_on_progress_and_aborts_on_stall_or_ceiling() {
+        use std::time::{Duration, Instant};
+        let threshold = HANDOFF_LAG_THRESHOLD;
+        let stall = Duration::from_millis(8000);
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_millis(30000);
+
+        // Caught up (lag within threshold) -> Done, regardless of matched.
+        {
+            let mut best = None;
+            let mut adv = t0;
+            assert_eq!(
+                evaluate_catchup(
+                    Some(threshold),
+                    Some(100),
+                    &mut best,
+                    &mut adv,
+                    t0,
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Done
+            );
+        }
+
+        // Snapshot install in flight (matched None, big lag): NOT stalled even far
+        // past the stall grace, because matching has not begun — bounded only by
+        // the absolute ceiling. This is the old-10s-cutoff bug the change fixes.
+        {
+            let mut best = None;
+            let mut adv = t0;
+            assert_eq!(
+                evaluate_catchup(
+                    Some(1_000_000),
+                    None,
+                    &mut best,
+                    &mut adv,
+                    t0 + Duration::from_millis(20000),
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Continue,
+                "a long-but-still-installing learner (matched None) is not killed early"
+            );
+        }
+
+        // Tail streaming: matched advances -> Continue, and last_advance resets so
+        // the stall clock restarts from each advance.
+        {
+            let mut best = Some(500u64);
+            let mut adv = t0;
+            let now = t0 + Duration::from_millis(7000);
+            assert_eq!(
+                evaluate_catchup(
+                    Some(200),
+                    Some(1200),
+                    &mut best,
+                    &mut adv,
+                    now,
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Continue
+            );
+            assert_eq!(best, Some(1200), "best matched advanced");
+            assert_eq!(adv, now, "the stall clock reset on the advance");
+        }
+
+        // Post-install stall: matched began (best is Some) but has not advanced for
+        // >= stall_grace -> abort EARLY (free the write-pause), before the ceiling.
+        {
+            let mut best = Some(1200u64);
+            let mut adv = t0;
+            assert_eq!(
+                evaluate_catchup(
+                    Some(200),
+                    Some(1200),
+                    &mut best,
+                    &mut adv,
+                    t0 + stall,
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Abort("learner catch-up stalled")
+            );
+        }
+
+        // Absolute ceiling wins even while matching (safety cap).
+        {
+            let mut best = Some(1200u64);
+            let mut adv = deadline; // "just advanced" — not a stall
+            assert_eq!(
+                evaluate_catchup(
+                    Some(200),
+                    Some(1201),
+                    &mut best,
+                    &mut adv,
+                    deadline,
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Abort("learner catch-up ceiling exceeded")
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn handoff_lease_engages_create_gate_and_a_bounded_completion_pause() {
         // The incumbent hand-off lease must engage BOTH the create write-gate and a
@@ -17538,8 +17801,12 @@ mod clustered_startup_tests {
         // writes resume even if the lease lingers. Release clears both.
         let (node0, _n1, _n2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
 
-        // Deterministic short pause so the test is fast and non-flaky.
+        // Deterministic short pause so the test is fast and non-flaky. The pause is
+        // clamped up to the catch-up ceiling (so completions stay paused for the
+        // whole catch-up), so shrink the ceiling too or the 120ms pause would be
+        // raised to the 30s production ceiling and never lift inside the test.
         let short = std::time::Duration::from_millis(120);
+        node0.set_handoff_catchup_ceiling_for_test(short);
         node0.set_handoff_write_pause_for_test(short);
 
         assert!(

@@ -1625,6 +1625,25 @@ impl RaftPartition {
         Some(last.saturating_sub(matched))
     }
 
+    /// The matched log index of learner/voter `node_id` on this leader — how far
+    /// replication (log stream or a completed snapshot install) has durably
+    /// carried it — or `None` if we are not the leader, have no replication
+    /// record yet, or the target has matched nothing (a snapshot install still in
+    /// flight reports `None` here until it lands). Distinct from
+    /// [`replication_lag`](Self::replication_lag): the hand-off catch-up watches
+    /// this to tell a learner that is genuinely *advancing* (extend the deadline)
+    /// from one that has *stalled* (abort early) — lag alone can't, since under a
+    /// moving log head a steadily-catching-up learner shows constant lag.
+    pub fn learner_matched(&self, node_id: NodeId) -> Option<u64> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        if m.state != openraft::ServerState::Leader {
+            return None;
+        }
+        let repl = m.replication.as_ref()?;
+        repl.get(&node_id)?.as_ref().map(|l| l.index)
+    }
+
     /// Replicates `command` (stamped with `now`) through the Raft log and applies
     /// it once committed, returning the events it produced. At RF=1 this commits
     /// as soon as the local log write lands. Routed through the per-partition

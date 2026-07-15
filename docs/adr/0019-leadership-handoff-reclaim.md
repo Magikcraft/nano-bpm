@@ -306,3 +306,58 @@ advancing) so a single attempt rides the delta to completion. Option 2 (true
 head-freeze) is an accelerator but insufficient alone (the from-empty install is
 the real cost). Option 1 (Zeebe-style best-effort) remains the safe ship state
 already achieved.
+
+## Implemented: adaptive catch-up deadline (this change)
+
+The fixed 10 s `HANDOFF_CATCHUP_TIMEOUT` was the immediate blocker for
+"reclaim completes UNDER load": a from-empty snapshot install cannot land in
+10 s while the incumbent serves the other partitions at ~28k/s, so **every**
+attempt aborted and was re-requested — each re-request re-added the learner,
+resetting its match to `None` and re-triggering the whole install (the observed
+catch-up livelock). The wall-clock cutoff couldn't tell a *progressing* install
+from a *stuck* one.
+
+Replaced it with an **adaptive** loop (`perform_handoff` +
+the pure, unit-tested `evaluate_catchup`):
+
+- **Succeed** the instant replication lag ≤ `HANDOFF_LAG_THRESHOLD` (unchanged).
+- **Keep going** while the learner is making progress. Progress is read from the
+  learner's *matched index* (`RaftPartition::learner_matched`), not lag alone —
+  under a moving log head a steadily-catching-up learner shows ~constant lag, so
+  lag can't distinguish progress from a stall. A snapshot install still in flight
+  reports `matched = None`; that phase is bounded only by the absolute ceiling
+  (never killed early).
+- **Abort early** only once matching has begun (`best_matched.is_some()`) and
+  then goes quiet for `NANOBPMN_HANDOFF_STALL_MS` (default 8 s) — a genuinely
+  stuck learner frees the write-pause fast instead of holding it for the full
+  ceiling.
+- **Absolute ceiling** `NANOBPMN_HANDOFF_CATCHUP_MS` (default 30 s) as the safety
+  cap, sized to cover one full state-machine install under load.
+
+The completion write-pause is **clamped up to the ceiling** in
+`acquire_handoff_lease` (unless explicitly disabled with `..._WRITE_PAUSE_MS=0`),
+so the log head stays frozen for the *whole* adaptive window — the two windows
+can no longer drift out of order and unfreeze the head mid-install (which would
+restart the install forever). The default write-pause is 32 s (≥ ceiling).
+`HANDOFF_PENDING_TICKS` raised to ~45 s so the requester never resends
+mid-attempt (it still never self-promotes while a reachable incumbent leads).
+
+Net: a single hand-off attempt now rides a from-empty install to completion under
+sustained load without teardown/re-add churn, while a dead learner still aborts
+promptly. Local gates green (251 server-bin tests incl.
+`evaluate_catchup_succeeds_extends_on_progress_and_aborts_on_stall_or_ceiling`,
+clippy 0, fmt). **Requires a GCP soak to confirm end-to-end under ~28k/s.**
+
+### Option 3 (on-disk common-prefix) status — deferred, needs openraft work
+With the adaptive deadline the from-empty install now *completes* under load, so
+Option 3 becomes a latency/availability **optimization** (stream the bounded
+downtime delta instead of a full install), not a correctness fix. It is NOT
+shipped here because hosting the owned partition from its restored on-disk log
+resurrects node18's old single-voter lineage: it (a) campaigns as sole voter and
+(b) cannot reconcile with the incumbent's newer lineage via AppendEntries when its
+log is purged below the leader's back-off probe (openraft raises a defensive
+`LogIndexNotFound` instead of falling back to InstallSnapshot). A correct Option 3
+therefore needs a vendored-openraft replication change (graceful purge-hole →
+snapshot fallback) plus a way to host the on-disk prefix as a non-voting receiver
+— PR #108-class work that must be soak-iterated, not landed under local-only
+gates.
