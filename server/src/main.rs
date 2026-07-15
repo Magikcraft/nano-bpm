@@ -8230,11 +8230,11 @@ impl ServerImpl {
     }
 
     /// Requester side: the incumbent acknowledged (or declined) our hand-off
-    /// request. On accept we rebuild our member for `partition` as a fresh receiver
-    /// so the incumbent can replicate to us as a learner (our own competing group
-    /// would otherwise reject its log, and the catch-up would never converge). On a
-    /// decline (`accepted = false`) we clear the pending marker so the recovery
-    /// tick's legacy self-promote can proceed.
+    /// request. On accept we make sure our member for `partition` is a plain
+    /// receiver so the incumbent can replicate to us as a learner (our own
+    /// competing group would otherwise reject its log). On a decline
+    /// (`accepted = false`) we clear the pending marker so the recovery tick's
+    /// legacy self-promote can proceed.
     pub(crate) async fn handle_handoff_ack(
         &self,
         partition: u64,
@@ -8246,17 +8246,32 @@ impl ServerImpl {
             self.handoff_pending.lock().unwrap().remove(&partition);
             return;
         }
-        // We must not already lead: become a clean receiver of the incumbent so its
-        // add_learner + catch-up can converge to zero lag before it transfers the
-        // vote to us. Idempotent enough — a repeated ack rebuilds again harmlessly.
-        let incumbent = self
-            .promotion_epoch
-            .lock()
-            .unwrap()
-            .get(&partition)
-            .map(|(_, leader)| *leader)
-            .unwrap_or(u64::MAX);
-        self.rebuild_as_receiver(partition, incumbent).await;
+        // Rebuild as a receiver ONLY when we don't already have a receiver in
+        // place: either we hold no member for the partition, or we still lead a
+        // competing group (which would reject the incumbent's log). If we are
+        // already hosting the partition as a non-leader (a learner/follower —
+        // e.g. from the fresh-receiver rejoin path, ADR 0019 part 1, or a prior
+        // ack), we MUST NOT rebuild: `rebuild_as_receiver` shuts the member down
+        // and re-bootstraps it with an empty log store, discarding everything the
+        // incumbent has already replicated. Under sustained load the incumbent's
+        // log outgrows what a from-scratch learner can drain inside a single
+        // catch-up window, so wiping on every retry makes the catch-up livelock
+        // forever. Keeping the receiver lets replication accumulate across
+        // attempts until the learner converges and the vote transfers.
+        let need_rebuild = match self.raft.get(partition) {
+            None => true,
+            Some(_) => self.i_lead_raft(partition),
+        };
+        if need_rebuild {
+            let incumbent = self
+                .promotion_epoch
+                .lock()
+                .unwrap()
+                .get(&partition)
+                .map(|(_, leader)| *leader)
+                .unwrap_or(u64::MAX);
+            self.rebuild_as_receiver(partition, incumbent).await;
+        }
     }
 
     /// Requester side: the incumbent completed the hand-off — we are now the sole
