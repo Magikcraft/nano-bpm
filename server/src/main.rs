@@ -1574,6 +1574,12 @@ fn spawn_adaptive_pruner(store: Arc<ReadStore>, high_bytes: u64) {
                     Ok(_) => {}
                     Err(e) => tracing::warn!("adaptive retention prune failed: {e}"),
                 }
+                // Size-gated WAL checkpoint on the pruner thread, every wake and
+                // independent of whether we pruned: concentrates all checkpoint
+                // copy-back into infrequent coalesced passes (off the exporter's
+                // hot path) instead of a per-delete-sweep TRUNCATE storm, and keeps
+                // the WAL bounded even while the store sits under budget.
+                store.maybe_checkpoint_wal(&conn);
             }
         })
         .expect("spawn read-model pruner thread");
