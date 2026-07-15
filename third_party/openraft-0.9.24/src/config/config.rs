@@ -180,6 +180,17 @@ pub struct Config {
     #[clap(long, default_value = "1000")]
     pub max_in_snapshot_log_to_keep: u64,
 
+    /// Extra already-in-snapshot logs to retain while a replication target lags.
+    ///
+    /// When a follower/learner is behind the snapshot point, retain up to this many
+    /// additional already-snapshotted entries (below the `max_in_snapshot_log_to_keep`
+    /// purge point) so the lagging target can catch up by streaming the retained log
+    /// tail instead of installing a full snapshot. Bounded, so a stuck or dead target
+    /// cannot pin the log without bound. `0` (default) disables it, preserving the
+    /// stock `max_in_snapshot_log_to_keep` purge behavior.
+    #[clap(long, default_value = "0")]
+    pub max_extra_log_to_keep_for_lagging: u64,
+
     /// The minimal number of applied logs to purge in a batch.
     #[clap(long, default_value = "1")]
     pub purge_batch_size: u64,

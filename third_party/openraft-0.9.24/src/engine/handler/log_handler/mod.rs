@@ -54,8 +54,8 @@ where C: RaftTypeConfig
     /// This method is called after building a snapshot, because openraft only purge logs that are
     /// already included in snapshot.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub(crate) fn schedule_policy_based_purge(&mut self) {
-        if let Some(purge_upto) = self.calc_purge_upto() {
+    pub(crate) fn schedule_policy_based_purge(&mut self, retain_from_index: Option<u64>) {
+        if let Some(purge_upto) = self.calc_purge_upto(retain_from_index) {
             self.update_purge_upto(purge_upto);
         }
     }
@@ -74,13 +74,27 @@ where C: RaftTypeConfig
     ///
     /// `max_keep` specifies the number of applied logs to keep.
     /// `max_keep==0` means every applied log can be purged.
+    ///
+    /// `retain_from_index`, when `Some`, is the first log index that must NOT be
+    /// purged (a lagging replication target still needs it); the purge point is
+    /// clamped below it. The caller is responsible for bounding it (see
+    /// [`crate::Config::max_extra_log_to_keep_for_lagging`]) so a stuck target cannot
+    /// pin the log without bound.
     #[tracing::instrument(level = "debug", skip_all)]
-    pub(crate) fn calc_purge_upto(&self) -> Option<LogId<C::NodeId>> {
+    pub(crate) fn calc_purge_upto(&self, retain_from_index: Option<u64>) -> Option<LogId<C::NodeId>> {
         let st = &self.state;
         let max_keep = self.config.max_in_snapshot_log_to_keep;
         let batch_size = self.config.purge_batch_size;
 
-        let purge_end = self.state.snapshot_meta.last_log_id.next_index().saturating_sub(max_keep);
+        let mut purge_end = self.state.snapshot_meta.last_log_id.next_index().saturating_sub(max_keep);
+
+        // Retain logs a lagging replication target still needs so it can stream the
+        // tail instead of installing a snapshot. Never purge at/above the retain
+        // floor; the caller bounds how far below the policy point this can reach, so
+        // a stuck target cannot pin the log without bound.
+        if let Some(retain_from) = retain_from_index {
+            purge_end = purge_end.min(retain_from);
+        }
 
         tracing::debug!(
             snapshot_last_log_id = debug(self.state.snapshot_meta.last_log_id.clone()),

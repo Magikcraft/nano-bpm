@@ -19,6 +19,11 @@ pub(crate) struct EngineConfig<NID: NodeId> {
     /// The maximum number of applied logs to keep before purging.
     pub(crate) max_in_snapshot_log_to_keep: u64,
 
+    /// Extra already-snapshotted entries to retain while a replication target lags,
+    /// so it can catch up by streaming the retained tail instead of a snapshot install.
+    /// `0` disables it. Bounded so a stuck target cannot pin the log without bound.
+    pub(crate) max_extra_log_to_keep_for_lagging: u64,
+
     /// The minimal number of applied logs to purge in a batch.
     pub(crate) purge_batch_size: u64,
 
@@ -34,6 +39,7 @@ impl<NID: NodeId> Default for EngineConfig<NID> {
             id: NID::default(),
             snapshot_policy: SnapshotPolicy::LogsSinceLast(5000),
             max_in_snapshot_log_to_keep: 1000,
+            max_extra_log_to_keep_for_lagging: 0,
             purge_batch_size: 256,
             max_payload_entries: 300,
             timer_config: time_state::Config::default(),
@@ -48,6 +54,7 @@ impl<NID: NodeId> EngineConfig<NID> {
             id,
             snapshot_policy: config.snapshot_policy.clone(),
             max_in_snapshot_log_to_keep: config.max_in_snapshot_log_to_keep,
+            max_extra_log_to_keep_for_lagging: config.max_extra_log_to_keep_for_lagging,
             purge_batch_size: config.purge_batch_size,
             max_payload_entries: config.max_payload_entries,
             timer_config: time_state::Config {

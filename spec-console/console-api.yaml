@@ -843,14 +843,16 @@ components:
         is_self: { type: boolean }
     PartitionInfo:
       type: object
-      required: [partition_id, replicas, leader, raft_term]
+      required: [partition_id, replicas, owner, leader, raft_term, recovering]
       properties:
         partition_id: { type: integer, format: int64 }
         replicas:
           type: array
           items: { type: integer, format: int64 }
+        owner: { type: integer, format: int64 }
         leader: { type: integer, format: int64, nullable: true }
         raft_term: { type: integer, format: int64, nullable: true }
+        recovering: { type: boolean }
     Topology:
       type: object
       required: [node_id, num_nodes, num_partitions, replication_factor, raft_enabled, gateway_version, nodes, partitions]
@@ -1070,6 +1072,7 @@ components:
         - admissionBacklogLimit
         - admissionCreateQueueLimit
         - admissionShedTotal
+        - recovery
       properties:
         timestampMs: { type: integer, format: int64 }
         activeInstances: { type: integer, format: int64 }
@@ -1098,6 +1101,22 @@ components:
         admissionBacklogLimit: { type: integer, format: int64 }
         admissionCreateQueueLimit: { type: integer, format: int64 }
         admissionShedTotal: { type: integer, format: int64 }
+        recovery: { $ref: '#/components/schemas/Recovery' }
+    Recovery:
+      type: object
+      description: >-
+        Per-node Raft recovery/leadership state so the cluster view can show
+        "up but catching up" while a restarted owner reclaims its partitions
+        (and the failover incumbent hands leadership back).
+      required: [recovering, owned, reclaimed, catchingUp, handingOff, detail]
+      properties:
+        recovering: { type: boolean }
+        owned: { type: integer, format: int64 }
+        reclaimed: { type: integer, format: int64 }
+        catchingUp: { type: integer, format: int64 }
+        handingOff: { type: integer, format: int64 }
+        handoffLagEntries: { type: integer, format: int64, nullable: true }
+        detail: { type: string }
     NodeMetrics:
       type: object
       required: [nodeId, address, isSelf, reachable, error, metrics]

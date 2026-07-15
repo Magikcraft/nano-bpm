@@ -325,6 +325,80 @@ impl PeerLink {
             .await
     }
 
+    /// Fire-and-forget a promotion-epoch solicitation to this peer (leader-durable
+    /// reclaim): ask it to re-announce the promotion epochs it currently leads so
+    /// this node can reclaim its owned partitions at incumbent+1. See
+    /// [`ClientFrame::SolicitPromotions`].
+    pub async fn send_solicit_promotions(&self, from_node: u64) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::SolicitPromotions { from_node })
+            .await
+    }
+
+    /// Fire-and-forget a leadership-hand-off request to this peer (the incumbent
+    /// leader), asking it to hand `partition` back to `requester_node` via an
+    /// openraft membership change. See [`ClientFrame::RequestHandoff`].
+    pub async fn send_request_handoff(
+        &self,
+        partition: u64,
+        requester_node: u64,
+        requester_addr: String,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::RequestHandoff {
+            partition,
+            requester_node,
+            requester_addr,
+        })
+        .await
+    }
+
+    /// Fire-and-forget a hand-off acknowledgement to the requesting owner (accept
+    /// + our epoch, or decline). See [`ClientFrame::HandoffAck`].
+    pub async fn send_handoff_ack(
+        &self,
+        partition: u64,
+        incumbent_epoch: u64,
+        accepted: bool,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::HandoffAck {
+            partition,
+            incumbent_epoch,
+            accepted,
+        })
+        .await
+    }
+
+    /// Fire-and-forget a hand-off completion to the requesting owner (it now leads
+    /// `partition` at `epoch`). See [`ClientFrame::HandoffComplete`].
+    pub async fn send_handoff_complete(
+        &self,
+        partition: u64,
+        epoch: u64,
+        new_leader: u64,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::HandoffComplete {
+            partition,
+            epoch,
+            new_leader,
+        })
+        .await
+    }
+
+    /// Fire-and-forget a hand-off failure to the requesting owner. See
+    /// [`ClientFrame::HandoffFailed`].
+    pub async fn send_handoff_failed(
+        &self,
+        partition: u64,
+        joint_suspected: bool,
+        reason: String,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::HandoffFailed {
+            partition,
+            joint_suspected,
+            reason,
+        })
+        .await
+    }
+
     /// Forwards a `createProcessInstance` to this peer (it creates on one of its
     /// own partitions). `await_completion` is intentionally unsupported here —
     /// it resolves over an async `InstanceCompleted` frame, wired in a later
@@ -722,6 +796,13 @@ impl PeerSet {
     pub async fn fail_node(&self, node_id: u32) {
         self.unreachable.lock().await.insert(node_id);
         self.links.lock().await.remove(&node_id);
+    }
+
+    /// Fault injection (tests only): clear a prior `fail_node`, restoring
+    /// reachability so the peer can be dialed again (models a node rejoining
+    /// after an outage). Production code never calls this.
+    pub async fn heal_node(&self, node_id: u32) {
+        self.unreachable.lock().await.remove(&node_id);
     }
 
     /// Returns a live link to peer `node_id`, dialing it if there is no cached

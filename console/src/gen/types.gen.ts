@@ -13,8 +13,10 @@ export type NodeInfo = {
 export type PartitionInfo = {
     partition_id: number;
     replicas: Array<number>;
+    owner: number;
     leader: number | null;
     raft_term: number | null;
+    recovering: boolean;
 };
 
 export type Topology = {
@@ -185,6 +187,20 @@ export type MetricsSnapshot = {
     admissionBacklogLimit: number;
     admissionCreateQueueLimit: number;
     admissionShedTotal: number;
+    recovery: Recovery;
+};
+
+/**
+ * Per-node Raft recovery/leadership state so the cluster view can show "up but catching up" while a restarted owner reclaims its partitions (and the failover incumbent hands leadership back).
+ */
+export type Recovery = {
+    recovering: boolean;
+    owned: number;
+    reclaimed: number;
+    catchingUp: number;
+    handingOff: number;
+    handoffLagEntries?: number | null;
+    detail: string;
 };
 
 export type NodeMetrics = {

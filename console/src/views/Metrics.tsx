@@ -143,6 +143,14 @@ export default function Metrics() {
                 <SectionLabel>Cluster</SectionLabel>
                 <span className="text-xs text-fg-faint">
                   {cluster.aggregate.reachableNodes}/{cluster.aggregate.totalNodes} nodes up
+                  {(() => {
+                    const recovering = cluster.nodes.filter(
+                      (n) => n.metrics?.recovery?.recovering,
+                    ).length;
+                    return recovering > 0 ? (
+                      <span className="text-warn"> · {recovering} catching up</span>
+                    ) : null;
+                  })()}
                 </span>
               </div>
               <div className="mb-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
@@ -198,7 +206,29 @@ export default function Metrics() {
                         </td>
                         <td className="px-3 py-2">
                           {n.reachable ? (
-                            <span className="text-ok">● up</span>
+                            n.metrics?.recovery?.recovering ? (
+                              <span
+                                className="text-warn"
+                                title={
+                                  n.metrics.recovery.detail ||
+                                  "catching up after restart"
+                                }
+                              >
+                                ● up · catching up
+                              </span>
+                            ) : (n.metrics?.recovery?.handingOff ?? 0) > 0 ? (
+                              <span
+                                className="text-info"
+                                title={
+                                  n.metrics?.recovery?.detail ||
+                                  "handing leadership back to a recovering owner"
+                                }
+                              >
+                                ● up · handing back
+                              </span>
+                            ) : (
+                              <span className="text-ok">● up</span>
+                            )
                           ) : (
                             <span className="text-danger" title={n.error ?? ""}>
                               ● {n.error ?? "down"}

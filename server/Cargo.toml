@@ -148,3 +148,17 @@ strip = false
 # (only src/core/raft_core.rs differs from the crates.io release).
 [patch.crates-io]
 openraft = { path = "../third_party/openraft-0.9.24" }
+
+[lints.rust]
+# Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
+# warning (unused code, deprecations, future-incompat lints, etc.).
+warnings = "deny"
+# The one documented exception: on macOS Apple `ld` emits a benign
+# `linker_messages` warning because the gateway bin's `__eh_frame` unwind section
+# (release keeps `panic = "unwind"`) is too large to encode into the Mach-O
+# compact-unwind table, so `ld` falls back to the full DWARF `__eh_frame` (valid,
+# just not compacted). The only real fix — dropping unwind tables — would break
+# `panic = "unwind"` (the test harness needs it; `-Wl,-no_compact_unwind` breaks
+# macOS unwinding outright). It's a platform-local artifact the deployed
+# x86_64-linux binary never emits, so we allow just this lint.
+linker_messages = "allow"

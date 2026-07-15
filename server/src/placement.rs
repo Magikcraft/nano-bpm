@@ -96,9 +96,10 @@ pub const SHED_LOAD: i64 = i64::MAX / 2;
 
 /// Numerator for the inverse-load weight. A node with load 0 gets this weight; a
 /// node with load `l` gets `WEIGHT_SCALE / (l + 1)`, so weight decreases with
-/// load and differentiates strongly across an order-of-magnitude backlog gap
+/// load and differentiates strongly across an order-of-magnitude load gap
 /// (e.g. load 100 → ~9901, load 4000 → ~250, a ~40× steer) while never dividing
-/// by zero.
+/// by zero. The load index is a create-acceptance-headroom occupancy
+/// ([`crate::ServerImpl::create_occupancy_index`]), not a resident backlog count.
 const WEIGHT_SCALE: u128 = 1_000_000;
 
 /// Inverse-load placement weight for an owner with composite load index `load`.

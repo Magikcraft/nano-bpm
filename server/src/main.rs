@@ -364,6 +364,46 @@ pub struct ServerImpl {
     /// a single leader. Empty (epoch 0 implied) unless leader-durable recovery has
     /// fired. Soft state, never journaled.
     promotion_epoch: Arc<std::sync::Mutex<std::collections::HashMap<u64, (u64, u64)>>>,
+    /// Opt-in (`NANOBPMN_RECLAIM_HANDOFF=1`): on rejoin, reclaim a statically-owned
+    /// partition led by a reachable failover incumbent by REQUESTING an openraft
+    /// leadership hand-off (the incumbent adds us as a learner, catches us up, then
+    /// `change_membership`s leadership to us and steps down) instead of forming a
+    /// competing fresh single-voter group. One raft lineage throughout, so there is
+    /// no two-group election war (the term storm) under sustained load. Off by
+    /// default -> byte-identical to the legacy self-promote reclaim.
+    reclaim_via_handoff: bool,
+    /// Incumbent side of an in-flight leadership hand-off: the partitions for which
+    /// THIS node (the failover leader) is currently executing a hand-off to a
+    /// returning owner, each mapped to its completion-pause deadline (ADR 0019).
+    /// Presence is both the per-partition hand-off LEASE (a second concurrent
+    /// request is declined) and the create WRITE-GATE (new creates are steered off
+    /// this partition while the learner catches up). Until the mapped deadline,
+    /// job-mutation writes (completions/fails/errors) to the partition are also
+    /// paused (retryable) so the raft log fully quiesces and the catch-up can reach
+    /// zero lag; the deadline bounds that pause (`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`).
+    /// Empty otherwise — zero overhead on the hot path.
+    handoff_gated: Arc<std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>>,
+    /// Bounded ceiling (milliseconds) on the per-partition completion write-pause
+    /// during a leadership hand-off catch-up (`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`,
+    /// default 2000; `0` disables the completion pause, leaving only the
+    /// create-steer = Zeebe-style best-effort). Paused completions are retryable
+    /// (at-least-once), so no work is lost — the log just stops growing long enough
+    /// to converge. Atomic only so tests can set a short deterministic window; it is
+    /// read once per hand-off (cold path).
+    handoff_write_pause_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Absolute ceiling (milliseconds) on the hand-off catch-up loop
+    /// (`NANOBPMN_HANDOFF_CATCHUP_MS`, default 30000 — see
+    /// [`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`]). Also the floor the completion
+    /// write-pause is clamped up to in [`ServerImpl::acquire_handoff_lease`], so
+    /// the head stays frozen for the whole catch-up. Atomic only so tests can set
+    /// a short deterministic window; read on the cold hand-off path.
+    handoff_catchup_ceiling_ms: Arc<std::sync::atomic::AtomicU64>,
+    /// Requester side of an in-flight leadership hand-off: partitions for which this
+    /// (rejoining owner) node has asked the incumbent to hand leadership back,
+    /// keyed by partition. Suppresses the legacy self-promote while the hand-off is
+    /// in flight so the two paths can't race into competing groups. See
+    /// [`HandoffPending`].
+    handoff_pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, HandoffPending>>>,
     /// Cluster create-placement mode (`NANOBPMN_CREATE_PLACEMENT`, ADR 0014).
     /// [`PlacementMode::Off`] (default) keeps blind round-robin placement with
     /// forwarded creates ungated — byte-identical to the historical path.
@@ -376,10 +416,15 @@ pub struct ServerImpl {
     /// Latest composite create-load index gossiped by each peer node, keyed by
     /// node id (see [`placement`](crate::placement)). Populated only in
     /// [`PlacementMode::Balanced`] by the pressure-gossip tick; weighted placement
-    /// reads it to steer creates toward nodes with headroom. A missing entry is
-    /// treated as full headroom (an unprobed peer still receives traffic). Empty
-    /// otherwise — zero overhead.
-    peer_pressure: Arc<std::sync::Mutex<std::collections::HashMap<u32, i64>>>,
+    /// reads it to steer creates toward nodes with headroom. A missing *or stale*
+    /// entry is treated as full headroom (an unprobed peer still receives
+    /// traffic). Each entry is stamped with its arrival [`Instant`] so a peer that
+    /// stops gossiping — dead, restarting, or its gossip link starved under load —
+    /// expires after [`peer_pressure_ttl`] instead of pinning weighted placement to
+    /// its last pre-silence value forever (the rejoin zero-creates trap: a node
+    /// that shed just before death would otherwise be steered away from
+    /// indefinitely). Empty otherwise — zero overhead.
+    peer_pressure: Arc<std::sync::Mutex<std::collections::HashMap<u32, (i64, std::time::Instant)>>>,
     /// Persistent smoothing state for the smooth weighted round-robin (SWRR) that
     /// drives load-aware create placement ([`PlacementMode::Balanced`]). One slot
     /// per partition; carried across placement decisions so equal weights yield an
@@ -806,6 +851,19 @@ impl ServerImpl {
             lease_digests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             replication_mode,
             promotion_epoch: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            reclaim_via_handoff: std::env::var("NANOBPMN_RECLAIM_HANDOFF")
+                .ok()
+                .as_deref()
+                .map(|v| matches!(v.trim(), "1" | "true" | "on" | "yes"))
+                .unwrap_or(false),
+            handoff_gated: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            handoff_write_pause_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                handoff_write_pause_from_env().as_millis() as u64,
+            )),
+            handoff_catchup_ceiling_ms: Arc::new(std::sync::atomic::AtomicU64::new(
+                handoff_catchup_ceiling_from_env().as_millis() as u64,
+            )),
+            handoff_pending: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_mode,
             peer_pressure: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             placement_swrr: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1721,6 +1779,221 @@ fn leader_durable_recovery_grace_ticks() -> u32 {
         .max(1)
 }
 
+/// Recovery-tick passes to hold a partition down after a self-promote before it is
+/// eligible to promote again. Damps the reclaim epoch-climb: once this node
+/// promotes partition `p` at epoch E, a lagging metrics view (the fresh group's
+/// self-election not yet reflected, or the failover leader not yet stepped down)
+/// must not trigger an immediate re-promote at E+1 — the tight climb loop that,
+/// under sustained writes, spun the raft term up and produced the `leader_reject`
+/// storm. A promote that genuinely took clears the hold-down early (leadership
+/// reads as ours); one that is still contested simply re-solicits and retries
+/// after the window, capping reclaim to ~one round per hold-down instead of a
+/// per-tick climb.
+const LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS: u32 = 2;
+
+/// Requester-side state for an in-flight leadership hand-off (see
+/// [`ServerImpl::handoff_pending`]). Tracks how long to keep suppressing the
+/// legacy self-promote while waiting for the incumbent to complete the openraft
+/// membership change, and whether the incumbent reported a *joint-config
+/// suspected* failure — in which case the owner must NOT fall back to forming a
+/// fresh competing group (that could diverge a partially-migrated lineage) and
+/// instead keeps waiting for the incumbent to finish or recover.
+#[derive(Default, Clone, Copy)]
+struct HandoffPending {
+    /// Recovery-tick passes remaining before giving up and falling back to the
+    /// legacy self-promote (only when NOT joint-suspected).
+    deadline_ticks: u32,
+    /// The incumbent reported it may have committed the joint config but not the
+    /// final uniform one; never self-promote over this — wait it out.
+    joint_suspected: bool,
+}
+
+/// Recovery-tick passes a returning owner waits for an in-flight hand-off before
+/// re-sending (it never self-promotes while a reachable incumbent leads the
+/// partition — see [`ServerImpl::request_handoff_or_wait`]). At ~500 ms/pass this
+/// is ~45 s, kept safely longer than the incumbent's catch-up absolute ceiling
+/// ([`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`]) plus the membership change, so a
+/// progressing hand-off is never pre-empted or needlessly resent mid-catch-up.
+const HANDOFF_PENDING_TICKS: u32 = 90;
+
+/// Absolute ceiling on how long the incumbent polls a hand-off learner toward
+/// zero replication lag before aborting. This is a *safety cap*, not the normal
+/// exit: the catch-up loop ([`ServerImpl::perform_handoff`], via
+/// [`evaluate_catchup`]) succeeds the instant the learner reaches
+/// [`HANDOFF_LAG_THRESHOLD`] and aborts EARLY the instant a post-install learner
+/// stops advancing for [`HANDOFF_CATCHUP_STALL_DEFAULT_MS`] — so a dead learner
+/// never holds the write-pause for the full ceiling, and a *progressing* one is
+/// never guillotined mid-stream by a blind fixed cutoff (the old 10 s bug: a
+/// from-empty snapshot install under load can't land in 10 s, so every attempt
+/// aborted and re-added the learner, re-triggering the install forever).
+///
+/// Sized to cover ONE full state-machine snapshot install under sustained load
+/// (the returning owner boots empty, so catch-up streams the incumbent's whole
+/// resident state, chunked at the snapshot transport rate — see ADR 0019). The
+/// completion write-pause freezes the log head for the whole of this window (see
+/// [`HANDOFF_WRITE_PAUSE_DEFAULT_MS`], clamped `>=` this ceiling in
+/// [`ServerImpl::acquire_handoff_lease`]) so the snapshot point stops moving and
+/// the install can finish and the tail drain to within the threshold.
+/// Overridable via `NANOBPMN_HANDOFF_CATCHUP_MS`.
+const HANDOFF_CATCHUP_CEILING_DEFAULT_MS: u64 = 30000;
+
+/// How long a hand-off learner that has *started* matching (a snapshot install
+/// landed, tail streaming) may go WITHOUT advancing its matched index before the
+/// catch-up aborts early. Distinguishes a genuinely stuck learner (abort, free
+/// the write-pause) from one still installing a snapshot (matched not yet
+/// reported — bounded only by [`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`]) or steadily
+/// draining a tail (advancing — keep going). Overridable via
+/// `NANOBPMN_HANDOFF_STALL_MS`.
+const HANDOFF_CATCHUP_STALL_DEFAULT_MS: u64 = 8000;
+
+/// Resolve the hand-off catch-up absolute ceiling from `NANOBPMN_HANDOFF_CATCHUP_MS`.
+fn handoff_catchup_ceiling_from_env() -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_HANDOFF_CATCHUP_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(HANDOFF_CATCHUP_CEILING_DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Resolve the hand-off catch-up post-install stall grace from
+/// `NANOBPMN_HANDOFF_STALL_MS`.
+fn handoff_catchup_stall_from_env() -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_HANDOFF_STALL_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(HANDOFF_CATCHUP_STALL_DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// One decision of the hand-off catch-up loop, computed by the pure
+/// [`evaluate_catchup`] from the learner's current replication signals.
+#[derive(Debug, PartialEq, Eq)]
+enum CatchupStep {
+    /// Learner is within threshold — promote it to voter.
+    Done,
+    /// Keep polling; the learner is installing/streaming and making progress.
+    Continue,
+    /// Give up this attempt with a reason (learner stalled or ceiling hit).
+    Abort(&'static str),
+}
+
+/// Pure catch-up decision for [`ServerImpl::perform_handoff`] — kept side-effect
+/// free (all clock/metric reads happen in the caller) so the adaptive
+/// deadline/stall logic is deterministically unit-testable.
+///
+/// - `lag`: current replication lag in entries (`None` = no record / a snapshot
+///   install still in flight); at/under `threshold` ⇒ [`CatchupStep::Done`].
+/// - `matched`: the learner's matched index (`None` until an install lands). Each
+///   time it advances past `best_matched`, `last_advance` is reset to `now` — so
+///   a steadily-draining tail keeps the attempt alive even under a moving head.
+/// - Aborts EARLY (`"learner stalled"`) only once matching has begun
+///   (`best_matched.is_some()`) and then goes quiet for `stall_grace`, so a
+///   long-but-progressing snapshot install (matched still `None`) is never
+///   killed prematurely — it is bounded only by the absolute `deadline`.
+#[allow(clippy::too_many_arguments)]
+fn evaluate_catchup(
+    lag: Option<u64>,
+    matched: Option<u64>,
+    best_matched: &mut Option<u64>,
+    last_advance: &mut std::time::Instant,
+    now: std::time::Instant,
+    deadline: std::time::Instant,
+    threshold: u64,
+    stall_grace: std::time::Duration,
+) -> CatchupStep {
+    if let Some(l) = lag
+        && l <= threshold
+    {
+        return CatchupStep::Done;
+    }
+    if let Some(m) = matched
+        && best_matched.map(|b| m > b).unwrap_or(true)
+    {
+        *best_matched = Some(m);
+        *last_advance = now;
+    }
+    if now >= deadline {
+        return CatchupStep::Abort("learner catch-up ceiling exceeded");
+    }
+    if best_matched.is_some() && now.duration_since(*last_advance) >= stall_grace {
+        return CatchupStep::Abort("learner catch-up stalled");
+    }
+    CatchupStep::Continue
+}
+
+/// Poll interval for the incumbent's learner-lag catch-up loop.
+const HANDOFF_LAG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Replication lag (in log entries) at or below which a hand-off learner is
+/// considered caught up enough to promote to voter. Small non-zero slack so a
+/// steady trickle of writes doesn't make the loop chase a perpetually-moving
+/// last-log index. During the completion write-pause (ADR 0019) the log head
+/// freezes, so the learner converges well inside this slack.
+const HANDOFF_LAG_THRESHOLD: u64 = 64;
+
+/// Phase E (boot-as-receiver) probe window: on (re)boot a node solicits its
+/// co-replicas for owned partitions a peer currently leads (a live failover
+/// incumbent) before forming its own groups. Bounded so a cold start — where no
+/// peer answers because none has promoted — proceeds to normal `initialize` after
+/// at most this delay. A rejoin discovers the incumbent well within it (a solicit
+/// reply is one partition-network RTT).
+const HANDOFF_PROBE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Poll/re-solicit interval for the Phase E boot incumbent probe.
+const HANDOFF_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Default bounded ceiling on the per-partition completion write-pause during a
+/// leadership hand-off catch-up (ADR 0019). Overridable via
+/// `NANOBPMN_HANDOFF_WRITE_PAUSE_MS`; `0` disables the completion pause (leaving
+/// only the create-steer = Zeebe-style best-effort reclaim).
+///
+/// Set at/above the [`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`] so completions stay
+/// paused for the ENTIRE catch-up attempt: the log head must stay frozen through
+/// the whole snapshot install, or the leader's snapshot point keeps advancing and
+/// the learner re-snapshots forever (a catch-up livelock). The lease is released
+/// the instant the hand-off completes or aborts, so the real stall is only as
+/// long as the catch-up actually takes — this is just the safety ceiling.
+/// [`ServerImpl::acquire_handoff_lease`] additionally clamps the effective pause
+/// up to the catch-up ceiling so the two can never drift out of order.
+const HANDOFF_WRITE_PAUSE_DEFAULT_MS: u64 = 32000;
+
+/// Resolve the leadership hand-off completion write-pause ceiling from
+/// `NANOBPMN_HANDOFF_WRITE_PAUSE_MS` (default [`HANDOFF_WRITE_PAUSE_DEFAULT_MS`],
+/// on by default). A non-numeric value falls back to the default; `0` disables it.
+fn handoff_write_pause_from_env() -> std::time::Duration {
+    parse_handoff_write_pause(
+        std::env::var("NANOBPMN_HANDOFF_WRITE_PAUSE_MS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure parser for [`handoff_write_pause_from_env`]: `None`/blank/non-numeric →
+/// the default; a numeric value (incl. `0`, which disables the pause) → that many
+/// milliseconds.
+fn parse_handoff_write_pause(v: Option<&str>) -> std::time::Duration {
+    let ms = v
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(HANDOFF_WRITE_PAUSE_DEFAULT_MS);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Cross-pass state for the leader-durable recovery supervisor
+/// ([`ServerImpl::leader_durable_recovery_tick`]). One instance lives for the
+/// whole supervisor loop (or a test's drive sequence).
+#[derive(Default)]
+struct RecoveryState {
+    /// Per-partition consecutive-leaderless counter (reset by a live leader).
+    misses: std::collections::HashMap<u64, u32>,
+    /// Partitions observed with a real (formed) leader at least once — only an
+    /// established partition is a genuine failover candidate (cold-start guard).
+    established: std::collections::HashSet<u64>,
+    /// Per-partition post-promote hold-down countdown (Option C damping).
+    holddown: std::collections::HashMap<u64, u32>,
+}
+
 /// The latest lease digest received from a partition's leader: the leases it held
 /// `(job_key, deadline)`. Held in the soft lease table and consumed by a
 /// newly-promoted leader to recover in-flight leases.
@@ -1889,6 +2162,13 @@ fn worker_concurrency_from_env() -> WorkerConcurrency {
 /// more resting state; deliberately conservative so the derived count is a
 /// generous safety backstop rather than a tight throughput clip.
 const NOMINAL_ACTIVE_BYTES: u64 = 16 * 1024;
+/// Full-scale value of the graded create-acceptance headroom index
+/// ([`ServerImpl::create_occupancy_index`]). Chosen to sit in the numeric band
+/// [`crate::placement::placement_weight`] is tuned for (`WEIGHT_SCALE/(load+1)`):
+/// `0` (idle) → weight `1e6`; `~CREATE_OCCUPANCY_SCALE` (near-saturation) → a few
+/// hundred — a strong-but-smooth steer toward headroom, while genuine saturation
+/// is caught by the hard `SHED_LOAD` shed (weight 0) rather than this graded band.
+const CREATE_OCCUPANCY_SCALE: i64 = 4096;
 /// Never auto-derive a backlog cap below this — a lower floor would shed against a
 /// legitimately large parked population (timers/messages) or a modest burst on a
 /// small host. Well above the create-queue floor because parked instances are a
@@ -4444,10 +4724,9 @@ impl ServerImpl {
 
     /// Shared by-key routing that follows the partition's CURRENT Raft leader
     /// when this node hosts the group, falling back to the static owner map
-    /// otherwise. `None` = handle locally (this node is the leader, or there is
-    /// no leader yet — a transient window), `Some(node)` = forward to peer
-    /// `node`. With Raft off this is exactly `remote_owner_of`, so the non-Raft
-    /// path is byte-identical.
+    /// otherwise. `None` = handle locally, `Some(node)` = forward to peer `node`.
+    /// With Raft off this is exactly `remote_owner_of`, so the non-Raft path is
+    /// byte-identical.
     fn route_by_leader(&self, key: u64) -> Option<u32> {
         if !self.raft.is_empty() {
             let p = partition_of(key);
@@ -4455,8 +4734,16 @@ impl ServerImpl {
                 let node_id = self.engine.topology().node_id as u64;
                 return match part.raft.metrics().borrow().current_leader {
                     Some(l) if l == node_id => None,
-                    None => None,
                     Some(l) => Some(l as u32),
+                    // Leader momentarily unknown (an election in flight during a
+                    // failover). "Handle locally" (`None`) is only safe when THIS
+                    // node actually hosts the partition's engine; for a partition it
+                    // does not own, `None` would drive a by-key op onto the wrong
+                    // engine (`local_for` panics under debug_assert, or silently
+                    // targets partition 0 in release). Fall back to the static-owner
+                    // forward so the op leaves this node instead of mis-applying;
+                    // the caller/client retries until the new leader is known.
+                    None => self.remote_owner_of(key),
                 };
             }
         }
@@ -7137,6 +7424,12 @@ impl ServerImpl {
     /// for every partition this node replicates, then forms the groups it leads.
     async fn raft_bootstrap(&self) {
         let server = self;
+        // Reclaim orphaned snapshot staging dirs from dead nano processes before
+        // hosting any partition, so a receiver/failover member's temp snapshots
+        // (and any multi-GB aborted-install partials) from prior boots don't
+        // accumulate on disk. Off the hot path; runs on a blocking thread so a
+        // large `remove_dir_all` never stalls the runtime.
+        tokio::task::spawn_blocking(crate::raft::sweep_orphaned_snapshot_dirs);
         {
             let topology = server.engine.topology().clone();
             let transport = server.raft_transport();
@@ -7150,6 +7443,19 @@ impl ServerImpl {
             // replica engine actor here (seeded with the current deployments) for
             // the state machine to apply the replicated log into.
             for p in topology.replica_partitions() {
+                // Phase E hand-off (NANOBPMN_RECLAIM_HANDOFF): defer hosting a
+                // partition this node OWNS until AFTER the incumbent probe below.
+                // Hosting it now with its restored on-disk log resurrects node's
+                // OLD single-voter lineage, which (a) immediately campaigns against
+                // a live failover incumbent (the "lost leadership during catch-up"
+                // symptom) and (b) cannot be reconciled with the incumbent's newer
+                // lineage by AppendEntries. For an incumbent-led partition we host a
+                // FRESH receiver (empty log) after the probe instead; a partition
+                // with no incumbent resumes its on-disk lineage there. Followers
+                // (non-owned replicas) host now — a learner never campaigns.
+                if server.reclaim_via_handoff && topology.leader_of(p) == topology.node_id {
+                    continue;
+                }
                 // A partition this node OWNS is served + exported locally; its
                 // exporter drives terminal-instance eviction. A partition this
                 // node only REPLICATES (follower under RF>1) has no exporter, so
@@ -7197,6 +7503,76 @@ impl ServerImpl {
             // staggered boot into the simultaneous-boot case, which forms cleanly.
             server.settle_before_forming(&topology).await;
 
+            // Phase E (boot-as-receiver, NANOBPMN_RECLAIM_HANDOFF): before forming
+            // our own groups, probe co-replicas for owned partitions a peer
+            // currently leads (a live failover incumbent from a recent outage). For
+            // those we must NOT `initialize` a competing single-voter group — that
+            // is the two-lineage election war that spins raft terms up under load.
+            // We leave the member uninitialized (a receiver) so the recovery tick
+            // drives an openraft leadership hand-off back to us instead. Owned
+            // partitions with no incumbent (cold start / genuine ownership) are
+            // initialized normally. Empty (no skips) when the flag is off.
+            let handoff_incumbents = if server.reclaim_via_handoff {
+                server.probe_incumbents_for_owned(&topology).await
+            } else {
+                std::collections::HashSet::new()
+            };
+
+            // Phase E: now host each OWNED partition that was deferred past the
+            // probe (skipped in the loop above when the flag is on). An owned
+            // partition a reachable incumbent leads is hosted as a FRESH receiver
+            // (empty in-memory log) so the incumbent's authoritative lineage
+            // replicates cleanly via the hand-off — the divergent on-disk log is
+            // discarded (sound in leader-durable: the sole voter's un-shipped tail
+            // was already accepted bounded loss at failover). An owned partition
+            // with NO incumbent resumes its durable on-disk lineage and is
+            // initialized by the loop below. Skipped entirely when the flag is off
+            // (those partitions were already hosted above).
+            if server.reclaim_via_handoff {
+                for p in topology.replica_partitions() {
+                    if topology.leader_of(p) != topology.node_id {
+                        continue;
+                    }
+                    // `handle_promotion` (adopting the incumbent's epoch during the
+                    // probe) may already have hosted a deferred partition as a fresh
+                    // receiver — don't clobber it.
+                    if server.raft_registry().get(p).is_some() {
+                        continue;
+                    }
+                    let Some(engine) = server.engine.local_for_partition(p).cloned() else {
+                        continue;
+                    };
+                    let deferred = handoff_incumbents.contains(&p);
+                    let log_dir = if deferred { None } else { raft_log_dir_for(p) };
+                    match crate::raft::RaftPartition::bootstrap_member(
+                        topology.node_id as u64,
+                        p,
+                        engine,
+                        transport.clone(),
+                        log_dir,
+                        false, // owned: has an exporter, never evicts in `apply`
+                    )
+                    .await
+                    {
+                        Ok(part) => {
+                            server.raft_registry().insert(Arc::new(part));
+                            tracing::info!(
+                                "raft: node {} hosting owned partition {p} ({})",
+                                topology.node_id,
+                                if deferred {
+                                    "fresh receiver, deferred to leadership hand-off"
+                                } else {
+                                    "resuming on-disk lineage"
+                                },
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!("raft: failed to host owned partition {p}: {e}");
+                        }
+                    }
+                }
+            }
+
             // Form each group this node leads from its replica set. `initialize`
             // is idempotent and does not require peers to be up (they catch up via
             // replication), but we retry to ride out a transient failure.
@@ -7214,6 +7590,16 @@ impl ServerImpl {
                 let Some(part) = server.raft_registry().get(p) else {
                     continue;
                 };
+                // Phase E: a reachable peer leads this owned partition — defer to a
+                // leadership hand-off (recovery tick) instead of forming a competing
+                // group. Leave the member an uninitialized receiver.
+                if handoff_incumbents.contains(&p) {
+                    tracing::info!(
+                        "raft: node {} deferring partition {p} to leadership hand-off (a peer leads it)",
+                        topology.node_id,
+                    );
+                    continue;
+                }
                 let all_replicas = topology.replicas_of(p);
                 // Voter set: every replica in `quorum`, leader-only in
                 // `leader-durable`.
@@ -7271,6 +7657,73 @@ impl ServerImpl {
             // (once per node) to bound the payload-bearing Raft log by bytes and
             // reclaim it at idle — beyond what the entry-count snapshot policy does.
             crate::raft::spawn_compaction_governor(server.raft_registry().clone());
+        }
+    }
+
+    /// Phase E boot incumbent probe (NANOBPMN_RECLAIM_HANDOFF). Before a (re)booting
+    /// node forms its own single-voter groups, it asks each co-replica for the
+    /// promotion epochs that peer currently raft-leads ([`solicit_promotions_from`]).
+    /// A reply naming a peer as leader of a partition WE own is a live failover
+    /// incumbent from our recent outage; adopting it ([`handle_promotion`]) also
+    /// rebuilds our member for that partition as a receiver. Returns the set of
+    /// owned partitions with a live, reachable incumbent — the caller skips
+    /// `initialize` for those so no competing lineage forms (the recovery tick then
+    /// requests an openraft leadership hand-off instead). Bounded by
+    /// [`HANDOFF_PROBE_WINDOW`]: on a cold start no peer answers (none has promoted),
+    /// so the set is empty and every owned group forms normally after the window.
+    async fn probe_incumbents_for_owned(
+        &self,
+        topology: &crate::cluster::Topology,
+    ) -> std::collections::HashSet<u64> {
+        use std::collections::HashSet;
+        let me = topology.node_id as u64;
+        let owned: Vec<u64> = topology
+            .replica_partitions()
+            .into_iter()
+            .filter(|&p| topology.leader_of(p) == topology.node_id)
+            .collect();
+        if owned.is_empty() {
+            return HashSet::new();
+        }
+        // Distinct co-replica peers to solicit for our owned partitions.
+        let mut targets: Vec<u32> = owned
+            .iter()
+            .flat_map(|&p| topology.replicas_of(p))
+            .filter(|&n| n != topology.node_id)
+            .collect();
+        targets.sort_unstable();
+        targets.dedup();
+        if targets.is_empty() {
+            return HashSet::new();
+        }
+        let deadline = std::time::Instant::now() + HANDOFF_PROBE_WINDOW;
+        loop {
+            for &t in &targets {
+                if self.peer_reachable(t).await {
+                    self.solicit_promotions_from(t).await;
+                }
+            }
+            tokio::time::sleep(HANDOFF_PROBE_POLL).await;
+            // Owned partitions whose adopted epoch names a peer (not us).
+            let candidates: Vec<(u64, u32)> = {
+                let map = self.promotion_epoch.lock().unwrap();
+                owned
+                    .iter()
+                    .filter_map(|&p| match map.get(&p) {
+                        Some(&(_, l)) if l != me => Some((p, l as u32)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let mut live = HashSet::new();
+            for (p, l) in candidates {
+                if self.peer_reachable(l).await {
+                    live.insert(p);
+                }
+            }
+            if live.len() == owned.len() || std::time::Instant::now() >= deadline {
+                return live;
+            }
         }
     }
 
@@ -7373,19 +7826,11 @@ impl ServerImpl {
             // A few consecutive leaderless observations before acting, so a brief
             // election/heartbeat flutter never triggers a needless promotion.
             let grace_ticks = leader_durable_recovery_grace_ticks();
-            let mut leaderless: std::collections::HashMap<u64, u32> =
-                std::collections::HashMap::new();
-            // Partitions this node has observed with a real (formed) leader at
-            // least once. Recovery only fails a partition OVER to a successor once
-            // it has been established — a partition that has NEVER had a leader is
-            // still in initial formation (its owner may just be booting), not a
-            // failover, so promoting it would race the owner's `initialize` into a
-            // split-brain (two committed leaders in one term -> openraft wedge).
-            let mut established: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut state = RecoveryState::default();
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 server
-                    .leader_durable_recovery_tick(grace_ticks, &mut leaderless, &mut established)
+                    .leader_durable_recovery_tick(grace_ticks, &mut state)
                     .await;
             }
         });
@@ -7396,9 +7841,9 @@ impl ServerImpl {
     /// original leader's peer link is down) for `grace_ticks` consecutive passes,
     /// the partition has already been ESTABLISHED (seen a real leader at least
     /// once), and this node is the deterministic surviving successor, promote it.
-    /// `misses` carries the per-partition consecutive-leaderless counter and
-    /// `established` the set of partitions ever seen with a leader, both across
-    /// passes.
+    /// `state` carries, across passes: the per-partition consecutive-leaderless
+    /// counter, the set of partitions ever seen with a leader, and the
+    /// post-promote hold-down countdowns (see [`RecoveryState`]).
     ///
     /// The establishment gate is what keeps recovery from firing during a
     /// staggered cold start: before a partition's owner has formed the group,
@@ -7408,12 +7853,7 @@ impl ServerImpl {
     ///
     /// Factored out (and not gated on the env) so a test can drive recovery
     /// deterministically without spawning the loop.
-    async fn leader_durable_recovery_tick(
-        &self,
-        grace_ticks: u32,
-        misses: &mut std::collections::HashMap<u64, u32>,
-        established: &mut std::collections::HashSet<u64>,
-    ) {
+    async fn leader_durable_recovery_tick(&self, grace_ticks: u32, state: &mut RecoveryState) {
         let topology = self.engine.topology().clone();
         let me = topology.node_id as u64;
         for p in topology.replica_partitions() {
@@ -7424,20 +7864,128 @@ impl ServerImpl {
             // Any named leader (live or since-dead) proves the group was formed
             // once -> this partition is established and thus a failover candidate.
             if leader.is_some() {
-                established.insert(p);
+                state.established.insert(p);
+            }
+            // Post-promote hold-down (Option C): after we self-promote `p`, damp the
+            // reclaim epoch-climb. If leadership now reads as ours the promote took —
+            // clear everything and move on. Otherwise it is still settling (or the
+            // failover leader is contesting): wait out the window before acting again
+            // instead of immediately re-promoting at the next epoch (the climb that
+            // spun the term up under load). A dropped/contested promote simply
+            // re-solicits and retries after the window.
+            if let Some(hd) = state.holddown.get_mut(&p) {
+                if leader == Some(me) {
+                    state.holddown.remove(&p);
+                    state.misses.remove(&p);
+                    continue;
+                }
+                *hd = hd.saturating_sub(1);
+                if *hd > 0 {
+                    continue;
+                }
+                state.holddown.remove(&p);
             }
             // A live leader resets the counter. "Live" means present AND, if it is
             // a peer, reachable — a metric still naming a dead leader does not count.
+            //
+            // EXCEPTION — reclaim of a statically-owned partition: routing is
+            // static (`leader_of == owner_of`), so every create/activation for a
+            // partition this node owns is sent HERE regardless of who actually
+            // leads the Raft group. If a *peer* leads a partition we own, it is a
+            // stale failover leader from our recent outage: the owner is back but
+            // traffic routed to it hits a mere learner and is `leader_reject`ed —
+            // the partition takes zero creates and cannot drain (observed: a
+            // rejoined owner stranded a subset of its partitions because a race let
+            // the failover leader's replication reach it before it self-promoted).
+            // Treat "a peer leads a partition I own" as NOT live so the reclaim
+            // path below fires: the owner self-promotes at `incumbent_epoch + 1`
+            // (it adopted the failover leader's epoch as a learner, so its next
+            // epoch strictly wins the fence) and the old leader steps down. During
+            // normal operation the owner leads its own partitions (`l == me`), so
+            // this never triggers; it is purely a post-failover reclaim.
             let leader_live = match leader {
                 Some(l) if l == me => true,
+                Some(_) if topology.is_local(p) => false,
                 Some(l) => self.peer_reachable(l as u32).await,
                 None => false,
             };
             if leader_live {
-                misses.remove(&p);
+                state.misses.remove(&p);
                 continue;
             }
-            let n = misses.entry(p).or_insert(0);
+            // Leadership hand-off reclaim (opt-in, NANOBPMN_RECLAIM_HANDOFF): a
+            // REACHABLE peer is the failover incumbent for a partition we own.
+            // Rather than form a competing fresh single-voter group (two lineages
+            // fighting elections under load = the term storm), ask the incumbent to
+            // hand leadership back via an openraft membership change (it catches us
+            // up as a learner, then change_membership's the vote to us and steps
+            // down). While that is in flight we suppress the legacy self-promote
+            // below; if the incumbent declines or the hand-off times out (without a
+            // joint-config suspicion) we fall through to the legacy path.
+            //
+            // The incumbent is the local raft leader if it is a reachable peer,
+            // ELSE the app-epoch map's named leader if reachable. The map covers the
+            // Phase E boot-as-receiver case: our member is an uninitialized receiver
+            // (no competing group formed at boot), so `current_leader` is not yet the
+            // peer — but the boot probe / solicit adopted the incumbent epoch, so the
+            // map names it. Without the map fallback the hand-off would never fire for
+            // a boot-deferred partition and it would self-promote a competing group.
+            if self.reclaim_via_handoff && topology.is_local(p) {
+                let candidate: Option<u32> = match leader {
+                    Some(l) if l != me => Some(l as u32),
+                    _ => self
+                        .promotion_epoch
+                        .lock()
+                        .unwrap()
+                        .get(&p)
+                        .map(|&(_, l)| l)
+                        .filter(|&l| l != me)
+                        .map(|l| l as u32),
+                };
+                let incumbent = match candidate {
+                    Some(l) if self.peer_reachable(l).await => Some(l),
+                    _ => None,
+                };
+                if let Some(inc) = incumbent {
+                    // Best-effort reclaim (ADR 0019, Zeebe-aligned): while a
+                    // REACHABLE incumbent still leads this owned partition, keep
+                    // requesting the leadership hand-off and NEVER fall back to a
+                    // competing self-promote — that fallback is the two-lineage
+                    // election storm. If a bounded attempt lapses,
+                    // `request_handoff_or_wait` re-arms and resends. We only reach
+                    // the self-promote path when NO reachable incumbent leads `p`
+                    // (a genuine failover / cold owner).
+                    self.solicit_promotions_from(inc).await;
+                    self.request_handoff_or_wait(p, inc).await;
+                    continue;
+                } else if leader.is_none() {
+                    // Leaderless with no incumbent yet known: solicit ALL reachable
+                    // co-replicas so a live incumbent is discovered (and handed off
+                    // to) before we self-promote. Only if none answers across the
+                    // grace window do we fall through to a fresh self-promote.
+                    for n in topology.replicas_of(p) {
+                        if n != topology.node_id && self.peer_reachable(n).await {
+                            self.solicit_promotions_from(n).await;
+                        }
+                    }
+                }
+            }
+            // Reclaim solicitation (Option A): a peer leads a partition we own.
+            // Solicit its promotion epoch NOW, during the grace window, so we adopt
+            // it (via `handle_promotion`) before we promote — then `next_promotion_epoch`
+            // yields `incumbent + 1`, winning the fence in a single round. Without
+            // this the epoch (in-memory, reset on restart) starts at 1, loses to the
+            // higher-epoch failover leader, and we climb one epoch per tick — the
+            // load-sensitive `leader_reject` storm. Re-solicited each grace pass (at
+            // most `grace_ticks` fire-and-forget frames) so a dropped or pre-link
+            // solicit still lands before promotion.
+            if let Some(l) = leader
+                && l != me
+                && topology.is_local(p)
+            {
+                self.solicit_promotions_from(l as u32).await;
+            }
+            let n = state.misses.entry(p).or_insert(0);
             *n += 1;
             if *n < grace_ticks {
                 continue;
@@ -7445,7 +7993,7 @@ impl ServerImpl {
             // Never fail over a partition still in initial formation: only an
             // established group (its owner formed it, then its leader was lost) is
             // a genuine failover. This is the cold-start split-brain guard.
-            if !established.contains(&p) {
+            if !state.established.contains(&p) {
                 continue;
             }
             // Leaderless past the grace window. Promote iff this node is the
@@ -7456,7 +8004,15 @@ impl ServerImpl {
                     "leader-durable: partition {p} leaderless; node {me} self-promoting (epoch {next_epoch})"
                 );
                 self.promote_partition(p, next_epoch).await;
-                misses.remove(&p);
+                state.misses.remove(&p);
+                // No reachable incumbent remained, so any stale hand-off request
+                // for `p` is moot — clear it so a later rejoin starts clean.
+                self.handoff_pending.lock().unwrap().remove(&p);
+                // Hold the partition down for a settle window so a lagging metrics
+                // view cannot trigger an immediate re-promote at the next epoch.
+                state
+                    .holddown
+                    .insert(p, LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS);
             }
         }
     }
@@ -7560,6 +8116,7 @@ impl ServerImpl {
             return;
         }
         self.raft.insert(part.clone());
+        metrics::record_promote(p);
         tracing::info!(
             "leader-durable: node {me} promoted itself leader of partition {p} (epoch {epoch})"
         );
@@ -7594,6 +8151,504 @@ impl ServerImpl {
                 link.send_promote(p, epoch, me as u64, addr.clone())
                     .await
                     .ok();
+            }
+        }
+    }
+
+    /// Ask peer `target` to re-announce the promotion epochs it currently leads
+    /// (leader-durable reclaim, [`ClientFrame::SolicitPromotions`]). Fire-and-forget:
+    /// the peer replies with its standing [`ClientFrame::Promote`] frames, which we
+    /// adopt in [`handle_promotion`](Self::handle_promotion) — seeding the incumbent
+    /// epoch so the next reclaim promote lands at `incumbent + 1` and wins the fence
+    /// in one round instead of climbing epochs under load.
+    async fn solicit_promotions_from(&self, target: u32) {
+        let me = self.engine.topology().node_id;
+        if target == me {
+            return;
+        }
+        if let Ok(link) = self.peers.link(target).await {
+            link.send_solicit_promotions(me as u64).await.ok();
+        }
+    }
+
+    /// Whether this node is the **current raft leader** of partition `p` (its
+    /// openraft core reports `state == Leader` and names itself the leader). This
+    /// is the authoritative "am I actually serving writes for `p`" signal — as
+    /// opposed to the app-level `promotion_epoch` map, which can name a node that
+    /// has since been demoted (e.g. after a leadership hand-off). Callers that
+    /// advertise leadership to peers (solicit replies, promotion re-announcements)
+    /// MUST gate on this so a demoted learner never claims to lead — a stale claim
+    /// can make the real leader step back down and undo a completed hand-off.
+    fn i_lead_raft(&self, p: u64) -> bool {
+        let me = self.engine.topology().node_id as u64;
+        self.raft
+            .get(p)
+            .map(|part| {
+                let m = part.raft.metrics().borrow().clone();
+                m.state == openraft::ServerState::Leader && m.current_leader == Some(me)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Answer a peer's [`ClientFrame::SolicitPromotions`]: re-announce to `from_node`
+    /// every partition this node currently app-leads (its `promotion_epoch` names
+    /// us) **and still actually raft-leads**, so a rejoining owner learns the
+    /// incumbent epoch and reclaims at `incumbent + 1`. A no-op if we lead nothing
+    /// or the solicit is our own. The raft-leadership gate ([`i_lead_raft`]) is
+    /// critical: after a leadership hand-off our `promotion_epoch` map may still
+    /// name us for `p` while openraft has moved leadership elsewhere — replying
+    /// then would make the returning owner adopt a stale epoch and re-demote the
+    /// new leader, undoing the hand-off.
+    pub(crate) async fn answer_promotion_solicit(&self, from_node: u64) {
+        let topology = self.engine.topology().clone();
+        let me = topology.node_id as u64;
+        if from_node == me {
+            return;
+        }
+        let led: Vec<(u64, u64)> = {
+            let map = self.promotion_epoch.lock().unwrap();
+            map.iter()
+                .filter(|(_, (_, leader))| *leader == me)
+                .map(|(p, (epoch, _))| (*p, *epoch))
+                .collect()
+        };
+        // Only re-announce partitions we STILL raft-lead (a demoted learner must
+        // not advertise itself as leader).
+        let led: Vec<(u64, u64)> = led
+            .into_iter()
+            .filter(|(p, _)| self.i_lead_raft(*p))
+            .collect();
+        if led.is_empty() {
+            return;
+        }
+        let addr = topology.peer_addr(me as u32).unwrap_or("").to_string();
+        if let Ok(link) = self.peers.link(from_node as u32).await {
+            for (p, epoch) in led {
+                link.send_promote(p, epoch, me, addr.clone()).await.ok();
+            }
+        }
+    }
+
+    /// Incumbent side of the leadership hand-off. A rejoining owner asked us to
+    /// hand `partition` back via an openraft membership change instead of forming
+    /// a competing group. We must ACTUALLY raft-lead `partition` to hand it off;
+    /// we reserve the per-partition hand-off lease (also the create write-gate),
+    /// ack the requester, run [`perform_handoff`](Self::perform_handoff), then
+    /// report the terminal outcome. Concurrency-safe: a second request while one
+    /// is in flight is declined.
+    pub(crate) async fn handle_handoff_request(
+        &self,
+        partition: u64,
+        requester_node: u64,
+        requester_addr: String,
+    ) {
+        // Must genuinely lead the group to hand it off.
+        if !self.i_lead_raft(partition) {
+            self.reply_handoff_ack(requester_node, partition, 0, false)
+                .await;
+            return;
+        }
+        // Reserve the per-partition hand-off lease (and engage the create
+        // write-gate). Declined if a hand-off for this partition is already in
+        // flight — never run two concurrent membership changes on one group.
+        if !self.acquire_handoff_lease(partition) {
+            let epoch = self.current_app_epoch(partition);
+            self.reply_handoff_ack(requester_node, partition, epoch, false)
+                .await;
+            return;
+        }
+        let incumbent_epoch = self.current_app_epoch(partition);
+        self.reply_handoff_ack(requester_node, partition, incumbent_epoch, true)
+            .await;
+
+        let result = self
+            .perform_handoff(partition, requester_node, requester_addr, incumbent_epoch)
+            .await;
+
+        // Release the lease / lift the write-gate regardless of outcome.
+        self.release_handoff_lease(partition);
+
+        match result {
+            Ok(new_epoch) => {
+                tracing::info!(
+                    partition,
+                    requester_node,
+                    new_epoch,
+                    "leadership hand-off complete: transferred to returning owner"
+                );
+                self.reply_handoff_complete(requester_node, partition, new_epoch)
+                    .await;
+            }
+            Err((joint_suspected, reason)) => {
+                tracing::warn!(
+                    partition,
+                    requester_node,
+                    joint_suspected,
+                    %reason,
+                    "leadership hand-off aborted"
+                );
+                self.reply_handoff_failed(requester_node, partition, joint_suspected, reason)
+                    .await;
+            }
+        }
+    }
+
+    /// Execute the leadership hand-off for `partition` to `requester_node`: add it
+    /// as a learner, poll it to within [`HANDOFF_LAG_THRESHOLD`] of our log (the
+    /// create write-gate is engaged so the log quiesces), then
+    /// `change_membership` the sole voter to it (which demotes us to a learner and
+    /// steps us down), and finally advance our epoch fence to `(incumbent + 1,
+    /// requester)` so a stale promote can't undo the transfer. Returns the new
+    /// epoch on success, or `(joint_suspected, reason)` on abort — where
+    /// `joint_suspected` means the membership change may be half-applied and the
+    /// requester must NOT fall back to forming a fresh group.
+    async fn perform_handoff(
+        &self,
+        partition: u64,
+        requester_node: u64,
+        requester_addr: String,
+        incumbent_epoch: u64,
+    ) -> Result<u64, (bool, String)> {
+        let Some(part) = self.raft.get(partition) else {
+            return Err((false, format!("no raft group for partition {partition}")));
+        };
+        let node = openraft::BasicNode::new(requester_addr);
+        // Set up replication to the returning owner (non-blocking).
+        if let Err(e) = part.add_learner(requester_node, node).await {
+            return Err((false, format!("add_learner: {e}")));
+        }
+        // Poll the learner toward zero lag with an ADAPTIVE deadline: succeed the
+        // instant it reaches HANDOFF_LAG_THRESHOLD, keep going while it is still
+        // installing/streaming (making progress), and abort only on a genuine
+        // stall or the absolute ceiling (see [`evaluate_catchup`]). The write-gate
+        // keeps new creates off this partition and the completion write-pause (ADR
+        // 0019, clamped >= the ceiling) holds off job-mutation writes for the whole
+        // attempt, so the log head stays frozen and a from-empty snapshot install
+        // can land and its tail drain — without a blind fixed cutoff guillotining a
+        // progressing learner and re-triggering the install forever.
+        let deadline = std::time::Instant::now() + self.handoff_catchup_ceiling();
+        let stall_grace = handoff_catchup_stall_from_env();
+        let mut best_matched: Option<u64> = None;
+        let mut last_advance = std::time::Instant::now();
+        loop {
+            if !self.i_lead_raft(partition) {
+                return Err((false, "lost leadership during catch-up".to_string()));
+            }
+            let lag = part.replication_lag(requester_node);
+            let matched = part.learner_matched(requester_node);
+            match evaluate_catchup(
+                lag,
+                matched,
+                &mut best_matched,
+                &mut last_advance,
+                std::time::Instant::now(),
+                deadline,
+                HANDOFF_LAG_THRESHOLD,
+                stall_grace,
+            ) {
+                CatchupStep::Done => break,
+                CatchupStep::Abort(reason) => return Err((false, reason.to_string())),
+                CatchupStep::Continue => {}
+            }
+            tokio::time::sleep(HANDOFF_LAG_POLL).await;
+        }
+        // Transfer the vote to the requester. retain=true demotes us to a learner
+        // and steps us down; the requester becomes the sole voter/leader.
+        if let Err(e) = part.change_voters_to(vec![requester_node]).await {
+            // A failure may have left the group in the transient joint config
+            // (needs a quorum of BOTH voter sets) — flag it so the requester waits
+            // rather than diverging with a fresh group.
+            let joint = part.in_joint_config();
+            return Err((joint, format!("change_membership: {e}")));
+        }
+        // Advance our fence to (incumbent + 1, requester) so a later stale
+        // Promote/SolicitPromotions naming us can't re-adopt and undo the transfer.
+        let new_epoch = incumbent_epoch + 1;
+        {
+            let mut map = self.promotion_epoch.lock().unwrap();
+            let cur = map.get(&partition).map(|(e, _)| *e).unwrap_or(0);
+            if new_epoch >= cur {
+                map.insert(partition, (new_epoch, requester_node));
+            }
+        }
+        Ok(new_epoch)
+    }
+
+    /// Requester side: the incumbent acknowledged (or declined) our hand-off
+    /// request. On accept we make sure our member for `partition` is a plain
+    /// receiver so the incumbent can replicate to us as a learner (our own
+    /// competing group would otherwise reject its log). On a decline
+    /// (`accepted = false`) we clear the pending marker so the recovery tick's
+    /// legacy self-promote can proceed.
+    pub(crate) async fn handle_handoff_ack(
+        &self,
+        partition: u64,
+        incumbent_epoch: u64,
+        accepted: bool,
+    ) {
+        tracing::debug!(partition, incumbent_epoch, accepted, "hand-off ack");
+        if !accepted {
+            self.handoff_pending.lock().unwrap().remove(&partition);
+            return;
+        }
+        // Rebuild as a receiver ONLY when we don't already have a receiver in
+        // place: either we hold no member for the partition, or we still lead a
+        // competing group (which would reject the incumbent's log). If we are
+        // already hosting the partition as a non-leader (a learner/follower —
+        // e.g. from the fresh-receiver rejoin path, ADR 0019 part 1, or a prior
+        // ack), we MUST NOT rebuild: `rebuild_as_receiver` shuts the member down
+        // and re-bootstraps it with an empty log store, discarding everything the
+        // incumbent has already replicated. Under sustained load the incumbent's
+        // log outgrows what a from-scratch learner can drain inside a single
+        // catch-up window, so wiping on every retry makes the catch-up livelock
+        // forever. Keeping the receiver lets replication accumulate across
+        // attempts until the learner converges and the vote transfers.
+        let need_rebuild = match self.raft.get(partition) {
+            None => true,
+            Some(_) => self.i_lead_raft(partition),
+        };
+        if need_rebuild {
+            let incumbent = self
+                .promotion_epoch
+                .lock()
+                .unwrap()
+                .get(&partition)
+                .map(|(_, leader)| *leader)
+                .unwrap_or(u64::MAX);
+            self.rebuild_as_receiver(partition, incumbent).await;
+        }
+    }
+
+    /// Requester side: the incumbent completed the hand-off — we are now the sole
+    /// voter/leader of `partition`. Adopt the new epoch fence (so a stale promote
+    /// can't undo it) and clear the pending marker.
+    pub(crate) async fn handle_handoff_complete(
+        &self,
+        partition: u64,
+        epoch: u64,
+        new_leader: u64,
+    ) {
+        {
+            let mut map = self.promotion_epoch.lock().unwrap();
+            let cur = map.get(&partition).map(|(e, _)| *e).unwrap_or(0);
+            if epoch >= cur {
+                map.insert(partition, (epoch, new_leader));
+            }
+        }
+        self.handoff_pending.lock().unwrap().remove(&partition);
+        tracing::info!(
+            partition,
+            epoch,
+            "leadership hand-off received: this node now leads the partition"
+        );
+    }
+
+    /// Requester side: the incumbent aborted the hand-off. If it may have left the
+    /// group in a joint config (`joint_suspected`), we keep the pending marker
+    /// (and flag it) so we do NOT fall back to a fresh self-promote over a
+    /// partially-migrated lineage; otherwise we clear it so the recovery tick's
+    /// legacy self-promote can proceed.
+    pub(crate) async fn handle_handoff_failed(
+        &self,
+        partition: u64,
+        joint_suspected: bool,
+        reason: String,
+    ) {
+        tracing::warn!(partition, joint_suspected, %reason, "hand-off failed");
+        let mut pending = self.handoff_pending.lock().unwrap();
+        if joint_suspected {
+            if let Some(hp) = pending.get_mut(&partition) {
+                hp.joint_suspected = true;
+            }
+        } else {
+            pending.remove(&partition);
+        }
+    }
+
+    /// The app-promotion epoch this node currently holds for `partition` if it
+    /// names us as leader, else 0. Used by the incumbent to tell the requester
+    /// which epoch to fence above.
+    fn current_app_epoch(&self, partition: u64) -> u64 {
+        let me = self.engine.topology().node_id as u64;
+        self.promotion_epoch
+            .lock()
+            .unwrap()
+            .get(&partition)
+            .filter(|(_, leader)| *leader == me)
+            .map(|(e, _)| *e)
+            .unwrap_or(0)
+    }
+
+    /// Reserve the per-partition incumbent hand-off lease (and engage the create
+    /// write-gate + the bounded completion write-pause). Returns `false` if a
+    /// hand-off for `partition` is already in flight.
+    fn acquire_handoff_lease(&self, partition: u64) -> bool {
+        let configured = std::time::Duration::from_millis(
+            self.handoff_write_pause_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        // Clamp the pause up to the catch-up ceiling (unless explicitly disabled
+        // with 0): completions must stay paused for the WHOLE catch-up, or the log
+        // head unfreezes mid-install and the learner re-snapshots forever. This
+        // keeps the two windows from drifting out of order even if the pause env
+        // is set below the ceiling.
+        let pause = if configured.is_zero() {
+            configured
+        } else {
+            configured.max(self.handoff_catchup_ceiling())
+        };
+        let deadline = std::time::Instant::now() + pause;
+        let mut gated = self.handoff_gated.lock().unwrap();
+        if gated.contains_key(&partition) {
+            return false;
+        }
+        gated.insert(partition, deadline);
+        true
+    }
+
+    /// Test hook: set the completion write-pause ceiling to a short, deterministic
+    /// window so a hand-off test isn't at the mercy of the 2 s production default.
+    #[cfg(test)]
+    fn set_handoff_write_pause_for_test(&self, d: std::time::Duration) {
+        self.handoff_write_pause_ms
+            .store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The hand-off catch-up absolute ceiling (per-instance, seeded from
+    /// `NANOBPMN_HANDOFF_CATCHUP_MS`). Read on the cold hand-off path by both the
+    /// catch-up loop and the write-pause clamp so the two windows stay ordered.
+    fn handoff_catchup_ceiling(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.handoff_catchup_ceiling_ms
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// Test hook: shrink the catch-up ceiling to a short deterministic window so a
+    /// hand-off test (and the write-pause clamp) isn't gated on the 30 s default.
+    #[cfg(test)]
+    fn set_handoff_catchup_ceiling_for_test(&self, d: std::time::Duration) {
+        self.handoff_catchup_ceiling_ms
+            .store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Release the incumbent hand-off lease and lift the write-gate/pause for
+    /// `partition`.
+    fn release_handoff_lease(&self, partition: u64) {
+        self.handoff_gated.lock().unwrap().remove(&partition);
+    }
+
+    /// Whether `partition` is currently create-write-gated by an in-flight
+    /// incumbent hand-off (new creates are steered off it so its log quiesces).
+    fn handoff_write_gated(&self, partition: u64) -> bool {
+        let gated = self.handoff_gated.lock().unwrap();
+        !gated.is_empty() && gated.contains_key(&partition)
+    }
+
+    /// Whether job-mutation writes (completions/fails/errors) to `partition` are
+    /// currently paused by an in-flight incumbent hand-off — true only while the
+    /// bounded pause window (`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`) is open. Rejected
+    /// writes are retryable; the pause lets the catch-up learner reach zero lag.
+    fn handoff_completion_paused(&self, partition: u64) -> bool {
+        let gated = self.handoff_gated.lock().unwrap();
+        if gated.is_empty() {
+            return false;
+        }
+        matches!(gated.get(&partition), Some(&deadline) if std::time::Instant::now() < deadline)
+    }
+
+    /// Fire-and-forget a hand-off ack to the requesting owner.
+    async fn reply_handoff_ack(
+        &self,
+        to: u64,
+        partition: u64,
+        incumbent_epoch: u64,
+        accepted: bool,
+    ) {
+        if let Ok(link) = self.peers.link(to as u32).await {
+            link.send_handoff_ack(partition, incumbent_epoch, accepted)
+                .await
+                .ok();
+        }
+    }
+
+    /// Fire-and-forget a hand-off completion to the requesting owner.
+    async fn reply_handoff_complete(&self, to: u64, partition: u64, epoch: u64) {
+        if let Ok(link) = self.peers.link(to as u32).await {
+            link.send_handoff_complete(partition, epoch, to).await.ok();
+        }
+    }
+
+    /// Fire-and-forget a hand-off failure to the requesting owner.
+    async fn reply_handoff_failed(
+        &self,
+        to: u64,
+        partition: u64,
+        joint_suspected: bool,
+        reason: String,
+    ) {
+        if let Ok(link) = self.peers.link(to as u32).await {
+            link.send_handoff_failed(partition, joint_suspected, reason)
+                .await
+                .ok();
+        }
+    }
+
+    /// Requester side, driven by the recovery tick: a reachable failover incumbent
+    /// `incumbent` leads our owned `partition`. Ask it for a leadership hand-off,
+    /// or re-send a fresh request if a prior bounded attempt lapsed. Best-effort
+    /// (ADR 0019): as long as a reachable incumbent leads the partition the caller
+    /// keeps calling this and never self-promotes, so this never "gives up" — it
+    /// re-arms the deadline and resends instead.
+    async fn request_handoff_or_wait(&self, partition: u64, incumbent: u32) {
+        // Fast path: the transfer already landed and we now lead — clear and stop.
+        if self.i_lead_raft(partition) {
+            self.handoff_pending.lock().unwrap().remove(&partition);
+            return;
+        }
+        let resend = {
+            let mut pending = self.handoff_pending.lock().unwrap();
+            match pending.get_mut(&partition) {
+                None => {
+                    pending.insert(
+                        partition,
+                        HandoffPending {
+                            deadline_ticks: HANDOFF_PENDING_TICKS,
+                            joint_suspected: false,
+                        },
+                    );
+                    true
+                }
+                Some(hp) => {
+                    if hp.joint_suspected {
+                        // A membership change may be half-applied; wait it out
+                        // quietly rather than resend or diverge.
+                        false
+                    } else {
+                        hp.deadline_ticks = hp.deadline_ticks.saturating_sub(1);
+                        if hp.deadline_ticks == 0 {
+                            // The prior attempt lapsed. Re-arm and resend rather
+                            // than give up — the incumbent is still reachable and
+                            // leading, so self-promote would restart the storm.
+                            hp.deadline_ticks = HANDOFF_PENDING_TICKS;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }
+            }
+        };
+        if resend {
+            let me = self.engine.topology().node_id as u64;
+            let addr = self
+                .engine
+                .topology()
+                .peer_addr(me as u32)
+                .unwrap_or("")
+                .to_string();
+            if let Ok(link) = self.peers.link(incumbent).await {
+                link.send_request_handoff(partition, me, addr).await.ok();
             }
         }
     }
@@ -7736,7 +8791,26 @@ impl ServerImpl {
         // Rebuild our member for `p` as a fresh receiver so the new leader can
         // replicate to us (a learner of the OLD group would reject the new leader's
         // lower-term, fresh log). No initialize: we only receive.
+        if self.rebuild_as_receiver(p, leader_node).await {
+            tracing::info!(
+                "leader-durable: node {me} rejoined partition {p} as a learner of node {leader_node} (epoch {epoch})"
+            );
+        } else {
+            tracing::error!(
+                "leader-durable: node {me} failed to rejoin partition {p} after promotion"
+            );
+        }
+    }
+
+    /// Rebuild this node's member for `p` as a fresh receiver (uninitialized —
+    /// receive-only) of `leader_node`'s group, replacing any existing member. A
+    /// learner of an OLD lineage would reject a new leader's lower-term fresh log,
+    /// so on adopting a new leader (a promotion or a leadership hand-off) we tear
+    /// our member down and rebuild it clean so replication resumes. Returns whether
+    /// the rebuild succeeded.
+    async fn rebuild_as_receiver(&self, p: u64, leader_node: u64) -> bool {
         use crate::raft::RaftPartition;
+        let me = self.engine.topology().node_id as u64;
         let engine = match self.engine_handle_for(p) {
             Some(h) => h,
             None => self.replica_engine_for(p).await,
@@ -7752,13 +8826,13 @@ impl ServerImpl {
         {
             Ok(part) => {
                 self.raft.insert(Arc::new(part));
-                tracing::info!(
-                    "leader-durable: node {me} rejoined partition {p} as a learner of node {leader_node} (epoch {epoch})"
-                );
+                let _ = leader_node;
+                true
             }
-            Err(e) => tracing::error!(
-                "leader-durable: node {me} failed to rejoin partition {p} after promotion: {e}"
-            ),
+            Err(e) => {
+                tracing::error!("node {me} failed to rebuild partition {p} as receiver: {e}");
+                false
+            }
         }
     }
 
@@ -8797,20 +9871,51 @@ impl ServerImpl {
         Ok((instance_key, sync_completed))
     }
 
-    /// The Raft create path (experimental): pick a partition this node currently
-    /// LEADS and replicate `CreateInstance` through its Raft log. The state
-    /// machine applies the committed command to the same engine actor the rest of
-    /// the server reads from, so durability and serving share one materialized
-    /// copy. Returns the minted instance key and whether it completed
+    /// The Raft create path (experimental): place the create cluster-wide across
+    /// EVERY partition (leader-aware, via [`Self::stream_leader_placement`]) and
+    /// replicate `CreateInstance` through the chosen partition's Raft log. The
+    /// state machine applies the committed command to the same engine actor the
+    /// rest of the server reads from, so durability and serving share one
+    /// materialized copy. Returns the minted instance key and whether it completed
     /// synchronously (no async jobs), matching [`Self::create_for_stream`].
     ///
-    /// Choosing among the *led* partitions (rather than the statically owned set)
-    /// means a create commits locally whenever this node leads any partition —
-    /// after a failover it routes to a partition this node was elected to lead
-    /// instead of shedding a 503 on a partition whose leadership moved away. When
-    /// this node leads NO partition (a transient window right after losing every
-    /// leadership), the create is FORWARDED to a peer that leads one rather than
-    /// returning a retryable 503.
+    /// Placement forwards each create to the partition's CURRENT leader, so a
+    /// producer attached to one gateway drives the whole cluster — not just the
+    /// partitions this node happens to lead (the RF>=2 stream imbalance that left a
+    /// recovered node with no attached producer receiving zero creates). When a
+    /// placement lands on a partition THIS node leads it commits locally among the
+    /// *led* partitions (`for_create_among`); when this node leads NO partition (a
+    /// transient window right after losing every leadership) the create is
+    /// FORWARDED to a peer that leads one rather than returning a retryable 503.
+    /// Cluster-wide, leader-aware create placement for the Raft stream create
+    /// path. Advances the shared round-robin cursor to a partition and resolves
+    /// its CURRENT Raft leader: returns `Some(node)` when a *remote* node leads it
+    /// (forward the create there), or `None` when this node leads it, its leader
+    /// is unknown, or the cluster is single-partition (create locally).
+    ///
+    /// Routing to the live LEADER — not the static owner ([`stream_create_placement`]
+    /// / `next_create_placement`) — is what keeps placement failover-safe: while an
+    /// owner is down its partitions resolve to the incumbent leader, and once the
+    /// owner returns and reclaims leadership they resolve back to it. This closes
+    /// the RF>=2 stream-create imbalance where a producer attached to ONE gateway
+    /// only ever committed on the partitions THIS node led, starving peer-led
+    /// partitions — most visibly a freshly recovered node with no directly
+    /// attached producer, which reclaimed leadership but received zero creates.
+    /// The REST path already spreads via `next_create_placement`; this gives the
+    /// falcon stream path the same spread, but leader-aware.
+    fn stream_leader_placement(&self) -> Option<u32> {
+        let p = self.engine.next_create_partition()?;
+        let node_id = self.engine.topology().node_id as u64;
+        match self
+            .raft
+            .get(p)
+            .and_then(|part| part.raft.metrics().borrow().current_leader)
+        {
+            Some(leader) if leader != node_id => Some(leader as u32),
+            _ => None,
+        }
+    }
+
     async fn create_via_raft(
         &self,
         by_id: Option<String>,
@@ -8819,6 +9924,38 @@ impl ServerImpl {
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
         if let Some(message) = self.admission_shed() {
             return Err((503, message));
+        }
+        // Cluster-wide, leader-aware placement (see `stream_leader_placement`):
+        // spread stream creates across EVERY partition and forward each to its
+        // current leader, so a producer on one gateway drives the whole cluster —
+        // including a recovered node that reclaimed leadership but has no directly
+        // attached producer. A local/own-leader placement (`None`) falls through to
+        // the local propose below.
+        if let Some(leader) = self.stream_leader_placement() {
+            let wire_vars = if variables.is_empty() {
+                None
+            } else {
+                Some(
+                    variables
+                        .iter()
+                        .map(|(k, v)| (k.clone(), value_to_json(v)))
+                        .collect(),
+                )
+            };
+            return match self
+                .create_forwarded_stream(leader, by_id.clone(), by_key.clone(), wire_vars)
+                .await
+            {
+                Ok(res) => Ok(res),
+                // A genuine client rejection is returned as-is; any other failure
+                // (an unreachable or just-lost leader) becomes a retryable 503 so
+                // the client re-places onto a healthy leader. We deliberately do
+                // NOT fall through to a local create here, so an ambiguous
+                // post-send transport error can never mint a duplicate instance.
+                Err((400, m)) => Err((400, m)),
+                Err((409, m)) => Err((409, m)),
+                Err((_, m)) => Err((503, m)),
+            };
         }
         // This node leads nothing right now: forward to a peer leader instead of
         // shedding a 503 the client would have to retry.
@@ -9086,6 +10223,14 @@ impl ServerImpl {
         (u16, String),
     > {
         let led = self.led_partitions();
+        // Create write-gate: while this node (as a failover incumbent) is handing a
+        // partition back to its returning owner, steer new creates OFF that
+        // partition so its raft log quiesces and the hand-off learner can catch up
+        // to zero lag. Cheap: the gate set is empty on the hot path.
+        let led: Vec<u64> = led
+            .into_iter()
+            .filter(|&p| !self.handoff_write_gated(p))
+            .collect();
         let Some(p) = self.engine.for_create_among(&led) else {
             return Err((503, "this node leads no partition; retry".to_string()));
         };
@@ -9241,6 +10386,14 @@ impl ServerImpl {
         command: Command,
     ) -> Result<Commit, (u16, String)> {
         let p = partition_of(job_key);
+        // Bounded completion write-pause (ADR 0019): while this node is handing
+        // `p` back to its returning owner, pause job-mutation writes so the raft
+        // log fully quiesces and the catch-up learner can reach zero lag. Retryable
+        // (at-least-once) — the worker redelivers once the brief pause lifts.
+        if self.handoff_completion_paused(p) {
+            crate::metrics::record_complete_outcome("handoff_pause");
+            return Err((503, format!("partition {p} handing off; retry")));
+        }
         let Some(part) = self.raft.get(p) else {
             return Err((500, format!("partition {p} has no Raft group")));
         };
@@ -9797,36 +10950,126 @@ impl ServerImpl {
         (throughput, memory)
     }
 
+    /// Graded **create-acceptance headroom** occupancy in `[0, CREATE_OCCUPANCY_SCALE]`
+    /// — `0` = full headroom, higher = tighter. It is the MAX over the configured
+    /// create-admission rails of how full each is *right now*:
+    /// * create-processing concurrency vs the AIMD watermark
+    ///   ([`Backpressure::current_limit`](crate::backpressure::Backpressure::current_limit)),
+    /// * standing create-queue depth vs [`Self::admission_max_create_queue`],
+    /// * resident memory vs [`Self::mem_watermark_bytes`].
+    ///
+    /// It deliberately does **not** include the resident active-instance backlog:
+    /// a recovered node holding a deep but idle backlog (workers not yet draining
+    /// it) has full create-acceptance capacity and must stay eligible for new
+    /// creates. The hard shed rails (memory watermark / create-queue / submission
+    /// pressure, via [`create_should_shed`](Self::create_should_shed)) remain the
+    /// OOM/liveness backstop; this index only steers *below* the shed line. Cheap:
+    /// a few relaxed atomic loads plus one create-queue read.
+    pub(crate) fn create_occupancy_index(&self) -> i64 {
+        // occ(num, den) = fraction of `den` used, scaled to CREATE_OCCUPANCY_SCALE,
+        // clamped to the scale (the >=1.0 case is the shed rails' job, not the
+        // graded steer). A rail with no configured limit contributes nothing.
+        fn occ(num: u64, den: u64) -> i64 {
+            if den == 0 {
+                return 0;
+            }
+            let n = num.min(den) as u128;
+            ((n * CREATE_OCCUPANCY_SCALE as u128) / den as u128) as i64
+        }
+        let mut load = 0i64;
+        // Create-processing concurrency vs the adaptive/fixed watermark.
+        if let Some(limit) = self.backpressure.current_limit() {
+            let processing = self.processing.load(Ordering::Relaxed) as u64;
+            load = load.max(occ(processing, limit as u64));
+        }
+        // Standing create-queue depth vs its memory-safety cap.
+        if self.admission_max_create_queue > 0 {
+            let create_queue = self.engine.pending_create_queue() as u64;
+            load = load.max(occ(create_queue, self.admission_max_create_queue as u64));
+        }
+        // Resident memory vs the watermark.
+        if self.mem_watermark_bytes > 0 {
+            let used = self.mem_pressure_bytes.load(Ordering::Relaxed);
+            load = load.max(occ(used, self.mem_watermark_bytes));
+        }
+        load
+    }
+
     /// This node's composite create-load index for load-aware placement (ADR
     /// 0014, `PlacementMode::Balanced`). A shedding node reports
     /// [`SHED_LOAD`](crate::placement::SHED_LOAD) (weight 0 — never placed on);
-    /// otherwise it reports its active backlog, so weighted placement steers
-    /// creates toward nodes with the shallowest backlog. Cheap: a couple of
-    /// relaxed atomic loads plus the admission-gate checks, no engine round-trip.
+    /// otherwise it reports its [`create_occupancy_index`](Self::create_occupancy_index)
+    /// — create-acceptance headroom, *not* accumulated active backlog — so
+    /// weighted placement steers creates toward nodes with real intake capacity
+    /// (a recovered node draining a deep backlog stays eligible). Cheap: a couple
+    /// of relaxed atomic loads plus the admission-gate checks, no engine
+    /// round-trip beyond the create-queue gauge.
     pub(crate) fn create_load_index(&self) -> i64 {
         if self.create_should_shed().is_some() {
             crate::placement::SHED_LOAD
         } else {
-            self.active_backlog()
+            self.create_occupancy_index()
         }
     }
 
     /// Record a peer's gossiped create-load index (ADR 0014 pressure gossip).
-    /// Overwrites the previous value for that node; weighted placement reads the
-    /// latest. Only invoked in `PlacementMode::Balanced`.
+    /// Overwrites the previous value for that node and restamps its freshness;
+    /// weighted placement reads the latest within [`peer_pressure_ttl`]. Only
+    /// invoked in `PlacementMode::Balanced`.
     pub(crate) fn record_peer_pressure(&self, node: u32, load: i64) {
         if let Ok(mut map) = self.peer_pressure.lock() {
-            map.insert(node, load);
+            map.insert(node, (load, std::time::Instant::now()));
         }
     }
 
     /// The latest create-load index gossiped by peer `node`, or `None` if that
-    /// peer has not reported yet (treated by placement as full headroom).
+    /// peer has not reported *recently* (never reported, or its last report is
+    /// older than [`peer_pressure_ttl`]) — both cases treated by placement as
+    /// full headroom. The TTL is what lets a rejoining node re-enter create
+    /// placement within a couple of gossip intervals: its stale pre-death value
+    /// (often SHED) expires instead of steering all creates away forever.
     pub(crate) fn peer_load(&self, node: u32) -> Option<i64> {
+        let ttl = peer_pressure_ttl();
         self.peer_pressure
             .lock()
             .ok()
             .and_then(|m| m.get(&node).copied())
+            .filter(|(_, at)| at.elapsed() < ttl)
+            .map(|(load, _)| load)
+    }
+
+    /// Diagnostic snapshot of this node's gossiped peer-pressure view: for each
+    /// peer we have ever heard from, `(node, load, age_ms, expired)` where
+    /// `expired` is true once the reading is older than [`peer_pressure_ttl`]
+    /// (i.e. placement now treats it as full headroom). Read-only; used by the
+    /// `/debug/peers` route to confirm whether a rejoining peer is being pinned
+    /// out of create placement by a stale SHED reading under sustained load.
+    pub(crate) fn peer_pressure_snapshot(&self) -> Vec<(u32, i64, u128, bool)> {
+        let ttl = peer_pressure_ttl();
+        let mut rows: Vec<(u32, i64, u128, bool)> = self
+            .peer_pressure
+            .lock()
+            .map(|m| {
+                m.iter()
+                    .map(|(node, (load, at))| {
+                        let age = at.elapsed();
+                        (*node, *load, age.as_millis(), age >= ttl)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rows.sort_by_key(|(node, ..)| *node);
+        rows
+    }
+
+    /// Test-only: record a peer's create-load index stamped at an explicit
+    /// instant, so freshness/TTL expiry can be exercised deterministically
+    /// without sleeping or racing the wall clock.
+    #[cfg(test)]
+    pub(crate) fn record_peer_pressure_at(&self, node: u32, load: i64, at: std::time::Instant) {
+        if let Ok(mut map) = self.peer_pressure.lock() {
+            map.insert(node, (load, at));
+        }
     }
 
     /// `InstanceCompleted` frame. Reuses the REST await path verbatim.
@@ -10466,6 +11709,43 @@ fn raft_debug_body(reg: &crate::raft::RaftRegistry) -> Response {
         .expect("raft debug response builds")
 }
 
+/// Diagnostic dump of this node's gossiped peer-pressure (create-load) view, plus
+/// its own locally-computed create-load index. Read-only. Answers "is a rejoining
+/// healthy peer being pinned out of create placement by a stale/expired SHED
+/// reading?": each row is `peer=<node> load=<idx> age_ms=<ms> expired=<bool>
+/// weight=<placement_weight>`. A peer with `expired=true` is treated as full
+/// headroom by placement; a fresh `load=SHED` (weight 0) peer is steered away.
+fn peers_debug_body(server: &ServerImpl) -> Response {
+    use std::fmt::Write as _;
+    let me = server.engine.topology().node_id;
+    let my_load = server.create_load_index();
+    let ttl_ms = peer_pressure_ttl().as_millis();
+    let mut body = String::new();
+    let _ = writeln!(
+        body,
+        "node={me} self_load={my_load} self_weight={} peer_pressure_ttl_ms={ttl_ms}",
+        crate::placement::placement_weight(my_load),
+    );
+    for (node, load, age_ms, expired) in server.peer_pressure_snapshot() {
+        // Placement uses `peer_load` (TTL-filtered): an expired reading counts as
+        // full headroom, so its effective weight is the full-headroom weight.
+        let effective = if expired {
+            crate::placement::placement_weight(0)
+        } else {
+            crate::placement::placement_weight(load)
+        };
+        let _ = writeln!(
+            body,
+            "peer={node} load={load} age_ms={age_ms} expired={expired} effective_weight={effective}"
+        );
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(Body::from(body))
+        .expect("peers debug response builds")
+}
+
 /// Diagnostic dump of non-terminal instance / job state, per partition this node
 /// hosts (owned or replica). Characterizes "wedged" instances that remain
 /// `Active` after load drains: for each partition it reports state histograms
@@ -10704,6 +11984,22 @@ fn placement_gossip_interval() -> std::time::Duration {
         .filter(|&n| n > 0)
         .unwrap_or(500);
     std::time::Duration::from_millis(ms)
+}
+
+/// Number of gossip intervals a peer-pressure reading stays authoritative.
+const PEER_PRESSURE_TTL_INTERVALS: u32 = 4;
+
+/// How long a gossiped peer-pressure reading stays authoritative before weighted
+/// placement reverts that peer to full-headroom. Derived from the gossip interval
+/// so it scales with the configured cadence: several intervals of tolerance so a
+/// single skipped tick (the gossip loop uses `MissedTickBehavior::Skip` under
+/// load) does not expire a live peer, yet a peer that truly goes silent — killed,
+/// restarting, or its gossip frame starved on a saturated link — clears within a
+/// second or two. This is the freshness guard that lets a rejoining node
+/// re-enter create placement promptly instead of being pinned out by the SHED
+/// value it gossiped just before it died.
+fn peer_pressure_ttl() -> std::time::Duration {
+    placement_gossip_interval().saturating_mul(PEER_PRESSURE_TTL_INTERVALS)
 }
 
 /// Renders a body as a single-line, length-prefixed preview for logging,
@@ -11519,6 +12815,10 @@ async fn main() {
     // job state breakdown per led partition — used to characterize wedged
     // instances that never reach a terminal state after load drains).
     let dbg_server = server.clone();
+    // Captured for the /debug/peers diagnostic route (this node's gossiped
+    // peer-pressure view + own create-load index — used to confirm whether a
+    // rejoining peer is pinned out of create placement by a stale SHED reading).
+    let peers_dbg = server.clone();
 
     // Raft partition-liveness supervisor. An openraft core can enter `Shutdown`
     // (e.g. on an unrecoverable storage error) and then silently stop applying,
@@ -11597,6 +12897,13 @@ async fn main() {
             axum::routing::get(move || {
                 let srv = dbg_server.clone();
                 async move { instances_debug_body(&srv).await }
+            }),
+        )
+        .route(
+            "/debug/peers",
+            axum::routing::get(move || {
+                let srv = peers_dbg.clone();
+                async move { peers_debug_body(&srv) }
             }),
         )
         .route(
@@ -12774,6 +14081,59 @@ mod clustered_startup_tests {
     }
 
     #[test]
+    fn create_load_index_reflects_intake_headroom_not_resident_backlog() {
+        use super::CREATE_OCCUPANCY_SCALE;
+
+        // A recovered node holding a HUGE resident active-instance backlog but
+        // with an idle create pipeline and RAM below any watermark has full
+        // create-acceptance capacity: its load index must be ~0 (eligible for
+        // creates), NOT the raw backlog count that would freeze it out of
+        // weighted placement.
+        let mut node = clustered_node(0);
+        node.inflight.store(5_000_000, Ordering::Relaxed);
+        assert_eq!(
+            node.active_backlog(),
+            5_000_000,
+            "active_backlog still reports the raw resident count (unchanged)"
+        );
+        let idle = node.create_load_index();
+        assert!(
+            idle < CREATE_OCCUPANCY_SCALE && idle < node.active_backlog(),
+            "a deep-but-idle backlog must yield a low intake-headroom index \
+             (got {idle}), not the resident backlog"
+        );
+        assert_ne!(
+            idle,
+            crate::placement::SHED_LOAD,
+            "an idle recovered node must not be shed out of placement"
+        );
+
+        // Graded steer: at ~50% of the memory watermark the index sits mid-band
+        // (between full headroom and the hard shed), so placement steers *some*
+        // creates away without freezing the node.
+        node.mem_watermark_bytes = 1000;
+        node.mem_pressure_bytes.store(500, Ordering::Relaxed);
+        let mid = node.create_load_index();
+        assert_eq!(
+            mid,
+            CREATE_OCCUPANCY_SCALE / 2,
+            "50% memory occupancy must map to half the occupancy scale"
+        );
+        assert!(mid > 0 && mid < crate::placement::SHED_LOAD);
+
+        // The hard OOM backstop is unchanged: resident at/above the watermark
+        // reports SHED_LOAD (weight 0 — never placed on), regardless of intake
+        // headroom.
+        node.mem_watermark_bytes = 1;
+        node.mem_pressure_bytes.store(1 << 20, Ordering::Relaxed);
+        assert_eq!(
+            node.create_load_index(),
+            crate::placement::SHED_LOAD,
+            "a node past its memory watermark must still hard-shed"
+        );
+    }
+
+    #[test]
     fn weighted_placement_steers_away_from_loaded_and_shedding_peers() {
         let node0 = clustered_node(0);
 
@@ -12804,6 +14164,81 @@ mod clustered_startup_tests {
         assert!(
             loaded < healthy,
             "a loaded peer ({loaded}) must receive fewer creates than a healthy one ({healthy})"
+        );
+    }
+
+    #[test]
+    fn stale_peer_pressure_expires_to_full_headroom_on_rejoin() {
+        // Rejoin regression (#1 zero-creates): a peer that shed (SHED_LOAD) just
+        // before it died must not be steered away from forever. Once its last
+        // gossip is older than the TTL, weighted placement reverts it to full
+        // headroom so a returning node re-enters create placement — even if its
+        // fresh post-restart gossip is briefly delayed on a saturated link.
+        let node0 = clustered_node(0);
+
+        // Fresh SHED reading → never placed on (baseline: the pre-death state).
+        node0.record_peer_pressure(1, crate::placement::SHED_LOAD);
+        assert_eq!(node0.peer_load(1), Some(crate::placement::SHED_LOAD));
+        assert_eq!(
+            node0.next_create_placement_weighted(&[]),
+            None,
+            "a freshly-shedding peer must not receive weighted placement"
+        );
+
+        // Backdate that SHED reading beyond the TTL: the peer has gone silent.
+        let stale = std::time::Instant::now() - (peer_pressure_ttl() + Duration::from_secs(1));
+        node0.record_peer_pressure_at(1, crate::placement::SHED_LOAD, stale);
+        assert_eq!(
+            node0.peer_load(1),
+            None,
+            "a peer-pressure reading older than the TTL must read as absent (full headroom)"
+        );
+
+        // With the stale SHED expired, the returning peer is treated as headroom
+        // and receives a meaningful share of creates again.
+        let recovered = (0..1_000)
+            .filter(|_| node0.next_create_placement_weighted(&[]) == Some(1))
+            .count();
+        assert!(
+            recovered > 0,
+            "a peer whose stale SHED expired must re-enter create placement ({recovered} creates)"
+        );
+    }
+
+    #[test]
+    fn peer_pressure_snapshot_flags_expired_readings_for_debug_peers() {
+        // The /debug/peers diagnostic must faithfully report whether a peer's
+        // gossiped reading has aged past the TTL — that expired flag is exactly
+        // what tells an operator "placement now treats this peer as headroom",
+        // distinguishing a still-pinned fresh SHED from an expired-and-eligible
+        // one during a rejoin soak.
+        let node0 = clustered_node(0);
+
+        // A fresh reading is present and not expired.
+        node0.record_peer_pressure(1, crate::placement::SHED_LOAD);
+        let snap = node0.peer_pressure_snapshot();
+        let row = snap
+            .iter()
+            .find(|(n, ..)| *n == 1)
+            .expect("peer 1 present in snapshot");
+        assert_eq!(row.1, crate::placement::SHED_LOAD, "load reported verbatim");
+        assert!(!row.3, "a fresh reading must not be flagged expired");
+
+        // Backdate it past the TTL: the snapshot must now flag it expired.
+        let stale = std::time::Instant::now() - (peer_pressure_ttl() + Duration::from_secs(1));
+        node0.record_peer_pressure_at(1, crate::placement::SHED_LOAD, stale);
+        let row = node0
+            .peer_pressure_snapshot()
+            .into_iter()
+            .find(|(n, ..)| *n == 1)
+            .expect("peer 1 still present in snapshot");
+        assert!(
+            row.3,
+            "a reading older than the TTL must be flagged expired in the debug snapshot"
+        );
+        assert!(
+            row.2 >= peer_pressure_ttl().as_millis(),
+            "reported age must reflect the backdated timestamp"
         );
     }
 
@@ -13541,6 +14976,44 @@ mod clustered_startup_tests {
         }
         assert_eq!(local, 4, "half of 8 placements (partitions 0,2) are local");
         assert_eq!(remote_to_1, 4, "half (partitions 1,3) forward to node 1");
+    }
+
+    #[test]
+    fn next_create_partition_round_robins_every_partition() {
+        // The leader-aware stream create placement (`stream_leader_placement`)
+        // rides this cursor: it must sweep EVERY partition in the cluster, not
+        // just the ones this node owns, so a producer on one gateway can drive
+        // instances on peer-led partitions (incl. a recovered node's). node 0 of a
+        // 2-node, 4-partition cluster still sees all four ids come round.
+        let node0 = clustered_node(0);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..8 {
+            seen.insert(
+                node0
+                    .engine
+                    .next_create_partition()
+                    .expect("multi-partition cluster yields a placement partition"),
+            );
+        }
+        assert_eq!(
+            seen,
+            std::collections::HashSet::from([0, 1, 2, 3]),
+            "placement sweeps every partition in the cluster"
+        );
+    }
+
+    #[test]
+    fn single_node_next_create_partition_is_local() {
+        // A single-node cluster owns every partition, so the leader-aware stream
+        // placement is always local (None) — no forwarding, byte-identical fast
+        // path.
+        let solo = ServerImpl::default();
+        for _ in 0..16 {
+            assert!(
+                solo.engine.next_create_partition().is_none(),
+                "single node never forwards a stream create"
+            );
+        }
     }
 
     #[test]
@@ -14813,12 +16286,32 @@ mod clustered_startup_tests {
         let (node0, node1, node2) = boot_rf3_intake_cluster().await;
 
         const N: usize = 12;
+        // Pin every create to partition 0 by proposing directly to its Raft
+        // group. Cluster-wide leader-aware placement now spreads stream creates
+        // across EVERY partition (a producer on one gateway drives the whole
+        // cluster), so `create_for_stream` no longer lands all creates on
+        // partition 0. This test specifically exercises failover durability for
+        // the instances committed through partition 0's leader, so it targets
+        // that partition explicitly.
+        let part0 = node0
+            .raft_registry()
+            .get(0)
+            .expect("node0 leads partition 0");
         let mut instances = Vec::new();
         for _ in 0..N {
-            let (key, _c) = node0
-                .create_for_stream(Some("intake".into()), None, Default::default())
+            let item = part0
+                .propose_result(
+                    Command::create_instance_full("intake", Default::default(), Vec::new(), None),
+                    now_millis(),
+                )
                 .await
                 .expect("raft-routed create commits via quorum");
+            assert!(item.error.is_none(), "create rejected: {:?}", item.error);
+            let key = item
+                .events
+                .iter()
+                .find_map(Event::instance_key)
+                .expect("create produced an instance key");
             assert_eq!(nanobpmn_engine_core::partition_of(key), 0);
             instances.push(key);
         }
@@ -14980,6 +16473,30 @@ mod clustered_startup_tests {
         } else {
             &node1
         };
+
+        // `other` (the survivor we drive the REST mutation through) may momentarily
+        // lag the election: its partition-0 view can still read leaderless right after
+        // `wait_new_leader` observed the leader on the other survivor. Issuing the
+        // by-key mutation in that window would route it nowhere useful (the owner is
+        // dead). Wait until `other` agrees on the new leader so `route_by_leader`
+        // forwards to it — the exact behaviour this test asserts.
+        let mut other_converged = false;
+        for _ in 0..400 {
+            if other
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(new_leader_id as u64)
+            {
+                other_converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            other_converged,
+            "the follower survivor converges on the new leader before the REST mutation"
+        );
 
         // Activate the parked job on the new leader to obtain its key.
         let mut job_key = None;
@@ -15683,18 +17200,12 @@ mod clustered_startup_tests {
         // started in-test). node 1 is the deterministic successor for partition 0
         // (replicas_of(0) = [0,1,2]; node 0 is down), so it self-promotes; node 2
         // sees node 1 alive and stands down. Use grace_ticks = 1 for a prompt test.
-        let mut misses1 = std::collections::HashMap::new();
-        let mut misses2 = std::collections::HashMap::new();
-        let mut established1 = std::collections::HashSet::new();
-        let mut established2 = std::collections::HashSet::new();
+        let mut state1 = RecoveryState::default();
+        let mut state2 = RecoveryState::default();
         let mut promoted = false;
         for _ in 0..200 {
-            node1
-                .leader_durable_recovery_tick(1, &mut misses1, &mut established1)
-                .await;
-            node2
-                .leader_durable_recovery_tick(1, &mut misses2, &mut established2)
-                .await;
+            node1.leader_durable_recovery_tick(1, &mut state1).await;
+            node2.leader_durable_recovery_tick(1, &mut state2).await;
             if node1
                 .raft_registry()
                 .get(0)
@@ -15777,6 +17288,713 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rejoined_owner_reclaims_a_partition_a_peer_leads() {
+        // Reclaim on rejoin. Routing is static (`leader_of == owner_of`), so every
+        // create/activation for a partition is sent to its OWNER regardless of which
+        // node actually leads the Raft group. After an outage a survivor self-promotes
+        // the owner's partition (failover); when the owner comes back, a race can let
+        // that failover leader's replication reach the owner FIRST, so the owner
+        // rebuilds as a mere learner reporting the peer as leader. Static routing then
+        // funnels the partition's traffic to the owner, which `leader_reject`s it as a
+        // learner: the partition takes zero creates and cannot drain (observed on a
+        // rejoined node: a subset of its owned partitions stranded their backlog). The
+        // recovery supervisor must treat "a peer leads a partition I OWN" as not-live
+        // so the owner reclaims (self-promotes) it. This proves that reclaim fires.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Seed partition-0 state and ship it to node 1 so the survivor can promote
+        // from a warm replica engine.
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("leader-durable create acks on the sole voter");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        let node1_p0 = node1
+            .engine_handle_for(0)
+            .expect("node 1 materializes a replica engine for partition 0");
+        let mut shipped = false;
+        for _ in 0..400 {
+            if node1_p0
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
+                })
+                .await
+            {
+                shipped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(shipped, "the create ships to node 1 before the outage");
+
+        // Outage: node 0's Raft groups go down and it is fault-injected unreachable
+        // from the survivors so node 1 becomes the deterministic successor. Unlike the
+        // auto-recovery test we do NOT abort node 0's serve task: the owner must stay
+        // dial-able so it can rejoin as a learner when it comes back (modelling the
+        // rejoin race, not a permanent death).
+        for p in 0..3u64 {
+            if let Some(part) = node0.raft_registry().get(p) {
+                part.raft.shutdown().await.ok();
+            }
+        }
+        node1.peers.fail_node(0).await;
+        node2.peers.fail_node(0).await;
+
+        // Survivors run recovery; node 1 self-promotes partition 0 (node 0 is owner but
+        // unreachable, so node 1 is the successor). node 0's tick is NOT driven during
+        // the outage.
+        let mut state1 = RecoveryState::default();
+        let mut state2 = RecoveryState::default();
+        let mut promoted = false;
+        for _ in 0..200 {
+            node1.leader_durable_recovery_tick(1, &mut state1).await;
+            node2.leader_durable_recovery_tick(1, &mut state2).await;
+            if node1
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(1)
+            {
+                promoted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(promoted, "node 1 fails over partition 0 during the outage");
+
+        // Rejoin: node 0 comes back. Restore reachability, then reproduce the losing
+        // side of the race — node 1's failover leadership reaches node 0 first, so
+        // node 0 rebuilds as a LEARNER of node 1 (adopts epoch (1,1)) and its metrics
+        // report node 1 as the leader of a partition node 0 OWNS.
+        node1.peers.heal_node(0).await;
+        node2.peers.heal_node(0).await;
+        node0.handle_promotion(0, 1, 1).await;
+        let node0_addr = node1
+            .engine
+            .topology()
+            .peer_addr(0)
+            .expect("node 0 address")
+            .to_string();
+        node1
+            .raft_registry()
+            .get(0)
+            .expect("node 1 leads partition 0")
+            .add_learner(0, openraft::BasicNode::new(node0_addr))
+            .await
+            .ok();
+        let mut learner_ready = false;
+        for _ in 0..600 {
+            if node0
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(1)
+            {
+                learner_ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            learner_ready,
+            "the rejoined owner ends up a learner reporting the peer as leader (the strand)"
+        );
+
+        // Drive the owner's recovery tick. WITHOUT the reclaim fix it would see a
+        // reachable peer leader and reset the miss counter forever, leaving the
+        // partition stranded. WITH the fix, a peer leading an OWNED partition counts as
+        // not-live, so the owner self-promotes at the next epoch and reclaims it.
+        let mut state0 = RecoveryState::default();
+        // The recovery supervisor's `established` set persists for the whole process
+        // life: node 0 formed partition 0 before its outage, so it is already marked
+        // established when the reclaim ticks run. (Seeding it faithfully; otherwise a
+        // reclaim tick that momentarily reads a leaderless learner would trip the
+        // never-established cold-start guard.)
+        state0.established.insert(0u64);
+        let mut reclaimed = false;
+        for _ in 0..600 {
+            node0.leader_durable_recovery_tick(1, &mut state0).await;
+            if node0
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(0)
+            {
+                reclaimed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            reclaimed,
+            "the rejoined owner reclaims (self-promotes) the partition a peer was leading"
+        );
+        assert!(
+            node0.led_partitions().contains(&0),
+            "serving follows the reclaimed leadership on the owner"
+        );
+        // The reclaim used a strictly higher epoch than the failover leader's (1,1) ->
+        // (2,0), so the fence resolves cleanly in the owner's favour.
+        assert_eq!(
+            node0.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((2, 0)),
+            "the owner reclaims at incumbent_epoch + 1, naming itself"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn rejoined_owner_solicits_incumbent_epoch_for_single_round_reclaim() {
+        // Option A wiring: the reclaim epoch fence only resolves in one round if the
+        // rejoining owner knows the incumbent (failover) epoch before it promotes.
+        // That epoch is in-memory and reset on restart, and the failover leader's
+        // original Promote was broadcast while the owner was DOWN — so on rejoin the
+        // owner's map is empty and, without help, it would promote at epoch 1, lose
+        // the fence to the higher-epoch incumbent, and climb one epoch per tick (the
+        // load-sensitive leader_reject storm). The owner therefore SOLICITS the
+        // incumbent on rejoin; the incumbent re-announces the promotions it leads;
+        // the owner adopts the epoch and its next promote lands at incumbent + 1.
+        // This proves the solicit -> answer -> adopt round-trip over the real peer
+        // links, isolated from the raft failover dance.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // The incumbent: node 1 becomes the REAL failover raft leader of partition 0
+        // at epoch 1 (as a failover would when node 0 was down) — a fresh single-voter
+        // group it actually leads, not just an app-map entry. The leadership gate on
+        // `answer_promotion_solicit` requires genuine raft leadership: a node that only
+        // has a stale `promotion_epoch` entry (e.g. one demoted by a later hand-off)
+        // must NOT advertise itself as leader, so the incumbent here must truly lead.
+        assert_eq!(node1.next_promotion_epoch(0), 1);
+        assert_eq!(
+            node1.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((1, 1)),
+            "node 1 is the incumbent leader of partition 0 at epoch 1"
+        );
+        node1.promote_partition(0, 1).await;
+        let mut leads = false;
+        for _ in 0..300 {
+            if node1.i_lead_raft(0) {
+                leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leads, "the incumbent genuinely raft-leads partition 0");
+
+        // Model the rejoined owner: promote_partition broadcast a Promote to node 0,
+        // which it may have adopted. Wait for that to drain, then RESET node 0's view
+        // so it has NOT heard the incumbent epoch — exactly the post-restart state
+        // (its in-memory map was wiped). The solicit round-trip below must re-deliver.
+        for _ in 0..300 {
+            if node0.promotion_epoch.lock().unwrap().get(&0).copied() == Some((1, 1)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        node0.promotion_epoch.lock().unwrap().remove(&0);
+
+        // Solicit the incumbent. node 1 STILL raft-leads, so the leadership gate lets
+        // it answer with a Promote for partition 0; node 0's falcon handler adopts it
+        // via handle_promotion.
+        node0.solicit_promotions_from(1).await;
+
+        let mut adopted = false;
+        for _ in 0..300 {
+            if node0.promotion_epoch.lock().unwrap().get(&0).copied() == Some((1, 1)) {
+                adopted = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            adopted,
+            "the owner adopts the incumbent epoch (1,1) from the solicited re-announcement"
+        );
+
+        // With the incumbent epoch adopted, the owner's next promote lands at
+        // incumbent + 1 (epoch 2, naming itself) — winning the fence in one round.
+        assert_eq!(
+            node0.next_promotion_epoch(0),
+            2,
+            "the owner reclaims at incumbent_epoch + 1 after soliciting, not epoch 1"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn solicit_reply_is_gated_on_real_raft_leadership_not_a_stale_epoch_entry() {
+        // Regression for the leadership hand-off: after leadership moves off a node
+        // (e.g. it was demoted to a learner), its in-memory `promotion_epoch` map may
+        // STILL name it as the leader of a partition. If it answered a solicit on that
+        // stale entry it would make the returning owner adopt a dead epoch and could
+        // re-demote the genuine leader — undoing the hand-off. `answer_promotion_solicit`
+        // must therefore gate on ACTUAL raft leadership (`i_lead_raft`), not the map.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Forge a stale entry on node 1 claiming it leads partition 0 at epoch 1,
+        // WITHOUT it ever raft-leading partition 0 (node 0 is the real owner/leader).
+        node1.promotion_epoch.lock().unwrap().insert(0, (1, 1));
+        assert!(
+            !node1.i_lead_raft(0),
+            "node 1 does not actually raft-lead partition 0 despite the forged epoch entry"
+        );
+        node0.promotion_epoch.lock().unwrap().remove(&0);
+
+        // Solicit node 1. The gate must suppress the reply, so node 0 learns nothing.
+        node0.solicit_promotions_from(1).await;
+
+        for _ in 0..25 {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            assert!(
+                node0.promotion_epoch.lock().unwrap().get(&0).is_none(),
+                "the owner must NOT adopt an epoch from a node that only has a stale map \
+                 entry and does not actually raft-lead the partition"
+            );
+        }
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leadership_handoff_transfers_a_partition_back_to_the_returning_owner() {
+        // The leadership hand-off (NANOBPMN_RECLAIM_HANDOFF): when a rejoining owner
+        // reclaims a partition led by a reachable failover incumbent, the incumbent
+        // hands leadership back via an openraft membership change — ONE raft lineage
+        // throughout — instead of the owner forming a competing group. This proves
+        // the end-to-end incumbent path: add the owner as a learner, catch it up,
+        // change_membership the vote to it, step down, and advance the epoch fence.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // node 1 is the failover incumbent: it genuinely raft-leads partition 0 at
+        // epoch 1 (node 0, the static owner, is treated as having been down). The
+        // promote broadcast pulls node 0 in as a receiver of node 1's group.
+        assert_eq!(node1.next_promotion_epoch(0), 1);
+        node1.promote_partition(0, 1).await;
+        let mut leads = false;
+        for _ in 0..300 {
+            if node1.i_lead_raft(0) {
+                leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leads, "the incumbent genuinely raft-leads partition 0");
+
+        // The returning owner requests the hand-off (simulated: invoke the
+        // incumbent's request handler directly with node 0 as the requester).
+        let owner_addr = node0
+            .engine
+            .topology()
+            .peer_addr(0)
+            .expect("node 0 has an address")
+            .to_string();
+        node1.handle_handoff_request(0, 0, owner_addr).await;
+
+        // The owner ends up the sole voter/leader of partition 0.
+        let mut owner_leads = false;
+        for _ in 0..400 {
+            if node0.i_lead_raft(0) {
+                owner_leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            owner_leads,
+            "the returning owner leads partition 0 after the hand-off"
+        );
+
+        // The incumbent stepped down (no longer raft-leads) and both nodes fence at
+        // (incumbent_epoch + 1, owner) so a stale promote can't undo the transfer.
+        assert!(
+            !node1.i_lead_raft(0),
+            "the incumbent stepped down to a learner after handing off"
+        );
+        assert_eq!(
+            node1.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((2, 0)),
+            "the incumbent advanced its fence to (2, owner)"
+        );
+        let mut owner_fence = None;
+        for _ in 0..200 {
+            owner_fence = node0.promotion_epoch.lock().unwrap().get(&0).copied();
+            if owner_fence == Some((2, 0)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            owner_fence,
+            Some((2, 0)),
+            "the owner adopted the (2, owner) fence from the hand-off completion"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn recovery_tick_hands_off_a_boot_deferred_partition_from_the_epoch_map() {
+        // Phase E (boot-as-receiver): a rejoining owner that deferred forming its own
+        // group for an owned partition (a peer leads it) is a RECEIVER — its local
+        // raft member has no `current_leader` yet, but the boot probe/solicit adopted
+        // the incumbent epoch into the app map. The recovery tick must derive the
+        // incumbent FROM THE MAP (not just local `current_leader`) and drive an
+        // openraft leadership hand-off, NOT self-promote a competing group (the
+        // two-lineage election war). This proves the recovery tick reclaims a
+        // boot-deferred partition end-to-end via hand-off, with no fresh self-promote.
+        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // node 1 is the failover incumbent: it genuinely raft-leads partition 0 at
+        // epoch 1 (node 0, the static owner, treated as having been down).
+        assert_eq!(node1.next_promotion_epoch(0), 1);
+        node1.promote_partition(0, 1).await;
+        let mut leads = false;
+        for _ in 0..300 {
+            if node1.i_lead_raft(0) {
+                leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(leads, "the incumbent genuinely raft-leads partition 0");
+
+        // The promote broadcast makes node 0 adopt (1,1) and rebuild as a receiver —
+        // exactly the Phase E boot-deferred state: node 0 does NOT lead partition 0,
+        // its map names the incumbent, and it never formed a competing group.
+        for _ in 0..300 {
+            if node0.promotion_epoch.lock().unwrap().get(&0).copied() == Some((1, 1)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            node0.promotion_epoch.lock().unwrap().get(&0).copied(),
+            Some((1, 1)),
+            "the returning owner adopted the incumbent epoch as a receiver"
+        );
+        assert!(
+            !node0.i_lead_raft(0),
+            "the returning owner is a receiver, not a competing leader, pre-reclaim"
+        );
+
+        // Drive node 0's recovery tick. With reclaim-via-handoff on, it derives the
+        // incumbent (node 1) from the map, requests the hand-off, and node 1 transfers
+        // leadership via an openraft membership change — no self-promote.
+        let mut state0 = RecoveryState::default();
+        let mut owner_leads = false;
+        for _ in 0..400 {
+            node0.leader_durable_recovery_tick(3, &mut state0).await;
+            if node0.i_lead_raft(0) {
+                owner_leads = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            owner_leads,
+            "the recovery tick reclaims the boot-deferred partition via hand-off"
+        );
+
+        // ONE lineage: the incumbent stepped down, and the fence advanced to
+        // (incumbent_epoch + 1, owner) — never a fresh self-promote at epoch 1.
+        assert!(
+            !node1.i_lead_raft(0),
+            "the incumbent stepped down to a learner after handing off"
+        );
+        assert_eq!(
+            node0
+                .promotion_epoch
+                .lock()
+                .unwrap()
+                .get(&0)
+                .map(|&(_, l)| l),
+            Some(0),
+            "the fence names the owner (node 0) as leader after the hand-off"
+        );
+        assert!(
+            node0
+                .promotion_epoch
+                .lock()
+                .unwrap()
+                .get(&0)
+                .map(|&(e, _)| e >= 2)
+                .unwrap_or(false),
+            "the owner reclaimed at incumbent_epoch + 1 (>= 2), not a fresh epoch-1 self-promote"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[test]
+    fn handoff_write_pause_parses_env_with_a_default_and_a_disable() {
+        use std::time::Duration;
+        // Absent / blank / non-numeric -> the on-by-default ceiling.
+        assert_eq!(
+            parse_handoff_write_pause(None),
+            Duration::from_millis(HANDOFF_WRITE_PAUSE_DEFAULT_MS),
+            "absent -> default (on by default)"
+        );
+        assert_eq!(
+            parse_handoff_write_pause(Some("   ")),
+            Duration::from_millis(HANDOFF_WRITE_PAUSE_DEFAULT_MS),
+            "blank -> default"
+        );
+        assert_eq!(
+            parse_handoff_write_pause(Some("nope")),
+            Duration::from_millis(HANDOFF_WRITE_PAUSE_DEFAULT_MS),
+            "non-numeric -> default"
+        );
+        // Explicit values, including 0 which disables the completion pause.
+        assert_eq!(
+            parse_handoff_write_pause(Some("500")),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            parse_handoff_write_pause(Some(" 1500 ")),
+            Duration::from_millis(1500),
+            "surrounding whitespace is trimmed"
+        );
+        assert_eq!(
+            parse_handoff_write_pause(Some("0")),
+            Duration::ZERO,
+            "0 disables the completion pause (Zeebe-style best-effort)"
+        );
+    }
+
+    #[test]
+    fn evaluate_catchup_succeeds_extends_on_progress_and_aborts_on_stall_or_ceiling() {
+        use std::time::{Duration, Instant};
+        let threshold = HANDOFF_LAG_THRESHOLD;
+        let stall = Duration::from_millis(8000);
+        let t0 = Instant::now();
+        let deadline = t0 + Duration::from_millis(30000);
+
+        // Caught up (lag within threshold) -> Done, regardless of matched.
+        {
+            let mut best = None;
+            let mut adv = t0;
+            assert_eq!(
+                evaluate_catchup(
+                    Some(threshold),
+                    Some(100),
+                    &mut best,
+                    &mut adv,
+                    t0,
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Done
+            );
+        }
+
+        // Snapshot install in flight (matched None, big lag): NOT stalled even far
+        // past the stall grace, because matching has not begun — bounded only by
+        // the absolute ceiling. This is the old-10s-cutoff bug the change fixes.
+        {
+            let mut best = None;
+            let mut adv = t0;
+            assert_eq!(
+                evaluate_catchup(
+                    Some(1_000_000),
+                    None,
+                    &mut best,
+                    &mut adv,
+                    t0 + Duration::from_millis(20000),
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Continue,
+                "a long-but-still-installing learner (matched None) is not killed early"
+            );
+        }
+
+        // Tail streaming: matched advances -> Continue, and last_advance resets so
+        // the stall clock restarts from each advance.
+        {
+            let mut best = Some(500u64);
+            let mut adv = t0;
+            let now = t0 + Duration::from_millis(7000);
+            assert_eq!(
+                evaluate_catchup(
+                    Some(200),
+                    Some(1200),
+                    &mut best,
+                    &mut adv,
+                    now,
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Continue
+            );
+            assert_eq!(best, Some(1200), "best matched advanced");
+            assert_eq!(adv, now, "the stall clock reset on the advance");
+        }
+
+        // Post-install stall: matched began (best is Some) but has not advanced for
+        // >= stall_grace -> abort EARLY (free the write-pause), before the ceiling.
+        {
+            let mut best = Some(1200u64);
+            let mut adv = t0;
+            assert_eq!(
+                evaluate_catchup(
+                    Some(200),
+                    Some(1200),
+                    &mut best,
+                    &mut adv,
+                    t0 + stall,
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Abort("learner catch-up stalled")
+            );
+        }
+
+        // Absolute ceiling wins even while matching (safety cap).
+        {
+            let mut best = Some(1200u64);
+            let mut adv = deadline; // "just advanced" — not a stall
+            assert_eq!(
+                evaluate_catchup(
+                    Some(200),
+                    Some(1201),
+                    &mut best,
+                    &mut adv,
+                    deadline,
+                    deadline,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Abort("learner catch-up ceiling exceeded")
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn handoff_lease_engages_create_gate_and_a_bounded_completion_pause() {
+        // The incumbent hand-off lease must engage BOTH the create write-gate and a
+        // bounded completion write-pause (ADR 0019). The create-gate holds for the
+        // whole lease (creates steer off the partition); the completion-pause is
+        // time-bounded by the pause ceiling and lifts on its own so job-mutation
+        // writes resume even if the lease lingers. Release clears both.
+        let (node0, _n1, _n2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Deterministic short pause so the test is fast and non-flaky. The pause is
+        // clamped up to the catch-up ceiling (so completions stay paused for the
+        // whole catch-up), so shrink the ceiling too or the 120ms pause would be
+        // raised to the 30s production ceiling and never lift inside the test.
+        let short = std::time::Duration::from_millis(120);
+        node0.set_handoff_catchup_ceiling_for_test(short);
+        node0.set_handoff_write_pause_for_test(short);
+
+        assert!(
+            !node0.handoff_write_gated(7),
+            "no gate before acquiring the lease"
+        );
+        assert!(
+            !node0.handoff_completion_paused(7),
+            "no pause before acquiring the lease"
+        );
+
+        assert!(
+            node0.acquire_handoff_lease(7),
+            "first acquire wins the lease"
+        );
+        assert!(
+            !node0.acquire_handoff_lease(7),
+            "a second concurrent hand-off for the same partition is declined"
+        );
+        assert!(
+            node0.handoff_write_gated(7),
+            "create-gate engaged while the lease is held"
+        );
+        assert!(
+            node0.handoff_completion_paused(7),
+            "completion-pause engaged inside the bounded window"
+        );
+
+        // After the bounded window the completion-pause lifts, but the create-gate
+        // (the lease) still holds until release.
+        tokio::time::sleep(short + std::time::Duration::from_millis(60)).await;
+        assert!(
+            !node0.handoff_completion_paused(7),
+            "completion-pause lifts once the bounded window elapses"
+        );
+        assert!(
+            node0.handoff_write_gated(7),
+            "the create-gate still holds until the lease is released"
+        );
+
+        node0.release_handoff_lease(7);
+        assert!(
+            !node0.handoff_write_gated(7),
+            "release lifts the create-gate"
+        );
+        assert!(
+            !node0.handoff_completion_paused(7),
+            "release lifts the completion-pause"
+        );
+
+        for h in handles.drain(..) {
+            h.abort();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn leader_durable_split_brain_reconverges_to_one_leader_via_epoch_tiebreak() {
         // A symmetric multi-way split can make TWO survivors each self-promote the
         // same leaderless partition at the SAME epoch (each isolated from the other,
@@ -15836,10 +18054,8 @@ mod clustered_startup_tests {
         // Drive recovery on both: each promotes partition 0 at epoch 1. (Broadcasts
         // can't cross the split — the peers are fault-injected down — so no
         // cross-delivery happens yet; both end up leaders. That is the split-brain.)
-        let mut m1 = std::collections::HashMap::new();
-        let mut m2 = std::collections::HashMap::new();
-        let mut est1 = std::collections::HashSet::new();
-        let mut est2 = std::collections::HashSet::new();
+        let mut state1 = RecoveryState::default();
+        let mut state2 = RecoveryState::default();
         let leads = |node: &ServerImpl, who: u64| -> bool {
             node.raft_registry()
                 .get(0)
@@ -15848,12 +18064,8 @@ mod clustered_startup_tests {
         };
         let mut both = false;
         for _ in 0..200 {
-            node1
-                .leader_durable_recovery_tick(1, &mut m1, &mut est1)
-                .await;
-            node2
-                .leader_durable_recovery_tick(1, &mut m2, &mut est2)
-                .await;
+            node1.leader_durable_recovery_tick(1, &mut state1).await;
+            node2.leader_durable_recovery_tick(1, &mut state2).await;
             if leads(&node1, 1) && leads(&node2, 2) {
                 both = true;
                 break;
@@ -15957,17 +18169,14 @@ mod clustered_startup_tests {
         node0.peers.fail_node(1).await;
         node0.peers.fail_node(2).await;
 
-        let mut misses = std::collections::HashMap::new();
-        let mut established = std::collections::HashSet::new();
+        let mut state = RecoveryState::default();
         for _ in 0..50 {
-            node0
-                .leader_durable_recovery_tick(1, &mut misses, &mut established)
-                .await;
+            node0.leader_durable_recovery_tick(1, &mut state).await;
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
 
         assert!(
-            !established.contains(&1),
+            !state.established.contains(&1),
             "a never-led partition is never marked established"
         );
         assert!(

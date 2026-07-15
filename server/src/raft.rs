@@ -53,8 +53,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Debug;
+use std::io::Write as _;
 use std::ops::RangeBounds;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -366,6 +367,94 @@ struct StoredSnapshot {
     path: PathBuf,
 }
 
+/// The durable pointer to a partition's current snapshot, persisted next to the
+/// snapshot `.bin` as `current-snapshot.json`.
+///
+/// # Why this exists (the rejoin-brick bug)
+///
+/// By the Raft model the log is the source of truth, and boot used to rebuild
+/// engine state by replaying the *full* durable log — so it unconditionally
+/// deleted every on-disk snapshot as dead. That is only sound while the log is
+/// never compacted. But openraft snapshots then **purges** the log (persisting a
+/// `last_purged` marker and dropping every covered entry). After a purge the
+/// snapshot is the ONLY source for the `[0, last_purged]` prefix; deleting it on
+/// the next boot left openraft with a `last_purged` marker but no snapshot and no
+/// entries below it, so hosting the partition failed with a degenerate
+/// `expected [0, N), got [None, None)` log read and the partition never formed
+/// its group (received zero traffic thereafter).
+///
+/// The pointer is written atomically once the `.bin` is fsync'd and **before**
+/// openraft is allowed to purge the log the snapshot subsumes, so a restart can
+/// always restore the exact state a subsequent purge relied on.
+#[derive(Serialize, Deserialize)]
+struct PersistedSnapshotPtr {
+    /// File name (not the full path) of the current snapshot `.bin`, resolved
+    /// against the snapshot dir so the pointer survives a data-dir move.
+    file: String,
+    last_log_id: Option<LogId<NodeId>>,
+    last_membership: StoredMembership<NodeId, BasicNode>,
+    snapshot_id: String,
+}
+
+fn snapshot_ptr_path(dir: &Path) -> PathBuf {
+    dir.join("current-snapshot.json")
+}
+
+/// Atomically persist the current-snapshot pointer (temp write + fsync + rename +
+/// directory fsync) so it is crash-durable before the caller returns.
+fn write_snapshot_ptr(dir: &Path, stored: &StoredSnapshot) -> std::io::Result<()> {
+    let file = stored
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "snapshot path has no file name",
+            )
+        })?
+        .to_string();
+    let ptr = PersistedSnapshotPtr {
+        file,
+        last_log_id: stored.meta.last_log_id,
+        last_membership: stored.meta.last_membership.clone(),
+        snapshot_id: stored.meta.snapshot_id.clone(),
+    };
+    let bytes = serde_json::to_vec(&ptr)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = dir.join(format!("current-snapshot.json.tmp-{}", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, snapshot_ptr_path(dir))?;
+    // fsync the directory so the rename (and any preceding unlink) is durable.
+    if let Ok(dirf) = std::fs::File::open(dir) {
+        let _ = dirf.sync_all();
+    }
+    Ok(())
+}
+
+/// Read the durable current-snapshot pointer, returning the [`StoredSnapshot`] it
+/// names iff the referenced `.bin` is physically present.
+fn read_snapshot_ptr(dir: &Path) -> Option<StoredSnapshot> {
+    let bytes = std::fs::read(snapshot_ptr_path(dir)).ok()?;
+    let ptr: PersistedSnapshotPtr = serde_json::from_slice(&bytes).ok()?;
+    let path = dir.join(&ptr.file);
+    if !path.is_file() {
+        return None;
+    }
+    Some(StoredSnapshot {
+        meta: SnapshotMeta {
+            last_log_id: ptr.last_log_id,
+            last_membership: ptr.last_membership,
+            snapshot_id: ptr.snapshot_id,
+        },
+        path,
+    })
+}
+
 /// Metadata held by the Raft state machine: the last applied log id and
 /// membership. The materialized engine state itself lives on the partition's
 /// [`DeepthiHandle`] (driven by [`apply`](RaftStateMachine::apply)) and is
@@ -428,14 +517,22 @@ impl PartitionStateMachine {
         leader: Arc<AtomicU64>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&snapshot_dir)?;
-        // Clear any stale snapshot files left by a previous process: on boot the
-        // engine state is reconstructed by replaying the durable log (or a fresh
-        // network install), and `current_snapshot` starts empty, so any file on
-        // disk here is dead. Removing it also reconciles a crash mid-install that
-        // left an orphan `incoming-*` file.
+        // Restore from the durable current-snapshot pointer if one is present.
+        // Once the log has been compacted (openraft persists a `last_purged`
+        // marker and drops the covered entries), the snapshot is the ONLY source
+        // for the purged prefix; deleting it here — as this used to
+        // unconditionally do — bricks the partition on restart (it fails to host
+        // with a degenerate `[0, N)` log read; see [`PersistedSnapshotPtr`]). So
+        // keep the pointed-at snapshot, adopt its applied metadata, and garbage
+        // collect only the OTHER (stale / orphan `incoming-*`) snapshot files.
+        let restored = read_snapshot_ptr(&snapshot_dir);
+        let keep = restored.as_ref().map(|s| s.path.clone());
         if let Ok(entries) = std::fs::read_dir(&snapshot_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
+                if keep.as_deref() == Some(path.as_path()) {
+                    continue;
+                }
                 let ours = path
                     .file_name()
                     .and_then(|n| n.to_str())
@@ -446,16 +543,25 @@ impl PartitionStateMachine {
                 }
             }
         }
+        if restored.is_none() {
+            // No durable snapshot: the pointer (if any) is dead — drop it so a
+            // later successful build writes a clean one.
+            let _ = std::fs::remove_file(snapshot_ptr_path(&snapshot_dir));
+        }
+        let (last_applied, last_membership) = restored
+            .as_ref()
+            .map(|s| (s.meta.last_log_id, s.meta.last_membership.clone()))
+            .unwrap_or_else(|| (None, StoredMembership::default()));
         Ok(Self {
             engine,
             inner: Mutex::new(SmMeta {
                 partition_id,
-                last_applied: None,
-                last_membership: StoredMembership::default(),
+                last_applied,
+                last_membership,
             }),
             snapshot_idx: AtomicU64::new(0),
             recv_idx: AtomicU64::new(0),
-            current_snapshot: Mutex::new(None),
+            current_snapshot: Mutex::new(restored),
             snapshot_dir,
             node_id,
             evict_eligible,
@@ -472,7 +578,7 @@ impl PartitionStateMachine {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!(
-            "nanobpmn-raftsnap-{}-p{partition_id}-{nanos}",
+            "{RAFT_SNAPSHOT_DIR_PREFIX}{}-p{partition_id}-{nanos}",
             std::process::id()
         ))
     }
@@ -489,6 +595,94 @@ impl PartitionStateMachine {
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )
+    }
+
+    /// Restore the engine to the state captured by the durable current snapshot,
+    /// if any. Called once at boot (from
+    /// [`bootstrap_member`](RaftPartition::bootstrap_member)) BEFORE the openraft
+    /// [`Raft`](openraft::Raft) is constructed, so the state machine already
+    /// carries the snapshot's applied metadata (adopted in [`new`](Self::new))
+    /// and openraft only has to replay the post-snapshot log tail on top. A no-op
+    /// when there is no durable snapshot (the unpurged log replays in full, the
+    /// original recovery path).
+    async fn restore_from_current_snapshot(&self) -> anyhow::Result<()> {
+        let path = {
+            let guard = self.current_snapshot.lock().unwrap();
+            match guard.as_ref() {
+                Some(s) => s.path.clone(),
+                None => return Ok(()),
+            }
+        };
+        let captured: nanobpmn_engine_core::EngineSnapshot =
+            tokio::task::spawn_blocking(move || -> std::io::Result<_> {
+                let f = std::fs::File::open(&path)?;
+                serde_json::from_reader(std::io::BufReader::new(f))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })
+            .await??;
+        self.engine
+            .with(move |journal| {
+                *journal = Journal::in_memory_from_snapshot(captured);
+            })
+            .await;
+        Ok(())
+    }
+}
+
+/// Filename prefix for the per-process, per-partition snapshot staging dirs a
+/// volatile-log member anchors its snapshots under (see
+/// [`PartitionStateMachine::temp_snapshot_dir`]). Shared with
+/// [`sweep_orphaned_snapshot_dirs`] so creation and cleanup never drift.
+const RAFT_SNAPSHOT_DIR_PREFIX: &str = "nanobpmn-raftsnap-";
+
+/// Whether `pid` names a live process. Linux-only signal via `/proc/<pid>`; on
+/// other platforms (dev/test) we conservatively report "alive" so the sweep
+/// never removes a dir it cannot prove is orphaned.
+fn pid_is_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    } else {
+        true
+    }
+}
+
+/// Remove orphaned per-process snapshot staging dirs left in the system temp dir
+/// by dead nano processes. Each volatile-log (receiver / failover) member anchors
+/// its snapshots under `nanobpmn-raftsnap-<pid>-p<part>-<ts>`; a member rebuild
+/// (new ts) or a process restart (new pid) orphans the old dir, and an aborted
+/// `InstallSnapshot` can leave a multi-GB partial inside it. Nothing else ever
+/// reclaims them, so across restarts they can fill the disk (observed: 175+ GB on
+/// a soak node, tripping the deploy disk preflight). Swept once at raft bootstrap:
+/// a dir is removed only when its embedded pid is neither this process nor a live
+/// one, so a co-located nano instance is never disturbed.
+pub fn sweep_orphaned_snapshot_dirs() {
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(RAFT_SNAPSHOT_DIR_PREFIX))
+            .and_then(|rest| rest.split('-').next())
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me || pid_is_alive(pid) {
+            continue;
+        }
+        let path = entry.path();
+        tracing::info!(
+            ?path,
+            orphaned_pid = pid,
+            "reclaiming orphaned raft snapshot staging dir"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 }
 
@@ -541,16 +735,19 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         file.sync_all()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
 
+        // Record the durable pointer to this snapshot BEFORE anything unlinks the
+        // one it replaces AND before build_snapshot returns: openraft may purge
+        // the log this snapshot subsumes as soon as it returns, so a restartable
+        // recovery point must already be on disk (see [`PersistedSnapshotPtr`]).
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            path: path.clone(),
+        };
+        write_snapshot_ptr(&self.sm.snapshot_dir, &stored)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+
         // Publish as the current snapshot and unlink the file it replaces.
-        let previous = self
-            .sm
-            .current_snapshot
-            .lock()
-            .unwrap()
-            .replace(StoredSnapshot {
-                meta: meta.clone(),
-                path: path.clone(),
-            });
+        let previous = self.sm.current_snapshot.lock().unwrap().replace(stored);
         if let Some(previous) = previous.filter(|p| p.path != path) {
             let _ = std::fs::remove_file(&previous.path);
         }
@@ -707,6 +904,24 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<Box<SnapshotFile>, StorageError<NodeId>> {
+        // Reclaim any orphaned partials from previously-aborted installs in this
+        // dir before starting a fresh receive. openraft never resumes a prior
+        // `begin_receiving_snapshot` file, so any leftover `incoming-*.tmp` is dead
+        // weight: under a catch-up-timeout retry loop (ADR 0019 snapshot churn)
+        // each aborted InstallSnapshot would otherwise leave a multi-GB partial
+        // behind, and they accumulate until the disk fills. Sweeping here bounds
+        // the in-flight partials for this partition to one.
+        if let Ok(entries) = std::fs::read_dir(&self.snapshot_dir) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with("incoming-"))
+                {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
         // A fresh, empty on-disk file that openraft streams the incoming snapshot
         // chunks into (AsyncWrite + AsyncSeek), so the receiving side never buffers
         // the whole snapshot in RAM either.
@@ -772,14 +987,20 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
             .join(format!("snap-installed-{snapshot_idx}.bin"));
         std::fs::rename(&path, &current_path)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
-        let previous = self
-            .current_snapshot
-            .lock()
-            .unwrap()
-            .replace(StoredSnapshot {
-                meta: meta.clone(),
-                path: current_path,
-            });
+        // fsync the promoted file, then record it as the durable current snapshot
+        // BEFORE unlinking the one it replaces — an installed snapshot is just as
+        // much a restart recovery point as a locally-built one, and the log store
+        // will purge below it (see [`PersistedSnapshotPtr`]).
+        if let Ok(f) = std::fs::File::open(&current_path) {
+            let _ = f.sync_all();
+        }
+        let stored = StoredSnapshot {
+            meta: meta.clone(),
+            path: current_path,
+        };
+        write_snapshot_ptr(&self.snapshot_dir, &stored)
+            .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        let previous = self.current_snapshot.lock().unwrap().replace(stored);
         if let Some(previous) = previous {
             let _ = std::fs::remove_file(&previous.path);
         }
@@ -896,6 +1117,19 @@ fn raft_config(partition_id: u64) -> Config {
         // catches up from the (lean) snapshot, which for big payloads is cheaper
         // than shipping the retained log tail.
         max_in_snapshot_log_to_keep: raft_env_u64("NANOBPMN_RAFT_KEEP_LOGS", 1000),
+        // Retention accelerator for the reclaim hand-off (ADR 0019): retain up to
+        // this many extra already-snapshotted entries when a replication target is
+        // behind, so a returning owner (added as a learner on rejoin) catches up by
+        // STREAMING the retained tail instead of installing a full state-machine
+        // snapshot — which under sustained load cannot finish inside the hand-off
+        // catch-up window, so the transfer would otherwise only complete once load
+        // eased. Bounded, so a stuck/dead target cannot pin the log without bound.
+        // `0` disables it (pure `max_in_snapshot_log_to_keep` purging). Sized to
+        // cover a realistic rejoin gap (downtime × per-partition write rate); under
+        // large variable payloads a deployment should shrink it (each retained
+        // entry can be ~1 MB), trading a snapshot install for retained-log memory.
+        // (`NANOBPMN_RAFT_LAGGING_RETAIN`, default 400_000.)
+        max_extra_log_to_keep_for_lagging: raft_env_u64("NANOBPMN_RAFT_LAGGING_RETAIN", 400_000),
         // Cap on entries coalesced into one AppendEntries RPC. openraft's default
         // is 300; combined with large (50 KB-variable) batched entries a single
         // catch-up RPC would carry hundreds of MB and blow the ~250 ms
@@ -1249,6 +1483,13 @@ impl RaftPartition {
             evict_eligible,
             leader.clone(),
         )?);
+        // Restore the engine from the durable current snapshot (if any) BEFORE
+        // openraft is constructed: with a compacted log the snapshot holds the
+        // purged prefix, and the state machine already carries its applied
+        // metadata, so openraft's `get_initial_state` reconciles cleanly and only
+        // replays the post-snapshot log tail. Without this a rejoining node whose
+        // log was purged fails to host the partition entirely.
+        state_machine.restore_from_current_snapshot().await?;
         let network = PartitionNetwork::new(transport, partition_id);
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
@@ -1321,6 +1562,88 @@ impl RaftPartition {
         }
     }
 
+    /// Adds `node` as a learner and **blocks until it has caught up** to the
+    /// leader's log (openraft `blocking = true`), so a subsequent
+    /// [`change_voters_to`](Self::change_voters_to) that promotes it to voter
+    /// won't stall the group on a lagging replica. Used by the leadership
+    /// hand-off: the incumbent leader brings the returning owner fully in sync
+    /// as a learner BEFORE transferring the voting membership to it.
+    ///
+    /// CAUTION: under a sustained high write rate the learner may never catch up
+    /// (the log grows faster than replication) and this call can block
+    /// indefinitely — callers MUST wrap it in a timeout and quiesce writes for
+    /// the partition while it runs (the Phase C hand-off write-gate). Idempotent
+    /// against an already-present member.
+    pub async fn add_learner_blocking(
+        &self,
+        node_id: NodeId,
+        node: BasicNode,
+    ) -> anyhow::Result<()> {
+        match self.raft.add_learner(node_id, node, true).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.to_string().contains("already") => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("add_learner_blocking({node_id}): {e}")),
+        }
+    }
+
+    /// Replaces this group's voting membership with exactly `voters` (openraft
+    /// `change_membership(ReplaceAllVoters, retain = true)`). Every current voter
+    /// NOT in `voters` is demoted to a **learner** (retained, not removed), and
+    /// if the current leader is among the demoted it steps down — this is how the
+    /// hand-off transfers leadership to the returning owner without ever forming
+    /// a competing group. Every id in `voters` MUST already be a learner of this
+    /// group (call [`add_learner_blocking`](Self::add_learner_blocking) first) or
+    /// openraft rejects it with `LearnerNotFound`.
+    ///
+    /// CAUTION: openraft commits this as a two-step joint change; if the leader
+    /// loses leadership or crashes between the joint and the final uniform commit
+    /// the group is left in the JOINT config (needs a quorum of BOTH the old and
+    /// new voter sets). Callers must treat a mid-flight failure as "joint
+    /// suspected" and NOT fall back to forming a fresh competing group (Phase D).
+    pub async fn change_voters_to(&self, voters: Vec<NodeId>) -> anyhow::Result<()> {
+        self.raft
+            .change_membership(voters, true)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("change_voters_to: {e}"))
+    }
+
+    /// The replication lag (in log entries) of learner/voter `node_id` behind
+    /// this leader's last log index, or `None` if we are not the leader or have
+    /// no replication record for `node_id` yet. Used by the hand-off to poll a
+    /// learner toward zero lag before promoting it to voter. Cheap: reads the
+    /// openraft metrics watch.
+    pub fn replication_lag(&self, node_id: NodeId) -> Option<u64> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        if m.state != openraft::ServerState::Leader {
+            return None;
+        }
+        let last = m.last_log_index.unwrap_or(0);
+        let repl = m.replication.as_ref()?;
+        let matched = repl.get(&node_id)?.as_ref().map(|l| l.index).unwrap_or(0);
+        Some(last.saturating_sub(matched))
+    }
+
+    /// The matched log index of learner/voter `node_id` on this leader — how far
+    /// replication (log stream or a completed snapshot install) has durably
+    /// carried it — or `None` if we are not the leader, have no replication
+    /// record yet, or the target has matched nothing (a snapshot install still in
+    /// flight reports `None` here until it lands). Distinct from
+    /// [`replication_lag`](Self::replication_lag): the hand-off catch-up watches
+    /// this to tell a learner that is genuinely *advancing* (extend the deadline)
+    /// from one that has *stalled* (abort early) — lag alone can't, since under a
+    /// moving log head a steadily-catching-up learner shows constant lag.
+    pub fn learner_matched(&self, node_id: NodeId) -> Option<u64> {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        if m.state != openraft::ServerState::Leader {
+            return None;
+        }
+        let repl = m.replication.as_ref()?;
+        repl.get(&node_id)?.as_ref().map(|l| l.index)
+    }
+
     /// Replicates `command` (stamped with `now`) through the Raft log and applies
     /// it once committed, returning the events it produced. At RF=1 this commits
     /// as soon as the local log write lands. Routed through the per-partition
@@ -1355,6 +1678,17 @@ impl RaftPartition {
     /// volatile (in-memory-log) partition. Read by the compaction governor.
     pub fn log_bytes(&self) -> i64 {
         self.log_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Whether this group's committed membership is a JOINT config (more than one
+    /// voter set) — the transient two-config state openraft passes through during
+    /// `change_membership`. A hand-off that fails while joint means the transfer
+    /// may be half-applied (needs a quorum of BOTH sets), so the requester must not
+    /// fall back to forming a competing group. Read from the metrics watch.
+    pub fn in_joint_config(&self) -> bool {
+        let metrics = self.raft.metrics();
+        let m = metrics.borrow();
+        m.membership_config.membership().get_joint_config().len() > 1
     }
 
     /// Applied-log index and the index the last local snapshot covers, for the
@@ -1750,6 +2084,93 @@ mod tests {
             "nanobpmn-raftlog-{}-{tag}-{nanos}",
             std::process::id()
         ))
+    }
+
+    /// A rejoining node whose log was compacted must restore engine state from the
+    /// durable snapshot instead of deleting it. Regression for the rejoin-brick
+    /// bug: boot used to unconditionally delete every on-disk snapshot and rebuild
+    /// state by full log replay, so once the log was purged the deleted snapshot
+    /// was the only source for the purged prefix and the partition failed to host
+    /// (`expected [0, N), got [None, None)`). The durable current-snapshot pointer
+    /// now survives the reboot, its applied metadata is adopted, and the engine is
+    /// restored from it.
+    #[tokio::test]
+    async fn boot_restores_engine_from_the_durable_snapshot_instead_of_deleting_it() {
+        use openraft::CommittedLeaderId;
+        let snap_dir = unique_log_dir("snap-reboot").join("snapshots");
+
+        // Boot 1: a state machine over an engine that has a deployed process.
+        // Simulate an applied index (as openraft's `apply` would), then snapshot —
+        // which writes the `.bin` AND the durable current-snapshot pointer.
+        let applied = LogId::new(CommittedLeaderId::new(1, 0), 42);
+        {
+            let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+            src.with(|j| {
+                let _ = j.apply_command_at(deploy_command(), 1).expect("deploy");
+            })
+            .await;
+            let mut src_sm: Arc<PartitionStateMachine> = Arc::new(
+                PartitionStateMachine::new(
+                    src,
+                    0,
+                    snap_dir.clone(),
+                    0,
+                    false,
+                    Arc::new(AtomicU64::new(u64::MAX)),
+                )
+                .expect("state machine"),
+            );
+            src_sm.inner.lock().unwrap().last_applied = Some(applied);
+            let mut builder = src_sm.get_snapshot_builder().await;
+            let _ = builder.build_snapshot().await.expect("build snapshot");
+        }
+
+        // The durable pointer and the snapshot body it names are both on disk.
+        assert!(
+            snapshot_ptr_path(&snap_dir).is_file(),
+            "the current-snapshot pointer is persisted"
+        );
+
+        // Boot 2: a BRAND-NEW, EMPTY engine + state machine reopens the same
+        // snapshot dir (the rejoin). The old code would delete the snapshot here.
+        let dst = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
+        assert!(
+            dst.with(|j| j.state().processes.is_empty()).await,
+            "the fresh engine starts empty"
+        );
+        let dst_sm: Arc<PartitionStateMachine> = Arc::new(
+            PartitionStateMachine::new(
+                dst.clone(),
+                0,
+                snap_dir.clone(),
+                0,
+                false,
+                Arc::new(AtomicU64::new(u64::MAX)),
+            )
+            .expect("reopen state machine"),
+        );
+
+        // The snapshot was RETAINED (not deleted) and its applied metadata adopted.
+        assert!(
+            read_snapshot_ptr(&snap_dir).is_some(),
+            "the snapshot survived the reboot"
+        );
+        let (last_applied, _) = dst_sm.clone().applied_state().await.expect("applied state");
+        assert_eq!(
+            last_applied,
+            Some(applied),
+            "boot adopts the snapshot's applied index (so openraft only replays the tail)"
+        );
+
+        // Restoring seeds the fresh engine with the snapshotted state.
+        dst_sm
+            .restore_from_current_snapshot()
+            .await
+            .expect("restore from snapshot");
+        assert!(
+            !dst.with(|j| j.state().processes.is_empty()).await,
+            "the deployed process is recovered from the snapshot, not from a (purged) log"
+        );
     }
 
     #[tokio::test]

@@ -194,17 +194,19 @@ fn decode_segment_bytes(path: &Path) -> io::Result<Vec<u8>> {
             }
             i = end;
         } else {
-            // Legacy plaintext record: copy through the next newline (inclusive),
-            // or to end-of-file for an unterminated (torn) trailing line.
+            // Legacy plaintext record: copy through the next newline (inclusive).
+            // An unterminated trailing line is a crash mid-append that was never
+            // newline-terminated — hence never fsynced/acked — so it is dropped,
+            // matching the torn-frame contract above and the writer's
+            // ack-after-write-before-fsync durability contract. Copying it through
+            // would hand a truncated JSON record to the segment reader and panic
+            // boot recovery ("EOF while parsing a string").
             match raw[i..].iter().position(|&b| b == b'\n') {
                 Some(nl) => {
                     out.extend_from_slice(&raw[i..=i + nl]);
                     i += nl + 1;
                 }
-                None => {
-                    out.extend_from_slice(&raw[i..]);
-                    break;
-                }
+                None => break,
             }
         }
     }
@@ -617,20 +619,46 @@ fn list_sealed(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(segs)
 }
 
+/// Index of the last line that carries content (any non-whitespace, non-NUL
+/// byte), or `None` when every line is blank. Only this final line may be a torn
+/// tail — a crash mid-append can leave an unterminated record or NUL padding at
+/// end-of-file — so segment readers tolerate a parse failure *there* (dropping
+/// it) while still hard-erroring on genuine mid-file corruption.
+fn last_content_line(lines: &[&[u8]]) -> Option<usize> {
+    lines
+        .iter()
+        .rposition(|l| l.iter().any(|&b| b != 0 && !b.is_ascii_whitespace()))
+}
+
 /// Reads and deserializes every event from a single segment/log file (empty if
 /// absent).
 pub fn read_segment_events(path: &Path) -> io::Result<Vec<Event>> {
     let mut events = Vec::new();
     if path.exists() {
         let decoded = decode_segment_bytes(path)?;
-        for line in decoded.split(|&b| b == b'\n') {
-            let line = std::str::from_utf8(line)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let lines: Vec<&[u8]> = decoded.split(|&b| b == b'\n').collect();
+        let last = last_content_line(&lines);
+        for (idx, line) in lines.iter().enumerate() {
+            let torn_tail = Some(idx) == last;
+            let line = match std::str::from_utf8(line) {
+                Ok(s) => s,
+                Err(e) if torn_tail => {
+                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
+                    break;
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            };
             if line.trim().is_empty() {
                 continue;
             }
-            let event: Event = serde_json::from_str(line)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let event: Event = match serde_json::from_str(line) {
+                Ok(ev) => ev,
+                Err(e) if torn_tail => {
+                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
+                    break;
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            };
             events.push(event);
         }
     }
@@ -649,9 +677,18 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
     let mut events = Vec::new();
     if path.exists() {
         let decoded = decode_segment_bytes(path)?;
-        for line in decoded.split(|&b| b == b'\n') {
-            let line = std::str::from_utf8(line)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let lines: Vec<&[u8]> = decoded.split(|&b| b == b'\n').collect();
+        let last = last_content_line(&lines);
+        for (idx, line) in lines.iter().enumerate() {
+            let torn_tail = Some(idx) == last;
+            let line = match std::str::from_utf8(line) {
+                Ok(s) => s,
+                Err(e) if torn_tail => {
+                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
+                    break;
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -659,8 +696,14 @@ fn read_segment_events_tagged(path: &Path, num_partitions: usize) -> io::Result<
                 Some((t, rest)) => (t.parse::<u64>().ok(), rest),
                 None => (None, line),
             };
-            let event: Event = serde_json::from_str(json)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let event: Event = match serde_json::from_str(json) {
+                Ok(ev) => ev,
+                Err(e) if torn_tail => {
+                    tracing::warn!("dropping torn journal tail in {}: {e}", path.display());
+                    break;
+                }
+                Err(e) => return Err(io::Error::new(io::ErrorKind::InvalidData, e)),
+            };
             let tag = tag.unwrap_or_else(|| {
                 (partition_of(event.max_key()) as usize).min(num_partitions.saturating_sub(1))
                     as u64
@@ -1978,6 +2021,96 @@ mod tests {
             decode_segment_bytes(&active_path).unwrap(),
             lines,
             "compressed active segment decodes byte-for-byte to the plaintext batch"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A crash mid-append of a plaintext batch leaves the final record without a
+    /// terminating newline. `decode_segment_bytes` drops that torn tail (never
+    /// hands a truncated line to the reader) and keeps the durable prefix.
+    #[test]
+    fn journal_decode_drops_a_torn_plaintext_tail() {
+        let dir = temp_dir("plain-torn");
+        fs::create_dir_all(&dir).unwrap();
+
+        let durable = b"0\t{\"seq\":\"one\"}\n0\t{\"seq\":\"two\"}\n".to_vec();
+        let mut file = durable.clone();
+        // Unterminated (torn) trailing line — no `\n`.
+        file.extend_from_slice(b"0\t{\"seq\":\"tor");
+
+        let path = dir.join("torn-plain.jsonl");
+        fs::write(&path, &file).unwrap();
+        assert_eq!(
+            decode_segment_bytes(&path).unwrap(),
+            durable,
+            "durable prefix survives, torn unterminated line dropped"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Boot recovery must never panic on a torn journal tail. Both a truncated
+    /// final record and NUL padding at end-of-file (a preallocated file killed
+    /// mid-write) recover the durable prefix instead of erroring — but genuine
+    /// corruption before the final line still errors.
+    #[test]
+    fn read_segment_tolerates_torn_and_nul_padded_tail() {
+        let dir = temp_dir("seg-torn-tail");
+        fs::create_dir_all(&dir).unwrap();
+
+        // Mint two real events so the reader exercises the true JSON shape.
+        let mut j = crate::journal::Journal::in_memory_partition(0);
+        let (deploy, _) = j.apply_command(Command::DeployProcess(demo())).unwrap();
+        let (create, _) = j
+            .apply_command(Command::create_instance_with(
+                "demo",
+                std::collections::HashMap::new(),
+            ))
+            .unwrap();
+        let mut good = Vec::new();
+        let mut n: u64 = 0;
+        for e in deploy.iter().chain(create.iter()) {
+            good.extend_from_slice(serde_json::to_string(e).unwrap().as_bytes());
+            good.push(b'\n');
+            n += 1;
+        }
+
+        // Case 1: truncated final record (no newline).
+        let mut torn = good.clone();
+        torn.extend_from_slice(br#"{"CreateInstance":{"process":"de"#);
+        let p1 = dir.join("torn.jsonl");
+        fs::write(&p1, &torn).unwrap();
+        assert_eq!(
+            read_segment_events(&p1).unwrap().len() as u64,
+            n,
+            "truncated tail dropped, durable events recovered"
+        );
+
+        // Case 2: a fully newline-terminated but unparseable final line — the
+        // shape a torn write leaves when reused-block garbage contains a `\n`, so
+        // it survives `decode_segment_bytes` and must be dropped by the reader.
+        let mut garbage = good.clone();
+        garbage.extend_from_slice(b"}\x00torngarbage{not-json\n");
+        let p2 = dir.join("garbage.jsonl");
+        fs::write(&p2, &garbage).unwrap();
+        assert_eq!(
+            read_segment_events(&p2).unwrap().len() as u64,
+            n,
+            "terminated-but-unparseable tail dropped, durable events recovered"
+        );
+
+        // Case 3: corruption BEFORE the final valid line still errors — only the
+        // tail is allowed to be torn.
+        let mut mid_corrupt = Vec::new();
+        mid_corrupt.extend_from_slice(b"{ this is not valid json");
+        mid_corrupt.push(b'\n');
+        mid_corrupt.extend_from_slice(&good);
+        let p3 = dir.join("midcorrupt.jsonl");
+        fs::write(&p3, &mid_corrupt).unwrap();
+        assert!(
+            read_segment_events(&p3).is_err(),
+            "mid-file corruption is not silently dropped"
         );
 
         let _ = fs::remove_dir_all(&dir);
