@@ -1213,6 +1213,18 @@ fn raft_config(partition_id: u64) -> Config {
         // final install is slower per byte than raw transfer). Env-tunable.
         // (`NANOBPMN_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS`, 2s per chunk.)
         install_snapshot_timeout: raft_env_u64("NANOBPMN_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS", 2_000),
+        // Per-RPC AppendEntries timeout, DECOUPLED from `heartbeat_interval`.
+        // Upstream openraft times each AppendEntries out at one heartbeat (250ms
+        // here), so a follower that is alive but momentarily busy — e.g. node18
+        // just after it rejoins, simultaneously leading its own 4 partitions,
+        // following the other 8, and draining a large catch-up — cannot ack in
+        // time, and EVERY AppendEntries is aborted + re-sent. That retry storm
+        // (thousands/sec, seen as `timeout after 250ms when AppendEntries 0->2`)
+        // burns leader CPU and makes cluster throughput oscillate long after the
+        // node is otherwise healthy. Keep fast heartbeats (quick failover) but
+        // give each RPC a generous deadline so a loaded follower applies backlog
+        // instead of thrashing. (`NANOBPMN_RAFT_APPEND_ENTRIES_TIMEOUT_MS`, 1s.)
+        append_entries_timeout: raft_env_u64("NANOBPMN_RAFT_APPEND_ENTRIES_TIMEOUT_MS", 1_000),
         ..Default::default()
     }
 }

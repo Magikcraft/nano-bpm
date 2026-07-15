@@ -128,6 +128,19 @@ pub struct Config {
     #[clap(long, default_value = "50")]
     pub heartbeat_interval: u64,
 
+    /// The RPC timeout (milliseconds) for a single AppendEntries call.
+    ///
+    /// Upstream openraft hard-codes this to `heartbeat_interval`, which couples
+    /// the heartbeat CADENCE to the per-RPC DEADLINE: a follower that is alive
+    /// but momentarily busy (e.g. leading its own partitions + applying a large
+    /// catch-up while it rejoins under load) cannot ack within one heartbeat, so
+    /// every AppendEntries is aborted and re-sent — a retry storm that burns
+    /// leader CPU and makes cluster throughput oscillate. Decoupling lets a
+    /// deployment keep fast heartbeats (quick failover) while giving each RPC a
+    /// longer deadline.
+    #[clap(long, default_value = "1000")]
+    pub append_entries_timeout: u64,
+
     /// The timeout for sending then installing the last snapshot segment,
     /// in millisecond. It is also used as the timeout for sending a non-last segment, if
     /// `send_snapshot_timeout` is 0.
@@ -271,6 +284,12 @@ impl Config {
     /// Get the timeout for sending and installing the last snapshot segment.
     pub fn install_snapshot_timeout(&self) -> Duration {
         Duration::from_millis(self.install_snapshot_timeout)
+    }
+
+    /// Get the per-RPC AppendEntries timeout, decoupled from the heartbeat
+    /// cadence so a busy-but-alive follower is not guillotined at one heartbeat.
+    pub fn append_entries_timeout(&self) -> Duration {
+        Duration::from_millis(self.append_entries_timeout)
     }
 
     /// Get the timeout for sending a non-last snapshot segment.
