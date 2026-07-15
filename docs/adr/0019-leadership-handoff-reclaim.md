@@ -113,24 +113,44 @@ within `HANDOFF_LAG_THRESHOLD` (bounded by `HANDOFF_CATCHUP_TIMEOUT`) →
 the fence epoch to `(incumbent+1, node18)`. If the incumbent loses leadership mid-
 catch-up the hand-off aborts cleanly and node18 retries (part 2).
 
+**The returning owner must keep its receiver across retries.** When node18
+receives a hand-off ack it must *not* rebuild its member if it already hosts the
+partition as a non-leader (learner/follower): `rebuild_as_receiver` shuts the
+member down and re-bootstraps it with an empty log store, discarding everything
+the incumbent has already replicated. Rebuilding on every ~4 s retry reset the
+catch-up to zero each cycle, so it never converged (first-soak livelock). node18
+now rebuilds as a receiver **once** (only when it holds no member, or still leads
+a competing group) and thereafter keeps it, so replication accumulates across
+attempts.
+
 ### 4. Bounded per-partition write-pause during catch-up (accelerator, configurable)
 
-Under sustained load the incumbent's log can grow faster than the learner catches
-up, so the bounded catch-up never reaches zero lag and the hand-off keeps timing
-out (a livelock — the same dynamic as the original snapshot-install defensive bug,
-one layer up). To make the hand-off complete on the **first** attempt rather than
-waiting for a load lull, the incumbent applies a **brief, bounded, per-partition
-write-pause** for the target partition during catch-up so the log quiesces long
-enough for the learner to converge, then transfers and lifts the pause.
+Under sustained load the single-voter incumbent retains only ~1 s of log — it
+snapshots and **purges aggressively** (observed: `last_log − purged ≈ 1000`
+entries). A returning owner that missed tens of seconds is far outside that
+window, so it must catch up via a **full snapshot install**, not log streaming.
+While writes continue, the leader's snapshot point keeps advancing, so the
+learner re-snapshots forever and the catch-up livelocks — the lag never falls to
+`HANDOFF_LAG_THRESHOLD` because the head moves ~thousands of entries per second.
+(The mechanism is proven by the fact that node18 converges to the exact head
+within seconds the instant load subsides.)
 
-- Controlled by env var **`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`** (see the
-  implementation for the exact default); `0` disables the pause (pure Zeebe-style
-  best-effort). **On by default** initially, so reclaim is prompt out of the box;
-  we can dial it down once soaks confirm reliability.
-- Only the target partition is paused (~1/12th of cluster write traffic in the
-  12-partition topology), only during the sub-second-to-~2s hand-off, only on
-  rejoin. Paused creates steer to other owners; paused completions are retried by
-  workers (at-least-once), so no work is lost.
+The fix is a **per-partition completion write-pause** that freezes the log head
+for the **whole** catch-up attempt (`HANDOFF_WRITE_PAUSE_MS` is sized a hair above
+`HANDOFF_CATCHUP_TIMEOUT`), so the snapshot point stops moving, one snapshot
+install completes, the tail drains, and lag reaches zero. The catch-up window is
+sized to cover a snapshot install (seconds, not the original 4 s). The lease — and
+thus the pause — is released the instant the hand-off completes or aborts, so the
+real stall is only as long as the catch-up actually takes.
+
+- Controlled by env var **`NANOBPMN_HANDOFF_WRITE_PAUSE_MS`** (default sized to
+  cover the catch-up window; see the implementation); `0` disables the pause
+  (pure Zeebe-style best-effort). **On by default** initially, so reclaim is
+  prompt out of the box; we can dial it down once soaks confirm reliability.
+- Only the returning owner's partitions are paused (its share of cluster write
+  traffic), only during the hand-off, only on rejoin. Paused creates steer to
+  other owners; paused completions are retried by workers (at-least-once), so no
+  work is lost.
 - This is a *smaller* availability concession than Zeebe's leaderless-election
   window, and vastly cheaper than the status-quo 100k+ `leader_reject` storm.
 
@@ -142,7 +162,10 @@ enough for the learner to converge, then transfers and lifts the pause.
   terms stay flat. With the pause disabled, reclaim degrades gracefully to Zeebe-
   style best-effort (may wait for a lull) rather than storming.
 - **Bounded, deliberate write-pause** on the target partition during hand-off is
-  the price of promptness; it is env-tunable and defaults on.
+  the price of promptness; it is env-tunable and defaults on. It must span a full
+  snapshot install, so it is sized in seconds (≥ the catch-up window), not the
+  original sub-2 s guess — the aggressive single-voter log purge means anything
+  shorter cannot break the re-snapshot livelock under load.
 - **Default-off flag** keeps production byte-identical to the legacy self-promote
   reclaim until the phased soaks green-light enabling it by default.
 - **Correctness note (bounded loss):** discarding node18's divergent on-disk log
@@ -154,11 +177,15 @@ enough for the learner to converge, then transfers and lifts the pause.
 
 - Confirm via GCP soak (clean-journal restart) that parts 1–4 together yield:
   node18 creates climb, `leader_reject` flat, terms flat, hand-off **completes**
-  (no self-promote fallback), 0 panics / 0 restarts.
-- Tune the default `NANOBPMN_HANDOFF_WRITE_PAUSE_MS` from soak data (start
-  generous, tighten).
+  (no self-promote fallback), 0 panics / 0 restarts. *Soak progress:* the storm is
+  eliminated (leader_reject=0, self-promote=0, cluster stable); parts 3–4 iterated
+  to fix the catch-up livelock (stop wiping the receiver; freeze the head for a
+  whole snapshot install).
+- Tune the default `NANOBPMN_HANDOFF_WRITE_PAUSE_MS` / `HANDOFF_CATCHUP_TIMEOUT`
+  from soak data (start generous, tighten).
 - Phase D (harden the requester side: joint-config-aware fallback) remains pending
   per the phased plan.
 - Longer-term: whether to offer a multi-voter (quorum) reclaim path that avoids the
-  single-voter two-lineage hazard entirely, at the ADR 0003 latency cost — out of
-  scope here.
+  single-voter two-lineage hazard entirely, at the ADR 0003 latency cost — or to
+  soften the single-voter log-purge threshold during an active hand-off so the
+  learner can stream instead of re-snapshotting — out of scope here.

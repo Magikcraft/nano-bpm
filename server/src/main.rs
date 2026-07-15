@@ -1799,15 +1799,24 @@ struct HandoffPending {
 }
 
 /// Recovery-tick passes a returning owner waits for an in-flight hand-off before
-/// falling back to the legacy self-promote. At ~500 ms/pass this is ~6 s, safely
+/// falling back to the legacy self-promote. At ~500 ms/pass this is ~15 s, safely
 /// longer than the incumbent's learner catch-up ([`HANDOFF_CATCHUP_TIMEOUT`]) plus
-/// the membership change, so a working hand-off is never pre-empted.
-const HANDOFF_PENDING_TICKS: u32 = 12;
+/// the membership change, so a working hand-off is never pre-empted or resent
+/// mid-catch-up.
+const HANDOFF_PENDING_TICKS: u32 = 30;
 
 /// Max wall time the incumbent polls a hand-off learner toward zero replication
 /// lag before aborting (and letting the owner fall back to self-promote). Bounded
 /// so a learner that cannot catch up under load never blocks the hand-off forever.
-const HANDOFF_CATCHUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(4000);
+///
+/// Sized to cover ONE snapshot install: under sustained load the single-voter
+/// leader retains only ~1 s of log (it snapshots+purges aggressively), so a
+/// returning owner that missed tens of seconds is far outside the retained window
+/// and must catch up via a full snapshot install, not log streaming. The
+/// completion write-pause freezes the log head for the whole of this window (see
+/// [`HANDOFF_WRITE_PAUSE_DEFAULT_MS`]) so the snapshot point stops moving and the
+/// install can finish and the tail drain to within [`HANDOFF_LAG_THRESHOLD`].
+const HANDOFF_CATCHUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10000);
 
 /// Poll interval for the incumbent's learner-lag catch-up loop.
 const HANDOFF_LAG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -1815,8 +1824,8 @@ const HANDOFF_LAG_POLL: std::time::Duration = std::time::Duration::from_millis(5
 /// Replication lag (in log entries) at or below which a hand-off learner is
 /// considered caught up enough to promote to voter. Small non-zero slack so a
 /// steady trickle of writes doesn't make the loop chase a perpetually-moving
-/// last-log index. During the bounded completion write-pause (ADR 0019) the log
-/// fully quiesces, so the learner converges well inside this slack.
+/// last-log index. During the completion write-pause (ADR 0019) the log head
+/// freezes, so the learner converges well inside this slack.
 const HANDOFF_LAG_THRESHOLD: u64 = 64;
 
 /// Phase E (boot-as-receiver) probe window: on (re)boot a node solicits its
@@ -1834,7 +1843,14 @@ const HANDOFF_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis
 /// leadership hand-off catch-up (ADR 0019). Overridable via
 /// `NANOBPMN_HANDOFF_WRITE_PAUSE_MS`; `0` disables the completion pause (leaving
 /// only the create-steer = Zeebe-style best-effort reclaim).
-const HANDOFF_WRITE_PAUSE_DEFAULT_MS: u64 = 2000;
+///
+/// Set a hair above [`HANDOFF_CATCHUP_TIMEOUT`] so completions stay paused for the
+/// ENTIRE catch-up attempt: the log head must stay frozen through the whole
+/// snapshot install, or the leader's snapshot point keeps advancing and the
+/// learner re-snapshots forever (a catch-up livelock). The lease is released the
+/// instant the hand-off completes or aborts, so the real stall is only as long as
+/// the catch-up actually takes — this is just the safety ceiling.
+const HANDOFF_WRITE_PAUSE_DEFAULT_MS: u64 = 12000;
 
 /// Resolve the leadership hand-off completion write-pause ceiling from
 /// `NANOBPMN_HANDOFF_WRITE_PAUSE_MS` (default [`HANDOFF_WRITE_PAUSE_DEFAULT_MS`],
