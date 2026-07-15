@@ -543,6 +543,22 @@ fn state_path(dir: &Path) -> PathBuf {
     dir.join("state.json")
 }
 
+/// Cheaply peek the durable `(committed, last_purged)` markers from a partition's
+/// `state.json` WITHOUT opening the whole log store (no segment replay). Used by
+/// the boot purge-hole detector ([`crate::raft::durable_log_has_purge_hole`]) to
+/// decide whether hosting the partition from its on-disk log would trip openraft's
+/// defensive `LogIndexNotFound` (the reapply range is purged) — in which case the
+/// caller hosts a fresh receiver and installs a snapshot from the leader instead.
+/// Any read/parse error is treated as "no markers" (returns `(None, None)`), which
+/// yields "no hole" — the conservative choice that preserves the on-disk lineage.
+pub fn peek_committed_and_purged(dir: &Path) -> (Option<LogId<NodeId>>, Option<LogId<NodeId>>) {
+    let state: PersistedState = read_json(&state_path(dir))
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    (state.committed, state.last_purged)
+}
+
 /// `fsync` the directory so a preceding `rename` is itself durable.
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()

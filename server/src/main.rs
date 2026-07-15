@@ -7467,12 +7467,23 @@ impl ServerImpl {
                     Some(owned) => owned.clone(),
                     None => server.replica_engine_for(p).await,
                 };
+                // Purge-hole → snapshot fallback (issue #111) applies only to a
+                // partition this node REPLICATES but does not own: such a partition
+                // always has a leader elsewhere (its owner or a failover incumbent)
+                // to install the snapshot. An OWNED partition reaching this loop
+                // (only when the hand-off flag is off) has no other snapshot source,
+                // so it must still resume its on-disk lineage and re-form its group.
+                let log_dir = if evict_terminal {
+                    purge_hole_aware_log_dir(p)
+                } else {
+                    raft_log_dir_for(p)
+                };
                 match crate::raft::RaftPartition::bootstrap_member(
                     topology.node_id as u64,
                     p,
                     engine,
                     transport.clone(),
-                    raft_log_dir_for(p),
+                    log_dir,
                     evict_terminal,
                 )
                 .await
@@ -13543,6 +13554,44 @@ fn raft_log_dir_for(partition: u64) -> Option<PathBuf> {
     let (journal, _) = resolve_data_paths();
     let root = journal?.parent()?.to_path_buf();
     Some(root.join("raft").join(format!("p{partition}")))
+}
+
+/// Whether the boot **purge-hole → snapshot fallback** is enabled
+/// (`NANOBPMN_RAFT_PURGE_HOLE_FALLBACK`, default **on**). When a node rejoins
+/// after being down longer than the leader's log-retention window, its on-disk
+/// log can no longer replay `(last_applied, committed]` (the entries were purged),
+/// so hosting the partition from that log trips openraft's defensive
+/// `LogIndexNotFound` and the member fails to host. With the fallback on, such a
+/// partition is instead hosted as a fresh receiver so the leader installs a
+/// snapshot (see [`crate::raft::durable_log_has_purge_hole`], issue #111). Set to
+/// `0`/`false`/`off` to restore the raw resume-on-disk behavior.
+fn raft_purge_hole_fallback_enabled() -> bool {
+    match std::env::var("NANOBPMN_RAFT_PURGE_HOLE_FALLBACK") {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// The durable log dir to host `partition` from, or `None` to host a fresh
+/// receiver. Returns `None` when the on-disk log has a purge-hole
+/// ([`crate::raft::durable_log_has_purge_hole`]) and the fallback is enabled, so a
+/// node that outslept the retention window installs a snapshot from the leader
+/// rather than failing to host the partition. Otherwise returns the on-disk dir.
+fn purge_hole_aware_log_dir(partition: u64) -> Option<PathBuf> {
+    let dir = raft_log_dir_for(partition)?;
+    if raft_purge_hole_fallback_enabled() && crate::raft::durable_log_has_purge_hole(&dir) {
+        tracing::warn!(
+            partition,
+            "raft: durable log has a purge-hole (committed beyond the local snapshot, reapply \
+             range purged); hosting a fresh receiver to install a snapshot from the leader \
+             (purge-hole → snapshot fallback, issue #111)"
+        );
+        return None;
+    }
+    Some(dir)
 }
 
 /// Number of engine partitions to run, from `NANOBPMN_PARTITIONS`.

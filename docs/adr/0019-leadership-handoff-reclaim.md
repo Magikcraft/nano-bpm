@@ -362,6 +362,46 @@ snapshot fallback) plus a way to host the on-disk prefix as a non-voting receive
 — PR #108-class work that must be soak-iterated, not landed under local-only
 gates.
 
+### Purge-hole → snapshot fallback (boot detection) — SHIPPED (issue #111)
+
+The *first* enabler for Option 3, and a correctness fix in its own right, is now
+shipped as a **server-side boot detection** rather than a deep openraft change —
+the minimal patch that also maps cleanly onto openraft 0.10's
+`loosen-follower-log-revert`.
+
+**Problem.** On boot openraft's `get_initial_state` replays `(last_applied,
+committed]` from the durable log to rebuild the state machine to the commit
+point. The snapshot `apply` restores `last_applied`; the durable store filters
+every entry `<= last_purged` on open. So when a node rejoins after being down
+longer than the leader's retention window, `last_purged >=
+last_applied.next_index()` **and** `committed > last_applied`: the first entry
+the reapply needs is physically gone → openraft raises a defensive
+`LogIndexNotFound (want:N …)` → the partition **fails to host** (the rejoining
+node then silently runs only its owned groups, dropping its replica groups —
+degraded RF + a peer AppendEntries storm).
+
+**Fix.** `raft::durable_log_has_purge_hole(log_dir)` cheaply peeks the durable
+`(committed, last_purged)` markers (`raft_logstore::peek_committed_and_purged`,
+no segment replay) plus the current-snapshot pointer, and flags the hole iff
+`committed` is beyond the snapshot AND the reapply range is purged. When the
+replica-hosting loop (`raft_bootstrap`) sees a hole for a partition this node
+**replicates but does not own** (`evict_terminal` — such a partition always has a
+leader elsewhere to install a snapshot), it hosts a **fresh receiver**
+(`log_dir = None`) so the leader installs a snapshot, instead of resuming the
+unusable on-disk log. An **owned** partition reaching that loop (only when the
+hand-off flag is off) has no other snapshot source, so it deliberately still
+resumes on-disk. Flag-gated by `NANOBPMN_RAFT_PURGE_HOLE_FALLBACK` (default on;
+`0`/`false`/`off` restores raw resume-on-disk).
+
+Boundary pinned by `durable_log_purge_hole_detection_pins_the_boundary`: a
+snapshot that already covers `committed`, a retained tail that still holds the
+range, and an empty/uncommitted dir are all **not** holes (host on-disk
+normally). Local gates green (raft + logstore + 67 clustered tests, clippy 0,
+fmt). **GCP soak remains the final acceptance gate** (`ph-soak`): confirm a node
+down longer than the window rejoins via snapshot fallback and hosts all its
+replica groups. When migrated to openraft 0.10 the follower may revert to an
+empty log without panicking the leader and this helper becomes deletable.
+
 ## Parallel per-partition hand-offs (commit `00aa1ee`) — SHIPPED + A/B validated
 
 The reclaim was **orchestration-bound, not transfer-bound**. `falcon.rs`'s
