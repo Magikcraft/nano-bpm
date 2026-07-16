@@ -648,8 +648,24 @@ impl ServerImpl {
                 );
                 backlog_cap_floor = floor;
                 backlog_cap_ceiling = ceiling;
-                let (cap, obs) =
-                    controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone());
+                // The governor drives the backlog cap off an absolute create→accept
+                // latency target (µs) rather than a self-anchored ratio, so it grows
+                // off the floor and settles at the queueing knee. Tunable live via
+                // NANOBPMN_ADMISSION_LATENCY_TARGET_US (default 10ms).
+                let target_us = std::env::var("NANOBPMN_ADMISSION_LATENCY_TARGET_US")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+                    .filter(|t| *t > 0.0)
+                    .unwrap_or(10_000.0);
+                tracing::info!(
+                    "admission backlog governor: create→accept latency target {target_us:.0}µs"
+                );
+                let (cap, obs) = controller.with_backlog_governor(
+                    floor,
+                    ceiling,
+                    runnable_backlog.clone(),
+                    Some(target_us),
+                );
                 backlog_gov = Some(BacklogGovernor {
                     floor,
                     ceiling,
@@ -13577,6 +13593,10 @@ async fn main() {
                         "window_latency_us",
                         gov.obs.window_avg_us.load(Ordering::Relaxed) as i64,
                     );
+                    crate::metrics::set_backlog_governor(
+                        "target_latency_us",
+                        gov.obs.target_us.load(Ordering::Relaxed) as i64,
+                    );
                 }
                 crate::metrics::set_admission_limit(
                     "create_queue",
@@ -13742,6 +13762,7 @@ async fn main() {
                     });
                     let guard = monitor_server.drain_guard();
                     guard.publish(decision.metering, decision.halted);
+                    guard.set_mint_permille(decision.mint_permille);
                     if !decision.metering {
                         // Below the pressure band: keep the bucket topped up so the
                         // servo never meters healthy load and always engages with a
@@ -13754,6 +13775,7 @@ async fn main() {
                         completes_per_sec,
                         guard.budget(),
                     );
+                    crate::metrics::set_drain_mint_permille(guard.mint_permille());
                     // Log only on state transitions (edge-triggered) so a healthy
                     // server stays quiet and a wedge is a single, greppable event.
                     if decision.halted != drain_halt_lit {

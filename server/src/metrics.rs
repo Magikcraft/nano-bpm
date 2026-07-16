@@ -251,6 +251,11 @@ struct Metrics {
     /// are granted from this bucket (refilled +1 per completion, capped at the
     /// burst); its floor near 0 means intake is fully paced to the drain.
     drain_credit_budget: prometheus::IntGauge,
+    /// The drain-stall servo's completion→create mint ratio in ‰ (parts-per-
+    /// thousand), `nanobpm_drain_mint_permille`. `1000` = mint one create token per
+    /// completion (intake≈drain, the metering hold); below `1000` while draining an
+    /// overshoot down to the setpoint (intake < drain); `0` under the hard valve.
+    drain_mint_permille: prometheus::IntGauge,
     /// The configured admission thresholds the ceiling rails trip at, labelled by
     /// `limit` (`backlog`, `create_queue` — counts; `pipeline_bytes`,
     /// `mem_watermark` — bytes; `0` = rail disabled). Reference lines so a dashboard
@@ -682,6 +687,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "Drain-stall servo token-bucket level: create submission credits available to grant. Refilled +1 per completion (capped at the burst); while metering, a floor near 0 means intake is fully paced to the completion drain.",
     )
     .expect("valid gauge");
+    let drain_mint_permille = prometheus::IntGauge::new(
+        "nanobpm_drain_mint_permille",
+        "Drain-stall servo completion→create mint ratio in per-thousand: 1000 = one create token per completion (intake≈drain hold); below 1000 while draining an overshoot toward the setpoint (intake<drain); 0 under the hard valve.",
+    )
+    .expect("valid gauge");
     let admission_limit = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_admission_limit",
@@ -781,6 +791,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(drain_guard_state.clone())))
         .and(registry.register(Box::new(drain_completes_per_sec.clone())))
         .and(registry.register(Box::new(drain_credit_budget.clone())))
+        .and(registry.register(Box::new(drain_mint_permille.clone())))
         .and(registry.register(Box::new(admission_limit.clone())))
         .and(registry.register(Box::new(backlog_governor.clone())))
         .and(registry.register(Box::new(cmd_seconds.clone())))
@@ -842,6 +853,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         drain_guard_state,
         drain_completes_per_sec,
         drain_credit_budget,
+        drain_mint_permille,
         admission_limit,
         backlog_governor,
         cmd_seconds,
@@ -1037,6 +1049,12 @@ pub fn set_drain_guard(metering: bool, halted: bool, completes_per_sec: f64, cre
         .set(i64::from(halted));
     METRICS.drain_completes_per_sec.set(completes_per_sec);
     METRICS.drain_credit_budget.set(credit_budget);
+}
+
+/// Publishes the drain-stall servo's completion→create mint ratio (‰) this tick
+/// (`nanobpm_drain_mint_permille`). Called ~1 Hz from the monitor supervisor.
+pub fn set_drain_mint_permille(permille: i64) {
+    METRICS.drain_mint_permille.set(permille);
 }
 
 /// Publishes one configured admission threshold as a reference line

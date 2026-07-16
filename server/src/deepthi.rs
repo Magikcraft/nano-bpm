@@ -144,8 +144,8 @@ struct Mailbox {
 }
 
 struct MailboxInner {
-    hi: VecDeque<Job>,
-    lo: VecDeque<Job>,
+    hi: VecDeque<(Instant, Job)>,
+    lo: VecDeque<(Instant, Job)>,
     /// Live [`DeepthiHandle`] count. When it hits zero with both queues drained,
     /// the consumer loop exits (mirrors an mpsc channel disconnect).
     producers: usize,
@@ -165,14 +165,19 @@ impl Mailbox {
     }
 
     fn push(&self, priority: Priority, job: Job) {
+        // Stamp the enqueue instant so the consumer can measure how long a job
+        // waited before it was applied. For creates (`Low`) that residence *is*
+        // the create→accept latency — the queueing signal the backlog governor
+        // targets (a sharp knee the pure apply-time signal lacks).
+        let enq = Instant::now();
         let mut g = self.inner.lock().expect("engine mailbox poisoned");
         match priority {
             Priority::High => {
-                g.hi.push_back(job);
+                g.hi.push_back((enq, job));
                 self.stats.hi_depth.store(g.hi.len(), Ordering::Relaxed);
             }
             Priority::Low => {
-                g.lo.push_back(job);
+                g.lo.push_back((enq, job));
                 self.stats.lo_depth.store(g.lo.len(), Ordering::Relaxed);
             }
         }
@@ -183,19 +188,20 @@ impl Mailbox {
     /// Blocks until a job is available, returning High-priority work first.
     /// Returns the job together with the [`Priority`] queue it came from (so the
     /// latency instrumentation can attribute the sample to its command class —
-    /// creates vs completions — and keep a like-for-like baseline). Returns `None`
+    /// creates vs completions) and the [`Instant`] it was enqueued (so a create's
+    /// create→accept latency = residence + apply can be measured). Returns `None`
     /// once every producer handle is gone and both queues are empty (clean
     /// shutdown).
-    fn pop(&self) -> Option<(Job, Priority)> {
+    fn pop(&self) -> Option<(Job, Priority, Instant)> {
         let mut g = self.inner.lock().expect("engine mailbox poisoned");
         loop {
-            if let Some(job) = g.hi.pop_front() {
+            if let Some((enq, job)) = g.hi.pop_front() {
                 self.stats.hi_depth.store(g.hi.len(), Ordering::Relaxed);
-                return Some((job, Priority::High));
+                return Some((job, Priority::High, enq));
             }
-            if let Some(job) = g.lo.pop_front() {
+            if let Some((enq, job)) = g.lo.pop_front() {
                 self.stats.lo_depth.store(g.lo.len(), Ordering::Relaxed);
-                return Some((job, Priority::Low));
+                return Some((job, Priority::Low, enq));
             }
             if g.producers == 0 {
                 return None;
@@ -291,7 +297,7 @@ impl DeepthiHandle {
                     Self::run_instrumented(&consumer, &mut journal, profile, controller);
                 } else {
                     let stats = &consumer.stats;
-                    while let Some((job, _)) = consumer.pop() {
+                    while let Some((job, _, _)) = consumer.pop() {
                         stats.job_start_mono_ms.store(mono_ms(), Ordering::Relaxed);
                         job(&mut journal);
                         stats.job_start_mono_ms.store(0, Ordering::Relaxed);
@@ -325,7 +331,9 @@ impl DeepthiHandle {
 
         loop {
             let before_recv = Instant::now();
-            let Some((job, prio)) = mb.pop() else { break };
+            let Some((job, prio, enq)) = mb.pop() else {
+                break;
+            };
             idle += before_recv.elapsed();
 
             mb.stats
@@ -337,11 +345,17 @@ impl DeepthiHandle {
             mb.stats.job_start_mono_ms.store(0, Ordering::Relaxed);
             mb.stats.jobs.fetch_add(1, Ordering::Relaxed);
 
-            // Feed the adaptive limiter every command, tagged with its class
-            // (creates = `Low`, completion-side/reads = `High`) so it can window
-            // each class against its own baseline instead of one contaminated mix.
+            // Feed the adaptive limiter every command, tagged with its class.
+            // Creates (`Low`) report **create→accept latency** = queue residence +
+            // apply (`enq.elapsed()`) — the queueing signal with a sharp knee that
+            // the backlog governor targets. Completion-side (`High`) reports pure
+            // apply time (`job_time`), the drain-cost signal the worker governor
+            // uses. Feeding job_time to the backlog governor was the bug: it has no
+            // queueing knee, so the governor could never find the admission knee.
             if let Some(c) = controller.as_mut() {
-                c.record(job_time, prio == Priority::Low);
+                let is_create = prio == Priority::Low;
+                let latency = if is_create { enq.elapsed() } else { job_time };
+                c.record(latency, is_create);
             }
 
             if !profile {

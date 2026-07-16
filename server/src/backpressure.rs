@@ -34,6 +34,11 @@ pub struct GovernorObs {
     /// The most recent window's mean per-command latency (µs) — the value compared
     /// against the threshold. Above it, the governor backed the cap off.
     pub window_avg_us: Arc<AtomicU64>,
+    /// Absolute create→accept latency target (µs) when the governor runs in
+    /// target mode (`0` = classic self-calibrated baseline-ratio mode). Non-zero
+    /// for the backlog governor, whose knee-latency dynamic range a baseline
+    /// ratio cannot express, so it targets an absolute SLO instead.
+    pub target_us: Arc<AtomicU64>,
 }
 
 /// Parsed configuration for the backpressure subsystem.
@@ -279,6 +284,11 @@ pub struct AimdLimit {
     min_limit: usize,
     max_limit: usize,
     baseline_us: f64,
+    /// Absolute create→accept latency target (µs). When `Some`, congestion is
+    /// judged against this fixed target rather than a self-calibrated baseline —
+    /// see [`AimdLimit::new_targeted`]. When `None`, the classic baseline-ratio
+    /// law applies.
+    target_us: Option<f64>,
     /// Slow-start probes the ceiling fast (multiplicative growth) until the first
     /// congestion signal, then switches to additive-increase probing.
     slow_start: bool,
@@ -291,6 +301,32 @@ impl AimdLimit {
             min_limit,
             max_limit,
             baseline_us: 0.0,
+            target_us: None,
+            slow_start: true,
+        }
+    }
+
+    /// An absolute-latency-target variant: congestion is judged against a fixed
+    /// `target_us` instead of a self-calibrated baseline (min-ever window ×
+    /// [`CONGESTION_RATIO`]). Used by the backlog governor, whose control signal
+    /// (create→accept latency) has a real queueing knee but a wide dynamic range
+    /// — knee latency is many × the light-load latency — that a baseline-ratio
+    /// law cannot express: it anchors the baseline to a cold/warmup window and
+    /// then reads every healthy loaded window as congestion, pinning the cap at
+    /// its floor. The absolute target *is* the create→accept SLO the admission
+    /// cap exists to hold, so it has no cold-baseline pathology and a clear knee.
+    pub fn new_targeted(
+        initial: usize,
+        min_limit: usize,
+        max_limit: usize,
+        target_us: f64,
+    ) -> Self {
+        Self {
+            limit: initial.clamp(min_limit, max_limit) as f64,
+            min_limit,
+            max_limit,
+            baseline_us: 0.0,
+            target_us: Some(target_us),
             slow_start: true,
         }
     }
@@ -299,9 +335,27 @@ impl AimdLimit {
         self.limit as usize
     }
 
-    /// The current latency baseline (µs) the congestion threshold is derived from.
+    /// The current latency reference (µs) the congestion threshold is derived
+    /// from: the self-calibrated baseline in ratio mode, or the fixed target in
+    /// target mode (so observability/logs surface the value the window is judged
+    /// against in either mode).
     pub fn baseline_us(&self) -> f64 {
-        self.baseline_us
+        self.target_us.unwrap_or(self.baseline_us)
+    }
+
+    /// The absolute create→accept target (µs), or `0.0` when the limiter runs in
+    /// classic baseline-ratio mode. Surfaced for observability.
+    pub fn target_us_or_zero(&self) -> f64 {
+        self.target_us.unwrap_or(0.0)
+    }
+
+    /// The latency (µs) at/above which a window is treated as congested: the
+    /// absolute target in target mode, else `baseline × `[`CONGESTION_RATIO`].
+    pub fn congestion_threshold_us(&self) -> f64 {
+        match self.target_us {
+            Some(t) => t,
+            None => self.baseline_us * CONGESTION_RATIO,
+        }
     }
 
     /// Fold one window of stats into the limit and return the new value.
@@ -309,38 +363,49 @@ impl AimdLimit {
     /// current in-flight count (the limit only grows while it is being used, so
     /// an idle engine doesn't inflate the watermark).
     ///
-    /// Congestion is judged by comparing the current window average against a
-    /// *baseline of the lowest average seen* — like-for-like, since the command
-    /// mix (cheap completes vs heavy 50 KB creates) makes a single-command
-    /// minimum a poor reference. When the average inflates past
-    /// `baseline * CONGESTION_RATIO` the engine is queueing / under heap pressure,
-    /// so the limit is cut.
+    /// **Target mode** (`target_us = Some`): congestion is simply `avg_us >
+    /// target` — an absolute create→accept SLO. This is the backlog governor's
+    /// law: its signal's knee latency is many × the light-load latency, so a
+    /// ratio-to-baseline can't hold the system at the knee (it reads the knee as
+    /// congestion). An absolute target has no cold-baseline pathology.
+    ///
+    /// **Ratio mode** (`target_us = None`): congestion is judged against a
+    /// *baseline of the lowest average seen* × [`CONGESTION_RATIO`] — like-for-
+    /// like, since the command mix (cheap completes vs heavy 50 KB creates) makes
+    /// a single-command minimum a poor reference. When the average inflates past
+    /// the threshold the engine is queueing / under heap pressure, so the limit
+    /// is cut.
     pub fn on_window(&mut self, avg_us: f64, inflight: usize) -> usize {
-        // Establish the baseline on the first ever window.
-        if self.baseline_us == 0.0 {
-            self.baseline_us = avg_us;
-        }
-
-        let threshold = self.baseline_us * CONGESTION_RATIO;
         let loaded = (inflight as f64) * 2.0 >= self.limit;
+        let congested = if self.target_us.is_some() {
+            avg_us > self.congestion_threshold_us()
+        } else {
+            // Establish the baseline on the first ever window.
+            if self.baseline_us == 0.0 {
+                self.baseline_us = avg_us;
+            }
+            avg_us > self.congestion_threshold_us()
+        };
 
-        if avg_us > threshold {
+        if congested {
             // Congested: multiplicative decrease, and leave slow-start for good.
-            // Crucially the baseline is *frozen* here — never adapt it toward a
-            // congested latency, or sustained queueing would be accepted as the
+            // In ratio mode the baseline is *frozen* here — never adapt it toward
+            // a congested latency, or sustained queueing would be accepted as the
             // new normal and shedding would stop (the exact unbounded-backlog
             // pathology we exist to prevent).
             self.slow_start = false;
             self.limit = (self.limit * BACKOFF).max(self.min_limit as f64);
         } else {
-            // Healthy window: refine the baseline toward the uncongested floor
-            // (snap down to a new minimum, else creep up slowly so a genuinely
-            // slower host isn't throttled forever), then probe the limit upward
-            // while it is being used.
-            if avg_us < self.baseline_us {
-                self.baseline_us = avg_us;
-            } else {
-                self.baseline_us += (avg_us - self.baseline_us) * BASELINE_CREEP;
+            // Healthy window. In ratio mode, refine the baseline toward the
+            // uncongested floor (snap down to a new minimum, else creep up slowly
+            // so a genuinely slower host isn't throttled forever). Target mode has
+            // no baseline to refine. Then probe the limit upward while it is used.
+            if self.target_us.is_none() {
+                if avg_us < self.baseline_us {
+                    self.baseline_us = avg_us;
+                } else {
+                    self.baseline_us += (avg_us - self.baseline_us) * BASELINE_CREEP;
+                }
             }
             if loaded {
                 if self.slow_start {
@@ -382,6 +447,8 @@ impl LatencyLimiter {
             obs.baseline_us
                 .store(self.aimd.baseline_us() as u64, Ordering::Relaxed);
             obs.window_avg_us.store(avg_us as u64, Ordering::Relaxed);
+            obs.target_us
+                .store(self.aimd.target_us_or_zero() as u64, Ordering::Relaxed);
         }
         if verbose && new_limit != prev {
             tracing::info!(
@@ -507,24 +574,29 @@ impl AdaptiveController {
 
     /// Install the self-optimizing active-backlog governor: it tunes the
     /// admission backlog cap between `floor` (≈ the measured throughput knee) and
-    /// `ceiling` (the memory-derived backstop) from the same per-command latency
-    /// signal, gated on the current `runnable` backlog. Starts at `floor` and
-    /// slow-starts upward while the backlog is loaded and latency is healthy,
-    /// backing off multiplicatively the moment per-command latency inflates past
-    /// its self-calibrated baseline — i.e. it holds the system just left of the
-    /// congestion-collapse knee. Returns the shared cap handle the admission gate
-    /// reads, plus a [`GovernorObs`] read handle whose baseline / window-latency
-    /// the monitor and shed message surface to explain the live cap.
+    /// `ceiling` (the memory-derived backstop), gated on the current `runnable`
+    /// backlog. When `target_us` is `Some`, it runs in **target mode** — the cap
+    /// grows while the backlog is loaded and the create→accept latency is under
+    /// the target, and backs off multiplicatively above it (the create→accept SLO
+    /// the cap exists to hold). When `None`, it uses the classic self-calibrated
+    /// baseline-ratio law. Returns the shared cap handle the admission gate reads,
+    /// plus a [`GovernorObs`] read handle whose latency/target the monitor and
+    /// shed message surface to explain the live cap.
     pub fn with_backlog_governor(
         &mut self,
         floor: usize,
         ceiling: usize,
         runnable: Arc<AtomicUsize>,
+        target_us: Option<f64>,
     ) -> (Arc<AtomicUsize>, GovernorObs) {
         let shared = Arc::new(AtomicUsize::new(floor));
         let obs = GovernorObs::default();
+        let aimd = match target_us {
+            Some(t) => AimdLimit::new_targeted(floor, floor, ceiling, t),
+            None => AimdLimit::new(floor, floor, ceiling),
+        };
         self.backlog = Some(LatencyLimiter {
-            aimd: AimdLimit::new(floor, floor, ceiling),
+            aimd,
             shared: shared.clone(),
             signal: runnable,
             label: "backlog-governor",
@@ -831,7 +903,7 @@ mod tests {
     fn backlog_governor_grows_toward_ceiling_while_healthy_and_loaded() {
         let runnable = Arc::new(AtomicUsize::new(100_000)); // backlog well above the cap
         let mut c = AdaptiveController::new();
-        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), None);
         assert_eq!(cap.load(Ordering::Relaxed), 2_000, "starts at the floor");
 
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // establish baseline
@@ -848,7 +920,7 @@ mod tests {
     fn backlog_governor_backs_off_to_floor_under_congestion() {
         let runnable = Arc::new(AtomicUsize::new(100_000));
         let mut c = AdaptiveController::new();
-        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), None);
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline 100us
         // Grow it up a bit first.
         for _ in 0..5 {
@@ -874,7 +946,7 @@ mod tests {
         // never the reason the cap moves.
         let runnable = Arc::new(AtomicUsize::new(0));
         let mut c = AdaptiveController::new();
-        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), None);
         drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline
         for _ in 0..20 {
             drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy but unloaded
@@ -890,7 +962,7 @@ mod tests {
     fn backlog_governor_publishes_observability_baseline_and_window_latency() {
         let runnable = Arc::new(AtomicUsize::new(100_000));
         let mut c = AdaptiveController::new();
-        let (_cap, obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (_cap, obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), None);
         // Nothing published until a window folds.
         assert_eq!(obs.baseline_us.load(Ordering::Relaxed), 0);
         assert_eq!(obs.window_avg_us.load(Ordering::Relaxed), 0);
@@ -924,7 +996,7 @@ mod tests {
         // cheap completions is interleaved.
         let runnable = Arc::new(AtomicUsize::new(100_000));
         let mut c = AdaptiveController::new();
-        let (cap, obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (cap, obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), None);
 
         // Establish the create-class baseline at ~100µs, interleaving cheap 1µs
         // completions (which must NOT contaminate the create baseline).
@@ -962,7 +1034,7 @@ mod tests {
         // completion class drives the worker governor, not the create-side cap.
         let runnable = Arc::new(AtomicUsize::new(100_000));
         let mut c = AdaptiveController::new();
-        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), None);
         for _ in 0..20 {
             drive_window_class(&mut c, 100, WINDOW_MIN_SAMPLES, false); // completions only
         }
@@ -973,6 +1045,77 @@ mod tests {
         );
     }
 
+    // --- target-mode backlog governor (absolute create→accept latency SLO) ----
+
+    #[test]
+    fn target_governor_grows_off_floor_when_a_cold_window_would_pin_the_ratio_law() {
+        // The live-cluster failure: a 5µs warmup window anchors the ratio-law
+        // baseline, so the real ~2ms operating latency reads as 400× congestion
+        // and the cap pins at the floor forever. The target law judges against an
+        // absolute create→accept SLO, so the same interleaving grows the cap.
+        let runnable = Arc::new(AtomicUsize::new(100_000)); // loaded well above the cap
+        let mut c = AdaptiveController::new();
+        // Target 10ms create→accept; healthy operating latency 2ms is well under.
+        let (cap, obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), Some(10_000.0));
+
+        // A cold 5µs window first (the warmup sample that pins the ratio law).
+        drive_window_class(&mut c, 5, WINDOW_MIN_SAMPLES, true);
+        // Now the real operating point: 2ms create→accept — 400× the cold window,
+        // but under the 10ms target — sustained and loaded.
+        for _ in 0..6 {
+            drive_window_class(&mut c, 2_000, WINDOW_MIN_SAMPLES, true);
+        }
+        assert!(
+            cap.load(Ordering::Relaxed) > 2_000,
+            "target law must grow the cap while under the SLO despite a cold \
+             warmup window that would pin the ratio law: cap={}",
+            cap.load(Ordering::Relaxed)
+        );
+        assert_eq!(
+            obs.target_us.load(Ordering::Relaxed),
+            10_000,
+            "the target is published for observability"
+        );
+    }
+
+    #[test]
+    fn target_governor_backs_off_above_the_latency_target() {
+        let runnable = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), Some(10_000.0));
+        // Grow it up first with healthy (under-target) windows.
+        for _ in 0..6 {
+            drive_window_class(&mut c, 2_000, WINDOW_MIN_SAMPLES, true);
+        }
+        assert!(cap.load(Ordering::Relaxed) > 2_000);
+        // create→accept latency now exceeds the 10ms SLO: back off to the floor.
+        for _ in 0..200 {
+            drive_window_class(&mut c, 25_000, WINDOW_MIN_SAMPLES, true);
+        }
+        assert_eq!(
+            cap.load(Ordering::Relaxed),
+            2_000,
+            "sustained latency above the target must hold the cap at the floor"
+        );
+    }
+
+    #[test]
+    fn target_governor_ignores_completion_class_samples() {
+        // Even in target mode the backlog governor keys off the CREATE window; a
+        // completion firehose (cheap or not) must not move the create-side cap.
+        let runnable = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone(), Some(10_000.0));
+        for _ in 0..20 {
+            drive_window_class(&mut c, 100, WINDOW_MIN_SAMPLES, false); // completions only
+        }
+        assert_eq!(
+            cap.load(Ordering::Relaxed),
+            2_000,
+            "completion-only load must not move the target-mode backlog cap"
+        );
+    }
+
     #[test]
     fn controller_is_active_only_with_a_limiter_installed() {
         assert!(!AdaptiveController::new().is_active());
@@ -980,7 +1123,7 @@ mod tests {
         c.with_create_limiter(Arc::new(AtomicUsize::new(0)));
         assert!(c.is_active());
         let mut c = AdaptiveController::new();
-        c.with_backlog_governor(2_000, 200_000, Arc::new(AtomicUsize::new(0)));
+        c.with_backlog_governor(2_000, 200_000, Arc::new(AtomicUsize::new(0)), None);
         assert!(c.is_active());
         let mut c = AdaptiveController::new();
         c.with_worker_governor(50, 4_096, Arc::new(AtomicUsize::new(0)));
