@@ -809,6 +809,13 @@ impl PeerSet {
     /// link or the cached one has dropped. Concurrent callers for the same peer
     /// share the single in-flight dial (serialized by the map lock).
     pub async fn link(&self, node_id: u32) -> Result<PeerLink, PeerError> {
+        let link_start = std::time::Instant::now();
+        let result = self.link_inner(node_id).await;
+        crate::metrics::record_peer_link(link_start.elapsed());
+        result
+    }
+
+    async fn link_inner(&self, node_id: u32) -> Result<PeerLink, PeerError> {
         if self.unreachable.lock().await.contains(&node_id) {
             return Err(PeerError::Connect(format!(
                 "node {node_id} marked unreachable (fault injection)"
@@ -826,7 +833,11 @@ impl PeerSet {
             .topology
             .peer_addr(node_id)
             .ok_or_else(|| PeerError::Connect(format!("no address for node {node_id}")))?;
-        let link = PeerLink::connect(addr).await?;
+        // Onset-diagnosis instrument: count every dial to a peer, split by outcome.
+        // A survivor's redial rate to a *dead* peer is the "wasted send work" signal.
+        let dial = PeerLink::connect(addr).await;
+        crate::metrics::record_peer_connect_attempt(node_id, dial.is_ok());
+        let link = dial?;
         links.insert(node_id, link.clone());
         Ok(link)
     }

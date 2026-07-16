@@ -71,6 +71,18 @@ struct Metrics {
     stream_connections_active: IntGauge,
     /// Time spent processing each falcon frame (read + apply + reply).
     stream_frame_processing_seconds: Histogram,
+    /// Peer raft/app-uplink dial (redial) attempts, by target node and outcome
+    /// (`ok`|`fail`). Onset-diagnosis instrument: a surviving node's redial rate
+    /// to a *dead* peer quantifies the "wasted work sending to the down node"
+    /// (no dead-peer circuit-breaker exists, so every replication attempt to an
+    /// unreachable learner redials).
+    peer_connect_attempts_total: prometheus::IntCounterVec,
+    /// Wall time spent inside `PeerSet::link()` acquiring a peer uplink. Onset
+    /// instrument: `link()` awaits the redial `connect()` while holding the global
+    /// links mutex, so a slow/black-holed peer head-of-line-blocks *all* peer-link
+    /// acquisition — this histogram surfaces that stall (tail inflates when a peer
+    /// is down).
+    peer_link_seconds: Histogram,
 
     /// Process instance creates, split by protocol (rest vs stream).
     creates_total: prometheus::IntCounterVec,
@@ -411,6 +423,29 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter vec");
 
+    let peer_connect_attempts_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_peer_connect_attempts_total",
+            "Peer uplink dial (redial) attempts, by target node and outcome (ok|fail). \
+             Onset-diagnosis: redial rate to a dead peer quantifies wasted send work.",
+        ),
+        &["target", "outcome"],
+    )
+    .expect("valid counter vec");
+
+    let peer_link_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "nanobpm_peer_link_seconds",
+            "Wall time inside PeerSet::link() acquiring a peer uplink (the redial \
+             connect is awaited under the global links mutex; tail inflates while a \
+             peer is down and head-of-line-blocks healthy peers).",
+        )
+        .buckets(vec![
+            0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0,
+        ]),
+    )
+    .expect("valid histogram");
+
     let job_completions_total = IntCounterVec::new(
         Opts::new(
             "nanobpm_job_completions_total",
@@ -710,6 +745,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(read_model_export_retries_total.clone())))
         .and(registry.register(Box::new(stream_connections_active.clone())))
         .and(registry.register(Box::new(stream_frame_processing_seconds.clone())))
+        .and(registry.register(Box::new(peer_connect_attempts_total.clone())))
+        .and(registry.register(Box::new(peer_link_seconds.clone())))
         .and(registry.register(Box::new(creates_total.clone())))
         .and(registry.register(Box::new(job_completions_total.clone())))
         .and(registry.register(Box::new(stream_complete_outcome_total.clone())))
@@ -769,6 +806,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         read_model_export_retries_total,
         stream_connections_active,
         stream_frame_processing_seconds,
+        peer_connect_attempts_total,
+        peer_link_seconds,
         creates_total,
         job_completions_total,
         stream_complete_outcome_total,
@@ -1212,6 +1251,22 @@ pub fn record_stream_frame_processing(elapsed: Duration) {
 /// Records a process instance create (by protocol: "rest" or "stream").
 pub fn record_create(protocol: &str) {
     METRICS.creates_total.with_label_values(&[protocol]).inc();
+}
+
+/// Records one peer uplink dial (redial) attempt to `target`, tagged by outcome
+/// (`ok`|`fail`). Onset-diagnosis instrument for the redial rate to a dead peer.
+pub fn record_peer_connect_attempt(target: u32, ok: bool) {
+    let outcome = if ok { "ok" } else { "fail" };
+    METRICS
+        .peer_connect_attempts_total
+        .with_label_values(&[&target.to_string(), outcome])
+        .inc();
+}
+
+/// Records the wall time spent inside `PeerSet::link()` acquiring a peer uplink
+/// (captures the connect-under-global-mutex head-of-line stall while a peer is down).
+pub fn record_peer_link(elapsed: Duration) {
+    METRICS.peer_link_seconds.observe(elapsed.as_secs_f64());
 }
 
 /// Records a job completion (by protocol: "rest" or "stream").
