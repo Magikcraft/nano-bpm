@@ -565,7 +565,7 @@ impl Inner {
     /// nothing is outstanding, so the idle-tick path is cheap.
     fn flush_async(&mut self) -> io::Result<()> {
         if self.unsynced_bytes > 0 {
-            self.active_file.sync_all()?;
+            timed_log_sync(&self.active_file)?;
             self.unsynced_bytes = 0;
         }
         if self.state_dirty {
@@ -633,6 +633,18 @@ pub fn peek_committed_and_purged(dir: &Path) -> (Option<LogId<NodeId>>, Option<L
 /// `fsync` the directory so a preceding `rename` is itself durable.
 fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+/// `sync_all()` a Raft-log data file, timing the barrier into the
+/// `nanobpm_raft_fsync_seconds` histogram. This is the disk-saturation signal the
+/// recovery admission throttle reads: on a failover node carrying a down peer's
+/// partitions these barriers are what saturate the shared disk. Records the
+/// elapsed time even on error (the barrier still consumed disk time).
+fn timed_log_sync(file: &File) -> io::Result<()> {
+    let t0 = std::time::Instant::now();
+    let r = file.sync_all();
+    crate::metrics::observe_raft_fsync(t0.elapsed());
+    r
 }
 
 /// Atomically replace `path`'s contents with `bytes`: write a sibling temp file,
@@ -1121,7 +1133,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             // is fsynced before the switch so a sealed segment is always durable
             // regardless of durability mode.
             if inner.active_bytes > 0 && inner.active_bytes + len > inner.seg_max_bytes {
-                inner.active_file.sync_all().map_err(io_err)?;
+                timed_log_sync(&inner.active_file).map_err(io_err)?;
                 inner.unsynced_bytes = 0;
                 inner.roll_active(index).map_err(io_err)?;
             }
@@ -1157,7 +1169,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             // durable. The media barrier (an `F_FULLFSYNC` on macOS) is on the
             // critical path of every replication round.
             false => {
-                inner.active_file.sync_all().map_err(io_err)?;
+                timed_log_sync(&inner.active_file).map_err(io_err)?;
                 inner.unsynced_bytes = 0;
             }
             // Async (base mode, or a sync store inside the recovery fsync-relief
@@ -1167,7 +1179,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             // when the periodic tick alone could fall behind.
             true => {
                 if inner.unsynced_bytes >= inner.flush.max_bytes {
-                    inner.active_file.sync_all().map_err(io_err)?;
+                    timed_log_sync(&inner.active_file).map_err(io_err)?;
                     inner.unsynced_bytes = 0;
                 }
             }

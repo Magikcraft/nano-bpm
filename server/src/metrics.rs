@@ -26,6 +26,11 @@ struct Metrics {
     /// Wall time of each `write` + `fsync` group-commit. On macOS `sync_all`
     /// issues `F_FULLFSYNC`, a true media barrier, so this is typically ms-scale.
     fsync_seconds: Histogram,
+    /// Wall time of each Raft-log `sync_all()` (append + committed-marker + flusher
+    /// barrier). Separate from the varstore `fsync_seconds` above so the recovery
+    /// admission throttle can read the *Raft-log* disk-saturation signal directly —
+    /// on a failover node this is the fsync that saturates the shared disk.
+    raft_fsync_seconds: Histogram,
     /// Time a caller spends awaiting its commit's durability (queueing behind
     /// other commits + the fsync itself). The closed-loop latency clients feel.
     commit_wait_seconds: Histogram,
@@ -293,6 +298,15 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         HistogramOpts::new(
             "nanobpm_journal_fsync_seconds",
             "Wall time of each journal write+fsync group-commit.",
+        )
+        .buckets(latency_buckets.clone()),
+    )
+    .expect("valid histogram opts");
+
+    let raft_fsync_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "nanobpm_raft_fsync_seconds",
+            "Wall time of each Raft-log sync_all() barrier (append/committed-marker/flusher).",
         )
         .buckets(latency_buckets.clone()),
     )
@@ -682,6 +696,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
+        .and(registry.register(Box::new(raft_fsync_seconds.clone())))
         .and(registry.register(Box::new(commit_wait_seconds.clone())))
         .and(registry.register(Box::new(commits_total.clone())))
         .and(registry.register(Box::new(writes_total.clone())))
@@ -740,6 +755,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         registry,
         commit_batch_size,
         fsync_seconds,
+        raft_fsync_seconds,
         commit_wait_seconds,
         commits_total,
         writes_total,
@@ -824,6 +840,21 @@ pub fn record_fsync(writes: usize, fsync: Duration) {
 /// Records how long a caller waited for its commit to become durable.
 pub fn record_commit_wait(wait: Duration) {
     METRICS.commit_wait_seconds.observe(wait.as_secs_f64());
+}
+
+/// Records the wall time of one Raft-log `sync_all()` barrier. The recovery
+/// admission throttle reads the windowed mean of this (see
+/// [`raft_fsync_sum_count`]) to detect disk saturation on a failover node.
+pub fn observe_raft_fsync(dur: Duration) {
+    METRICS.raft_fsync_seconds.observe(dur.as_secs_f64());
+}
+
+/// Cumulative (sum_seconds, count) of Raft-log fsync barriers since boot. The
+/// monitor tick differences these across ticks to get the window mean fsync
+/// latency that drives the recovery admission throttle.
+pub fn raft_fsync_sum_count() -> (f64, u64) {
+    let h = &METRICS.raft_fsync_seconds;
+    (h.get_sample_sum(), h.get_sample_count())
 }
 
 /// A durable write was enqueued (pipeline depth +1).

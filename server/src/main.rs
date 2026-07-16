@@ -33,6 +33,7 @@ mod raft;
 mod raft_logstore;
 mod raft_net;
 mod readstore;
+mod recovery_throttle;
 mod seglog;
 mod stub_impls;
 mod varspill;
@@ -223,6 +224,16 @@ pub struct ServerImpl {
     /// Upper bound for the unified setpoint (`effective_backlog_cap`): the memory
     /// backstop / governor ceiling (or the fixed cap). `0` when disabled.
     backlog_cap_ceiling: usize,
+    /// The live **recovery admission cap** published by the adaptive recovery
+    /// throttle ([`crate::recovery_throttle`]): while this node is a failover
+    /// incumbent / returning owner with a saturating Raft-log disk, this is the
+    /// backlog the throttle paces intake to so the disk stays under its `fsync`
+    /// knee (durability-preserving — no `fsync` is deferred). `0` = no recovery
+    /// clamp (steady state, or the throttle disabled). Folded as a `min` into
+    /// [`Self::effective_backlog_cap`] in *all* SLA modes (a recovery liveness rail),
+    /// and honoured even when the general backlog cap is off. Recomputed each ~1 Hz
+    /// monitor tick.
+    recovery_backlog_cap: Arc<AtomicUsize>,
     /// The live per-job-type active dispatch width the push dispatcher caps its
     /// per-pass subscriber fan-out at; `0` = no cap (dispatch to all subscribers).
     /// Held behind an atomic because in [`WorkerConcurrency::Auto`] mode the engine
@@ -654,6 +665,10 @@ impl ServerImpl {
         // (shed effectively off) so the servo owns admission until the first memory
         // sample lands — never shed before we know the live headroom.
         let backlog_shed_cap = Arc::new(AtomicUsize::new(backlog_cap_ceiling));
+        // The recovery admission cap, published by the adaptive recovery throttle
+        // each monitor tick. Seed at 0 (no clamp) — only engages inside a recovery
+        // window with a saturating Raft-log disk.
+        let recovery_backlog_cap = Arc::new(AtomicUsize::new(0));
         // `active_worker_cap` is the live per-job-type active dispatch width the
         // push dispatcher reads (0 = no cap). Resolved from one of three policies,
         // mirroring the backlog governor: Off (no cap), Fixed, or a self-optimizing
@@ -830,6 +845,7 @@ impl ServerImpl {
             backlog_gov,
             backlog_cap_floor,
             backlog_cap_ceiling,
+            recovery_backlog_cap,
             effective_backlog_cap,
             backlog_shed_cap,
             runnable_backlog,
@@ -10801,12 +10817,19 @@ impl ServerImpl {
     /// Both are `0` (disabled) when the backlog cap is off, leaving the servo on its
     /// absolute band and the shed following the raw governor cap.
     fn refresh_effective_backlog_cap(&self, active_backlog: i64) -> usize {
+        // The recovery throttle's cap (0 = no clamp) is honoured in *both* SLA modes
+        // and even when the general backlog cap is off — it is a recovery liveness
+        // rail, not a latency policy.
+        let recovery_cap = self.recovery_backlog_cap.load(Ordering::Relaxed);
         let ceiling = self.backlog_cap_ceiling;
         if ceiling == 0 {
-            // Backlog cap disabled (Off): no unified setpoint, no count-based shed.
-            self.effective_backlog_cap.store(0, Ordering::Relaxed);
+            // General backlog cap disabled (Off): no latency/memory setpoint. Still
+            // honour a live recovery clamp so intake is paced while the failover disk
+            // saturates; the drain servo bands against the published setpoint.
+            self.effective_backlog_cap
+                .store(recovery_cap, Ordering::Relaxed);
             self.backlog_shed_cap.store(0, Ordering::Relaxed);
-            return 0;
+            return recovery_cap;
         }
         let latency_cap = self.backlog_cap.load(Ordering::Relaxed);
         let latency_component = if self.sla_mode.get().sheds_for_latency() && latency_cap > 0 {
@@ -10822,10 +10845,19 @@ impl ServerImpl {
         } else {
             usize::MAX
         };
-        // Servo setpoint: latency ∧ memory. Shed backstop: memory only (sits above
-        // the servo's operating band so it cannot collide with the credit servo).
+        // Recovery clamp joins the setpoint min (below `ceiling`, above `floor`). A
+        // `0` recovery cap means no clamp (treated as unbounded here).
+        let recovery_component = if recovery_cap > 0 {
+            recovery_cap
+        } else {
+            usize::MAX
+        };
+        // Servo setpoint: latency ∧ memory ∧ recovery. Shed backstop: memory only
+        // (sits above the servo's operating band so it cannot collide with the
+        // credit servo).
         let eff = latency_component
             .min(memory_cap)
+            .min(recovery_component)
             .clamp(self.backlog_cap_floor, ceiling);
         let shed = memory_cap.clamp(self.backlog_cap_floor, ceiling);
         self.effective_backlog_cap.store(eff, Ordering::Relaxed);
@@ -13273,6 +13305,16 @@ async fn main() {
             let mut prev_drain_instant = std::time::Instant::now();
             let mut drain_meter_lit = false;
             let mut drain_halt_lit = false;
+            // Adaptive recovery admission throttle: paces intake while this node is a
+            // failover incumbent / returning owner with a saturating Raft-log disk,
+            // so the disk stays under its fsync knee without deferring any fsync
+            // (durability-preserving). Driven by the windowed Raft-log fsync latency.
+            let mut recovery_throttle = crate::recovery_throttle::RecoveryThrottle::new(
+                crate::recovery_throttle::RecoveryThrottleCfg::from_env(),
+            );
+            let (mut prev_raft_fsync_sum, mut prev_raft_fsync_count) =
+                crate::metrics::raft_fsync_sum_count();
+            let mut recovery_throttle_engaged = false;
             loop {
                 interval.tick().await;
 
@@ -13390,9 +13432,56 @@ async fn main() {
                     prev_completions = completions_now;
                     let completes_per_sec = if dt > 0.0 { completed as f64 / dt } else { 0.0 };
                     let backlog = monitor_server.active_backlog();
-                    // Recompute the unified admission setpoint (latency ∧ memory)
-                    // from the live signals, publish it, and band the servo against
-                    // it so intake is paced to the *current* cap in both SLA modes.
+
+                    // Adaptive recovery throttle: fold the windowed Raft-log fsync
+                    // latency (the failover disk-saturation signal) into the AIMD
+                    // controller, gated on whether this node is actually in a recovery
+                    // window, and publish the resulting admission cap (0 = no clamp).
+                    // Recomputed before the setpoint so the min below sees it.
+                    {
+                        let (sum_now, count_now) = crate::metrics::raft_fsync_sum_count();
+                        let d_count = count_now.saturating_sub(prev_raft_fsync_count);
+                        let d_sum = (sum_now - prev_raft_fsync_sum).max(0.0);
+                        prev_raft_fsync_sum = sum_now;
+                        prev_raft_fsync_count = count_now;
+                        // Window-mean fsync latency in µs (0 when no fsyncs this window).
+                        let fsync_avg_us = if d_count > 0 {
+                            d_sum / d_count as f64 * 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        let recovering = monitor_server.recovery_fsync_load_active();
+                        let cap = recovery_throttle.observe(fsync_avg_us, recovering);
+                        monitor_server
+                            .recovery_backlog_cap
+                            .store(cap.unwrap_or(0), Ordering::Relaxed);
+                        crate::metrics::set_admission_limit(
+                            "backlog_recovery",
+                            cap.map(|c| c as i64).unwrap_or(0),
+                        );
+                        // Log engagement transitions so the recovery window is legible
+                        // in the ops log alongside the console recovery indicator.
+                        let engaged = recovery_throttle.is_engaged();
+                        if engaged != recovery_throttle_engaged {
+                            recovery_throttle_engaged = engaged;
+                            if engaged {
+                                tracing::info!(
+                                    fsync_avg_us,
+                                    cap = cap.unwrap_or(0),
+                                    "recovery admission throttle engaged (failover disk load)"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "recovery admission throttle released (recovery cleared)"
+                                );
+                            }
+                        }
+                    }
+
+                    // Recompute the unified admission setpoint (latency ∧ memory ∧
+                    // recovery) from the live signals, publish it, and band the servo
+                    // against it so intake is paced to the *current* cap in both SLA
+                    // modes.
                     let effective_cap = monitor_server.refresh_effective_backlog_cap(backlog);
                     crate::metrics::set_admission_limit("backlog_effective", effective_cap as i64);
 
