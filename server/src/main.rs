@@ -10,6 +10,7 @@
 //! `ServerImpl` type, authentication/error glue, and the server bootstrap.
 
 mod backpressure;
+mod capacity_governor;
 mod cluster;
 mod cmd_profile;
 mod coldspill;
@@ -234,6 +235,15 @@ pub struct ServerImpl {
     /// and honoured even when the general backlog cap is off. Recomputed each ~1 Hz
     /// monitor tick.
     recovery_backlog_cap: Arc<AtomicUsize>,
+    /// The live **capacity admission cap** published by the capacity-aware governor
+    /// ([`crate::capacity_governor`]): the per-node active-backlog envelope scaled to
+    /// the cluster's *current* capacity (fewer healthy nodes ⇒ smaller envelope) and
+    /// tuned by the binding *commit-wait* latency signal. `0` = no capacity clamp
+    /// (full capacity with healthy commit latency, or the governor disabled). Folded
+    /// as a `min` into [`Self::effective_backlog_cap`] in *all* SLA modes (a
+    /// capacity liveness rail, like the recovery throttle), and honoured even when
+    /// the general backlog cap is off. Recomputed each ~1 Hz monitor tick.
+    capacity_backlog_cap: Arc<AtomicUsize>,
     /// The live per-job-type active dispatch width the push dispatcher caps its
     /// per-pass subscriber fan-out at; `0` = no cap (dispatch to all subscribers).
     /// Held behind an atomic because in [`WorkerConcurrency::Auto`] mode the engine
@@ -669,6 +679,10 @@ impl ServerImpl {
         // each monitor tick. Seed at 0 (no clamp) — only engages inside a recovery
         // window with a saturating Raft-log disk.
         let recovery_backlog_cap = Arc::new(AtomicUsize::new(0));
+        // The capacity admission cap, published by the capacity-aware governor each
+        // monitor tick. Seed at 0 (no clamp) — only engages when the cluster is
+        // degraded (a peer down) or commit-wait latency shows real saturation.
+        let capacity_backlog_cap = Arc::new(AtomicUsize::new(0));
         // `active_worker_cap` is the live per-job-type active dispatch width the
         // push dispatcher reads (0 = no cap). Resolved from one of three policies,
         // mirroring the backlog governor: Off (no cap), Fixed, or a self-optimizing
@@ -846,6 +860,7 @@ impl ServerImpl {
             backlog_cap_floor,
             backlog_cap_ceiling,
             recovery_backlog_cap,
+            capacity_backlog_cap,
             effective_backlog_cap,
             backlog_shed_cap,
             runnable_backlog,
@@ -8003,7 +8018,37 @@ impl ServerImpl {
         false
     }
 
-    /// Per-`(partition, peer)` catch-up feed observations for every partition
+    /// This node's Raft leadership load as `(owned, led)`: how many partitions it
+    /// statically owns versus how many it currently leads. `led > owned` ⇒ it is a
+    /// failover incumbent carrying a down peer's partitions (extra Raft load on one
+    /// disk); `led == owned` ⇒ full capacity. Feeds the capacity governor's
+    /// proactive envelope scaling. Both `0`-safe: single node / Raft off returns the
+    /// static owned count against itself so the governor sees full capacity.
+    fn leadership_load(&self) -> (usize, usize) {
+        let topology = self.engine.topology();
+        let me = topology.node_id;
+        let mut owned = 0usize;
+        for p in 0..topology.num_partitions {
+            if topology.owner_of(p) == me {
+                owned += 1;
+            }
+        }
+        if !raft_enabled() || topology.num_nodes() <= 1 {
+            // No failover possible: leadership tracks ownership exactly.
+            return (owned, owned);
+        }
+        let mut led = 0usize;
+        for p in 0..topology.num_partitions {
+            let leader = self
+                .raft_registry()
+                .get(p)
+                .and_then(|part| part.raft.metrics().borrow().current_leader);
+            if leader == Some(me as u64) {
+                led += 1;
+            }
+        }
+        (owned, led)
+    }
     /// this node currently **leads**: the replication `lag` (entries the peer is
     /// behind the log head) and a monotone `progress` scalar (matched index +
     /// cumulative snapshot bytes) the caller diffs across ticks to distinguish an
@@ -10912,15 +10957,26 @@ impl ServerImpl {
         // and even when the general backlog cap is off — it is a recovery liveness
         // rail, not a latency policy.
         let recovery_cap = self.recovery_backlog_cap.load(Ordering::Relaxed);
+        // The capacity governor's cap (0 = no clamp) is likewise honoured in both SLA
+        // modes and with the general backlog cap off — it is a cluster-capacity
+        // liveness rail (shrinks the envelope to the current node count, tuned by the
+        // binding commit-wait signal).
+        let capacity_cap = self.capacity_backlog_cap.load(Ordering::Relaxed);
+        let recovery_or_capacity = match (recovery_cap, capacity_cap) {
+            (0, c) => c,
+            (r, 0) => r,
+            (r, c) => r.min(c),
+        };
         let ceiling = self.backlog_cap_ceiling;
         if ceiling == 0 {
             // General backlog cap disabled (Off): no latency/memory setpoint. Still
-            // honour a live recovery clamp so intake is paced while the failover disk
-            // saturates; the drain servo bands against the published setpoint.
+            // honour a live recovery / capacity clamp so intake is paced while the
+            // cluster is degraded or the failover disk saturates; the drain servo
+            // bands against the published setpoint.
             self.effective_backlog_cap
-                .store(recovery_cap, Ordering::Relaxed);
+                .store(recovery_or_capacity, Ordering::Relaxed);
             self.backlog_shed_cap.store(0, Ordering::Relaxed);
-            return recovery_cap;
+            return recovery_or_capacity;
         }
         let latency_cap = self.backlog_cap.load(Ordering::Relaxed);
         let latency_component = if self.sla_mode.get().sheds_for_latency() && latency_cap > 0 {
@@ -10936,15 +10992,15 @@ impl ServerImpl {
         } else {
             usize::MAX
         };
-        // Recovery clamp joins the setpoint min (below `ceiling`, above `floor`). A
-        // `0` recovery cap means no clamp (treated as unbounded here).
-        let recovery_component = if recovery_cap > 0 {
-            recovery_cap
+        // Recovery / capacity clamp joins the setpoint min (below `ceiling`, above
+        // `floor`). A `0` cap on either means no clamp (treated as unbounded here).
+        let recovery_component = if recovery_or_capacity > 0 {
+            recovery_or_capacity
         } else {
             usize::MAX
         };
-        // Servo setpoint: latency ∧ memory ∧ recovery. Shed backstop: memory only
-        // (sits above the servo's operating band so it cannot collide with the
+        // Servo setpoint: latency ∧ memory ∧ recovery/capacity. Shed backstop: memory
+        // only (sits above the servo's operating band so it cannot collide with the
         // credit servo).
         let eff = latency_component
             .min(memory_cap)
@@ -13406,6 +13462,17 @@ async fn main() {
             let (mut prev_raft_fsync_sum, mut prev_raft_fsync_count) =
                 crate::metrics::raft_fsync_sum_count();
             let mut recovery_throttle_engaged = false;
+            // Capacity-aware admission governor: scales the per-node admission
+            // envelope to the cluster's current capacity (a peer down ⇒ this node
+            // leads more than it owns ⇒ smaller envelope, held proactively) and tunes
+            // it by the binding commit-wait latency signal, so the envelope actually
+            // engages under overpressure (the local per-command CPU signal does not).
+            let mut capacity_governor = crate::capacity_governor::CapacityGovernor::new(
+                crate::capacity_governor::CapacityGovernorCfg::from_env(),
+            );
+            let (mut prev_commit_wait_sum, mut prev_commit_wait_count) =
+                crate::metrics::commit_wait_sum_count();
+            let mut capacity_governor_engaged = false;
             // Catch-up hold: keep the recovery throttle engaged while this node is
             // still feeding a rejoined peer's post-hand-off learner catch-up (which
             // saturates the Raft disk after leadership displacement has cleared).
@@ -13615,6 +13682,62 @@ async fn main() {
                             } else {
                                 tracing::info!(
                                     "recovery admission throttle released (recovery cleared)"
+                                );
+                            }
+                        }
+                    }
+
+                    // Capacity-aware governor: fold the windowed commit-wait latency
+                    // (the binding replication/durability signal) into the AIMD, with
+                    // the envelope proactively scaled to this node's live leadership
+                    // load (owned vs led — a peer down means it leads more than it
+                    // owns, so the envelope shrinks and holds). Publish the resulting
+                    // cap (0 = no clamp). Recomputed before the setpoint so the min
+                    // below sees it.
+                    {
+                        let (cw_sum_now, cw_count_now) = crate::metrics::commit_wait_sum_count();
+                        let d_count = cw_count_now.saturating_sub(prev_commit_wait_count);
+                        let d_sum = (cw_sum_now - prev_commit_wait_sum).max(0.0);
+                        prev_commit_wait_sum = cw_sum_now;
+                        prev_commit_wait_count = cw_count_now;
+                        // Window-mean commit-wait latency in µs (0 when no waits this window).
+                        let commit_wait_avg_us = if d_count > 0 {
+                            d_sum / d_count as f64 * 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        let (owned, led) = monitor_server.leadership_load();
+                        let cap = capacity_governor.observe(commit_wait_avg_us, owned, led);
+                        monitor_server
+                            .capacity_backlog_cap
+                            .store(cap.unwrap_or(0), Ordering::Relaxed);
+                        crate::metrics::set_admission_limit(
+                            "backlog_capacity",
+                            cap.map(|c| c as i64).unwrap_or(0),
+                        );
+                        // Log engagement transitions so the reduced-capacity envelope
+                        // is legible in the ops log.
+                        let engaged = capacity_governor.is_engaged();
+                        if engaged != capacity_governor_engaged {
+                            capacity_governor_engaged = engaged;
+                            if engaged {
+                                let cause = if capacity_governor.is_degraded() {
+                                    "reduced node capacity"
+                                } else {
+                                    "commit-latency saturation"
+                                };
+                                tracing::info!(
+                                    commit_wait_avg_us,
+                                    cap = cap.unwrap_or(0),
+                                    owned,
+                                    led,
+                                    baseline_us = capacity_governor.baseline_us().unwrap_or(0.0),
+                                    cause,
+                                    "capacity governor engaged"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "capacity governor released (full capacity, commit latency healthy)"
                                 );
                             }
                         }
