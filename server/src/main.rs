@@ -3030,6 +3030,114 @@ fn cold_spill_from_env() -> Option<(u64, u64)> {
     Some((high, low))
 }
 
+/// Chooses the surviving successor for a leaderless partition, given the
+/// partition's ordered replica set (`replicas`, owner first), a parallel
+/// `reachable` mask, the cluster `num_nodes`, and the partition id `p`.
+///
+/// Rules:
+/// - A reachable owner (replica-set head) is always the successor — a live owner
+///   re-assumes leadership; it is never displaced.
+/// - When the owner is down, the orphaned partition is assigned by round-robin
+///   across the *reachable* remaining replicas, keyed by the partition's index
+///   within its owner's set (`p / num_nodes`), so a dead owner's partitions fan
+///   out evenly over the survivors instead of all landing on the first reachable
+///   one (which would leave one survivor carrying the entire failover load).
+/// - Returns `None` if no replica is reachable.
+///
+/// Pure and deterministic: `replicas`, `reachable`, and `num_nodes` are identical
+/// on every node, so all survivors independently agree on the same successor with
+/// no coordination — at most one node promotes.
+fn pick_successor(replicas: &[u32], reachable: &[bool], num_nodes: u32, p: u64) -> Option<u32> {
+    // A reachable owner (replica-set head) always re-assumes leadership.
+    if let (Some(&owner), Some(&true)) = (replicas.first(), reachable.first()) {
+        return Some(owner);
+    }
+    // Owner down (or absent): reachable remaining replicas, in replica order.
+    let candidates: Vec<u32> = replicas
+        .iter()
+        .zip(reachable.iter())
+        .skip(1)
+        .filter_map(|(&n, &up)| up.then_some(n))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let part_index = (p / num_nodes.max(1) as u64) as usize;
+    Some(candidates[part_index % candidates.len()])
+}
+
+#[cfg(test)]
+mod successor_balance_tests {
+    use super::pick_successor;
+
+    /// RF3, 3 nodes. Owner is node `p % 3`; replica order is
+    /// `[owner, owner+1, owner+2]`. When node 2 (owner of 2,5,8,11) dies, its
+    /// four orphaned partitions must fan out 2/2 across the two survivors —
+    /// NOT all land on node 0 (the old first-reachable behaviour).
+    #[test]
+    fn dead_owner_partitions_split_evenly_across_survivors() {
+        let num_nodes = 3;
+        // node 2 down, nodes 0 and 1 up.
+        let assign = |p: u64| {
+            let owner = (p % 3) as u32;
+            let replicas: Vec<u32> = (0..3).map(|i| (owner + i) % 3).collect();
+            let reachable: Vec<bool> = replicas.iter().map(|&n| n != 2).collect();
+            pick_successor(&replicas, &reachable, num_nodes, p)
+        };
+        let mut counts = [0usize; 3];
+        for p in [2u64, 5, 8, 11] {
+            let s = assign(p).expect("a survivor is reachable");
+            assert_ne!(s, 2, "never promote the dead owner");
+            counts[s as usize] += 1;
+        }
+        assert_eq!(counts[0], 2, "node0 should inherit 2 of node2's partitions");
+        assert_eq!(counts[1], 2, "node1 should inherit 2 of node2's partitions");
+    }
+
+    /// A reachable owner is always the successor — a live head is never displaced.
+    #[test]
+    fn reachable_owner_is_never_displaced() {
+        let replicas = [2u32, 0, 1];
+        let reachable = [true, true, true];
+        assert_eq!(pick_successor(&replicas, &reachable, 3, 8), Some(2));
+    }
+
+    /// All survivors compute the same successor for a given partition (agreement),
+    /// so at most one node promotes.
+    #[test]
+    fn all_survivors_agree_on_the_successor() {
+        // Owner (node2) down; nodes 0 and 1 evaluate the same inputs.
+        let replicas = [2u32, 0, 1];
+        let reachable = [false, true, true];
+        for p in [2u64, 5, 8, 11] {
+            let pick = pick_successor(&replicas, &reachable, 3, p);
+            // Deterministic function of shared inputs → identical on every node.
+            assert_eq!(pick, pick_successor(&replicas, &reachable, 3, p));
+            assert!(matches!(pick, Some(0) | Some(1)));
+        }
+    }
+
+    /// With only one survivor reachable, it inherits everything (no even split
+    /// possible) but the dead owner is still never chosen.
+    #[test]
+    fn single_survivor_inherits_all() {
+        let replicas = [2u32, 0, 1];
+        // Only node 1 up.
+        let reachable = [false, false, true];
+        for p in [2u64, 5, 8, 11] {
+            assert_eq!(pick_successor(&replicas, &reachable, 3, p), Some(1));
+        }
+    }
+
+    /// No reachable replica → no successor.
+    #[test]
+    fn no_reachable_replica_yields_none() {
+        let replicas = [2u32, 0, 1];
+        let reachable = [false, false, false];
+        assert_eq!(pick_successor(&replicas, &reachable, 3, 5), None);
+    }
+}
+
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
@@ -8252,19 +8360,18 @@ impl ServerImpl {
         matches!(self.peers.link(node).await, Ok(link) if link.is_connected())
     }
 
-    /// The deterministic surviving successor for partition `p`: the first node in
-    /// `replicas_of(p)` order (leader first) that is currently reachable. Because
-    /// the replica order is identical on every node, all survivors independently
-    /// agree on the same successor with no coordination — so at most one node
-    /// promotes. Returns `None` if no replica is reachable (this node included,
-    /// which cannot happen since `self` is always reachable to itself).
+    /// The deterministic surviving successor for partition `p`: probes each
+    /// replica's reachability, then delegates the (pure) choice to
+    /// [`pick_successor`]. Returns `None` if no replica is reachable (impossible
+    /// in practice: `self` is always reachable to itself).
     async fn designated_successor(&self, p: u64) -> Option<u32> {
-        for n in self.engine.topology().replicas_of(p) {
-            if self.peer_reachable(n).await {
-                return Some(n);
-            }
+        let topo = self.engine.topology();
+        let replicas = topo.replicas_of(p);
+        let mut reachable = Vec::with_capacity(replicas.len());
+        for &n in &replicas {
+            reachable.push(self.peer_reachable(n).await);
         }
-        None
+        pick_successor(&replicas, &reachable, topo.num_nodes(), p)
     }
 
     /// Reserves the next promotion epoch for partition `p` (current max + 1) and
