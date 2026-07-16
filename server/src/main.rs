@@ -2000,6 +2000,40 @@ fn evaluate_catchup(
     CatchupStep::Continue
 }
 
+/// Pure catch-up-hold decision for the recovery admission throttle. Given this
+/// tick's per-`(partition, peer)` `(lag, progress)` observations
+/// ([`ServerImpl::catchup_feed_observations`]), the running best-progress map,
+/// the (window-derived) lag `threshold` and the `stall_grace`, this updates the
+/// map in place and reports whether any peer is in an *advancing* bulk catch-up
+/// (lag ≥ `threshold` AND its progress scalar advanced within `stall_grace`),
+/// plus the max qualifying lag (for logging). A peer whose progress has gone
+/// quiet past the grace is treated as stalled/dead and ignored, so a wedged
+/// async learner can't pin the throttle. Clock is injected (`now`) so the
+/// stall/advance logic is deterministically unit-testable.
+fn catchup_hold_active(
+    observations: &[((u64, u64), u64, u128)],
+    progress: &mut std::collections::HashMap<(u64, u64), (u128, std::time::Instant)>,
+    threshold: u64,
+    stall_grace: std::time::Duration,
+    now: std::time::Instant,
+) -> (bool, u64) {
+    let mut active = false;
+    let mut max_lag = 0u64;
+    for &(key, lag, prog) in observations {
+        let slot = progress.entry(key).or_insert((prog, now));
+        if prog > slot.0 {
+            slot.0 = prog;
+            slot.1 = now;
+        }
+        let advancing = now.duration_since(slot.1) < stall_grace;
+        if lag >= threshold && advancing {
+            active = true;
+            max_lag = max_lag.max(lag);
+        }
+    }
+    (active, max_lag)
+}
+
 /// Poll interval for the incumbent's learner-lag catch-up loop.
 const HANDOFF_LAG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -7969,6 +8003,63 @@ impl ServerImpl {
         false
     }
 
+    /// Per-`(partition, peer)` catch-up feed observations for every partition
+    /// this node currently **leads**: the replication `lag` (entries the peer is
+    /// behind the log head) and a monotone `progress` scalar (matched index +
+    /// cumulative snapshot bytes) the caller diffs across ticks to distinguish an
+    /// *advancing* catch-up from a *stalled/dead* peer. Empty when Raft is
+    /// disabled or this is a single node.
+    ///
+    /// This is the signal that closes the post-hand-off oscillation gap:
+    /// [`recovery_fsync_load_active`](Self::recovery_fsync_load_active) keys only
+    /// on leadership *displacement*, so it clears the instant a rejoined peer
+    /// reclaims its partitions — but that peer is then a badly-lagging learner,
+    /// and streaming its retained-log backlog keeps THIS leader's Raft disk
+    /// saturated well past the displacement window. The recovery admission
+    /// throttle folds these observations in so it stays engaged through the
+    /// catch-up (peer lag above a window-derived threshold while still
+    /// advancing), then releases once the peer is caught up.
+    fn catchup_feed_observations(&self) -> Vec<((u64, u64), u64, u128)> {
+        let mut out = Vec::new();
+        if !raft_enabled() {
+            return out;
+        }
+        let topology = self.engine.topology();
+        if topology.num_nodes() <= 1 {
+            return out;
+        }
+        for p in 0..topology.num_partitions {
+            let Some(part) = self.raft_registry().get(p) else {
+                continue;
+            };
+            // Snapshot the leader's per-target matched indices, dropping the
+            // metrics borrow before touching the snapshot-progress map.
+            let (last, targets): (u64, Vec<(u64, u64)>) = {
+                let metrics = part.raft.metrics();
+                let m = metrics.borrow();
+                if m.state != openraft::ServerState::Leader {
+                    continue;
+                }
+                let last = m.last_log_index.unwrap_or(0);
+                let targets = match m.replication.as_ref() {
+                    Some(map) => map
+                        .iter()
+                        .map(|(n, l)| (*n, l.as_ref().map(|id| id.index).unwrap_or(0)))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                (last, targets)
+            };
+            for (node, matched) in targets {
+                let lag = last.saturating_sub(matched);
+                let bytes = part.snapshot_bytes_sent(node).unwrap_or(0);
+                let progress = matched as u128 + bytes as u128;
+                out.push(((p, node), lag, progress));
+            }
+        }
+        out
+    }
+
     /// One pass of the leader-durable recovery supervisor. For every partition this
     /// node replicates: if the group is leaderless (no current leader, and the
     /// original leader's peer link is down) for `grace_ticks` consecutive passes,
@@ -13315,6 +13406,34 @@ async fn main() {
             let (mut prev_raft_fsync_sum, mut prev_raft_fsync_count) =
                 crate::metrics::raft_fsync_sum_count();
             let mut recovery_throttle_engaged = false;
+            // Catch-up hold: keep the recovery throttle engaged while this node is
+            // still feeding a rejoined peer's post-hand-off learner catch-up (which
+            // saturates the Raft disk after leadership displacement has cleared).
+            // The lag threshold is auto-derived from the retained-log window so
+            // operators don't have to guess it: a peer counts as "in bulk catch-up"
+            // once it lags the log head by >5% of that window (floored), or is mid
+            // snapshot install (matched 0 ⇒ lag ≈ head). `NANOBPMN_RECOVERY_CATCHUP_LAG`
+            // overrides the derived value.
+            let catchup_lag_threshold: u64 = {
+                let retain = std::env::var("NANOBPMN_RAFT_LAGGING_RETAIN")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(400_000);
+                let derived = (retain / 20).max(20_000);
+                std::env::var("NANOBPMN_RECOVERY_CATCHUP_LAG")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(derived)
+            };
+            // A lagging peer whose progress scalar (matched + snapshot bytes) has
+            // not advanced for this long is treated as stalled/dead, not catching
+            // up, so a wedged learner can't pin the throttle indefinitely (the
+            // leader-durable model tolerates a lost async learner).
+            let catchup_stall_grace = std::time::Duration::from_secs(5);
+            let mut catchup_progress: std::collections::HashMap<
+                (u64, u64),
+                (u128, std::time::Instant),
+            > = std::collections::HashMap::new();
             loop {
                 interval.tick().await;
 
@@ -13450,7 +13569,23 @@ async fn main() {
                         } else {
                             0.0
                         };
-                        let recovering = monitor_server.recovery_fsync_load_active();
+                        let displaced = monitor_server.recovery_fsync_load_active();
+                        // Fold in the post-hand-off catch-up hold: stay engaged
+                        // while any led partition is still feeding a peer that lags
+                        // the log head beyond the derived threshold AND is still
+                        // advancing (matched/snapshot-bytes progress within the
+                        // stall grace). A stalled/dead peer is ignored so it can't
+                        // pin the throttle.
+                        let now_ct = std::time::Instant::now();
+                        let observations = monitor_server.catchup_feed_observations();
+                        let (catchup_active, catchup_max_lag) = catchup_hold_active(
+                            &observations,
+                            &mut catchup_progress,
+                            catchup_lag_threshold,
+                            catchup_stall_grace,
+                            now_ct,
+                        );
+                        let recovering = displaced || catchup_active;
                         let cap = recovery_throttle.observe(fsync_avg_us, recovering);
                         monitor_server
                             .recovery_backlog_cap
@@ -13465,10 +13600,17 @@ async fn main() {
                         if engaged != recovery_throttle_engaged {
                             recovery_throttle_engaged = engaged;
                             if engaged {
+                                let cause = if displaced {
+                                    "failover disk load"
+                                } else {
+                                    "peer catch-up disk load"
+                                };
                                 tracing::info!(
                                     fsync_avg_us,
                                     cap = cap.unwrap_or(0),
-                                    "recovery admission throttle engaged (failover disk load)"
+                                    catchup_max_lag,
+                                    cause,
+                                    "recovery admission throttle engaged"
                                 );
                             } else {
                                 tracing::info!(
@@ -18329,6 +18471,117 @@ mod clustered_startup_tests {
                 CatchupStep::Abort("learner catch-up ceiling exceeded"),
                 "the hard cap bounds even an actively-streaming install"
             );
+        }
+    }
+
+    #[test]
+    fn catchup_hold_engages_while_a_lagging_peer_advances_and_releases_when_caught_up_or_stalled() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let threshold = 60_000u64;
+        let grace = Duration::from_secs(5);
+        let t0 = Instant::now();
+
+        // A peer lagging above the threshold, first sighting -> engaged (a fresh
+        // observation counts as advancing for the first grace window).
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let obs = vec![((0u64, 18u64), 800_000u64, 1_000u128)];
+            let (active, max_lag) = catchup_hold_active(&obs, &mut prog, threshold, grace, t0);
+            assert!(
+                active,
+                "a freshly-seen bulk-lagging peer holds the throttle"
+            );
+            assert_eq!(max_lag, 800_000);
+        }
+
+        // A peer within the threshold -> NOT engaged (steady-state learner jitter).
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let obs = vec![((0u64, 18u64), 64u64, 1_000u128)];
+            let (active, _) = catchup_hold_active(&obs, &mut prog, threshold, grace, t0);
+            assert!(
+                !active,
+                "a nearly-caught-up peer does not hold the throttle"
+            );
+        }
+
+        // Still lagging but ADVANCING across ticks (progress grows) -> stays engaged,
+        // and the stall clock resets on each advance.
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let _ = catchup_hold_active(
+                &[((0u64, 18u64), 800_000u64, 1_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                t0,
+            );
+            let later = t0 + Duration::from_secs(4);
+            let (active, _) = catchup_hold_active(
+                &[((0u64, 18u64), 600_000u64, 200_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                later,
+            );
+            assert!(
+                active,
+                "an advancing bulk catch-up keeps the throttle engaged"
+            );
+            assert_eq!(
+                prog[&(0, 18)].1,
+                later,
+                "the stall clock reset on the advance"
+            );
+        }
+
+        // Lagging but STALLED: progress frozen past the grace -> released (a wedged
+        // or dead async learner must not pin the throttle in the leader-durable model).
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let _ = catchup_hold_active(
+                &[((0u64, 18u64), 800_000u64, 1_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                t0,
+            );
+            let much_later = t0 + Duration::from_secs(6);
+            let (active, _) = catchup_hold_active(
+                &[((0u64, 18u64), 800_000u64, 1_000u128)], // progress unchanged
+                &mut prog,
+                threshold,
+                grace,
+                much_later,
+            );
+            assert!(
+                !active,
+                "a stalled peer past the grace releases the throttle"
+            );
+        }
+
+        // A snapshot install (progress carried by cumulative bytes) above threshold,
+        // advancing -> engaged, exercising the bytes-driven progress path.
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let _ = catchup_hold_active(
+                &[((1u64, 18u64), 1_000_000u64, 50_000_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                t0,
+            );
+            let later = t0 + Duration::from_secs(3);
+            let (active, max_lag) = catchup_hold_active(
+                &[((1u64, 18u64), 1_000_000u64, 90_000_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                later,
+            );
+            assert!(active, "a streaming snapshot install holds the throttle");
+            assert_eq!(max_lag, 1_000_000);
         }
     }
 
