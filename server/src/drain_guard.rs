@@ -357,16 +357,6 @@ pub struct DrainSample {
     /// actor is a different failure (crash/panic) handled elsewhere; the valve
     /// must not fire on it (cutting creates would not revive a dead thread).
     pub actor_alive: bool,
-    /// Force the completion-paced servo to engage regardless of backlog level.
-    /// Driven by the capacity governor while it is engaged (a peer is down or
-    /// commit-latency is congested). This workload keeps the active-instance
-    /// backlog far below the setpoint floor, so the level-triggered band never
-    /// arms on its own; forcing it here paces create *intake* to the completion
-    /// rate (plus the burst) during capacity degradation instead of letting the
-    /// loadgen's deep inflight buffer amplify the completion ripple into intake
-    /// swings. Only affects *engage*: the hard valve and release hysteresis are
-    /// unchanged, and release still requires `!force_meter`.
-    pub force_meter: bool,
 }
 
 /// The published outcome of one observation.
@@ -449,12 +439,8 @@ impl DrainStateMachine {
         };
 
         // ---- Soft throttle (option 3): completion-paced servo, banded. ---------
-        // `force_meter` (capacity governor engaged) arms the servo regardless of
-        // the backlog level, and holds it armed until the force clears — the
-        // level-triggered band cannot arm on its own for a workload whose backlog
-        // sits below the setpoint floor.
         if !self.metering {
-            if s.force_meter || s.backlog >= engage_level {
+            if s.backlog >= engage_level {
                 self.meter_engage_ticks = self.meter_engage_ticks.saturating_add(1);
             } else {
                 self.meter_engage_ticks = 0;
@@ -464,7 +450,7 @@ impl DrainStateMachine {
                 self.meter_release_ticks = 0;
             }
         } else {
-            if !s.force_meter && s.backlog <= release_level {
+            if s.backlog <= release_level {
                 self.meter_release_ticks = self.meter_release_ticks.saturating_add(1);
             } else {
                 self.meter_release_ticks = 0;
@@ -532,7 +518,6 @@ mod tests {
             backlog,
             backlog_cap: 0,
             actor_alive: true,
-            force_meter: false,
         }
     }
 
@@ -544,7 +529,6 @@ mod tests {
             backlog,
             backlog_cap: cap,
             actor_alive: true,
-            force_meter: false,
         }
     }
 
@@ -593,53 +577,6 @@ mod tests {
         assert!(
             !d.metering,
             "backlog below release band must release the servo"
-        );
-    }
-
-    #[test]
-    fn force_meter_engages_below_band_and_holds_until_cleared() {
-        // The capacity governor drives `force_meter` while a peer is down /
-        // commit-latency is congested. It must arm the completion-paced servo even
-        // though the active backlog sits far below the engage band, and hold it
-        // armed until the force clears — this is the lever the backlog-count band
-        // cannot reach for a fast create->complete workload.
-        let c = cfg();
-        let mut sm = DrainStateMachine::new(c);
-
-        let forced = DrainSample {
-            completes_per_sec: 800.0,
-            backlog: 200, // far below the engage band
-            backlog_cap: 0,
-            actor_alive: true,
-            force_meter: true,
-        };
-        let mut d = sm.observe(forced);
-        assert!(!d.metering, "one forced tick must not engage (debounce)");
-        for _ in 0..c.meter_engage_ticks {
-            d = sm.observe(forced);
-        }
-        assert!(
-            d.metering,
-            "sustained force_meter must engage the servo despite a tiny backlog"
-        );
-
-        // While forced, a low backlog must NOT release it (force holds the servo).
-        for _ in 0..(c.meter_release_ticks + 5) {
-            d = sm.observe(forced);
-            assert!(d.metering, "force_meter must hold metering engaged");
-        }
-
-        // Clearing the force lets the normal (below-band) release fire.
-        let cleared = DrainSample {
-            force_meter: false,
-            ..forced
-        };
-        for _ in 0..c.meter_release_ticks {
-            d = sm.observe(cleared);
-        }
-        assert!(
-            !d.metering,
-            "once force clears, a below-band backlog releases the servo"
         );
     }
 
@@ -695,7 +632,6 @@ mod tests {
             backlog: cap,
             backlog_cap: cap,
             actor_alive: true,
-            force_meter: false,
         };
         for _ in 0..(c.halt_engage_ticks + 5) {
             let d = sm.observe(stalled_at_cap);
@@ -708,7 +644,6 @@ mod tests {
             backlog: cap * c.halt_arm_mult_pct as i64 / 100 + 1_000,
             backlog_cap: cap,
             actor_alive: true,
-            force_meter: false,
         };
         let mut d = sm.observe(wedged);
         for _ in 0..c.halt_engage_ticks {
@@ -729,7 +664,6 @@ mod tests {
             backlog: c.halt_min_backlog + 5_000,
             backlog_cap: 0,
             actor_alive: true,
-            force_meter: false,
         };
         let mut d = sm.observe(stall);
         assert!(!d.halted, "one stalled tick must not halt");
@@ -745,7 +679,6 @@ mod tests {
             backlog: c.halt_min_backlog + 5_000,
             backlog_cap: 0,
             actor_alive: true,
-            force_meter: false,
         };
         for _ in 0..c.halt_release_ticks {
             d = sm.observe(recover);
@@ -762,7 +695,6 @@ mod tests {
             backlog: c.halt_min_backlog + 5_000,
             backlog_cap: 0,
             actor_alive: false,
-            force_meter: false,
         };
         for _ in 0..(c.halt_engage_ticks + 5) {
             let d = sm.observe(dead);
@@ -782,7 +714,6 @@ mod tests {
             backlog: c.halt_min_backlog - 1,
             backlog_cap: 0,
             actor_alive: true,
-            force_meter: false,
         };
         for _ in 0..(c.halt_engage_ticks + 5) {
             let d = sm.observe(idle);
@@ -800,7 +731,6 @@ mod tests {
             backlog: 1_000_000,
             backlog_cap: 0,
             actor_alive: true,
-            force_meter: false,
         };
         for _ in 0..20 {
             let d = sm.observe(stall);
