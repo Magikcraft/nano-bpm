@@ -857,18 +857,6 @@ pub fn raft_fsync_sum_count() -> (f64, u64) {
     (h.get_sample_sum(), h.get_sample_count())
 }
 
-/// Cumulative (sum_seconds, count) of commit-waits since boot — the wall time
-/// callers spent waiting for their command's events to become durable
-/// (group-committed + fsynced). The monitor tick differences these across ticks
-/// to get the window-mean commit latency that drives the capacity governor. This
-/// is the *binding* replication/durability signal (unlike the single-writer's
-/// per-command CPU processing time, which stays fast while commits queue behind a
-/// saturating or peer-reduced cluster).
-pub fn commit_wait_sum_count() -> (f64, u64) {
-    let h = &METRICS.commit_wait_seconds;
-    (h.get_sample_sum(), h.get_sample_count())
-}
-
 /// A durable write was enqueued (pipeline depth +1).
 pub fn inflight_inc() {
     METRICS.inflight.inc();
