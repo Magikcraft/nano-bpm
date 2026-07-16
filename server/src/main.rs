@@ -7904,8 +7904,53 @@ impl ServerImpl {
                 server
                     .leader_durable_recovery_tick(grace_ticks, &mut state)
                     .await;
+                // Engage/clear the Raft-log fsync-relief window from the live
+                // leadership picture: while this node carries a down peer's
+                // partitions (or is catching its own back up) it runs ~double its
+                // steady Raft load on one disk, so coalescing its `sync`-mode
+                // fsyncs for the window keeps the shared disk from saturating and
+                // turning commits (and the completion-paced admission servo)
+                // bursty. Reverts to strict per-round fsync the moment recovery
+                // clears. A no-op under `async` durability or when the feature is
+                // disabled.
+                crate::raft_logstore::set_recovery_fsync_relief(
+                    server.recovery_fsync_load_active(),
+                );
             }
         });
+    }
+
+    /// True when this node carries recovery Raft load worth relieving `fsync` for:
+    /// it leads a partition it does not statically own (a failover incumbent
+    /// covering a down peer), or it owns a partition currently led by a peer (a
+    /// returning owner catching back up). In both cases the node runs roughly
+    /// double its steady Raft load on one shared disk. Cheap: borrows each hosted
+    /// group's metrics watch. Mirrors the console recovery indicator's signal.
+    fn recovery_fsync_load_active(&self) -> bool {
+        if !raft_enabled() {
+            return false;
+        }
+        let topology = self.engine.topology();
+        let me = topology.node_id;
+        if topology.num_nodes() <= 1 {
+            return false;
+        }
+        for p in 0..topology.num_partitions {
+            let owner = topology.owner_of(p);
+            let leader = self
+                .raft_registry()
+                .get(p)
+                .and_then(|part| part.raft.metrics().borrow().current_leader);
+            match leader {
+                // We lead a partition we don't own: a failover incumbent.
+                Some(l) if l as u32 == me && owner != me => return true,
+                // We own it but a peer leads it: a returning owner catching up.
+                // (Leaderless — cold-start formation — does not count.)
+                Some(l) if l as u32 != me && owner == me => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     /// One pass of the leader-durable recovery supervisor. For every partition this

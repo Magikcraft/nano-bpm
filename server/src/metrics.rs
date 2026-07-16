@@ -96,6 +96,10 @@ struct Metrics {
     raft_log_ram_bytes: IntGauge,
     /// Count of uncompacted Raft log entries in memory across all owned partitions.
     raft_log_entries: IntGauge,
+    /// 1 while the node-wide Raft-log fsync-relief window is engaged (a failover
+    /// incumbent / returning owner coalescing its `sync`-mode fsyncs during
+    /// recovery), else 0. Lets a soak confirm the relief actually engaged.
+    raft_fsync_relief_active: IntGauge,
     /// Distribution of a single appended Raft log entry's serialized byte length
     /// (one observation per entry, on every owned partition). A batched entry
     /// carries all coalesced commands' payloads, so this is the payload-size
@@ -436,6 +440,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "Uncompacted in-memory Raft log entries (all partitions).",
     )
     .expect("valid gauge");
+    let raft_fsync_relief_active = IntGauge::new(
+        "nanobpm_raft_fsync_relief_active",
+        "1 while the Raft-log fsync-relief window is engaged during recovery, else 0.",
+    )
+    .expect("valid gauge");
     // Per-entry serialized size. Buckets span 64 B .. ~256 MB (exp base 4) to
     // cover negligible batched creates through very large variable payloads.
     let raft_log_entry_bytes = Histogram::with_opts(
@@ -693,6 +702,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(raft_log_bytes.clone())))
         .and(registry.register(Box::new(raft_log_ram_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entries.clone())))
+        .and(registry.register(Box::new(raft_fsync_relief_active.clone())))
         .and(registry.register(Box::new(raft_log_entry_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entry_bytes_max.clone())))
         .and(registry.register(Box::new(exporter_queue_bytes.clone())))
@@ -750,6 +760,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         raft_log_bytes,
         raft_log_ram_bytes,
         raft_log_entries,
+        raft_fsync_relief_active,
         raft_log_entry_bytes,
         raft_log_entry_bytes_max,
         exporter_queue_bytes,
@@ -838,6 +849,14 @@ pub fn set_pipeline_bytes(bytes: u64) {
 pub fn raft_log_delta(entries_delta: i64, bytes_delta: i64) {
     METRICS.raft_log_entries.add(entries_delta);
     METRICS.raft_log_bytes.add(bytes_delta);
+}
+
+/// Sets the Raft-log fsync-relief gauge (1 = engaged during recovery, 0 = off).
+/// Driven by the recovery supervisor as it toggles the process-global relief flag.
+pub fn set_raft_fsync_relief(active: bool) {
+    METRICS
+        .raft_fsync_relief_active
+        .set(if active { 1 } else { 0 });
 }
 
 /// Adjusts the aggregate resident (in-RAM) Raft-log byte gauge by a signed delta.

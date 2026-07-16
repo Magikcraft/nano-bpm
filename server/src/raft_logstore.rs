@@ -47,7 +47,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -97,6 +97,54 @@ fn durability_mode_from_env() -> DurabilityMode {
         Ok(v) if v.trim().eq_ignore_ascii_case("async") => DurabilityMode::Async,
         _ => DurabilityMode::Sync,
     }
+}
+
+/// Process-wide "recovery fsync relief" flag. When a node becomes a failover
+/// incumbent (leads partitions it does not statically own, because a peer is
+/// down) or a returning owner catching its partitions back up, the surviving
+/// node carries roughly double its steady Raft load on a single shared disk.
+/// Under `sync` durability that doubles the per-replication-round `fsync` rate
+/// and can saturate the disk, inflating `fsync` latency an order of magnitude
+/// and making commits — and therefore completions and the completion-paced
+/// admission servo — bursty and oscillatory.
+///
+/// While this flag is set, `sync`-mode stores coalesce the *log-append* and
+/// *committed-marker* `fsync` onto the same bounded background cadence the
+/// `async` mode already uses (at most [`AsyncFlush::interval`] / `max_bytes`
+/// unfsynced) — group-committing many rounds into one media barrier. The
+/// election **vote is still fsynced synchronously** (see [`save_vote`]), so the
+/// Raft safety invariant is untouched; only the *optional* committed marker and
+/// the page-cache-resident log tail are deferred, exactly as `async` mode. The
+/// unfsynced window is bounded to the flush interval (~10 ms) and only widens
+/// during the recovery window on the node already carrying the extra load, so
+/// the marginal durability exposure is small and self-limiting.
+///
+/// The relief is a milder, measurable first step toward a full async-during-
+/// recovery mode: it reuses the shipped `async` code path rather than adding a
+/// new one, and reverts to strict per-round `fsync` the moment recovery clears.
+static RECOVERY_FSYNC_RELIEF: AtomicBool = AtomicBool::new(false);
+
+/// Enables/disables the recovery fsync-relief window (driven by the server's
+/// recovery supervisor from the live per-partition leadership picture).
+pub fn set_recovery_fsync_relief(on: bool) {
+    RECOVERY_FSYNC_RELIEF.store(on, Ordering::Relaxed);
+    crate::metrics::set_raft_fsync_relief(on);
+}
+
+/// Whether the recovery fsync-relief window is currently active.
+pub fn recovery_fsync_relief() -> bool {
+    RECOVERY_FSYNC_RELIEF.load(Ordering::Relaxed)
+}
+
+/// Whether the recovery fsync-relief feature is compiled into effect for this
+/// process. `NANOBPMN_RECOVERY_FSYNC_COALESCE` (default on). When off, a `sync`
+/// store is byte-identical to the pre-feature behaviour (no background flusher,
+/// every append fsynced inline) regardless of the relief flag.
+fn recovery_coalesce_enabled() -> bool {
+    !matches!(
+        std::env::var("NANOBPMN_RECOVERY_FSYNC_COALESCE"),
+        Ok(ref v) if v.trim() == "0" || v.trim().eq_ignore_ascii_case("false")
+    )
 }
 
 /// Async flush policy from env. `NANOBPMN_ASYNC_FLUSH_MS` (default 10, clamped to
@@ -430,9 +478,25 @@ struct Inner {
     /// Fixed at open. Reads stay codec-agnostic (frames are self-describing), so
     /// flipping this across a restart safely interleaves plaintext and framed records.
     compress: bool,
+    /// Whether this store may coalesce its `sync`-mode `fsync`s onto the async
+    /// cadence while [`RECOVERY_FSYNC_RELIEF`] is set (`NANOBPMN_RECOVERY_FSYNC_COALESCE`,
+    /// default on). Fixed at open; also gates spawning the background flusher for
+    /// a `sync` store so the relieved tail is bounded when the partition goes quiet.
+    coalesce_capable: bool,
 }
 
 impl Inner {
+    /// Whether this store should acknowledge appends before `fsync` and defer the
+    /// media barrier to the background flusher — i.e. behave like `async` mode.
+    /// True when the base mode is `async`, or when a `sync` store is inside the
+    /// recovery fsync-relief window (see [`RECOVERY_FSYNC_RELIEF`]). The vote is
+    /// unaffected (always synchronous); only the log tail + committed marker are
+    /// deferred, bounded by the flush cadence.
+    fn async_durability(&self) -> bool {
+        matches!(self.mode, DurabilityMode::Async)
+            || (self.coalesce_capable && recovery_fsync_relief())
+    }
+
     /// Demotes the coldest (lowest-index) resident entries to descriptor-only until
     /// the resident footprint is at or below `ram_budget`, keeping the most-recent
     /// entries in RAM for hot-path replication. A no-op when demotion is disabled
@@ -511,11 +575,11 @@ impl Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        // Best-effort flush of the async tail on shutdown so a clean stop leaves
-        // nothing unfsynced (sync mode already fsynced everything inline).
-        if self.mode == DurabilityMode::Async {
-            let _ = self.flush_async();
-        }
+        // Best-effort flush of any unfsynced async/relieved tail on shutdown so a
+        // clean stop leaves nothing unfsynced. A no-op for a sync store outside
+        // the relief window (its appends already fsynced inline, so nothing is
+        // outstanding), so this is safe to call unconditionally.
+        let _ = self.flush_async();
     }
 }
 
@@ -631,6 +695,15 @@ impl RaftLogStore {
         self.bytes.clone()
     }
 
+    /// Test-only: whether an append would DEFER its `fsync` (coalesce onto the
+    /// async cadence) rather than fsync inline right now, given the store's mode,
+    /// `coalesce_capable`, and the live recovery-relief flag. Mirrors the exact
+    /// predicate the `append`/`save_committed` fsync paths branch on.
+    #[cfg(test)]
+    fn would_defer_fsync(&self) -> bool {
+        self.inner.lock().unwrap().async_durability()
+    }
+
     /// Opens (creating if absent) a durable log store rooted at `dir`, replaying
     /// any existing `seg-*.ndjson` segments (or a legacy `log.ndjson`), `vote.json`
     /// and `state.json` to reconstruct the in-memory index, the persisted vote and
@@ -735,6 +808,7 @@ impl RaftLogStore {
                 unsynced_bytes: 0,
                 state_dirty: false,
                 compress: raft_log_compress_from_env(),
+                coalesce_capable: recovery_coalesce_enabled(),
             })),
             bytes: Arc::new(AtomicI64::new(log_bytes as i64)),
         };
@@ -744,12 +818,16 @@ impl RaftLogStore {
         // restart under a large-payload workload does not re-balloon RAM.
         store.inner.lock().unwrap().enforce_ram_budget();
 
-        // Async mode amortises fsync off the append critical path; a background
-        // ticker bounds the unfsynced window even when the partition goes quiet
-        // (an idle follower would otherwise hold an unflushed tail indefinitely).
-        // The ticker holds a `Weak`, so it exits once the Raft instance drops the
-        // store — no explicit shutdown handshake needed.
-        if mode == DurabilityMode::Async {
+        // The async flusher bounds the unfsynced window when the partition goes
+        // quiet (an idle follower would otherwise hold an unflushed tail
+        // indefinitely). It is needed in `async` mode, and also for a `sync`
+        // store that may enter the recovery fsync-relief window: the ticker
+        // fsyncs the coalesced tail within `flush.interval`. It holds a `Weak`,
+        // so it exits once the Raft instance drops the store — no explicit
+        // shutdown handshake needed. When neither applies it is not spawned, so
+        // a pure `sync` store with coalescing disabled keeps its exact prior
+        // thread model (no background flusher, every append fsynced inline).
+        if mode == DurabilityMode::Async || recovery_coalesce_enabled() {
             store.spawn_flusher();
         }
 
@@ -1060,19 +1138,20 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             added += 1;
             crate::metrics::raft_log_entry_appended(len);
         }
-        match inner.mode {
+        match inner.async_durability() {
             // Sync: fsync before acknowledging — a flushed entry is power-loss
             // durable. The media barrier (an `F_FULLFSYNC` on macOS) is on the
             // critical path of every replication round.
-            DurabilityMode::Sync => {
+            false => {
                 inner.active_file.sync_all().map_err(io_err)?;
                 inner.unsynced_bytes = 0;
             }
-            // Async: the bytes are in the page cache (process-crash durable);
+            // Async (base mode, or a sync store inside the recovery fsync-relief
+            // window): the bytes are in the page cache (process-crash durable);
             // acknowledge now and let the background flusher amortise the fsync.
             // A byte-bounded inline flush caps the unfsynced window under a flood,
             // when the periodic tick alone could fall behind.
-            DurabilityMode::Async => {
+            true => {
                 if inner.unsynced_bytes >= inner.flush.max_bytes {
                     inner.active_file.sync_all().map_err(io_err)?;
                     inner.unsynced_bytes = 0;
@@ -1172,13 +1251,14 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock().unwrap();
         inner.committed = committed;
-        match inner.mode {
+        match inner.async_durability() {
             // Sync: persist the committed marker durably (atomic write + fsync).
-            DurabilityMode::Sync => Self::persist_state(&inner),
-            // Async: the committed marker is an *optional* openraft optimisation
-            // (re-derived from the log + membership on restart), so defer it to
-            // the background flusher rather than fsyncing on every commit.
-            DurabilityMode::Async => {
+            false => Self::persist_state(&inner),
+            // Async (base mode, or the recovery fsync-relief window): the committed
+            // marker is an *optional* openraft optimisation (re-derived from the
+            // log + membership on restart), so defer it to the background flusher
+            // rather than fsyncing on every commit.
+            true => {
                 inner.state_dirty = true;
                 Ok(())
             }
@@ -1641,6 +1721,41 @@ mod tests {
         let got = store.try_get_log_entries(1..=2).await.unwrap();
         assert_eq!(got.len(), 2);
         assert!(matches!(got[0].payload, EntryPayload::Normal(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The recovery fsync-relief window flips a default (`sync`, coalesce-capable)
+    /// store from fsync-inline to coalesced-onto-the-async-cadence and back. This
+    /// is the durability gate the failover incumbent / returning owner rides during
+    /// recovery; the vote (always synchronous elsewhere) is untouched by this flag.
+    #[tokio::test]
+    async fn recovery_relief_defers_fsync_only_while_engaged() {
+        let dir = tmp_dir("relief-defer");
+        // Default env => sync mode, coalesce-capable.
+        let store = RaftLogStore::open(&dir).unwrap();
+
+        // Ensure a clean starting flag regardless of other tests, then assert the
+        // steady sync store fsyncs inline.
+        set_recovery_fsync_relief(false);
+        assert!(
+            !store.would_defer_fsync(),
+            "a steady sync store must fsync inline (relief off)"
+        );
+
+        // Engage the recovery window: the same store now defers to the flusher.
+        set_recovery_fsync_relief(true);
+        assert!(
+            store.would_defer_fsync(),
+            "a coalesce-capable sync store must defer fsync while relief is engaged"
+        );
+
+        // Recovery clears: strict per-round fsync resumes.
+        set_recovery_fsync_relief(false);
+        assert!(
+            !store.would_defer_fsync(),
+            "relief clearing must restore inline fsync"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
