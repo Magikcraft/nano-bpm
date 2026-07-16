@@ -1110,10 +1110,6 @@ async fn handle_client_frame(
             fetch_variables,
             request_timeout,
         } => {
-            // Wall-clock start for the create-accept latency signal (frame
-            // receipt -> accepted result). The submission-window governor reads
-            // the windowed mean of this to size producer credit under pressure.
-            let create_started = std::time::Instant::now();
             // Consume a submission credit (intake metering). The client is
             // expected to hold one; we still account so the top-up pass refills.
             let before = conn.submission_outstanding.fetch_sub(1, Ordering::Relaxed);
@@ -1186,7 +1182,6 @@ async fn handle_client_frame(
                                         "processCompleted": sync_completed,
                                     })),
                                 });
-                                crate::metrics::record_create_accept(create_started.elapsed());
                             }
                             Some(Err((status, message))) => {
                                 conn.send(ServerFrame::CommandResult {
@@ -1217,9 +1212,6 @@ async fn handle_client_frame(
                                                 "processCompleted": sync_completed,
                                             })),
                                         });
-                                        crate::metrics::record_create_accept(
-                                            create_started.elapsed(),
-                                        );
                                     }
                                     Err((status, message)) => {
                                         conn.send(ServerFrame::CommandResult {
@@ -1247,7 +1239,6 @@ async fn handle_client_frame(
                                         "processCompleted": sync_completed,
                                     })),
                                 });
-                                crate::metrics::record_create_accept(create_started.elapsed());
                             }
                             Err((status, message)) => {
                                 conn.send(ServerFrame::CommandResult {
@@ -1281,7 +1272,6 @@ async fn handle_client_frame(
                                 "processCompleted": sync_completed,
                             })),
                         });
-                        crate::metrics::record_create_accept(create_started.elapsed());
                         grant_submission_credit_if_clear(server, conn, 1);
                     }
                     Some(Err((status, message))) => {
@@ -1308,7 +1298,6 @@ async fn handle_client_frame(
                                         "processCompleted": sync_completed,
                                     })),
                                 });
-                                crate::metrics::record_create_accept(create_started.elapsed());
                             }
                             Err((status, message)) => {
                                 conn.send(ServerFrame::CommandResult {
@@ -1339,7 +1328,6 @@ async fn handle_client_frame(
                             "processCompleted": sync_completed,
                         })),
                     });
-                    crate::metrics::record_create_accept(create_started.elapsed());
                     if await_completion.unwrap_or(false) {
                         // Emit completion asynchronously (the task returns
                         // immediately if the instance is already terminal).
@@ -2075,19 +2063,6 @@ fn grant_submission_credit_if_clear(server: &ServerImpl, conn: &Arc<Connection>,
     if n <= 0 || server.create_admission_blocked() {
         return;
     }
-    // Respect the adaptive submission-window governor: never replenish a
-    // connection above its effective window `min(submission_window, cap)`. When
-    // the governor has shrunk the cap this holds the connection's outstanding
-    // creates at the reduced window (extra credits are simply not granted, so the
-    // window drains toward the cap); at steady state the cap == ceiling so this is
-    // a no-op.
-    let effective_window = conn.submission_window.min(server.submission_window_cap());
-    let outstanding = conn.submission_outstanding.load(Ordering::Relaxed);
-    let headroom = effective_window - outstanding;
-    if headroom <= 0 {
-        return;
-    }
-    let n = n.min(headroom);
     let n = if server.drain_guard().is_metering() {
         server.drain_guard().take_credits(n)
     } else {
@@ -2706,19 +2681,12 @@ fn topup_submission_credits(server: &ServerImpl, registry: &Arc<Registry>) {
         return;
     }
     let metering = server.drain_guard().is_metering();
-    // Cluster-wide submission-window cap from the adaptive governor. At steady
-    // state this equals the ceiling (>= every connection's `submission_window`),
-    // so `min` below is a no-op; under capacity-loss latency the governor shrinks
-    // it, capping each producer's effective window so create intake drops to a
-    // stable reduced-capacity level instead of limit-cycling.
-    let window_cap = server.submission_window_cap();
     for conn in registry.all_connections() {
         if conn.closed.load(Ordering::Relaxed) {
             continue;
         }
         let outstanding = conn.submission_outstanding.load(Ordering::Relaxed);
-        let effective_window = conn.submission_window.min(window_cap);
-        let want = effective_window - outstanding;
+        let want = conn.submission_window - outstanding;
         if want <= 0 {
             continue;
         }

@@ -36,14 +36,13 @@ mod readstore;
 mod recovery_throttle;
 mod seglog;
 mod stub_impls;
-mod submission_governor;
 mod varspill;
 mod varstore;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -235,17 +234,6 @@ pub struct ServerImpl {
     /// and honoured even when the general backlog cap is off. Recomputed each ~1 Hz
     /// monitor tick.
     recovery_backlog_cap: Arc<AtomicUsize>,
-    /// The live **per-producer submission-window cap** published by the adaptive
-    /// submission governor ([`crate::submission_governor`]): the TCP-style
-    /// congestion window on create admission credits. Under capacity loss the
-    /// governor shrinks this below the per-connection `submission_window` (AIMD on
-    /// create-accept latency) so fewer creates are admitted and the cluster holds a
-    /// stable reduced-capacity throughput instead of limit-cycling; on recovery it
-    /// grows back to the ceiling. Initialised to (and held at) the ceiling when
-    /// healthy, so `min(conn.submission_window, cap)` is a no-op at steady state.
-    /// Read by the credit top-up / grant path in `falcon`. Recomputed each ~1 Hz
-    /// monitor tick.
-    submission_window_cap: Arc<AtomicI64>,
     /// The live per-job-type active dispatch width the push dispatcher caps its
     /// per-pass subscriber fan-out at; `0` = no cap (dispatch to all subscribers).
     /// Held behind an atomic because in [`WorkerConcurrency::Auto`] mode the engine
@@ -681,12 +669,6 @@ impl ServerImpl {
         // each monitor tick. Seed at 0 (no clamp) — only engages inside a recovery
         // window with a saturating Raft-log disk.
         let recovery_backlog_cap = Arc::new(AtomicUsize::new(0));
-        // Submission-window governor cap: initialised at the governor ceiling so it
-        // is inert (a no-op `min` against each connection's `submission_window`)
-        // until the monitor tick shrinks it under create-accept latency pressure.
-        let submission_window_cap = Arc::new(AtomicI64::new(
-            crate::submission_governor::SubmissionGovernorCfg::from_env().ceiling,
-        ));
         // `active_worker_cap` is the live per-job-type active dispatch width the
         // push dispatcher reads (0 = no cap). Resolved from one of three policies,
         // mirroring the backlog governor: Off (no cap), Fixed, or a self-optimizing
@@ -864,7 +846,6 @@ impl ServerImpl {
             backlog_cap_floor,
             backlog_cap_ceiling,
             recovery_backlog_cap,
-            submission_window_cap,
             effective_backlog_cap,
             backlog_shed_cap,
             runnable_backlog,
@@ -10863,16 +10844,6 @@ impl ServerImpl {
         &self.drain_guard
     }
 
-    /// The live per-producer submission-window cap published by the adaptive
-    /// submission governor ([`crate::submission_governor`]). The credit top-up /
-    /// grant path caps each connection's effective window to
-    /// `min(conn.submission_window, this)`, so create intake shrinks under
-    /// capacity-loss latency and reopens to the ceiling on recovery. Equals the
-    /// governor ceiling (a no-op cap) at steady state.
-    pub(crate) fn submission_window_cap(&self) -> i64 {
-        self.submission_window_cap.load(Ordering::Relaxed)
-    }
-
     /// Whether new-instance admission is currently blocked by *either* the
     /// create-side latency backpressure ([`submission_pressure`](Self::submission_pressure))
     /// or the drain-stall guard. The submission-credit lanes and the fleet
@@ -13435,17 +13406,6 @@ async fn main() {
             let (mut prev_raft_fsync_sum, mut prev_raft_fsync_count) =
                 crate::metrics::raft_fsync_sum_count();
             let mut recovery_throttle_engaged = false;
-            // Adaptive submission-window governor: a TCP-style congestion window on
-            // producer create credits, AIMD on create-accept latency. Holds a stable
-            // reduced-capacity intake window while a peer is down (so the cluster
-            // settles instead of limit-cycling) and reopens to the ceiling on
-            // recovery. Inert at steady state (window == ceiling == no-op cap).
-            let mut submission_governor = crate::submission_governor::SubmissionGovernor::new(
-                crate::submission_governor::SubmissionGovernorCfg::from_env(),
-            );
-            let (mut prev_create_accept_sum, mut prev_create_accept_count) =
-                crate::metrics::create_accept_sum_count();
-            let mut submission_governor_engaged = false;
             // Catch-up hold: keep the recovery throttle engaged while this node is
             // still feeding a rejoined peer's post-hand-off learner catch-up (which
             // saturates the Raft disk after leadership displacement has cleared).
@@ -13655,52 +13615,6 @@ async fn main() {
                             } else {
                                 tracing::info!(
                                     "recovery admission throttle released (recovery cleared)"
-                                );
-                            }
-                        }
-                    }
-
-                    // Adaptive submission-window governor: fold the windowed
-                    // create-accept latency (the closed-loop overpressure signal)
-                    // into the AIMD congestion window and publish the resulting
-                    // per-producer submission-window cap. Under capacity loss the
-                    // window shrinks so fewer creates are admitted (the cluster
-                    // holds a stable lower throughput instead of limit-cycling);
-                    // on recovery it grows back to the ceiling (a no-op cap).
-                    // Independent of the recovery throttle: it engages on latency
-                    // alone, whether or not this node is a failover incumbent.
-                    {
-                        let (sum_now, count_now) = crate::metrics::create_accept_sum_count();
-                        let d_count = count_now.saturating_sub(prev_create_accept_count);
-                        let d_sum = (sum_now - prev_create_accept_sum).max(0.0);
-                        prev_create_accept_sum = sum_now;
-                        prev_create_accept_count = count_now;
-                        // Window-mean create-accept latency in µs (0 when no creates
-                        // this window -> governor holds).
-                        let create_accept_avg_us = if d_count > 0 {
-                            d_sum / d_count as f64 * 1_000_000.0
-                        } else {
-                            0.0
-                        };
-                        let window = submission_governor.observe(create_accept_avg_us, d_count);
-                        monitor_server
-                            .submission_window_cap
-                            .store(window, Ordering::Relaxed);
-                        crate::metrics::set_admission_limit("submission_window", window);
-                        let engaged = submission_governor.is_engaged();
-                        if engaged != submission_governor_engaged {
-                            submission_governor_engaged = engaged;
-                            if engaged {
-                                tracing::info!(
-                                    create_accept_avg_us,
-                                    window,
-                                    "submission-window governor engaged (create-accept latency \
-                                     pressure; shrinking producer credit window)"
-                                );
-                            } else {
-                                tracing::info!(
-                                    window,
-                                    "submission-window governor released (window restored)"
                                 );
                             }
                         }

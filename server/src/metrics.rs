@@ -34,9 +34,6 @@ struct Metrics {
     /// Time a caller spends awaiting its commit's durability (queueing behind
     /// other commits + the fsync itself). The closed-loop latency clients feel.
     commit_wait_seconds: Histogram,
-    /// Server-side latency from CreateInstance receipt to the accepted (commit)
-    /// result. The submission-window governor's congestion signal.
-    create_accept_seconds: Histogram,
     /// Group-commits performed (i.e. number of fsyncs).
     commits_total: IntCounter,
     /// Individual durable writes acknowledged (sum of all batch sizes).
@@ -319,16 +316,6 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         HistogramOpts::new(
             "nanobpm_commit_wait_seconds",
             "Time a caller awaits its commit becoming durable.",
-        )
-        .buckets(latency_buckets.clone()),
-    )
-    .expect("valid histogram opts");
-
-    let create_accept_seconds = Histogram::with_opts(
-        HistogramOpts::new(
-            "nanobpm_create_accept_seconds",
-            "Server-side latency from CreateInstance receipt to accepted (commit) result. \
-             The submission-window governor reads the windowed mean as its congestion signal.",
         )
         .buckets(latency_buckets),
     )
@@ -711,7 +698,6 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(fsync_seconds.clone())))
         .and(registry.register(Box::new(raft_fsync_seconds.clone())))
         .and(registry.register(Box::new(commit_wait_seconds.clone())))
-        .and(registry.register(Box::new(create_accept_seconds.clone())))
         .and(registry.register(Box::new(commits_total.clone())))
         .and(registry.register(Box::new(writes_total.clone())))
         .and(registry.register(Box::new(bytes_total.clone())))
@@ -771,7 +757,6 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         fsync_seconds,
         raft_fsync_seconds,
         commit_wait_seconds,
-        create_accept_seconds,
         commits_total,
         writes_total,
         bytes_total,
@@ -855,24 +840,6 @@ pub fn record_fsync(writes: usize, fsync: Duration) {
 /// Records how long a caller waited for its commit to become durable.
 pub fn record_commit_wait(wait: Duration) {
     METRICS.commit_wait_seconds.observe(wait.as_secs_f64());
-}
-
-/// Records the server-side create-accept latency: the wall time from receiving a
-/// `CreateInstance` frame to producing its accepted (committed) result. This is
-/// the closed-loop cost of admitting one create and rises under overpressure
-/// (batcher/single-writer queueing + replication), so the submission-window
-/// governor uses its windowed mean as the congestion signal that shrinks the
-/// per-producer credit window on capacity loss and reopens it on recovery.
-pub fn record_create_accept(latency: Duration) {
-    METRICS.create_accept_seconds.observe(latency.as_secs_f64());
-}
-
-/// Cumulative (sum_seconds, count) of create-accept latencies since boot. The
-/// monitor tick differences these across ticks to get the window-mean create
-/// latency driving the submission-window governor.
-pub fn create_accept_sum_count() -> (f64, u64) {
-    let h = &METRICS.create_accept_seconds;
-    (h.get_sample_sum(), h.get_sample_count())
 }
 
 /// Records the wall time of one Raft-log `sync_all()` barrier. The recovery
