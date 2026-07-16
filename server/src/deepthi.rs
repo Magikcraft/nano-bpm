@@ -181,18 +181,21 @@ impl Mailbox {
     }
 
     /// Blocks until a job is available, returning High-priority work first.
-    /// Returns `None` once every producer handle is gone and both queues are
-    /// empty (clean shutdown).
-    fn pop(&self) -> Option<Job> {
+    /// Returns the job together with the [`Priority`] queue it came from (so the
+    /// latency instrumentation can attribute the sample to its command class —
+    /// creates vs completions — and keep a like-for-like baseline). Returns `None`
+    /// once every producer handle is gone and both queues are empty (clean
+    /// shutdown).
+    fn pop(&self) -> Option<(Job, Priority)> {
         let mut g = self.inner.lock().expect("engine mailbox poisoned");
         loop {
             if let Some(job) = g.hi.pop_front() {
                 self.stats.hi_depth.store(g.hi.len(), Ordering::Relaxed);
-                return Some(job);
+                return Some((job, Priority::High));
             }
             if let Some(job) = g.lo.pop_front() {
                 self.stats.lo_depth.store(g.lo.len(), Ordering::Relaxed);
-                return Some(job);
+                return Some((job, Priority::Low));
             }
             if g.producers == 0 {
                 return None;
@@ -288,7 +291,7 @@ impl DeepthiHandle {
                     Self::run_instrumented(&consumer, &mut journal, profile, controller);
                 } else {
                     let stats = &consumer.stats;
-                    while let Some(job) = consumer.pop() {
+                    while let Some((job, _)) = consumer.pop() {
                         stats.job_start_mono_ms.store(mono_ms(), Ordering::Relaxed);
                         job(&mut journal);
                         stats.job_start_mono_ms.store(0, Ordering::Relaxed);
@@ -322,7 +325,7 @@ impl DeepthiHandle {
 
         loop {
             let before_recv = Instant::now();
-            let Some(job) = mb.pop() else { break };
+            let Some((job, prio)) = mb.pop() else { break };
             idle += before_recv.elapsed();
 
             mb.stats
@@ -334,9 +337,11 @@ impl DeepthiHandle {
             mb.stats.job_start_mono_ms.store(0, Ordering::Relaxed);
             mb.stats.jobs.fetch_add(1, Ordering::Relaxed);
 
-            // Feed the adaptive limiter every command; it windows internally.
+            // Feed the adaptive limiter every command, tagged with its class
+            // (creates = `Low`, completion-side/reads = `High`) so it can window
+            // each class against its own baseline instead of one contaminated mix.
             if let Some(c) = controller.as_mut() {
-                c.record(job_time);
+                c.record(job_time, prio == Priority::Low);
             }
 
             if !profile {

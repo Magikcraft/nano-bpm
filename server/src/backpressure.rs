@@ -394,25 +394,74 @@ impl LatencyLimiter {
     }
 }
 
+/// One command-class latency window (creates vs completion-side). Accumulates
+/// per-command latencies of a single class and yields the window average once it
+/// has enough samples and has run long enough — keeping each class's baseline
+/// like-for-like. Windowing per class (rather than one mixed window) is what
+/// stops a cheap-completion window from pinning the create-side baseline near
+/// zero, which made `threshold = baseline * CONGESTION_RATIO` fire on every
+/// normal window and pinned the governor at its floor.
+struct ClassWindow {
+    count: u64,
+    sum_us: f64,
+    start: Instant,
+}
+
+impl ClassWindow {
+    fn new() -> Self {
+        Self {
+            count: 0,
+            sum_us: 0.0,
+            start: Instant::now(),
+        }
+    }
+
+    /// Fold one same-class sample in; return the window average (and reset) once
+    /// the window has enough samples and has run long enough, else `None`.
+    fn offer(&mut self, us: f64) -> Option<f64> {
+        self.count += 1;
+        self.sum_us += us;
+        if self.count >= WINDOW_MIN_SAMPLES && self.start.elapsed() >= WINDOW_MIN_INTERVAL {
+            let avg = self.sum_us / self.count as f64;
+            self.count = 0;
+            self.sum_us = 0.0;
+            self.start = Instant::now();
+            Some(avg)
+        } else {
+            None
+        }
+    }
+}
+
 /// Engine-thread side of the adaptive limiters: accumulates per-command latency
-/// into windows and, once a window has enough samples and has run long enough,
-/// steps every installed [`LatencyLimiter`] from the *same* window average.
-/// Owned by the single (partition-0) engine thread, so its window state needs no
-/// synchronization. Two limiters can be installed, both driven off the one
-/// per-command latency signal:
+/// into **per-class** windows and, once a class window has enough samples and has
+/// run long enough, steps the limiters that key off that class from its window
+/// average. Owned by the single (partition-0) engine thread, so its window state
+/// needs no synchronization. The command classes are creates (`Priority::Low`)
+/// and completion-side/reads (`Priority::High`); splitting the window keeps each
+/// class's latency baseline like-for-like:
 /// - the **create limiter** (present in adaptive backpressure mode) sizes the
-///   create-processing concurrency watermark, gated on the `processing` gauge;
+///   create-processing concurrency watermark, gated on the `processing` gauge,
+///   and steps off the **create** window;
 /// - the **backlog governor** (present in auto admission-backlog mode) sizes the
 ///   active-backlog admission cap between a knee floor and a memory ceiling,
-///   gated on the runnable (task-job) backlog — self-optimizing the throughput
-///   knee without shedding parked instances (which create no jobs).
+///   gated on the runnable (task-job) backlog, and also steps off the **create**
+///   window — it is the create→accept SLO the admission cap gates;
+/// - the **worker governor** steps off the **completion** window — the drain-side
+///   knee.
+///
+/// Previously a single mixed window fed all three: because the cheapest command
+/// (≈1µs job-completes) anchored the AIMD baseline, every normal mixed window
+/// exceeded `baseline * CONGESTION_RATIO` and the governor backed off to its
+/// floor forever. Per-class windows fix that at the source.
 pub struct AdaptiveController {
     create: Option<LatencyLimiter>,
     backlog: Option<LatencyLimiter>,
     workers: Option<LatencyLimiter>,
-    count: u64,
-    sum_us: f64,
-    window_start: Instant,
+    /// Create-class (`Priority::Low`) latency window — drives create + backlog.
+    lo: ClassWindow,
+    /// Completion-class (`Priority::High`) latency window — drives the workers.
+    hi: ClassWindow,
     /// Log every limit change at INFO (gated by `NANOBPM_ACTOR_PROFILE`) so the
     /// limiters' convergence is observable during tuning.
     verbose: bool,
@@ -434,9 +483,8 @@ impl AdaptiveController {
             create: None,
             backlog: None,
             workers: None,
-            count: 0,
-            sum_us: 0.0,
-            window_start: Instant::now(),
+            lo: ClassWindow::new(),
+            hi: ClassWindow::new(),
             verbose: std::env::var_os("NANOBPM_ACTOR_PROFILE").is_some(),
         }
     }
@@ -518,25 +566,30 @@ impl AdaptiveController {
         self.create.is_some() || self.backlog.is_some() || self.workers.is_some()
     }
 
-    /// Record one command's processing latency. Evaluates the window (and updates
-    /// every installed limiter) once it has enough samples and has run long enough.
-    pub fn record(&mut self, latency: Duration) {
-        self.count += 1;
-        self.sum_us += latency.as_micros() as f64;
-        if self.count >= WINDOW_MIN_SAMPLES && self.window_start.elapsed() >= WINDOW_MIN_INTERVAL {
-            let avg = self.sum_us / self.count as f64;
-            if let Some(c) = self.create.as_mut() {
-                c.step(avg, self.verbose);
+    /// Record one command's processing latency, tagged with its class
+    /// (`is_create` = the create-side `Priority::Low` queue). Folds the sample
+    /// into that class's window and steps the limiters keyed off it once the
+    /// window is ready: the create limiter and backlog governor off the **create**
+    /// window, the worker governor off the **completion** window. Splitting the
+    /// windows keeps each limiter's AIMD baseline like-for-like so the governor is
+    /// no longer pinned at its floor by cheap cross-class samples.
+    pub fn record(&mut self, latency: Duration, is_create: bool) {
+        let us = latency.as_micros() as f64;
+        if is_create {
+            if let Some(avg) = self.lo.offer(us) {
+                if let Some(c) = self.create.as_mut() {
+                    c.step(avg, self.verbose);
+                }
+                if let Some(b) = self.backlog.as_mut() {
+                    b.step(avg, self.verbose);
+                }
             }
-            if let Some(b) = self.backlog.as_mut() {
-                b.step(avg, self.verbose);
-            }
-            if let Some(w) = self.workers.as_mut() {
-                w.step(avg, self.verbose);
-            }
-            self.count = 0;
-            self.sum_us = 0.0;
-            self.window_start = Instant::now();
+            return;
+        }
+        if let Some(avg) = self.hi.offer(us)
+            && let Some(w) = self.workers.as_mut()
+        {
+            w.step(avg, self.verbose);
         }
     }
 }
@@ -757,10 +810,20 @@ mod tests {
 
     /// Feed `n` synthetic commands of `us` microseconds each; enough to satisfy
     /// `WINDOW_MIN_SAMPLES`, with a sleep so `WINDOW_MIN_INTERVAL` also elapses.
+    /// Feed `n` synthetic create-class commands of `us` microseconds each; enough
+    /// to satisfy `WINDOW_MIN_SAMPLES`, with a sleep so `WINDOW_MIN_INTERVAL` also
+    /// elapses. Create-class drives the create limiter + backlog governor.
     fn drive_window(c: &mut AdaptiveController, us: u64, n: u64) {
+        drive_window_class(c, us, n, true)
+    }
+
+    /// Like [`drive_window`] but lets the caller pick the command class
+    /// (`is_create`) so tests can drive the create vs completion window
+    /// independently — the whole point of the per-class split.
+    fn drive_window_class(c: &mut AdaptiveController, us: u64, n: u64, is_create: bool) {
         std::thread::sleep(WINDOW_MIN_INTERVAL + Duration::from_millis(1));
         for _ in 0..n.max(WINDOW_MIN_SAMPLES) {
-            c.record(Duration::from_micros(us));
+            c.record(Duration::from_micros(us), is_create);
         }
     }
 
@@ -850,6 +913,67 @@ mod tests {
     }
 
     #[test]
+    fn backlog_governor_grows_off_floor_despite_interleaved_cheap_completions() {
+        // Regression for the floor-pinning bug: in production the actor mixes
+        // cheap (~1µs) completion commands with heavier create commands. With a
+        // single mixed window the completion samples anchored the AIMD baseline
+        // near zero, so every window exceeded `baseline * CONGESTION_RATIO` and the
+        // governor backed off to its floor forever. With per-class windows the
+        // create-class baseline is calibrated from create samples alone, so a
+        // healthy, loaded create stream grows the cap even while a firehose of
+        // cheap completions is interleaved.
+        let runnable = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let (cap, obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+
+        // Establish the create-class baseline at ~100µs, interleaving cheap 1µs
+        // completions (which must NOT contaminate the create baseline).
+        std::thread::sleep(WINDOW_MIN_INTERVAL + Duration::from_millis(1));
+        for _ in 0..WINDOW_MIN_SAMPLES {
+            c.record(Duration::from_micros(1), false); // completion (High)
+            c.record(Duration::from_micros(100), true); // create (Low)
+        }
+        assert_eq!(
+            obs.baseline_us.load(Ordering::Relaxed),
+            100,
+            "create baseline must reflect create samples, not the 1µs completions"
+        );
+        let after_baseline = cap.load(Ordering::Relaxed);
+
+        // Healthy (110µs ≈ baseline, well under the 2× threshold) + loaded, still
+        // interleaved with cheap completions => the cap must slow-start UP.
+        std::thread::sleep(WINDOW_MIN_INTERVAL + Duration::from_millis(1));
+        for _ in 0..WINDOW_MIN_SAMPLES {
+            c.record(Duration::from_micros(1), false);
+            c.record(Duration::from_micros(110), true);
+        }
+        assert!(
+            cap.load(Ordering::Relaxed) > after_baseline,
+            "governor must grow off the floor on a healthy loaded create stream \
+             despite interleaved cheap completions: {after_baseline} -> {}",
+            cap.load(Ordering::Relaxed)
+        );
+    }
+
+    #[test]
+    fn completion_stream_does_not_drive_the_backlog_governor() {
+        // The backlog governor keys off the CREATE window only. A pure completion
+        // firehose (no create samples) must leave it inert at the floor — the
+        // completion class drives the worker governor, not the create-side cap.
+        let runnable = Arc::new(AtomicUsize::new(100_000));
+        let mut c = AdaptiveController::new();
+        let (cap, _obs) = c.with_backlog_governor(2_000, 200_000, runnable.clone());
+        for _ in 0..20 {
+            drive_window_class(&mut c, 100, WINDOW_MIN_SAMPLES, false); // completions only
+        }
+        assert_eq!(
+            cap.load(Ordering::Relaxed),
+            2_000,
+            "completion-only load must not move the create-side backlog cap"
+        );
+    }
+
+    #[test]
     fn controller_is_active_only_with_a_limiter_installed() {
         assert!(!AdaptiveController::new().is_active());
         let mut c = AdaptiveController::new();
@@ -875,9 +999,9 @@ mod tests {
         let width = c.with_worker_governor(50, 4_096, backlog.clone());
         assert_eq!(width.load(Ordering::Relaxed), 50, "starts at the floor");
 
-        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // establish baseline
+        drive_window_class(&mut c, 100, WINDOW_MIN_SAMPLES, false); // establish baseline
         let after_baseline = width.load(Ordering::Relaxed);
-        drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy + loaded => grow
+        drive_window_class(&mut c, 110, WINDOW_MIN_SAMPLES, false); // healthy + loaded => grow
         assert!(
             width.load(Ordering::Relaxed) > after_baseline,
             "healthy loaded windows must widen the fan-out: {after_baseline} -> {}",
@@ -893,13 +1017,13 @@ mod tests {
         let backlog = Arc::new(AtomicUsize::new(100_000));
         let mut c = AdaptiveController::new();
         let width = c.with_worker_governor(50, 4_096, backlog.clone());
-        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline 100us
+        drive_window_class(&mut c, 100, WINDOW_MIN_SAMPLES, false); // baseline 100us
         for _ in 0..5 {
-            drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // grow a bit first
+            drive_window_class(&mut c, 110, WINDOW_MIN_SAMPLES, false); // grow a bit first
         }
         assert!(width.load(Ordering::Relaxed) > 50);
         for _ in 0..200 {
-            drive_window(&mut c, 5_000, WINDOW_MIN_SAMPLES); // sustained congestion
+            drive_window_class(&mut c, 5_000, WINDOW_MIN_SAMPLES, false); // sustained congestion
         }
         assert_eq!(
             width.load(Ordering::Relaxed),
@@ -916,9 +1040,9 @@ mod tests {
         let backlog = Arc::new(AtomicUsize::new(0));
         let mut c = AdaptiveController::new();
         let width = c.with_worker_governor(50, 4_096, backlog.clone());
-        drive_window(&mut c, 100, WINDOW_MIN_SAMPLES); // baseline
+        drive_window_class(&mut c, 100, WINDOW_MIN_SAMPLES, false); // baseline
         for _ in 0..20 {
-            drive_window(&mut c, 110, WINDOW_MIN_SAMPLES); // healthy but unloaded
+            drive_window_class(&mut c, 110, WINDOW_MIN_SAMPLES, false); // healthy but unloaded
         }
         assert_eq!(
             width.load(Ordering::Relaxed),
