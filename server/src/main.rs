@@ -13755,6 +13755,14 @@ async fn main() {
                         backlog,
                         backlog_cap: effective_cap as i64,
                         actor_alive: any_actor_alive,
+                        // While the capacity governor is engaged (a peer is down or
+                        // commit latency is congested), force the completion-paced
+                        // servo on regardless of backlog level. This workload keeps
+                        // the active backlog far below the setpoint floor, so the
+                        // level-triggered band never arms; forcing it paces create
+                        // intake to the completion rate (plus burst) during capacity
+                        // degradation instead of the loadgen's deep inflight buffer.
+                        force_meter: capacity_governor.is_engaged(),
                     });
                     let guard = monitor_server.drain_guard();
                     guard.publish(decision.metering, decision.halted);
