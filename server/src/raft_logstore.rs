@@ -136,14 +136,21 @@ pub fn recovery_fsync_relief() -> bool {
     RECOVERY_FSYNC_RELIEF.load(Ordering::Relaxed)
 }
 
-/// Whether the recovery fsync-relief feature is compiled into effect for this
-/// process. `NANOBPMN_RECOVERY_FSYNC_COALESCE` (default on). When off, a `sync`
-/// store is byte-identical to the pre-feature behaviour (no background flusher,
-/// every append fsynced inline) regardless of the relief flag.
+/// Whether the recovery fsync-relief fallback is enabled for this process.
+/// `NANOBPMN_RECOVERY_FSYNC_COALESCE` — **default OFF**. This deliberately
+/// relaxes durability during recovery (a `sync` store's committed marker + log
+/// tail are deferred to the async cadence while relief is engaged; see
+/// [`RECOVERY_FSYNC_RELIEF`]), so it is opt-in: the durability-preserving
+/// primary lever is the adaptive recovery admission throttle (which paces intake
+/// so the disk stays under its fsync knee without deferring any fsync). Leave
+/// this off unless the throttle alone cannot hold the disk and you accept the
+/// bounded recovery-window durability exposure. When off, a `sync` store is
+/// byte-identical to the pre-feature behaviour (no background flusher, every
+/// append fsynced inline) regardless of the relief flag.
 fn recovery_coalesce_enabled() -> bool {
-    !matches!(
+    matches!(
         std::env::var("NANOBPMN_RECOVERY_FSYNC_COALESCE"),
-        Ok(ref v) if v.trim() == "0" || v.trim().eq_ignore_ascii_case("false")
+        Ok(ref v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("true")
     )
 }
 
@@ -702,6 +709,13 @@ impl RaftLogStore {
     #[cfg(test)]
     fn would_defer_fsync(&self) -> bool {
         self.inner.lock().unwrap().async_durability()
+    }
+
+    /// Test-only: force `coalesce_capable` on/off without touching the process
+    /// environment (which would race other parallel tests that `open()` a store).
+    #[cfg(test)]
+    fn force_coalesce_capable(&self, on: bool) {
+        self.inner.lock().unwrap().coalesce_capable = on;
     }
 
     /// Opens (creating if absent) a durable log store rooted at `dir`, replaying
@@ -1724,38 +1738,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The recovery fsync-relief window flips a default (`sync`, coalesce-capable)
-    /// store from fsync-inline to coalesced-onto-the-async-cadence and back. This
-    /// is the durability gate the failover incumbent / returning owner rides during
-    /// recovery; the vote (always synchronous elsewhere) is untouched by this flag.
+    /// The recovery fsync-relief gate: coalescing is opt-in (default OFF, fully
+    /// durable), and even when enabled it only defers a `sync` store's fsync
+    /// *while the recovery window is engaged*, reverting on clear. The vote
+    /// (always synchronous elsewhere) is untouched by this flag. Both behaviours
+    /// live in one test because they share the process-global relief flag, which
+    /// would race across parallel test functions.
     #[tokio::test]
-    async fn recovery_relief_defers_fsync_only_while_engaged() {
-        let dir = tmp_dir("relief-defer");
-        // Default env => sync mode, coalesce-capable.
-        let store = RaftLogStore::open(&dir).unwrap();
-
-        // Ensure a clean starting flag regardless of other tests, then assert the
-        // steady sync store fsyncs inline.
-        set_recovery_fsync_relief(false);
-        assert!(
-            !store.would_defer_fsync(),
-            "a steady sync store must fsync inline (relief off)"
-        );
-
-        // Engage the recovery window: the same store now defers to the flusher.
+    async fn recovery_relief_gates_fsync_and_is_off_by_default() {
+        // --- Default posture: coalescing off => fsync stays inline even in the
+        // recovery window (durability fully preserved). ---
+        let off_dir = tmp_dir("relief-default-off");
+        let off_store = RaftLogStore::open(&off_dir).unwrap();
         set_recovery_fsync_relief(true);
         assert!(
-            store.would_defer_fsync(),
-            "a coalesce-capable sync store must defer fsync while relief is engaged"
+            !off_store.would_defer_fsync(),
+            "a default (coalescing-off) sync store must fsync inline even during recovery"
         );
 
-        // Recovery clears: strict per-round fsync resumes.
+        // --- Opt-in posture: a coalesce-capable sync store defers only while the
+        // recovery window is engaged, and reverts on clear. ---
+        let on_dir = tmp_dir("relief-defer");
+        let on_store = RaftLogStore::open(&on_dir).unwrap();
+        on_store.force_coalesce_capable(true);
+
         set_recovery_fsync_relief(false);
         assert!(
-            !store.would_defer_fsync(),
+            !on_store.would_defer_fsync(),
+            "a steady sync store must fsync inline (relief off)"
+        );
+        set_recovery_fsync_relief(true);
+        assert!(
+            on_store.would_defer_fsync(),
+            "a coalesce-capable sync store must defer fsync while relief is engaged"
+        );
+        set_recovery_fsync_relief(false);
+        assert!(
+            !on_store.would_defer_fsync(),
             "relief clearing must restore inline fsync"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&off_dir);
+        let _ = std::fs::remove_dir_all(&on_dir);
     }
 }
