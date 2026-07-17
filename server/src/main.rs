@@ -178,18 +178,12 @@ pub struct ServerImpl {
     backlog_cap: Arc<AtomicUsize>,
     /// When the active-backlog cap is governed live (`AdmissionBacklog::Auto`),
     /// the standalone monitor-stepped [`BacklogGovernor`] compressor that clamps the
-    /// cap when internal command latency rises over its learned baseline. `None` in
-    /// `Fixed`/`Off` mode (the cap is then a plain constant). Surfaced by the ~1 Hz
-    /// monitor as `nanobpm_backlog_governor_*` metrics and used to explain the
-    /// auto-tuned cap in the `active_backlog` / `create_backlog` shed message.
+    /// cap by **engine-actor saturation ρ** (busy fraction) paired with the
+    /// runnable-backlog growth rate — "are we falling behind AND is it our fault".
+    /// `None` in `Fixed`/`Off` mode (the cap is then a plain constant). Surfaced by
+    /// the ~1 Hz monitor as `nanobpm_backlog_governor_*` metrics and used to explain
+    /// the auto-tuned cap in the `active_backlog` / `create_backlog` shed message.
     backlog_gov: Option<BacklogGovernor>,
-    /// Read handle onto the create limiter's live per-window **internal command
-    /// latency** (+ its learned baseline + a freshness `seq`), published each time
-    /// the create window folds. The monitor-stepped backlog compressor
-    /// ([`BacklogGovernor`]) keys off this — the "are we the bottleneck" signal that
-    /// is immune to external/worker service time. `None` unless adaptive
-    /// backpressure is installed (the compressor then stays inert).
-    internal_latency_obs: Option<crate::backpressure::LatencyObs>,
     /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
     /// completed *service-task* jobs, summed across owned partitions. This is the
     /// parked-excluded load signal the admission gate and the backlog governor
@@ -603,17 +597,11 @@ impl ServerImpl {
         // self-optimizing active-backlog governor (auto admission-backlog). The
         // controller owns the shared atomics; the server keeps the read sides.
         let mut controller = AdaptiveController::new();
-        // The create limiter also publishes its per-window internal command latency
-        // (the "are we the bottleneck" signal) via a `LatencyObs` read handle that
-        // the monitor-stepped backlog compressor keys off. Non-adaptive modes leave
-        // it `None` (compressor stays inert / disabled).
-        let mut internal_latency_obs: Option<crate::backpressure::LatencyObs> = None;
         let backpressure = match backpressure_setting_from_env() {
             BackpressureSetting::Disabled => Backpressure::Disabled,
             BackpressureSetting::Fixed(n) => Backpressure::Fixed(n),
             BackpressureSetting::Adaptive => {
-                let (limit, obs) = controller.with_create_limiter(processing.clone());
-                internal_latency_obs = Some(obs);
+                let limit = controller.with_create_limiter(processing.clone());
                 Backpressure::Adaptive(limit)
             }
         };
@@ -661,14 +649,20 @@ impl ServerImpl {
                 );
                 backlog_cap_floor = floor;
                 backlog_cap_ceiling = ceiling;
-                // The backlog cap is held by a COMPRESSOR keyed on internal command
-                // latency (the create limiter's window latency — "are we the
-                // bottleneck") over its auto-learned baseline, NOT an absolute SLO
-                // and NOT e2e sojourn (which is dominated by external/worker service
-                // time and would mis-throttle on a downstream outage). Like an audio
-                // compressor: threshold = baseline·LEVEL, soft KNEE dead-band, fast
-                // ATTACK clamp-down, slow RELEASE relax (anti-oscillation asymmetry).
-                // Tunable live via NANOBPMN_ADMISSION_COMP_LEVEL/ATTACK/RELEASE/KNEE.
+                // The backlog cap is held by a COMPRESSOR keyed on engine-actor
+                // saturation ρ (the busy fraction of the single-writer engine actor,
+                // aggregated node-level by the monitor) paired with the runnable-
+                // backlog growth rate — "are we falling behind AND is it our fault".
+                // ρ is absolute (cold-start-proof, no learning), captures disk+CPU
+                // (fsync is inside the timed job region), and is immune to external
+                // strain (a slow worker parks the actor → ρ low). Three-zone law:
+                // attack (cut) only when saturated AND rising (the attack step
+                // steepens with the growth rate — the one proportional term); release
+                // (grow) slowly when draining or idle (the anti-oscillation
+                // asymmetry); hold otherwise (healthy saturated peak). Tunable live
+                // via NANOBPMN_ADMISSION_COMP_RHO_TARGET/DEADBAND/ATTACK/RELEASE/
+                // ATTACK_GAIN. Only the dimensionless ρ target matters — portable
+                // across hardware, no absolute latency number to calibrate.
                 let env_f64 = |k: &str, d: f64, pred: fn(f64) -> bool| {
                     std::env::var(k)
                         .ok()
@@ -676,20 +670,31 @@ impl ServerImpl {
                         .filter(|x| pred(*x))
                         .unwrap_or(d)
                 };
-                let level = env_f64("NANOBPMN_ADMISSION_COMP_LEVEL", 2.0, |x| x > 0.0);
+                let rho_target = env_f64("NANOBPMN_ADMISSION_COMP_RHO_TARGET", 0.9, |x| {
+                    x > 0.0 && x < 1.0
+                });
+                let deadband = env_f64("NANOBPMN_ADMISSION_COMP_DEADBAND", 0.05, |x| {
+                    (0.0..1.0).contains(&x)
+                });
                 let attack = env_f64("NANOBPMN_ADMISSION_COMP_ATTACK", 0.7, |x| {
                     x > 0.0 && x < 1.0
                 });
                 let release = env_f64("NANOBPMN_ADMISSION_COMP_RELEASE", 1.1, |x| x > 1.0);
-                let knee = env_f64("NANOBPMN_ADMISSION_COMP_KNEE", 0.15, |x| {
-                    (0.0..1.0).contains(&x)
-                });
+                let attack_gain = env_f64("NANOBPMN_ADMISSION_COMP_ATTACK_GAIN", 3.0, |x| x >= 0.0);
                 tracing::info!(
-                    "admission backlog compressor: internal-latency threshold \
-                     baseline·{level} (attack {attack}, release {release}, knee {knee})"
+                    "admission backlog compressor: actor-saturation ρ target {rho_target} \
+                     (deadband {deadband}, attack {attack}, release {release}, \
+                     attack_gain {attack_gain})"
                 );
-                let (gov, cap, _obs) =
-                    BacklogGovernor::new(floor, ceiling, level, attack, release, knee);
+                let (gov, cap, _obs) = BacklogGovernor::new(
+                    floor,
+                    ceiling,
+                    rho_target,
+                    deadband,
+                    attack,
+                    release,
+                    attack_gain,
+                );
                 backlog_gov = Some(gov);
                 cap
             }
@@ -879,7 +884,6 @@ impl ServerImpl {
             activity: Arc::new(AtomicU64::new(0)),
             backlog_cap,
             backlog_gov,
-            internal_latency_obs,
             backlog_cap_floor,
             backlog_cap_ceiling,
             recovery_backlog_cap,
@@ -11137,11 +11141,11 @@ impl ServerImpl {
     /// Trailing sentence for an active-backlog / create-backlog shed message that
     /// explains *why* the cap is what it is — so an operator isn't left staring at
     /// a shed threshold they never configured. In `Auto` mode the cap is the live
-    /// output of the internal-latency **compressor**, so we name it as auto-tuned,
-    /// give its floor/ceiling bounds, and (once a window has folded) report the
-    /// current internal command latency vs the compressor threshold that drove the
-    /// last adjustment. In `Fixed`/`Off` mode the cap is a plain operator setting,
-    /// so we just point at the tuning lever.
+    /// output of the actor-saturation **compressor**, so we name it as auto-tuned,
+    /// give its floor/ceiling bounds, and report the current engine-actor saturation
+    /// ρ vs its target plus the backlog trend that drove the last adjustment. In
+    /// `Fixed`/`Off` mode the cap is a plain operator setting, so we just point at
+    /// the tuning lever.
     fn backlog_cap_explainer(&self) -> String {
         let Some(gov) = &self.backlog_gov else {
             return " This is a fixed cap (NANOBPMN_ADMISSION_MAX_BACKLOG); \
@@ -11149,22 +11153,20 @@ impl ServerImpl {
                     instead of shedding. Retry after a backoff."
                 .to_string();
         };
-        let threshold = gov.obs().target_us.load(Ordering::Relaxed);
-        let window = gov.obs().window_avg_us.load(Ordering::Relaxed);
+        let rho = gov.obs().rho_permille.load(Ordering::Relaxed);
+        let target = gov.obs().rho_target_permille.load(Ordering::Relaxed);
+        let growth = gov.obs().growth_per_s.load(Ordering::Relaxed);
         let bounds = format!(
-            " This cap is auto-tuned by the internal-latency compressor (floor {}, \
-             ceiling {} runnable jobs); it clamps intake when the engine's internal \
-             command latency rises above its {threshold}µs threshold",
+            " This cap is auto-tuned by the actor-saturation compressor (floor {}, \
+             ceiling {} runnable jobs); it clamps intake when the engine actor is \
+             saturated (ρ {:.2} vs target {:.2}) AND the backlog is rising ({growth:+}/s)",
             gov.floor(),
-            gov.ceiling()
+            gov.ceiling(),
+            rho as f64 / 1000.0,
+            target as f64 / 1000.0,
         );
-        let latency = if window > 0 {
-            format!("; last window internal latency was {window}µs vs the {threshold}µs threshold.")
-        } else {
-            ".".to_string()
-        };
         format!(
-            "{bounds}{latency} Retry after a backoff, set NANOBPMN_ADMISSION_MAX_BACKLOG \
+            "{bounds}. Retry after a backoff, set NANOBPMN_ADMISSION_MAX_BACKLOG \
              for a fixed cap, or NANOBPMN_SLA_MODE=admission to accept latency instead \
              of shedding."
         )
@@ -13544,11 +13546,21 @@ async fn main() {
             let mut memory_lit = false;
             let mut seen_job_types: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
-            // Freshness tracking for the backlog compressor: the last internal-latency
-            // window `seq` we stepped on. The compressor releases (grows the cap) only
-            // on a fresh create-window sample, so a stale (unchanged) seq means the
-            // cap is held — an idle create pipeline can never creep the cap open.
-            let mut prev_latency_seq: u64 = 0;
+            // Compressor state for the backlog governor. ρ (engine-actor saturation)
+            // is aggregated node-level from the actor stats: each tick we diff the
+            // summed `busy_nanos` across all engine handles against the wall time
+            // elapsed and the actor count, giving the busy fraction ρ = Σ Δbusy /
+            // (n_actors · Δwall). Backlog growth is the runnable-backlog delta over
+            // the same wall interval (jobs/s, signed). Seeded on the first tick.
+            let mut prev_busy_nanos_sum: u128 = monitor_server
+                .engine
+                .all()
+                .iter()
+                .map(|h| h.stats().busy_nanos.load(Ordering::Relaxed) as u128)
+                .sum();
+            let mut prev_rho_backlog: i64 =
+                monitor_server.runnable_backlog.load(Ordering::Relaxed) as i64;
+            let mut prev_rho_instant = std::time::Instant::now();
             // Drain-stall guard supervisor state (options 3+4). The state machine
             // owns the edge/hysteresis counters; here we track the deltas it needs:
             // the completion count (rate = drain throughput) and the active backlog
@@ -13622,23 +13634,23 @@ async fn main() {
                     "backlog",
                     monitor_server.backlog_cap.load(Ordering::Relaxed) as i64,
                 );
-                // In Auto mode, publish the governor's bounds + live latency signal
-                // so a dashboard (and the shed message) can explain where the cap
-                // sits and why it moved there, rather than only the bare cap value.
+                // In Auto mode, publish the governor's bounds + live ρ/backlog-trend
+                // signal so a dashboard (and the shed message) can explain where the
+                // cap sits and why it moved there, rather than only the bare cap value.
                 if let Some(gov) = &monitor_server.backlog_gov {
                     crate::metrics::set_backlog_governor("floor", gov.floor() as i64);
                     crate::metrics::set_backlog_governor("ceiling", gov.ceiling() as i64);
                     crate::metrics::set_backlog_governor(
-                        "baseline_latency_us",
-                        gov.obs().baseline_us.load(Ordering::Relaxed) as i64,
+                        "rho_permille",
+                        gov.obs().rho_permille.load(Ordering::Relaxed) as i64,
                     );
                     crate::metrics::set_backlog_governor(
-                        "window_latency_us",
-                        gov.obs().window_avg_us.load(Ordering::Relaxed) as i64,
+                        "rho_target_permille",
+                        gov.obs().rho_target_permille.load(Ordering::Relaxed) as i64,
                     );
                     crate::metrics::set_backlog_governor(
-                        "target_latency_us",
-                        gov.obs().target_us.load(Ordering::Relaxed) as i64,
+                        "growth_per_s",
+                        gov.obs().growth_per_s.load(Ordering::Relaxed),
                     );
                 }
                 crate::metrics::set_admission_limit(
@@ -13671,22 +13683,35 @@ async fn main() {
                 monitor_server
                     .runnable_backlog
                     .store(runnable, Ordering::Relaxed);
-                // Step the standalone backlog compressor once per tick off the create
-                // limiter's live internal command latency (the "are we the bottleneck"
-                // signal), NOT e2e sojourn. Only step on a FRESH create window (seq
-                // advanced) so a release can't creep the cap open on a stale sample /
-                // idle create pipeline; otherwise hold the cap.
-                if let (Some(gov), Some(obs)) = (
-                    &monitor_server.backlog_gov,
-                    &monitor_server.internal_latency_obs,
-                ) {
-                    let seq = obs.seq.load(Ordering::Relaxed);
-                    if seq != prev_latency_seq {
-                        prev_latency_seq = seq;
-                        let lat_us = obs.window_avg_us.load(Ordering::Relaxed) as f64;
-                        let baseline_us = obs.baseline_us.load(Ordering::Relaxed) as f64;
-                        gov.step(lat_us, baseline_us);
+                // Step the standalone backlog compressor once per tick off engine-actor
+                // saturation ρ + the runnable-backlog growth rate — "are we falling
+                // behind AND is it our fault", NOT e2e sojourn (dominated by external
+                // service time) and NOT internal latency vs a learned baseline (which
+                // pins to idle). ρ = Σ Δbusy_nanos across all engine actors / (n_actors
+                // · Δwall): absolute, cold-start-proof, disk+CPU-inclusive, immune to
+                // external strain. Stepped in BOTH SLA modes so ρ/growth stay populated
+                // for monitoring; the cap only actuates admission in latency mode.
+                if let Some(gov) = &monitor_server.backlog_gov {
+                    let handles = monitor_server.engine.all();
+                    let n_actors = handles.len().max(1) as f64;
+                    let busy_sum: u128 = handles
+                        .iter()
+                        .map(|h| h.stats().busy_nanos.load(Ordering::Relaxed) as u128)
+                        .sum();
+                    let now = std::time::Instant::now();
+                    let wall_ns = now.duration_since(prev_rho_instant).as_nanos();
+                    // First tick (or a zero interval) has no interval to divide by —
+                    // seed the baselines and hold the cap.
+                    if wall_ns > 0 {
+                        let d_busy = busy_sum.saturating_sub(prev_busy_nanos_sum) as f64;
+                        let rho = (d_busy / (n_actors * wall_ns as f64)).clamp(0.0, 1.0);
+                        let wall_s = wall_ns as f64 / 1_000_000_000.0;
+                        let growth_per_s = (runnable as i64 - prev_rho_backlog) as f64 / wall_s;
+                        gov.step(rho, growth_per_s);
                     }
+                    prev_busy_nanos_sum = busy_sum;
+                    prev_rho_backlog = runnable as i64;
+                    prev_rho_instant = now;
                 }
                 let workers = monitor_registry.workers_per_type();
                 let mut current: std::collections::HashSet<String> =

@@ -18,45 +18,31 @@
 //! is limited (instances) — it makes the *limit itself* track latency.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// Live-published internal state of the [`BacklogGovernor`], so the ~1 Hz monitor
 /// can surface *why* the compressor is holding its cap where it is (and a shed
-/// message can explain it). The governor owns the write side (updated each monitor
-/// tick); the server keeps a clone of the read side. Latencies are whole
-/// microseconds. All zero until the first window folds.
+/// message can explain it), and so ρ + backlog-trend are available as a monitoring
+/// surface in **both** SLA modes (the cap only actuates in latency mode, but the
+/// signals are always published). The governor owns the write side (updated each
+/// monitor tick); the server keeps a clone of the read side. All zero until the
+/// first tick folds.
 #[derive(Clone, Default)]
 pub struct GovernorObs {
-    /// The self-calibrated *internal command-latency* baseline (µs) — the engine's
-    /// uncongested per-command apply/journal time. The compressor's threshold is a
-    /// multiple of this (see `target_us`). Read against the reported end-to-end job
-    /// sojourn: the gap ≈ external/worker service time.
-    pub baseline_us: Arc<AtomicU64>,
-    /// The most recent window's mean *internal command latency* (µs) — the "are we
-    /// the bottleneck" signal the compressor keys on. Above the threshold, the
-    /// compressor attacks (cuts the cap); below it, it releases (grows).
-    pub window_avg_us: Arc<AtomicU64>,
-    /// The current compressor *threshold* (µs) = `baseline × level`. When the
-    /// window internal latency crosses this (± the knee) the compressor acts.
-    pub target_us: Arc<AtomicU64>,
-}
-
-/// Read handle onto the create-side latency limiter's live window, published each
-/// time its window folds so the monitor-stepped [`BacklogGovernor`] compressor can
-/// key off the engine's *internal command latency* — the only "is our system the
-/// bottleneck" signal that a slow downstream/worker cannot move (external strain
-/// makes workers hold jobs longer, but the engine's apply/journal path stays fast).
-/// `seq` increments on every published window so the monitor can tell a fresh
-/// sample from a stale one and only step (or hold) accordingly.
-#[derive(Clone, Default)]
-pub struct LatencyObs {
-    /// Most recent create-window mean internal command latency (µs).
-    pub window_avg_us: Arc<AtomicU64>,
-    /// The limiter's self-calibrated uncongested baseline (µs).
-    pub baseline_us: Arc<AtomicU64>,
-    /// Monotonic window counter — bumped once per published window (freshness).
-    pub seq: Arc<AtomicU64>,
+    /// The most recent tick's **actor saturation ρ**, in per-mille (0–1000). ρ→1000
+    /// means the single-writer engine actor is the wall (CPU-bound apply or
+    /// disk-bound fsync). This is the compressor's primary "are we the bottleneck"
+    /// signal — absolute, cold-start-proof, immune to external/worker strain.
+    pub rho_permille: Arc<AtomicU64>,
+    /// The ρ setpoint, in per-mille: at/above this (plus the deadband) *and* while
+    /// the backlog is rising, the compressor attacks the cap.
+    pub rho_target_permille: Arc<AtomicU64>,
+    /// The most recent tick's runnable-backlog growth rate (jobs/second, signed):
+    /// `> 0` = falling behind (intake outrunning drain), `< 0` = draining. Paired
+    /// with ρ it separates "we're the bottleneck" (ρ high **and** rising) from a
+    /// healthy peak (ρ high, stable) or external strain (ρ low, rising).
+    pub growth_per_s: Arc<AtomicI64>,
 }
 
 /// Parsed configuration for the backpressure subsystem.
@@ -395,10 +381,6 @@ struct LatencyLimiter {
     signal: Arc<AtomicUsize>,
     /// Stable tag for the verbose convergence log (`adaptive`, `worker-governor`).
     label: &'static str,
-    /// When present (the create limiter), each folded window publishes its mean
-    /// internal command latency + baseline here so the monitor-stepped backlog
-    /// compressor can key off the "are we the bottleneck" signal.
-    obs: Option<LatencyObs>,
 }
 
 impl LatencyLimiter {
@@ -408,12 +390,6 @@ impl LatencyLimiter {
         let prev = self.aimd.limit();
         let new_limit = self.aimd.on_window(avg_us, signal);
         self.shared.store(new_limit, Ordering::Relaxed);
-        if let Some(obs) = &self.obs {
-            obs.window_avg_us.store(avg_us as u64, Ordering::Relaxed);
-            obs.baseline_us
-                .store(self.aimd.baseline_us() as u64, Ordering::Relaxed);
-            obs.seq.fetch_add(1, Ordering::Relaxed);
-        }
         if verbose && new_limit != prev {
             tracing::info!(
                 "backpressure({}): limit {prev} -> {new_limit} (avg {avg_us:.0}us, \
@@ -478,11 +454,11 @@ impl ClassWindow {
 ///   knee.
 ///
 /// The admission-backlog cap is *not* driven here: it is owned by the standalone
-/// monitor-stepped [`BacklogGovernor`] compressor, which keys off this create
-/// limiter's **internal command latency** signal (published via [`LatencyObs`]) —
-/// "is our system the bottleneck" — deliberately *not* end-to-end sojourn (which is
-/// dominated by external/worker service time and would mis-throttle on a downstream
-/// outage).
+/// monitor-stepped [`BacklogGovernor`] compressor, which keys off **engine-actor
+/// saturation ρ** + backlog trend (the monitor aggregates ρ from the actor stats) —
+/// "are we falling behind AND is it our fault" — deliberately *not* end-to-end
+/// sojourn (which is dominated by external/worker service time and would
+/// mis-throttle on a downstream outage).
 pub struct AdaptiveController {
     create: Option<LatencyLimiter>,
     workers: Option<LatencyLimiter>,
@@ -519,22 +495,16 @@ impl AdaptiveController {
     /// Install the create-processing concurrency limiter (the historical adaptive
     /// backpressure watermark). Growth is gated on the `inflight` processing
     /// gauge. Returns the shared limit handle to install in
-    /// [`Backpressure::Adaptive`], plus a [`LatencyObs`] read handle publishing the
-    /// create-window internal command latency for the backlog compressor.
-    pub fn with_create_limiter(
-        &mut self,
-        inflight: Arc<AtomicUsize>,
-    ) -> (Arc<AtomicUsize>, LatencyObs) {
+    /// [`Backpressure::Adaptive`].
+    pub fn with_create_limiter(&mut self, inflight: Arc<AtomicUsize>) -> Arc<AtomicUsize> {
         let shared = Arc::new(AtomicUsize::new(INITIAL_LIMIT));
-        let obs = LatencyObs::default();
         self.create = Some(LatencyLimiter {
             aimd: AimdLimit::new(INITIAL_LIMIT, MIN_LIMIT, MAX_LIMIT),
             shared: shared.clone(),
             signal: inflight,
             label: "adaptive",
-            obs: Some(obs.clone()),
         });
-        (shared, obs)
+        shared
     }
 
     /// Install the self-optimizing worker-concurrency governor: it tunes the
@@ -562,7 +532,6 @@ impl AdaptiveController {
             shared: shared.clone(),
             signal: backlog,
             label: "worker-governor",
-            obs: None,
         });
         shared
     }
@@ -596,85 +565,103 @@ impl AdaptiveController {
 
 /// The standalone admission-backlog **compressor**, stepped once per ~1 Hz monitor
 /// tick (not on the engine actor loop). It bounds the admission-backlog cap by
-/// reacting to the *growth of internal command latency over its auto-learned
-/// baseline* — exactly like an audio compressor reacts to signal above a threshold.
+/// reacting to **engine-actor saturation ρ** (the busy fraction of the single-writer
+/// engine actor) paired with the **runnable-backlog growth rate** — the two signals
+/// that together answer the operator's real question: *are we falling behind
+/// (backlog rising) AND is it our fault (the engine actor is saturated)?*
 ///
-/// ## Why internal latency, not sojourn
-/// End-to-end job sojourn (create→complete) tracks backlog depth beautifully, but
-/// it is dominated by **external/worker service time**: a slow downstream or a
-/// stalled worker pool inflates sojourn to tens of seconds while *our* engine is
-/// idle and healthy. Throttling admission on that would punish clients for someone
-/// else's outage. **Internal command latency** — the engine's per-command
-/// apply+journal time, published by the create [`LatencyLimiter`] via
-/// [`LatencyObs`] — rises only when *we* are the bottleneck (create-flood, Raft/disk
-/// saturation) and stays flat under external strain. It is the correct
-/// "compress only when our system is the bottleneck" signal, and it needs no
-/// per-process isolation: it is global and immune to external latency by
-/// construction. (Sojourn is retained purely as a per-job-type *reporting* surface.)
+/// ## Why ρ + backlog-trend, not latency-over-baseline
+/// A latency-over-learned-baseline compressor (the prior design) needs a
+/// *healthy-busy* reference it cannot learn from a cold start or a busy-storm
+/// wake-up, and its baseline pinned to the idle floor, clamping perpetually. ρ has
+/// none of those problems:
+/// - **absolute** — ρ ∈ [0,1] needs no learning and no magic latency number, so it
+///   is correct on the very first window (cold-start-proof);
+/// - **captures disk *and* CPU** — the fsync is inside the timed `job(journal)`
+///   region, so a disk-bound actor reads ρ≈1 just like a CPU-bound one;
+/// - **immune to external strain** — a slow downstream/worker makes the actor *park*
+///   waiting for work (ρ low), so it never mistakes someone else's outage for our
+///   own saturation and never throttles admission for it.
 ///
-/// ## Compressor control law
-/// The threshold is **relative to the learned baseline**, never an absolute SLO the
-/// operator must set: `threshold = baseline · level`. Around it sits a soft
-/// dead-band (the *knee*): `[threshold·(1−knee), threshold·(1+knee)]`. Each tick,
-/// given the current window internal latency `lat` and the create limiter's
-/// published `baseline`:
-/// - **above the knee** (`lat > threshold·(1+knee)`): **attack** — cut the cap fast
-///   (`cap · attack`, `attack < 1`) toward the floor;
-/// - **below the knee** (`lat < threshold·(1−knee)`): **release** — grow the cap
-///   slowly (`cap · release`, `release > 1`) toward the ceiling;
-/// - **within the knee**: hold.
+/// ρ alone cannot tell a healthy peak (a work-conserving server saturates at ρ≈1
+/// serving a load it *is* keeping up with) from genuine overload, so it is paired
+/// with backlog growth: **we are the bottleneck only when ρ is high AND the backlog
+/// is rising.** (Sojourn is retained purely as a per-job-type *reporting* surface.)
 ///
-/// `attack ≪ release` (fast clamp-down, slow relax) is the anti-oscillation
-/// asymmetry that stops the cap sawtoothing. Because release only happens when a
-/// *fresh* create window reports low latency, an idle pipeline (no creates flowing)
-/// produces no new sample, so the monitor holds — the cap cannot creep open while
-/// nothing is being admitted. When the system is healthy the latency sits under the
-/// threshold and the cap relaxes to the ceiling (compressor inert); when we become
-/// the bottleneck it clamps to the real latency knee.
+/// ## Compressor control law (three-zone, crisp + one proportional touch)
+/// Each tick, given actor saturation `rho` ∈ [0,1] and runnable-backlog growth
+/// `growth_per_s` (jobs/s, signed):
+/// - **attack** — `rho > target + deadband` **and** `growth_per_s > 0` (saturated
+///   *and* falling behind): cut the cap multiplicatively toward the floor. The
+///   attack step is the **only proportional term**: it steepens as the backlog rises
+///   faster (`f = attack^(1 + attack_gain·g)`, `g = clamp(growth/cap, 0, 1)`), so a
+///   cold-start storm slams the cap to the floor in a few ticks while a mild
+///   overshoot is nudged gently.
+/// - **release** — `growth_per_s < 0` (draining) **or** `rho < target − deadband`
+///   (idle headroom): grow the cap slowly toward the ceiling (`cap · release`).
+///   Release is deliberately **slow and un-proportional** — this asymmetry is the
+///   anti-oscillation guarantee (the compressor is the *outer* loop of a cascade
+///   over the drain-guard servo; it must move slower than the inner loop or they
+///   fight, which is what caused the historical sawtooth).
+/// - **hold** — otherwise (healthy saturated peak: ρ high but backlog stable; or the
+///   ambiguous mid-zone). Holding at a healthy peak is exactly the compressor knee.
+///
+/// Only the dimensionless `rho_target` matters as a tuning knob, and it is portable
+/// across hardware — there is no absolute latency number to calibrate per box.
 #[derive(Clone)]
 pub struct BacklogGovernor {
     /// Published admission-backlog cap the gate reads — and the compressor's own
-    /// state (`step` loads the current cap, folds one window, stores the new cap).
+    /// state (`step` loads the current cap, folds one tick, stores the new cap).
     cap: Arc<AtomicUsize>,
     floor: usize,
     ceiling: usize,
-    /// Threshold multiple over the learned baseline (`threshold = baseline·level`).
-    level: f64,
-    /// Attack coefficient (< 1): fast multiplicative clamp-down above the knee.
+    /// Actor-saturation setpoint ρ* ∈ (0,1): attack fires only above `target +
+    /// deadband` (while the backlog is rising).
+    rho_target: f64,
+    /// Half-width of the ρ dead-band around the setpoint (the hold zone).
+    deadband: f64,
+    /// Base attack coefficient (< 1): the per-tick multiplicative clamp-down when
+    /// saturated-and-rising, before the growth-rate steepening is applied.
     attack: f64,
-    /// Release coefficient (> 1): slow multiplicative relax below the knee.
+    /// Release coefficient (> 1): the slow multiplicative relax toward the ceiling.
     release: f64,
-    /// Soft-knee half-width (fraction of the threshold) — the hold dead-band.
-    knee: f64,
+    /// Proportional gain on the attack exponent: how much faster backlog growth
+    /// steepens the clamp (`f = attack^(1 + attack_gain·g)`).
+    attack_gain: f64,
     obs: GovernorObs,
     verbose: bool,
 }
 
 impl BacklogGovernor {
-    /// Build a compressor bounded by `[floor, ceiling]` reacting to internal command
-    /// latency above `baseline · level` (soft knee `knee`), clamping with `attack`
-    /// (< 1) and relaxing with `release` (> 1). Returns the governor plus the shared
-    /// cap handle the admission gate reads (seeded at the ceiling — inert until the
-    /// compressor clamps) and a [`GovernorObs`] read handle the monitor surfaces to
-    /// explain the live cap.
+    /// Build a compressor bounded by `[floor, ceiling]` that attacks when actor
+    /// saturation exceeds `rho_target + deadband` while the backlog is rising
+    /// (clamping with `attack` < 1, steepened by `attack_gain` on the growth rate)
+    /// and releases slowly with `release` (> 1) when draining or idle. Returns the
+    /// governor plus the shared cap handle the admission gate reads (seeded at the
+    /// ceiling — inert until the compressor clamps) and a [`GovernorObs`] read handle
+    /// the monitor surfaces to explain the live cap.
     pub fn new(
         floor: usize,
         ceiling: usize,
-        level: f64,
+        rho_target: f64,
+        deadband: f64,
         attack: f64,
         release: f64,
-        knee: f64,
+        attack_gain: f64,
     ) -> (Self, Arc<AtomicUsize>, GovernorObs) {
         let cap = Arc::new(AtomicUsize::new(ceiling));
         let obs = GovernorObs::default();
+        obs.rho_target_permille
+            .store((rho_target * 1000.0) as u64, Ordering::Relaxed);
         let gov = Self {
             cap: cap.clone(),
             floor,
             ceiling,
-            level,
+            rho_target,
+            deadband,
             attack,
             release,
-            knee,
+            attack_gain,
             obs: obs.clone(),
             verbose: std::env::var_os("NANOBPM_ACTOR_PROFILE").is_some(),
         };
@@ -693,41 +680,45 @@ impl BacklogGovernor {
         &self.obs
     }
 
-    /// Fold one window's mean internal command latency (`lat_us`) against the create
-    /// limiter's learned `baseline_us` into the cap, publish, and return the new cap.
-    /// Call once per monitor tick **only when the create window produced a fresh
-    /// sample** (see [`LatencyObs::seq`]); when no new create window has folded the
-    /// caller holds the cap (release must not creep the cap open on stale samples).
-    pub fn step(&self, lat_us: f64, baseline_us: f64) -> usize {
+    /// Fold one monitor tick's actor saturation `rho` ∈ [0,1] and runnable-backlog
+    /// growth `growth_per_s` (jobs/s, signed) into the cap, publish the observability,
+    /// and return the new cap. Call once per monitor tick in **both** SLA modes (the
+    /// signals stay populated for monitoring); the cap only *actuates* admission in
+    /// latency mode, but the governor itself is mode-agnostic.
+    pub fn step(&self, rho: f64, growth_per_s: f64) -> usize {
         let prev = self.cap.load(Ordering::Relaxed);
         let mut limit = prev as f64;
-        // A degenerate (zero) baseline means the limiter hasn't calibrated yet —
-        // hold rather than react to a threshold of zero.
-        let threshold = baseline_us * self.level;
-        if threshold > 0.0 {
-            if lat_us > threshold * (1.0 + self.knee) {
-                // Above the knee: attack — fast clamp toward the floor.
-                limit = (limit * self.attack).max(self.floor as f64);
-            } else if lat_us < threshold * (1.0 - self.knee) {
-                // Below the knee: release — slow relax toward the ceiling.
-                limit = (limit * self.release).min(self.ceiling as f64);
-            }
+        let sat_hi = rho > self.rho_target + self.deadband;
+        let sat_lo = rho < self.rho_target - self.deadband;
+        let rising = growth_per_s > 0.0;
+        let draining = growth_per_s < 0.0;
+        if sat_hi && rising {
+            // Saturated AND falling behind → attack. The step steepens with the
+            // backlog growth rate (the only signal with dynamic range, since ρ
+            // saturates at 1): a cold-start storm slams to the floor fast; a mild
+            // overshoot is nudged gently.
+            let g = (growth_per_s / (prev.max(1) as f64)).clamp(0.0, 1.0);
+            let f = self.attack.powf(1.0 + self.attack_gain * g);
+            limit = (limit * f).max(self.floor as f64);
+        } else if draining || sat_lo {
+            // Draining, or idle headroom → release slowly toward the ceiling.
+            limit = (limit * self.release).min(self.ceiling as f64);
         }
+        // else: hold (healthy saturated peak, or ambiguous mid-zone).
         let new = limit as usize;
         self.cap.store(new, Ordering::Relaxed);
         self.obs
-            .window_avg_us
-            .store(lat_us as u64, Ordering::Relaxed);
+            .rho_permille
+            .store((rho * 1000.0) as u64, Ordering::Relaxed);
         self.obs
-            .baseline_us
-            .store(baseline_us as u64, Ordering::Relaxed);
-        self.obs
-            .target_us
-            .store(threshold as u64, Ordering::Relaxed);
+            .growth_per_s
+            .store(growth_per_s as i64, Ordering::Relaxed);
         if self.verbose && new != prev {
             tracing::info!(
-                "backlog-compressor: cap {prev} -> {new} (internal-lat {lat_us:.0}us, \
-                 baseline {baseline_us:.0}us, threshold {threshold:.0}us)",
+                "backlog-compressor: cap {prev} -> {new} (rho {:.3}, growth {growth_per_s:.0}/s, \
+                 target {:.3})",
+                rho,
+                self.rho_target,
             );
         }
         new
@@ -961,17 +952,18 @@ mod tests {
 
     // --- standalone internal-latency backlog compressor ---------------------
 
-    /// Compressor params for the tests: threshold = baseline·2, fast attack (0.7),
-    /// slow release (1.1), 15% soft knee.
-    const C_LEVEL: f64 = 2.0;
+    /// Compressor params for the tests: ρ setpoint 0.9 ± 0.05 dead-band, fast attack
+    /// (0.7 base), slow release (1.1), attack-gain 3 on the growth rate.
+    const C_TARGET: f64 = 0.9;
+    const C_DEADBAND: f64 = 0.05;
     const C_ATTACK: f64 = 0.7;
     const C_RELEASE: f64 = 1.1;
-    const C_KNEE: f64 = 0.15;
-    /// A learned baseline of 5ms for the compressor tests => threshold 10ms.
-    const C_BASE: f64 = 5_000.0;
+    const C_GAIN: f64 = 3.0;
 
     fn test_compressor() -> (BacklogGovernor, Arc<AtomicUsize>, GovernorObs) {
-        BacklogGovernor::new(2_000, 200_000, C_LEVEL, C_ATTACK, C_RELEASE, C_KNEE)
+        BacklogGovernor::new(
+            2_000, 200_000, C_TARGET, C_DEADBAND, C_ATTACK, C_RELEASE, C_GAIN,
+        )
     }
 
     #[test]
@@ -980,108 +972,145 @@ mod tests {
         assert_eq!(
             cap.load(Ordering::Relaxed),
             200_000,
-            "the compressor is inert (cap at ceiling) until internal latency clamps it"
+            "the compressor is inert (cap at ceiling) until ρ+backlog-trend clamps it"
         );
     }
 
     #[test]
-    fn backlog_compressor_attacks_toward_floor_above_the_knee() {
+    fn backlog_compressor_attacks_toward_floor_when_saturated_and_rising() {
         let (gov, cap, _obs) = test_compressor();
         let before = cap.load(Ordering::Relaxed);
-        // Internal latency well above threshold (baseline·level = 10ms) => attack.
-        gov.step(30_000.0, C_BASE);
+        // Actor saturated (ρ above target+deadband) AND backlog rising => attack.
+        gov.step(0.99, 5_000.0);
         assert!(
             cap.load(Ordering::Relaxed) < before,
-            "above-threshold internal latency must cut the cap: {before} -> {}",
+            "saturated-and-rising must cut the cap: {before} -> {}",
             cap.load(Ordering::Relaxed)
         );
-        // Sustained congestion drives it all the way to the floor.
+        // Sustained saturation-and-rising drives it all the way to the floor.
         for _ in 0..200 {
-            gov.step(30_000.0, C_BASE);
+            gov.step(0.99, 5_000.0);
         }
         assert_eq!(
             cap.load(Ordering::Relaxed),
             2_000,
-            "sustained above-threshold latency clamps to the floor"
+            "sustained saturated-and-rising clamps to the floor"
         );
     }
 
     #[test]
-    fn backlog_compressor_releases_toward_ceiling_below_the_knee() {
+    fn backlog_compressor_releases_toward_ceiling_when_draining() {
         let (gov, cap, _obs) = test_compressor();
         // Clamp it down first.
         for _ in 0..200 {
-            gov.step(30_000.0, C_BASE);
+            gov.step(0.99, 5_000.0);
         }
         assert_eq!(cap.load(Ordering::Relaxed), 2_000);
-        // Latency now well under threshold => slow release back toward the ceiling.
+        // Backlog now draining (growth < 0) => slow release back toward the ceiling.
         let after_clamp = cap.load(Ordering::Relaxed);
-        gov.step(1_000.0, C_BASE);
+        gov.step(0.99, -100.0);
         assert!(
             cap.load(Ordering::Relaxed) > after_clamp,
-            "below-threshold latency must grow the cap: {after_clamp} -> {}",
+            "draining must grow the cap: {after_clamp} -> {}",
             cap.load(Ordering::Relaxed)
         );
         for _ in 0..500 {
-            gov.step(1_000.0, C_BASE);
+            gov.step(0.99, -100.0);
         }
         assert_eq!(
             cap.load(Ordering::Relaxed),
             200_000,
-            "sustained below-threshold latency releases to the ceiling"
+            "sustained draining releases to the ceiling"
         );
     }
 
     #[test]
-    fn backlog_compressor_holds_within_the_knee() {
+    fn backlog_compressor_releases_when_saturation_falls_below_target() {
+        let (gov, cap, _obs) = test_compressor();
+        for _ in 0..200 {
+            gov.step(0.99, 5_000.0);
+        }
+        assert_eq!(cap.load(Ordering::Relaxed), 2_000);
+        // ρ well below the target-deadband band (idle headroom) => release even
+        // though the backlog is not draining (external strain: workers are the wall).
+        for _ in 0..500 {
+            gov.step(0.10, 5_000.0);
+        }
+        assert_eq!(
+            cap.load(Ordering::Relaxed),
+            200_000,
+            "low saturation (external strain) releases to the ceiling — we do not \
+             throttle when the engine actor is not the bottleneck"
+        );
+    }
+
+    #[test]
+    fn backlog_compressor_holds_at_a_healthy_saturated_peak() {
         let (gov, cap, _obs) = test_compressor();
         // Clamp down to a mid value first.
-        gov.step(30_000.0, C_BASE);
+        gov.step(0.99, 200_000.0);
         let settled = cap.load(Ordering::Relaxed);
         assert!(settled < 200_000 && settled > 2_000);
-        // Latency exactly at threshold (baseline·level = 10ms) => inside the knee.
+        // Saturated (ρ high) but the backlog is STABLE (growth 0) — a healthy peak,
+        // the compressor knee. Must hold, neither attack nor release.
         for _ in 0..20 {
-            gov.step(C_BASE * C_LEVEL, C_BASE);
+            gov.step(0.99, 0.0);
         }
         assert_eq!(
             cap.load(Ordering::Relaxed),
             settled,
-            "internal latency within the knee of the threshold must hold the cap"
+            "a healthy saturated peak (ρ high, backlog stable) must hold the cap"
         );
     }
 
     #[test]
-    fn backlog_compressor_holds_on_a_degenerate_baseline() {
-        // Before the create limiter has calibrated a baseline (baseline 0), the
-        // threshold is 0 and the compressor must not react to it.
+    fn backlog_compressor_holds_in_the_ambiguous_midzone() {
+        // ρ inside the dead-band (at the setpoint) and the backlog rising: neither
+        // clearly saturated nor draining => hold, don't thrash.
         let (gov, cap, _obs) = test_compressor();
         let before = cap.load(Ordering::Relaxed);
         for _ in 0..50 {
-            gov.step(30_000.0, 0.0);
+            gov.step(C_TARGET, 5_000.0);
         }
         assert_eq!(
             cap.load(Ordering::Relaxed),
             before,
-            "a zero (uncalibrated) baseline must hold the cap, not react to threshold 0"
+            "ρ within the dead-band of the setpoint must hold the cap"
         );
     }
 
     #[test]
-    fn backlog_compressor_publishes_observability_latency_and_threshold() {
-        let (gov, _cap, obs) = test_compressor();
-        // Nothing published until a window folds.
-        assert_eq!(obs.window_avg_us.load(Ordering::Relaxed), 0);
-        assert_eq!(obs.baseline_us.load(Ordering::Relaxed), 0);
-        assert_eq!(obs.target_us.load(Ordering::Relaxed), 0);
-
-        gov.step(3_000.0, C_BASE);
-        assert_eq!(obs.window_avg_us.load(Ordering::Relaxed), 3_000);
-        assert_eq!(obs.baseline_us.load(Ordering::Relaxed), C_BASE as u64);
-        assert_eq!(
-            obs.target_us.load(Ordering::Relaxed),
-            (C_BASE * C_LEVEL) as u64,
-            "the published threshold is baseline·level"
+    fn backlog_compressor_attack_steepens_with_backlog_growth_rate() {
+        // The one proportional touch: a faster-rising backlog cuts more per tick than
+        // a slow overshoot (attack^(1+gain·g), g = growth/cap).
+        let (fast, fast_cap, _) = test_compressor();
+        let (slow, slow_cap, _) = test_compressor();
+        // Cold-start storm: growth ≈ the whole cap per second => g≈1.
+        fast.step(0.99, 200_000.0);
+        // Mild overshoot: a trickle of growth => g≈0.
+        slow.step(0.99, 10.0);
+        assert!(
+            fast_cap.load(Ordering::Relaxed) < slow_cap.load(Ordering::Relaxed),
+            "a faster-rising backlog must attack the cap harder: fast {} vs slow {}",
+            fast_cap.load(Ordering::Relaxed),
+            slow_cap.load(Ordering::Relaxed)
         );
+    }
+
+    #[test]
+    fn backlog_compressor_publishes_observability_rho_and_growth() {
+        let (gov, _cap, obs) = test_compressor();
+        // The setpoint is published at construction; the live signals start at zero.
+        assert_eq!(
+            obs.rho_target_permille.load(Ordering::Relaxed),
+            (C_TARGET * 1000.0) as u64
+        );
+        assert_eq!(obs.rho_permille.load(Ordering::Relaxed), 0);
+        assert_eq!(obs.growth_per_s.load(Ordering::Relaxed), 0);
+
+        gov.step(0.95, -300.0);
+        assert_eq!(obs.rho_permille.load(Ordering::Relaxed), 950);
+        assert_eq!(obs.growth_per_s.load(Ordering::Relaxed), -300);
     }
 
     #[test]

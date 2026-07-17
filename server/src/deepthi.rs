@@ -80,6 +80,17 @@ pub struct ActorStats {
     /// a panic inside a command that silently kills the single writer and hangs
     /// every subsequent `with().await` forever).
     pub alive: AtomicBool,
+    /// Cumulative wall-clock nanoseconds this actor has spent *inside* a command
+    /// (`job(journal)` — engine apply **plus** the journal write/fsync), summed
+    /// over its whole life. The ~1 Hz monitor differences this against wall time
+    /// across all a node's actors to derive **actor saturation ρ** = busy/elapsed:
+    /// ρ→1 means the single writer is the wall (CPU-bound apply or disk-bound
+    /// fsync — both are counted here because the fsync happens *inside* the timed
+    /// region), ρ≪1 means throughput is limited upstream (a starved actor parks in
+    /// `pop`, accruing no busy time). This is the cold-start-proof "are we the
+    /// bottleneck" signal the admission compressor keys off — absolute, needs no
+    /// learned baseline, and immune to external/worker strain by construction.
+    pub busy_nanos: AtomicU64,
 }
 
 impl ActorStats {
@@ -91,6 +102,7 @@ impl ActorStats {
             lo_depth: AtomicUsize::new(0),
             job_start_mono_ms: AtomicU64::new(0),
             alive: AtomicBool::new(true),
+            busy_nanos: AtomicU64::new(0),
         })
     }
 
@@ -292,7 +304,11 @@ impl DeepthiHandle {
                     let stats = &consumer.stats;
                     while let Some((job, _)) = consumer.pop() {
                         stats.job_start_mono_ms.store(mono_ms(), Ordering::Relaxed);
+                        let before_job = Instant::now();
                         job(&mut journal);
+                        stats
+                            .busy_nanos
+                            .fetch_add(before_job.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         stats.job_start_mono_ms.store(0, Ordering::Relaxed);
                         stats.jobs.fetch_add(1, Ordering::Relaxed);
                     }
@@ -337,6 +353,11 @@ impl DeepthiHandle {
             let job_time = before_job.elapsed();
             mb.stats.job_start_mono_ms.store(0, Ordering::Relaxed);
             mb.stats.jobs.fetch_add(1, Ordering::Relaxed);
+            // Publish busy time for node-level actor-saturation ρ (always — this is
+            // the admission compressor's control signal, not profiling output).
+            mb.stats
+                .busy_nanos
+                .fetch_add(job_time.as_nanos() as u64, Ordering::Relaxed);
 
             // Feed the adaptive limiter every command, tagged with its class.
             // Both classes report pure apply time (`job_time`): creates (`Low`)
