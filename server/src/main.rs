@@ -177,12 +177,19 @@ pub struct ServerImpl {
     /// path with a relaxed load.
     backlog_cap: Arc<AtomicUsize>,
     /// When the active-backlog cap is governed live (`AdmissionBacklog::Auto`),
-    /// the standalone monitor-stepped [`BacklogGovernor`] that holds the cap to an
-    /// end-to-end job-sojourn SLO. `None` in `Fixed`/`Off` mode (the cap is then a
-    /// plain constant). Surfaced by the ~1 Hz monitor as `nanobpm_backlog_governor_*`
-    /// metrics and used to explain the auto-tuned cap in the `active_backlog` /
-    /// `create_backlog` shed message.
+    /// the standalone monitor-stepped [`BacklogGovernor`] compressor that clamps the
+    /// cap when internal command latency rises over its learned baseline. `None` in
+    /// `Fixed`/`Off` mode (the cap is then a plain constant). Surfaced by the ~1 Hz
+    /// monitor as `nanobpm_backlog_governor_*` metrics and used to explain the
+    /// auto-tuned cap in the `active_backlog` / `create_backlog` shed message.
     backlog_gov: Option<BacklogGovernor>,
+    /// Read handle onto the create limiter's live per-window **internal command
+    /// latency** (+ its learned baseline + a freshness `seq`), published each time
+    /// the create window folds. The monitor-stepped backlog compressor
+    /// ([`BacklogGovernor`]) keys off this — the "are we the bottleneck" signal that
+    /// is immune to external/worker service time. `None` unless adaptive
+    /// backpressure is installed (the compressor then stays inert).
+    internal_latency_obs: Option<crate::backpressure::LatencyObs>,
     /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
     /// completed *service-task* jobs, summed across owned partitions. This is the
     /// parked-excluded load signal the admission gate and the backlog governor
@@ -190,16 +197,6 @@ pub struct ServerImpl {
     /// not jobs, so they never appear here and are never shed against. Refreshed
     /// by the ~1 Hz monitor tick; read with a relaxed load.
     runnable_backlog: Arc<AtomicUsize>,
-    /// End-to-end job-sojourn accumulator, folded on every `JobCompleted` at the
-    /// completion sites and drained once per ~1 Hz monitor tick into the backlog
-    /// governor. `sojourn_sum_us` is the running sum of `(completed_at −
-    /// created_at)` in microseconds; `sojourn_count` the number of completions
-    /// folded. The monitor computes the window-mean sojourn = sum/count, resets
-    /// both, and steps the governor — so the governor's control signal is the true
-    /// e2e latency (which tracks backlog depth by Little's law), not create→accept
-    /// latency (which stays cheap under downstream worker starvation).
-    sojourn_sum_us: Arc<AtomicU64>,
-    sojourn_count: Arc<AtomicU64>,
     /// The live **unified admission setpoint**: the effective per-node active-backlog
     /// cap the throttle converges intake to, `min(latency_cap, memory_cap)` clamped
     /// to `[backlog_cap_floor, backlog_cap_ceiling]`. `0` = no active setpoint (the
@@ -606,11 +603,18 @@ impl ServerImpl {
         // self-optimizing active-backlog governor (auto admission-backlog). The
         // controller owns the shared atomics; the server keeps the read sides.
         let mut controller = AdaptiveController::new();
+        // The create limiter also publishes its per-window internal command latency
+        // (the "are we the bottleneck" signal) via a `LatencyObs` read handle that
+        // the monitor-stepped backlog compressor keys off. Non-adaptive modes leave
+        // it `None` (compressor stays inert / disabled).
+        let mut internal_latency_obs: Option<crate::backpressure::LatencyObs> = None;
         let backpressure = match backpressure_setting_from_env() {
             BackpressureSetting::Disabled => Backpressure::Disabled,
             BackpressureSetting::Fixed(n) => Backpressure::Fixed(n),
             BackpressureSetting::Adaptive => {
-                Backpressure::Adaptive(controller.with_create_limiter(processing.clone()))
+                let (limit, obs) = controller.with_create_limiter(processing.clone());
+                internal_latency_obs = Some(obs);
+                Backpressure::Adaptive(limit)
             }
         };
         tracing::info!("backpressure: {}", backpressure.describe());
@@ -624,10 +628,6 @@ impl ServerImpl {
         // monitor tick from `activatable_job_counts` (parked instances create no
         // jobs, so they are excluded by construction). Seeded at 0.
         let runnable_backlog = Arc::new(AtomicUsize::new(0));
-        // End-to-end job-sojourn accumulator (sum µs + count), folded on each
-        // completion and drained by the monitor into the backlog governor.
-        let sojourn_sum_us = Arc::new(AtomicU64::new(0));
-        let sojourn_count = Arc::new(AtomicU64::new(0));
         // `backlog_cap` is the live active-backlog admission cap the gate reads
         // (0 = off). Its value comes from one of three policies:
         //  - Off:   a fixed 0 (never sheds on backlog).
@@ -661,21 +661,35 @@ impl ServerImpl {
                 );
                 backlog_cap_floor = floor;
                 backlog_cap_ceiling = ceiling;
-                // The governor holds the backlog cap to an absolute end-to-end job
-                // *sojourn* SLO (µs): by Little's law L = λ·W, bounding sojourn W at
-                // the target bounds the runnable backlog L at target·λ, auto-
-                // calibrated to the live drain rate. Sojourn (unlike create→accept
-                // latency) grows with backlog depth, so the cap tracks the real SLA.
-                // Tunable live via NANOBPMN_ADMISSION_LATENCY_TARGET_US (default 500ms).
-                let target_us = std::env::var("NANOBPMN_ADMISSION_LATENCY_TARGET_US")
-                    .ok()
-                    .and_then(|v| v.trim().parse::<f64>().ok())
-                    .filter(|t| *t > 0.0)
-                    .unwrap_or(500_000.0);
+                // The backlog cap is held by a COMPRESSOR keyed on internal command
+                // latency (the create limiter's window latency — "are we the
+                // bottleneck") over its auto-learned baseline, NOT an absolute SLO
+                // and NOT e2e sojourn (which is dominated by external/worker service
+                // time and would mis-throttle on a downstream outage). Like an audio
+                // compressor: threshold = baseline·LEVEL, soft KNEE dead-band, fast
+                // ATTACK clamp-down, slow RELEASE relax (anti-oscillation asymmetry).
+                // Tunable live via NANOBPMN_ADMISSION_COMP_LEVEL/ATTACK/RELEASE/KNEE.
+                let env_f64 = |k: &str, d: f64, pred: fn(f64) -> bool| {
+                    std::env::var(k)
+                        .ok()
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .filter(|x| pred(*x))
+                        .unwrap_or(d)
+                };
+                let level = env_f64("NANOBPMN_ADMISSION_COMP_LEVEL", 2.0, |x| x > 0.0);
+                let attack = env_f64("NANOBPMN_ADMISSION_COMP_ATTACK", 0.7, |x| {
+                    x > 0.0 && x < 1.0
+                });
+                let release = env_f64("NANOBPMN_ADMISSION_COMP_RELEASE", 1.1, |x| x > 1.0);
+                let knee = env_f64("NANOBPMN_ADMISSION_COMP_KNEE", 0.15, |x| {
+                    (0.0..1.0).contains(&x)
+                });
                 tracing::info!(
-                    "admission backlog governor: e2e job-sojourn target {target_us:.0}µs"
+                    "admission backlog compressor: internal-latency threshold \
+                     baseline·{level} (attack {attack}, release {release}, knee {knee})"
                 );
-                let (gov, cap, _obs) = BacklogGovernor::new(floor, ceiling, target_us);
+                let (gov, cap, _obs) =
+                    BacklogGovernor::new(floor, ceiling, level, attack, release, knee);
                 backlog_gov = Some(gov);
                 cap
             }
@@ -865,14 +879,13 @@ impl ServerImpl {
             activity: Arc::new(AtomicU64::new(0)),
             backlog_cap,
             backlog_gov,
+            internal_latency_obs,
             backlog_cap_floor,
             backlog_cap_ceiling,
             recovery_backlog_cap,
             effective_backlog_cap,
             backlog_shed_cap,
             runnable_backlog,
-            sojourn_sum_us,
-            sojourn_count,
             active_worker_cap,
             admission_max_create_queue,
             mem_watermark_bytes,
@@ -10960,30 +10973,32 @@ impl ServerImpl {
         self.drain_guard.note_completion();
     }
 
-    /// Fold every `JobCompleted` in `events` into the end-to-end job-sojourn
-    /// accumulator: `completed_at − created_at` (both wall-clock ms, the `now`
-    /// injected into the engine at create and complete), converted to microseconds.
-    /// The monitor drains this once per ~1 Hz tick into the backlog governor, whose
-    /// setpoint is thereby the true e2e latency SLO. Called at each completion site
-    /// that has the emitted events in scope (REST + both stream paths); events with
-    /// no `created_at` (jobs created before the engine carried the field, `0`) are
-    /// skipped. Hot-path cheap: a slice scan + two relaxed atomic adds per completion.
+    /// Observe every `JobCompleted` in `events` into the per-`job_type` end-to-end
+    /// sojourn SLA histogram: `completed_at − created_at` (both wall-clock ms, the
+    /// `now` injected into the engine at create and complete), in seconds. This is
+    /// the user-facing SLA/SLI reporting surface, **not** a control input — sojourn
+    /// is dominated by external/worker service time, so it must never throttle
+    /// admission (that is the internal-command-latency compressor's job). Per job
+    /// type so an operator can localize a slow downstream to a specific process/job
+    /// type (its sojourn stretches while the engine's internal command latency stays
+    /// flat). Called at each completion site that has the emitted events in scope
+    /// (REST + both stream paths); completions with no `created_at` (jobs created
+    /// before the engine carried the field, `0`) are skipped. Hot-path cheap: a
+    /// slice scan + a histogram observe per completion.
     #[inline]
     pub(crate) fn observe_job_sojourn(&self, events: &[Event], now_ms: u64) {
-        let mut sum_us: u64 = 0;
-        let mut count: u64 = 0;
         for ev in events {
-            if let Event::JobCompleted { created_at, .. } = ev
+            if let Event::JobCompleted {
+                created_at,
+                job_type,
+                ..
+            } = ev
                 && *created_at > 0
                 && now_ms >= *created_at
             {
-                sum_us = sum_us.saturating_add((now_ms - *created_at).saturating_mul(1_000));
-                count += 1;
+                let seconds = (now_ms - *created_at) as f64 / 1_000.0;
+                crate::metrics::observe_job_sojourn(job_type, seconds);
             }
-        }
-        if count > 0 {
-            self.sojourn_sum_us.fetch_add(sum_us, Ordering::Relaxed);
-            self.sojourn_count.fetch_add(count, Ordering::Relaxed);
         }
     }
 
@@ -11122,11 +11137,11 @@ impl ServerImpl {
     /// Trailing sentence for an active-backlog / create-backlog shed message that
     /// explains *why* the cap is what it is — so an operator isn't left staring at
     /// a shed threshold they never configured. In `Auto` mode the cap is the live
-    /// output of the e2e-sojourn governor, so we name it as auto-tuned, give its
-    /// floor/ceiling bounds, and (once a window has folded) report the target vs
-    /// current end-to-end job sojourn that drove the last adjustment. In
-    /// `Fixed`/`Off` mode the cap is a plain operator setting, so we just point at
-    /// the tuning lever.
+    /// output of the internal-latency **compressor**, so we name it as auto-tuned,
+    /// give its floor/ceiling bounds, and (once a window has folded) report the
+    /// current internal command latency vs the compressor threshold that drove the
+    /// last adjustment. In `Fixed`/`Off` mode the cap is a plain operator setting,
+    /// so we just point at the tuning lever.
     fn backlog_cap_explainer(&self) -> String {
         let Some(gov) = &self.backlog_gov else {
             return " This is a fixed cap (NANOBPMN_ADMISSION_MAX_BACKLOG); \
@@ -11134,16 +11149,17 @@ impl ServerImpl {
                     instead of shedding. Retry after a backoff."
                 .to_string();
         };
-        let target = gov.obs().target_us.load(Ordering::Relaxed);
+        let threshold = gov.obs().target_us.load(Ordering::Relaxed);
         let window = gov.obs().window_avg_us.load(Ordering::Relaxed);
         let bounds = format!(
-            " This cap is auto-tuned by the e2e-sojourn governor (floor {}, ceiling {} \
-             runnable jobs) to hold end-to-end job latency near its {target}µs target",
+            " This cap is auto-tuned by the internal-latency compressor (floor {}, \
+             ceiling {} runnable jobs); it clamps intake when the engine's internal \
+             command latency rises above its {threshold}µs threshold",
             gov.floor(),
             gov.ceiling()
         );
         let latency = if window > 0 {
-            format!("; last window sojourn was {window}µs vs the {target}µs target.")
+            format!("; last window internal latency was {window}µs vs the {threshold}µs threshold.")
         } else {
             ".".to_string()
         };
@@ -13528,6 +13544,11 @@ async fn main() {
             let mut memory_lit = false;
             let mut seen_job_types: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // Freshness tracking for the backlog compressor: the last internal-latency
+            // window `seq` we stepped on. The compressor releases (grows the cap) only
+            // on a fresh create-window sample, so a stale (unchanged) seq means the
+            // cap is held — an idle create pipeline can never creep the cap open.
+            let mut prev_latency_seq: u64 = 0;
             // Drain-stall guard supervisor state (options 3+4). The state machine
             // owns the edge/hysteresis counters; here we track the deltas it needs:
             // the completion count (rate = drain throughput) and the active backlog
@@ -13650,18 +13671,21 @@ async fn main() {
                 monitor_server
                     .runnable_backlog
                     .store(runnable, Ordering::Relaxed);
-                // Step the standalone e2e-sojourn backlog governor once per tick:
-                // drain the sojourn accumulator (sum µs / count) folded by the
-                // completion sites into the window-mean sojourn, and fold it plus the
-                // live runnable backlog into the cap. Only step when at least one job
-                // completed this window (a fresh sojourn sample); during a total drain
-                // stall the cap is held and the drain-down servo throttles intake.
-                if let Some(gov) = &monitor_server.backlog_gov {
-                    let count = monitor_server.sojourn_count.swap(0, Ordering::Relaxed);
-                    let sum_us = monitor_server.sojourn_sum_us.swap(0, Ordering::Relaxed);
-                    if count > 0 {
-                        let mean_us = sum_us as f64 / count as f64;
-                        gov.step(mean_us, runnable);
+                // Step the standalone backlog compressor once per tick off the create
+                // limiter's live internal command latency (the "are we the bottleneck"
+                // signal), NOT e2e sojourn. Only step on a FRESH create window (seq
+                // advanced) so a release can't creep the cap open on a stale sample /
+                // idle create pipeline; otherwise hold the cap.
+                if let (Some(gov), Some(obs)) = (
+                    &monitor_server.backlog_gov,
+                    &monitor_server.internal_latency_obs,
+                ) {
+                    let seq = obs.seq.load(Ordering::Relaxed);
+                    if seq != prev_latency_seq {
+                        prev_latency_seq = seq;
+                        let lat_us = obs.window_avg_us.load(Ordering::Relaxed) as f64;
+                        let baseline_us = obs.baseline_us.load(Ordering::Relaxed) as f64;
+                        gov.step(lat_us, baseline_us);
                     }
                 }
                 let workers = monitor_registry.workers_per_type();

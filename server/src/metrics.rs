@@ -166,6 +166,16 @@ struct Metrics {
     /// signals it answers "are workers the bottleneck for this type, and would more
     /// help?" (Little's Law) rather than just "is the backlog growing?".
     job_type_dispatched_total: prometheus::IntCounterVec,
+    /// End-to-end job sojourn (create→complete wall latency, seconds) per
+    /// `job_type`. This is the user-facing SLA/SLI surface — p50/p90/p99 of how
+    /// long a job takes end to end. It is *reporting only*, deliberately NOT a
+    /// control input: sojourn is dominated by external/worker service time, so
+    /// throttling admission on it would wrongly penalize healthy traffic during a
+    /// downstream outage. Read it against the engine's internal command latency
+    /// (`nanobpm_backlog_governor{field="window_latency_us"}`): the gap ≈ external
+    /// service time, and one job type's sojourn stretching while internal latency
+    /// stays flat localizes a slow downstream to that specific type.
+    job_sojourn_seconds: prometheus::HistogramVec,
     /// Per-partition Raft liveness alarm: 1 when the partition's openraft core has
     /// entered `Shutdown` (terminated, e.g. on a storage error) and is no longer
     /// applying, else 0. A stuck-at-1 partition strands its share of instances and
@@ -587,6 +597,16 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter vec");
 
+    let job_sojourn_seconds = prometheus::HistogramVec::new(
+        HistogramOpts::new(
+            "nanobpm_job_sojourn_seconds",
+            "End-to-end job sojourn (create->complete) per job type — the user-facing SLA/SLI. Reporting only, not a control signal.",
+        )
+        .buckets(prometheus::exponential_buckets(0.005, 3.0, 12).expect("valid buckets")),
+        &["job_type"],
+    )
+    .expect("valid histogram vec");
+
     let raft_partition_shutdown = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_raft_partition_shutdown",
@@ -776,6 +796,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_type_workers.clone())))
         .and(registry.register(Box::new(job_type_starved.clone())))
         .and(registry.register(Box::new(job_type_dispatched_total.clone())))
+        .and(registry.register(Box::new(job_sojourn_seconds.clone())))
         .and(registry.register(Box::new(raft_partition_shutdown.clone())))
         .and(registry.register(Box::new(actor_alive.clone())))
         .and(registry.register(Box::new(actor_jobs_total.clone())))
@@ -838,6 +859,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_type_workers,
         job_type_starved,
         job_type_dispatched_total,
+        job_sojourn_seconds,
         raft_partition_shutdown,
         actor_alive,
         actor_jobs_total,
@@ -1112,6 +1134,20 @@ pub fn record_jobs_dispatched(job_type: &str, n: u64) {
         .job_type_dispatched_total
         .with_label_values(&[job_type])
         .inc_by(n);
+}
+
+/// Observes one job's end-to-end sojourn (create→complete, `seconds`) into the
+/// per-`job_type` SLA histogram. Reporting only (see `job_sojourn_seconds`); a
+/// no-op for a non-positive sample (jobs created before the engine carried
+/// `created_at`, or a clock skew) so the reported distribution is never polluted.
+pub fn observe_job_sojourn(job_type: &str, seconds: f64) {
+    if seconds <= 0.0 {
+        return;
+    }
+    METRICS
+        .job_sojourn_seconds
+        .with_label_values(&[job_type])
+        .observe(seconds);
 }
 
 /// Publishes the per-partition Raft `Shutdown` alarm: `down = true` sets the gauge

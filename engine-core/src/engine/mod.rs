@@ -660,6 +660,7 @@ impl Engine {
                 let element_instance_key = job.element_instance_key;
                 let element_id = job.element_id.clone();
                 let created_at = job.created_at;
+                let job_type = job.job_type.clone();
 
                 self.emit(
                     &mut log,
@@ -667,6 +668,7 @@ impl Engine {
                         job_key,
                         instance_key,
                         created_at,
+                        job_type,
                     },
                 );
                 if !variables.is_empty() {
