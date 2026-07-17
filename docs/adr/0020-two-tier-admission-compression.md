@@ -109,6 +109,35 @@ Env: `NANOBPMN_TIER1` (default on) + `NANOBPMN_TIER1_{RATIO,ATTACK,ATTACK_GAIN,
 RELEASE,EWMA,CREEP,FLOOR_US}`. Published as `nanobpm_tier1_pressure` (per-mille,
 node-level gauge).
 
+**Recovery relaxation — defer the soft knee to the recovery throttle (2026-07-18).**
+A GCP bounce soak exposed a failure mode where Tier-1 and the recovery admission
+throttle (`recovery_throttle.rs`) *stack* destructively on a returning owner. Both
+key on the same raft-fsync signal: the recovery throttle paces intake under the
+fsync knee via a backlog cap (it *is* the durability-preserving recovery actuator),
+and Tier-1 *also* sheds on the fsync knee. On a node rejoining near the cluster
+ceiling, its just-reclaimed partitions carry an elevated/oscillating fsync latency
+(the "depth ratchet"), so Tier-1 shed the returning owner's **own** creates to ~0
+(`tier1_pressure` pinned near 1000‰) for the whole recovery window — while the node
+had *near-zero* backlog to justify it. The shed instances simply displaced onto the
+already-loaded survivors, so it bought **no aggregate-latency benefit**: exactly the
+"punish admission, deliver no latency gain" anti-pattern ADR-0021 warns against. The
+result was the old node-bounce **oscillation collapse** (recovered throughput
+swinging 77 ↔ 24 k/s, never converging).
+
+The fix: while the node is in a recovery window (`recovering` = failover incumbent
+or returning owner, the same signal the recovery throttle consumes), Tier-1 defers
+its **soft knee** to the recovery throttle and only sheds past a **wider
+hard-ceiling backstop** (`baseline · recovery_ratio`, default 4× vs the 2× soft
+knee), and it does **not** calibrate its baseline from the congested recovery
+latency (which would inflate the steady-state knee afterward). The recovery throttle
+remains the primary disk-protection actuator during the window; Tier-1 becomes a
+pure backstop that still clamps a *genuinely* drowning node (fsync past the hard
+ceiling). Env: `NANOBPMN_TIER1_RECOVERY_RELAX` (default on),
+`NANOBPMN_TIER1_RECOVERY_RATIO` (default 4.0). Outside a recovery window Tier-1 is
+byte-for-byte unchanged. This closes the oscillation regression but **not** the
+residual recovered-throughput deficit, which is completion-latency-bound on the
+returning owner's deep partitions (a distinct, still-open lever — see ADR-0019).
+
 ### Tier 2 — Per-process-definition backlog compressors
 
 The primary latency-preservation loop. An earlier draft detected congestion per
@@ -312,6 +341,24 @@ specifically. When the bottleneck is instead the single-writer **engine actor**
 does not — and should not — fire; that regime is covered by the ρ-based
 `AdmissionGovernor` (engine-actor saturation). The two are both "global" guards but
 watch different shared resources; a complete deployment wants both live.
+
+**Recovery-relax A/B (2026-07-18, binsha `578efd7248d52a23`).** Node-bounce soak,
+RATE=14000, 90 s outage, node18 killed near the cluster ceiling and restored;
+recovered throughput sampled t=155–300 after restore. Identical script and params,
+guard relax OFF vs ON:
+
+| arm | recovered mean/s | recovered min/s | node18 creates/s (median) |
+|---|---|---|---|
+| soft-knee shed in recovery (OFF) | **4,324** | **77** (oscillation collapse) | **0** |
+| recovery-relax (ON) | **28,923** | **20,701** (stable band) | **1,107** |
+
+Baseline steady ≈ 38,500/s. Relaxing Tier-1 during recovery converts an oscillating,
+collapse-to-~80/s recovery into a **stable ≈75%-of-baseline** band and lets the
+returning owner participate (median 0 → 1,107 creates/s) instead of being shed to
+zero for no aggregate-latency benefit. The returning node stayed healthy while
+admitting (drained its backlog; `rho` never pinned). The residual ~25% vs baseline
+is **completion-latency-bound** on node18's deep just-reclaimed partitions — not
+admission — and is the still-open lever tracked in ADR-0019.
 
 ## Alternatives considered
 
