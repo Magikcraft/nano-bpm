@@ -1,6 +1,9 @@
 # ADR 0020 — Two-tier admission compression: a global engine-saturation guard + per-process-definition backlog compressors
 
-Status: **Proposed — accepted for implementation.**
+Status: **Proposed — accepted for implementation.** Superseded in part: the Tier-2
+per-definition compressor must not ship as a customer latency-SLA control until the
+latency-causal shed predicate is added — see ADR 0021 "Blocking constraint: shedding
+must be latency-causal" (2026-07-17).
 Date: 2026-07-17. Revised 2026-07-18 (Tier-2 keyed on per-process-definition
 in-flight backlog directly, replacing the per-job-type detect + per-process
 fan-in design; Tier-1 signal resolved to raft-log fsync latency).
@@ -166,6 +169,17 @@ but it is **reporting only** — no longer a control input.
   This is the correct `SLA_MODE=latency` behaviour (match admission to capacity to
   hold latency) and the opposite of ρ's fault-attribution. `SLA_MODE=admission`
   users are unaffected — Tier 1/2 do not actuate there (memory rails only).
+  - **⚠ CORRECTION / RELEASE BLOCKER (2026-07-17):** this "correct behaviour" claim
+    is only valid when the backlog reflects a *locally relievable* queue. When the
+    elevated sojourn comes from a **slow external service the worker calls**,
+    throttling intake does **not** speed up in-flight instances and (with ample
+    worker concurrency) buys *no* latency at all — it sheds customer instances for
+    nothing, inverting the SLA trade. Tier-2 keys on total in-flight `L_P` and
+    cannot tell relievable queue-wait from external in-service waiting. **Tier-2
+    must not ship as a customer latency-SLA control until a latency-causal shed
+    predicate is added.** See ADR 0021 → "Blocking constraint: shedding must be
+    latency-causal." (Observe-only / monitoring mode, which does not shed, is
+    unaffected.)
 - **Per-definition collateral throttling:** throttling a definition suppresses all
   of its instances (instance-granular admission); a deep-but-stable backlog is bled
   to the latency band. Both inherent and accepted.

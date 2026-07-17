@@ -2,6 +2,8 @@
 
 Status: **Proposed — exploratory (not yet accepted for implementation).**
 Date: 2026-07-17.
+**Blocks release of the ADR-0020 Tier-2 compressor as an SLA feature — see
+"Blocking constraint: shedding must be latency-causal" below.**
 Relates to: ADR 0020 (two-tier admission compression), ADR 0013 (SLA modes &
 the compressor/limiter model), ADR 0017 (worker-concurrency governor),
 `engine-core/src/state.rs` (`activation_order`), `engine-core/src/bpmn.rs`
@@ -150,6 +152,67 @@ On the GCP soak rig (as for ADR-0020), once implemented:
 3. **Per-instance override + gaming guard.** EXPECT a per-instance tight SLA honored
    up to the definition cap, and a client that declares everything urgent clamped to
    the cap (no starvation of other definitions).
+
+## Blocking constraint: shedding must be latency-causal
+
+**This is a release blocker for the ADR-0020 Tier-2 compressor as a customer-facing
+SLA feature.** The SLA promise is a *trade*: **we sacrifice admission to protect
+latency.** A shed is only legitimate when it actually *buys* latency for the work
+we keep. The current Tier-2 control law does not guarantee that trade holds.
+
+**The defect.** Tier-2 attacks a definition when its in-flight backlog `L_P` exceeds
+its Little's-law band `W_target · λ_P` and is rising (`server/src/backpressure.rs`,
+`ProcessGovernors::step`). `L_P` is *only the in-flight instance count* — and by
+Little's Law `L = λ·W`, `L_P > W_target·λ_P` is exactly `W_actual > W_target`. The
+controller therefore fires whenever realized sojourn exceeds target **and cannot
+see *why*.** Engine congestion, a contended worker pool, and a **slow external
+service the worker calls** all inflate `L_P` identically.
+
+In the external-dependency case this is actively harmful:
+
+- The elevated sojourn comes from time spent *in service* on a downstream the engine
+  does not control. Reducing the admission rate λ does **not** speed up the instances
+  already in flight — they remain blocked on the same slow dependency.
+- If worker concurrency is ample (async I/O, no local queue forming), no
+  queue-wait component exists to relieve, so the shed yields **no latency benefit at
+  all** — we reject the customer's process instances and deliver nothing in return.
+
+That inverts the SLA: **we punish admission and produce no latency gain.** For a
+general product deployed into heterogeneous customer environments — where
+worker-to-external-service latency is the *common* source of process latency — this
+is not acceptable behaviour and must be fixed before Tier-2 ships as an SLA control.
+
+**Why the global tier does not have this bug.** The ρ-based server governor
+(`AdmissionGovernor`) explicitly gates on engine-actor saturation ρ and, by its own
+documentation, separates *"we're the bottleneck (ρ high **and** rising)"* from
+*"external strain (ρ low, rising)"* — it refuses to shed on external strain. Tier-2
+has **no equivalent causal gate**; it keys on backlog depth vs band alone. Closing
+that asymmetry is the crux of the fix.
+
+**Direction (to be designed).** A shed must be predicated on a signal that the
+backlog reflects a **locally contended resource** the engine *can* relieve by pacing
+intake — e.g. a growing runnable/worker-wait queue, worker-pool saturation, or
+engine-side congestion — not pure in-service waiting on an external call. Candidate
+approaches, to evaluate:
+
+1. **Causal gate on a local-contention signal.** Only attack when a per-definition
+   (or per-job-type) *queue-wait* / worker-saturation signal is present, mirroring
+   the ρ gate. Decompose realized sojourn into *queue-wait* (relievable by shedding)
+   vs *in-service* (not relievable); shed only against the former.
+2. **Counterfactual self-check.** Extend the observe-vs-act mechanism (already used
+   for the OFF/ON A/B in ADR-0020 validation): when pressure rises, verify the
+   *queue-wait* component actually falls; if it does not, the shed is not buying
+   latency — release and stop shedding that definition (an online causality probe,
+   echoing the user's "compress-and-watch-latency" instinct).
+3. **Scope the metric.** Track the relievable backlog (jobs waiting for a free
+   worker) rather than total in-flight `L_P`, so external in-service time never
+   enters the trigger.
+
+Until one of these lands, Tier-2 must not be presented to customers as a
+latency-SLA control (it may still run in observe-only / monitoring mode, which does
+not shed). This constraint is a hard input to the process-SLA design above: an
+importance-weighted shed still needs a *"shed only when it relieves latency"*
+predicate underneath it.
 
 ## Alternatives considered
 
