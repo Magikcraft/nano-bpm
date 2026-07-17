@@ -58,8 +58,8 @@ use nanobpmn_engine_core::{
 };
 
 use crate::backpressure::{
-    AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, SharedSlaMode, SlaMode,
-    parse_backpressure_setting, parse_sla_mode,
+    AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, ProcGovConfig,
+    ProcessGovernors, SharedSlaMode, SlaMode, parse_backpressure_setting, parse_sla_mode,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -184,6 +184,24 @@ pub struct ServerImpl {
     /// the ~1 Hz monitor as `nanobpm_backlog_governor_*` metrics and used to explain
     /// the auto-tuned cap in the `active_backlog` / `create_backlog` shed message.
     backlog_gov: Option<BacklogGovernor>,
+    /// ADR-0020 **Tier-2** per-process-definition admission compressors. While
+    /// [`backlog_gov`](Self::backlog_gov) (Tier-1) protects our shared write path
+    /// globally, this registry protects each user workload's end-to-end latency
+    /// independently: it keys on the in-flight instance backlog L_P of each BPMN
+    /// process definition and, by Little's law, throttles only the definition that
+    /// is actually accumulating — never a healthy sibling that merely shares a
+    /// congested job type. Stepped each ~1 Hz monitor tick from the cross-partition
+    /// `backlog_by_process` snapshot; consulted per `createProcessInstance`.
+    /// Actuates only in [`SlaMode::Latency`]. Always present (the signals stay
+    /// populated for monitoring); `NANOBPMN_TIER2` (default on) gates actuation.
+    procgov: Arc<ProcessGovernors>,
+    /// Whether Tier-2 per-definition admission actuates (else it observes only).
+    tier2_enabled: bool,
+    /// Cheap, monitor-refreshed `processDefinitionKey` → BPMN `process_id` index,
+    /// so the admission gate can resolve a create-by-key to the same identifier the
+    /// [`procgov`](Self::procgov) counters use without an engine round-trip on the
+    /// hot path. Deployments are rare, so ~1 Hz staleness is harmless.
+    def_key_to_process_id: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
     /// completed *service-task* jobs, summed across owned partitions. This is the
     /// parked-excluded load signal the admission gate and the backlog governor
@@ -699,6 +717,25 @@ impl ServerImpl {
                 cap
             }
         };
+        // ADR-0020 Tier-2: per-process-definition admission compressors. Always
+        // built (the per-definition backlog/pressure signals are a monitoring
+        // surface in both SLA modes); NANOBPMN_TIER2 (default on) gates whether it
+        // actuates admission — and it only actuates in latency mode regardless.
+        let procgov = Arc::new(ProcessGovernors::new(ProcGovConfig::from_env()));
+        let tier2_enabled = !matches!(
+            std::env::var("NANOBPMN_TIER2")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "off" | "false" | "no" | "disabled")
+        );
+        tracing::info!(
+            "ADR-0020 Tier-2 per-definition admission: {} (config {:?})",
+            if tier2_enabled { "on" } else { "observe-only" },
+            ProcGovConfig::from_env(),
+        );
+        let def_key_to_process_id =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         // The unified setpoint, recomputed each monitor tick. Seed at 0 (no clamp)
         // until the first tick folds in the live latency + memory signals.
         let effective_backlog_cap = Arc::new(AtomicUsize::new(0));
@@ -884,6 +921,9 @@ impl ServerImpl {
             activity: Arc::new(AtomicU64::new(0)),
             backlog_cap,
             backlog_gov,
+            procgov,
+            tier2_enabled,
+            def_key_to_process_id,
             backlog_cap_floor,
             backlog_cap_ceiling,
             recovery_backlog_cap,
@@ -3289,6 +3329,17 @@ impl ServerImpl {
             ) => (None, Some(b.process_definition_key.0.clone())),
         };
 
+        // ADR-0020 Tier-2: shed this definition's create if it is accumulating
+        // in-flight backlog past its end-to-end latency budget (latency mode only),
+        // leaving healthy siblings — even ones sharing a job type — fully admitted.
+        if let Some(message) = self.tier2_should_shed(by_id.as_deref(), by_key.as_deref()) {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                message,
+            )));
+        }
+
         // Under Raft (RF>=2) the create must be REPLICATED through a partition's
         // Raft log and placed by *leadership*, not statically-owned round-robin:
         // route through the shared Raft create core (leadership-following + leader
@@ -5659,6 +5710,11 @@ impl ServerImpl {
             && let Some(reason) = self.create_should_shed()
         {
             return Err((503, format!("{PLACEMENT_SHED_MARKER} {reason}")));
+        }
+        // ADR-0020 Tier-2: a forwarded create is still subject to the target
+        // definition's per-definition latency budget on the owner node.
+        if let Some(message) = self.tier2_should_shed(by_id.as_deref(), by_key.as_deref()) {
+            return Err((503, message));
         }
         let tags_for_response = tags.clone();
         let business_id_for_response = business_id.clone();
@@ -10043,6 +10099,13 @@ impl ServerImpl {
         by_key: Option<String>,
         variables: std::collections::HashMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        // ADR-0020 Tier-2: shed this definition's create if it is accumulating
+        // in-flight backlog past its latency budget (latency mode only). Checked
+        // first so an over-budget definition is rejected before any engine/Raft
+        // work, while healthy siblings pass straight through.
+        if let Some(message) = self.tier2_should_shed(by_id.as_deref(), by_key.as_deref()) {
+            return Err((503, message));
+        }
         // Per-partition Raft (experimental): when this node hosts Raft groups
         // (populated only by the env-gated `raft_bootstrap`), the create is
         // replicated through the partition leader's log instead of applied
@@ -11341,6 +11404,49 @@ impl ServerImpl {
             return Some("Backpressure: create-processing concurrency at capacity.".to_string());
         }
         self.admission_shed()
+    }
+
+    /// ADR-0020 **Tier-2** per-process-definition admission gate. Given a create's
+    /// `processDefinitionId` and/or `processDefinitionKey`, resolve the BPMN
+    /// `process_id` the Tier-2 compressors key on and, if that definition's
+    /// in-flight backlog is accumulating past its Little's-law latency band, shed a
+    /// paced fraction of its creates — leaving healthy sibling definitions (even
+    /// ones sharing a congested job type) fully admitted.
+    ///
+    /// Actuates only when [`tier2_enabled`](Self::tier2_enabled) **and** the node
+    /// is in [`SlaMode::Latency`] (the latency-preservation policy). Cheap on the
+    /// hot path: a direct id, or a single lock-free-ish map lookup for the key
+    /// (the monitor keeps [`def_key_to_process_id`](Self::def_key_to_process_id)
+    /// warm), then one brief mutex on the pressure map. Unknown definitions and
+    /// zero-pressure definitions (the common case) never shed.
+    pub(crate) fn tier2_should_shed(
+        &self,
+        by_id: Option<&str>,
+        by_key: Option<&str>,
+    ) -> Option<String> {
+        if !self.tier2_enabled || !self.sla_mode.get().sheds_for_latency() {
+            return None;
+        }
+        let process_id = match by_id {
+            Some(id) => id.to_string(),
+            None => {
+                let key = by_key?;
+                self.def_key_to_process_id
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()?
+            }
+        };
+        if self.procgov.should_shed(&process_id) {
+            crate::metrics::record_admission_shed("tier2_process");
+            return Some(format!(
+                "Admission control (ADR-0020 Tier-2): process definition '{process_id}' is \
+                 accumulating in-flight backlog beyond its end-to-end latency budget. Retry \
+                 after a backoff."
+            ));
+        }
+        None
     }
 
     /// The capacity ceilings this node is currently pressed against — the
@@ -13561,6 +13667,14 @@ async fn main() {
             let mut prev_rho_backlog: i64 =
                 monitor_server.runnable_backlog.load(Ordering::Relaxed) as i64;
             let mut prev_rho_instant = std::time::Instant::now();
+            // ADR-0020 Tier-2: previous-tick wall clock for the per-definition
+            // compressor step (its own λ_P / dL_P/dt are derived per definition from
+            // the engine snapshot; this only supplies dt).
+            let mut prev_tier2_instant = std::time::Instant::now();
+            // Definitions that had non-zero Tier-2 pressure last tick, so a release
+            // back to zero re-publishes the gauge as 0 instead of leaving it stale.
+            let mut prev_tier2_pressured: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             // Drain-stall guard supervisor state (options 3+4). The state machine
             // owns the edge/hysteresis counters; here we track the deltas it needs:
             // the completion count (rate = drain throughput) and the active backlog
@@ -13712,6 +13826,65 @@ async fn main() {
                     prev_busy_nanos_sum = busy_sum;
                     prev_rho_backlog = runnable as i64;
                     prev_rho_instant = now;
+                }
+
+                // ADR-0020 Tier-2: aggregate each BPMN process definition's
+                // in-flight backlog L_P (and cumulative-created, for λ_P) across
+                // this node's partitions, refresh the create-by-key → process_id
+                // index off the same snapshot, then step every per-definition
+                // compressor. One actor round-trip per partition at ~1 Hz (the same
+                // shape as cmd_profile's cardinality read) — cheap and off the hot
+                // path. Stepped in both SLA modes so the per-definition signals stay
+                // populated for monitoring; actuation is gated in `tier2_should_shed`.
+                {
+                    let mut backlog: std::collections::HashMap<String, (u64, u64)> =
+                        std::collections::HashMap::new();
+                    let mut key_index: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    for handle in monitor_server.engine.all() {
+                        let (per_proc, defs) = handle
+                            .with(|journal| {
+                                let engine = journal.engine();
+                                let state = engine.state();
+                                // (process_id, key) for the create-by-key resolver.
+                                let defs: Vec<(String, String)> = state
+                                    .processes
+                                    .values()
+                                    .map(|d| (d.definition.id.clone(), d.key.to_string()))
+                                    .collect();
+                                (engine.backlog_by_process(), defs)
+                            })
+                            .await;
+                        for (pid, inflight, created) in per_proc {
+                            let slot = backlog.entry(pid).or_insert((0, 0));
+                            slot.0 += inflight;
+                            slot.1 += created;
+                        }
+                        for (pid, key) in defs {
+                            key_index.insert(key, pid);
+                        }
+                    }
+                    if !key_index.is_empty() {
+                        *monitor_server.def_key_to_process_id.lock().unwrap() = key_index;
+                    }
+                    let now = std::time::Instant::now();
+                    let dt_s = now.duration_since(prev_tier2_instant).as_secs_f64();
+                    prev_tier2_instant = now;
+                    let snapshot: Vec<(String, u64, u64)> = backlog
+                        .into_iter()
+                        .map(|(pid, (l, created))| (pid, l, created))
+                        .collect();
+                    monitor_server.procgov.step(dt_s, &snapshot);
+                    let mut now_pressured: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for (pid, permille) in monitor_server.procgov.pressures() {
+                        crate::metrics::set_tier2_pressure(&pid, permille as i64);
+                        now_pressured.insert(pid);
+                    }
+                    for pid in prev_tier2_pressured.difference(&now_pressured) {
+                        crate::metrics::set_tier2_pressure(pid, 0);
+                    }
+                    prev_tier2_pressured = now_pressured;
                 }
                 let workers = monitor_registry.workers_per_type();
                 let mut current: std::collections::HashSet<String> =

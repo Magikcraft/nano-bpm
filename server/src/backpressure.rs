@@ -725,6 +725,240 @@ impl BacklogGovernor {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ADR-0020 Tier-2: per-process-definition admission compressors.
+//
+// Tier-1 (the ρ / raft-fsync guard above) protects OUR shared write path — a
+// global "are we the bottleneck" signal. Tier-2 protects each USER WORKLOAD's
+// end-to-end latency independently: it keys on the in-flight instance backlog
+// L_P of each BPMN process definition P (the authoritative engine counter added
+// in ADR-0020), and by Little's law W_P = L_P / λ_P bounding L_P bounds the
+// definition's e2e instance sojourn. Because the detection unit *is* the
+// actuation unit (the definition), a definition that accumulates backlog is
+// throttled without touching a healthy sibling that merely shares a congested
+// job type — strictly more precise than per-job-type detection with per-process
+// fan-in.
+//
+// The controller is an audio-compressor-shaped delay-gradient law on each
+// definition's own pressure p_P ∈ [0,1]: a fast ATTACK term drives the backlog
+// growth dL_P/dt → 0 (scale-free — it needs no absolute setpoint), and a slow
+// RELEASE term biases the operating point toward the Little's-law band
+// L*_P = W_target · λ_P (the one portable knob: the target e2e sojourn). The
+// deadband is expressed as a fraction of λ_P so the same tuning holds across
+// definitions of wildly different throughput.
+//
+// Actuation: the ~1 Hz monitor `step`s every definition from the cross-partition
+// backlog snapshot and publishes each p_P as per-mille. Admission reads p_P for
+// the target definition and sheds a p_P fraction of that definition's creates
+// via a per-definition accumulator (deterministic, even, cheap) — so a partially
+// pressured definition is *paced*, not bang-banged on the tick boundary.
+
+/// Parsed configuration for the [`ProcessGovernors`] Tier-2 compressors. All
+/// fields are env-tunable (see [`ProcGovConfig::from_env`]) but default to a
+/// conservative, largely-inert operating point so healthy workloads are never
+/// throttled — the growth term does the real work and only a definition whose
+/// in-flight backlog is both *above its Little's-law band and still rising* is
+/// squeezed.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcGovConfig {
+    /// `W_target`: the target end-to-end instance sojourn (seconds). The band is
+    /// `L*_P = W_target · λ_P`; a definition is only a candidate for attack once
+    /// its in-flight backlog exceeds this. Generous by default — the scale-free
+    /// growth term catches runaway accumulation long before the absolute band.
+    pub w_target_s: f64,
+    /// Per-tick pressure rise (fast attack) when a definition is above-band and
+    /// rising, before the growth-rate steepening.
+    pub attack: f64,
+    /// Proportional gain on the attack: steepens the rise with the (normalised)
+    /// backlog growth rate, so a runaway definition clamps in a few ticks while a
+    /// mild overshoot is nudged gently.
+    pub attack_gain: f64,
+    /// Per-tick pressure fall (slow release) when a definition is draining or
+    /// below its band. The attack/release asymmetry is the anti-oscillation term.
+    pub release: f64,
+    /// Deadband half-width as a fraction of λ_P (min 1 instance): the hold zone
+    /// around the band + the growth-rate significance threshold.
+    pub deadband_frac: f64,
+    /// EWMA weight (0–1, higher = smoother) applied to the measured backlog growth
+    /// rate dL_P/dt before it feeds the attack decision.
+    pub ewma: f64,
+    /// Below this per-definition create rate (instances/s) the definition is
+    /// treated as idle and its pressure is released — never throttle a workload
+    /// that is barely creating (avoids dividing by a noise-level λ_P).
+    pub min_lambda: f64,
+}
+
+impl Default for ProcGovConfig {
+    fn default() -> Self {
+        Self {
+            w_target_s: 30.0,
+            attack: 0.34,
+            attack_gain: 3.0,
+            release: 0.05,
+            deadband_frac: 0.1,
+            ewma: 0.5,
+            min_lambda: 5.0,
+        }
+    }
+}
+
+impl ProcGovConfig {
+    /// Resolve the config from the `NANOBPMN_TIER2_*` environment, falling back to
+    /// [`Default`] for any unset/unparseable knob.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let f = |key: &str, def: f64| -> f64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|x| x.is_finite())
+                .unwrap_or(def)
+        };
+        Self {
+            w_target_s: f("NANOBPMN_TIER2_W_TARGET_MS", d.w_target_s * 1000.0) / 1000.0,
+            attack: f("NANOBPMN_TIER2_ATTACK", d.attack),
+            attack_gain: f("NANOBPMN_TIER2_ATTACK_GAIN", d.attack_gain),
+            release: f("NANOBPMN_TIER2_RELEASE", d.release),
+            deadband_frac: f("NANOBPMN_TIER2_DEADBAND_FRAC", d.deadband_frac),
+            ewma: f("NANOBPMN_TIER2_EWMA", d.ewma).clamp(0.0, 1.0),
+            min_lambda: f("NANOBPMN_TIER2_MIN_LAMBDA", d.min_lambda),
+        }
+    }
+}
+
+/// Per-definition compressor state, owned and stepped by the monitor loop only.
+struct DefGov {
+    prev_inflight: u64,
+    prev_created: u64,
+    /// EWMA of dL_P/dt (instances/s), signed.
+    ewma_growth: f64,
+    /// The control output p_P ∈ [0,1].
+    pressure: f64,
+}
+
+/// Published, admission-readable Tier-2 pressure for one definition: the shed
+/// fraction in per-mille plus a running accumulator so `should_shed` paces the
+/// shed evenly across the definition's creates without an RNG.
+#[derive(Default)]
+struct PubPressure {
+    permille: u32,
+    acc: u64,
+}
+
+/// The ADR-0020 Tier-2 registry: one delay-gradient compressor per BPMN process
+/// definition. The monitor calls [`ProcessGovernors::step`] once per tick with
+/// the cross-partition `(process_id, in_flight L_P, cumulative_created)` snapshot;
+/// admission calls [`ProcessGovernors::should_shed`] per `createProcessInstance`.
+pub struct ProcessGovernors {
+    cfg: ProcGovConfig,
+    /// Compressor state, mutated only by the monitor `step`.
+    state: std::sync::Mutex<std::collections::HashMap<String, DefGov>>,
+    /// Published pressure, read (and accumulator-advanced) by admission.
+    published: std::sync::Mutex<std::collections::HashMap<String, PubPressure>>,
+    verbose: bool,
+}
+
+impl ProcessGovernors {
+    pub fn new(cfg: ProcGovConfig) -> Self {
+        Self {
+            cfg,
+            state: std::sync::Mutex::new(std::collections::HashMap::new()),
+            published: std::sync::Mutex::new(std::collections::HashMap::new()),
+            verbose: std::env::var_os("NANOBPM_ACTOR_PROFILE").is_some(),
+        }
+    }
+
+    /// Fold one monitor tick. `dt_s` is the wall time since the previous `step`;
+    /// `backlog` is the aggregated per-definition `(process_id, in_flight,
+    /// cumulative_created)` view (summed across the node's partitions). Updates
+    /// each definition's pressure and republishes the per-mille shed fractions.
+    pub fn step(&self, dt_s: f64, backlog: &[(String, u64, u64)]) {
+        if dt_s <= 0.0 {
+            return;
+        }
+        let mut st = self.state.lock().unwrap();
+        let mut pubm = self.published.lock().unwrap();
+        for (pid, inflight, created) in backlog {
+            let e = st.entry(pid.clone()).or_insert_with(|| DefGov {
+                prev_inflight: *inflight,
+                prev_created: *created,
+                ewma_growth: 0.0,
+                pressure: 0.0,
+            });
+            let lambda = (created.saturating_sub(e.prev_created) as f64 / dt_s).max(0.0);
+            let growth = (*inflight as f64 - e.prev_inflight as f64) / dt_s;
+            e.ewma_growth = self.cfg.ewma * e.ewma_growth + (1.0 - self.cfg.ewma) * growth;
+            e.prev_inflight = *inflight;
+            e.prev_created = *created;
+
+            let l = *inflight as f64;
+            if lambda < self.cfg.min_lambda {
+                // Idle / barely-creating definition: never throttle; let it relax.
+                e.pressure = (e.pressure - self.cfg.release).max(0.0);
+            } else {
+                let band = self.cfg.w_target_s * lambda; // L*_P = W_target · λ_P
+                let deadband = (self.cfg.deadband_frac * lambda).max(1.0);
+                let above_band = l > band + deadband;
+                let rising = e.ewma_growth > deadband;
+                let draining = e.ewma_growth < -deadband;
+                if above_band && rising {
+                    // Above the latency band AND still accumulating → attack. The
+                    // step steepens with the (normalised) growth rate.
+                    let g = (e.ewma_growth / l.max(1.0)).clamp(0.0, 1.0);
+                    let step = self.cfg.attack * (1.0 + self.cfg.attack_gain * g);
+                    e.pressure = (e.pressure + step).min(1.0);
+                } else if draining || l < band {
+                    // Draining, or comfortably under the band → release slowly.
+                    e.pressure = (e.pressure - self.cfg.release).max(0.0);
+                }
+                // else: within band / holding → hold pressure.
+            }
+
+            let permille = (e.pressure * 1000.0).round().clamp(0.0, 1000.0) as u32;
+            let slot = pubm.entry(pid.clone()).or_default();
+            slot.permille = permille;
+            if self.verbose && permille > 0 {
+                tracing::info!(
+                    "tier2: proc={pid} L={inflight} lambda={lambda:.0}/s growth={:.0}/s p={permille}permille",
+                    e.ewma_growth,
+                );
+            }
+        }
+    }
+
+    /// Admission hook: return `true` if this `createProcessInstance` for `pid`
+    /// should be shed under the definition's current Tier-2 pressure. Sheds a
+    /// `permille/1000` fraction of the definition's creates, spread evenly by a
+    /// per-definition accumulator (no RNG, deterministic). Zero-pressure (the
+    /// common case) is a cheap map lookup with no shed.
+    pub fn should_shed(&self, pid: &str) -> bool {
+        let mut pubm = self.published.lock().unwrap();
+        if let Some(slot) = pubm.get_mut(pid) {
+            if slot.permille == 0 {
+                return false;
+            }
+            slot.acc += slot.permille as u64;
+            if slot.acc >= 1000 {
+                slot.acc -= 1000;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Snapshot of the currently-pressured definitions (`process_id` → per-mille),
+    /// for metrics / observability. Only definitions with non-zero pressure.
+    pub fn pressures(&self) -> Vec<(String, u32)> {
+        self.published
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, s)| s.permille > 0)
+            .map(|(k, s)| (k.clone(), s.permille))
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1186,5 +1420,162 @@ mod tests {
             50,
             "no backlog to drain must never widen the active fan-out"
         );
+    }
+
+    // ── ADR-0020 Tier-2 per-definition governor ─────────────────────────────
+
+    fn tight_procgov() -> ProcessGovernors {
+        // Tight, deterministic knobs for the unit tests: a small band so the
+        // scenarios cross it quickly, brisk attack, slow release.
+        ProcessGovernors::new(ProcGovConfig {
+            w_target_s: 1.0,
+            attack: 0.34,
+            attack_gain: 3.0,
+            release: 0.05,
+            deadband_frac: 0.1,
+            ewma: 0.5,
+            min_lambda: 5.0,
+        })
+    }
+
+    fn pressure_of(g: &ProcessGovernors, pid: &str) -> u32 {
+        g.pressures()
+            .into_iter()
+            .find(|(k, _)| k == pid)
+            .map(|(_, p)| p)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn tier2_attacks_a_definition_whose_backlog_grows_above_band() {
+        let g = tight_procgov();
+        // A definition creating ~1000/s (λ well above min_lambda) with its
+        // in-flight backlog climbing far past the band L* = W_target·λ = 1000.
+        let mut inflight = 1000u64;
+        let mut created = 1000u64;
+        // Seed the previous-tick baseline.
+        g.step(1.0, &[("orders-slow".into(), inflight, created)]);
+        for _ in 0..8 {
+            created += 1000; // λ ≈ 1000/s
+            inflight += 800; // backlog rising fast, above band
+            g.step(1.0, &[("orders-slow".into(), inflight, created)]);
+        }
+        assert!(
+            pressure_of(&g, "orders-slow") > 500,
+            "a runaway, above-band definition must be attacked to high pressure"
+        );
+    }
+
+    #[test]
+    fn tier2_leaves_a_healthy_sibling_untouched() {
+        let g = tight_procgov();
+        // Two definitions sharing nothing at the governor level: SLOW accumulates,
+        // FAST stays flat (create==complete, in-flight ~ constant, within band).
+        let mut sc = 1000u64;
+        let mut si = 1000u64;
+        let mut fc = 1000u64;
+        let fi = 500u64; // flat, comfortably under band (1000)
+        g.step(
+            1.0,
+            &[
+                ("orders-slow".into(), si, sc),
+                ("orders-fast".into(), fi, fc),
+            ],
+        );
+        for _ in 0..8 {
+            sc += 1000;
+            si += 800; // slow: rising above band
+            fc += 1000; // fast: same create rate…
+            // …but in-flight stays flat (drains as fast as it creates).
+            g.step(
+                1.0,
+                &[
+                    ("orders-slow".into(), si, sc),
+                    ("orders-fast".into(), fi, fc),
+                ],
+            );
+        }
+        assert!(
+            pressure_of(&g, "orders-slow") > 500,
+            "the accumulating definition is throttled"
+        );
+        assert_eq!(
+            pressure_of(&g, "orders-fast"),
+            0,
+            "a healthy sibling with a flat in-flight backlog must NOT be throttled"
+        );
+    }
+
+    #[test]
+    fn tier2_releases_when_a_definition_drains() {
+        let g = tight_procgov();
+        // Drive it to high pressure first.
+        let mut inflight = 1000u64;
+        let mut created = 1000u64;
+        g.step(1.0, &[("p".into(), inflight, created)]);
+        for _ in 0..8 {
+            created += 1000;
+            inflight += 800;
+            g.step(1.0, &[("p".into(), inflight, created)]);
+        }
+        assert!(pressure_of(&g, "p") > 500);
+        // Now it drains: in-flight falls each tick, still creating.
+        for _ in 0..40 {
+            created += 1000;
+            inflight = inflight.saturating_sub(600);
+            g.step(1.0, &[("p".into(), inflight, created)]);
+        }
+        assert_eq!(
+            pressure_of(&g, "p"),
+            0,
+            "a draining definition must release its pressure back to zero"
+        );
+    }
+
+    #[test]
+    fn tier2_does_not_throttle_a_barely_creating_definition() {
+        let g = tight_procgov();
+        // Below min_lambda (5/s): even a deep in-flight backlog must not throttle,
+        // because dividing by a noise-level λ would fabricate a tiny band.
+        let mut inflight = 10_000u64;
+        let mut created = 100u64;
+        g.step(1.0, &[("idle".into(), inflight, created)]);
+        for _ in 0..8 {
+            created += 1; // λ ≈ 1/s < min_lambda
+            inflight += 1;
+            g.step(1.0, &[("idle".into(), inflight, created)]);
+        }
+        assert_eq!(
+            pressure_of(&g, "idle"),
+            0,
+            "a definition creating below min_lambda is never throttled"
+        );
+    }
+
+    #[test]
+    fn tier2_should_shed_paces_the_configured_fraction() {
+        let g = tight_procgov();
+        // Force a definition to a known pressure, then confirm should_shed sheds
+        // ~that fraction evenly (deterministic accumulator, no RNG).
+        let mut inflight = 1000u64;
+        let mut created = 1000u64;
+        g.step(1.0, &[("p".into(), inflight, created)]);
+        for _ in 0..8 {
+            created += 1000;
+            inflight += 800;
+            g.step(1.0, &[("p".into(), inflight, created)]);
+        }
+        let permille = pressure_of(&g, "p");
+        assert!(permille > 0);
+        let n = 10_000;
+        let shed = (0..n).filter(|_| g.should_shed("p")).count();
+        let expected = n * permille as usize / 1000;
+        let tol = n / 100; // ±1% of samples
+        assert!(
+            shed.abs_diff(expected) <= tol,
+            "should_shed must pace ~{permille}permille: shed {shed} vs expected {expected}"
+        );
+        // An unknown definition is never shed.
+        assert!(!g.should_shed("unknown-definition"));
     }
 }

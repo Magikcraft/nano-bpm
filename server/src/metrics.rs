@@ -278,6 +278,12 @@ struct Metrics {
     /// `nanobpm_admission_limit{limit="backlog"}` (the live cap) sits where it
     /// does. Absent in `Fixed`/`Off` backlog modes.
     backlog_governor: prometheus::IntGaugeVec,
+    /// ADR-0020 Tier-2 per-process-definition admission pressure, labelled by
+    /// `proc` (BPMN process id), in per-mille (0–1000). Non-zero means that
+    /// definition's in-flight backlog is accumulating past its end-to-end latency
+    /// budget and a paced fraction of its creates is being shed — while healthy
+    /// sibling definitions stay at 0. Only pressured definitions are published.
+    tier2_pressure: prometheus::IntGaugeVec,
 
     // ---- Per-command engine-actor profiling (NANOBPM_CMD_PROFILE) ----
     /// Wall time of a single applied [`Command`](nanobpmn_engine_core::Command)
@@ -728,6 +734,14 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         &["field"],
     )
     .expect("valid gauge vec");
+    let tier2_pressure = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_tier2_pressure",
+            "ADR-0020 Tier-2 per-process-definition admission pressure in per-mille (0-1000), labelled by proc (BPMN process id). Non-zero = that definition is accumulating in-flight backlog past its e2e latency budget and a paced fraction of its creates is shed; healthy siblings stay 0.",
+        ),
+        &["proc"],
+    )
+    .expect("valid gauge vec");
 
     // Per-command actor profiling. Time buckets span 1µs .. ~16s (the multi-second
     // stalls observed under collapse); alloc buckets span 0 B .. ~256 MB.
@@ -815,6 +829,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(drain_mint_permille.clone())))
         .and(registry.register(Box::new(admission_limit.clone())))
         .and(registry.register(Box::new(backlog_governor.clone())))
+        .and(registry.register(Box::new(tier2_pressure.clone())))
         .and(registry.register(Box::new(cmd_seconds.clone())))
         .and(registry.register(Box::new(cmd_alloc_bytes.clone())))
         .and(registry.register(Box::new(engine_cardinality.clone())))
@@ -878,6 +893,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         drain_mint_permille,
         admission_limit,
         backlog_governor,
+        tier2_pressure,
         cmd_seconds,
         cmd_alloc_bytes,
         engine_cardinality,
@@ -1101,6 +1117,17 @@ pub fn set_backlog_governor(field: &str, value: i64) {
         .backlog_governor
         .with_label_values(&[field])
         .set(value);
+}
+
+/// Publishes one process definition's ADR-0020 Tier-2 admission pressure in
+/// per-mille (`nanobpm_tier2_pressure{proc=...}`), the paced shed fraction the
+/// admission gate applies to that definition's creates. Only pressured
+/// definitions are emitted (healthy siblings are absent / implicitly 0).
+pub fn set_tier2_pressure(proc: &str, permille: i64) {
+    METRICS
+        .tier2_pressure
+        .with_label_values(&[proc])
+        .set(permille);
 }
 
 /// Publishes the per-job-type worker-provisioning gauges: waiting jobs, live
