@@ -26,6 +26,11 @@ struct Metrics {
     /// Wall time of each `write` + `fsync` group-commit. On macOS `sync_all`
     /// issues `F_FULLFSYNC`, a true media barrier, so this is typically ms-scale.
     fsync_seconds: Histogram,
+    /// Wall time of each Raft-log `sync_all()` (append + committed-marker + flusher
+    /// barrier). Separate from the varstore `fsync_seconds` above so the recovery
+    /// admission throttle can read the *Raft-log* disk-saturation signal directly —
+    /// on a failover node this is the fsync that saturates the shared disk.
+    raft_fsync_seconds: Histogram,
     /// Time a caller spends awaiting its commit's durability (queueing behind
     /// other commits + the fsync itself). The closed-loop latency clients feel.
     commit_wait_seconds: Histogram,
@@ -66,6 +71,18 @@ struct Metrics {
     stream_connections_active: IntGauge,
     /// Time spent processing each falcon frame (read + apply + reply).
     stream_frame_processing_seconds: Histogram,
+    /// Peer raft/app-uplink dial (redial) attempts, by target node and outcome
+    /// (`ok`|`fail`). Onset-diagnosis instrument: a surviving node's redial rate
+    /// to a *dead* peer quantifies the "wasted work sending to the down node"
+    /// (no dead-peer circuit-breaker exists, so every replication attempt to an
+    /// unreachable learner redials).
+    peer_connect_attempts_total: prometheus::IntCounterVec,
+    /// Wall time spent inside `PeerSet::link()` acquiring a peer uplink. Onset
+    /// instrument: `link()` awaits the redial `connect()` while holding the global
+    /// links mutex, so a slow/black-holed peer head-of-line-blocks *all* peer-link
+    /// acquisition — this histogram surfaces that stall (tail inflates when a peer
+    /// is down).
+    peer_link_seconds: Histogram,
 
     /// Process instance creates, split by protocol (rest vs stream).
     creates_total: prometheus::IntCounterVec,
@@ -96,6 +113,10 @@ struct Metrics {
     raft_log_ram_bytes: IntGauge,
     /// Count of uncompacted Raft log entries in memory across all owned partitions.
     raft_log_entries: IntGauge,
+    /// 1 while the node-wide Raft-log fsync-relief window is engaged (a failover
+    /// incumbent / returning owner coalescing its `sync`-mode fsyncs during
+    /// recovery), else 0. Lets a soak confirm the relief actually engaged.
+    raft_fsync_relief_active: IntGauge,
     /// Distribution of a single appended Raft log entry's serialized byte length
     /// (one observation per entry, on every owned partition). A batched entry
     /// carries all coalesced commands' payloads, so this is the payload-size
@@ -145,6 +166,16 @@ struct Metrics {
     /// signals it answers "are workers the bottleneck for this type, and would more
     /// help?" (Little's Law) rather than just "is the backlog growing?".
     job_type_dispatched_total: prometheus::IntCounterVec,
+    /// End-to-end job sojourn (create→complete wall latency, seconds) per
+    /// `job_type`. This is the user-facing SLA/SLI surface — p50/p90/p99 of how
+    /// long a job takes end to end. It is *reporting only*, deliberately NOT a
+    /// control input: sojourn is dominated by external/worker service time, so
+    /// throttling admission on it would wrongly penalize healthy traffic during a
+    /// downstream outage. Read it against the engine's internal command latency
+    /// (`nanobpm_backlog_governor{field="window_latency_us"}`): the gap ≈ external
+    /// service time, and one job type's sojourn stretching while internal latency
+    /// stays flat localizes a slow downstream to that specific type.
+    job_sojourn_seconds: prometheus::HistogramVec,
     /// Per-partition Raft liveness alarm: 1 when the partition's openraft core has
     /// entered `Shutdown` (terminated, e.g. on a storage error) and is no longer
     /// applying, else 0. A stuck-at-1 partition strands its share of instances and
@@ -230,6 +261,11 @@ struct Metrics {
     /// are granted from this bucket (refilled +1 per completion, capped at the
     /// burst); its floor near 0 means intake is fully paced to the drain.
     drain_credit_budget: prometheus::IntGauge,
+    /// The drain-stall servo's completion→create mint ratio in ‰ (parts-per-
+    /// thousand), `nanobpm_drain_mint_permille`. `1000` = mint one create token per
+    /// completion (intake≈drain, the metering hold); below `1000` while draining an
+    /// overshoot down to the setpoint (intake < drain); `0` under the hard valve.
+    drain_mint_permille: prometheus::IntGauge,
     /// The configured admission thresholds the ceiling rails trip at, labelled by
     /// `limit` (`backlog`, `create_queue` — counts; `pipeline_bytes`,
     /// `mem_watermark` — bytes; `0` = rail disabled). Reference lines so a dashboard
@@ -242,6 +278,17 @@ struct Metrics {
     /// `nanobpm_admission_limit{limit="backlog"}` (the live cap) sits where it
     /// does. Absent in `Fixed`/`Off` backlog modes.
     backlog_governor: prometheus::IntGaugeVec,
+    /// ADR-0020 Tier-2 per-process-definition admission pressure, labelled by
+    /// `proc` (BPMN process id), in per-mille (0–1000). Non-zero means that
+    /// definition's in-flight backlog is accumulating past its end-to-end latency
+    /// budget and a paced fraction of its creates is being shed — while healthy
+    /// sibling definitions stay at 0. Only pressured definitions are published.
+    tier2_pressure: prometheus::IntGaugeVec,
+    /// ADR-0020 **Tier-1** global engine-saturation guard pressure in per-mille
+    /// (0–1000): the paced fraction of *all* creates shed because the engine's
+    /// shared write path (raft-log fsync) has crossed its latency knee. 0 =
+    /// healthy write path. A single node-level gauge (no labels).
+    tier1_pressure: prometheus::IntGauge,
 
     // ---- Per-command engine-actor profiling (NANOBPM_CMD_PROFILE) ----
     /// Wall time of a single applied [`Command`](nanobpmn_engine_core::Command)
@@ -289,6 +336,15 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         HistogramOpts::new(
             "nanobpm_journal_fsync_seconds",
             "Wall time of each journal write+fsync group-commit.",
+        )
+        .buckets(latency_buckets.clone()),
+    )
+    .expect("valid histogram opts");
+
+    let raft_fsync_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "nanobpm_raft_fsync_seconds",
+            "Wall time of each Raft-log sync_all() barrier (append/committed-marker/flusher).",
         )
         .buckets(latency_buckets.clone()),
     )
@@ -393,6 +449,29 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter vec");
 
+    let peer_connect_attempts_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_peer_connect_attempts_total",
+            "Peer uplink dial (redial) attempts, by target node and outcome (ok|fail). \
+             Onset-diagnosis: redial rate to a dead peer quantifies wasted send work.",
+        ),
+        &["target", "outcome"],
+    )
+    .expect("valid counter vec");
+
+    let peer_link_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "nanobpm_peer_link_seconds",
+            "Wall time inside PeerSet::link() acquiring a peer uplink (the redial \
+             connect is awaited under the global links mutex; tail inflates while a \
+             peer is down and head-of-line-blocks healthy peers).",
+        )
+        .buckets(vec![
+            0.00001, 0.00005, 0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 30.0,
+        ]),
+    )
+    .expect("valid histogram");
+
     let job_completions_total = IntCounterVec::new(
         Opts::new(
             "nanobpm_job_completions_total",
@@ -434,6 +513,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let raft_log_entries = IntGauge::new(
         "nanobpm_raft_log_entries",
         "Uncompacted in-memory Raft log entries (all partitions).",
+    )
+    .expect("valid gauge");
+    let raft_fsync_relief_active = IntGauge::new(
+        "nanobpm_raft_fsync_relief_active",
+        "1 while the Raft-log fsync-relief window is engaged during recovery, else 0.",
     )
     .expect("valid gauge");
     // Per-entry serialized size. Buckets span 64 B .. ~256 MB (exp base 4) to
@@ -523,6 +607,16 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         &["job_type"],
     )
     .expect("valid counter vec");
+
+    let job_sojourn_seconds = prometheus::HistogramVec::new(
+        HistogramOpts::new(
+            "nanobpm_job_sojourn_seconds",
+            "End-to-end job sojourn (create->complete) per job type — the user-facing SLA/SLI. Reporting only, not a control signal.",
+        )
+        .buckets(prometheus::exponential_buckets(0.005, 3.0, 12).expect("valid buckets")),
+        &["job_type"],
+    )
+    .expect("valid histogram vec");
 
     let raft_partition_shutdown = prometheus::IntGaugeVec::new(
         Opts::new(
@@ -624,6 +718,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         "Drain-stall servo token-bucket level: create submission credits available to grant. Refilled +1 per completion (capped at the burst); while metering, a floor near 0 means intake is fully paced to the completion drain.",
     )
     .expect("valid gauge");
+    let drain_mint_permille = prometheus::IntGauge::new(
+        "nanobpm_drain_mint_permille",
+        "Drain-stall servo completion→create mint ratio in per-thousand: 1000 = one create token per completion (intake≈drain hold); below 1000 while draining an overshoot toward the setpoint (intake<drain); 0 under the hard valve.",
+    )
+    .expect("valid gauge");
     let admission_limit = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_admission_limit",
@@ -635,14 +734,27 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let backlog_governor = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_backlog_governor",
-            "Auto-mode active-backlog governor live state (field=floor|ceiling are runnable-job cap bounds; baseline_latency_us|window_latency_us are per-command latencies). Explains where the governor holds nanobpm_admission_limit{limit=\"backlog\"}.",
+            "Auto-mode active-backlog governor live state (field=floor|ceiling are runnable-job cap bounds; rho_permille|rho_target_permille are engine-actor saturation ρ and its setpoint in per-mille; growth_per_s is the signed runnable-backlog growth rate). Explains where the governor holds nanobpm_admission_limit{limit=\"backlog\"}.",
         ),
         &["field"],
     )
     .expect("valid gauge vec");
+    let tier2_pressure = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_tier2_pressure",
+            "ADR-0020 Tier-2 per-process-definition admission pressure in per-mille (0-1000), labelled by proc (BPMN process id). Non-zero = that definition is accumulating in-flight backlog past its e2e latency budget and a paced fraction of its creates is shed; healthy siblings stay 0.",
+        ),
+        &["proc"],
+    )
+    .expect("valid gauge vec");
+
+    let tier1_pressure = prometheus::IntGauge::new(
+        "nanobpm_tier1_pressure",
+        "ADR-0020 Tier-1 global engine-saturation guard pressure in per-mille (0-1000): the paced fraction of all creates shed because the engine's shared write path (raft-log fsync) crossed its latency knee. 0 = healthy write path.",
+    )
+    .expect("valid gauge");
 
     // Per-command actor profiling. Time buckets span 1µs .. ~16s (the multi-second
-    // stalls observed under collapse); alloc buckets span 0 B .. ~256 MB.
     let cmd_seconds = prometheus::HistogramVec::new(
         HistogramOpts::new(
             "nanobpm_cmd_seconds",
@@ -673,6 +785,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     registry
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
+        .and(registry.register(Box::new(raft_fsync_seconds.clone())))
         .and(registry.register(Box::new(commit_wait_seconds.clone())))
         .and(registry.register(Box::new(commits_total.clone())))
         .and(registry.register(Box::new(writes_total.clone())))
@@ -686,6 +799,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(read_model_export_retries_total.clone())))
         .and(registry.register(Box::new(stream_connections_active.clone())))
         .and(registry.register(Box::new(stream_frame_processing_seconds.clone())))
+        .and(registry.register(Box::new(peer_connect_attempts_total.clone())))
+        .and(registry.register(Box::new(peer_link_seconds.clone())))
         .and(registry.register(Box::new(creates_total.clone())))
         .and(registry.register(Box::new(job_completions_total.clone())))
         .and(registry.register(Box::new(stream_complete_outcome_total.clone())))
@@ -693,6 +808,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(raft_log_bytes.clone())))
         .and(registry.register(Box::new(raft_log_ram_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entries.clone())))
+        .and(registry.register(Box::new(raft_fsync_relief_active.clone())))
         .and(registry.register(Box::new(raft_log_entry_bytes.clone())))
         .and(registry.register(Box::new(raft_log_entry_bytes_max.clone())))
         .and(registry.register(Box::new(exporter_queue_bytes.clone())))
@@ -704,6 +820,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(job_type_workers.clone())))
         .and(registry.register(Box::new(job_type_starved.clone())))
         .and(registry.register(Box::new(job_type_dispatched_total.clone())))
+        .and(registry.register(Box::new(job_sojourn_seconds.clone())))
         .and(registry.register(Box::new(raft_partition_shutdown.clone())))
         .and(registry.register(Box::new(actor_alive.clone())))
         .and(registry.register(Box::new(actor_jobs_total.clone())))
@@ -719,8 +836,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(drain_guard_state.clone())))
         .and(registry.register(Box::new(drain_completes_per_sec.clone())))
         .and(registry.register(Box::new(drain_credit_budget.clone())))
+        .and(registry.register(Box::new(drain_mint_permille.clone())))
         .and(registry.register(Box::new(admission_limit.clone())))
         .and(registry.register(Box::new(backlog_governor.clone())))
+        .and(registry.register(Box::new(tier2_pressure.clone())))
+        .and(registry.register(Box::new(tier1_pressure.clone())))
         .and(registry.register(Box::new(cmd_seconds.clone())))
         .and(registry.register(Box::new(cmd_alloc_bytes.clone())))
         .and(registry.register(Box::new(engine_cardinality.clone())))
@@ -730,6 +850,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         registry,
         commit_batch_size,
         fsync_seconds,
+        raft_fsync_seconds,
         commit_wait_seconds,
         commits_total,
         writes_total,
@@ -743,6 +864,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         read_model_export_retries_total,
         stream_connections_active,
         stream_frame_processing_seconds,
+        peer_connect_attempts_total,
+        peer_link_seconds,
         creates_total,
         job_completions_total,
         stream_complete_outcome_total,
@@ -750,6 +873,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         raft_log_bytes,
         raft_log_ram_bytes,
         raft_log_entries,
+        raft_fsync_relief_active,
         raft_log_entry_bytes,
         raft_log_entry_bytes_max,
         exporter_queue_bytes,
@@ -761,6 +885,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         job_type_workers,
         job_type_starved,
         job_type_dispatched_total,
+        job_sojourn_seconds,
         raft_partition_shutdown,
         actor_alive,
         actor_jobs_total,
@@ -776,8 +901,11 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         drain_guard_state,
         drain_completes_per_sec,
         drain_credit_budget,
+        drain_mint_permille,
         admission_limit,
         backlog_governor,
+        tier2_pressure,
+        tier1_pressure,
         cmd_seconds,
         cmd_alloc_bytes,
         engine_cardinality,
@@ -815,6 +943,21 @@ pub fn record_commit_wait(wait: Duration) {
     METRICS.commit_wait_seconds.observe(wait.as_secs_f64());
 }
 
+/// Records the wall time of one Raft-log `sync_all()` barrier. The recovery
+/// admission throttle reads the windowed mean of this (see
+/// [`raft_fsync_sum_count`]) to detect disk saturation on a failover node.
+pub fn observe_raft_fsync(dur: Duration) {
+    METRICS.raft_fsync_seconds.observe(dur.as_secs_f64());
+}
+
+/// Cumulative (sum_seconds, count) of Raft-log fsync barriers since boot. The
+/// monitor tick differences these across ticks to get the window mean fsync
+/// latency that drives the recovery admission throttle.
+pub fn raft_fsync_sum_count() -> (f64, u64) {
+    let h = &METRICS.raft_fsync_seconds;
+    (h.get_sample_sum(), h.get_sample_count())
+}
+
 /// A durable write was enqueued (pipeline depth +1).
 pub fn inflight_inc() {
     METRICS.inflight.inc();
@@ -838,6 +981,14 @@ pub fn set_pipeline_bytes(bytes: u64) {
 pub fn raft_log_delta(entries_delta: i64, bytes_delta: i64) {
     METRICS.raft_log_entries.add(entries_delta);
     METRICS.raft_log_bytes.add(bytes_delta);
+}
+
+/// Sets the Raft-log fsync-relief gauge (1 = engaged during recovery, 0 = off).
+/// Driven by the recovery supervisor as it toggles the process-global relief flag.
+pub fn set_raft_fsync_relief(active: bool) {
+    METRICS
+        .raft_fsync_relief_active
+        .set(if active { 1 } else { 0 });
 }
 
 /// Adjusts the aggregate resident (in-RAM) Raft-log byte gauge by a signed delta.
@@ -950,6 +1101,12 @@ pub fn set_drain_guard(metering: bool, halted: bool, completes_per_sec: f64, cre
     METRICS.drain_credit_budget.set(credit_budget);
 }
 
+/// Publishes the drain-stall servo's completion→create mint ratio (‰) this tick
+/// (`nanobpm_drain_mint_permille`). Called ~1 Hz from the monitor supervisor.
+pub fn set_drain_mint_permille(permille: i64) {
+    METRICS.drain_mint_permille.set(permille);
+}
+
 /// Publishes one configured admission threshold as a reference line
 /// (`backlog`/`create_queue` are counts, `pipeline_bytes`/`mem_watermark` are
 /// bytes; `0` = that rail is disabled).
@@ -972,6 +1129,25 @@ pub fn set_backlog_governor(field: &str, value: i64) {
         .backlog_governor
         .with_label_values(&[field])
         .set(value);
+}
+
+/// Publishes one process definition's ADR-0020 Tier-2 admission pressure in
+/// per-mille (`nanobpm_tier2_pressure{proc=...}`), the paced shed fraction the
+/// admission gate applies to that definition's creates. Only pressured
+/// definitions are emitted (healthy siblings are absent / implicitly 0).
+pub fn set_tier2_pressure(proc: &str, permille: i64) {
+    METRICS
+        .tier2_pressure
+        .with_label_values(&[proc])
+        .set(permille);
+}
+
+/// Publishes the ADR-0020 Tier-1 global engine-saturation guard pressure in
+/// per-mille (`nanobpm_tier1_pressure`), the paced shed fraction the admission
+/// gate applies to *all* creates when the shared write path (raft-log fsync) is
+/// saturated. 0 = healthy.
+pub fn set_tier1_pressure(permille: i64) {
+    METRICS.tier1_pressure.set(permille);
 }
 
 /// Publishes the per-job-type worker-provisioning gauges: waiting jobs, live
@@ -1005,6 +1181,20 @@ pub fn record_jobs_dispatched(job_type: &str, n: u64) {
         .job_type_dispatched_total
         .with_label_values(&[job_type])
         .inc_by(n);
+}
+
+/// Observes one job's end-to-end sojourn (create→complete, `seconds`) into the
+/// per-`job_type` SLA histogram. Reporting only (see `job_sojourn_seconds`); a
+/// no-op for a non-positive sample (jobs created before the engine carried
+/// `created_at`, or a clock skew) so the reported distribution is never polluted.
+pub fn observe_job_sojourn(job_type: &str, seconds: f64) {
+    if seconds <= 0.0 {
+        return;
+    }
+    METRICS
+        .job_sojourn_seconds
+        .with_label_values(&[job_type])
+        .observe(seconds);
 }
 
 /// Publishes the per-partition Raft `Shutdown` alarm: `down = true` sets the gauge
@@ -1162,6 +1352,22 @@ pub fn record_stream_frame_processing(elapsed: Duration) {
 /// Records a process instance create (by protocol: "rest" or "stream").
 pub fn record_create(protocol: &str) {
     METRICS.creates_total.with_label_values(&[protocol]).inc();
+}
+
+/// Records one peer uplink dial (redial) attempt to `target`, tagged by outcome
+/// (`ok`|`fail`). Onset-diagnosis instrument for the redial rate to a dead peer.
+pub fn record_peer_connect_attempt(target: u32, ok: bool) {
+    let outcome = if ok { "ok" } else { "fail" };
+    METRICS
+        .peer_connect_attempts_total
+        .with_label_values(&[&target.to_string(), outcome])
+        .inc();
+}
+
+/// Records the wall time spent inside `PeerSet::link()` acquiring a peer uplink
+/// (captures the connect-under-global-mutex head-of-line stall while a peer is down).
+pub fn record_peer_link(elapsed: Duration) {
+    METRICS.peer_link_seconds.observe(elapsed.as_secs_f64());
 }
 
 /// Records a job completion (by protocol: "rest" or "stream").

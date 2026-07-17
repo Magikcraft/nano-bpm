@@ -80,6 +80,17 @@ pub struct ActorStats {
     /// a panic inside a command that silently kills the single writer and hangs
     /// every subsequent `with().await` forever).
     pub alive: AtomicBool,
+    /// Cumulative wall-clock nanoseconds this actor has spent *inside* a command
+    /// (`job(journal)` — engine apply **plus** the journal write/fsync), summed
+    /// over its whole life. The ~1 Hz monitor differences this against wall time
+    /// across all a node's actors to derive **actor saturation ρ** = busy/elapsed:
+    /// ρ→1 means the single writer is the wall (CPU-bound apply or disk-bound
+    /// fsync — both are counted here because the fsync happens *inside* the timed
+    /// region), ρ≪1 means throughput is limited upstream (a starved actor parks in
+    /// `pop`, accruing no busy time). This is the cold-start-proof "are we the
+    /// bottleneck" signal the admission compressor keys off — absolute, needs no
+    /// learned baseline, and immune to external/worker strain by construction.
+    pub busy_nanos: AtomicU64,
 }
 
 impl ActorStats {
@@ -91,6 +102,7 @@ impl ActorStats {
             lo_depth: AtomicUsize::new(0),
             job_start_mono_ms: AtomicU64::new(0),
             alive: AtomicBool::new(true),
+            busy_nanos: AtomicU64::new(0),
         })
     }
 
@@ -181,18 +193,20 @@ impl Mailbox {
     }
 
     /// Blocks until a job is available, returning High-priority work first.
-    /// Returns `None` once every producer handle is gone and both queues are
-    /// empty (clean shutdown).
-    fn pop(&self) -> Option<Job> {
+    /// Returns the job together with the [`Priority`] queue it came from (so the
+    /// latency instrumentation can attribute the sample to its command class —
+    /// creates vs completions). Returns `None` once every producer handle is gone
+    /// and both queues are empty (clean shutdown).
+    fn pop(&self) -> Option<(Job, Priority)> {
         let mut g = self.inner.lock().expect("engine mailbox poisoned");
         loop {
             if let Some(job) = g.hi.pop_front() {
                 self.stats.hi_depth.store(g.hi.len(), Ordering::Relaxed);
-                return Some(job);
+                return Some((job, Priority::High));
             }
             if let Some(job) = g.lo.pop_front() {
                 self.stats.lo_depth.store(g.lo.len(), Ordering::Relaxed);
-                return Some(job);
+                return Some((job, Priority::Low));
             }
             if g.producers == 0 {
                 return None;
@@ -288,9 +302,13 @@ impl DeepthiHandle {
                     Self::run_instrumented(&consumer, &mut journal, profile, controller);
                 } else {
                     let stats = &consumer.stats;
-                    while let Some(job) = consumer.pop() {
+                    while let Some((job, _)) = consumer.pop() {
                         stats.job_start_mono_ms.store(mono_ms(), Ordering::Relaxed);
+                        let before_job = Instant::now();
                         job(&mut journal);
+                        stats
+                            .busy_nanos
+                            .fetch_add(before_job.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         stats.job_start_mono_ms.store(0, Ordering::Relaxed);
                         stats.jobs.fetch_add(1, Ordering::Relaxed);
                     }
@@ -322,7 +340,9 @@ impl DeepthiHandle {
 
         loop {
             let before_recv = Instant::now();
-            let Some(job) = mb.pop() else { break };
+            let Some((job, prio)) = mb.pop() else {
+                break;
+            };
             idle += before_recv.elapsed();
 
             mb.stats
@@ -333,10 +353,21 @@ impl DeepthiHandle {
             let job_time = before_job.elapsed();
             mb.stats.job_start_mono_ms.store(0, Ordering::Relaxed);
             mb.stats.jobs.fetch_add(1, Ordering::Relaxed);
+            // Publish busy time for node-level actor-saturation ρ (always — this is
+            // the admission compressor's control signal, not profiling output).
+            mb.stats
+                .busy_nanos
+                .fetch_add(job_time.as_nanos() as u64, Ordering::Relaxed);
 
-            // Feed the adaptive limiter every command; it windows internally.
+            // Feed the adaptive limiter every command, tagged with its class.
+            // Both classes report pure apply time (`job_time`): creates (`Low`)
+            // drive the create-processing concurrency limiter, completion-side
+            // (`High`) drives the worker governor. The admission-backlog cap is
+            // driven separately by the monitor-stepped backlog governor off e2e
+            // job sojourn, not from here.
             if let Some(c) = controller.as_mut() {
-                c.record(job_time);
+                let is_create = prio == Priority::Low;
+                c.record(job_time, is_create);
             }
 
             if !profile {

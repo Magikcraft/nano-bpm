@@ -411,6 +411,43 @@ fn create_instance_key(engine: &mut Engine, proc_id: &str) -> Key {
 }
 
 #[test]
+fn inflight_by_process_tracks_create_and_terminal_transitions() {
+    // ADR-0020 Tier-2 signal L_P: per-definition in-flight instance count,
+    // maintained at the logical lifecycle (create +1, terminal −1), with a
+    // monotonic created counter feeding λ_P.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_priority("orders", "10")))
+        .unwrap();
+    assert!(
+        engine.backlog_by_process().is_empty(),
+        "no definitions with live instances yet"
+    );
+
+    let a = create_instance_key(&mut engine, "orders");
+    let _b = create_instance_key(&mut engine, "orders");
+    let snap = engine.backlog_by_process();
+    let (_, inflight, created) = snap.iter().find(|(p, _, _)| p == "orders").unwrap();
+    assert_eq!(*inflight, 2, "two live instances");
+    assert_eq!(*created, 2, "two cumulative creates");
+
+    // Complete instance a's single job → a reaches its end event → Completed,
+    // so its in-flight count drops to 1 while `created` stays monotonic.
+    let job = engine
+        .activate_jobs("work", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.instance_key == a)
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job(job.key))
+        .unwrap();
+    let snap = engine.backlog_by_process();
+    let (_, inflight, created) = snap.iter().find(|(p, _, _)| p == "orders").unwrap();
+    assert_eq!(*inflight, 1, "one instance completed");
+    assert_eq!(*created, 2, "created is monotonic across completion");
+}
+
+#[test]
 fn higher_priority_jobs_activate_before_older_lower_priority_jobs() {
     // Two processes emit the same `work` job type at different priorities.
     let mut engine = Engine::new();

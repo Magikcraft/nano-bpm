@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_orders_slow" targetNamespace="http://bpmn.io/schema/bpmn">
+  <!--
+    ADR-0020 Tier-2 differential scenario: the SICK definition.
+    First a service task on the SHARED job type `common-job` (identical to
+    orders-fast, and healthy), THEN a second service task on `slow-job`, whose
+    worker pool is deliberately under-provisioned/slow. Instances pile up waiting
+    on `slow-job`, so ONLY this definition's in-flight instance backlog L_P grows.
+    Tier-2 (per-definition) must raise pressure on `orders-slow` alone; a
+    per-job-type detector on the shared `common-job` would see it healthy and fail
+    to isolate — the whole point of keying on the process definition.
+  -->
+  <bpmn:process id="orders-slow" name="Orders Slow" isExecutable="true">
+    <bpmn:startEvent id="slow_start">
+      <bpmn:outgoing>slow_f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="slow_f1" sourceRef="slow_start" targetRef="slow_common" />
+    <bpmn:serviceTask id="slow_common" name="Common">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="common-job" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>slow_f1</bpmn:incoming>
+      <bpmn:outgoing>slow_f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="slow_f2" sourceRef="slow_common" targetRef="slow_bottleneck" />
+    <bpmn:serviceTask id="slow_bottleneck" name="Slow">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="slow-job" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>slow_f2</bpmn:incoming>
+      <bpmn:outgoing>slow_f3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="slow_f3" sourceRef="slow_bottleneck" targetRef="slow_end" />
+    <bpmn:endEvent id="slow_end">
+      <bpmn:incoming>slow_f3</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>

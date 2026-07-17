@@ -33,6 +33,7 @@ mod raft;
 mod raft_logstore;
 mod raft_net;
 mod readstore;
+mod recovery_throttle;
 mod seglog;
 mod stub_impls;
 mod varspill;
@@ -57,8 +58,9 @@ use nanobpmn_engine_core::{
 };
 
 use crate::backpressure::{
-    AdaptiveController, Backpressure, BackpressureSetting, CONGESTION_RATIO, GovernorObs,
-    SharedSlaMode, SlaMode, parse_backpressure_setting, parse_sla_mode,
+    AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, GlobalGuard,
+    ProcGovConfig, ProcessGovernors, SharedSlaMode, SlaMode, Tier1Config,
+    parse_backpressure_setting, parse_sla_mode,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -176,13 +178,38 @@ pub struct ServerImpl {
     /// path with a relaxed load.
     backlog_cap: Arc<AtomicUsize>,
     /// When the active-backlog cap is governed live (`AdmissionBacklog::Auto`),
-    /// the governor's static bounds (`floor` ≈ knee, `ceiling` = memory backstop)
-    /// and a [`GovernorObs`] read handle onto its self-calibrated latency baseline
-    /// and last-window latency. `None` in `Fixed`/`Off` mode (the cap is then a
-    /// plain constant). Surfaced by the ~1 Hz monitor as
-    /// `nanobpm_backlog_governor_*` metrics and used to explain the auto-tuned
-    /// cap in the `active_backlog` / `create_backlog` shed message.
+    /// the standalone monitor-stepped [`BacklogGovernor`] compressor that clamps the
+    /// cap by **engine-actor saturation ρ** (busy fraction) paired with the
+    /// runnable-backlog growth rate — "are we falling behind AND is it our fault".
+    /// `None` in `Fixed`/`Off` mode (the cap is then a plain constant). Surfaced by
+    /// the ~1 Hz monitor as `nanobpm_backlog_governor_*` metrics and used to explain
+    /// the auto-tuned cap in the `active_backlog` / `create_backlog` shed message.
     backlog_gov: Option<BacklogGovernor>,
+    /// ADR-0020 **Tier-2** per-process-definition admission compressors. While
+    /// [`backlog_gov`](Self::backlog_gov) (Tier-1) protects our shared write path
+    /// globally, this registry protects each user workload's end-to-end latency
+    /// independently: it keys on the in-flight instance backlog L_P of each BPMN
+    /// process definition and, by Little's law, throttles only the definition that
+    /// is actually accumulating — never a healthy sibling that merely shares a
+    /// congested job type. Stepped each ~1 Hz monitor tick from the cross-partition
+    /// `backlog_by_process` snapshot; consulted per `createProcessInstance`.
+    /// Actuates only in [`SlaMode::Latency`]. Always present (the signals stay
+    /// populated for monitoring); `NANOBPMN_TIER2` (default on) gates actuation.
+    procgov: Arc<ProcessGovernors>,
+    /// Whether Tier-2 per-definition admission actuates (else it observes only).
+    tier2_enabled: bool,
+    /// ADR-0020 **Tier-1** global engine-saturation guard: throttles *all* intake
+    /// when the shared write path (raft-log fsync) crosses its latency knee — the
+    /// bottleneck class that saturates every definition at once and that
+    /// per-definition Tier-2 cannot see. Stepped each ~1 Hz monitor tick from the
+    /// windowed fsync latency; consulted per `createProcessInstance`. Actuates only
+    /// in [`SlaMode::Latency`]; `NANOBPMN_TIER1` (default on) gates it.
+    guard: Arc<GlobalGuard>,
+    /// Cheap, monitor-refreshed `processDefinitionKey` → BPMN `process_id` index,
+    /// so the admission gate can resolve a create-by-key to the same identifier the
+    /// [`procgov`](Self::procgov) counters use without an engine round-trip on the
+    /// hot path. Deployments are rare, so ~1 Hz staleness is harmless.
+    def_key_to_process_id: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
     /// completed *service-task* jobs, summed across owned partitions. This is the
     /// parked-excluded load signal the admission gate and the backlog governor
@@ -223,6 +250,16 @@ pub struct ServerImpl {
     /// Upper bound for the unified setpoint (`effective_backlog_cap`): the memory
     /// backstop / governor ceiling (or the fixed cap). `0` when disabled.
     backlog_cap_ceiling: usize,
+    /// The live **recovery admission cap** published by the adaptive recovery
+    /// throttle ([`crate::recovery_throttle`]): while this node is a failover
+    /// incumbent / returning owner with a saturating Raft-log disk, this is the
+    /// backlog the throttle paces intake to so the disk stays under its `fsync`
+    /// knee (durability-preserving — no `fsync` is deferred). `0` = no recovery
+    /// clamp (steady state, or the throttle disabled). Folded as a `min` into
+    /// [`Self::effective_backlog_cap`] in *all* SLA modes (a recovery liveness rail),
+    /// and honoured even when the general backlog cap is off. Recomputed each ~1 Hz
+    /// monitor tick.
+    recovery_backlog_cap: Arc<AtomicUsize>,
     /// The live per-job-type active dispatch width the push dispatcher caps its
     /// per-pass subscriber fan-out at; `0` = no cap (dispatch to all subscribers).
     /// Held behind an atomic because in [`WorkerConcurrency::Auto`] mode the engine
@@ -590,7 +627,8 @@ impl ServerImpl {
             BackpressureSetting::Disabled => Backpressure::Disabled,
             BackpressureSetting::Fixed(n) => Backpressure::Fixed(n),
             BackpressureSetting::Adaptive => {
-                Backpressure::Adaptive(controller.with_create_limiter(processing.clone()))
+                let limit = controller.with_create_limiter(processing.clone());
+                Backpressure::Adaptive(limit)
             }
         };
         tracing::info!("backpressure: {}", backpressure.describe());
@@ -637,16 +675,87 @@ impl ServerImpl {
                 );
                 backlog_cap_floor = floor;
                 backlog_cap_ceiling = ceiling;
-                let (cap, obs) =
-                    controller.with_backlog_governor(floor, ceiling, runnable_backlog.clone());
-                backlog_gov = Some(BacklogGovernor {
+                // The backlog cap is held by a COMPRESSOR keyed on engine-actor
+                // saturation ρ (the busy fraction of the single-writer engine actor,
+                // aggregated node-level by the monitor) paired with the runnable-
+                // backlog growth rate — "are we falling behind AND is it our fault".
+                // ρ is absolute (cold-start-proof, no learning), captures disk+CPU
+                // (fsync is inside the timed job region), and is immune to external
+                // strain (a slow worker parks the actor → ρ low). Three-zone law:
+                // attack (cut) only when saturated AND rising (the attack step
+                // steepens with the growth rate — the one proportional term); release
+                // (grow) slowly when draining or idle (the anti-oscillation
+                // asymmetry); hold otherwise (healthy saturated peak). Tunable live
+                // via NANOBPMN_ADMISSION_COMP_RHO_TARGET/DEADBAND/ATTACK/RELEASE/
+                // ATTACK_GAIN. Only the dimensionless ρ target matters — portable
+                // across hardware, no absolute latency number to calibrate.
+                let env_f64 = |k: &str, d: f64, pred: fn(f64) -> bool| {
+                    std::env::var(k)
+                        .ok()
+                        .and_then(|v| v.trim().parse::<f64>().ok())
+                        .filter(|x| pred(*x))
+                        .unwrap_or(d)
+                };
+                let rho_target = env_f64("NANOBPMN_ADMISSION_COMP_RHO_TARGET", 0.9, |x| {
+                    x > 0.0 && x < 1.0
+                });
+                let deadband = env_f64("NANOBPMN_ADMISSION_COMP_DEADBAND", 0.05, |x| {
+                    (0.0..1.0).contains(&x)
+                });
+                let attack = env_f64("NANOBPMN_ADMISSION_COMP_ATTACK", 0.7, |x| {
+                    x > 0.0 && x < 1.0
+                });
+                let release = env_f64("NANOBPMN_ADMISSION_COMP_RELEASE", 1.1, |x| x > 1.0);
+                let attack_gain = env_f64("NANOBPMN_ADMISSION_COMP_ATTACK_GAIN", 3.0, |x| x >= 0.0);
+                tracing::info!(
+                    "admission backlog compressor: actor-saturation ρ target {rho_target} \
+                     (deadband {deadband}, attack {attack}, release {release}, \
+                     attack_gain {attack_gain})"
+                );
+                let (gov, cap, _obs) = BacklogGovernor::new(
                     floor,
                     ceiling,
-                    obs,
-                });
+                    rho_target,
+                    deadband,
+                    attack,
+                    release,
+                    attack_gain,
+                );
+                backlog_gov = Some(gov);
                 cap
             }
         };
+        // ADR-0020 Tier-2: per-process-definition admission compressors. Always
+        // built (the per-definition backlog/pressure signals are a monitoring
+        // surface in both SLA modes); NANOBPMN_TIER2 (default on) gates whether it
+        // actuates admission — and it only actuates in latency mode regardless.
+        let procgov = Arc::new(ProcessGovernors::new(ProcGovConfig::from_env()));
+        let tier2_enabled = !matches!(
+            std::env::var("NANOBPMN_TIER2")
+                .ok()
+                .map(|v| v.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "off" | "false" | "no" | "disabled")
+        );
+        tracing::info!(
+            "ADR-0020 Tier-2 per-definition admission: {} (config {:?})",
+            if tier2_enabled { "on" } else { "observe-only" },
+            ProcGovConfig::from_env(),
+        );
+        let def_key_to_process_id =
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // ADR-0020 Tier-1: global engine-saturation guard on the raft-log fsync
+        // latency knee. Always built (the pressure is a monitoring surface);
+        // NANOBPMN_TIER1 (default on) gates actuation and it only sheds in latency
+        // mode. It is the backstop for the shared-write-path bottleneck class that
+        // per-definition Tier-2 cannot see.
+        let tier1_cfg = Tier1Config::from_env();
+        let guard = Arc::new(GlobalGuard::new(tier1_cfg));
+        tracing::info!(
+            "ADR-0020 Tier-1 global engine-saturation guard: {} (config {:?})",
+            if tier1_cfg.enabled { "on" } else { "off" },
+            tier1_cfg,
+        );
         // The unified setpoint, recomputed each monitor tick. Seed at 0 (no clamp)
         // until the first tick folds in the live latency + memory signals.
         let effective_backlog_cap = Arc::new(AtomicUsize::new(0));
@@ -654,6 +763,10 @@ impl ServerImpl {
         // (shed effectively off) so the servo owns admission until the first memory
         // sample lands — never shed before we know the live headroom.
         let backlog_shed_cap = Arc::new(AtomicUsize::new(backlog_cap_ceiling));
+        // The recovery admission cap, published by the adaptive recovery throttle
+        // each monitor tick. Seed at 0 (no clamp) — only engages inside a recovery
+        // window with a saturating Raft-log disk.
+        let recovery_backlog_cap = Arc::new(AtomicUsize::new(0));
         // `active_worker_cap` is the live per-job-type active dispatch width the
         // push dispatcher reads (0 = no cap). Resolved from one of three policies,
         // mirroring the backlog governor: Off (no cap), Fixed, or a self-optimizing
@@ -828,8 +941,13 @@ impl ServerImpl {
             activity: Arc::new(AtomicU64::new(0)),
             backlog_cap,
             backlog_gov,
+            procgov,
+            tier2_enabled,
+            guard,
+            def_key_to_process_id,
             backlog_cap_floor,
             backlog_cap_ceiling,
+            recovery_backlog_cap,
             effective_backlog_cap,
             backlog_shed_cap,
             runnable_backlog,
@@ -1574,6 +1692,12 @@ fn spawn_adaptive_pruner(store: Arc<ReadStore>, high_bytes: u64) {
                     Ok(_) => {}
                     Err(e) => tracing::warn!("adaptive retention prune failed: {e}"),
                 }
+                // Size-gated WAL checkpoint on the pruner thread, every wake and
+                // independent of whether we pruned: concentrates all checkpoint
+                // copy-back into infrequent coalesced passes (off the exporter's
+                // hot path) instead of a per-delete-sweep TRUNCATE storm, and keeps
+                // the WAL bounded even while the store sits under budget.
+                store.maybe_checkpoint_wal(&conn);
             }
         })
         .expect("spawn read-model pruner thread");
@@ -1867,6 +1991,30 @@ fn handoff_catchup_stall_from_env() -> std::time::Duration {
     std::time::Duration::from_millis(ms)
 }
 
+/// Absolute HARD cap on a hand-off catch-up, past which the attempt aborts even
+/// while a snapshot install is actively transferring. The [soft ceiling]
+/// ([`HANDOFF_CATCHUP_CEILING_DEFAULT_MS`]) is the *normal* budget; when a
+/// snapshot install is still streaming bytes at the soft ceiling
+/// ([`RaftPartition::snapshot_bytes_sent`](crate::raft::RaftPartition::snapshot_bytes_sent)
+/// advancing), the deadline EXTENDS up to this hard cap instead of guillotining a
+/// large-but-progressing install — the snapshot-transfer-aware adaptive deadline
+/// (ADR 0019). Bounds a pathologically slow/huge transfer so it can't hold the
+/// completion write-pause forever. Default 6× the soft ceiling; must be `>=` it.
+/// Overridable via `NANOBPMN_HANDOFF_CATCHUP_MAX_MS`.
+const HANDOFF_CATCHUP_MAX_DEFAULT_MS: u64 = 180000;
+
+/// Resolve the hand-off catch-up absolute hard cap from
+/// `NANOBPMN_HANDOFF_CATCHUP_MAX_MS`, clamped to at least the soft ceiling so the
+/// extension window is never negative.
+fn handoff_catchup_max_from_env(ceiling: std::time::Duration) -> std::time::Duration {
+    let ms = std::env::var("NANOBPMN_HANDOFF_CATCHUP_MAX_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&ms| ms > 0)
+        .unwrap_or(HANDOFF_CATCHUP_MAX_DEFAULT_MS);
+    std::time::Duration::from_millis(ms).max(ceiling)
+}
+
 /// One decision of the hand-off catch-up loop, computed by the pure
 /// [`evaluate_catchup`] from the learner's current replication signals.
 #[derive(Debug, PartialEq, Eq)]
@@ -1886,20 +2034,30 @@ enum CatchupStep {
 /// - `lag`: current replication lag in entries (`None` = no record / a snapshot
 ///   install still in flight); at/under `threshold` ⇒ [`CatchupStep::Done`].
 /// - `matched`: the learner's matched index (`None` until an install lands). Each
-///   time it advances past `best_matched`, `last_advance` is reset to `now` — so
-///   a steadily-draining tail keeps the attempt alive even under a moving head.
-/// - Aborts EARLY (`"learner stalled"`) only once matching has begun
-///   (`best_matched.is_some()`) and then goes quiet for `stall_grace`, so a
-///   long-but-progressing snapshot install (matched still `None`) is never
-///   killed prematurely — it is bounded only by the absolute `deadline`.
+///   time it advances past `best_matched`, `last_advance` is reset to `now`.
+/// - `snapshot_bytes`: cumulative bytes streamed to the learner during an
+///   `InstallSnapshot` (`None` = no install started). This is the signal that a
+///   large install is *actively transferring* even while `matched` is still
+///   `None` — each time it advances past `best_bytes`, `last_advance` resets too.
+/// - Aborts EARLY (`"learner stalled"`) only once progress has begun (matching
+///   started OR bytes flowing) and then goes quiet for `stall_grace`, so a
+///   healthy-but-slow install is never killed prematurely.
+/// - `soft_deadline` is the normal budget. Past it the attempt CONTINUES only
+///   while a snapshot install is actively streaming (bytes advanced within
+///   `stall_grace`) — the snapshot-transfer-aware extension — bounded by the
+///   absolute `hard_deadline`. A plain log-tail catch-up (no install bytes) still
+///   aborts at the soft deadline; every attempt aborts at the hard deadline.
 #[allow(clippy::too_many_arguments)]
 fn evaluate_catchup(
     lag: Option<u64>,
     matched: Option<u64>,
+    snapshot_bytes: Option<u64>,
     best_matched: &mut Option<u64>,
+    best_bytes: &mut u64,
     last_advance: &mut std::time::Instant,
     now: std::time::Instant,
-    deadline: std::time::Instant,
+    soft_deadline: std::time::Instant,
+    hard_deadline: std::time::Instant,
     threshold: u64,
     stall_grace: std::time::Duration,
 ) -> CatchupStep {
@@ -1908,19 +2066,74 @@ fn evaluate_catchup(
     {
         return CatchupStep::Done;
     }
+    // Any forward progress — a growing matched index (tail streaming) or a growing
+    // snapshot byte count (install streaming) — resets the stall clock.
     if let Some(m) = matched
         && best_matched.map(|b| m > b).unwrap_or(true)
     {
         *best_matched = Some(m);
         *last_advance = now;
     }
-    if now >= deadline {
+    if let Some(b) = snapshot_bytes
+        && b > *best_bytes
+    {
+        *best_bytes = b;
+        *last_advance = now;
+    }
+    // Absolute hard cap: never extend past this, even mid-transfer, so a
+    // pathological install can't pin the completion write-pause forever.
+    if now >= hard_deadline {
         return CatchupStep::Abort("learner catch-up ceiling exceeded");
     }
-    if best_matched.is_some() && now.duration_since(*last_advance) >= stall_grace {
+    // Genuine stall: progress had begun (matched or bytes) then went quiet.
+    let progress_began = best_matched.is_some() || *best_bytes > 0;
+    if progress_began && now.duration_since(*last_advance) >= stall_grace {
         return CatchupStep::Abort("learner catch-up stalled");
     }
+    // Soft ceiling: past the normal budget, keep going ONLY while a snapshot
+    // install is actively streaming (bytes advanced within the stall grace);
+    // otherwise abort. This is the snapshot-transfer-aware extension.
+    if now >= soft_deadline {
+        let streaming = *best_bytes > 0 && now.duration_since(*last_advance) < stall_grace;
+        if !streaming {
+            return CatchupStep::Abort("learner catch-up ceiling exceeded");
+        }
+    }
     CatchupStep::Continue
+}
+
+/// Pure catch-up-hold decision for the recovery admission throttle. Given this
+/// tick's per-`(partition, peer)` `(lag, progress)` observations
+/// ([`ServerImpl::catchup_feed_observations`]), the running best-progress map,
+/// the (window-derived) lag `threshold` and the `stall_grace`, this updates the
+/// map in place and reports whether any peer is in an *advancing* bulk catch-up
+/// (lag ≥ `threshold` AND its progress scalar advanced within `stall_grace`),
+/// plus the max qualifying lag (for logging). A peer whose progress has gone
+/// quiet past the grace is treated as stalled/dead and ignored, so a wedged
+/// async learner can't pin the throttle. Clock is injected (`now`) so the
+/// stall/advance logic is deterministically unit-testable.
+fn catchup_hold_active(
+    observations: &[((u64, u64), u64, u128)],
+    progress: &mut std::collections::HashMap<(u64, u64), (u128, std::time::Instant)>,
+    threshold: u64,
+    stall_grace: std::time::Duration,
+    now: std::time::Instant,
+) -> (bool, u64) {
+    let mut active = false;
+    let mut max_lag = 0u64;
+    for &(key, lag, prog) in observations {
+        let slot = progress.entry(key).or_insert((prog, now));
+        if prog > slot.0 {
+            slot.0 = prog;
+            slot.1 = now;
+        }
+        let advancing = now.duration_since(slot.1) < stall_grace;
+        if lag >= threshold && advancing {
+            active = true;
+            max_lag = max_lag.max(lag);
+        }
+    }
+    (active, max_lag)
 }
 
 /// Poll interval for the incumbent's learner-lag catch-up loop.
@@ -2015,18 +2228,6 @@ enum AdmissionBacklog {
     /// Self-optimizing: a latency-driven governor tunes the cap between `floor`
     /// (≈ the throughput knee) and `ceiling` (the memory-derived backstop).
     Auto { floor: usize, ceiling: usize },
-}
-
-/// Live state of the auto-mode active-backlog governor, kept on the [`Server`] so
-/// the monitor and the shed message can explain *why* the cap sits where it does.
-/// `floor`/`ceiling` are the static AIMD bounds; `obs` is the read side of the
-/// governor's self-calibrated latency baseline and last-window mean latency, which
-/// the engine thread republishes each window.
-#[derive(Clone)]
-struct BacklogGovernor {
-    floor: usize,
-    ceiling: usize,
-    obs: GovernorObs,
 }
 
 /// Resolves the active-backlog admission policy from `NANOBPMN_ADMISSION_MAX_BACKLOG`.
@@ -2919,6 +3120,114 @@ fn cold_spill_from_env() -> Option<(u64, u64)> {
     Some((high, low))
 }
 
+/// Chooses the surviving successor for a leaderless partition, given the
+/// partition's ordered replica set (`replicas`, owner first), a parallel
+/// `reachable` mask, the cluster `num_nodes`, and the partition id `p`.
+///
+/// Rules:
+/// - A reachable owner (replica-set head) is always the successor — a live owner
+///   re-assumes leadership; it is never displaced.
+/// - When the owner is down, the orphaned partition is assigned by round-robin
+///   across the *reachable* remaining replicas, keyed by the partition's index
+///   within its owner's set (`p / num_nodes`), so a dead owner's partitions fan
+///   out evenly over the survivors instead of all landing on the first reachable
+///   one (which would leave one survivor carrying the entire failover load).
+/// - Returns `None` if no replica is reachable.
+///
+/// Pure and deterministic: `replicas`, `reachable`, and `num_nodes` are identical
+/// on every node, so all survivors independently agree on the same successor with
+/// no coordination — at most one node promotes.
+fn pick_successor(replicas: &[u32], reachable: &[bool], num_nodes: u32, p: u64) -> Option<u32> {
+    // A reachable owner (replica-set head) always re-assumes leadership.
+    if let (Some(&owner), Some(&true)) = (replicas.first(), reachable.first()) {
+        return Some(owner);
+    }
+    // Owner down (or absent): reachable remaining replicas, in replica order.
+    let candidates: Vec<u32> = replicas
+        .iter()
+        .zip(reachable.iter())
+        .skip(1)
+        .filter_map(|(&n, &up)| up.then_some(n))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let part_index = (p / num_nodes.max(1) as u64) as usize;
+    Some(candidates[part_index % candidates.len()])
+}
+
+#[cfg(test)]
+mod successor_balance_tests {
+    use super::pick_successor;
+
+    /// RF3, 3 nodes. Owner is node `p % 3`; replica order is
+    /// `[owner, owner+1, owner+2]`. When node 2 (owner of 2,5,8,11) dies, its
+    /// four orphaned partitions must fan out 2/2 across the two survivors —
+    /// NOT all land on node 0 (the old first-reachable behaviour).
+    #[test]
+    fn dead_owner_partitions_split_evenly_across_survivors() {
+        let num_nodes = 3;
+        // node 2 down, nodes 0 and 1 up.
+        let assign = |p: u64| {
+            let owner = (p % 3) as u32;
+            let replicas: Vec<u32> = (0..3).map(|i| (owner + i) % 3).collect();
+            let reachable: Vec<bool> = replicas.iter().map(|&n| n != 2).collect();
+            pick_successor(&replicas, &reachable, num_nodes, p)
+        };
+        let mut counts = [0usize; 3];
+        for p in [2u64, 5, 8, 11] {
+            let s = assign(p).expect("a survivor is reachable");
+            assert_ne!(s, 2, "never promote the dead owner");
+            counts[s as usize] += 1;
+        }
+        assert_eq!(counts[0], 2, "node0 should inherit 2 of node2's partitions");
+        assert_eq!(counts[1], 2, "node1 should inherit 2 of node2's partitions");
+    }
+
+    /// A reachable owner is always the successor — a live head is never displaced.
+    #[test]
+    fn reachable_owner_is_never_displaced() {
+        let replicas = [2u32, 0, 1];
+        let reachable = [true, true, true];
+        assert_eq!(pick_successor(&replicas, &reachable, 3, 8), Some(2));
+    }
+
+    /// All survivors compute the same successor for a given partition (agreement),
+    /// so at most one node promotes.
+    #[test]
+    fn all_survivors_agree_on_the_successor() {
+        // Owner (node2) down; nodes 0 and 1 evaluate the same inputs.
+        let replicas = [2u32, 0, 1];
+        let reachable = [false, true, true];
+        for p in [2u64, 5, 8, 11] {
+            let pick = pick_successor(&replicas, &reachable, 3, p);
+            // Deterministic function of shared inputs → identical on every node.
+            assert_eq!(pick, pick_successor(&replicas, &reachable, 3, p));
+            assert!(matches!(pick, Some(0) | Some(1)));
+        }
+    }
+
+    /// With only one survivor reachable, it inherits everything (no even split
+    /// possible) but the dead owner is still never chosen.
+    #[test]
+    fn single_survivor_inherits_all() {
+        let replicas = [2u32, 0, 1];
+        // Only node 1 up.
+        let reachable = [false, false, true];
+        for p in [2u64, 5, 8, 11] {
+            assert_eq!(pick_successor(&replicas, &reachable, 3, p), Some(1));
+        }
+    }
+
+    /// No reachable replica → no successor.
+    #[test]
+    fn no_reachable_replica_yields_none() {
+        let replicas = [2u32, 0, 1];
+        let reachable = [false, false, false];
+        assert_eq!(pick_successor(&replicas, &reachable, 3, 5), None);
+    }
+}
+
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
@@ -3040,6 +3349,27 @@ impl ServerImpl {
                 b,
             ) => (None, Some(b.process_definition_key.0.clone())),
         };
+
+        // ADR-0020 Tier-1: shed if the engine's shared write path (raft-log fsync)
+        // is saturated — the global bottleneck that hits every definition at once,
+        // which per-definition Tier-2 cannot see. Checked first (cheaper, global).
+        if let Some(message) = self.tier1_should_shed() {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                message,
+            )));
+        }
+        // ADR-0020 Tier-2: shed this definition's create if it is accumulating
+        // in-flight backlog past its end-to-end latency budget (latency mode only),
+        // leaving healthy siblings — even ones sharing a job type — fully admitted.
+        if let Some(message) = self.tier2_should_shed(by_id.as_deref(), by_key.as_deref()) {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                message,
+            )));
+        }
 
         // Under Raft (RF>=2) the create must be REPLICATED through a partition's
         // Raft log and placed by *leadership*, not statically-owned round-robin:
@@ -3558,6 +3888,7 @@ impl ServerImpl {
                 // Completing a job may advance the token into an off-partition
                 // message catch: route the resulting subscription open/correlate.
                 self.spawn_routing_if_needed(&events);
+                self.observe_job_sojourn(&events, now_millis());
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
                 self.signal_jobs_available();
@@ -5410,6 +5741,16 @@ impl ServerImpl {
             && let Some(reason) = self.create_should_shed()
         {
             return Err((503, format!("{PLACEMENT_SHED_MARKER} {reason}")));
+        }
+        // ADR-0020 Tier-1: a forwarded create is still subject to the owner node's
+        // global engine-saturation guard (the shared write path is this node's).
+        if let Some(message) = self.tier1_should_shed() {
+            return Err((503, message));
+        }
+        // ADR-0020 Tier-2: a forwarded create is still subject to the target
+        // definition's per-definition latency budget on the owner node.
+        if let Some(message) = self.tier2_should_shed(by_id.as_deref(), by_key.as_deref()) {
+            return Err((503, message));
         }
         let tags_for_response = tags.clone();
         let business_id_for_response = business_id.clone();
@@ -7843,8 +8184,110 @@ impl ServerImpl {
                 server
                     .leader_durable_recovery_tick(grace_ticks, &mut state)
                     .await;
+                // Engage/clear the Raft-log fsync-relief window from the live
+                // leadership picture: while this node carries a down peer's
+                // partitions (or is catching its own back up) it runs ~double its
+                // steady Raft load on one disk, so coalescing its `sync`-mode
+                // fsyncs for the window keeps the shared disk from saturating and
+                // turning commits (and the completion-paced admission servo)
+                // bursty. Reverts to strict per-round fsync the moment recovery
+                // clears. A no-op under `async` durability or when the feature is
+                // disabled.
+                crate::raft_logstore::set_recovery_fsync_relief(
+                    server.recovery_fsync_load_active(),
+                );
             }
         });
+    }
+
+    /// True when this node carries recovery Raft load worth relieving `fsync` for:
+    /// it leads a partition it does not statically own (a failover incumbent
+    /// covering a down peer), or it owns a partition currently led by a peer (a
+    /// returning owner catching back up). In both cases the node runs roughly
+    /// double its steady Raft load on one shared disk. Cheap: borrows each hosted
+    /// group's metrics watch. Mirrors the console recovery indicator's signal.
+    fn recovery_fsync_load_active(&self) -> bool {
+        if !raft_enabled() {
+            return false;
+        }
+        let topology = self.engine.topology();
+        let me = topology.node_id;
+        if topology.num_nodes() <= 1 {
+            return false;
+        }
+        for p in 0..topology.num_partitions {
+            let owner = topology.owner_of(p);
+            let leader = self
+                .raft_registry()
+                .get(p)
+                .and_then(|part| part.raft.metrics().borrow().current_leader);
+            match leader {
+                // We lead a partition we don't own: a failover incumbent.
+                Some(l) if l as u32 == me && owner != me => return true,
+                // We own it but a peer leads it: a returning owner catching up.
+                // (Leaderless — cold-start formation — does not count.)
+                Some(l) if l as u32 != me && owner == me => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Per-`(partition, peer)` catch-up feed observations for every partition
+    /// this node currently **leads**: the replication `lag` (entries the peer is
+    /// behind the log head) and a monotone `progress` scalar (matched index +
+    /// cumulative snapshot bytes) the caller diffs across ticks to distinguish an
+    /// *advancing* catch-up from a *stalled/dead* peer. Empty when Raft is
+    /// disabled or this is a single node.
+    ///
+    /// This is the signal that closes the post-hand-off oscillation gap:
+    /// [`recovery_fsync_load_active`](Self::recovery_fsync_load_active) keys only
+    /// on leadership *displacement*, so it clears the instant a rejoined peer
+    /// reclaims its partitions — but that peer is then a badly-lagging learner,
+    /// and streaming its retained-log backlog keeps THIS leader's Raft disk
+    /// saturated well past the displacement window. The recovery admission
+    /// throttle folds these observations in so it stays engaged through the
+    /// catch-up (peer lag above a window-derived threshold while still
+    /// advancing), then releases once the peer is caught up.
+    fn catchup_feed_observations(&self) -> Vec<((u64, u64), u64, u128)> {
+        let mut out = Vec::new();
+        if !raft_enabled() {
+            return out;
+        }
+        let topology = self.engine.topology();
+        if topology.num_nodes() <= 1 {
+            return out;
+        }
+        for p in 0..topology.num_partitions {
+            let Some(part) = self.raft_registry().get(p) else {
+                continue;
+            };
+            // Snapshot the leader's per-target matched indices, dropping the
+            // metrics borrow before touching the snapshot-progress map.
+            let (last, targets): (u64, Vec<(u64, u64)>) = {
+                let metrics = part.raft.metrics();
+                let m = metrics.borrow();
+                if m.state != openraft::ServerState::Leader {
+                    continue;
+                }
+                let last = m.last_log_index.unwrap_or(0);
+                let targets = match m.replication.as_ref() {
+                    Some(map) => map
+                        .iter()
+                        .map(|(n, l)| (*n, l.as_ref().map(|id| id.index).unwrap_or(0)))
+                        .collect(),
+                    None => Vec::new(),
+                };
+                (last, targets)
+            };
+            for (node, matched) in targets {
+                let lag = last.saturating_sub(matched);
+                let bytes = part.snapshot_bytes_sent(node).unwrap_or(0);
+                let progress = matched as u128 + bytes as u128;
+                out.push(((p, node), lag, progress));
+            }
+        }
+        out
     }
 
     /// One pass of the leader-durable recovery supervisor. For every partition this
@@ -8039,19 +8482,18 @@ impl ServerImpl {
         matches!(self.peers.link(node).await, Ok(link) if link.is_connected())
     }
 
-    /// The deterministic surviving successor for partition `p`: the first node in
-    /// `replicas_of(p)` order (leader first) that is currently reachable. Because
-    /// the replica order is identical on every node, all survivors independently
-    /// agree on the same successor with no coordination — so at most one node
-    /// promotes. Returns `None` if no replica is reachable (this node included,
-    /// which cannot happen since `self` is always reachable to itself).
+    /// The deterministic surviving successor for partition `p`: probes each
+    /// replica's reachability, then delegates the (pure) choice to
+    /// [`pick_successor`]. Returns `None` if no replica is reachable (impossible
+    /// in practice: `self` is always reachable to itself).
     async fn designated_successor(&self, p: u64) -> Option<u32> {
-        for n in self.engine.topology().replicas_of(p) {
-            if self.peer_reachable(n).await {
-                return Some(n);
-            }
+        let topo = self.engine.topology();
+        let replicas = topo.replicas_of(p);
+        let mut reachable = Vec::with_capacity(replicas.len());
+        for &n in &replicas {
+            reachable.push(self.peer_reachable(n).await);
         }
-        None
+        pick_successor(&replicas, &reachable, topo.num_nodes(), p)
     }
 
     /// Reserves the next promotion epoch for partition `p` (current max + 1) and
@@ -8328,32 +8770,51 @@ impl ServerImpl {
         if let Err(e) = part.add_learner(requester_node, node).await {
             return Err((false, format!("add_learner: {e}")));
         }
-        // Poll the learner toward zero lag with an ADAPTIVE deadline: succeed the
-        // instant it reaches HANDOFF_LAG_THRESHOLD, keep going while it is still
-        // installing/streaming (making progress), and abort only on a genuine
-        // stall or the absolute ceiling (see [`evaluate_catchup`]). The write-gate
-        // keeps new creates off this partition and the completion write-pause (ADR
-        // 0019, clamped >= the ceiling) holds off job-mutation writes for the whole
-        // attempt, so the log head stays frozen and a from-empty snapshot install
-        // can land and its tail drain — without a blind fixed cutoff guillotining a
-        // progressing learner and re-triggering the install forever.
-        let deadline = std::time::Instant::now() + self.handoff_catchup_ceiling();
+        // Poll the learner toward zero lag with an ADAPTIVE, snapshot-transfer-aware
+        // deadline: succeed the instant it reaches HANDOFF_LAG_THRESHOLD; keep going
+        // while it is still installing/streaming (matched OR snapshot bytes making
+        // progress); abort on a genuine stall or the absolute hard cap (see
+        // [`evaluate_catchup`]). The soft ceiling is the normal budget; while a
+        // snapshot install is actively transferring at the soft ceiling we EXTEND
+        // (up to the hard cap) rather than guillotine a large-but-progressing
+        // install — and extend the completion write-pause in lockstep so the log
+        // head stays frozen for the whole extended install (else the snapshot point
+        // moves and the learner re-snapshots forever). The write-gate keeps new
+        // creates off this partition throughout.
+        let soft_deadline = std::time::Instant::now() + self.handoff_catchup_ceiling();
+        let hard_deadline = std::time::Instant::now()
+            + handoff_catchup_max_from_env(self.handoff_catchup_ceiling());
         let stall_grace = handoff_catchup_stall_from_env();
         let mut best_matched: Option<u64> = None;
+        let mut best_bytes: u64 = 0;
         let mut last_advance = std::time::Instant::now();
+        let mut pause_extended = false;
         loop {
             if !self.i_lead_raft(partition) {
                 return Err((false, "lost leadership during catch-up".to_string()));
             }
             let lag = part.replication_lag(requester_node);
             let matched = part.learner_matched(requester_node);
+            let snapshot_bytes = part.snapshot_bytes_sent(requester_node);
+            let now = std::time::Instant::now();
+            // Once we cross the soft ceiling while an install is still streaming,
+            // the catch-up may run up to the hard cap — so extend the completion
+            // write-pause to cover it (idempotent), keeping the log head frozen for
+            // the whole extended install so the snapshot point can't move.
+            if !pause_extended && now >= soft_deadline && snapshot_bytes.is_some() {
+                self.extend_handoff_pause(partition, hard_deadline);
+                pause_extended = true;
+            }
             match evaluate_catchup(
                 lag,
                 matched,
+                snapshot_bytes,
                 &mut best_matched,
+                &mut best_bytes,
                 &mut last_advance,
-                std::time::Instant::now(),
-                deadline,
+                now,
+                soft_deadline,
+                hard_deadline,
                 HANDOFF_LAG_THRESHOLD,
                 stall_grace,
             ) {
@@ -8515,6 +8976,22 @@ impl ServerImpl {
         }
         gated.insert(partition, deadline);
         true
+    }
+
+    /// Extend the completion write-pause for `partition` to at least `until`, so
+    /// the log head stays frozen while a snapshot-transfer-aware catch-up runs past
+    /// the soft ceiling (up to the hard cap). Idempotent and monotonic — only ever
+    /// pushes the pause deadline later, never earlier, and is a no-op if the lease
+    /// was released or the pause is disabled (no entry present). Without this a
+    /// hand-off that extends its catch-up would outlive its write-pause, the head
+    /// would move mid-install, and the learner would re-snapshot forever.
+    fn extend_handoff_pause(&self, partition: u64, until: std::time::Instant) {
+        let mut gated = self.handoff_gated.lock().unwrap();
+        if let Some(deadline) = gated.get_mut(&partition)
+            && until > *deadline
+        {
+            *deadline = until;
+        }
     }
 
     /// Test hook: set the completion write-pause ceiling to a short, deterministic
@@ -9658,6 +10135,19 @@ impl ServerImpl {
         by_key: Option<String>,
         variables: std::collections::HashMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        // ADR-0020 Tier-1: shed if the engine's shared write path (raft-log fsync)
+        // is saturated — the global bottleneck that hits every definition at once.
+        // Checked first (cheaper, global) before any engine/Raft work.
+        if let Some(message) = self.tier1_should_shed() {
+            return Err((503, message));
+        }
+        // ADR-0020 Tier-2: shed this definition's create if it is accumulating
+        // in-flight backlog past its latency budget (latency mode only). Checked
+        // first so an over-budget definition is rejected before any engine/Raft
+        // work, while healthy siblings pass straight through.
+        if let Some(message) = self.tier2_should_shed(by_id.as_deref(), by_key.as_deref()) {
+            return Err((503, message));
+        }
         // Per-partition Raft (experimental): when this node hosts Raft groups
         // (populated only by the env-gated `raft_bootstrap`), the create is
         // replicated through the partition leader's log instead of applied
@@ -10425,6 +10915,7 @@ impl ServerImpl {
             return Err((status, message));
         }
         self.spawn_routing_if_needed(&response.events);
+        self.observe_job_sojourn(&response.events, now_millis());
         Ok(Commit::ready())
     }
 
@@ -10464,6 +10955,7 @@ impl ServerImpl {
             .await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
+            self.observe_job_sojourn(events, now_millis());
         }
         Self::map_job_outcome(result)
     }
@@ -10590,7 +11082,35 @@ impl ServerImpl {
         self.drain_guard.note_completion();
     }
 
-    /// Handle to the drain-stall guard (the monitor supervisor drives it; the
+    /// Observe every `JobCompleted` in `events` into the per-`job_type` end-to-end
+    /// sojourn SLA histogram: `completed_at − created_at` (both wall-clock ms, the
+    /// `now` injected into the engine at create and complete), in seconds. This is
+    /// the user-facing SLA/SLI reporting surface, **not** a control input — sojourn
+    /// is dominated by external/worker service time, so it must never throttle
+    /// admission (that is the internal-command-latency compressor's job). Per job
+    /// type so an operator can localize a slow downstream to a specific process/job
+    /// type (its sojourn stretches while the engine's internal command latency stays
+    /// flat). Called at each completion site that has the emitted events in scope
+    /// (REST + both stream paths); completions with no `created_at` (jobs created
+    /// before the engine carried the field, `0`) are skipped. Hot-path cheap: a
+    /// slice scan + a histogram observe per completion.
+    #[inline]
+    pub(crate) fn observe_job_sojourn(&self, events: &[Event], now_ms: u64) {
+        for ev in events {
+            if let Event::JobCompleted {
+                created_at,
+                job_type,
+                ..
+            } = ev
+                && *created_at > 0
+                && now_ms >= *created_at
+            {
+                let seconds = (now_ms - *created_at) as f64 / 1_000.0;
+                crate::metrics::observe_job_sojourn(job_type, seconds);
+            }
+        }
+    }
+
     /// admission gates read it).
     pub(crate) fn drain_guard(&self) -> &Arc<crate::drain_guard::DrainGuard> {
         &self.drain_guard
@@ -10660,12 +11180,19 @@ impl ServerImpl {
     /// Both are `0` (disabled) when the backlog cap is off, leaving the servo on its
     /// absolute band and the shed following the raw governor cap.
     fn refresh_effective_backlog_cap(&self, active_backlog: i64) -> usize {
+        // The recovery throttle's cap (0 = no clamp) is honoured in *both* SLA modes
+        // and even when the general backlog cap is off — it is a recovery liveness
+        // rail, not a latency policy.
+        let recovery_cap = self.recovery_backlog_cap.load(Ordering::Relaxed);
         let ceiling = self.backlog_cap_ceiling;
         if ceiling == 0 {
-            // Backlog cap disabled (Off): no unified setpoint, no count-based shed.
-            self.effective_backlog_cap.store(0, Ordering::Relaxed);
+            // General backlog cap disabled (Off): no latency/memory setpoint. Still
+            // honour a live recovery clamp so intake is paced while the failover disk
+            // saturates; the drain servo bands against the published setpoint.
+            self.effective_backlog_cap
+                .store(recovery_cap, Ordering::Relaxed);
             self.backlog_shed_cap.store(0, Ordering::Relaxed);
-            return 0;
+            return recovery_cap;
         }
         let latency_cap = self.backlog_cap.load(Ordering::Relaxed);
         let latency_component = if self.sla_mode.get().sheds_for_latency() && latency_cap > 0 {
@@ -10681,10 +11208,19 @@ impl ServerImpl {
         } else {
             usize::MAX
         };
-        // Servo setpoint: latency ∧ memory. Shed backstop: memory only (sits above
-        // the servo's operating band so it cannot collide with the credit servo).
+        // Recovery clamp joins the setpoint min (below `ceiling`, above `floor`). A
+        // `0` recovery cap means no clamp (treated as unbounded here).
+        let recovery_component = if recovery_cap > 0 {
+            recovery_cap
+        } else {
+            usize::MAX
+        };
+        // Servo setpoint: latency ∧ memory ∧ recovery. Shed backstop: memory only
+        // (sits above the servo's operating band so it cannot collide with the
+        // credit servo).
         let eff = latency_component
             .min(memory_cap)
+            .min(recovery_component)
             .clamp(self.backlog_cap_floor, ceiling);
         let shed = memory_cap.clamp(self.backlog_cap_floor, ceiling);
         self.effective_backlog_cap.store(eff, Ordering::Relaxed);
@@ -10710,11 +11246,11 @@ impl ServerImpl {
     /// Trailing sentence for an active-backlog / create-backlog shed message that
     /// explains *why* the cap is what it is — so an operator isn't left staring at
     /// a shed threshold they never configured. In `Auto` mode the cap is the live
-    /// output of the AIMD latency governor, so we name it as auto-tuned, give its
-    /// floor/ceiling bounds, and (once a window has folded) report the baseline vs
-    /// current per-command latency and the congestion threshold that drove the
-    /// last backoff. In `Fixed`/`Off` mode the cap is a plain operator setting, so
-    /// we just point at the tuning lever.
+    /// output of the actor-saturation **compressor**, so we name it as auto-tuned,
+    /// give its floor/ceiling bounds, and report the current engine-actor saturation
+    /// ρ vs its target plus the backlog trend that drove the last adjustment. In
+    /// `Fixed`/`Off` mode the cap is a plain operator setting, so we just point at
+    /// the tuning lever.
     fn backlog_cap_explainer(&self) -> String {
         let Some(gov) = &self.backlog_gov else {
             return " This is a fixed cap (NANOBPMN_ADMISSION_MAX_BACKLOG); \
@@ -10722,24 +11258,20 @@ impl ServerImpl {
                     instead of shedding. Retry after a backoff."
                 .to_string();
         };
-        let baseline = gov.obs.baseline_us.load(Ordering::Relaxed);
-        let window = gov.obs.window_avg_us.load(Ordering::Relaxed);
+        let rho = gov.obs().rho_permille.load(Ordering::Relaxed);
+        let target = gov.obs().rho_target_permille.load(Ordering::Relaxed);
+        let growth = gov.obs().growth_per_s.load(Ordering::Relaxed);
         let bounds = format!(
-            " This cap is auto-tuned by the latency governor (floor {}, ceiling {} \
-             runnable jobs) to hold per-command latency near its baseline",
-            gov.floor, gov.ceiling
+            " This cap is auto-tuned by the actor-saturation compressor (floor {}, \
+             ceiling {} runnable jobs); it clamps intake when the engine actor is \
+             saturated (ρ {:.2} vs target {:.2}) AND the backlog is rising ({growth:+}/s)",
+            gov.floor(),
+            gov.ceiling(),
+            rho as f64 / 1000.0,
+            target as f64 / 1000.0,
         );
-        let latency = if baseline > 0 {
-            let threshold = (baseline as f64 * CONGESTION_RATIO) as u64;
-            format!(
-                "; it backed the cap off because window latency {window}µs vs \
-                 baseline {baseline}µs neared the {threshold}µs congestion threshold."
-            )
-        } else {
-            ".".to_string()
-        };
         format!(
-            "{bounds}{latency} Retry after a backoff, set NANOBPMN_ADMISSION_MAX_BACKLOG \
+            "{bounds}. Retry after a backoff, set NANOBPMN_ADMISSION_MAX_BACKLOG \
              for a fixed cap, or NANOBPMN_SLA_MODE=admission to accept latency instead \
              of shedding."
         )
@@ -10914,6 +11446,73 @@ impl ServerImpl {
             return Some("Backpressure: create-processing concurrency at capacity.".to_string());
         }
         self.admission_shed()
+    }
+
+    /// ADR-0020 **Tier-2** per-process-definition admission gate. Given a create's
+    /// `processDefinitionId` and/or `processDefinitionKey`, resolve the BPMN
+    /// `process_id` the Tier-2 compressors key on and, if that definition's
+    /// in-flight backlog is accumulating past its Little's-law latency band, shed a
+    /// paced fraction of its creates — leaving healthy sibling definitions (even
+    /// ones sharing a congested job type) fully admitted.
+    ///
+    /// Actuates only when [`tier2_enabled`](Self::tier2_enabled) **and** the node
+    /// is in [`SlaMode::Latency`] (the latency-preservation policy). Cheap on the
+    /// hot path: a direct id, or a single lock-free-ish map lookup for the key
+    /// (the monitor keeps [`def_key_to_process_id`](Self::def_key_to_process_id)
+    /// warm), then one brief mutex on the pressure map. Unknown definitions and
+    /// zero-pressure definitions (the common case) never shed.
+    pub(crate) fn tier2_should_shed(
+        &self,
+        by_id: Option<&str>,
+        by_key: Option<&str>,
+    ) -> Option<String> {
+        if !self.tier2_enabled || !self.sla_mode.get().sheds_for_latency() {
+            return None;
+        }
+        let process_id = match by_id {
+            Some(id) => id.to_string(),
+            None => {
+                let key = by_key?;
+                self.def_key_to_process_id
+                    .lock()
+                    .unwrap()
+                    .get(key)
+                    .cloned()?
+            }
+        };
+        if self.procgov.should_shed(&process_id) {
+            crate::metrics::record_admission_shed("tier2_process");
+            return Some(format!(
+                "Admission control (ADR-0020 Tier-2): process definition '{process_id}' is \
+                 accumulating in-flight backlog beyond its end-to-end latency budget. Retry \
+                 after a backoff."
+            ));
+        }
+        None
+    }
+
+    /// ADR-0020 **Tier-1** global engine-saturation admission gate. Sheds a paced
+    /// fraction of *all* creates when the engine's shared write path (raft-log
+    /// fsync) is the bottleneck — the class that saturates every definition at
+    /// once, which per-definition Tier-2 cannot see. Actuates only in
+    /// [`SlaMode::Latency`] with the feature enabled (the monitor keeps the guard's
+    /// published pressure at zero otherwise). Cheap on the hot path: a single brief
+    /// mutex on the guard's published pressure; zero-pressure (the common case)
+    /// never sheds.
+    pub(crate) fn tier1_should_shed(&self) -> Option<String> {
+        if !self.sla_mode.get().sheds_for_latency() {
+            return None;
+        }
+        if self.guard.should_shed() {
+            crate::metrics::record_admission_shed("tier1_global");
+            return Some(
+                "Admission control (ADR-0020 Tier-1): the engine's shared write path (raft-log \
+                 fsync) is saturated; intake is throttled to preserve end-to-end latency. Retry \
+                 after a backoff."
+                    .to_string(),
+            );
+        }
+        None
     }
 
     /// The capacity ceilings this node is currently pressed against — the
@@ -13119,6 +13718,29 @@ async fn main() {
             let mut memory_lit = false;
             let mut seen_job_types: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
+            // Compressor state for the backlog governor. ρ (engine-actor saturation)
+            // is aggregated node-level from the actor stats: each tick we diff the
+            // summed `busy_nanos` across all engine handles against the wall time
+            // elapsed and the actor count, giving the busy fraction ρ = Σ Δbusy /
+            // (n_actors · Δwall). Backlog growth is the runnable-backlog delta over
+            // the same wall interval (jobs/s, signed). Seeded on the first tick.
+            let mut prev_busy_nanos_sum: u128 = monitor_server
+                .engine
+                .all()
+                .iter()
+                .map(|h| h.stats().busy_nanos.load(Ordering::Relaxed) as u128)
+                .sum();
+            let mut prev_rho_backlog: i64 =
+                monitor_server.runnable_backlog.load(Ordering::Relaxed) as i64;
+            let mut prev_rho_instant = std::time::Instant::now();
+            // ADR-0020 Tier-2: previous-tick wall clock for the per-definition
+            // compressor step (its own λ_P / dL_P/dt are derived per definition from
+            // the engine snapshot; this only supplies dt).
+            let mut prev_tier2_instant = std::time::Instant::now();
+            // Definitions that had non-zero Tier-2 pressure last tick, so a release
+            // back to zero re-publishes the gauge as 0 instead of leaving it stale.
+            let mut prev_tier2_pressured: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             // Drain-stall guard supervisor state (options 3+4). The state machine
             // owns the edge/hysteresis counters; here we track the deltas it needs:
             // the completion count (rate = drain throughput) and the active backlog
@@ -13132,6 +13754,44 @@ async fn main() {
             let mut prev_drain_instant = std::time::Instant::now();
             let mut drain_meter_lit = false;
             let mut drain_halt_lit = false;
+            // Adaptive recovery admission throttle: paces intake while this node is a
+            // failover incumbent / returning owner with a saturating Raft-log disk,
+            // so the disk stays under its fsync knee without deferring any fsync
+            // (durability-preserving). Driven by the windowed Raft-log fsync latency.
+            let mut recovery_throttle = crate::recovery_throttle::RecoveryThrottle::new(
+                crate::recovery_throttle::RecoveryThrottleCfg::from_env(),
+            );
+            let (mut prev_raft_fsync_sum, mut prev_raft_fsync_count) =
+                crate::metrics::raft_fsync_sum_count();
+            let mut recovery_throttle_engaged = false;
+            // Catch-up hold: keep the recovery throttle engaged while this node is
+            // still feeding a rejoined peer's post-hand-off learner catch-up (which
+            // saturates the Raft disk after leadership displacement has cleared).
+            // The lag threshold is auto-derived from the retained-log window so
+            // operators don't have to guess it: a peer counts as "in bulk catch-up"
+            // once it lags the log head by >5% of that window (floored), or is mid
+            // snapshot install (matched 0 ⇒ lag ≈ head). `NANOBPMN_RECOVERY_CATCHUP_LAG`
+            // overrides the derived value.
+            let catchup_lag_threshold: u64 = {
+                let retain = std::env::var("NANOBPMN_RAFT_LAGGING_RETAIN")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(400_000);
+                let derived = (retain / 20).max(20_000);
+                std::env::var("NANOBPMN_RECOVERY_CATCHUP_LAG")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(derived)
+            };
+            // A lagging peer whose progress scalar (matched + snapshot bytes) has
+            // not advanced for this long is treated as stalled/dead, not catching
+            // up, so a wedged learner can't pin the throttle indefinitely (the
+            // leader-durable model tolerates a lost async learner).
+            let catchup_stall_grace = std::time::Duration::from_secs(5);
+            let mut catchup_progress: std::collections::HashMap<
+                (u64, u64),
+                (u128, std::time::Instant),
+            > = std::collections::HashMap::new();
             loop {
                 interval.tick().await;
 
@@ -13154,19 +13814,23 @@ async fn main() {
                     "backlog",
                     monitor_server.backlog_cap.load(Ordering::Relaxed) as i64,
                 );
-                // In Auto mode, publish the governor's bounds + live latency signal
-                // so a dashboard (and the shed message) can explain where the cap
-                // sits and why it moved there, rather than only the bare cap value.
+                // In Auto mode, publish the governor's bounds + live ρ/backlog-trend
+                // signal so a dashboard (and the shed message) can explain where the
+                // cap sits and why it moved there, rather than only the bare cap value.
                 if let Some(gov) = &monitor_server.backlog_gov {
-                    crate::metrics::set_backlog_governor("floor", gov.floor as i64);
-                    crate::metrics::set_backlog_governor("ceiling", gov.ceiling as i64);
+                    crate::metrics::set_backlog_governor("floor", gov.floor() as i64);
+                    crate::metrics::set_backlog_governor("ceiling", gov.ceiling() as i64);
                     crate::metrics::set_backlog_governor(
-                        "baseline_latency_us",
-                        gov.obs.baseline_us.load(Ordering::Relaxed) as i64,
+                        "rho_permille",
+                        gov.obs().rho_permille.load(Ordering::Relaxed) as i64,
                     );
                     crate::metrics::set_backlog_governor(
-                        "window_latency_us",
-                        gov.obs.window_avg_us.load(Ordering::Relaxed) as i64,
+                        "rho_target_permille",
+                        gov.obs().rho_target_permille.load(Ordering::Relaxed) as i64,
+                    );
+                    crate::metrics::set_backlog_governor(
+                        "growth_per_s",
+                        gov.obs().growth_per_s.load(Ordering::Relaxed),
                     );
                 }
                 crate::metrics::set_admission_limit(
@@ -13199,6 +13863,95 @@ async fn main() {
                 monitor_server
                     .runnable_backlog
                     .store(runnable, Ordering::Relaxed);
+                // Step the standalone backlog compressor once per tick off engine-actor
+                // saturation ρ + the runnable-backlog growth rate — "are we falling
+                // behind AND is it our fault", NOT e2e sojourn (dominated by external
+                // service time) and NOT internal latency vs a learned baseline (which
+                // pins to idle). ρ = Σ Δbusy_nanos across all engine actors / (n_actors
+                // · Δwall): absolute, cold-start-proof, disk+CPU-inclusive, immune to
+                // external strain. Stepped in BOTH SLA modes so ρ/growth stay populated
+                // for monitoring; the cap only actuates admission in latency mode.
+                if let Some(gov) = &monitor_server.backlog_gov {
+                    let handles = monitor_server.engine.all();
+                    let n_actors = handles.len().max(1) as f64;
+                    let busy_sum: u128 = handles
+                        .iter()
+                        .map(|h| h.stats().busy_nanos.load(Ordering::Relaxed) as u128)
+                        .sum();
+                    let now = std::time::Instant::now();
+                    let wall_ns = now.duration_since(prev_rho_instant).as_nanos();
+                    // First tick (or a zero interval) has no interval to divide by —
+                    // seed the baselines and hold the cap.
+                    if wall_ns > 0 {
+                        let d_busy = busy_sum.saturating_sub(prev_busy_nanos_sum) as f64;
+                        let rho = (d_busy / (n_actors * wall_ns as f64)).clamp(0.0, 1.0);
+                        let wall_s = wall_ns as f64 / 1_000_000_000.0;
+                        let growth_per_s = (runnable as i64 - prev_rho_backlog) as f64 / wall_s;
+                        gov.step(rho, growth_per_s);
+                    }
+                    prev_busy_nanos_sum = busy_sum;
+                    prev_rho_backlog = runnable as i64;
+                    prev_rho_instant = now;
+                }
+
+                // ADR-0020 Tier-2: aggregate each BPMN process definition's
+                // in-flight backlog L_P (and cumulative-created, for λ_P) across
+                // this node's partitions, refresh the create-by-key → process_id
+                // index off the same snapshot, then step every per-definition
+                // compressor. One actor round-trip per partition at ~1 Hz (the same
+                // shape as cmd_profile's cardinality read) — cheap and off the hot
+                // path. Stepped in both SLA modes so the per-definition signals stay
+                // populated for monitoring; actuation is gated in `tier2_should_shed`.
+                {
+                    let mut backlog: std::collections::HashMap<String, (u64, u64)> =
+                        std::collections::HashMap::new();
+                    let mut key_index: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    for handle in monitor_server.engine.all() {
+                        let (per_proc, defs) = handle
+                            .with(|journal| {
+                                let engine = journal.engine();
+                                let state = engine.state();
+                                // (process_id, key) for the create-by-key resolver.
+                                let defs: Vec<(String, String)> = state
+                                    .processes
+                                    .values()
+                                    .map(|d| (d.definition.id.clone(), d.key.to_string()))
+                                    .collect();
+                                (engine.backlog_by_process(), defs)
+                            })
+                            .await;
+                        for (pid, inflight, created) in per_proc {
+                            let slot = backlog.entry(pid).or_insert((0, 0));
+                            slot.0 += inflight;
+                            slot.1 += created;
+                        }
+                        for (pid, key) in defs {
+                            key_index.insert(key, pid);
+                        }
+                    }
+                    if !key_index.is_empty() {
+                        *monitor_server.def_key_to_process_id.lock().unwrap() = key_index;
+                    }
+                    let now = std::time::Instant::now();
+                    let dt_s = now.duration_since(prev_tier2_instant).as_secs_f64();
+                    prev_tier2_instant = now;
+                    let snapshot: Vec<(String, u64, u64)> = backlog
+                        .into_iter()
+                        .map(|(pid, (l, created))| (pid, l, created))
+                        .collect();
+                    monitor_server.procgov.step(dt_s, &snapshot);
+                    let mut now_pressured: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for (pid, permille) in monitor_server.procgov.pressures() {
+                        crate::metrics::set_tier2_pressure(&pid, permille as i64);
+                        now_pressured.insert(pid);
+                    }
+                    for pid in prev_tier2_pressured.difference(&now_pressured) {
+                        crate::metrics::set_tier2_pressure(pid, 0);
+                    }
+                    prev_tier2_pressured = now_pressured;
+                }
                 let workers = monitor_registry.workers_per_type();
                 let mut current: std::collections::HashSet<String> =
                     std::collections::HashSet::with_capacity(activatable.len() + workers.len());
@@ -13249,9 +14002,86 @@ async fn main() {
                     prev_completions = completions_now;
                     let completes_per_sec = if dt > 0.0 { completed as f64 / dt } else { 0.0 };
                     let backlog = monitor_server.active_backlog();
-                    // Recompute the unified admission setpoint (latency ∧ memory)
-                    // from the live signals, publish it, and band the servo against
-                    // it so intake is paced to the *current* cap in both SLA modes.
+
+                    // Adaptive recovery throttle: fold the windowed Raft-log fsync
+                    // latency (the failover disk-saturation signal) into the AIMD
+                    // controller, gated on whether this node is actually in a recovery
+                    // window, and publish the resulting admission cap (0 = no clamp).
+                    // Recomputed before the setpoint so the min below sees it.
+                    {
+                        let (sum_now, count_now) = crate::metrics::raft_fsync_sum_count();
+                        let d_count = count_now.saturating_sub(prev_raft_fsync_count);
+                        let d_sum = (sum_now - prev_raft_fsync_sum).max(0.0);
+                        prev_raft_fsync_sum = sum_now;
+                        prev_raft_fsync_count = count_now;
+                        // Window-mean fsync latency in µs (0 when no fsyncs this window).
+                        let fsync_avg_us = if d_count > 0 {
+                            d_sum / d_count as f64 * 1_000_000.0
+                        } else {
+                            0.0
+                        };
+                        // ADR-0020 Tier-1: fold the same windowed raft-fsync latency
+                        // into the global engine-saturation guard. It actuates only
+                        // in latency mode; when inactive it releases to zero. Publish
+                        // the resulting shed fraction for observability.
+                        let tier1_active = monitor_server.sla_mode.get().sheds_for_latency();
+                        let tier1_permille = monitor_server.guard.step(fsync_avg_us, tier1_active);
+                        crate::metrics::set_tier1_pressure(tier1_permille as i64);
+                        let displaced = monitor_server.recovery_fsync_load_active();
+                        // Fold in the post-hand-off catch-up hold: stay engaged
+                        // while any led partition is still feeding a peer that lags
+                        // the log head beyond the derived threshold AND is still
+                        // advancing (matched/snapshot-bytes progress within the
+                        // stall grace). A stalled/dead peer is ignored so it can't
+                        // pin the throttle.
+                        let now_ct = std::time::Instant::now();
+                        let observations = monitor_server.catchup_feed_observations();
+                        let (catchup_active, catchup_max_lag) = catchup_hold_active(
+                            &observations,
+                            &mut catchup_progress,
+                            catchup_lag_threshold,
+                            catchup_stall_grace,
+                            now_ct,
+                        );
+                        let recovering = displaced || catchup_active;
+                        let cap = recovery_throttle.observe(fsync_avg_us, recovering);
+                        monitor_server
+                            .recovery_backlog_cap
+                            .store(cap.unwrap_or(0), Ordering::Relaxed);
+                        crate::metrics::set_admission_limit(
+                            "backlog_recovery",
+                            cap.map(|c| c as i64).unwrap_or(0),
+                        );
+                        // Log engagement transitions so the recovery window is legible
+                        // in the ops log alongside the console recovery indicator.
+                        let engaged = recovery_throttle.is_engaged();
+                        if engaged != recovery_throttle_engaged {
+                            recovery_throttle_engaged = engaged;
+                            if engaged {
+                                let cause = if displaced {
+                                    "failover disk load"
+                                } else {
+                                    "peer catch-up disk load"
+                                };
+                                tracing::info!(
+                                    fsync_avg_us,
+                                    cap = cap.unwrap_or(0),
+                                    catchup_max_lag,
+                                    cause,
+                                    "recovery admission throttle engaged"
+                                );
+                            } else {
+                                tracing::info!(
+                                    "recovery admission throttle released (recovery cleared)"
+                                );
+                            }
+                        }
+                    }
+
+                    // Recompute the unified admission setpoint (latency ∧ memory ∧
+                    // recovery) from the live signals, publish it, and band the servo
+                    // against it so intake is paced to the *current* cap in both SLA
+                    // modes.
                     let effective_cap = monitor_server.refresh_effective_backlog_cap(backlog);
                     crate::metrics::set_admission_limit("backlog_effective", effective_cap as i64);
 
@@ -13263,6 +14093,7 @@ async fn main() {
                     });
                     let guard = monitor_server.drain_guard();
                     guard.publish(decision.metering, decision.halted);
+                    guard.set_mint_permille(decision.mint_permille);
                     if !decision.metering {
                         // Below the pressure band: keep the bucket topped up so the
                         // servo never meters healthy load and always engages with a
@@ -13275,6 +14106,7 @@ async fn main() {
                         completes_per_sec,
                         guard.budget(),
                     );
+                    crate::metrics::set_drain_mint_permille(guard.mint_permille());
                     // Log only on state transitions (edge-triggered) so a healthy
                     // server stays quiet and a wedge is a single, greppable event.
                     if decision.halted != drain_halt_lit {
@@ -17867,20 +18699,25 @@ mod clustered_startup_tests {
         let threshold = HANDOFF_LAG_THRESHOLD;
         let stall = Duration::from_millis(8000);
         let t0 = Instant::now();
-        let deadline = t0 + Duration::from_millis(30000);
+        let soft = t0 + Duration::from_millis(30000);
+        let hard = t0 + Duration::from_millis(180000);
 
         // Caught up (lag within threshold) -> Done, regardless of matched.
         {
             let mut best = None;
+            let mut bytes = 0u64;
             let mut adv = t0;
             assert_eq!(
                 evaluate_catchup(
                     Some(threshold),
                     Some(100),
+                    None,
                     &mut best,
+                    &mut bytes,
                     &mut adv,
                     t0,
-                    deadline,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
@@ -17888,25 +18725,110 @@ mod clustered_startup_tests {
             );
         }
 
-        // Snapshot install in flight (matched None, big lag): NOT stalled even far
-        // past the stall grace, because matching has not begun — bounded only by
-        // the absolute ceiling. This is the old-10s-cutoff bug the change fixes.
+        // Snapshot install in flight (matched None, no bytes yet, big lag): NOT
+        // stalled even far past the stall grace, because progress has not begun —
+        // bounded only by the deadlines. The old-10s-cutoff bug the change fixes.
         {
             let mut best = None;
+            let mut bytes = 0u64;
             let mut adv = t0;
             assert_eq!(
                 evaluate_catchup(
                     Some(1_000_000),
                     None,
+                    None,
                     &mut best,
+                    &mut bytes,
                     &mut adv,
                     t0 + Duration::from_millis(20000),
-                    deadline,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
                 CatchupStep::Continue,
-                "a long-but-still-installing learner (matched None) is not killed early"
+                "a long-but-still-installing learner (no progress yet) is not killed early"
+            );
+        }
+
+        // Snapshot bytes streaming: cumulative bytes advance -> Continue, and the
+        // stall clock resets on the byte advance even though matched is still None.
+        {
+            let mut best = None;
+            let mut bytes = 50_000_000u64;
+            let mut adv = t0;
+            let now = t0 + Duration::from_millis(7000);
+            assert_eq!(
+                evaluate_catchup(
+                    Some(1_000_000),
+                    None,
+                    Some(90_000_000),
+                    &mut best,
+                    &mut bytes,
+                    &mut adv,
+                    now,
+                    soft,
+                    hard,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Continue
+            );
+            assert_eq!(bytes, 90_000_000, "best bytes advanced");
+            assert_eq!(adv, now, "the stall clock reset on the byte advance");
+        }
+
+        // Snapshot-transfer-aware EXTENSION: past the soft ceiling but bytes are
+        // still advancing (within the stall grace) -> Continue, not Abort. This is
+        // the enhancement: a large install that outlasts the soft ceiling keeps
+        // going toward the hard cap instead of being guillotined.
+        {
+            let mut best = None;
+            let mut bytes = 100_000_000u64;
+            let now = soft + Duration::from_millis(5000);
+            let mut adv = now; // bytes just advanced -> actively streaming
+            assert_eq!(
+                evaluate_catchup(
+                    Some(1_000_000),
+                    None,
+                    Some(120_000_000),
+                    &mut best,
+                    &mut bytes,
+                    &mut adv,
+                    now,
+                    soft,
+                    hard,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Continue,
+                "an actively-streaming install extends past the soft ceiling"
+            );
+        }
+
+        // Past the soft ceiling with NO install bytes (plain log-tail catch-up)
+        // -> abort at the soft ceiling (only snapshot installs get the extension).
+        {
+            let mut best = Some(1200u64);
+            let mut bytes = 0u64;
+            let now = soft + Duration::from_millis(1);
+            let mut adv = now; // matched just advanced (not a stall) yet no bytes
+            assert_eq!(
+                evaluate_catchup(
+                    Some(200),
+                    Some(1201),
+                    None,
+                    &mut best,
+                    &mut bytes,
+                    &mut adv,
+                    now,
+                    soft,
+                    hard,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Abort("learner catch-up ceiling exceeded"),
+                "a non-install catch-up is not extended past the soft ceiling"
             );
         }
 
@@ -17914,16 +18836,20 @@ mod clustered_startup_tests {
         // the stall clock restarts from each advance.
         {
             let mut best = Some(500u64);
+            let mut bytes = 0u64;
             let mut adv = t0;
             let now = t0 + Duration::from_millis(7000);
             assert_eq!(
                 evaluate_catchup(
                     Some(200),
                     Some(1200),
+                    None,
                     &mut best,
+                    &mut bytes,
                     &mut adv,
                     now,
-                    deadline,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
@@ -17933,19 +18859,24 @@ mod clustered_startup_tests {
             assert_eq!(adv, now, "the stall clock reset on the advance");
         }
 
-        // Post-install stall: matched began (best is Some) but has not advanced for
-        // >= stall_grace -> abort EARLY (free the write-pause), before the ceiling.
+        // Post-install stall: progress began (matched Some) but has not advanced
+        // for >= stall_grace -> abort EARLY (free the write-pause), before the soft
+        // ceiling. Also fires for a wedged snapshot transfer (bytes stop flowing).
         {
             let mut best = Some(1200u64);
+            let mut bytes = 0u64;
             let mut adv = t0;
             assert_eq!(
                 evaluate_catchup(
                     Some(200),
                     Some(1200),
+                    None,
                     &mut best,
+                    &mut bytes,
                     &mut adv,
                     t0 + stall,
-                    deadline,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
@@ -17953,23 +18884,164 @@ mod clustered_startup_tests {
             );
         }
 
-        // Absolute ceiling wins even while matching (safety cap).
+        // Wedged snapshot transfer: bytes began then went quiet for >= stall_grace
+        // (matched still None) -> abort (a stuck install must not extend forever).
         {
-            let mut best = Some(1200u64);
-            let mut adv = deadline; // "just advanced" — not a stall
+            let mut best = None;
+            let mut bytes = 100_000_000u64;
+            let mut adv = t0;
             assert_eq!(
                 evaluate_catchup(
-                    Some(200),
-                    Some(1201),
+                    Some(1_000_000),
+                    None,
+                    Some(100_000_000), // no advance since best_bytes
                     &mut best,
+                    &mut bytes,
                     &mut adv,
-                    deadline,
-                    deadline,
+                    t0 + stall,
+                    soft,
+                    hard,
                     threshold,
                     stall,
                 ),
-                CatchupStep::Abort("learner catch-up ceiling exceeded")
+                CatchupStep::Abort("learner catch-up stalled"),
+                "a wedged install (bytes flatlined) aborts on the stall grace"
             );
+        }
+
+        // Absolute HARD cap wins even while actively streaming (safety cap).
+        {
+            let mut best = None;
+            let mut bytes = 100_000_000u64;
+            let mut adv = hard; // "just advanced" — not a stall
+            assert_eq!(
+                evaluate_catchup(
+                    Some(1_000_000),
+                    None,
+                    Some(200_000_000),
+                    &mut best,
+                    &mut bytes,
+                    &mut adv,
+                    hard,
+                    soft,
+                    hard,
+                    threshold,
+                    stall,
+                ),
+                CatchupStep::Abort("learner catch-up ceiling exceeded"),
+                "the hard cap bounds even an actively-streaming install"
+            );
+        }
+    }
+
+    #[test]
+    fn catchup_hold_engages_while_a_lagging_peer_advances_and_releases_when_caught_up_or_stalled() {
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        let threshold = 60_000u64;
+        let grace = Duration::from_secs(5);
+        let t0 = Instant::now();
+
+        // A peer lagging above the threshold, first sighting -> engaged (a fresh
+        // observation counts as advancing for the first grace window).
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let obs = vec![((0u64, 18u64), 800_000u64, 1_000u128)];
+            let (active, max_lag) = catchup_hold_active(&obs, &mut prog, threshold, grace, t0);
+            assert!(
+                active,
+                "a freshly-seen bulk-lagging peer holds the throttle"
+            );
+            assert_eq!(max_lag, 800_000);
+        }
+
+        // A peer within the threshold -> NOT engaged (steady-state learner jitter).
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let obs = vec![((0u64, 18u64), 64u64, 1_000u128)];
+            let (active, _) = catchup_hold_active(&obs, &mut prog, threshold, grace, t0);
+            assert!(
+                !active,
+                "a nearly-caught-up peer does not hold the throttle"
+            );
+        }
+
+        // Still lagging but ADVANCING across ticks (progress grows) -> stays engaged,
+        // and the stall clock resets on each advance.
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let _ = catchup_hold_active(
+                &[((0u64, 18u64), 800_000u64, 1_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                t0,
+            );
+            let later = t0 + Duration::from_secs(4);
+            let (active, _) = catchup_hold_active(
+                &[((0u64, 18u64), 600_000u64, 200_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                later,
+            );
+            assert!(
+                active,
+                "an advancing bulk catch-up keeps the throttle engaged"
+            );
+            assert_eq!(
+                prog[&(0, 18)].1,
+                later,
+                "the stall clock reset on the advance"
+            );
+        }
+
+        // Lagging but STALLED: progress frozen past the grace -> released (a wedged
+        // or dead async learner must not pin the throttle in the leader-durable model).
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let _ = catchup_hold_active(
+                &[((0u64, 18u64), 800_000u64, 1_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                t0,
+            );
+            let much_later = t0 + Duration::from_secs(6);
+            let (active, _) = catchup_hold_active(
+                &[((0u64, 18u64), 800_000u64, 1_000u128)], // progress unchanged
+                &mut prog,
+                threshold,
+                grace,
+                much_later,
+            );
+            assert!(
+                !active,
+                "a stalled peer past the grace releases the throttle"
+            );
+        }
+
+        // A snapshot install (progress carried by cumulative bytes) above threshold,
+        // advancing -> engaged, exercising the bytes-driven progress path.
+        {
+            let mut prog: HashMap<(u64, u64), (u128, Instant)> = HashMap::new();
+            let _ = catchup_hold_active(
+                &[((1u64, 18u64), 1_000_000u64, 50_000_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                t0,
+            );
+            let later = t0 + Duration::from_secs(3);
+            let (active, max_lag) = catchup_hold_active(
+                &[((1u64, 18u64), 1_000_000u64, 90_000_000u128)],
+                &mut prog,
+                threshold,
+                grace,
+                later,
+            );
+            assert!(active, "a streaming snapshot install holds the throttle");
+            assert_eq!(max_lag, 1_000_000);
         }
     }
 

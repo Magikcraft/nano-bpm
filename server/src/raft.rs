@@ -73,7 +73,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::deepthi::DeepthiHandle;
 use crate::journal::Journal;
-use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport};
+use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport, SnapshotSendProgress};
 
 /// Raft node id. We key the cluster by the topology's `node_id` (a `u32`),
 /// widened to openraft's expected `u64`.
@@ -1191,6 +1191,40 @@ fn raft_config(partition_id: u64) -> Config {
         // entries from the propose batcher) keeps each AppendEntries shippable
         // within the timeout. Env-tunable (`NANOBPMN_RAFT_MAX_PAYLOAD_ENTRIES`).
         max_payload_entries: raft_env_u64("NANOBPMN_RAFT_MAX_PAYLOAD_ENTRIES", 16),
+        // PER-CHUNK budget for an InstallSnapshot segment RPC. openraft's default
+        // is a mere 200 ms, and because `send_snapshot_timeout` is 0 that same
+        // value also bounds the FINAL segment — whose RPC only returns after the
+        // receiver deserializes and applies the ENTIRE snapshot body
+        // (PartitionStateMachine install_snapshot does a full serde_json read of
+        // the resident engine state: every active process instance). For a large
+        // state machine (millions of instances after a long-downtime rejoin under
+        // load) that install takes seconds to tens of seconds, so the 200 ms
+        // deadline elapses and openraft aborts + restarts the whole snapshot
+        // forever (`InstallSnapshot RPC timed out: deadline has elapsed`,
+        // request_id Snapshot(N) climbing) — the transfer never lands and a
+        // returning owner can never catch up via snapshot install under load.
+        //
+        // We DON'T fix this with a bigger fixed guess (that rots as state grows).
+        // The vendored snapshot transport derives the FINAL segment's deadline
+        // from the snapshot SIZE: it budgets `ceil(snapshot_bytes / chunk_size)`
+        // of THIS value, so the whole-install deadline auto-scales linearly with
+        // the snapshot. This knob is therefore the per-chunk unit (transfer +
+        // apply of one `snapshot_max_chunk_size` chunk); pick it generously (the
+        // final install is slower per byte than raw transfer). Env-tunable.
+        // (`NANOBPMN_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS`, 2s per chunk.)
+        install_snapshot_timeout: raft_env_u64("NANOBPMN_RAFT_INSTALL_SNAPSHOT_TIMEOUT_MS", 2_000),
+        // Per-RPC AppendEntries timeout, DECOUPLED from `heartbeat_interval`.
+        // Upstream openraft times each AppendEntries out at one heartbeat (250ms
+        // here), so a follower that is alive but momentarily busy — e.g. node18
+        // just after it rejoins, simultaneously leading its own 4 partitions,
+        // following the other 8, and draining a large catch-up — cannot ack in
+        // time, and EVERY AppendEntries is aborted + re-sent. That retry storm
+        // (thousands/sec, seen as `timeout after 250ms when AppendEntries 0->2`)
+        // burns leader CPU and makes cluster throughput oscillate long after the
+        // node is otherwise healthy. Keep fast heartbeats (quick failover) but
+        // give each RPC a generous deadline so a loaded follower applies backlog
+        // instead of thrashing. (`NANOBPMN_RAFT_APPEND_ENTRIES_TIMEOUT_MS`, 1s.)
+        append_entries_timeout: raft_env_u64("NANOBPMN_RAFT_APPEND_ENTRIES_TIMEOUT_MS", 1_000),
         ..Default::default()
     }
 }
@@ -1410,6 +1444,12 @@ pub struct RaftPartition {
     /// compaction governor simply never byte-triggers. Read by the governor to
     /// decide byte-based snapshots — see [`snapshot_bytes_threshold`].
     log_bytes: Arc<AtomicI64>,
+    /// Cumulative bytes this member (as leader) has streamed to each replication
+    /// target during an `InstallSnapshot`. Shared with the partition's
+    /// [`PartitionNetwork`]. Read by the hand-off catch-up loop
+    /// ([`snapshot_bytes_sent`](Self::snapshot_bytes_sent)) to extend the deadline
+    /// while a snapshot install is actively transferring.
+    snapshot_progress: Arc<SnapshotSendProgress>,
 }
 
 impl RaftPartition {
@@ -1430,7 +1470,12 @@ impl RaftPartition {
 
         let log_store = MemLogStore::default();
         let state_machine = Arc::new(PartitionStateMachine::new_temp(engine, partition_id)?);
-        let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
+        let snapshot_progress = Arc::new(SnapshotSendProgress::default());
+        let network = PartitionNetwork::new(
+            Arc::new(NullTransport),
+            partition_id,
+            snapshot_progress.clone(),
+        );
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         let mut members = BTreeMap::new();
@@ -1444,6 +1489,7 @@ impl RaftPartition {
             partition_id,
             batcher,
             log_bytes: Arc::new(AtomicI64::new(0)),
+            snapshot_progress,
         })
     }
 
@@ -1473,7 +1519,12 @@ impl RaftPartition {
             false,
             Arc::new(AtomicU64::new(u64::MAX)),
         )?);
-        let network = PartitionNetwork::new(Arc::new(NullTransport), partition_id);
+        let snapshot_progress = Arc::new(SnapshotSendProgress::default());
+        let network = PartitionNetwork::new(
+            Arc::new(NullTransport),
+            partition_id,
+            snapshot_progress.clone(),
+        );
         let raft = openraft::Raft::new(node_id, config, network, log_store, state_machine).await?;
 
         // A fresh log needs the one-shot membership bootstrap; a recovered log
@@ -1491,6 +1542,7 @@ impl RaftPartition {
             partition_id,
             batcher,
             log_bytes,
+            snapshot_progress,
         })
     }
 
@@ -1543,7 +1595,8 @@ impl RaftPartition {
         // replays the post-snapshot log tail. Without this a rejoining node whose
         // log was purged fails to host the partition entirely.
         state_machine.restore_from_current_snapshot().await?;
-        let network = PartitionNetwork::new(transport, partition_id);
+        let snapshot_progress = Arc::new(SnapshotSendProgress::default());
+        let network = PartitionNetwork::new(transport, partition_id, snapshot_progress.clone());
         // One `Raft` handle, two possible log stores. The handle erases the log
         // storage type, so both arms yield the same `RaftPartition`; building the
         // `Raft` inside each arm avoids needing a common concrete store type. The
@@ -1586,6 +1639,7 @@ impl RaftPartition {
             partition_id,
             batcher,
             log_bytes,
+            snapshot_progress,
         })
     }
 
@@ -1695,6 +1749,21 @@ impl RaftPartition {
         }
         let repl = m.replication.as_ref()?;
         repl.get(&node_id)?.as_ref().map(|l| l.index)
+    }
+
+    /// Cumulative bytes this leader has streamed to `node_id` during an
+    /// `InstallSnapshot`, or `None` if no snapshot chunk has been sent to it yet.
+    ///
+    /// openraft's leader metrics report only a matched `LogId` per target, which
+    /// stays `None` for the *entire* snapshot install — so
+    /// [`learner_matched`](Self::learner_matched) cannot distinguish a large
+    /// install that is actively transferring from a wedged/dead learner. This
+    /// byte counter (bumped per acknowledged chunk in the partition network) is
+    /// that missing signal: the hand-off catch-up loop watches it to **extend** the
+    /// deadline while an install streams, and to detect a genuinely stalled
+    /// transfer (bytes stop advancing) — see `evaluate_catchup`.
+    pub fn snapshot_bytes_sent(&self, node_id: NodeId) -> Option<u64> {
+        self.snapshot_progress.bytes_sent(node_id)
     }
 
     /// Replicates `command` (stamped with `now`) through the Raft log and applies

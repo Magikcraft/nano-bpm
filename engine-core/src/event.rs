@@ -200,8 +200,24 @@ pub enum Event {
         instance_key: Key,
         error_code: String,
     },
-    /// A job was completed.
-    JobCompleted { job_key: Key, instance_key: Key },
+    /// A job was completed. `created_at` is the logical instant the job was
+    /// created (carried through from job state) so the server can observe the
+    /// job's end-to-end sojourn (create→complete) at the completion site. `job_type`
+    /// is carried so that sojourn can be reported *per job type* — the reporting
+    /// surface that lets an operator localize external/worker strain to a specific
+    /// process/job type (one type's sojourn stretching while the engine's internal
+    /// command latency stays flat = a slow downstream for that type, not our
+    /// congestion). Both are observational: `created_at` is `0` and `job_type` is
+    /// empty for jobs created before the engine carried the fields; neither is used
+    /// by replay.
+    JobCompleted {
+        job_key: Key,
+        instance_key: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        created_at: u64,
+        #[cfg_attr(feature = "serde", serde(default))]
+        job_type: String,
+    },
     /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.
     JobRetriesUpdated {

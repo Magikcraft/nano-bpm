@@ -270,6 +270,38 @@ pub struct VariableRow {
     pub process_definition_key: String,
 }
 
+/// WAL autocheckpoint threshold in pages for the read-model store. Default 12288
+/// (~48 MiB at the 4 KiB page size), 12x SQLite's built-in 1000, chosen to
+/// coalesce repeated dirties of hot pages before they are copied back into the
+/// main DB. Acts as the always-safe backstop bound on the WAL (works even when no
+/// adaptive pruner runs). `NANOBPMN_READ_WAL_AUTOCHECKPOINT` overrides; 0 disables
+/// SQLite's automatic checkpoint entirely (only safe when a pruner checkpoints).
+fn read_wal_autocheckpoint_pages() -> i64 {
+    std::env::var("NANOBPMN_READ_WAL_AUTOCHECKPOINT")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
+        .unwrap_or(12288)
+}
+
+/// Minimum `-wal` sidecar size (bytes) before the adaptive pruner spends a
+/// `wal_checkpoint(TRUNCATE)`. Below this the raised autocheckpoint keeps the WAL
+/// bounded, so the pruner skips the extra copy-back+truncate — cutting the former
+/// ~5/s TRUNCATE storm (each a full-WAL copy-back into the random-access main DB)
+/// down to an occasional file-space reclaim. Default 32 MiB, deliberately below
+/// the autocheckpoint backstop so the pruner (off the exporter thread) does the
+/// checkpointing first and the exporter's inline autocheckpoint rarely fires.
+/// `NANOBPMN_READ_WAL_TRUNCATE_MB` overrides (0 = checkpoint on every pruner wake,
+/// the pre-throttle behavior, for A/B).
+fn read_wal_truncate_bytes() -> u64 {
+    std::env::var("NANOBPMN_READ_WAL_TRUNCATE_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(32)
+        * 1024
+        * 1024
+}
+
 /// Reads a SQLite database's size as `(file_bytes, live_bytes)` from its header:
 /// `file_bytes = page_count × page_size` (the whole allocated file, freelist
 /// included) and `live_bytes = (page_count − freelist_count) × page_size` (the
@@ -403,6 +435,19 @@ impl ReadStore {
             let sync = std::env::var("NANOBPMN_READ_SYNC").unwrap_or_else(|_| "NORMAL".into());
             conn.pragma_update(None, "journal_mode", "WAL")?;
             conn.pragma_update(None, "synchronous", &sync)?;
+            // WAL autocheckpoint threshold (pages). SQLite's built-in default is
+            // 1000 (~4 MiB), which under a sustained projection flood checkpoints
+            // hot pages back into the multi-hundred-MB main DB extremely often —
+            // rewriting the same index / freelist / recently-inserted leaf pages
+            // over and over and amplifying *physical* disk writes ~100x over the
+            // logical change. A larger window coalesces repeated dirties of a page
+            // into a single copy-back, cutting checkpoint write volume (and thus
+            // disk saturation and the fsync-latency it inflates on a shared disk)
+            // roughly in proportion. This is the backstop bound; when the adaptive
+            // pruner runs it checkpoints off the exporter thread at a lower
+            // threshold (see `maybe_checkpoint_wal`) so this rarely fires inline.
+            // `NANOBPMN_READ_WAL_AUTOCHECKPOINT` overrides (0 disables auto).
+            conn.pragma_update(None, "wal_autocheckpoint", read_wal_autocheckpoint_pages())?;
             conn.busy_timeout(std::time::Duration::from_secs(5))?;
         }
         let store = Self {
@@ -617,12 +662,16 @@ impl ReadStore {
             [],
         )?;
         tx.commit()?;
-        // Return the WAL's freed pages to a bounded size. Without this the WAL
-        // grows with each prune (hundreds of MB observed) and never shrinks while
-        // the store is under load, inflating both disk and mapped memory. TRUNCATE
-        // is best-effort: a concurrent reader can hold it back, and that is fine —
+        // Return the WAL's freed pages to a bounded size — but only once it has
+        // grown meaningfully. TRUNCATE-ing after every sweep copies the whole WAL
+        // back into the random-access main DB and was a dominant write-amplifier;
+        // size-gating it (default 32 MiB) keeps the WAL bounded via the raised
+        // autocheckpoint and reclaims file space only occasionally. TRUNCATE is
+        // best-effort: a concurrent reader can hold it back, and that is fine —
         // the next sweep retries.
-        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        if self.wal_len_bytes() >= read_wal_truncate_bytes() {
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        }
         Ok(evicted)
     }
 
@@ -704,13 +753,57 @@ impl ReadStore {
             total += evicted;
         }
         if total > 0 {
-            let _write = self
-                .write_lock
-                .lock()
-                .expect("read store write lock poisoned");
-            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+            // Checkpointing is deferred to the size-gated `maybe_checkpoint_wal`
+            // (called every pruner wake): TRUNCATE-ing the whole WAL back into the
+            // random-access main DB after *every* delete sweep (~5/s under
+            // sustained pressure) was a dominant source of read-model write
+            // amplification. The deletes' freed pages sit in the WAL until the
+            // next size-gated checkpoint, bounded by the raised autocheckpoint.
         }
         Ok(total)
+    }
+
+    /// Size of this shard's `-wal` sidecar file in bytes (0 if absent / in-memory).
+    /// An O(1) `stat`; cheap enough for the pruner's per-wake gate.
+    fn wal_len_bytes(&self) -> u64 {
+        let Some(path) = self.path.as_ref() else {
+            return 0;
+        };
+        let mut wal = path.clone().into_os_string();
+        wal.push("-wal");
+        std::fs::metadata(std::path::PathBuf::from(wal))
+            .map(|m| m.len())
+            .unwrap_or(0)
+    }
+
+    /// Size-gated WAL checkpoint, run once per pruner wake on the pruner's own
+    /// connection (off the exporter's hot path). When the `-wal` sidecar has grown
+    /// to at least [`read_wal_truncate_bytes`], TRUNCATE-checkpoints it back into
+    /// the main DB and reclaims the WAL file space; otherwise a no-op. This
+    /// concentrates all checkpoint copy-back into infrequent, coalesced passes
+    /// instead of a per-delete-sweep storm, and keeps those passes off the single
+    /// exporter thread so projection never stalls mid-checkpoint. Returns whether
+    /// a checkpoint ran. Best-effort: a concurrent reader can hold TRUNCATE back,
+    /// which is fine — the next wake retries.
+    pub fn maybe_checkpoint_wal(&self, conn: &Connection) -> bool {
+        self.checkpoint_wal_if_larger_than(conn, read_wal_truncate_bytes())
+    }
+
+    /// Core of [`maybe_checkpoint_wal`] with an explicit byte threshold (so tests
+    /// can exercise the gate without racing a process-global env var).
+    fn checkpoint_wal_if_larger_than(&self, conn: &Connection, threshold: u64) -> bool {
+        if self.path.is_none() {
+            return false;
+        }
+        if self.wal_len_bytes() < threshold {
+            return false;
+        }
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("read store write lock poisoned");
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+        true
     }
 
     /// Total number of process instances (active + terminal) in this shard, via
@@ -2178,6 +2271,52 @@ mod definition_xml_tests {
                 .adaptive_prune_once(&mut conn, 1, 1, 4096, 4096)
                 .unwrap(),
             0
+        );
+
+        drop(conn);
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn wal_checkpoint_is_size_gated() {
+        // The size-gate is what turns the former ~5/s TRUNCATE storm (a dominant
+        // read-model write amplifier) into an occasional file-space reclaim: below
+        // the threshold `maybe_checkpoint_wal` must be a no-op; at/above it must
+        // TRUNCATE the WAL back into the main DB (shrinking the -wal sidecar).
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-ckptgate-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = ReadStore::open(Some(&path)).unwrap();
+        // Write enough committed rows to grow the WAL sidecar past zero. The raised
+        // autocheckpoint (48 MiB) will not have truncated it for this small volume.
+        for k in 1..=200u64 {
+            store.export(&[&created_event(k)]).unwrap();
+        }
+        let conn = store.prune_connection().unwrap().expect("file-backed");
+        let wal_before = store.wal_len_bytes();
+        assert!(wal_before > 0, "WAL should hold uncheckpointed frames");
+
+        // Threshold above the current WAL size → gated off, no checkpoint, WAL unchanged.
+        assert!(!store.checkpoint_wal_if_larger_than(&conn, wal_before + 1));
+        assert_eq!(
+            store.wal_len_bytes(),
+            wal_before,
+            "no-op must not shrink WAL"
+        );
+
+        // Threshold at/below the WAL size → checkpoint runs and TRUNCATE shrinks it.
+        assert!(store.checkpoint_wal_if_larger_than(&conn, 1));
+        assert!(
+            store.wal_len_bytes() < wal_before,
+            "TRUNCATE checkpoint must reclaim WAL file space"
         );
 
         drop(conn);

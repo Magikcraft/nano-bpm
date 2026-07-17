@@ -424,6 +424,30 @@ impl Engine {
         self.state.instances.len()
     }
 
+    /// Per-process-definition in-flight instance backlog for this partition:
+    /// `(process_id, in_flight_L_P, cumulative_created)`. O(distinct definitions
+    /// with live instances) — a handful of small map clones, cheap for the ~1 Hz
+    /// monitor tick that aggregates these across the node's partitions to drive
+    /// the ADR-0020 Tier-2 per-definition admission compressors. `created` is
+    /// monotonic (survives an instance going terminal), so the monitor can
+    /// difference it into the create rate `λ_P` even for a definition whose
+    /// in-flight count has since returned to zero (and dropped out of `L_P`).
+    pub fn backlog_by_process(&self) -> Vec<(String, u64, u64)> {
+        self.state
+            .created_by_process
+            .iter()
+            .map(|(pid, created)| {
+                let inflight = self
+                    .state
+                    .inflight_by_process
+                    .get(pid)
+                    .copied()
+                    .unwrap_or(0);
+                (pid.clone(), inflight, *created)
+            })
+            .collect()
+    }
+
     /// Total approximate heap bytes of variables held resident by instances in
     /// this partition (spilled instances hold an empty map, so they contribute
     /// ~0). O(N) over the resident set — call it off the hot path (the 250ms

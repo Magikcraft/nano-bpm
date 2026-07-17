@@ -36,6 +36,22 @@ use crate::falcon::{ClientFrame, ReadKind, ServerFrame, UserTaskOp};
 /// `CommandResult` before giving up. Overridable via `NANOBPMN_PEER_TIMEOUT_MS`.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
 
+/// Default per-dial connect deadline. A peer that is process-killed answers with
+/// a fast RST, but a host-down / black-holed peer (firewall drop, dead host)
+/// leaves `connect_async` hanging at the OS TCP timeout (~75s). Bounding the
+/// connect keeps a probe dial to a dead peer cheap. Override via
+/// `NANOBPMN_PEER_CONNECT_TIMEOUT_MS`.
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 2_000;
+
+/// Default circuit-breaker cooldown. Once a peer's dial fails, `link()` fast-fails
+/// to it (without redialing) for this window, allowing only a single probe dial
+/// per cooldown to detect recovery. This collapses the redial storm a dead node
+/// otherwise induces — every survivor-led partition retries AppendEntries to the
+/// dead learner ~2×/s, and without the breaker each retry redials, inflating
+/// peer-link acquisition cluster-wide. Override via
+/// `NANOBPMN_PEER_BREAKER_COOLDOWN_MS`.
+const DEFAULT_BREAKER_COOLDOWN_MS: u64 = 500;
+
 /// A failure forwarding a request to a peer.
 #[derive(Debug)]
 pub enum PeerError {
@@ -127,9 +143,18 @@ impl PeerLink {
         pending: Pending,
         connected: Arc<AtomicBool>,
     ) -> Result<mpsc::Sender<Message>, PeerError> {
-        let (ws, _resp) = tokio_tungstenite::connect_async(ws_url)
-            .await
-            .map_err(|e| PeerError::Connect(e.to_string()))?;
+        let (ws, _resp) =
+            match tokio::time::timeout(connect_timeout(), tokio_tungstenite::connect_async(ws_url))
+                .await
+            {
+                Ok(res) => res.map_err(|e| PeerError::Connect(e.to_string()))?,
+                Err(_) => {
+                    return Err(PeerError::Connect(format!(
+                        "connect timed out after {:?}",
+                        connect_timeout()
+                    )));
+                }
+            };
         // Disable Nagle on the peer socket: the Falcon protocol carries small,
         // latency-sensitive request/response frames (notably Raft AppendEntries),
         // and Nagle + delayed-ACK adds ~40ms per round-trip, collapsing Raft
@@ -772,6 +797,30 @@ pub struct PeerSet {
     /// the dead node's already-accepted connections (which `axum::serve` drives on
     /// detached per-connection tasks that outlive an aborted serve task).
     unreachable: Arc<Mutex<HashSet<u32>>>,
+    /// Per-peer reachability circuit-breaker. Once a dial to a peer fails, the
+    /// peer is marked down and `link()` fast-fails to it — without redialing — for
+    /// a cooldown, admitting only one probe dial per cooldown to detect recovery.
+    /// This kills the redial storm a dead node otherwise induces (every
+    /// survivor-led partition retries AppendEntries to the dead learner ~2×/s;
+    /// without the breaker each retry redials, inflating peer-link acquisition
+    /// cluster-wide — the measured onset amplifier of the node-down oscillation).
+    breaker: Arc<Mutex<HashMap<u32, Breaker>>>,
+    /// Per-peer connect serialization. Concurrent callers for the *same* peer
+    /// share one in-flight dial, but the (possibly slow) connect is awaited under
+    /// this per-peer lock — NOT under the global `links` mutex — so a stalled dial
+    /// to one peer never freezes cache hits or dials to other peers. This removes
+    /// the connect-under-global-lock head-of-line stall.
+    connect_locks: Arc<Mutex<HashMap<u32, Arc<Mutex<()>>>>>,
+}
+
+/// Circuit-breaker state for one down peer.
+struct Breaker {
+    /// When the peer was first observed down (diagnostics only).
+    down_since: std::time::Instant,
+    /// Start of the current cooldown; the next probe dial is admitted once this
+    /// is at least `breaker_cooldown()` old. Reserving it (setting it to `now`)
+    /// under the breaker lock makes "one probe per cooldown" race-free.
+    last_probe: std::time::Instant,
 }
 
 impl PeerSet {
@@ -782,6 +831,8 @@ impl PeerSet {
             topology,
             links: Arc::new(Mutex::new(HashMap::new())),
             unreachable: Arc::new(Mutex::new(HashSet::new())),
+            breaker: Arc::new(Mutex::new(HashMap::new())),
+            connect_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -803,32 +854,139 @@ impl PeerSet {
     /// after an outage). Production code never calls this.
     pub async fn heal_node(&self, node_id: u32) {
         self.unreachable.lock().await.remove(&node_id);
+        self.breaker.lock().await.remove(&node_id);
     }
 
     /// Returns a live link to peer `node_id`, dialing it if there is no cached
     /// link or the cached one has dropped. Concurrent callers for the same peer
     /// share the single in-flight dial (serialized by the map lock).
     pub async fn link(&self, node_id: u32) -> Result<PeerLink, PeerError> {
+        let link_start = std::time::Instant::now();
+        let result = self.link_inner(node_id).await;
+        crate::metrics::record_peer_link(link_start.elapsed());
+        result
+    }
+
+    async fn link_inner(&self, node_id: u32) -> Result<PeerLink, PeerError> {
         if self.unreachable.lock().await.contains(&node_id) {
             return Err(PeerError::Connect(format!(
                 "node {node_id} marked unreachable (fault injection)"
             )));
         }
-        let mut links = self.links.lock().await;
-        if let Some(existing) = links.get(&node_id) {
-            if existing.is_connected() {
-                return Ok(existing.clone());
-            }
-            // Stale link (peer dropped): discard and redial below.
-            links.remove(&node_id);
+        // Fast path: a cached, live link. Only the global map lock is held, and
+        // never across a connect, so this can never be blocked by a stalled dial.
+        if let Some(link) = self.cached_live_link(node_id).await {
+            return Ok(link);
+        }
+        // Circuit-breaker fast path removed here: the admit check *reserves* the
+        // cooldown probe (advances `last_probe`), so it must run exactly once per
+        // dial attempt. Running it here as well as under the lock would make the
+        // reserving caller fail its own second check and never dial. We instead
+        // gate once, under the connect lock, below.
+        //
+        // Serialize the dial per-peer WITHOUT the global `links` lock, so a slow
+        // connect to this peer cannot freeze cache hits or dials to other peers.
+        let connect_lock = self.connect_lock_for(node_id).await;
+        let _guard = connect_lock.lock().await;
+        // Re-check: another caller may have connected while we waited on the lock.
+        if let Some(link) = self.cached_live_link(node_id).await {
+            return Ok(link);
+        }
+        // Circuit-breaker gate, *under* the connect lock. Placing it here (rather
+        // than before the lock) collapses the redial storm to a dead peer to one
+        // dial per cooldown even on the first failure wave: when a healthy peer
+        // dies, a whole concurrent burst of callers passes `cached_live_link` and
+        // queues on the lock; the first to acquire it dials and — on failure —
+        // marks the peer down, so every subsequent caller in the burst re-checks
+        // here, finds the breaker open, and fast-fails instead of redialing.
+        if !self.breaker_admit_dial(node_id).await {
+            return Err(PeerError::Connect(format!(
+                "node {node_id} circuit-open (unreachable, cooling down)"
+            )));
         }
         let addr = self
             .topology
             .peer_addr(node_id)
             .ok_or_else(|| PeerError::Connect(format!("no address for node {node_id}")))?;
-        let link = PeerLink::connect(addr).await?;
-        links.insert(node_id, link.clone());
-        Ok(link)
+        // Onset-diagnosis instrument: count every dial to a peer, split by outcome.
+        // A survivor's redial rate to a *dead* peer is the "wasted send work" signal.
+        let dial = PeerLink::connect(addr).await;
+        crate::metrics::record_peer_connect_attempt(node_id, dial.is_ok());
+        match dial {
+            Ok(link) => {
+                self.breaker_clear(node_id).await;
+                self.links.lock().await.insert(node_id, link.clone());
+                Ok(link)
+            }
+            Err(e) => {
+                self.breaker_mark_down(node_id).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Returns the cached link to `node_id` iff it exists and is still connected;
+    /// evicts a stale (dropped) link. Holds only the global map lock, briefly.
+    async fn cached_live_link(&self, node_id: u32) -> Option<PeerLink> {
+        let mut links = self.links.lock().await;
+        if let Some(existing) = links.get(&node_id) {
+            if existing.is_connected() {
+                return Some(existing.clone());
+            }
+            links.remove(&node_id);
+        }
+        None
+    }
+
+    /// Circuit-breaker gate. Returns `true` if a dial should proceed:
+    /// - peer not marked down (healthy) → always;
+    /// - peer down but its cooldown has elapsed → admits exactly one probe by
+    ///   reserving the cooldown (advancing `last_probe`) under the lock;
+    /// - peer down and mid-cooldown → `false` (fast-fail, no redial).
+    async fn breaker_admit_dial(&self, node_id: u32) -> bool {
+        let mut breaker = self.breaker.lock().await;
+        match breaker.get_mut(&node_id) {
+            None => true,
+            Some(state) => {
+                if state.last_probe.elapsed() >= breaker_cooldown() {
+                    state.last_probe = std::time::Instant::now();
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Marks `node_id` down (a dial just failed), arming the cooldown. Keeps the
+    /// existing `down_since`/`last_probe` if the peer was already flagged.
+    async fn breaker_mark_down(&self, node_id: u32) {
+        let now = std::time::Instant::now();
+        self.breaker.lock().await.entry(node_id).or_insert(Breaker {
+            down_since: now,
+            last_probe: now,
+        });
+    }
+
+    /// Clears `node_id`'s breaker (a dial just succeeded — the peer is back).
+    async fn breaker_clear(&self, node_id: u32) {
+        if let Some(state) = self.breaker.lock().await.remove(&node_id) {
+            tracing::info!(
+                node = node_id,
+                down_ms = state.down_since.elapsed().as_millis() as u64,
+                "peer circuit-breaker closed: node {node_id} reachable again"
+            );
+        }
+    }
+
+    /// Fetches (or lazily creates) the per-peer connect serialization lock.
+    async fn connect_lock_for(&self, node_id: u32) -> Arc<Mutex<()>> {
+        self.connect_locks
+            .lock()
+            .await
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 }
 
@@ -862,6 +1020,27 @@ fn request_timeout() -> Duration {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
+/// Per-dial connect deadline (see [`DEFAULT_CONNECT_TIMEOUT_MS`]).
+fn connect_timeout() -> Duration {
+    let ms = std::env::var("NANOBPMN_PEER_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_MS);
+    Duration::from_millis(ms)
+}
+
+/// Circuit-breaker cooldown between probe dials to a down peer (see
+/// [`DEFAULT_BREAKER_COOLDOWN_MS`]).
+fn breaker_cooldown() -> Duration {
+    let ms = std::env::var("NANOBPMN_PEER_BREAKER_COOLDOWN_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BREAKER_COOLDOWN_MS);
     Duration::from_millis(ms)
 }
 
@@ -997,6 +1176,121 @@ mod tests {
         assert!(
             peers.link(0).await.is_err(),
             "single node has no peer to dial"
+        );
+    }
+
+    /// Two-node topology whose peer node 1 points at a dead port, for exercising
+    /// the reachability circuit-breaker without a live peer.
+    fn peers_with_dead_peer() -> PeerSet {
+        PeerSet::new(crate::cluster::Topology {
+            node_id: 0,
+            // Port 1 is unused → connect refuses fast (ECONNREFUSED).
+            peers: vec![
+                "http://self-unused".to_string(),
+                "http://127.0.0.1:1".to_string(),
+            ],
+            num_partitions: 4,
+            replication_factor: 1,
+        })
+    }
+
+    /// The first dial to a dead peer really dials (and fails); an immediate second
+    /// dial is fast-failed by the open circuit — no redial — so a survivor cannot
+    /// storm a dead peer with reconnects. The two errors are distinguishable: a
+    /// real connect failure vs. the circuit-open short-circuit.
+    #[tokio::test]
+    async fn breaker_fast_fails_repeated_dials_to_a_dead_peer() {
+        let peers = peers_with_dead_peer();
+
+        let first_msg = match peers.link(1).await {
+            Ok(_) => panic!("dead peer: first dial must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !first_msg.contains("circuit-open"),
+            "first call must actually dial, got: {first_msg}"
+        );
+
+        let second_msg = match peers.link(1).await {
+            Ok(_) => panic!("dead peer: second dial must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            second_msg.contains("circuit-open"),
+            "second call within cooldown must short-circuit, got: {second_msg}"
+        );
+    }
+
+    /// After the cooldown elapses, exactly one probe dial is admitted again (so a
+    /// recovered peer is rediscovered), rather than staying open forever.
+    #[tokio::test]
+    async fn breaker_reprobes_after_cooldown() {
+        let peers = peers_with_dead_peer();
+
+        assert!(peers.link(1).await.is_err(), "arm the breaker");
+        let mid = match peers.link(1).await {
+            Ok(_) => panic!("mid-cooldown dial must fail"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            mid.contains("circuit-open"),
+            "mid-cooldown call should short-circuit"
+        );
+
+        // Past the default cooldown, a probe dial is admitted (and fails for real
+        // again, since the peer is still dead) — NOT short-circuited.
+        tokio::time::sleep(breaker_cooldown() + Duration::from_millis(100)).await;
+        let probe = match peers.link(1).await {
+            Ok(_) => panic!("post-cooldown probe dial must fail (peer still dead)"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            !probe.contains("circuit-open"),
+            "post-cooldown call must re-dial, got: {probe}"
+        );
+    }
+
+    /// A *concurrent burst* of dials to a peer that was still healthy at entry
+    /// (breaker empty, so the pre-lock fast path admits everyone) collapses to a
+    /// single real dial: the first caller to win the per-peer connect lock dials
+    /// and — on failure — marks the peer down, and every other caller in the burst
+    /// then re-checks the breaker *under the lock* and short-circuits. Regression
+    /// test for the redial storm that occurred when the breaker was checked only
+    /// *before* acquiring the connect lock: the whole burst passed the gate before
+    /// anyone marked the peer down, so all of them dialled.
+    #[tokio::test]
+    async fn breaker_collapses_a_concurrent_dial_burst_to_one_dial() {
+        let peers = std::sync::Arc::new(peers_with_dead_peer());
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let p = std::sync::Arc::clone(&peers);
+            handles.push(tokio::spawn(async move {
+                p.link(1).await.err().map(|e| e.to_string())
+            }));
+        }
+
+        let mut real_dials = 0;
+        let mut short_circuits = 0;
+        for h in handles {
+            let msg = h
+                .await
+                .expect("task panicked")
+                .expect("dead peer: every dial must fail");
+            if msg.contains("circuit-open") {
+                short_circuits += 1;
+            } else {
+                real_dials += 1;
+            }
+        }
+
+        assert_eq!(
+            real_dials, 1,
+            "exactly one caller in the burst may actually dial a dead peer"
+        );
+        assert_eq!(
+            short_circuits, 15,
+            "every other caller in the burst must short-circuit under the connect lock"
         );
     }
 }

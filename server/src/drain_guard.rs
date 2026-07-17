@@ -82,6 +82,15 @@ pub struct DrainGuardCfg {
     /// metering, admitted-but-undrained creates can lead completions by at most
     /// this much, so it bounds the backlog overshoot above the engage level.
     pub burst: i64,
+    /// Floor (‰, parts-per-thousand) on the completion→create mint ratio while the
+    /// servo is *draining down* an overshoot (backlog above the setpoint). Normal
+    /// metering mints 1 token per completion (1000‰ = intake≈drain, a hold). When
+    /// the backlog has overshot the setpoint, the mint ratio drops to
+    /// `setpoint/backlog` so intake < drain and the backlog actively shrinks to
+    /// the setpoint; this floor bounds how aggressively (never fully starves
+    /// intake — that is the hard valve's job). `1000` disables drain-down (pure
+    /// hold, the old behaviour).
+    pub drain_mint_floor_permille: i64,
 
     // ---- Hard safety valve (option 4) -----------------------------------------
     /// Completion rate (completes/s) at or below which the drain counts as
@@ -127,6 +136,10 @@ impl Default for DrainGuardCfg {
             // Allow a few thousand admitted creates to lead the drain before the
             // bucket empties; bounds the backlog overshoot while metering.
             burst: 4_000,
+            // Drain an overshoot down to the setpoint by minting as few as 5% of a
+            // token per completion (intake ≈ 5% of drain) when the backlog is far
+            // above the setpoint, easing back to 1:1 as it converges.
+            drain_mint_floor_permille: 50,
 
             // ~0 completes/s: a stalled drain.
             halt_completes_floor: 1.0,
@@ -153,6 +166,8 @@ impl DrainGuardCfg {
     /// * `NANOBPMN_DRAIN_GUARD_ENGAGE_BACKLOG=<n>` overrides [`Self::meter_engage_backlog`]
     ///   (and clamps [`Self::meter_release_backlog`]/[`Self::halt_min_backlog`] below it).
     /// * `NANOBPMN_DRAIN_GUARD_BURST=<n>` overrides [`Self::burst`].
+    /// * `NANOBPMN_DRAIN_GUARD_MINT_FLOOR_PERMILLE=<0..=1000>` overrides
+    ///   [`Self::drain_mint_floor_permille`] (the drain-down mint-ratio floor).
     /// * `NANOBPMN_DRAIN_GUARD_HALT_FLOOR=<f>` overrides [`Self::halt_completes_floor`].
     /// * `NANOBPMN_DRAIN_GUARD_RECOVER_RATE=<f>` overrides [`Self::recover_completes_rate`].
     ///
@@ -179,6 +194,12 @@ impl DrainGuardCfg {
             && n > 0
         {
             cfg.burst = n;
+        }
+        if let Ok(v) = std::env::var("NANOBPMN_DRAIN_GUARD_MINT_FLOOR_PERMILLE")
+            && let Ok(n) = v.trim().parse::<i64>()
+            && (0..=1000).contains(&n)
+        {
+            cfg.drain_mint_floor_permille = n;
         }
         if let Ok(v) = std::env::var("NANOBPMN_DRAIN_GUARD_HALT_FLOOR")
             && let Ok(f) = v.trim().parse::<f64>()
@@ -211,9 +232,19 @@ pub struct DrainGuard {
     /// the engine's true drain throughput. Bumped next to the
     /// `nanobpm_job_completions_total` metric so the two never drift.
     completions: AtomicU64,
-    /// Completion-paced create-admission token bucket. Refilled +1 per completion
-    /// (clamped to `capacity`), spent by submission-credit grants while metering.
+    /// Completion-paced create-admission token bucket. Refilled per completion
+    /// (see `mint_permille`, clamped to `capacity`), spent by submission-credit
+    /// grants while metering.
     budget: AtomicI64,
+    /// Completion→create mint ratio (‰, parts-per-thousand), published each
+    /// monitor tick. `1000` = mint one token per completion (intake≈drain, the
+    /// metering hold). Below `1000` while draining an overshoot down to the
+    /// setpoint (intake < drain). Read on the hot completion path.
+    mint_permille: AtomicI64,
+    /// Sub-token mint accumulator (‰). `note_completion` adds `mint_permille` here
+    /// and mints one whole token each time it crosses 1000, so a fractional mint
+    /// ratio is realised without floating point on the hot path.
+    mint_acc: AtomicI64,
     /// Servo engaged (option 3): backlog in the pressure band; create admission is
     /// paced against `budget`.
     metering: AtomicBool,
@@ -233,6 +264,8 @@ impl DrainGuard {
         Self {
             completions: AtomicU64::new(0),
             budget: AtomicI64::new(cfg.burst),
+            mint_permille: AtomicI64::new(1000),
+            mint_acc: AtomicI64::new(0),
             metering: AtomicBool::new(false),
             halted: AtomicBool::new(false),
             capacity: cfg.burst,
@@ -240,12 +273,10 @@ impl DrainGuard {
         }
     }
 
-    /// Records one drain-side apply and returns one create token to the bucket
-    /// (clamped to capacity). Hot-path cheap (a relaxed add + a short CAS that
-    /// no-ops once the bucket is full — the common healthy case).
+    /// Mints one create token into the bucket (clamped to capacity). A short CAS
+    /// that no-ops once the bucket is full — the common healthy case.
     #[inline]
-    pub fn note_completion(&self) {
-        self.completions.fetch_add(1, Ordering::Relaxed);
+    fn mint_one(&self) {
         let cap = self.capacity;
         let mut cur = self.budget.load(Ordering::Relaxed);
         while cur < cap {
@@ -259,6 +290,53 @@ impl DrainGuard {
                 Err(v) => cur = v,
             }
         }
+    }
+
+    /// Records one drain-side apply and returns create tokens to the bucket at the
+    /// published mint ratio (`mint_permille`): one token per completion at the
+    /// `1000‰` hold, or a fraction of one while draining an overshoot toward the
+    /// setpoint (so intake < drain and the backlog shrinks). Hot-path cheap
+    /// (a relaxed add + at most one short CAS).
+    #[inline]
+    pub fn note_completion(&self) {
+        self.completions.fetch_add(1, Ordering::Relaxed);
+        let permille = self.mint_permille.load(Ordering::Relaxed);
+        if permille >= 1000 {
+            // Fast path: full 1:1 mint (metering hold or not draining down).
+            self.mint_one();
+            return;
+        }
+        if permille <= 0 {
+            // Never mint (would fully starve intake); left to the hard valve.
+            return;
+        }
+        // Fractional mint: accumulate ‰ into a monotonic total and mint one token
+        // each time that total crosses a whole-1000 boundary. `permille <= 1000`,
+        // so each completion crosses at most one boundary. Deriving the crossing
+        // from `fetch_add`'s own before/after is race-safe: each concurrent caller
+        // gets an exact, disjoint [before, after) interval, so a given boundary
+        // k·1000 is claimed by exactly one caller — no lost or double mints, and
+        // (unlike a separate compensating `fetch_sub`) the accumulator never drifts
+        // negative under a concurrent completion burst.
+        let before = self.mint_acc.fetch_add(permille, Ordering::Relaxed);
+        let after = before + permille;
+        if after / 1000 > before / 1000 {
+            self.mint_one();
+        }
+    }
+
+    /// Publishes the completion→create mint ratio (‰) the monitor computed this
+    /// tick. Called ~1 Hz alongside [`Self::publish`].
+    #[inline]
+    pub fn set_mint_permille(&self, permille: i64) {
+        self.mint_permille
+            .store(permille.clamp(0, 1000), Ordering::Relaxed);
+    }
+
+    /// Current mint ratio (‰) — for the metric.
+    #[inline]
+    pub fn mint_permille(&self) -> i64 {
+        self.mint_permille.load(Ordering::Relaxed)
     }
 
     /// Current monotonic completion count (the monitor samples this each tick).
@@ -366,6 +444,9 @@ pub struct DrainDecision {
     pub metering: bool,
     /// Hard valve forcing create admission to 0 (option 4).
     pub halted: bool,
+    /// Completion→create mint ratio (‰) to publish: `1000` = 1:1 hold, less while
+    /// draining an overshoot down to the setpoint (intake < drain).
+    pub mint_permille: i64,
 }
 
 /// Pure, tick-driven decision engine for the drain-stall guard. Holds only the
@@ -415,6 +496,7 @@ impl DrainStateMachine {
             return DrainDecision {
                 metering: false,
                 halted: false,
+                mint_permille: 1000,
             };
         }
 
@@ -489,9 +571,27 @@ impl DrainStateMachine {
             self.metering = true;
         }
 
+        // ---- Drain-down mint ratio -------------------------------------------
+        // Metering normally mints 1 create token per completion (a 1:1 *hold* at
+        // the current backlog). When the backlog has *overshot* the setpoint we
+        // instead mint a fraction — `setpoint/backlog` — so intake < drain and the
+        // backlog shrinks back to the setpoint, then reverts to the 1:1 hold. Only
+        // engages with a live setpoint (`backlog_cap > 0`); with no cap there is no
+        // target to drain toward, so we hold (1000). A halted guard mints nothing
+        // (0) — the hard valve owns intake.
+        let mint_permille = if self.halted {
+            0
+        } else if self.metering && s.backlog_cap > 0 && s.backlog > s.backlog_cap {
+            let ratio = (s.backlog_cap as i128 * 1000 / s.backlog as i128) as i64;
+            ratio.clamp(self.cfg.drain_mint_floor_permille, 1000)
+        } else {
+            1000
+        };
+
         DrainDecision {
             metering: self.metering,
             halted: self.halted,
+            mint_permille,
         }
     }
 
@@ -500,6 +600,7 @@ impl DrainStateMachine {
         DrainDecision {
             metering: self.metering,
             halted: self.halted,
+            mint_permille: if self.halted { 0 } else { 1000 },
         }
     }
 }
@@ -768,6 +869,117 @@ mod tests {
     }
 
     #[test]
+    fn metering_holds_1to1_until_backlog_overshoots_the_setpoint() {
+        let c = cfg();
+        let mut sm = DrainStateMachine::new(c);
+        let cap = 30_000;
+        // Drive the servo into metering by holding backlog above the engage band.
+        let mut d = DrainDecision {
+            metering: false,
+            halted: false,
+            mint_permille: 1000,
+        };
+        for _ in 0..(c.meter_engage_ticks + 2) {
+            d = sm.observe(healthy_capped(cap * 9 / 10, cap));
+        }
+        assert!(
+            d.metering,
+            "sustained backlog in-band must engage the servo"
+        );
+        // At/below the setpoint: hold at 1:1 (no drain-down).
+        let hold = sm.observe(healthy_capped(cap, cap));
+        assert_eq!(
+            hold.mint_permille, 1000,
+            "at the setpoint the servo holds 1:1"
+        );
+    }
+
+    #[test]
+    fn drain_down_mints_a_fraction_proportional_to_the_overshoot() {
+        let c = cfg();
+        let mut sm = DrainStateMachine::new(c);
+        let cap = 30_000;
+        // Engage metering, then present a 3x overshoot (backlog 90k vs cap 30k).
+        let mut d = DrainDecision {
+            metering: false,
+            halted: false,
+            mint_permille: 1000,
+        };
+        for _ in 0..(c.meter_engage_ticks + 2) {
+            d = sm.observe(healthy_capped(cap * 9 / 10, cap));
+        }
+        assert!(d.metering);
+        let over = sm.observe(healthy_capped(90_000, cap));
+        // setpoint/backlog = 30000/90000 = 333‰ (intake ≈ 1/3 of drain).
+        assert_eq!(
+            over.mint_permille, 333,
+            "mint ratio tracks setpoint/backlog"
+        );
+        // A huge overshoot is clamped to the configured drain floor, never 0.
+        let deep = sm.observe(healthy_capped(10_000_000, cap));
+        assert_eq!(
+            deep.mint_permille, c.drain_mint_floor_permille,
+            "a deep overshoot is floored, not fully starved"
+        );
+    }
+
+    #[test]
+    fn no_setpoint_means_no_drain_down() {
+        let c = cfg();
+        let mut sm = DrainStateMachine::new(c);
+        // Absolute-band mode (backlog_cap == 0): engage metering on a deep backlog.
+        let mut d = DrainDecision {
+            metering: false,
+            halted: false,
+            mint_permille: 1000,
+        };
+        for _ in 0..(c.meter_engage_ticks + 2) {
+            d = sm.observe(healthy(c.meter_engage_backlog + 50_000));
+        }
+        assert!(d.metering, "deep backlog must engage even without a cap");
+        assert_eq!(
+            d.mint_permille, 1000,
+            "no setpoint => no drain target => 1:1 hold"
+        );
+    }
+
+    #[test]
+    fn note_completion_realises_a_fractional_mint_ratio() {
+        let mut c = cfg();
+        c.burst = 100;
+        let g = DrainGuard::new(c);
+        g.take_credits(100); // empty the bucket
+        assert_eq!(g.budget(), 0);
+
+        // 500‰: one token minted every two completions.
+        g.set_mint_permille(500);
+        g.note_completion();
+        assert_eq!(g.budget(), 0, "first half-token accumulates, no mint yet");
+        g.note_completion();
+        assert_eq!(
+            g.budget(),
+            1,
+            "second completion crosses 1000‰ -> one token"
+        );
+        g.note_completion();
+        g.note_completion();
+        assert_eq!(g.budget(), 2, "steady 1 token per 2 completions");
+
+        // Back to a 1:1 hold: every completion mints.
+        g.set_mint_permille(1000);
+        g.note_completion();
+        assert_eq!(g.budget(), 3);
+
+        // 0‰: the hard-valve regime mints nothing.
+        g.take_credits(100);
+        g.set_mint_permille(0);
+        for _ in 0..10 {
+            g.note_completion();
+        }
+        assert_eq!(g.budget(), 0, "0‰ mints nothing (hard valve owns intake)");
+    }
+
+    #[test]
     fn refill_full_repins_the_bucket() {
         let mut c = cfg();
         c.burst = 8;
@@ -843,7 +1055,8 @@ mod tests {
             sm.decision(),
             DrainDecision {
                 metering: false,
-                halted: false
+                halted: false,
+                mint_permille: 1000
             }
         );
     }

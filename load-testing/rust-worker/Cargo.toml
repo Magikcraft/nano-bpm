@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "loadgen"
 path = "src/loadgen.rs"
 
+[[bin]]
+name = "diffgen"
+path = "src/diffgen.rs"
+
 [dependencies]
 # Both binaries drive the gateway through the published Rust SDK, which
 # transparently selects the Falcon command stream or REST long-poll based on the
