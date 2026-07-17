@@ -190,12 +190,27 @@ GCP 3-node RF=3 P=12, clean journal, latency mode. Required scenarios:
    whose instances still drain healthily keeps full admission. (The scenario no
    prior design could pass — and per-definition backlog is *more* precise here than
    the earlier per-type fan-in, which would have over-throttled the healthy one.)
+
+   **PASS** (binsha `0620df4683d8b881` = commit `8042ae5`, `load-testing/scenarios/tier2-diff`
+   driven by `diffgen`, both lanes offered 2000 creates/s; `orders-slow` adds a
+   starved `slow-job` pool of 4 workers × 250 ms ≈ 16 jobs/s while the shared
+   `common-job` pool of 128 keeps up). Measured over the sickened window:
+
+   | definition | Tier-2 pressure | shed | admitted | tput | e2e p50 |
+   |---|---|---|---|---|---|
+   | `orders-slow` (sick) | **1000‰** | 946/s | 669/s | 15/s | 28.4 s |
+   | `orders-fast` (healthy, shares `common-job`) | **0‰** | 0/s | 1195/s | 1196/s | **16 ms** |
+
+   The compressor drove `orders-slow` to full shed while `orders-fast` — sharing the
+   *same* `common-job` type — stayed at zero pressure with full admission and a
+   16 ms p50. A per-job-type detector on the shared `common-job` (never itself
+   congested) could not have isolated this; per-definition backlog does.
 2. **External-strain latency bound:** the old Test A (slow workers, deep backlog).
    EXPECT intake throttled to bleed the backlog to `W_target · λ` (bounded sojourn),
    *no* oscillation.
 3. **Shared-write-path overload:** the old Test B (create-flood). EXPECT the Tier-1
-   global guard engages on the commit path (once its signal is chosen) and holds a
-   stable operating point — no monotonic clamp, no sawtooth.
+   global guard (`nanobpm_tier1_pressure`) engages on the raft-fsync latency knee and
+   holds a stable operating point — no monotonic clamp, no sawtooth.
 4. **Cold-start into a storm:** no learning window available. EXPECT correct throttle
    on the first ticks (scale-free signals require no baseline).
 
