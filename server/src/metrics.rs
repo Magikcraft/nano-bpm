@@ -723,7 +723,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let backlog_governor = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_backlog_governor",
-            "Auto-mode active-backlog governor live state (field=floor|ceiling are runnable-job cap bounds; baseline_latency_us|window_latency_us are per-command latencies). Explains where the governor holds nanobpm_admission_limit{limit=\"backlog\"}.",
+            "Auto-mode active-backlog governor live state (field=floor|ceiling are runnable-job cap bounds; rho_permille|rho_target_permille are engine-actor saturation ρ and its setpoint in per-mille; growth_per_s is the signed runnable-backlog growth rate). Explains where the governor holds nanobpm_admission_limit{limit=\"backlog\"}.",
         ),
         &["field"],
     )
