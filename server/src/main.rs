@@ -58,8 +58,9 @@ use nanobpmn_engine_core::{
 };
 
 use crate::backpressure::{
-    AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, ProcGovConfig,
-    ProcessGovernors, SharedSlaMode, SlaMode, parse_backpressure_setting, parse_sla_mode,
+    AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, GlobalGuard,
+    ProcGovConfig, ProcessGovernors, SharedSlaMode, SlaMode, Tier1Config,
+    parse_backpressure_setting, parse_sla_mode,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -197,6 +198,13 @@ pub struct ServerImpl {
     procgov: Arc<ProcessGovernors>,
     /// Whether Tier-2 per-definition admission actuates (else it observes only).
     tier2_enabled: bool,
+    /// ADR-0020 **Tier-1** global engine-saturation guard: throttles *all* intake
+    /// when the shared write path (raft-log fsync) crosses its latency knee — the
+    /// bottleneck class that saturates every definition at once and that
+    /// per-definition Tier-2 cannot see. Stepped each ~1 Hz monitor tick from the
+    /// windowed fsync latency; consulted per `createProcessInstance`. Actuates only
+    /// in [`SlaMode::Latency`]; `NANOBPMN_TIER1` (default on) gates it.
+    guard: Arc<GlobalGuard>,
     /// Cheap, monitor-refreshed `processDefinitionKey` → BPMN `process_id` index,
     /// so the admission gate can resolve a create-by-key to the same identifier the
     /// [`procgov`](Self::procgov) counters use without an engine round-trip on the
@@ -736,6 +744,18 @@ impl ServerImpl {
         );
         let def_key_to_process_id =
             Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // ADR-0020 Tier-1: global engine-saturation guard on the raft-log fsync
+        // latency knee. Always built (the pressure is a monitoring surface);
+        // NANOBPMN_TIER1 (default on) gates actuation and it only sheds in latency
+        // mode. It is the backstop for the shared-write-path bottleneck class that
+        // per-definition Tier-2 cannot see.
+        let tier1_cfg = Tier1Config::from_env();
+        let guard = Arc::new(GlobalGuard::new(tier1_cfg));
+        tracing::info!(
+            "ADR-0020 Tier-1 global engine-saturation guard: {} (config {:?})",
+            if tier1_cfg.enabled { "on" } else { "off" },
+            tier1_cfg,
+        );
         // The unified setpoint, recomputed each monitor tick. Seed at 0 (no clamp)
         // until the first tick folds in the live latency + memory signals.
         let effective_backlog_cap = Arc::new(AtomicUsize::new(0));
@@ -923,6 +943,7 @@ impl ServerImpl {
             backlog_gov,
             procgov,
             tier2_enabled,
+            guard,
             def_key_to_process_id,
             backlog_cap_floor,
             backlog_cap_ceiling,
@@ -3329,6 +3350,16 @@ impl ServerImpl {
             ) => (None, Some(b.process_definition_key.0.clone())),
         };
 
+        // ADR-0020 Tier-1: shed if the engine's shared write path (raft-log fsync)
+        // is saturated — the global bottleneck that hits every definition at once,
+        // which per-definition Tier-2 cannot see. Checked first (cheaper, global).
+        if let Some(message) = self.tier1_should_shed() {
+            return Ok(Resp::Status503_TheServiceIsCurrentlyUnavailable(problem(
+                "RESOURCE_EXHAUSTED",
+                503,
+                message,
+            )));
+        }
         // ADR-0020 Tier-2: shed this definition's create if it is accumulating
         // in-flight backlog past its end-to-end latency budget (latency mode only),
         // leaving healthy siblings — even ones sharing a job type — fully admitted.
@@ -5710,6 +5741,11 @@ impl ServerImpl {
             && let Some(reason) = self.create_should_shed()
         {
             return Err((503, format!("{PLACEMENT_SHED_MARKER} {reason}")));
+        }
+        // ADR-0020 Tier-1: a forwarded create is still subject to the owner node's
+        // global engine-saturation guard (the shared write path is this node's).
+        if let Some(message) = self.tier1_should_shed() {
+            return Err((503, message));
         }
         // ADR-0020 Tier-2: a forwarded create is still subject to the target
         // definition's per-definition latency budget on the owner node.
@@ -10099,6 +10135,12 @@ impl ServerImpl {
         by_key: Option<String>,
         variables: std::collections::HashMap<String, Value>,
     ) -> Result<(nanobpmn_engine_core::Key, bool), (u16, String)> {
+        // ADR-0020 Tier-1: shed if the engine's shared write path (raft-log fsync)
+        // is saturated — the global bottleneck that hits every definition at once.
+        // Checked first (cheaper, global) before any engine/Raft work.
+        if let Some(message) = self.tier1_should_shed() {
+            return Err((503, message));
+        }
         // ADR-0020 Tier-2: shed this definition's create if it is accumulating
         // in-flight backlog past its latency budget (latency mode only). Checked
         // first so an over-budget definition is rejected before any engine/Raft
@@ -11445,6 +11487,30 @@ impl ServerImpl {
                  accumulating in-flight backlog beyond its end-to-end latency budget. Retry \
                  after a backoff."
             ));
+        }
+        None
+    }
+
+    /// ADR-0020 **Tier-1** global engine-saturation admission gate. Sheds a paced
+    /// fraction of *all* creates when the engine's shared write path (raft-log
+    /// fsync) is the bottleneck — the class that saturates every definition at
+    /// once, which per-definition Tier-2 cannot see. Actuates only in
+    /// [`SlaMode::Latency`] with the feature enabled (the monitor keeps the guard's
+    /// published pressure at zero otherwise). Cheap on the hot path: a single brief
+    /// mutex on the guard's published pressure; zero-pressure (the common case)
+    /// never sheds.
+    pub(crate) fn tier1_should_shed(&self) -> Option<String> {
+        if !self.sla_mode.get().sheds_for_latency() {
+            return None;
+        }
+        if self.guard.should_shed() {
+            crate::metrics::record_admission_shed("tier1_global");
+            return Some(
+                "Admission control (ADR-0020 Tier-1): the engine's shared write path (raft-log \
+                 fsync) is saturated; intake is throttled to preserve end-to-end latency. Retry \
+                 after a backoff."
+                    .to_string(),
+            );
         }
         None
     }
@@ -13954,6 +14020,13 @@ async fn main() {
                         } else {
                             0.0
                         };
+                        // ADR-0020 Tier-1: fold the same windowed raft-fsync latency
+                        // into the global engine-saturation guard. It actuates only
+                        // in latency mode; when inactive it releases to zero. Publish
+                        // the resulting shed fraction for observability.
+                        let tier1_active = monitor_server.sla_mode.get().sheds_for_latency();
+                        let tier1_permille = monitor_server.guard.step(fsync_avg_us, tier1_active);
+                        crate::metrics::set_tier1_pressure(tier1_permille as i64);
                         let displaced = monitor_server.recovery_fsync_load_active();
                         // Fold in the post-hand-off catch-up hold: stay engaged
                         // while any led partition is still feeding a peer that lags

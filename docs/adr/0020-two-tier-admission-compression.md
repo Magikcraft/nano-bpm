@@ -90,6 +90,22 @@ recovery throttle already consumes). This is the correct home for the
 engine's shared write machinery) are saturated, independent of any worker pool.
 It is a backstop, not the primary actuator.
 
+**Implementation (`GlobalGuard` in `backpressure.rs`).** A single node-level
+compressor on the smoothed raft-fsync latency. It calibrates a healthy baseline
+(snap-down-to-min, slow creep-up), *floored* at `baseline_floor_us` (default
+0.5 ms) so a near-zero idle baseline can't make the knee trivially crossable;
+the knee is `max(baseline, floor) · congestion_ratio` (default 2×). Above the
+knee it freezes the baseline and **attacks** (pressure `p ∈ [0,1]` rises,
+steepening with the fractional overshoot past the knee); below it, it releases
+slowly (attack/release asymmetry damps oscillation). The monitor steps it each
+~1 Hz tick with the windowed `fsync_avg_us` (reusing the delta already computed
+for the recovery throttle) and only actuates in latency mode; admission sheds a
+paced `p·1000` per-mille fraction of **all** creates via a deterministic
+accumulator (no RNG), at all three create entry points, checked before Tier-2.
+Env: `NANOBPMN_TIER1` (default on) + `NANOBPMN_TIER1_{RATIO,ATTACK,ATTACK_GAIN,
+RELEASE,EWMA,CREEP,FLOOR_US}`. Published as `nanobpm_tier1_pressure` (per-mille,
+node-level gauge).
+
 ### Tier 2 — Per-process-definition backlog compressors
 
 The primary latency-preservation loop. An earlier draft detected congestion per

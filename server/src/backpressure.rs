@@ -959,6 +959,223 @@ impl ProcessGovernors {
     }
 }
 
+/// Parsed configuration for the ADR-0020 **Tier-1** global engine-saturation
+/// guard ([`GlobalGuard`]). All fields are env-tunable (`NANOBPMN_TIER1_*`) but
+/// default to a conservative operating point: the guard is a *backstop* that only
+/// engages when the engine's own shared write path (the raft-log fsync) crosses
+/// its latency knee, and it compresses all intake gently (well below Tier-2's
+/// per-definition attack) so it never becomes the primary actuator.
+#[derive(Clone, Copy, Debug)]
+pub struct Tier1Config {
+    /// Master switch (`NANOBPMN_TIER1`, default **on**). When off the guard never
+    /// sheds (`should_shed` always false); the monitor still publishes 0.
+    pub enabled: bool,
+    /// Smoothed fsync latency above `max(baseline, floor) · congestion_ratio`
+    /// counts as the shared write path saturating and drives an attack.
+    pub congestion_ratio: f64,
+    /// Per-tick pressure rise (fast attack) when saturating, before the severity
+    /// steepening.
+    pub attack: f64,
+    /// Proportional gain on the attack: steepens the rise with the fractional
+    /// overshoot past the knee, so a hard wall clamps in a few ticks while a mild
+    /// overshoot is nudged gently.
+    pub attack_gain: f64,
+    /// Per-tick pressure fall (slow release) when the write path has headroom. The
+    /// attack/release asymmetry is the anti-oscillation term.
+    pub release: f64,
+    /// EWMA weight on the newest fsync-latency sample (0–1, smaller = smoother).
+    pub ewma: f64,
+    /// Upward drift of the healthy baseline when no faster sample is seen (so a
+    /// permanently slower disk isn't throttled forever). Snap-down is immediate.
+    pub baseline_creep: f64,
+    /// Floor (µs) applied to the calibrated baseline when computing the knee, so a
+    /// near-zero idle baseline can't make the threshold trivially crossable — the
+    /// idle raft fsync is sub-ms; the load knee is ~2.4–3 ms.
+    pub baseline_floor_us: f64,
+}
+
+impl Default for Tier1Config {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            congestion_ratio: 2.0,
+            attack: 0.15,
+            attack_gain: 2.0,
+            release: 0.05,
+            ewma: 0.3,
+            baseline_creep: 0.05,
+            baseline_floor_us: 500.0,
+        }
+    }
+}
+
+impl Tier1Config {
+    /// Resolve the config from the `NANOBPMN_TIER1_*` environment, falling back to
+    /// [`Default`] for any unset/unparseable knob.
+    pub fn from_env() -> Self {
+        let d = Self::default();
+        let enabled = match std::env::var("NANOBPMN_TIER1") {
+            Ok(v) => {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            }
+            Err(_) => d.enabled,
+        };
+        let f = |key: &str, def: f64| -> f64 {
+            std::env::var(key)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|x| x.is_finite())
+                .unwrap_or(def)
+        };
+        Self {
+            enabled,
+            congestion_ratio: f("NANOBPMN_TIER1_RATIO", d.congestion_ratio),
+            attack: f("NANOBPMN_TIER1_ATTACK", d.attack),
+            attack_gain: f("NANOBPMN_TIER1_ATTACK_GAIN", d.attack_gain),
+            release: f("NANOBPMN_TIER1_RELEASE", d.release),
+            ewma: f("NANOBPMN_TIER1_EWMA", d.ewma).clamp(0.0, 1.0),
+            baseline_creep: f("NANOBPMN_TIER1_CREEP", d.baseline_creep),
+            baseline_floor_us: f("NANOBPMN_TIER1_FLOOR_US", d.baseline_floor_us),
+        }
+    }
+}
+
+/// Interior controller state, mutated only by the monitor `step`.
+#[derive(Default)]
+struct GuardState {
+    /// Low-pass EWMA of the window-mean raft-log fsync latency (µs). `None` until
+    /// the first non-empty window seeds it.
+    ewma_us: Option<f64>,
+    /// Calibrated healthy-window fsync baseline (µs). `None` until seeded.
+    baseline_us: Option<f64>,
+    /// The control output p ∈ [0,1] (0 = healthy, 1 = fully shed).
+    pressure: f64,
+}
+
+/// The ADR-0020 **Tier-1** global engine-saturation guard: a single node-level
+/// compressor on the shared write path's saturation signal (raft-log fsync
+/// latency). It throttles *all* intake when the engine's own commit machinery is
+/// the bottleneck — the class the apply-loop ρ signal mis-located — independent
+/// of any worker pool. The monitor calls [`GlobalGuard::step`] once per tick with
+/// the window-mean fsync latency; admission calls [`GlobalGuard::should_shed`]
+/// per `createProcessInstance`. The final admission decision is the intersection
+/// with Tier-2: shed if *either* tier sheds.
+pub struct GlobalGuard {
+    cfg: Tier1Config,
+    state: std::sync::Mutex<GuardState>,
+    /// Published shed fraction (per-mille) + accumulator, read (and advanced) by
+    /// admission — separated from `state` so the hot path takes only this brief,
+    /// uncontended lock.
+    published: std::sync::Mutex<PubPressure>,
+    verbose: bool,
+}
+
+impl GlobalGuard {
+    pub fn new(cfg: Tier1Config) -> Self {
+        Self {
+            cfg,
+            state: std::sync::Mutex::new(GuardState::default()),
+            published: std::sync::Mutex::new(PubPressure::default()),
+            verbose: std::env::var_os("NANOBPM_ACTOR_PROFILE").is_some(),
+        }
+    }
+
+    /// Fold one monitor tick. `fsync_avg_us` is the window-mean raft-log fsync
+    /// latency this tick (µs), from the delta of `nanobpm_raft_fsync_seconds`
+    /// sum/count (`0` = no fsyncs this window → treated as idle/healthy, releasing
+    /// gently without disturbing the baseline). `active` is whether Tier-1 should
+    /// actuate at all (latency SLA mode + feature enabled); when false the guard
+    /// releases to zero. Returns the published shed fraction in per-mille (for the
+    /// `nanobpm_tier1_pressure` gauge).
+    pub fn step(&self, fsync_avg_us: f64, active: bool) -> u32 {
+        let mut st = self.state.lock().unwrap();
+
+        if !self.cfg.enabled || !active {
+            st.pressure = 0.0;
+            self.publish(0);
+            return 0;
+        }
+
+        // Empty window (idle, no writes): not saturation. Release gently and leave
+        // the smoothed signal / baseline untouched.
+        if fsync_avg_us <= 0.0 {
+            st.pressure = (st.pressure - self.cfg.release).max(0.0);
+            let permille = (st.pressure * 1000.0).round().clamp(0.0, 1000.0) as u32;
+            self.publish(permille);
+            return permille;
+        }
+
+        // Low-pass the signal.
+        let signal = {
+            let s = match st.ewma_us {
+                Some(prev) => self.cfg.ewma * fsync_avg_us + (1.0 - self.cfg.ewma) * prev,
+                None => fsync_avg_us,
+            };
+            st.ewma_us = Some(s);
+            s
+        };
+        if st.baseline_us.is_none() {
+            st.baseline_us = Some(signal);
+        }
+        let baseline = st
+            .baseline_us
+            .unwrap_or(signal)
+            .max(self.cfg.baseline_floor_us);
+        let threshold = baseline * self.cfg.congestion_ratio;
+
+        if signal > threshold {
+            // Shared write path saturating: freeze the baseline (never adapt it
+            // toward the congested latency) and attack, steepening with the
+            // fractional overshoot past the knee.
+            let severity = (signal / threshold - 1.0).clamp(0.0, 1.0);
+            let step = self.cfg.attack * (1.0 + self.cfg.attack_gain * severity);
+            st.pressure = (st.pressure + step).min(1.0);
+            if self.verbose {
+                tracing::info!(
+                    "tier1: fsync_avg={signal:.0}us knee={threshold:.0}us severity={severity:.2} \
+                     p={:.0}permille",
+                    st.pressure * 1000.0,
+                );
+            }
+        } else {
+            // Headroom: calibrate the baseline (snap down to the min seen, else
+            // creep up slowly) and release.
+            st.baseline_us = Some(match st.baseline_us {
+                Some(b) if signal < b => signal,
+                Some(b) => b + (signal - b) * self.cfg.baseline_creep,
+                None => signal,
+            });
+            st.pressure = (st.pressure - self.cfg.release).max(0.0);
+        }
+
+        let permille = (st.pressure * 1000.0).round().clamp(0.0, 1000.0) as u32;
+        self.publish(permille);
+        permille
+    }
+
+    fn publish(&self, permille: u32) {
+        self.published.lock().unwrap().permille = permille;
+    }
+
+    /// Admission hook: return `true` if this `createProcessInstance` should be shed
+    /// under the current global guard pressure. Sheds a `permille/1000` fraction of
+    /// *all* creates, spread evenly by an accumulator (no RNG, deterministic).
+    /// Zero-pressure (the common case) is a single cheap lock with no shed.
+    pub fn should_shed(&self) -> bool {
+        let mut pubm = self.published.lock().unwrap();
+        if pubm.permille == 0 {
+            return false;
+        }
+        pubm.acc += pubm.permille as u64;
+        if pubm.acc >= 1000 {
+            pubm.acc -= 1000;
+            return true;
+        }
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1577,5 +1794,116 @@ mod tests {
         );
         // An unknown definition is never shed.
         assert!(!g.should_shed("unknown-definition"));
+    }
+
+    // ── ADR-0020 Tier-1 global engine-saturation guard ───────────────────────
+
+    fn tight_guard() -> GlobalGuard {
+        GlobalGuard::new(Tier1Config {
+            enabled: true,
+            congestion_ratio: 2.0,
+            attack: 0.25,
+            attack_gain: 2.0,
+            release: 0.05,
+            ewma: 1.0, // no smoothing lag in tests: signal == latest sample
+            baseline_creep: 0.05,
+            baseline_floor_us: 500.0,
+        })
+    }
+
+    #[test]
+    fn tier1_healthy_write_path_never_sheds() {
+        let g = tight_guard();
+        // Idle-then-healthy raft fsync (sub-ms, under the floored knee): baseline
+        // calibrates, pressure stays at zero.
+        for _ in 0..10 {
+            assert_eq!(g.step(700.0, true), 0);
+        }
+        assert!(!g.should_shed());
+    }
+
+    #[test]
+    fn tier1_attacks_when_the_fsync_knee_is_crossed_and_releases_on_recovery() {
+        let g = tight_guard();
+        // Calibrate a healthy baseline of ~0.7ms (floored to 500us → knee 1ms).
+        assert_eq!(g.step(700.0, true), 0);
+
+        // Shared write path saturates (fsync 3ms >> 1ms knee): attack.
+        let p1 = g.step(3_000.0, true);
+        let p2 = g.step(3_000.0, true);
+        assert!(p1 > 0, "crossing the fsync knee must raise pressure");
+        assert!(p2 > p1, "sustained saturation keeps rising: {p1} -> {p2}");
+
+        // Write path recovers (fsync back under the knee): release.
+        let p3 = g.step(700.0, true);
+        assert!(p3 < p2, "headroom must release pressure: {p2} -> {p3}");
+    }
+
+    #[test]
+    fn tier1_baseline_floor_prevents_spurious_trip_on_low_idle_fsync() {
+        let g = tight_guard();
+        // A near-zero idle baseline (50us) would give a 100us knee and trip on any
+        // real load; the 500us floor keeps the knee at 1ms so ~700us load is fine.
+        g.step(50.0, true); // baseline calibrates to 50us
+        for _ in 0..5 {
+            assert_eq!(
+                g.step(700.0, true),
+                0,
+                "sub-knee load must not trip the floored guard"
+            );
+        }
+    }
+
+    #[test]
+    fn tier1_inactive_or_disabled_never_sheds() {
+        // Not active (e.g. admission SLA mode): releases to zero even under a
+        // saturating signal.
+        let g = tight_guard();
+        for _ in 0..10 {
+            assert_eq!(g.step(5_000.0, false), 0);
+        }
+        assert!(!g.should_shed());
+
+        // Feature disabled: never sheds regardless of signal.
+        let g = GlobalGuard::new(Tier1Config {
+            enabled: false,
+            ..tight_guard_cfg()
+        });
+        for _ in 0..10 {
+            assert_eq!(g.step(5_000.0, true), 0);
+        }
+        assert!(!g.should_shed());
+    }
+
+    #[test]
+    fn tier1_should_shed_paces_the_pressure_fraction() {
+        let g = tight_guard();
+        g.step(700.0, true); // baseline
+        let mut permille = 0;
+        for _ in 0..20 {
+            permille = g.step(5_000.0, true); // drive pressure up under saturation
+        }
+        assert!(permille > 0);
+        let n = 10_000;
+        let shed = (0..n).filter(|_| g.should_shed()).count();
+        let expected = n * permille as usize / 1000;
+        let tol = n / 100; // ±1% of samples
+        assert!(
+            shed.abs_diff(expected) <= tol,
+            "should_shed must pace ~{permille}permille: shed {shed} vs expected {expected}"
+        );
+    }
+
+    fn tight_guard_cfg() -> Tier1Config {
+        Tier1Config {
+            enabled: true,
+            congestion_ratio: 2.0,
+            attack: 0.25,
+            attack_gain: 2.0,
+            release: 0.05,
+            ewma: 1.0,
+            baseline_creep: 0.05,
+            baseline_floor_us: 500.0,
+        }
     }
 }

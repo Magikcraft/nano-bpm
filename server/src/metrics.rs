@@ -284,6 +284,11 @@ struct Metrics {
     /// budget and a paced fraction of its creates is being shed — while healthy
     /// sibling definitions stay at 0. Only pressured definitions are published.
     tier2_pressure: prometheus::IntGaugeVec,
+    /// ADR-0020 **Tier-1** global engine-saturation guard pressure in per-mille
+    /// (0–1000): the paced fraction of *all* creates shed because the engine's
+    /// shared write path (raft-log fsync) has crossed its latency knee. 0 =
+    /// healthy write path. A single node-level gauge (no labels).
+    tier1_pressure: prometheus::IntGauge,
 
     // ---- Per-command engine-actor profiling (NANOBPM_CMD_PROFILE) ----
     /// Wall time of a single applied [`Command`](nanobpmn_engine_core::Command)
@@ -743,8 +748,13 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge vec");
 
+    let tier1_pressure = prometheus::IntGauge::new(
+        "nanobpm_tier1_pressure",
+        "ADR-0020 Tier-1 global engine-saturation guard pressure in per-mille (0-1000): the paced fraction of all creates shed because the engine's shared write path (raft-log fsync) crossed its latency knee. 0 = healthy write path.",
+    )
+    .expect("valid gauge");
+
     // Per-command actor profiling. Time buckets span 1µs .. ~16s (the multi-second
-    // stalls observed under collapse); alloc buckets span 0 B .. ~256 MB.
     let cmd_seconds = prometheus::HistogramVec::new(
         HistogramOpts::new(
             "nanobpm_cmd_seconds",
@@ -830,6 +840,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(admission_limit.clone())))
         .and(registry.register(Box::new(backlog_governor.clone())))
         .and(registry.register(Box::new(tier2_pressure.clone())))
+        .and(registry.register(Box::new(tier1_pressure.clone())))
         .and(registry.register(Box::new(cmd_seconds.clone())))
         .and(registry.register(Box::new(cmd_alloc_bytes.clone())))
         .and(registry.register(Box::new(engine_cardinality.clone())))
@@ -894,6 +905,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         admission_limit,
         backlog_governor,
         tier2_pressure,
+        tier1_pressure,
         cmd_seconds,
         cmd_alloc_bytes,
         engine_cardinality,
@@ -1128,6 +1140,14 @@ pub fn set_tier2_pressure(proc: &str, permille: i64) {
         .tier2_pressure
         .with_label_values(&[proc])
         .set(permille);
+}
+
+/// Publishes the ADR-0020 Tier-1 global engine-saturation guard pressure in
+/// per-mille (`nanobpm_tier1_pressure`), the paced shed fraction the admission
+/// gate applies to *all* creates when the shared write path (raft-log fsync) is
+/// saturated. 0 = healthy.
+pub fn set_tier1_pressure(permille: i64) {
+    METRICS.tier1_pressure.set(permille);
 }
 
 /// Publishes the per-job-type worker-provisioning gauges: waiting jobs, live
