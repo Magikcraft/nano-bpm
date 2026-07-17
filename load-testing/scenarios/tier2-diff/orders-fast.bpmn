@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_orders_fast" targetNamespace="http://bpmn.io/schema/bpmn">
+  <!--
+    ADR-0020 Tier-2 differential scenario: the HEALTHY definition.
+    A single service task on the SHARED job type `common-job`. Its workers keep up,
+    so this definition's in-flight instance backlog stays low and Tier-2 must leave
+    it fully admitted even while its sibling (orders-slow, same `common-job`) sickens.
+  -->
+  <bpmn:process id="orders-fast" name="Orders Fast" isExecutable="true">
+    <bpmn:startEvent id="fast_start">
+      <bpmn:outgoing>fast_f1</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="fast_f1" sourceRef="fast_start" targetRef="fast_common" />
+    <bpmn:serviceTask id="fast_common" name="Common">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="common-job" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>fast_f1</bpmn:incoming>
+      <bpmn:outgoing>fast_f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="fast_f2" sourceRef="fast_common" targetRef="fast_end" />
+    <bpmn:endEvent id="fast_end">
+      <bpmn:incoming>fast_f2</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>
