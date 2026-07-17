@@ -461,3 +461,56 @@ parallel axis — they stayed ~325–355 when backlog was small and spiked to 74
 only on the higher-backlog serial trial. That remains the next lever when the
 resident state machine is large (raise openraft `install_snapshot_timeout`), but
 it did not dominate at these SM sizes.
+
+## Recovered-throughput deficit: drain-bound, not reclaim-bound (2026-07-18)
+
+A follow-up investigation asked whether the delta-stream work (Option 3, above)
+would restore the recovered cluster to pre-failure throughput. It would not, for
+the general (small-payload) case — the deficit was empirically **drain-bound, not
+reclaim-bound**:
+
+- **Reclaim transfer stays cheap.** For small-payload load (`VAR_BYTES=0`) the
+  returning owner reclaimed all 4 partitions in `t_reclaim ≈ 20 s` even for a 243 s
+  outage — barely up from the 14 s of a 90 s outage. Delta-stream only shortens the
+  reclaim *transfer*, which dominates **only** for large-payload workloads (16 KB
+  vars → multi-GB snapshot; §Soak-4). So it is not the general lever.
+- **The wall is downstream of reclaim.** A rich per-node diagnostic
+  (`drain-diag.sh`: creates/s, active/runnable backlog, `drain_completes_per_sec`,
+  `backlog_recovery` clamp, `rho_permille`, `tier1_global` shed/s) localized the
+  recovered-tput deficit precisely. On the returning owner during recovery:
+  `active_backlog ≈ 0` (nothing to drain), `runnable_backlog ≈ 0`, the recovery
+  admission throttle's `backlog_recovery` clamp `≈ 0` (not clamping), `rho` low —
+  yet **creates ≈ 0** because the **Tier-1 fsync-knee guard shed the node's own
+  creates** (`tier1_pressure` near 1000‰, `tier1_global` shed ramping to ~7.5 k/s,
+  oscillating). The node's just-reclaimed partitions carry an elevated/oscillating
+  raft-fsync latency (the *depth ratchet*); Tier-1 read that as saturation and shed
+  the returning owner's admissions — which merely displaced onto the already-loaded
+  survivors, delivering **no aggregate-latency benefit**. This was the old
+  node-bounce **oscillation collapse** (recovered throughput swinging 77 ↔ 24 k/s).
+
+### Fix shipped: Tier-1 recovery-relax (the admission half)
+
+The gratuitous shedding is addressed in ADR-0020 (`GlobalGuard` recovery-relax):
+during a recovery window Tier-1 defers its soft knee to the recovery admission
+throttle and only sheds past a wide hard-ceiling backstop. Validated A/B
+(binsha `578efd7248d52a23`, 90 s bounce, RATE=14000, recovered t=155–300):
+
+| arm | recovered mean/s | recovered min/s | returning-owner creates/s (median) |
+|---|---|---|---|
+| soft-knee shed in recovery (OFF) | 4,324 | 77 (collapse) | 0 |
+| recovery-relax (ON) | 28,923 | 20,701 (stable) | 1,107 |
+
+Baseline ≈ 38,500/s. This **eliminates the oscillation collapse** and restores a
+stable ≈75%-of-baseline recovery with the returning owner participating.
+
+### Still open: the completion-latency half (Option 1 territory)
+
+Recovery-relax fixes admission but **not** the residual ~25% mean deficit vs
+baseline. That residual is **completion-latency-bound**: the returning owner's deep,
+just-reclaimed partitions have a slow/oscillating fsync, so their instances
+*complete* slowly, and the completion-paced cluster runs below baseline while they
+catch up. Closing it needs a **depth/fsync lever on the returning owner** — e.g.
+compaction/snapshot-truncate the reclaimed partitions back to a shallow, fast-fsync
+depth, or bound the failover-window log retention so the depth ratchet never forms
+(distinct from the delta-stream transfer optimization). Deferred; tracked here as
+the next recovered-throughput lever.
