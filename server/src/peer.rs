@@ -878,14 +878,12 @@ impl PeerSet {
         if let Some(link) = self.cached_live_link(node_id).await {
             return Ok(link);
         }
-        // Circuit-breaker: if the peer is marked down and still within its
-        // cooldown (and this call is not the admitted probe), fast-fail without
-        // dialing. This is what collapses the redial storm to a dead peer.
-        if !self.breaker_admit_dial(node_id).await {
-            return Err(PeerError::Connect(format!(
-                "node {node_id} circuit-open (unreachable, cooling down)"
-            )));
-        }
+        // Circuit-breaker fast path removed here: the admit check *reserves* the
+        // cooldown probe (advances `last_probe`), so it must run exactly once per
+        // dial attempt. Running it here as well as under the lock would make the
+        // reserving caller fail its own second check and never dial. We instead
+        // gate once, under the connect lock, below.
+        //
         // Serialize the dial per-peer WITHOUT the global `links` lock, so a slow
         // connect to this peer cannot freeze cache hits or dials to other peers.
         let connect_lock = self.connect_lock_for(node_id).await;
@@ -893,6 +891,18 @@ impl PeerSet {
         // Re-check: another caller may have connected while we waited on the lock.
         if let Some(link) = self.cached_live_link(node_id).await {
             return Ok(link);
+        }
+        // Circuit-breaker gate, *under* the connect lock. Placing it here (rather
+        // than before the lock) collapses the redial storm to a dead peer to one
+        // dial per cooldown even on the first failure wave: when a healthy peer
+        // dies, a whole concurrent burst of callers passes `cached_live_link` and
+        // queues on the lock; the first to acquire it dials and — on failure —
+        // marks the peer down, so every subsequent caller in the burst re-checks
+        // here, finds the breaker open, and fast-fails instead of redialing.
+        if !self.breaker_admit_dial(node_id).await {
+            return Err(PeerError::Connect(format!(
+                "node {node_id} circuit-open (unreachable, cooling down)"
+            )));
         }
         let addr = self
             .topology
@@ -1237,6 +1247,50 @@ mod tests {
         assert!(
             !probe.contains("circuit-open"),
             "post-cooldown call must re-dial, got: {probe}"
+        );
+    }
+
+    /// A *concurrent burst* of dials to a peer that was still healthy at entry
+    /// (breaker empty, so the pre-lock fast path admits everyone) collapses to a
+    /// single real dial: the first caller to win the per-peer connect lock dials
+    /// and — on failure — marks the peer down, and every other caller in the burst
+    /// then re-checks the breaker *under the lock* and short-circuits. Regression
+    /// test for the redial storm that occurred when the breaker was checked only
+    /// *before* acquiring the connect lock: the whole burst passed the gate before
+    /// anyone marked the peer down, so all of them dialled.
+    #[tokio::test]
+    async fn breaker_collapses_a_concurrent_dial_burst_to_one_dial() {
+        let peers = std::sync::Arc::new(peers_with_dead_peer());
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let p = std::sync::Arc::clone(&peers);
+            handles.push(tokio::spawn(async move {
+                p.link(1).await.err().map(|e| e.to_string())
+            }));
+        }
+
+        let mut real_dials = 0;
+        let mut short_circuits = 0;
+        for h in handles {
+            let msg = h
+                .await
+                .expect("task panicked")
+                .expect("dead peer: every dial must fail");
+            if msg.contains("circuit-open") {
+                short_circuits += 1;
+            } else {
+                real_dials += 1;
+            }
+        }
+
+        assert_eq!(
+            real_dials, 1,
+            "exactly one caller in the burst may actually dial a dead peer"
+        );
+        assert_eq!(
+            short_circuits, 15,
+            "every other caller in the burst must short-circuit under the connect lock"
         );
     }
 }

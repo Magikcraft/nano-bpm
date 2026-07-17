@@ -310,11 +310,17 @@ impl DrainGuard {
             // Never mint (would fully starve intake); left to the hard valve.
             return;
         }
-        // Fractional mint: accumulate ‰ and release a whole token each time we
-        // cross 1000. `permille <= 1000`, so each completion crosses at most once.
-        let after = self.mint_acc.fetch_add(permille, Ordering::Relaxed) + permille;
-        if after >= 1000 {
-            self.mint_acc.fetch_sub(1000, Ordering::Relaxed);
+        // Fractional mint: accumulate ‰ into a monotonic total and mint one token
+        // each time that total crosses a whole-1000 boundary. `permille <= 1000`,
+        // so each completion crosses at most one boundary. Deriving the crossing
+        // from `fetch_add`'s own before/after is race-safe: each concurrent caller
+        // gets an exact, disjoint [before, after) interval, so a given boundary
+        // k·1000 is claimed by exactly one caller — no lost or double mints, and
+        // (unlike a separate compensating `fetch_sub`) the accumulator never drifts
+        // negative under a concurrent completion burst.
+        let before = self.mint_acc.fetch_add(permille, Ordering::Relaxed);
+        let after = before + permille;
+        if after / 1000 > before / 1000 {
             self.mint_one();
         }
     }
