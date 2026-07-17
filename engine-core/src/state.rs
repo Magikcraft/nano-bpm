@@ -727,6 +727,22 @@ pub struct State {
     /// when a job is created and the whole entry is removed when the instance is
     /// evicted.
     pub jobs_by_instance: HashMap<Key, std::collections::HashSet<Key>>,
+    /// Per-process-definition **in-flight instance count** (created but not yet
+    /// terminal), keyed by BPMN process id. Maintained by [`apply_event`] at
+    /// `ProcessInstanceCreated` (+1) and the terminal transitions
+    /// `ProcessInstanceCompleted`/`ProcessInstanceTerminated` (−1) — the *logical*
+    /// lifecycle, unaffected by cold spill/rehydrate (those never change
+    /// `instance.state`). This is the ADR-0020 Tier-2 signal `L_P`: bounding it
+    /// bounds each definition's e2e instance sojourn `W_P = L_P/λ_P`. A definition
+    /// drops out of the map once its count returns to zero.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub inflight_by_process: HashMap<String, u64>,
+    /// Per-process-definition cumulative **created** count (monotonic), keyed by
+    /// BPMN process id. The monitor differences it across ticks to get each
+    /// definition's create rate `λ_P` for the Tier-2 throughput-scaled band
+    /// `L*_P = W_target·λ_P`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub created_by_process: HashMap<String, u64>,
 }
 
 /// A self-contained snapshot of one process instance and every entity it owns
@@ -844,6 +860,38 @@ pub(crate) fn resync_job_index(state: &mut State, job_key: Key) {
     }
 }
 
+/// Reads the process id of `instance_key` **iff** it is currently non-terminal,
+/// so the caller can decrement the per-definition in-flight counter exactly once
+/// (idempotent-safe against a re-delivered terminal event that finds the instance
+/// already Completed/Terminated).
+fn non_terminal_process_id(state: &State, instance_key: &Key) -> Option<String> {
+    match state.instances.get(instance_key) {
+        Some(i)
+            if !matches!(
+                i.state,
+                ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+            ) =>
+        {
+            Some(i.process_id.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Decrements a definition's in-flight instance count on a terminal transition,
+/// dropping the entry when it reaches zero (keeps the map bounded by the set of
+/// definitions with live instances). `None` = the transition was a no-op (already
+/// terminal / unknown instance), so nothing is decremented.
+fn decrement_inflight_by_process(state: &mut State, process_id: Option<String>) {
+    let Some(pid) = process_id else { return };
+    if let Some(count) = state.inflight_by_process.get_mut(&pid) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            state.inflight_by_process.remove(&pid);
+        }
+    }
+}
+
 /// Applies a single [`Event`] to [`State`]. This is the sole mutator of engine
 /// state; the processor never mutates [`State`] directly.
 pub fn apply(state: &mut State, event: &Event) {
@@ -881,6 +929,14 @@ pub fn apply(state: &mut State, event: &Event) {
             tags,
             business_id,
         } => {
+            *state
+                .inflight_by_process
+                .entry(process_id.clone())
+                .or_insert(0) += 1;
+            *state
+                .created_by_process
+                .entry(process_id.clone())
+                .or_insert(0) += 1;
             state.instances.insert(
                 *instance_key,
                 ProcessInstance {
@@ -1275,6 +1331,7 @@ pub fn apply(state: &mut State, event: &Event) {
         }
 
         Event::ProcessInstanceCompleted { instance_key } => {
+            let terminal_pid = non_terminal_process_id(state, instance_key);
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.state = ProcessInstanceState::Completed;
                 // A terminal instance's variables are never read from hot state
@@ -1291,9 +1348,11 @@ pub fn apply(state: &mut State, event: &Event) {
                 instance.scope_variables.clear();
                 instance.scope_parents.clear();
             }
+            decrement_inflight_by_process(state, terminal_pid);
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
+            let terminal_pid = non_terminal_process_id(state, instance_key);
             // Close any incident still active on the instance: with the instance
             // gone the parked tokens are gone too, so `hasIncident` must clear.
             // The resource cancellations (jobs/timers/subscriptions) were emitted
@@ -1319,6 +1378,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 instance.scope_variables.clear();
                 instance.scope_parents.clear();
             }
+            decrement_inflight_by_process(state, terminal_pid);
         }
 
         Event::TimerCreated {

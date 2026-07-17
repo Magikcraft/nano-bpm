@@ -1,7 +1,9 @@
-# ADR 0020 — Two-tier admission compression: a global engine-saturation guard + per-job-type backlog compressors fanned out to per-process throttling
+# ADR 0020 — Two-tier admission compression: a global engine-saturation guard + per-process-definition backlog compressors
 
 Status: **Proposed — accepted for implementation.**
-Date: 2026-07-17.
+Date: 2026-07-17. Revised 2026-07-18 (Tier-2 keyed on per-process-definition
+in-flight backlog directly, replacing the per-job-type detect + per-process
+fan-in design; Tier-1 signal resolved to raft-log fsync latency).
 Relates to: ADR 0013 (SLA modes & the compressor/limiter model), ADR 0017 (worker-concurrency governor), ADR 0012 (decoupling terminal state from exporter lag), `server/src/backpressure.rs`, `server/src/drain_guard.rs`, `server/src/deepthi.rs`, `server/src/main.rs`, `docs/distributed-scaling-design.md`.
 
 ## Context
@@ -48,14 +50,16 @@ Two structural facts fell out of that soak and the analysis around it:
 
 The engine is a **general product deployed into heterogeneous environments** with
 many process definitions and many independently-scaled worker pools. A single
-*global* backlog signal cannot express that heterogeneity: if one job type's
-workers die and its backlog explodes, a global compressor throttles admission of
-**every** process — punishing healthy workloads for one sick one. Heterogeneity
-therefore forces **per-job-type decomposition**.
+*global* backlog signal cannot express that heterogeneity: if one workload's
+backlog explodes, a global compressor throttles admission of **every** process —
+punishing healthy workloads for one sick one. Heterogeneity therefore forces
+**per-process-definition decomposition** (regulate each user workload by its own
+accumulating backlog).
 
-Finally, the create-flood soak showed a bottleneck class that is **not** per-type:
-a **shared internal write path** (raft commit / disk fsync / apply) that saturates
-*all* types at once. Per-type decomposition cannot see it; it needs a **global**
+Finally, the create-flood soak showed a bottleneck class that is **not**
+per-definition: a **shared internal write path** (raft commit / disk fsync / apply)
+that saturates *all* definitions at once. Per-definition decomposition cannot see
+it; it needs a **global**
 guard. The two bottleneck classes are orthogonal.
 
 ## Decision
@@ -64,63 +68,74 @@ Adopt a **two-tier admission compressor**, gated on in latency mode. The final
 admission decision is the **intersection** of the two tiers:
 
 ```
-admit(createProcessInstance P)  ⟺  global_engine_headroom > 0
-                                AND  admit_pressure(P) < 1
+admit(createProcessInstance P)  ⟺  global_engine_headroom > 0   (Tier 1)
+                                AND  p_P < 1                     (Tier 2, P's own backlog)
 ```
 
 ### Tier 1 — Global engine-saturation guard (the shared write path is *ours*)
 
 A single node-level guard that throttles **all** intake when the engine's own
 **shared write path** is the bottleneck — the class ρ was reaching for but
-mis-located. It keys on a signal that actually binds on the commit path, i.e. the
-**raft commit-wait / log-fsync busy fraction** (see Consequences → open item on the
-exact signal), *not* the apply-loop busy fraction. This is the correct home for the
-*isolated-server / fault-attribution* frame: it fires only when **we** (the engine's
-shared write machinery) are saturated, independent of any worker pool. It is a
-backstop, not the primary actuator.
+mis-located. A read-only GCP diagnostic (150k-offered create-flood, binsha
+`5e2e280c`) localized the wall to the **raft-log fsync**: `raft_fsync` ran
+~737–790/s at ~2.4 ms latency (aggregate ~1.78 fsync-seconds/s per node, spread
+concurrently across the node's partition logs), dwarfing the varstore
+`journal_fsync` (~260/s, 0.79 s/s), while **commit-wait stayed ~75 µs**
+(batch-amortized — a *poor* signal). So Tier-1 keys on the **raft-log fsync
+latency knee** (~2.4–3 ms under load vs sub-ms idle), *not* the apply-loop busy
+fraction and *not* commit-wait. The signal path already exists:
+`metrics::raft_fsync_sum_count()` (the windowed mean `raft_fsync_avg_us` the
+recovery throttle already consumes). This is the correct home for the
+*isolated-server / fault-attribution* frame: it fires only when **we** (the
+engine's shared write machinery) are saturated, independent of any worker pool.
+It is a backstop, not the primary actuator.
 
-### Tier 2 — Per-job-type backlog compressors, fanned out to per-process throttling
+### Tier 2 — Per-process-definition backlog compressors
 
-The primary latency-preservation loop. It resolves a structural mismatch unique to
-a workflow engine: **the congestion unit and the actuation unit differ.**
+The primary latency-preservation loop. An earlier draft detected congestion per
+**job type** and reconstructed a per-process pressure by fanning in
+(`max_{t∈types(P)} p_t`) over a statically-derived process→job-type incidence
+map. That indirection existed only to answer *"given a shared job type is
+backing up, which `createProcessInstance` calls do I throttle?"* — a question
+that **dissolves** once we measure a process definition's own backlog directly.
+Keying Tier-2 on **per-definition in-flight instance backlog** makes the
+detection unit equal the actuation unit (`createProcessInstance(P)` ↔ P's own
+backlog), and is strictly *more precise*: if processes `A` and `B` share a
+congested job type but only `B` is accumulating, per-definition backlog throttles
+only `B`, whereas fan-in would over-throttle healthy `A`.
 
-- **Congestion is per *job type*.** Workers subscribe by job type, so each job type
-  has an independent worker pool and its own drain rate `λ_t`. Backlog accumulates
-  per type; one sick type is independent of the others.
-- **Intake is per *process definition*.** The only admission knob is
-  `createProcessInstance` — instances are admitted, not jobs. One process fans out
-  to many job types; one job type is fed by many processes (many-to-many).
-
-So we **detect per job type** and **actuate per process**, coupled by the
-process→job-type incidence (statically derivable from deployed BPMN):
-
-1. **Per-type governor.** For each job type `t`, run a delay-gradient compressor on
-   its backlog `L_t`:
-   - fast term: drive `dL_t/dt → 0` (match intake to that type's drain — scale-free,
-     no magic number, finds capacity wherever it is);
-   - slow term: bias toward the throughput-scaled band `L*_t = W_target · λ_t` to
-     bound *absolute* latency (bleed a deep-but-stable backlog down).
-   Each governor emits a **pressure** `p_t ∈ [0,1]` (0 = healthy, 1 = fully shed).
-   Signals are EWMA-smoothed with a deadband as a fraction of `λ_t` (raw `dL/dt` is
-   noisy — ±0.2% jitter on a flat backlog was observed).
-2. **Per-process fan-in.** Admission of `createProcessInstance(P)` keys on the
-   fan-in of the pressures of the job types `P` can feed:
-   `admit_pressure(P) = max_{t ∈ types(P)} p_t` (max is the conservative default; a
-   contribution-weighted sum is a later refinement). `types(P)` is an
-   over-approximation from the process model (safe: over-approximation only throttles
-   more conservatively).
+- **Signal.** For each process definition `P`, let `L_P` = **in-flight instance
+  count** (created but not yet terminally completed/terminated), maintained as an
+  O(1) increment-on-CreateInstance / decrement-on-terminal-completion counter in
+  the engine `State` (hooked at the *logical* lifecycle, **not** the resident
+  insert/remove — a spilled instance is still in-flight). `λ_P` = P's create rate
+  (monitor differences a cumulative per-definition created counter).
+- **Law.** One delay-gradient compressor per definition on `L_P`:
+  - fast term: drive `dL_P/dt → 0` (match intake to P's own drain — scale-free,
+    no magic number, finds capacity wherever it is);
+  - slow term: bias toward the throughput-scaled band `L*_P = W_target · λ_P` to
+    bound *absolute* e2e **instance** latency `W_P = L_P/λ_P` (exactly the
+    process latency users feel), bleeding a deep-but-stable backlog down.
+  Each governor emits a **pressure** `p_P ∈ [0,1]` (0 = healthy, 1 = fully shed);
+  EWMA-smoothed with a deadband as a fraction of `λ_P` (raw `dL/dt` is noisy).
+- **Actuation.** `admit(createProcessInstance P) ⟺ p_P < 1` (throttled in
+  proportion to `p_P`). No incidence map, no fan-in.
 
 Two behaviours are **correct by design**, not bugs:
-- a process feeding *only* healthy types is **never** throttled (the entire win over
-  a global compressor);
-- throttling `P` to relieve a sick type *also* suppresses `P`'s healthy sibling
-  types — unavoidable, because you cannot create "just the healthy parts" of `P`.
+- a definition whose instances drain healthily is **never** throttled (the entire
+  win over a global compressor), even if it shares a job type with a sick one;
+- throttling `P` suppresses *all* of `P` (you cannot create "just the healthy
+  parts" of an instance) — inherent to instance-granular admission.
+
+Per-job-type congestion remains visible for **operators** via the existing
+`nanobpm_job_sojourn_seconds` histogram (which worker pool is the constraint),
+but it is **reporting only** — no longer a control input.
 
 ### What this replaces / retains
 
 - The ρ + backlog-trend `BacklogGovernor` (commit `4d60bfc`) is **superseded** as the
-  primary control. ρ (and/or commit-wait) survives as **observability** and as the
-  candidate signal for the Tier-1 global guard.
+  primary control. ρ survives as **observability**; the raft-fsync latency signal is
+  now the Tier-1 global guard (see Tier 1).
 - The **drain-guard credit servo** (`drain_guard.rs`, ADR-0013 lineage) remains the
   **inner** liveness rail. Tiers 1–2 are the **outer** loop; the cascade discipline
   holds (outer must move slower than inner to avoid the historical oscillation).
@@ -135,30 +150,30 @@ Two behaviours are **correct by design**, not bugs:
   This is the correct `SLA_MODE=latency` behaviour (match admission to capacity to
   hold latency) and the opposite of ρ's fault-attribution. `SLA_MODE=admission`
   users are unaffected — Tier 1/2 do not actuate there (memory rails only).
-- **Per-type collateral throttling** of healthy sibling types within a throttled
-  process is inherent and accepted.
-- **Cardinality:** per-type governors are a few atomics each — cheap even at
-  hundreds of types. The process→type incidence is precomputed per deployed
-  definition and cached; dynamic job types (expression-derived, call activities,
-  multi-instance) are over-approximated (safe).
+- **Per-definition collateral throttling:** throttling a definition suppresses all
+  of its instances (instance-granular admission); a deep-but-stable backlog is bled
+  to the latency band. Both inherent and accepted.
+- **Cardinality:** per-definition governors are a few atomics each — cheap even at
+  hundreds of definitions. `L_P`/`λ_P` are O(1) counters in the engine `State`; no
+  BPMN static analysis, no incidence map, no per-edge flow measurement.
 - **The one absolute knob is `W_target`** (target e2e latency), which is meaningful
   and portable — unlike an internal-latency µs threshold or an absolute backlog
   count. Everything else (`dL/dt → 0`, `L* = W_target · λ`) is scale-free.
-- **Open item — the Tier-1 signal.** ρ-of-the-apply-loop is proven insufficient. The
-  next step is a **read-only diagnostic to localize the shared-write-path wall**
-  (raft-log fsync latency `nanobpm_raft_fsync_seconds` vs batcher busy vs
-  commit-wait) before committing to `commit-wait` as the Tier-1 signal. Tier 1 must
-  not repeat the "right brain, wrong lever" pattern — it needs a measured binding
-  signal.
+- **Tier-1 signal (resolved):** the read-only diagnostic localized the shared-write
+  wall to the **raft-log fsync latency** (~2.4–3 ms under load vs sub-ms idle);
+  commit-wait (~75 µs, amortized) and apply-loop ρ (never saturates) were both
+  rejected. Tier-1 reuses `metrics::raft_fsync_sum_count()` — no new instrumentation.
 
 ## Validation (to be filled in)
 
 GCP 3-node RF=3 P=12, clean journal, latency mode. Required scenarios:
 
-1. **Heterogeneous per-type isolation:** two job types, sicken one worker pool.
-   EXPECT only the processes feeding the sick type get throttled; processes feeding
-   only the healthy type keep full admission. (This is the scenario no prior design
-   could pass.)
+1. **Heterogeneous per-definition isolation:** two process definitions sharing a
+   job type; sicken that type's worker pool via a definition that hammers it.
+   EXPECT only the *accumulating* definition gets throttled; a sibling definition
+   whose instances still drain healthily keeps full admission. (The scenario no
+   prior design could pass — and per-definition backlog is *more* precise here than
+   the earlier per-type fan-in, which would have over-throttled the healthy one.)
 2. **External-strain latency bound:** the old Test A (slow workers, deep backlog).
    EXPECT intake throttled to bleed the backlog to `W_target · λ` (bounded sojourn),
    *no* oscillation.
@@ -171,15 +186,23 @@ GCP 3-node RF=3 P=12, clean journal, latency mode. Required scenarios:
 ## Alternatives considered
 
 - **Single global backlog compressor (aggregate whole-system).** Simpler, but blind
-  to *where* the backlog is — one sick job type throttles all admission. Rejected for
+  to *where* the backlog is — one sick workload throttles all admission. Rejected for
   a general/heterogeneous product.
 - **Isolated-server ρ as primary (fault-attribution).** Rejected: proven inert on
   real workloads (apply loop never saturates) and it declines to preserve latency
   under external strain, which violates the `SLA_MODE=latency` contract. Retained
-  only as a Tier-1 *candidate*/observability.
-- **Per-`(process,type)` decomposition.** More precise attribution of a type's inflow
+  only as observability.
+- **Per-job-type detection + per-process fan-in (the earlier draft of this ADR).**
+  Detect congestion at each job-type queue, then throttle `createProcessInstance(P)`
+  by `max_{t∈types(P)} p_t` over a statically-derived incidence map. Rejected in
+  favour of per-definition backlog: it needs BPMN static analysis + an incidence map,
+  and it *over-throttles* — a definition sharing a congested type with a sick sibling
+  is throttled even when its own instances drain fine. Per-definition backlog makes
+  detection unit == actuation unit and only throttles the actually-accumulating
+  workload. Per-job-type sojourn is retained as **reporting**.
+- **Per-`(process,type)` decomposition.** Even finer attribution of a type's inflow
   across processes, but higher cardinality and needs per-edge flow measurement.
-  Deferred; `max`-fan-in over `types(P)` is the pragmatic first cut.
+  Unnecessary once control is per-definition.
 - **Direct e2e-sojourn probe (perturb-and-observe).** The original operator intuition;
   correct in spirit but e2e sojourn has a long transport dead-time that makes a fast
   probe oscillate. Resolved by using **backlog depth as the fast, dead-time-free
