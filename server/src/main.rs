@@ -58,8 +58,8 @@ use nanobpmn_engine_core::{
 };
 
 use crate::backpressure::{
-    AdaptiveController, Backpressure, BackpressureSetting, CONGESTION_RATIO, GovernorObs,
-    SharedSlaMode, SlaMode, parse_backpressure_setting, parse_sla_mode,
+    AdaptiveController, BacklogGovernor, Backpressure, BackpressureSetting, SharedSlaMode, SlaMode,
+    parse_backpressure_setting, parse_sla_mode,
 };
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
@@ -177,12 +177,11 @@ pub struct ServerImpl {
     /// path with a relaxed load.
     backlog_cap: Arc<AtomicUsize>,
     /// When the active-backlog cap is governed live (`AdmissionBacklog::Auto`),
-    /// the governor's static bounds (`floor` ≈ knee, `ceiling` = memory backstop)
-    /// and a [`GovernorObs`] read handle onto its self-calibrated latency baseline
-    /// and last-window latency. `None` in `Fixed`/`Off` mode (the cap is then a
-    /// plain constant). Surfaced by the ~1 Hz monitor as
-    /// `nanobpm_backlog_governor_*` metrics and used to explain the auto-tuned
-    /// cap in the `active_backlog` / `create_backlog` shed message.
+    /// the standalone monitor-stepped [`BacklogGovernor`] that holds the cap to an
+    /// end-to-end job-sojourn SLO. `None` in `Fixed`/`Off` mode (the cap is then a
+    /// plain constant). Surfaced by the ~1 Hz monitor as `nanobpm_backlog_governor_*`
+    /// metrics and used to explain the auto-tuned cap in the `active_backlog` /
+    /// `create_backlog` shed message.
     backlog_gov: Option<BacklogGovernor>,
     /// This node's runnable (task-job) backlog: the count of created-but-not-yet-
     /// completed *service-task* jobs, summed across owned partitions. This is the
@@ -191,6 +190,16 @@ pub struct ServerImpl {
     /// not jobs, so they never appear here and are never shed against. Refreshed
     /// by the ~1 Hz monitor tick; read with a relaxed load.
     runnable_backlog: Arc<AtomicUsize>,
+    /// End-to-end job-sojourn accumulator, folded on every `JobCompleted` at the
+    /// completion sites and drained once per ~1 Hz monitor tick into the backlog
+    /// governor. `sojourn_sum_us` is the running sum of `(completed_at −
+    /// created_at)` in microseconds; `sojourn_count` the number of completions
+    /// folded. The monitor computes the window-mean sojourn = sum/count, resets
+    /// both, and steps the governor — so the governor's control signal is the true
+    /// e2e latency (which tracks backlog depth by Little's law), not create→accept
+    /// latency (which stays cheap under downstream worker starvation).
+    sojourn_sum_us: Arc<AtomicU64>,
+    sojourn_count: Arc<AtomicU64>,
     /// The live **unified admission setpoint**: the effective per-node active-backlog
     /// cap the throttle converges intake to, `min(latency_cap, memory_cap)` clamped
     /// to `[backlog_cap_floor, backlog_cap_ceiling]`. `0` = no active setpoint (the
@@ -615,6 +624,10 @@ impl ServerImpl {
         // monitor tick from `activatable_job_counts` (parked instances create no
         // jobs, so they are excluded by construction). Seeded at 0.
         let runnable_backlog = Arc::new(AtomicUsize::new(0));
+        // End-to-end job-sojourn accumulator (sum µs + count), folded on each
+        // completion and drained by the monitor into the backlog governor.
+        let sojourn_sum_us = Arc::new(AtomicU64::new(0));
+        let sojourn_count = Arc::new(AtomicU64::new(0));
         // `backlog_cap` is the live active-backlog admission cap the gate reads
         // (0 = off). Its value comes from one of three policies:
         //  - Off:   a fixed 0 (never sheds on backlog).
@@ -648,29 +661,22 @@ impl ServerImpl {
                 );
                 backlog_cap_floor = floor;
                 backlog_cap_ceiling = ceiling;
-                // The governor drives the backlog cap off an absolute create→accept
-                // latency target (µs) rather than a self-anchored ratio, so it grows
-                // off the floor and settles at the queueing knee. Tunable live via
-                // NANOBPMN_ADMISSION_LATENCY_TARGET_US (default 10ms).
+                // The governor holds the backlog cap to an absolute end-to-end job
+                // *sojourn* SLO (µs): by Little's law L = λ·W, bounding sojourn W at
+                // the target bounds the runnable backlog L at target·λ, auto-
+                // calibrated to the live drain rate. Sojourn (unlike create→accept
+                // latency) grows with backlog depth, so the cap tracks the real SLA.
+                // Tunable live via NANOBPMN_ADMISSION_LATENCY_TARGET_US (default 500ms).
                 let target_us = std::env::var("NANOBPMN_ADMISSION_LATENCY_TARGET_US")
                     .ok()
                     .and_then(|v| v.trim().parse::<f64>().ok())
                     .filter(|t| *t > 0.0)
-                    .unwrap_or(10_000.0);
+                    .unwrap_or(500_000.0);
                 tracing::info!(
-                    "admission backlog governor: create→accept latency target {target_us:.0}µs"
+                    "admission backlog governor: e2e job-sojourn target {target_us:.0}µs"
                 );
-                let (cap, obs) = controller.with_backlog_governor(
-                    floor,
-                    ceiling,
-                    runnable_backlog.clone(),
-                    Some(target_us),
-                );
-                backlog_gov = Some(BacklogGovernor {
-                    floor,
-                    ceiling,
-                    obs,
-                });
+                let (gov, cap, _obs) = BacklogGovernor::new(floor, ceiling, target_us);
+                backlog_gov = Some(gov);
                 cap
             }
         };
@@ -865,6 +871,8 @@ impl ServerImpl {
             effective_backlog_cap,
             backlog_shed_cap,
             runnable_backlog,
+            sojourn_sum_us,
+            sojourn_count,
             active_worker_cap,
             admission_max_create_queue,
             mem_watermark_bytes,
@@ -2142,18 +2150,6 @@ enum AdmissionBacklog {
     /// Self-optimizing: a latency-driven governor tunes the cap between `floor`
     /// (≈ the throughput knee) and `ceiling` (the memory-derived backstop).
     Auto { floor: usize, ceiling: usize },
-}
-
-/// Live state of the auto-mode active-backlog governor, kept on the [`Server`] so
-/// the monitor and the shed message can explain *why* the cap sits where it does.
-/// `floor`/`ceiling` are the static AIMD bounds; `obs` is the read side of the
-/// governor's self-calibrated latency baseline and last-window mean latency, which
-/// the engine thread republishes each window.
-#[derive(Clone)]
-struct BacklogGovernor {
-    floor: usize,
-    ceiling: usize,
-    obs: GovernorObs,
 }
 
 /// Resolves the active-backlog admission policy from `NANOBPMN_ADMISSION_MAX_BACKLOG`.
@@ -3793,6 +3789,7 @@ impl ServerImpl {
                 // Completing a job may advance the token into an off-partition
                 // message catch: route the resulting subscription open/correlate.
                 self.spawn_routing_if_needed(&events);
+                self.observe_job_sojourn(&events, now_millis());
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
                 self.signal_jobs_available();
@@ -10796,6 +10793,7 @@ impl ServerImpl {
             return Err((status, message));
         }
         self.spawn_routing_if_needed(&response.events);
+        self.observe_job_sojourn(&response.events, now_millis());
         Ok(Commit::ready())
     }
 
@@ -10835,6 +10833,7 @@ impl ServerImpl {
             .await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
+            self.observe_job_sojourn(events, now_millis());
         }
         Self::map_job_outcome(result)
     }
@@ -10961,7 +10960,33 @@ impl ServerImpl {
         self.drain_guard.note_completion();
     }
 
-    /// Handle to the drain-stall guard (the monitor supervisor drives it; the
+    /// Fold every `JobCompleted` in `events` into the end-to-end job-sojourn
+    /// accumulator: `completed_at − created_at` (both wall-clock ms, the `now`
+    /// injected into the engine at create and complete), converted to microseconds.
+    /// The monitor drains this once per ~1 Hz tick into the backlog governor, whose
+    /// setpoint is thereby the true e2e latency SLO. Called at each completion site
+    /// that has the emitted events in scope (REST + both stream paths); events with
+    /// no `created_at` (jobs created before the engine carried the field, `0`) are
+    /// skipped. Hot-path cheap: a slice scan + two relaxed atomic adds per completion.
+    #[inline]
+    pub(crate) fn observe_job_sojourn(&self, events: &[Event], now_ms: u64) {
+        let mut sum_us: u64 = 0;
+        let mut count: u64 = 0;
+        for ev in events {
+            if let Event::JobCompleted { created_at, .. } = ev
+                && *created_at > 0
+                && now_ms >= *created_at
+            {
+                sum_us = sum_us.saturating_add((now_ms - *created_at).saturating_mul(1_000));
+                count += 1;
+            }
+        }
+        if count > 0 {
+            self.sojourn_sum_us.fetch_add(sum_us, Ordering::Relaxed);
+            self.sojourn_count.fetch_add(count, Ordering::Relaxed);
+        }
+    }
+
     /// admission gates read it).
     pub(crate) fn drain_guard(&self) -> &Arc<crate::drain_guard::DrainGuard> {
         &self.drain_guard
@@ -11097,11 +11122,11 @@ impl ServerImpl {
     /// Trailing sentence for an active-backlog / create-backlog shed message that
     /// explains *why* the cap is what it is — so an operator isn't left staring at
     /// a shed threshold they never configured. In `Auto` mode the cap is the live
-    /// output of the AIMD latency governor, so we name it as auto-tuned, give its
-    /// floor/ceiling bounds, and (once a window has folded) report the baseline vs
-    /// current per-command latency and the congestion threshold that drove the
-    /// last backoff. In `Fixed`/`Off` mode the cap is a plain operator setting, so
-    /// we just point at the tuning lever.
+    /// output of the e2e-sojourn governor, so we name it as auto-tuned, give its
+    /// floor/ceiling bounds, and (once a window has folded) report the target vs
+    /// current end-to-end job sojourn that drove the last adjustment. In
+    /// `Fixed`/`Off` mode the cap is a plain operator setting, so we just point at
+    /// the tuning lever.
     fn backlog_cap_explainer(&self) -> String {
         let Some(gov) = &self.backlog_gov else {
             return " This is a fixed cap (NANOBPMN_ADMISSION_MAX_BACKLOG); \
@@ -11109,19 +11134,16 @@ impl ServerImpl {
                     instead of shedding. Retry after a backoff."
                 .to_string();
         };
-        let baseline = gov.obs.baseline_us.load(Ordering::Relaxed);
-        let window = gov.obs.window_avg_us.load(Ordering::Relaxed);
+        let target = gov.obs().target_us.load(Ordering::Relaxed);
+        let window = gov.obs().window_avg_us.load(Ordering::Relaxed);
         let bounds = format!(
-            " This cap is auto-tuned by the latency governor (floor {}, ceiling {} \
-             runnable jobs) to hold per-command latency near its baseline",
-            gov.floor, gov.ceiling
+            " This cap is auto-tuned by the e2e-sojourn governor (floor {}, ceiling {} \
+             runnable jobs) to hold end-to-end job latency near its {target}µs target",
+            gov.floor(),
+            gov.ceiling()
         );
-        let latency = if baseline > 0 {
-            let threshold = (baseline as f64 * CONGESTION_RATIO) as u64;
-            format!(
-                "; it backed the cap off because window latency {window}µs vs \
-                 baseline {baseline}µs neared the {threshold}µs congestion threshold."
-            )
+        let latency = if window > 0 {
+            format!("; last window sojourn was {window}µs vs the {target}µs target.")
         } else {
             ".".to_string()
         };
@@ -13583,19 +13605,19 @@ async fn main() {
                 // so a dashboard (and the shed message) can explain where the cap
                 // sits and why it moved there, rather than only the bare cap value.
                 if let Some(gov) = &monitor_server.backlog_gov {
-                    crate::metrics::set_backlog_governor("floor", gov.floor as i64);
-                    crate::metrics::set_backlog_governor("ceiling", gov.ceiling as i64);
+                    crate::metrics::set_backlog_governor("floor", gov.floor() as i64);
+                    crate::metrics::set_backlog_governor("ceiling", gov.ceiling() as i64);
                     crate::metrics::set_backlog_governor(
                         "baseline_latency_us",
-                        gov.obs.baseline_us.load(Ordering::Relaxed) as i64,
+                        gov.obs().baseline_us.load(Ordering::Relaxed) as i64,
                     );
                     crate::metrics::set_backlog_governor(
                         "window_latency_us",
-                        gov.obs.window_avg_us.load(Ordering::Relaxed) as i64,
+                        gov.obs().window_avg_us.load(Ordering::Relaxed) as i64,
                     );
                     crate::metrics::set_backlog_governor(
                         "target_latency_us",
-                        gov.obs.target_us.load(Ordering::Relaxed) as i64,
+                        gov.obs().target_us.load(Ordering::Relaxed) as i64,
                     );
                 }
                 crate::metrics::set_admission_limit(
@@ -13628,6 +13650,20 @@ async fn main() {
                 monitor_server
                     .runnable_backlog
                     .store(runnable, Ordering::Relaxed);
+                // Step the standalone e2e-sojourn backlog governor once per tick:
+                // drain the sojourn accumulator (sum µs / count) folded by the
+                // completion sites into the window-mean sojourn, and fold it plus the
+                // live runnable backlog into the cap. Only step when at least one job
+                // completed this window (a fresh sojourn sample); during a total drain
+                // stall the cap is held and the drain-down servo throttles intake.
+                if let Some(gov) = &monitor_server.backlog_gov {
+                    let count = monitor_server.sojourn_count.swap(0, Ordering::Relaxed);
+                    let sum_us = monitor_server.sojourn_sum_us.swap(0, Ordering::Relaxed);
+                    if count > 0 {
+                        let mean_us = sum_us as f64 / count as f64;
+                        gov.step(mean_us, runnable);
+                    }
+                }
                 let workers = monitor_registry.workers_per_type();
                 let mut current: std::collections::HashSet<String> =
                     std::collections::HashSet::with_capacity(activatable.len() + workers.len());

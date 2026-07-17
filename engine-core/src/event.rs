@@ -200,8 +200,17 @@ pub enum Event {
         instance_key: Key,
         error_code: String,
     },
-    /// A job was completed.
-    JobCompleted { job_key: Key, instance_key: Key },
+    /// A job was completed. `created_at` is the logical instant the job was
+    /// created (carried through from job state) so the server can observe the
+    /// job's end-to-end sojourn (create→complete) at the completion site — the
+    /// Little's-law-faithful latency signal the backlog governor targets. `0` for
+    /// jobs created before the engine carried the field; not used by replay.
+    JobCompleted {
+        job_key: Key,
+        instance_key: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        created_at: u64,
+    },
     /// A job's remaining retries were updated (e.g. by an operator recovering a
     /// parked job before resolving its incident). Does not change job state.
     JobRetriesUpdated {

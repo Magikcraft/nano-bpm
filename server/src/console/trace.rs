@@ -601,6 +601,7 @@ impl Inner {
             Event::JobCompleted {
                 job_key,
                 instance_key,
+                ..
             } => {
                 if let Some(t) = self.instances.get_mut(instance_key) {
                     t.last_at = now;
@@ -1324,6 +1325,7 @@ mod tests {
                 &Event::JobCompleted {
                     job_key: 10,
                     instance_key: 1,
+                    created_at: 0,
                 },
                 &vars_updated(1, &[("label", Value::Str("vip".into()))]),
             ],
@@ -1343,6 +1345,7 @@ mod tests {
                 &Event::JobCompleted {
                     job_key: 10,
                     instance_key: 1,
+                    created_at: 0,
                 },
                 &vars_updated(1, &[("label", Value::Str("vip".into()))]),
                 &Event::ElementCompleted {
@@ -1423,6 +1426,7 @@ mod tests {
                 &Event::JobCompleted {
                     job_key: 10,
                     instance_key: 1,
+                    created_at: 0,
                 },
                 &Event::ElementCompleted {
                     instance_key: 1,
