@@ -14025,8 +14025,6 @@ async fn main() {
                         // in latency mode; when inactive it releases to zero. Publish
                         // the resulting shed fraction for observability.
                         let tier1_active = monitor_server.sla_mode.get().sheds_for_latency();
-                        let tier1_permille = monitor_server.guard.step(fsync_avg_us, tier1_active);
-                        crate::metrics::set_tier1_pressure(tier1_permille as i64);
                         let displaced = monitor_server.recovery_fsync_load_active();
                         // Fold in the post-hand-off catch-up hold: stay engaged
                         // while any led partition is still feeding a peer that lags
@@ -14044,6 +14042,15 @@ async fn main() {
                             now_ct,
                         );
                         let recovering = displaced || catchup_active;
+                        // During a recovery window Tier-1 defers to the recovery
+                        // admission throttle (below) and only sheds past a wide
+                        // hard-ceiling backstop — shedding the recovering owner's own
+                        // creates on the soft knee buys no aggregate-latency benefit.
+                        let tier1_permille =
+                            monitor_server
+                                .guard
+                                .step(fsync_avg_us, tier1_active, recovering);
+                        crate::metrics::set_tier1_pressure(tier1_permille as i64);
                         let cap = recovery_throttle.observe(fsync_avg_us, recovering);
                         monitor_server
                             .recovery_backlog_cap

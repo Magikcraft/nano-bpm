@@ -992,6 +992,19 @@ pub struct Tier1Config {
     /// near-zero idle baseline can't make the threshold trivially crossable — the
     /// idle raft fsync is sub-ms; the load knee is ~2.4–3 ms.
     pub baseline_floor_us: f64,
+    /// Relax Tier-1 during a recovery window (`NANOBPMN_TIER1_RECOVERY_RELAX`,
+    /// default **on**). When a node is a failover incumbent or a returning owner,
+    /// the recovery admission throttle ([`crate::recovery_throttle`]) is the primary
+    /// disk-protection actuator — it already paces intake under the fsync knee. A
+    /// second soft-knee shed here would only shed the recovering owner's *own*
+    /// creates for no aggregate-latency benefit (it just displaces them onto the
+    /// already-loaded survivors), so during recovery the guard defers to a wider
+    /// hard-ceiling backstop instead of the soft knee.
+    pub recovery_relax: bool,
+    /// Hard-ceiling knee multiple applied *during recovery* in place of
+    /// `congestion_ratio`. Wider than the soft knee (so the recovery throttle owns
+    /// the soft band) but still sheds a genuinely drowning node as a backstop.
+    pub recovery_ratio: f64,
 }
 
 impl Default for Tier1Config {
@@ -1005,6 +1018,8 @@ impl Default for Tier1Config {
             ewma: 0.3,
             baseline_creep: 0.05,
             baseline_floor_us: 500.0,
+            recovery_relax: true,
+            recovery_ratio: 4.0,
         }
     }
 }
@@ -1020,6 +1035,13 @@ impl Tier1Config {
                 !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
             }
             Err(_) => d.enabled,
+        };
+        let recovery_relax = match std::env::var("NANOBPMN_TIER1_RECOVERY_RELAX") {
+            Ok(v) => {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            }
+            Err(_) => d.recovery_relax,
         };
         let f = |key: &str, def: f64| -> f64 {
             std::env::var(key)
@@ -1037,6 +1059,8 @@ impl Tier1Config {
             ewma: f("NANOBPMN_TIER1_EWMA", d.ewma).clamp(0.0, 1.0),
             baseline_creep: f("NANOBPMN_TIER1_CREEP", d.baseline_creep),
             baseline_floor_us: f("NANOBPMN_TIER1_FLOOR_US", d.baseline_floor_us),
+            recovery_relax,
+            recovery_ratio: f("NANOBPMN_TIER1_RECOVERY_RATIO", d.recovery_ratio),
         }
     }
 }
@@ -1086,9 +1110,13 @@ impl GlobalGuard {
     /// sum/count (`0` = no fsyncs this window → treated as idle/healthy, releasing
     /// gently without disturbing the baseline). `active` is whether Tier-1 should
     /// actuate at all (latency SLA mode + feature enabled); when false the guard
-    /// releases to zero. Returns the published shed fraction in per-mille (for the
+    /// releases to zero. `recovering` is whether this node is in a recovery window
+    /// (failover incumbent or returning owner, from `recovery_fsync_load_active`):
+    /// while it holds the guard defers to the recovery admission throttle and only
+    /// sheds past a wider hard-ceiling backstop (see [`Tier1Config::recovery_relax`]).
+    /// Returns the published shed fraction in per-mille (for the
     /// `nanobpm_tier1_pressure` gauge).
-    pub fn step(&self, fsync_avg_us: f64, active: bool) -> u32 {
+    pub fn step(&self, fsync_avg_us: f64, active: bool, recovering: bool) -> u32 {
         let mut st = self.state.lock().unwrap();
 
         if !self.cfg.enabled || !active {
@@ -1115,6 +1143,41 @@ impl GlobalGuard {
             st.ewma_us = Some(s);
             s
         };
+
+        // Recovery window: the recovery admission throttle is the primary disk-
+        // protection actuator (it paces intake under the fsync knee via the backlog
+        // cap). A second soft-knee shed here would only shed the recovering owner's
+        // *own* creates for no aggregate-latency benefit, so defer to a wider
+        // hard-ceiling backstop and never calibrate the baseline from the congested
+        // recovery latency (it would inflate the knee for steady state afterward).
+        if recovering && self.cfg.recovery_relax {
+            match st.baseline_us {
+                // A healthy baseline learned outside recovery: shed only past the
+                // wide hard ceiling (a genuinely drowning node still gets clamped),
+                // otherwise release. Baseline stays frozen throughout.
+                Some(b) => {
+                    let baseline = b.max(self.cfg.baseline_floor_us);
+                    let threshold = baseline * self.cfg.recovery_ratio;
+                    if signal > threshold {
+                        let severity = (signal / threshold - 1.0).clamp(0.0, 1.0);
+                        let step = self.cfg.attack * (1.0 + self.cfg.attack_gain * severity);
+                        st.pressure = (st.pressure + step).min(1.0);
+                    } else {
+                        st.pressure = (st.pressure - self.cfg.release).max(0.0);
+                    }
+                }
+                // No healthy baseline yet (fresh restart straight into recovery): do
+                // not seed it from congested recovery latency and do not actuate —
+                // the recovery throttle owns disk protection here. Release.
+                None => {
+                    st.pressure = (st.pressure - self.cfg.release).max(0.0);
+                }
+            }
+            let permille = (st.pressure * 1000.0).round().clamp(0.0, 1000.0) as u32;
+            self.publish(permille);
+            return permille;
+        }
+
         if st.baseline_us.is_none() {
             st.baseline_us = Some(signal);
         }
@@ -1799,16 +1862,7 @@ mod tests {
     // ── ADR-0020 Tier-1 global engine-saturation guard ───────────────────────
 
     fn tight_guard() -> GlobalGuard {
-        GlobalGuard::new(Tier1Config {
-            enabled: true,
-            congestion_ratio: 2.0,
-            attack: 0.25,
-            attack_gain: 2.0,
-            release: 0.05,
-            ewma: 1.0, // no smoothing lag in tests: signal == latest sample
-            baseline_creep: 0.05,
-            baseline_floor_us: 500.0,
-        })
+        GlobalGuard::new(tight_guard_cfg())
     }
 
     #[test]
@@ -1817,7 +1871,7 @@ mod tests {
         // Idle-then-healthy raft fsync (sub-ms, under the floored knee): baseline
         // calibrates, pressure stays at zero.
         for _ in 0..10 {
-            assert_eq!(g.step(700.0, true), 0);
+            assert_eq!(g.step(700.0, true, false), 0);
         }
         assert!(!g.should_shed());
     }
@@ -1826,16 +1880,16 @@ mod tests {
     fn tier1_attacks_when_the_fsync_knee_is_crossed_and_releases_on_recovery() {
         let g = tight_guard();
         // Calibrate a healthy baseline of ~0.7ms (floored to 500us → knee 1ms).
-        assert_eq!(g.step(700.0, true), 0);
+        assert_eq!(g.step(700.0, true, false), 0);
 
         // Shared write path saturates (fsync 3ms >> 1ms knee): attack.
-        let p1 = g.step(3_000.0, true);
-        let p2 = g.step(3_000.0, true);
+        let p1 = g.step(3_000.0, true, false);
+        let p2 = g.step(3_000.0, true, false);
         assert!(p1 > 0, "crossing the fsync knee must raise pressure");
         assert!(p2 > p1, "sustained saturation keeps rising: {p1} -> {p2}");
 
         // Write path recovers (fsync back under the knee): release.
-        let p3 = g.step(700.0, true);
+        let p3 = g.step(700.0, true, false);
         assert!(p3 < p2, "headroom must release pressure: {p2} -> {p3}");
     }
 
@@ -1844,10 +1898,10 @@ mod tests {
         let g = tight_guard();
         // A near-zero idle baseline (50us) would give a 100us knee and trip on any
         // real load; the 500us floor keeps the knee at 1ms so ~700us load is fine.
-        g.step(50.0, true); // baseline calibrates to 50us
+        g.step(50.0, true, false); // baseline calibrates to 50us
         for _ in 0..5 {
             assert_eq!(
-                g.step(700.0, true),
+                g.step(700.0, true, false),
                 0,
                 "sub-knee load must not trip the floored guard"
             );
@@ -1860,7 +1914,7 @@ mod tests {
         // saturating signal.
         let g = tight_guard();
         for _ in 0..10 {
-            assert_eq!(g.step(5_000.0, false), 0);
+            assert_eq!(g.step(5_000.0, false, false), 0);
         }
         assert!(!g.should_shed());
 
@@ -1870,7 +1924,7 @@ mod tests {
             ..tight_guard_cfg()
         });
         for _ in 0..10 {
-            assert_eq!(g.step(5_000.0, true), 0);
+            assert_eq!(g.step(5_000.0, true, false), 0);
         }
         assert!(!g.should_shed());
     }
@@ -1878,10 +1932,10 @@ mod tests {
     #[test]
     fn tier1_should_shed_paces_the_pressure_fraction() {
         let g = tight_guard();
-        g.step(700.0, true); // baseline
+        g.step(700.0, true, false); // baseline
         let mut permille = 0;
         for _ in 0..20 {
-            permille = g.step(5_000.0, true); // drive pressure up under saturation
+            permille = g.step(5_000.0, true, false); // drive pressure up under saturation
         }
         assert!(permille > 0);
         let n = 10_000;
@@ -1894,6 +1948,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tier1_recovery_relax_defers_soft_knee_to_the_recovery_throttle() {
+        // A returning owner sees elevated recovery fsync above the *soft* knee but
+        // under the wide hard-ceiling backstop: with the recovery window flagged,
+        // Tier-1 must NOT shed its own creates (the recovery throttle owns pacing).
+        let g = tight_guard();
+        assert_eq!(g.step(700.0, true, false), 0); // healthy baseline (knee 1.4ms, ceiling 2.8ms)
+
+        // 2.5ms fsync: crosses the 1.4ms soft knee (would attack in steady state) but
+        // is under the 2.8ms hard ceiling → no shed while recovering.
+        for _ in 0..20 {
+            assert_eq!(
+                g.step(2_500.0, true, true),
+                0,
+                "recovery window must defer the soft knee to the recovery throttle"
+            );
+        }
+        assert!(!g.should_shed());
+    }
+
+    #[test]
+    fn tier1_recovery_hard_ceiling_still_sheds_a_drowning_node() {
+        // Backstop: even in recovery, fsync past the wide hard ceiling still sheds.
+        let g = tight_guard();
+        assert_eq!(g.step(700.0, true, false), 0); // baseline (hard ceiling 2.8ms)
+
+        let p1 = g.step(10_000.0, true, true); // 10ms >> 2.8ms hard ceiling
+        let p2 = g.step(10_000.0, true, true);
+        assert!(
+            p1 > 0,
+            "past the hard ceiling a drowning node must still shed"
+        );
+        assert!(p2 > p1, "sustained overload keeps rising: {p1} -> {p2}");
+    }
+
+    #[test]
+    fn tier1_recovery_freezes_baseline_so_steady_state_knee_is_unchanged() {
+        // Recovery must not calibrate the baseline toward the congested latency, or
+        // the steady-state knee would inflate afterward and stop protecting latency.
+        let g = tight_guard();
+        assert_eq!(g.step(700.0, true, false), 0); // baseline ~500us floor → knee 1ms
+
+        // A long recovery window at elevated (but sub-hard-ceiling) fsync.
+        for _ in 0..30 {
+            g.step(3_000.0, true, true);
+        }
+
+        // Back to steady state: the soft knee is still ~1ms, so a fresh 3ms spike
+        // attacks as before (baseline was NOT dragged up to 3ms during recovery).
+        let p = g.step(3_000.0, true, false);
+        assert!(
+            p > 0,
+            "post-recovery soft knee must be intact (baseline stayed frozen)"
+        );
+    }
+
+    #[test]
+    fn tier1_recovery_without_baseline_defers_and_does_not_seed_from_congestion() {
+        // Fresh restart straight into recovery (no healthy baseline yet): the guard
+        // must not seed its baseline from congested recovery latency and must not
+        // shed. After recovery clears it calibrates normally from healthy load.
+        let g = tight_guard();
+        for _ in 0..10 {
+            assert_eq!(
+                g.step(5_000.0, true, true),
+                0,
+                "no baseline yet → defer, don't seed from congestion"
+            );
+        }
+        // Recovery clears with healthy load: baseline calibrates, still no shed.
+        for _ in 0..5 {
+            assert_eq!(g.step(700.0, true, false), 0);
+        }
+        // A genuine steady-state spike now attacks off the healthy baseline.
+        assert!(g.step(3_000.0, true, false) > 0);
+    }
+
+    #[test]
+    fn tier1_recovery_relax_disabled_keeps_the_soft_knee_in_recovery() {
+        // With the relax switch off, recovery behaves like steady state: the soft
+        // knee still sheds (opt-out path for the revertibility guardrail).
+        let g = GlobalGuard::new(Tier1Config {
+            recovery_relax: false,
+            ..tight_guard_cfg()
+        });
+        assert_eq!(g.step(700.0, true, false), 0); // baseline
+        let p = g.step(3_000.0, true, true); // 3ms > 1ms soft knee, recovery ignored
+        assert!(p > 0, "relax disabled must keep the soft knee in recovery");
+    }
+
     fn tight_guard_cfg() -> Tier1Config {
         Tier1Config {
             enabled: true,
@@ -1901,9 +2045,11 @@ mod tests {
             attack: 0.25,
             attack_gain: 2.0,
             release: 0.05,
-            ewma: 1.0,
+            ewma: 1.0, // no smoothing lag in tests: signal == latest sample
             baseline_creep: 0.05,
             baseline_floor_us: 500.0,
+            recovery_relax: true,
+            recovery_ratio: 4.0,
         }
     }
 }
