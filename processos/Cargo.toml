@@ -11,6 +11,14 @@ description = "ProcessOS — the runtime process-optimization plane for Nano BPM
 name = "processos"
 path = "src/main.rs"
 
+# `duckdb-bundled` (on by default) compiles DuckDB from source so normal and
+# release builds produce a self-contained binary. CI's clippy+test job builds
+# with `--no-default-features` + `DUCKDB_DOWNLOAD_LIB=1` to link a prebuilt
+# DuckDB and skip the multi-minute C++ compile; nothing else toggles off.
+[features]
+default = ["duckdb-bundled"]
+duckdb-bundled = ["duckdb/bundled"]
+
 [dependencies]
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "process", "io-util", "time"] }
@@ -32,9 +40,12 @@ tracing-subscriber = "0.3"
 # engine never links ProcessOS). `serde` enables natural JSON variable I/O.
 nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
 # Embedded analytic SQL engine for the LLM-driven data-analysis tools (querying
-# the trace corpus). `bundled` compiles DuckDB from source (one-time C++ build)
-# so the binary is self-contained with no system DuckDB needed.
-duckdb = { version = "1", features = ["bundled"] }
+# the trace corpus). The default `duckdb-bundled` feature compiles DuckDB from
+# source (one-time C++ build) so shipped binaries are self-contained with no
+# system DuckDB needed. CI's clippy+test job instead builds `--no-default-features`
+# with `DUCKDB_DOWNLOAD_LIB=1`, which links a prebuilt DuckDB and skips the ~20-min
+# C++ compile (see `.github/workflows/ci.yml`); release builds keep the default.
+duckdb = { version = "1", default-features = false }
 # Psychological-trace export/import: bundle the investigation transcript, the LLM
 # profiles used (api keys redacted), and a manifest into a single shareable zip.
 # Pinned to the already-locked offline build; `deflate` keeps the archive compact.
