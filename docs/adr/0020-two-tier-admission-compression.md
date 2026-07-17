@@ -205,9 +205,51 @@ GCP 3-node RF=3 P=12, clean journal, latency mode. Required scenarios:
    *same* `common-job` type — stayed at zero pressure with full admission and a
    16 ms p50. A per-job-type detector on the shared `common-job` (never itself
    congested) could not have isolated this; per-definition backlog does.
-2. **External-strain latency bound:** the old Test A (slow workers, deep backlog).
-   EXPECT intake throttled to bleed the backlog to `W_target · λ` (bounded sojourn),
-   *no* oscillation.
+2. **External-strain latency bound — run as an explicit OFF-vs-ON counterfactual.**
+   The question this arm answers is *causal*: does throttling the sick definition
+   **cause** its backlog (hence sojourn) to stay bounded, or are we merely shedding
+   *because* latency is already high (correlation)? To separate the two we hold the
+   offered load fixed and toggle only the actuator: one arm with `NANOBPMN_TIER2=off`
+   (the governor still **computes and publishes** `nanobpm_tier2_pressure` but does
+   not shed — "observe-only"), one arm with `NANOBPMN_TIER2=on`. Single sick
+   definition `orders-slow`, offered 150 creates/s into a starved `slow-job` pool
+   (4 × 250 ms ≈ 15 jobs/s drain), `W_target = 15 s`, 120 s window, binsha
+   `0620df4683d8b881`. Server-side backlog `L(t) = nanobpm_active_backlog` summed
+   across the three nodes.
+
+   **PASS — the counterfactual is decisive on the backlog trajectory:**
+
+   | arm | shed | backlog `L(t)` behaviour | net slope after t=21 s |
+   |---|---|---|---|
+   | **Tier-2 OFF** (observe-only) | 0/s | diverges monotonically 0 → **16,800 and still climbing** | **+132 /s** (unbounded) |
+   | **Tier-2 ON** | 128/s | rises to the band (≈ `W_target·λ` = 2 250) then **arrests and holds ≈ 2 000**, gently bleeding | **−3.6 /s** (draining) |
+
+   Same offered load; the *only* changed variable is whether the compressor may
+   actuate — so the bounded backlog in the ON arm is **caused** by the throttling,
+   not merely coincident with it. The tell is visible in the OFF arm: the governor
+   *computed* pressure → 1000‰ by t = 21 s (it "wanted" to act) yet, unable to shed,
+   the backlog diverged anyway. Bounded `L` ⇒ bounded sojourn by Little's law
+   (`W = L/μ`): OFF → `W` tracks `L` to 1 100 s+ and rising; ON → `W ≈ L/μ ≈ 133 s`,
+   bounded. The ON compressor holds a stable operating point (pressure oscillates
+   850–1000‰ around the setpoint), not a monotonic clamp.
+
+   **Two honest findings from running it properly:**
+   - *Completed-only e2e percentiles cannot discriminate here* — both arms reported
+     p50 ≈ 61 s / p90 ≈ 104 s / max ≈ 116 s, near-identical. This is **window
+     censoring / survivorship bias**: in the divergent (OFF) arm the deeply-queued
+     instances never finish inside the measurement window, so they never enter the
+     percentile sample; the max simply pins to ≈ the window length in *both* arms.
+     The server-side backlog `L(t)` is therefore the honest discriminator, and the
+     admitted sojourn must be read as `L/μ`, not from completed-e2e percentiles.
+   - *The realized bound is looser than nominal `W_target`.* The law arrests growth
+     and then **holds** `L` near the level at which it caught it (≈ `W_target · λ_offered`)
+     rather than actively driving `L` down to `W_target · μ` (≈ 225). Because the band
+     keys on the **create rate** `λ` and attack fires only while `L` is *rising*, the
+     steady state is "growth arrested, slow bleed" (−3.6 /s here). Tightening the
+     realized sojourn to `W_target` is a tuning follow-up: key the band on the
+     **drain/throughput** `μ` rather than the create rate, or add an active
+     drive-down term below the band. The load-bounding (divergent → bounded) claim
+     is proven regardless.
 3. **Shared-write-path overload:** the old Test B (create-flood). EXPECT the Tier-1
    global guard (`nanobpm_tier1_pressure`) engages on the raft-fsync latency knee and
    holds a stable operating point — no monotonic clamp, no sawtooth.
