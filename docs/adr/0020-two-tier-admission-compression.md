@@ -180,9 +180,10 @@ but it is **reporting only** — no longer a control input.
   commit-wait (~75 µs, amortized) and apply-loop ρ (never saturates) were both
   rejected. Tier-1 reuses `metrics::raft_fsync_sum_count()` — no new instrumentation.
 
-## Validation (to be filled in)
+## Validation
 
-GCP 3-node RF=3 P=12, clean journal, latency mode. Required scenarios:
+GCP 3-node RF=3 P=12, clean journal, latency mode. All four scenarios below **PASS**
+on binsha `0620df4683d8b881` (commit `8042ae5`).
 
 1. **Heterogeneous per-definition isolation:** two process definitions sharing a
    job type; sicken that type's worker pool via a definition that hammers it.
@@ -250,11 +251,53 @@ GCP 3-node RF=3 P=12, clean journal, latency mode. Required scenarios:
      **drain/throughput** `μ` rather than the create rate, or add an active
      drive-down term below the band. The load-bounding (divergent → bounded) claim
      is proven regardless.
-3. **Shared-write-path overload:** the old Test B (create-flood). EXPECT the Tier-1
-   global guard (`nanobpm_tier1_pressure`) engages on the raft-fsync latency knee and
-   holds a stable operating point — no monotonic clamp, no sawtooth.
-4. **Cold-start into a storm:** no learning window available. EXPECT correct throttle
-   on the first ticks (scale-free signals require no baseline).
+3. **Shared-write-path overload — Tier-1 engages on the fsync knee.**
+   The premise is that the shared bottleneck is *our* raft write path. A plain
+   create-flood, however, does **not** reach that regime on this hardware: at
+   ~54k creates/s the **single-writer engine actor** (CPU) is the ceiling and the
+   disk stays healthy (fsync flat ≈ 2.8 ms, commit-inflight < 600), so Tier-1
+   correctly stays **dormant** — actor-CPU saturation is the *ρ-governor's* domain,
+   not Tier-1's. To actually move the bottleneck onto the disk write path we inflate
+   the per-instance journal payload (`VAR_BYTES=8192`) so disk *bandwidth* — hence
+   fsync latency — is what saturates. (binsha `0620df4683d8b881`, `NANOBPMN_TIER2=off`
+   to isolate Tier-1, offered ~60k creates/s of 8 KB instances across 3 nodes.)
+
+   **PASS:**
+
+   | phase | `nanobpm_tier1_pressure` | fsync | Tier-1 shed | behaviour |
+   |---|---|---|---|---|
+   | engage (t=6→9 s) | 0 → **1000‰** | ~1.9 → 2.6 ms (crosses 2× knee) | → 62,928/s peak | detects the knee, clamps |
+   | hold (t=9→50 s) | 750–1000‰ | held ~2.0–2.9 ms (bounded) | 40–60k/s | protects the write path |
+   | release (t=50→81 s) | **1000 → 850 → 650 → 500 → 350 → 231 → 126 → 32 → 0** | settles ~3.5–4.2 ms | → 0 | smooth glide, no sawtooth |
+   | equilibrium (t>81 s) | 0 | stable ~3.6–4.5 ms | 0 | admitted ~22–27k/s sustained |
+
+   Tier-1 engaged on the raft-fsync knee, held a **stable operating point** (no
+   monotonic clamp — pressure decayed smoothly back to 0 as the adaptive baseline
+   recalibrated to the sustained level; no sawtooth), and kept create-accept latency
+   bounded throughout (p50 27 ms, p99 415 ms, max 826 ms). The requirement that the
+   guard distinguish a *transient spike* (attack) from a *sustained new normal*
+   (recalibrate + release) is exactly what the baseline creep delivered here.
+4. **Cold-start into a storm — correct throttle on the first ticks.**
+   Same 8 KB flood, but launched into a **freshly-started, clean-journal cluster
+   with no warmup** (`WARM=0`, 1 s sampling) so the guard has *no* calibrated
+   baseline. **PASS:** the very first fsync knee-crossing — t=5 s, fsync spiking to
+   4326 µs as the cold commit pipeline fills — triggered Tier-1 on the **same tick**
+   (pressure 194‰, shedding began), ramping to 1000‰ by t=10 s and then holding a
+   controlled band (670–1000‰) with fsync bounded ~2.0–3.9 ms for the rest of the
+   run. No learning window was needed: the floored baseline (`baseline_floor_us`,
+   500 µs) makes the knee meaningful from t=0, so the scale-free signal throttles
+   correctly on the first ticks. This is the property no learned-threshold governor
+   could offer — it would have admitted the storm while still calibrating.
+
+**Status: all four ADR-0020 validation scenarios PASS** on binsha `0620df4683d8b881`
+(commit `8042ae5`), GCP 3-node RF=3 P=12, latency mode.
+
+**Scope note surfaced by #3.** Tier-1 guards the **disk write path** (raft fsync)
+specifically. When the bottleneck is instead the single-writer **engine actor**
+(CPU-bound, as under a small-payload create-flood), fsync stays healthy and Tier-1
+does not — and should not — fire; that regime is covered by the ρ-based
+`AdmissionGovernor` (engine-actor saturation). The two are both "global" guards but
+watch different shared resources; a complete deployment wants both live.
 
 ## Alternatives considered
 
