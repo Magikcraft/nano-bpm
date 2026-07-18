@@ -72,6 +72,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::deepthi::DeepthiHandle;
+#[cfg(test)]
 use crate::journal::Journal;
 use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport, SnapshotSendProgress};
 
@@ -675,7 +676,7 @@ impl PartitionStateMachine {
             .await??;
         self.engine
             .with(move |journal| {
-                *journal = Journal::in_memory_from_snapshot(captured);
+                journal.restore_engine_from_snapshot(captured);
             })
             .await;
         Ok(())
@@ -1042,12 +1043,15 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?
         .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
 
-        // Rebuild the engine actor's state directly from the captured snapshot.
+        // Rebuild the engine actor's state from the captured snapshot IN PLACE.
         // The engine journal is in-memory under Raft (the Raft log is the durable
-        // tier), so replacing it wholesale is the install.
+        // tier), so adopting the snapshot's engine state is the install — but the
+        // journal's read-model exporter wiring (and partition id / var store /
+        // spill tiers) MUST survive it, or an owned partition catching up via a
+        // snapshot install stops projecting and leaks its completed backlog.
         self.engine
             .with(move |journal| {
-                *journal = Journal::in_memory_from_snapshot(captured);
+                journal.restore_engine_from_snapshot(captured);
             })
             .await;
 
