@@ -514,3 +514,56 @@ compaction/snapshot-truncate the reclaimed partitions back to a shallow, fast-fs
 depth, or bound the failover-window log retention so the depth ratchet never forms
 (distinct from the delta-stream transfer optimization). Deferred; tracked here as
 the next recovered-throughput lever.
+
+### Option 1 landed: snapshot-build concurrency limiter (Fix B) + recovery cadence stretch (Fix C)
+
+Instrumenting the returning owner (`nanobpm_raft_snapshot_{builds_total,serialize_seconds,fsync_seconds,bytes}`)
+localised the completion-latency residual to a **snapshot-build storm** on the
+returning owner. Its four co-hosted partitions (e.g. 2,5,8,11) cross their
+`LogsSinceLast` threshold together as they apply the deep reclaim backlog and call
+`build_snapshot` at nearly the same instant. Each build does a blocking
+`serde_json` serialize + `sync_all` of a large (~130–250 MB) resident state
+machine, so four large fsyncs pile onto the one shared disk under
+`DURABILITY=sync` and the fsync latency amplifies ~7x (≈96 ms un-contended at
+131 MB → ≈711 ms under 4-way contention), stalling the shared Raft-log fsync path
+and the completion-paced admission servo — the ~60% of the recovery wall spent in
+snapshot builds.
+
+Two process-global levers, both **keyed on the resident SM size**
+(`snapshot_recovery_engaged()` = last-built snapshot bytes ≥
+`NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES`, default 32 MiB) so they engage exactly
+while a node's builds are expensive and self-release as the backlog drains:
+
+- **Fix B — build-concurrency limiter** (`raft.rs`): a process-global semaphore
+  (`NANOBPMN_RAFT_SNAPSHOT_BUILD_CONCURRENCY`, default 2) caps concurrent builds;
+  while the SM is large a build takes the **whole pool** (exclusive) so the
+  co-hosted reclaim builds serialize onto the disk one at a time instead of
+  contending.
+- **Fix C — recovery cadence stretch** (vendored openraft
+  `set_snapshot_logs_multiplier_permille`): while the SM is large the effective
+  `LogsSinceLast` threshold is multiplied
+  (`NANOBPMN_RAFT_RECOVERY_SNAPSHOT_MULT_PERMILLE`, default 4000 = 4x), so the
+  reclaim window builds far fewer snapshots.
+
+The SM-size signal replaced a first cut keyed on the leadership-displacement flag
+(`recovery_fsync_load_active`), which cleared the instant the owner reclaimed
+leadership (~18 s) — long before its ~160 s build storm finished draining the
+backlog, so the fixes under-engaged (fsync mean stuck at the 2-concurrent 585 ms).
+
+**Soak (14k kill node18@60 / restore@+90 / tail 180s, clean journal):**
+
+| metric | v1 (displacement-gated) | B+C (SM-size-gated) |
+|---|---|---|
+| recovery snapshot builds | 150 | **94** (Fix C: −37%) |
+| snapshot-fsync mean | 585 ms | **506 ms** |
+| node18 recovered creates/s | ~1000–1200 | **~2600–5200** (2–4x) |
+| SM-size engagement | n/a (cleared @18s) | **80/88 recovery samples ≥32 MB** |
+
+Fix C measurably cut the build count and node18's recovered throughput roughly
+doubled. The remaining snapshot-fsync cost (~506 ms) is now dominated by the
+**genuine size of node18's from-empty ~250 MB snapshots** (a deeper backlog than
+the 131 MB reference; ~250 MB `sync_all` is ≈0.5 s on the shared pd even
+un-contended), not by build contention. Closing that last part is the
+depth-management / delta-stream territory above (a returning owner should stream
+the bounded downtime delta rather than install a full from-empty snapshot
+proportional to the ratcheted backlog), tracked as the next lever.
