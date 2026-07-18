@@ -3,6 +3,8 @@
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyerror::AnyError;
@@ -41,11 +43,36 @@ impl SnapshotPolicy {
     where NID: NodeId {
         match self {
             SnapshotPolicy::LogsSinceLast(threshold) => {
+                // Apply the process-global recovery multiplier so a returning owner
+                // (or failover incumbent) reclaiming its co-hosted partitions builds
+                // snapshots less often while its state machine is large and the
+                // shared disk is already saturated by catch-up fsyncs. 1.0x
+                // (permille 1000) in steady state, so the cadence is unchanged then.
+                let mult = SNAPSHOT_LOGS_MULTIPLIER_PERMILLE.load(Ordering::Relaxed).max(1000);
+                let threshold = threshold.saturating_mul(mult) / 1000;
                 state.committed().next_index() >= state.snapshot_last_log_id().next_index() + threshold
             }
             SnapshotPolicy::Never => false,
         }
     }
+}
+
+/// Process-global multiplier (in permille; 1000 = 1.0x) applied to every
+/// [`SnapshotPolicy::LogsSinceLast`] threshold at evaluation time.
+///
+/// Kept here rather than in [`Config`] because a `Config` is immutable for the life
+/// of a Raft instance, but the recovery window it targets is dynamic and node-wide:
+/// the host application raises this while a node is a returning owner / failover
+/// incumbent (so co-hosted partitions snapshot rarely while their state machines are
+/// large and the one shared disk is saturated by reclaim fsyncs), then resets it to
+/// 1000. Clamped to a floor of 1000 so it can only ever *stretch* the cadence, never
+/// snapshot more aggressively than the configured threshold.
+pub static SNAPSHOT_LOGS_MULTIPLIER_PERMILLE: AtomicU64 = AtomicU64::new(1000);
+
+/// Set the process-global snapshot-logs multiplier (see
+/// [`SNAPSHOT_LOGS_MULTIPLIER_PERMILLE`]). Values below 1000 are clamped up to 1000.
+pub fn set_snapshot_logs_multiplier_permille(permille: u64) {
+    SNAPSHOT_LOGS_MULTIPLIER_PERMILLE.store(permille.max(1000), Ordering::Relaxed);
 }
 
 /// Parse number with unit such as 5.3 KB

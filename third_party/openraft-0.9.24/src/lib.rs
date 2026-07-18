@@ -76,6 +76,7 @@ pub use crate::async_runtime::TokioRuntime;
 pub use crate::change_members::ChangeMembers;
 pub use crate::config::Config;
 pub use crate::config::ConfigError;
+pub use crate::config::set_snapshot_logs_multiplier_permille;
 pub use crate::config::SnapshotPolicy;
 pub use crate::core::ServerState;
 pub use crate::entry::Entry;

@@ -1903,6 +1903,22 @@ fn leader_durable_recovery_grace_ticks() -> u32 {
         .max(1)
 }
 
+/// Multiplier (in permille; 1000 = 1.0x) applied to the Raft `LogsSinceLast`
+/// snapshot threshold while this node is in the recovery window (Fix C for the
+/// returning-owner recovery notch). Default 4000 (4x): during reclaim the co-hosted
+/// partitions apply their backlog in lockstep, so a 4x-wider threshold cuts the
+/// number of large snapshot builds — and the serialize + fsync IO they inflict on
+/// the shared disk — by ~4x while the state machine is large. Clamped to a floor of
+/// 1000 (the setter clamps too) so it can only stretch the cadence, never tighten
+/// it. `NANOBPMN_RAFT_RECOVERY_SNAPSHOT_MULT_PERMILLE`.
+fn recovery_snapshot_logs_multiplier_permille() -> u64 {
+    std::env::var("NANOBPMN_RAFT_RECOVERY_SNAPSHOT_MULT_PERMILLE")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(4000)
+        .max(1000)
+}
+
 /// Recovery-tick passes to hold a partition down after a self-promote before it is
 /// eligible to promote again. Damps the reclaim epoch-climb: once this node
 /// promotes partition `p` at epoch E, a lagging metrics view (the fresh group's
@@ -8195,6 +8211,21 @@ impl ServerImpl {
                 // disabled.
                 crate::raft_logstore::set_recovery_fsync_relief(
                     server.recovery_fsync_load_active(),
+                );
+                // Fix C: stretch the Raft snapshot cadence while this node is a
+                // returning owner / failover incumbent. Its co-hosted partitions
+                // apply a large reclaim backlog in lockstep and would otherwise
+                // cross `LogsSinceLast` together and build ~80 snapshots during the
+                // window; a wider effective threshold cuts that build count (and the
+                // serialize + fsync IO it inflicts on the shared disk) while the
+                // state machine is large. Reset to 1.0x (permille 1000) the moment
+                // recovery clears, so the steady-state cadence is unchanged.
+                openraft::set_snapshot_logs_multiplier_permille(
+                    if server.recovery_fsync_load_active() {
+                        recovery_snapshot_logs_multiplier_permille()
+                    } else {
+                        1000
+                    },
                 );
             }
         });

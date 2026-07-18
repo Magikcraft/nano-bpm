@@ -47,6 +47,26 @@ fn test_invalid_election_timeout_config_produces_expected_error() {
 }
 
 #[test]
+fn test_snapshot_logs_multiplier_clamps_to_floor() {
+    use super::config::set_snapshot_logs_multiplier_permille;
+    use super::config::SNAPSHOT_LOGS_MULTIPLIER_PERMILLE;
+    use std::sync::atomic::Ordering;
+
+    // Below the 1000 (1.0x) floor is clamped up: the recovery multiplier can only
+    // ever stretch the cadence, never snapshot more aggressively than configured.
+    set_snapshot_logs_multiplier_permille(500);
+    assert_eq!(1000, SNAPSHOT_LOGS_MULTIPLIER_PERMILLE.load(Ordering::Relaxed));
+
+    // A genuine stretch is stored verbatim.
+    set_snapshot_logs_multiplier_permille(4000);
+    assert_eq!(4000, SNAPSHOT_LOGS_MULTIPLIER_PERMILLE.load(Ordering::Relaxed));
+
+    // Restore the steady-state 1.0x so this test doesn't perturb others.
+    set_snapshot_logs_multiplier_permille(1000);
+    assert_eq!(1000, SNAPSHOT_LOGS_MULTIPLIER_PERMILLE.load(Ordering::Relaxed));
+}
+
+#[test]
 fn test_build() -> anyhow::Result<()> {
     let config = Config::build(&[
         "foo",

@@ -771,6 +771,19 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // runs the same blocking serialize the old `to_vec` did — but into a
         // buffered writer, so the peak transient is one buffer, not the whole
         // serialized state twice.
+        //
+        // Fix B: cap concurrent snapshot builds across this node's partitions. In
+        // the recovery window (a returning owner / failover incumbent, per
+        // `recovery_fsync_relief`) take the whole pool so the co-hosted reclaim
+        // builds serialize onto the shared disk one at a time instead of piling
+        // four simultaneous large fsyncs (~7x fsync amplification). Held across the
+        // serialize + `sync_all` (+ the durable-pointer fsync) until this returns.
+        let build_permits = if crate::raft_logstore::recovery_fsync_relief() {
+            snapshot_build_concurrency()
+        } else {
+            1
+        };
+        let _build_permit = snapshot_build_sem().acquire_many(build_permits).await.ok();
         let path = self
             .sm
             .snapshot_dir
@@ -1101,6 +1114,32 @@ fn raft_env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Max concurrent Raft snapshot builds across all of a node's partitions
+/// (`NANOBPMN_RAFT_SNAPSHOT_BUILD_CONCURRENCY`, default 2, floored at 1).
+fn snapshot_build_concurrency() -> u32 {
+    raft_env_u64("NANOBPMN_RAFT_SNAPSHOT_BUILD_CONCURRENCY", 2).clamp(1, 4096) as u32
+}
+
+/// Process-global limiter on concurrent snapshot builds (Fix B for the
+/// returning-owner recovery notch).
+///
+/// A returning owner reclaims all its co-hosted partitions (e.g. 2,5,8,11) at once;
+/// they cross their `LogsSinceLast` threshold together and call
+/// [`build_snapshot`](PartitionStateMachine::build_snapshot) at nearly the same
+/// instant. Each build does a blocking `serde_json` serialize + `sync_all` of a
+/// large (~130 MB) state machine, so four fire simultaneously onto the one shared
+/// disk and the fsync latency amplifies ~7x (≈96 ms un-contended → ≈711 ms under
+/// 4-way contention), stalling the shared Raft-log fsync path and the
+/// completion-paced admission servo. This semaphore caps how many build at once; in
+/// the recovery window a build takes the *whole* pool (exclusive) so the co-hosted
+/// reclaim builds run strictly one at a time.
+fn snapshot_build_sem() -> &'static tokio::sync::Semaphore {
+    static SNAPSHOT_BUILD_SEM: std::sync::OnceLock<tokio::sync::Semaphore> =
+        std::sync::OnceLock::new();
+    SNAPSHOT_BUILD_SEM
+        .get_or_init(|| tokio::sync::Semaphore::new(snapshot_build_concurrency() as usize))
 }
 
 /// The per-partition snapshot cadence, in applied log entries, with a bounded
@@ -1991,6 +2030,19 @@ mod tests {
         // Byte threshold disabled (0): only quiescence triggers.
         assert!(!should_compact(200, 100, i64::MAX, 0, Some(150)));
         assert!(should_compact(200, 100, i64::MAX, 0, Some(200)));
+    }
+
+    #[test]
+    fn snapshot_build_concurrency_defaults_and_floors() {
+        // Env-free default is 2 concurrent builds (steady-state co-hosted partitions
+        // rarely coincide thanks to the jitter, so a small cap is unobtrusive).
+        // The env var is read at process start via the OnceLock, so here we only
+        // assert the pure default + floor of the helper.
+        let c = snapshot_build_concurrency();
+        assert!(c >= 1, "concurrency must be floored at 1, got {c}");
+        // The semaphore is sized from the same helper, so it always has >=1 permit
+        // (acquire_many(concurrency) for the exclusive recovery path can succeed).
+        assert!(snapshot_build_sem().available_permits() >= 1);
     }
 
     #[test]
