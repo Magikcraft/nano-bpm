@@ -9726,7 +9726,20 @@ impl ServerImpl {
                 Some(h) => h,
                 None => continue,
             };
-            let low_water = handle.with(|journal| journal.retirement_low_water()).await;
+            let low_water = match tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                handle.with(|journal| journal.retirement_low_water()),
+            )
+            .await
+            {
+                Ok(lw) => lw,
+                // The owned engine actor is saturated (heavy-payload create/complete
+                // backlog); skip this partition this round rather than stalling the
+                // whole broadcast behind it. The watermark is idempotent and re-sent
+                // every tick, so a skipped round only delays convergence, and the
+                // actor drains (and this returns instantly) once load subsides.
+                Err(_) => continue,
+            };
             let followers: Vec<u32> = self
                 .engine
                 .topology()
@@ -13578,6 +13591,9 @@ async fn main() {
     // A server handle for the timer tick to route any cross-partition
     // subscription opens a fired timer advances a token into (no-op single-node).
     let tick_server = server.clone();
+    // A server handle for the decoupled retirement-broadcast tick (RF>1 follower
+    // reaping), captured before `server` is moved into the router.
+    let retire_server = server.clone();
 
     // Memory-pressure sampler: refresh the cached resident-memory gauge the
     // admission path reads, so `admission_shed` never advances jemalloc's stats
@@ -13934,13 +13950,33 @@ async fn main() {
                 if tick_server.lease_digest && !tick_server.raft.is_empty() {
                     tick_server.run_lease_digest(now).await;
                 }
-                // Best-effort retirement-digest pass (RF>1): broadcast the instances
-                // this node completed + evicted to their followers so replica engines
-                // drop them too (closes the leader-local-completion hot-state leak).
-                // Empty buffer / RF=1 / no raft => zero work.
-                if tick_server.engine.topology().effective_rf() > 1 && !tick_server.raft.is_empty()
+            }
+        });
+    }
+
+    // Retirement broadcast tick: RF>1 follower-replica reaping, on its OWN interval
+    // decoupled from the clock tick above. The clock tick drives per-partition Raft
+    // proposes (timer firing) through the owned engine actors; under a heavy-payload
+    // load those actors saturate and each `tick_partition_via_raft` round-trip stalls
+    // for seconds, so anything sequenced after it in the same loop body is starved.
+    // The follower-retirement broadcast (per-key digest + low-water watermark) used to
+    // live at that loop's tail and was therefore chronically starved exactly when a
+    // node was catching up — its replica engines then pile up never-reaped `Active`
+    // shells (each pinning its full variable payload), the large-payload rejoin memory
+    // blow-up. Running it here, on an independent ~500 ms cadence that skips missed
+    // ticks, keeps the backstop live regardless of clock-tick stalls. Empty buffer /
+    // RF=1 / no raft => zero work.
+    {
+        let retire_server = retire_server;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if retire_server.engine.topology().effective_rf() > 1
+                    && !retire_server.raft.is_empty()
                 {
-                    tick_server.run_retirement_digest().await;
+                    retire_server.run_retirement_digest().await;
                 }
             }
         });
