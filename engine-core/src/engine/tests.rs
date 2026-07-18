@@ -4837,6 +4837,109 @@ fn retire_before_create_tombstones_and_reaps_on_arrival() {
         .unwrap();
     assert!(engine.instance(live).is_some());
 }
+
+/// The loss-tolerant reconciliation backstop: `retire_below` drops every resident
+/// replica instance below the owner's low-water mark, and `retirement_low_water`
+/// ignores the owner's own resident terminal shells so the mark keeps advancing.
+#[test]
+fn retire_below_reconciles_follower_to_owner_low_water() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+
+    // Model a follower replica that applied five creates but no retirements.
+    let mut keys = Vec::new();
+    for _ in 0..5 {
+        keys.push(
+            engine
+                .apply_command(Command::create_instance("order"))
+                .unwrap()
+                .iter()
+                .find_map(|e| e.instance_key())
+                .unwrap(),
+        );
+    }
+    keys.sort_unstable();
+    assert!(keys.iter().all(|k| engine.instance(*k).is_some()));
+
+    // The owner's low-water mark sits just above the 3rd instance: everything below
+    // it has terminated on the owner. The sweep reaps exactly those (bounded).
+    let low_water = keys[3];
+    let reaped = engine.retire_below(low_water, 100);
+    assert_eq!(
+        reaped.len(),
+        3,
+        "reaps every resident instance below the mark"
+    );
+    assert!(engine.instance(keys[0]).is_none());
+    assert!(engine.instance(keys[2]).is_none());
+    assert!(
+        engine.instance(keys[3]).is_some(),
+        "the mark itself is kept"
+    );
+    assert!(engine.instance(keys[4]).is_some());
+
+    // Idempotent: re-running with the same mark reaps nothing more.
+    assert_eq!(engine.retire_below(low_water, 100).len(), 0);
+
+    // The bound caps a single sweep so a huge backlog drains across ticks.
+    let capped = engine.retire_below(keys[4] + 1, 1);
+    assert_eq!(capped.len(), 1);
+}
+
+/// `retirement_low_water` is the smallest still-`Active` key (so a follower can
+/// drop everything below it), and the next mintable key once nothing is active
+/// (so a quiescent owner tells followers to drop their whole backlog).
+#[test]
+fn retirement_low_water_tracks_min_active_then_next_key() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+
+    let first = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let second = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Two active instances -> the mark is the smaller (oldest) key.
+    assert_eq!(engine.retirement_low_water(), first.min(second));
+    let older = first.min(second);
+    let newer = first.max(second);
+
+    // Activate both jobs in one pass (a second pass would find nothing left).
+    let jobs = engine.activate_jobs("payment", "W", 10, 1_000, 0);
+    let job_older = jobs.iter().find(|j| j.instance_key == older).unwrap().key;
+    let job_newer = jobs.iter().find(|j| j.instance_key == newer).unwrap().key;
+
+    // Complete the older instance; the mark advances past it to the newer.
+    engine
+        .apply_command(Command::complete_job(job_older))
+        .unwrap();
+    assert_eq!(engine.retirement_low_water(), newer);
+
+    // Once nothing is active the mark is above every key ever minted, so a
+    // follower drops its entire resident backlog.
+    let mark_before = engine.retirement_low_water();
+    engine
+        .apply_command(Command::complete_job(job_newer))
+        .unwrap();
+    let mark_empty = engine.retirement_low_water();
+    assert!(
+        mark_empty > mark_before,
+        "a quiescent owner's mark exceeds every active key it ever held"
+    );
+    assert!(mark_empty > newer);
+}
 fn assert_job_index_consistent(engine: &Engine) {
     use std::collections::{BTreeSet, HashMap, HashSet};
     let mut expected: HashMap<String, BTreeSet<(i32, Key)>> = HashMap::new();

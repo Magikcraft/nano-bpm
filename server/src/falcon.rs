@@ -408,6 +408,19 @@ pub enum ClientFrame {
         partition: u64,
         keys: Vec<u64>,
     },
+    /// Loss-tolerant reconciliation backstop for [`ClientFrame::RetirementDigest`]
+    /// (RF>1). The partition owner broadcasts `low_water` — the smallest key still
+    /// `Active` on it — every tick; on receipt a follower drops every resident
+    /// replica instance below it ([`crate::journal::Journal::retire_below`]). Unlike
+    /// the per-key digest this is idempotent and self-healing: because the mark is
+    /// re-sent each tick and reaps below it wholesale, a follower converges even
+    /// when best-effort per-key frames are dropped under load. Fire-and-forget (no
+    /// `corr`); a dropped/stale watermark only delays convergence by a tick.
+    #[serde(rename_all = "camelCase")]
+    RetirementWatermark {
+        partition: u64,
+        low_water: u64,
+    },
     /// Leader-durable auto-recovery announcement (ADR 0003): the sender has
     /// app-promoted itself leader of `partition` at `epoch` after detecting the
     /// previous (sole-voter) leader was lost. Recipients adopt the higher epoch,
@@ -1082,6 +1095,7 @@ async fn handle_client_frame(
         ClientFrame::Raft { .. } => "raft",
         ClientFrame::LeaseDigest { .. } => "lease_digest",
         ClientFrame::RetirementDigest { .. } => "retirement_digest",
+        ClientFrame::RetirementWatermark { .. } => "retirement_watermark",
         ClientFrame::Promote { .. } => "promote",
         ClientFrame::SetSlaMode { .. } => "set_sla_mode",
         ClientFrame::PressureReport { .. } => "pressure_report",
@@ -1812,6 +1826,16 @@ async fn handle_client_frame(
             // completed instances it names from our replica engine so a follower
             // does not pile up never-reaped `Active` shells. Fire-and-forget.
             server.apply_retirement_digest(partition, keys);
+        }
+        ClientFrame::RetirementWatermark {
+            partition,
+            low_water,
+        } => {
+            // Loss-tolerant reconciliation backstop: drop every resident replica
+            // instance below the owner's authoritative low-water mark, converging
+            // our replica engine even if best-effort per-key digest frames were
+            // dropped under load. Fire-and-forget.
+            server.apply_retirement_watermark(partition, low_water);
         }
         ClientFrame::Promote {
             partition,

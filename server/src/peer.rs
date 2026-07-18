@@ -329,6 +329,22 @@ impl PeerLink {
             .await
     }
 
+    /// Fire-and-forget the retirement low-water mark to this peer (a follower
+    /// replica), which drops every resident replica instance below it. The
+    /// loss-tolerant reconciliation backstop for the per-key retirement digest.
+    /// See [`ClientFrame::RetirementWatermark`].
+    pub async fn send_retirement_watermark(
+        &self,
+        partition: u64,
+        low_water: u64,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::RetirementWatermark {
+            partition,
+            low_water,
+        })
+        .await
+    }
+
     /// Fire-and-forget a leader-durable promotion announcement to this peer (ADR
     /// 0003): this node has app-promoted itself leader of `partition` at `epoch`
     /// after the previous sole-voter leader was lost. See [`ClientFrame::Promote`].

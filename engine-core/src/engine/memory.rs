@@ -274,6 +274,65 @@ impl Engine {
         self.remove_instance_set(&hit)
     }
 
+    /// The retirement low-water mark this partition's **owner** broadcasts to its
+    /// follower replicas (consumed by [`Engine::retire_below`]): the smallest
+    /// still-`Active` instance key here. Every key below it has terminated — it is
+    /// either already evicted, or a resident `Completed`/`Terminated` shell (a
+    /// reclaimed owner can retain such shells until a later sweep) — so a follower
+    /// may safely reap any resident instance below it. When no instance is active,
+    /// it is the next key this partition would mint, so a quiescent owner tells its
+    /// followers to drop their entire replica backlog. Filtering to `Active`
+    /// (rather than the min resident key) is what lets the mark keep advancing even
+    /// while the owner still holds terminal shells, so it never pins a follower's
+    /// backlog. Cheap: an owner keeps only its in-flight working set active.
+    pub fn retirement_low_water(&self) -> Key {
+        self.state
+            .instances
+            .values()
+            .filter(|i| matches!(i.state, ProcessInstanceState::Active))
+            .map(|i| i.key)
+            .min()
+            .unwrap_or_else(|| {
+                state::compose_key(self.partition_id, self.next_local.saturating_add(1))
+            })
+    }
+
+    /// Loss-tolerant reconciliation counterpart to the per-key retirement digest:
+    /// on a **follower replica**, drops every resident instance whose key is
+    /// strictly below `low_water` (the owner's [`Engine::retirement_low_water`]).
+    /// Every such instance has terminated on the owner, so reaping its replica
+    /// shell here is safe. Bounded by `max_remove` per call so a large accumulated
+    /// backlog is drained across ticks without stalling the actor. Returns the
+    /// reaped keys (so the host can forget any spilled rows). Idempotent: once the
+    /// backlog below the mark is gone, re-running with the same or a higher mark is
+    /// a cheap no-op. Because the owner re-broadcasts the mark every tick, this
+    /// converges even when best-effort per-key digest frames are dropped under load.
+    pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> Vec<Key> {
+        if self.state.instances.is_empty() || max_remove == 0 {
+            return Vec::new();
+        }
+        let victims: Vec<Key> = self
+            .state
+            .instances
+            .keys()
+            .copied()
+            .filter(|&k| k < low_water)
+            .take(max_remove)
+            .collect();
+        if victims.is_empty() {
+            return victims;
+        }
+        // Any tombstone below the mark is now moot: a create for it, if it ever
+        // arrives, is reaped wholesale by this same sweep, so drop them to keep the
+        // tombstone set bounded to the still-active window.
+        if !self.retired_tombstones.is_empty() {
+            self.retired_tombstones.retain(|&k| k >= low_water);
+        }
+        let set: HashSet<Key> = victims.iter().copied().collect();
+        self.remove_instance_set(&set);
+        victims
+    }
+
     /// Shared removal pass for [`Engine::evict_instances`] and
     /// [`Engine::retire_instances`]: drops every instance in `victims` from hot
     /// state along with its jobs (via the `jobs_by_instance` reverse index, so the

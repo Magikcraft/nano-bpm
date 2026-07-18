@@ -1573,6 +1573,26 @@ impl Journal {
         self.engine.evict_completed()
     }
 
+    /// The owner-side low-water mark broadcast to this partition's follower
+    /// replicas. Passes through to [`Engine::retirement_low_water`].
+    pub fn retirement_low_water(&self) -> Key {
+        self.engine.retirement_low_water()
+    }
+
+    /// Follower-side reconciliation sweep: drops every resident replica instance
+    /// below the owner's `low_water` (and forgets their spilled rows), bounded to
+    /// `max_remove` per call. Mirrors [`Engine::retire_below`]; the loss-tolerant
+    /// convergence backstop for the best-effort per-key retirement digest.
+    pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> usize {
+        let reaped = self.engine.retire_below(low_water, max_remove);
+        if !reaped.is_empty()
+            && let Some(store) = self.spill_store()
+        {
+            store.forget(&reaped);
+        }
+        reaped.len()
+    }
+
     /// Shrinks the hot-state map capacities to fit their live contents, returning
     /// the bucket arrays freed by prior eviction back to the allocator. Mirrors
     /// [`Engine::shrink`]; called on the idle-purge path, where steady-state

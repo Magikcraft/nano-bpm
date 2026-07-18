@@ -9686,9 +9686,6 @@ impl ServerImpl {
         const MAX_KEYS_PER_FRAME: usize = 8192;
         let drained: std::collections::HashMap<u64, Vec<Key>> = {
             let mut buf = self.pending_retirements.lock().unwrap();
-            if buf.is_empty() {
-                return;
-            }
             std::mem::take(&mut *buf)
         };
         let node_id = self.engine.topology().node_id;
@@ -9715,6 +9712,35 @@ impl ServerImpl {
                 }
             }
         }
+
+        // Reconciliation phase (convergence backstop). The per-key digest above is
+        // best-effort: under load its fire-and-forget frames are dropped, so a
+        // follower's replica engine only ever reaps a fraction and the rest leak as
+        // never-retired `Active` shells. For every partition we lead, broadcast an
+        // authoritative low-water mark (the smallest key still `Active` on us);
+        // each follower drops every resident replica instance below it. This is
+        // idempotent and re-sent every tick, so a follower converges to the owner's
+        // live set regardless of dropped per-key frames.
+        for p in self.led_partitions() {
+            let handle = match self.engine_handle_for(p) {
+                Some(h) => h,
+                None => continue,
+            };
+            let low_water = handle.with(|journal| journal.retirement_low_water()).await;
+            let followers: Vec<u32> = self
+                .engine
+                .topology()
+                .replicas_of(p)
+                .into_iter()
+                .filter(|n| *n != node_id)
+                .collect();
+            for follower in followers {
+                if let Ok(link) = self.peers.link(follower).await {
+                    // Fire-and-forget: a dropped mark only delays convergence a tick.
+                    let _ = link.send_retirement_watermark(p, low_water).await;
+                }
+            }
+        }
     }
 
     /// Applies a retirement digest received from partition `p`'s leader: drops the
@@ -9733,6 +9759,29 @@ impl ServerImpl {
         if let Some(handle) = handle {
             handle.spawn_job(move |journal| {
                 journal.retire_instances(&keys);
+            });
+        }
+    }
+
+    /// Applies a retirement low-water mark received from partition `p`'s owner: on
+    /// the follower replica, drops every resident instance below `low_water`, the
+    /// convergence backstop for the best-effort per-key retirement digest (see
+    /// [`ClientFrame::RetirementWatermark`]). A no-op if this node OWNS `p` (its own
+    /// working set is authoritative) or does not replicate it. Bounded per call so a
+    /// large accumulated backlog is drained across ticks without stalling the actor;
+    /// the owner re-broadcasts the mark every tick, so the follower converges.
+    pub fn apply_retirement_watermark(&self, p: u64, low_water: Key) {
+        // Cap per-tick reaping so draining a multi-hundred-thousand backlog does
+        // not stall the single-writer replica actor against live create replication.
+        const MAX_REMOVE_PER_TICK: usize = 100_000;
+        // Only the follower replica needs this; the owner's own set is authoritative.
+        if self.engine.local_for_partition(p).is_some() {
+            return;
+        }
+        let handle = self.raft_replicas.lock().unwrap().get(&p).cloned();
+        if let Some(handle) = handle {
+            handle.spawn_job(move |journal| {
+                journal.retire_below(low_water, MAX_REMOVE_PER_TICK);
             });
         }
     }
@@ -18319,6 +18368,84 @@ mod clustered_startup_tests {
         assert!(
             retired,
             "the retirement digest reaps the completed instance from the follower replica"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_retirement_watermark_converges_a_follower_when_per_key_frames_are_lost() {
+        // The convergence backstop: the per-key retirement digest is best-effort, so
+        // under load its fire-and-forget frames are dropped and a follower only reaps
+        // a fraction — the rest leak as never-reaped `Active` shells. The owner also
+        // broadcasts a low-water mark every tick; a follower drops every resident
+        // replica instance below it, converging to the owner's live set REGARDLESS of
+        // any lost per-key frames. This proves that round-trip with an EMPTY per-key
+        // buffer (i.e. every per-key frame was lost).
+        let (node0, node1, node2) = boot_rf3_leader_durable_cluster().await;
+
+        // A create on partition 0 (led by node 0); it ships to the learners.
+        let (k1, _c1) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("leader-durable create acks on the sole voter");
+        assert_eq!(nanobpmn_engine_core::partition_of(k1), 0);
+
+        let learner_handle = node1
+            .engine_handle_for(0)
+            .expect("node 1 materializes a replica engine for partition 0");
+        let mut replicated = false;
+        for _ in 0..400 {
+            if learner_handle
+                .with(move |journal| journal.engine().state().instances.contains_key(&k1))
+                .await
+            {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(replicated, "the create ships to the learner replica engine");
+
+        // Simulate the leader completing + exporter-evicting the instance locally
+        // (leader-local, never logged) but WITHOUT buffering its key — i.e. its
+        // per-key digest frame was lost. The owner's low-water mark now advances past
+        // it, so the watermark phase alone must converge the follower.
+        let owner = node0.engine_handle_for(0).expect("node 0 owns partition 0");
+        owner
+            .with(move |journal| {
+                journal.retire_instances(&[k1]);
+            })
+            .await;
+
+        // Drop any per-key retirements the exporter may have buffered: this scenario
+        // proves the watermark converges the follower with ZERO per-key frames sent.
+        node0.pending_retirements.lock().unwrap().clear();
+
+        // One tick: the per-key phase is a no-op (empty buffer); the watermark phase
+        // broadcasts the advanced low-water mark to the followers.
+        node0.run_retirement_digest().await;
+
+        let mut converged = false;
+        for _ in 0..400 {
+            if !learner_handle
+                .with(move |journal| journal.engine().state().instances.contains_key(&k1))
+                .await
+            {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            converged,
+            "the retirement watermark reaps the follower backlog with zero per-key frames"
         );
 
         for node in [&node0, &node1, &node2] {
