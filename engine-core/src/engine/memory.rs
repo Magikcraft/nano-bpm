@@ -222,16 +222,48 @@ impl Engine {
                 )
             })
             .collect();
-        if terminal.is_empty() {
+        self.remove_instance_set(&terminal)
+    }
+
+    /// Unconditionally removes a batch of instances from hot state regardless of
+    /// their local lifecycle state — the follower-side counterpart to the leader's
+    /// exporter-driven [`Engine::evict_instances`]. Under RF>1 with leader-local
+    /// completion, a follower replica applies each `CreateInstance` (durably
+    /// replicated) but never the retirement (leader-local completion + exporter
+    /// eviction never enter the raft log), so completed instances pile up as
+    /// `Active` shells that [`Engine::evict_instances`] can never reap (they are
+    /// not terminal *here*). The partition leader broadcasts the authoritative set
+    /// of retired keys (the retirement digest) and the follower drops them here.
+    /// Keys absent locally are ignored (already gone, or the create has not yet
+    /// been applied — a benign, self-healing miss for a lagging learner, which is
+    /// re-snapshotted from the leader anyway). Returns the number removed.
+    pub fn retire_instances(&mut self, keys: &[Key]) -> usize {
+        let victims: HashSet<Key> = keys
+            .iter()
+            .copied()
+            .filter(|k| self.state.instances.contains_key(k))
+            .collect();
+        self.remove_instance_set(&victims)
+    }
+
+    /// Shared removal pass for [`Engine::evict_instances`] and
+    /// [`Engine::retire_instances`]: drops every instance in `victims` from hot
+    /// state along with its jobs (via the `jobs_by_instance` reverse index, so the
+    /// cost is `O(evicted jobs)` not `O(total jobs)`), timers, subscriptions and
+    /// incidents. Does **not** shrink the maps — capacity is reused by the next
+    /// instances, which is exactly what is wanted under sustained load. Returns the
+    /// number of instances removed.
+    fn remove_instance_set(&mut self, victims: &HashSet<Key>) -> usize {
+        if victims.is_empty() {
             return 0;
         }
         if self.track_dirty_vars {
-            for key in &terminal {
+            for key in victims {
                 self.dirty_vars.remove(key);
                 self.forgotten_vars.insert(*key);
             }
         }
-        for key in &terminal {
+        for key in victims {
             self.state.instances.remove(key);
             // Drop this instance's jobs via the reverse index (O(its jobs)),
             // deindexing each from the activatable/activated indices.
@@ -245,14 +277,14 @@ impl Engine {
         }
         self.state
             .timers
-            .retain(|_, t| !terminal.contains(&t.instance_key));
+            .retain(|_, t| !victims.contains(&t.instance_key));
         self.state
             .message_subscriptions
-            .retain(|_, s| !terminal.contains(&s.instance_key));
+            .retain(|_, s| !victims.contains(&s.instance_key));
         self.state
             .incidents
-            .retain(|_, i| !terminal.contains(&i.instance_key));
-        terminal.len()
+            .retain(|_, i| !victims.contains(&i.instance_key));
+        victims.len()
     }
 
     /// Evicts every completed instance (see [`Engine::evict_instance`]) and

@@ -392,6 +392,22 @@ pub enum ClientFrame {
         leases: Vec<(u64, u64)>,
         sent_at: u64,
     },
+    /// **Intra-cluster only.** A best-effort retirement digest broadcast by a
+    /// partition leader to its followers under RF>1. Carries the instance keys the
+    /// leader has completed and exporter-evicted locally for `partition`. Because
+    /// completion + eviction are leader-local (they never enter the raft log), a
+    /// follower replica applies each `CreateInstance` but never the matching
+    /// retirement, so completed instances accumulate as never-reaped `Active` shells
+    /// (the RF>1 hot-state leak). On receipt the follower drops these keys from its
+    /// replica engine ([`crate::journal::Journal::retire_instances`]). Fire-and-forget
+    /// (no `corr`) and idempotent: a dropped/stale digest only delays retirement
+    /// (memory converges on the next digest), and a lagging learner that has not yet
+    /// applied a create simply ignores the miss (it is re-snapshotted from the leader).
+    #[serde(rename_all = "camelCase")]
+    RetirementDigest {
+        partition: u64,
+        keys: Vec<u64>,
+    },
     /// Leader-durable auto-recovery announcement (ADR 0003): the sender has
     /// app-promoted itself leader of `partition` at `epoch` after detecting the
     /// previous (sole-voter) leader was lost. Recipients adopt the higher epoch,
@@ -1065,6 +1081,7 @@ async fn handle_client_frame(
         ClientFrame::ForwardCreate { .. } => "forward_create",
         ClientFrame::Raft { .. } => "raft",
         ClientFrame::LeaseDigest { .. } => "lease_digest",
+        ClientFrame::RetirementDigest { .. } => "retirement_digest",
         ClientFrame::Promote { .. } => "promote",
         ClientFrame::SetSlaMode { .. } => "set_sla_mode",
         ClientFrame::PressureReport { .. } => "pressure_report",
@@ -1789,6 +1806,12 @@ async fn handle_client_frame(
             // Store it; on promotion this node recovers the leases (see the tick
             // driver). Fire-and-forget: no reply.
             server.record_lease_digest(partition, leases, sent_at);
+        }
+        ClientFrame::RetirementDigest { partition, keys } => {
+            // Best-effort retirement digest from this partition's leader: drop the
+            // completed instances it names from our replica engine so a follower
+            // does not pile up never-reaped `Active` shells. Fire-and-forget.
+            server.apply_retirement_digest(partition, keys);
         }
         ClientFrame::Promote {
             partition,

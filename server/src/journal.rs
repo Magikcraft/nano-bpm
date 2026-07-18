@@ -1542,6 +1542,21 @@ impl Journal {
         self.engine.evict_instances(keys)
     }
 
+    /// Unconditionally retires a batch of instances from hot state (and their
+    /// spilled/cold rows) regardless of local lifecycle state. The follower-side
+    /// counterpart to [`Journal::evict_instances`]: a partition leader broadcasts
+    /// the authoritative retirement digest (the keys it completed + exporter-evicted
+    /// locally, which never enter the raft log) and each follower replica drops them
+    /// here, so its replica engine cannot pile up completed instances as never-reaped
+    /// `Active` shells (the RF>1 leader-local-completion hot-state leak). Mirrors
+    /// [`Engine::retire_instances`]; keys absent locally are ignored.
+    pub fn retire_instances(&mut self, keys: &[Key]) -> usize {
+        if let Some(store) = self.spill_store() {
+            store.forget(keys);
+        }
+        self.engine.retire_instances(keys)
+    }
+
     /// The shared disk-backed spill/cold store, if either tier is wired. Both
     /// tiers share one [`VarSpillStore`] (one file, one WAL), so either handle
     /// reaches the same `spill` and `cold` tables.
