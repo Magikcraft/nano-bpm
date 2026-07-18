@@ -1255,10 +1255,34 @@ impl Journal {
     /// partition — hot resident instances plus cold-spilled ones — into `out`.
     /// This is the authoritative set reconciliation compares the read model's
     /// `Active` rows against: any read row whose key is absent here corresponds to
-    /// an instance the engine has already driven to a terminal state and evicted,
-    /// so its read row is an orphan (its terminal event was never projected).
+    /// an instance the engine has already driven to a terminal state, so its read
+    /// row is an orphan (its terminal event was never projected).
+    ///
+    /// The hot side is filtered to `Active` (non-terminal) instances. The engine
+    /// normally evicts a terminal instance the moment it is reached, but a leader
+    /// keeps terminal shells resident until its exporter drives eviction, and a
+    /// node that reclaimed a partition can retain a large backlog of resident
+    /// terminal shells whose completions it applied via raft catch-up (never
+    /// exporter-evicted). Counting those resident-but-terminal shells as "live"
+    /// would defeat reconciliation: an orphaned `Active` read row whose engine
+    /// instance is resident-`Completed` would be treated as still live and never
+    /// retired, pinning the active-backlog gauge forever (the post-bounce "stuck
+    /// active instances" symptom). The cold side needs no filter — a terminal
+    /// instance is `forget`-ten from the store on eviction, never spilled, so
+    /// `cold.index` only ever holds dormant (non-terminal) instances.
     pub fn collect_live_instance_keys(&self, out: &mut std::collections::HashSet<Key>) {
-        out.extend(self.state().instances.keys().copied());
+        out.extend(
+            self.state()
+                .instances
+                .values()
+                .filter(|inst| {
+                    matches!(
+                        inst.state,
+                        nanobpmn_engine_core::ProcessInstanceState::Active
+                    )
+                })
+                .map(|inst| inst.key),
+        );
         if let Some(cold) = self.cold.as_ref() {
             out.extend(cold.index.keys());
         }
@@ -2254,6 +2278,61 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ProcessInstanceTerminated { instance_key } if *instance_key == key)));
+    }
+
+    #[test]
+    fn collect_live_instance_keys_excludes_resident_terminal_instances() {
+        // Regression for the post-bounce "stuck active instances" symptom: a leader
+        // (or a node that reclaimed a partition) keeps a completed instance's shell
+        // resident until its exporter drives eviction. The read-model orphan
+        // reconciler compares its `Active` rows against this live set, so a
+        // resident-but-terminal shell must NOT appear here — otherwise an orphaned
+        // `Active` read row whose engine instance is already `Completed` would be
+        // treated as still live and never retired, pinning the active-backlog gauge.
+        let mut journal = Journal::in_memory();
+        let completed_key = deploy_and_create(&mut journal);
+
+        // Drive the instance to Completed WITHOUT evicting it (no exporter runs in
+        // this unit): activate then complete its only job.
+        let jobs = journal.activate_jobs("demo-work", "w", 1, 1_000, 0);
+        assert_eq!(jobs.len(), 1);
+        let (events, _) = journal
+            .apply_command(Command::complete_job(jobs[0].key))
+            .unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::ProcessInstanceCompleted { instance_key } if *instance_key == completed_key
+        )));
+        // The completed instance is still resident (nothing evicted it)...
+        assert!(matches!(
+            journal.instance(completed_key).map(|i| i.state),
+            Some(nanobpmn_engine_core::ProcessInstanceState::Completed)
+        ));
+
+        // ...but it is terminal, so it is NOT a live instance.
+        let mut live = std::collections::HashSet::new();
+        journal.collect_live_instance_keys(&mut live);
+        assert!(
+            !live.contains(&completed_key),
+            "a resident-but-Completed instance must not count as live"
+        );
+
+        // Sanity: a genuinely Active instance IS collected, and the resident
+        // Completed one stays excluded alongside it.
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let active_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let mut live2 = std::collections::HashSet::new();
+        journal.collect_live_instance_keys(&mut live2);
+        assert!(
+            live2.contains(&active_key),
+            "an Active instance must count as live"
+        );
+        assert!(
+            !live2.contains(&completed_key),
+            "the resident Completed instance stays excluded"
+        );
     }
 
     #[test]
