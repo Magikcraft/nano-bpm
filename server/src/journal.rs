@@ -962,6 +962,16 @@ impl Journal {
     /// [`nanobpmn_engine_core::EngineSnapshot`] (control state + variables), so
     /// the engine is fully resident afterward; the preserved var store / spill
     /// tiers only participate in later spill write-through / rehydrate.
+    ///
+    /// The snapshot's `State` is cloned wholesale by [`Engine::snapshot`], so it
+    /// carries the source's resident **terminal** (Completed/Terminated) shells —
+    /// the exporter-lag / retirement backlog the leader held at build time. Those
+    /// instances are done and already durable in the read model at their source;
+    /// they never flow through THIS node's exporter (they arrived by snapshot, not
+    /// as replayed events), so nothing would ever evict them and they would pin
+    /// hot state on a reclaiming owner. Shed them here so the installed hot state
+    /// holds only in-flight instances — the same invariant the boot replay
+    /// establishes with its post-catch-up `evict_completed` sweep.
     pub fn restore_engine_from_snapshot(&mut self, snapshot: nanobpmn_engine_core::EngineSnapshot) {
         // Config the snapshot body does not carry, re-applied onto the new engine.
         let lenient = self.engine.lenient_completion();
@@ -975,6 +985,8 @@ impl Journal {
             self.engine.set_track_dirty_vars(true);
             self.engine.mark_all_dirty();
         }
+        // Drop the snapshot's terminal shells: hot state keeps only in-flight work.
+        self.engine.evict_completed();
         self.fresh = false;
     }
 
@@ -2582,12 +2594,27 @@ mod tests {
         // unbounded in hot state (the ~830k-per-partition leak on a returning
         // owner). Prove the exporter survives the install and still sees events.
 
-        // A "received" snapshot from a peer: a deployed demo + one live instance.
-        let captured = {
+        // A "received" snapshot from a peer: a deployed demo + one still-live
+        // instance AND one already-completed instance (the exporter-lag / terminal
+        // shell a leader carries at snapshot-build time — `Engine::snapshot` clones
+        // the whole state including terminal instances).
+        let (captured, completed_key) = {
             let mut src = Journal::in_memory_partition(0);
             let _ = src.apply_command(Command::DeployProcess(demo())).unwrap();
+            // Instance #1: drive it to Completed and leave it resident.
+            let (ev, _) = src.apply_command(Command::create_instance("demo")).unwrap();
+            let done_key = ev.iter().find_map(|e| e.instance_key()).unwrap();
+            let jobs = src.activate_jobs("demo-work", "w", 1, 1_000, 0);
+            let _ = src
+                .apply_command(Command::complete_job(jobs[0].key))
+                .unwrap();
+            assert!(matches!(
+                src.instance(done_key).map(|i| i.state),
+                Some(nanobpmn_engine_core::ProcessInstanceState::Completed)
+            ));
+            // Instance #2: parked on its job, still Active.
             let _ = src.apply_command(Command::create_instance("demo")).unwrap();
-            src.engine_snapshot()
+            (src.engine_snapshot(), done_key)
         };
 
         // The local owned journal: exporter wired at boot, then a snapshot lands.
@@ -2597,10 +2624,23 @@ mod tests {
 
         journal.restore_engine_from_snapshot(captured);
 
-        // The snapshot's instance is resident, and the exporter is still wired:
-        // a subsequent command's events flow to the read-model channel.
+        // The snapshot's terminal shell is shed (it never flows through this node's
+        // exporter, so it must not linger in hot state), while the live instance
+        // stays resident.
         assert!(!journal.is_fresh());
         assert_eq!(journal.state().processes.len(), 1);
+        assert!(
+            journal.instance(completed_key).is_none(),
+            "an installed snapshot's terminal instance must be evicted from hot state"
+        );
+        assert_eq!(
+            journal.state().instances.len(),
+            1,
+            "only the in-flight instance remains resident after the install"
+        );
+
+        // The exporter is still wired: a subsequent command's events flow to the
+        // read-model channel.
         let (events, _) = journal
             .apply_command(Command::create_instance("demo"))
             .unwrap();
