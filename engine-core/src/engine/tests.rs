@@ -4721,8 +4721,57 @@ fn evict_instances_batches_in_one_pass() {
     assert!(engine.state().jobs.values().any(|j| j.instance_key == live));
 }
 
-/// The activatable index must always equal the set of jobs in state
-/// `Created`/`Activated`, grouped by type. Asserts that invariant.
+/// `retire_instances` is the follower-side counterpart to `evict_instances`: it
+/// drops the named instances from hot state regardless of their local lifecycle
+/// state (a follower replica never sees the leader-local completion, so the
+/// instance is still `Active` here), while ignoring keys that are absent.
+#[test]
+fn retire_instances_drops_active_shells_and_ignores_absent() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+
+    // Two in-flight (Active, with a Created job) instances — this models a
+    // follower replica that applied the CreateInstance but never the completion.
+    let a = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let b = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let keep = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Both `a` and `b` are Active, not terminal — `evict_instances` must NOT
+    // touch them, proving the leak they cause.
+    assert_eq!(engine.evict_instances(&[a, b]), 0);
+    assert!(engine.instance(a).is_some());
+
+    // `retire_instances` drops the two named Active shells (and their jobs),
+    // ignores the unknown key, and leaves the untouched instance intact.
+    let retired = engine.retire_instances(&[a, b, 9_999_999]);
+    assert_eq!(retired, 2);
+    assert!(engine.instance(a).is_none());
+    assert!(engine.instance(b).is_none());
+    assert!(engine.instance(keep).is_some());
+    assert!(!engine
+        .state()
+        .jobs
+        .values()
+        .any(|j| j.instance_key == a || j.instance_key == b));
+    assert!(engine.state().jobs.values().any(|j| j.instance_key == keep));
+}
 fn assert_job_index_consistent(engine: &Engine) {
     use std::collections::{BTreeSet, HashMap, HashSet};
     let mut expected: HashMap<String, BTreeSet<(i32, Key)>> = HashMap::new();

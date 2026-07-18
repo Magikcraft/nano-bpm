@@ -316,6 +316,19 @@ impl PeerLink {
         .await
     }
 
+    /// Fire-and-forget a best-effort retirement digest for `partition` to this
+    /// follower: the instance keys the leader has completed + exporter-evicted, so
+    /// the follower drops them from its replica engine. See
+    /// [`ClientFrame::RetirementDigest`].
+    pub async fn send_retirement_digest(
+        &self,
+        partition: u64,
+        keys: Vec<u64>,
+    ) -> Result<(), PeerError> {
+        self.send_oneway(ClientFrame::RetirementDigest { partition, keys })
+            .await
+    }
+
     /// Fire-and-forget a leader-durable promotion announcement to this peer (ADR
     /// 0003): this node has app-promoted itself leader of `partition` at `epoch`
     /// after the previous sole-voter leader was lost. See [`ClientFrame::Promote`].

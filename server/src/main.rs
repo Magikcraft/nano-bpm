@@ -94,6 +94,12 @@ const DEFAULT_AWAIT_COMPLETION_TIMEOUT_MS: u64 = 5_000;
 /// wired to the engine via the inherent methods below and routed from the stub
 /// generator's override table. Every durable command is appended to the journal
 /// so engine state survives a restart.
+///
+/// Per-owned-partition buffer of instance keys pending broadcast as a retirement
+/// digest (see [`ServerImpl::run_retirement_digest`]): the exporter fills it, the
+/// tick drains it. Aliased to keep the exporter/`ServerImpl` signatures readable.
+type RetirementBuffer = Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<Key>>>>;
+
 #[derive(Clone)]
 pub struct ServerImpl {
     engine: Partitions,
@@ -383,6 +389,14 @@ pub struct ServerImpl {
     /// by the number of partitions this node replicates. Empty unless `lease_digest`
     /// is on.
     lease_digests: Arc<std::sync::Mutex<std::collections::HashMap<u64, ReceivedDigest>>>,
+    /// Per-owned-partition buffer of instance keys this node has completed and
+    /// exporter-evicted, pending broadcast to the partition's followers as a
+    /// retirement digest (see [`Self::run_retirement_digest`]). The exporter appends
+    /// each terminal batch here and the ~500 ms tick drains + broadcasts it so a
+    /// follower replica can drop the same instances instead of leaking them as
+    /// never-reaped `Active` shells (the RF>1 leader-local-completion hot-state
+    /// leak). Empty (and never populated) at RF=1 / single-node.
+    pending_retirements: Arc<std::sync::Mutex<std::collections::HashMap<u64, Vec<Key>>>>,
     /// Replication durability tier for the partition Raft log (`NANOBPMN_REPLICATION`,
     /// ADR 0003). [`ReplicationMode::Quorum`] (default) acks after majority commit;
     /// [`ReplicationMode::LeaderDurable`] forms each led group with the leader as the
@@ -967,6 +981,7 @@ impl ServerImpl {
             activation_policy,
             lease_digest,
             lease_digests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_retirements: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             replication_mode,
             promotion_epoch: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             reclaim_via_handoff: std::env::var("NANOBPMN_RECLAIM_HANDOFF")
@@ -1339,6 +1354,11 @@ fn build_server(
             server.instances_changed.clone(),
             server.inflight.clone(),
             server.activity.clone(),
+            if server.engine.topology().effective_rf() > 1 {
+                Some(server.pending_retirements.clone())
+            } else {
+                None
+            },
             #[cfg(feature = "console")]
             server.trace_store.clone(),
         );
@@ -1420,6 +1440,7 @@ fn spawn_exporter(
     instances_changed: Arc<tokio::sync::Notify>,
     inflight: Arc<AtomicUsize>,
     activity: Arc<AtomicU64>,
+    retirements: Option<RetirementBuffer>,
     #[cfg(feature = "console")] trace_store: Arc<console::trace::TraceStore>,
 ) {
     // Read-model history retention (per shard): how many terminal
@@ -1549,6 +1570,20 @@ fn spawn_exporter(
                 instances_changed.notify_waiters();
                 since_prune += completed.len();
                 if !completed.is_empty() {
+                    // Under RF>1, buffer the same terminal keys for broadcast to
+                    // this partition's followers (the retirement digest). Leader-local
+                    // completion + this exporter eviction never enter the raft log, so
+                    // a follower replica would otherwise pile them up as never-reaped
+                    // `Active` shells. Grouped by minting partition (a batch may span
+                    // the shard's owned partitions); the ~500 ms tick drains + sends.
+                    if let Some(buf) = &retirements {
+                        let mut buf = buf.lock().unwrap();
+                        for &key in &completed {
+                            buf.entry(nanobpmn_engine_core::partition_of(key))
+                                .or_default()
+                                .push(key);
+                        }
+                    }
                     // Reclaim hot state for the whole batch; no per-batch
                     // shrink_to_fit (reallocating every map needlessly throttles
                     // command throughput — capacity is reused by new instances).
@@ -9628,6 +9663,80 @@ impl ServerImpl {
         }
     }
 
+    /// One pass of the retirement-digest protocol (RF>1). Drains the buffer the
+    /// exporter fills with the instance keys this node completed + exporter-evicted
+    /// per owned partition, and fire-and-forgets them to each partition's followers
+    /// so their replica engines drop the same instances ([`ClientFrame::RetirementDigest`]).
+    ///
+    /// This closes the RF>1 leader-local-completion hot-state leak: completion and
+    /// eviction are leader-local (they never enter the raft log), so a follower
+    /// applies every `CreateInstance` but no retirement and would otherwise grow its
+    /// replica engine without bound (millions of never-reaped `Active` shells / GBs
+    /// of live heap). PR #117's fresh-host on rejoin only resets this once; the
+    /// divergence recurs on any caught-up learner during live tailing, so it must be
+    /// bounded continuously here.
+    ///
+    /// Soft/lossy by design: a dropped or stale digest only delays retirement (memory
+    /// converges on the next digest); it never touches the raft log, quorum, or
+    /// durability, and retiring an already-absent key is a no-op — so this is safe by
+    /// construction, exactly like the lease digest.
+    async fn run_retirement_digest(&self) {
+        // Frame cap: keep a single digest bounded regardless of the batch size the
+        // exporter accumulated between ticks (a large drain is chunked across frames).
+        const MAX_KEYS_PER_FRAME: usize = 8192;
+        let drained: std::collections::HashMap<u64, Vec<Key>> = {
+            let mut buf = self.pending_retirements.lock().unwrap();
+            if buf.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *buf)
+        };
+        let node_id = self.engine.topology().node_id;
+        for (p, keys) in drained {
+            if keys.is_empty() {
+                continue;
+            }
+            let followers: Vec<u32> = self
+                .engine
+                .topology()
+                .replicas_of(p)
+                .into_iter()
+                .filter(|n| *n != node_id)
+                .collect();
+            if followers.is_empty() {
+                continue;
+            }
+            for chunk in keys.chunks(MAX_KEYS_PER_FRAME) {
+                for &follower in &followers {
+                    if let Ok(link) = self.peers.link(follower).await {
+                        // Fire-and-forget: a failed send just skips this round.
+                        let _ = link.send_retirement_digest(p, chunk.to_vec()).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Applies a retirement digest received from partition `p`'s leader: drops the
+    /// named completed instances from this node's replica engine for `p`. A no-op if
+    /// this node OWNS `p` (its own exporter already evicted them) or does not
+    /// replicate it. Fire-and-forget on the engine actor (no reply to await).
+    pub fn apply_retirement_digest(&self, p: u64, keys: Vec<Key>) {
+        if keys.is_empty() {
+            return;
+        }
+        // Only the follower replica needs this; the owner already reaped locally.
+        if self.engine.local_for_partition(p).is_some() {
+            return;
+        }
+        let handle = self.raft_replicas.lock().unwrap().get(&p).cloned();
+        if let Some(handle) = handle {
+            handle.spawn_job(move |journal| {
+                journal.retire_instances(&keys);
+            });
+        }
+    }
+
     /// Fans a deployment into every replica engine actor (followers under RF>1) so
     /// a replicated `CreateInstance` for the new definition applies successfully on
     /// every replica. A no-op (and zero overhead) when this node hosts no replica
@@ -13775,6 +13884,14 @@ async fn main() {
                 // followers. Empty / single-node / non-digest => zero work.
                 if tick_server.lease_digest && !tick_server.raft.is_empty() {
                     tick_server.run_lease_digest(now).await;
+                }
+                // Best-effort retirement-digest pass (RF>1): broadcast the instances
+                // this node completed + evicted to their followers so replica engines
+                // drop them too (closes the leader-local-completion hot-state leak).
+                // Empty buffer / RF=1 / no raft => zero work.
+                if tick_server.engine.topology().effective_rf() > 1 && !tick_server.raft.is_empty()
+                {
+                    tick_server.run_retirement_digest().await;
                 }
             }
         });
@@ -18117,6 +18234,91 @@ mod clustered_startup_tests {
         assert!(
             replicated,
             "the acked entry ships to the learner asynchronously (leader-durable still replicates)"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_retirement_digest_reaps_completed_instances_from_follower_replicas() {
+        // The RF>1 leader-local-completion leak: completion + exporter eviction are
+        // leader-local (they never enter the raft log), so a learner applies each
+        // CreateInstance but no retirement — a completed instance would linger in its
+        // replica engine as a never-reaped `Active` shell. The leader broadcasts a
+        // retirement digest naming the instances it completed + evicted, and the
+        // learner drops them here. This proves that round-trip.
+        let (node0, node1, node2) = boot_rf3_leader_durable_cluster().await;
+
+        // Create on partition 0 (led by node 0). It ships to the learners.
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("leader-durable create acks on the sole voter");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+
+        // Wait until node 1's replica engine has materialized the instance (it is
+        // Active here — the learner never sees the leader-local completion).
+        let learner_handle = node1
+            .engine_handle_for(0)
+            .expect("node 1 materializes a replica engine for partition 0");
+        let mut replicated = false;
+        for _ in 0..400 {
+            if learner_handle
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
+                })
+                .await
+            {
+                replicated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(replicated, "the create ships to the learner replica engine");
+
+        // Simulate the leader completing + exporter-evicting the instance: the
+        // exporter buffers its key for the retirement digest. Then run one digest
+        // pass, which fire-and-forgets it to the partition's followers.
+        node0
+            .pending_retirements
+            .lock()
+            .unwrap()
+            .entry(0)
+            .or_default()
+            .push(instance_key);
+        node0.run_retirement_digest().await;
+
+        // The learner drops the instance from its replica engine (no more leak).
+        let mut retired = false;
+        for _ in 0..400 {
+            if !learner_handle
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
+                })
+                .await
+            {
+                retired = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            retired,
+            "the retirement digest reaps the completed instance from the follower replica"
         );
 
         for node in [&node0, &node1, &node2] {
