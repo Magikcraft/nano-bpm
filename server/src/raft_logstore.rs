@@ -208,8 +208,15 @@ struct Stored {
     /// The entry's log id (kept even when demoted, so `get_log_state` and the
     /// truncate/purge bookkeeping never have to touch disk).
     log_id: LogId<NodeId>,
-    /// Serialized byte length of this entry's on-disk line (JSON + `\n`).
+    /// Serialized byte length of this entry's on-disk line (the physical record:
+    /// the compressed frame when log compression is on, else `JSON + '\n'`). Drives
+    /// segment offset/roll bookkeeping and the on-disk `log_bytes` accounting.
     len: usize,
+    /// Uncompressed in-RAM footprint of this entry (plaintext `JSON + '\n'` length),
+    /// used for the resident-RAM budget and the `nanobpm_raft_log_ram_bytes` metric.
+    /// Equal to `len` when compression is off; larger than `len` (by the compression
+    /// ratio) when on — because the resident copy in `entry` is always uncompressed.
+    ram_len: usize,
     /// Start index of the segment file holding this entry's line.
     seg_start: u64,
     /// Byte offset of this entry's line within that segment file.
@@ -368,6 +375,7 @@ struct ScannedEntry {
     log_id: LogId<NodeId>,
     offset: usize,
     len: usize,
+    ram_len: usize,
     entry: Entry<RaftConfig>,
 }
 
@@ -418,11 +426,23 @@ fn scan_segment(path: &Path) -> io::Result<(Vec<ScannedEntry>, usize)> {
             continue;
         }
         let entry = entry_from_record(rec)?;
+        // `ram_len` is the uncompressed in-RAM footprint. Plaintext records are
+        // already `JSON + '\n'`, so `rec_len` is exact; a compressed frame's on-disk
+        // `rec_len` understates the resident copy, so recover the plaintext length by
+        // re-serializing (startup-only cost). Falls back to `rec_len` if that fails.
+        let ram_len = if is_frame {
+            serde_json::to_vec(&entry)
+                .map(|v| v.len() + 1)
+                .unwrap_or(rec_len)
+        } else {
+            rec_len
+        };
         out.push(ScannedEntry {
             index: entry.log_id.index,
             log_id: entry.log_id,
             offset: i,
             len: rec_len,
+            ram_len,
             entry,
         });
         i += rec_len;
@@ -534,8 +554,8 @@ impl Inner {
             }
             if let Some(s) = self.log.get_mut(&idx) {
                 s.entry = None;
-                self.ram_bytes -= s.len;
-                freed += s.len;
+                self.ram_bytes -= s.ram_len;
+                freed += s.ram_len;
             }
             cursor = idx + 1;
         }
@@ -764,6 +784,7 @@ impl RaftLogStore {
         // garbage — unlink it now to reclaim the space.
         let mut log: BTreeMap<u64, Stored> = BTreeMap::new();
         let mut log_bytes: usize = 0;
+        let mut ram_total: usize = 0;
         let mut segments: Vec<SegMeta> = Vec::new();
         let mut active_bytes: usize = 0;
         for (pos, &start) in starts.iter().enumerate() {
@@ -775,11 +796,13 @@ impl RaftLogStore {
                 last = Some(r.index);
                 if purged_upto.map(|p| r.index > p).unwrap_or(true) {
                     log_bytes += r.len;
+                    ram_total += r.ram_len;
                     log.insert(
                         r.index,
                         Stored {
                             log_id: r.log_id,
                             len: r.len,
+                            ram_len: r.ram_len,
                             seg_start: start,
                             offset: r.offset,
                             entry: Some(r.entry),
@@ -823,7 +846,7 @@ impl RaftLogStore {
                 seg_max_bytes: seg_max_bytes_from_env(),
                 log,
                 log_bytes,
-                ram_bytes: log_bytes,
+                ram_bytes: ram_total,
                 ram_budget: ram_budget_from_env(),
                 demote_scan_from: 0,
                 last_purged: state.last_purged,
@@ -839,7 +862,7 @@ impl RaftLogStore {
             bytes: Arc::new(AtomicI64::new(log_bytes as i64)),
         };
         crate::metrics::raft_log_delta(entries, log_bytes as i64);
-        crate::metrics::raft_log_ram_delta(log_bytes as i64);
+        crate::metrics::raft_log_ram_delta(ram_total as i64);
         // A recovered tail loads fully resident; demote its cold prefix so a
         // restart under a large-payload workload does not re-balloon RAM.
         store.inner.lock().unwrap().enforce_ram_budget();
@@ -1108,9 +1131,15 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         let mut inner = self.inner.lock().unwrap();
         let mut added = 0i64;
         let mut new_bytes = 0usize;
+        let mut new_ram = 0usize;
         for entry in entries {
             let mut json = Vec::new();
             serde_json::to_writer(&mut json, &entry).map_err(io_err)?;
+            // Uncompressed in-RAM footprint (plaintext `JSON + '\n'`), captured before
+            // the compress branch may reframe/extend `json`. This — not the possibly
+            // compressed on-disk `len` — is what the resident `entry` copy actually
+            // costs, so it drives the RAM budget/metric.
+            let ram_len = json.len() + 1;
             // Compress large entries into a self-describing frame when enabled; small
             // entries (and the disabled path) stay verbatim as `json + '\n'`. `len` is
             // the physical on-disk record length either way, so the offset/roll/demote
@@ -1152,15 +1181,17 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
                 Stored {
                     log_id,
                     len,
+                    ram_len,
                     seg_start,
                     offset,
                     entry: Some(entry),
                 },
             );
             inner.log_bytes += len;
-            inner.ram_bytes += len;
+            inner.ram_bytes += ram_len;
             inner.unsynced_bytes += len;
             new_bytes += len;
+            new_ram += ram_len;
             added += 1;
             crate::metrics::raft_log_entry_appended(len);
         }
@@ -1185,7 +1216,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
             }
         }
         crate::metrics::raft_log_delta(added, new_bytes as i64);
-        crate::metrics::raft_log_ram_delta(new_bytes as i64);
+        crate::metrics::raft_log_ram_delta(new_ram as i64);
         // Demote the cold tail back under the RAM budget (O(1) in-memory drops; the
         // bytes are already durably on disk). Off the fsync path above.
         inner.enforce_ram_budget();
@@ -1206,7 +1237,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         let removed_ram: usize = removed
             .values()
             .filter(|s| s.entry.is_some())
-            .map(|s| s.len)
+            .map(|s| s.ram_len)
             .sum();
         inner.log_bytes = inner.log_bytes.saturating_sub(removed_bytes);
         inner.ram_bytes = inner.ram_bytes.saturating_sub(removed_ram);
@@ -1238,7 +1269,7 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
         let dropped_ram: usize = dropped
             .values()
             .filter(|s| s.entry.is_some())
-            .map(|s| s.len)
+            .map(|s| s.ram_len)
             .sum();
         inner.log_bytes = inner.log_bytes.saturating_sub(dropped_bytes);
         inner.ram_bytes = inner.ram_bytes.saturating_sub(dropped_ram);
@@ -1503,7 +1534,7 @@ mod tests {
             assert_eq!(resident, vec![4], "only the newest entry stays resident");
             assert_eq!(
                 inner.ram_bytes,
-                inner.log.get(&4).unwrap().len,
+                inner.log.get(&4).unwrap().ram_len,
                 "resident bytes collapse to just the hot entry"
             );
         }
@@ -1747,6 +1778,44 @@ mod tests {
         let got = store.try_get_log_entries(1..=2).await.unwrap();
         assert_eq!(got.len(), 2);
         assert!(matches!(got[0].payload, EntryPayload::Normal(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the compressed-log RAM-accounting bug: a compressed frame is
+    /// small on disk but its resident `Entry` is uncompressed, so `ram_bytes` must
+    /// reflect the *uncompressed* footprint — otherwise the RAM budget never demotes
+    /// and `nanobpm_raft_log_ram_bytes` undercounts resident memory by the
+    /// compression ratio (the observed ~5 GB unaccounted heap under 50 KB payloads).
+    #[tokio::test]
+    async fn ram_bytes_accounts_uncompressed_size_for_framed_entries() {
+        let dir = tmp_dir("ram-uncompressed");
+        let (r0, j0) = framed_record(&big_entry(0, 50 * 1024));
+        let (r1, j1) = framed_record(&big_entry(1, 50 * 1024));
+        let mut file = Vec::new();
+        file.extend_from_slice(&r0);
+        file.extend_from_slice(&r1);
+        std::fs::write(seg_path(&dir, 0), &file).unwrap();
+
+        let store = RaftLogStore::open(&dir).unwrap();
+        let inner = store.inner.lock().unwrap();
+        let on_disk = r0.len() + r1.len();
+        let uncompressed = (j0.len() + 1) + (j1.len() + 1);
+        assert_eq!(
+            inner.log_bytes, on_disk,
+            "log_bytes tracks the compressed on-disk footprint"
+        );
+        assert_eq!(
+            inner.ram_bytes, uncompressed,
+            "ram_bytes tracks the uncompressed resident footprint"
+        );
+        assert!(
+            inner.ram_bytes > inner.log_bytes * 2,
+            "a 50 KB compressible payload must cost far more resident RAM ({}) \
+             than its compressed on-disk record ({})",
+            inner.ram_bytes,
+            inner.log_bytes
+        );
+        drop(inner);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
