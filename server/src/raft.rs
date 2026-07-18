@@ -778,15 +778,27 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         let file = std::fs::File::create(&path)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         let mut writer = std::io::BufWriter::new(file);
+        let serialize_start = std::time::Instant::now();
         serde_json::to_writer(&mut writer, &self.captured)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         let file = writer
             .into_inner()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e.into_error()))?;
+        let serialize_dur = serialize_start.elapsed();
+        let snapshot_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
         // Durable enough to serve to a follower even across a crash: the log is
         // still the authoritative tier, but a torn snapshot must never be shipped.
+        let fsync_start = std::time::Instant::now();
         file.sync_all()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        // Attribute the returning-owner recovery notch to snapshot-build IO: a
+        // large resident SM makes this serialize + sync_all stall the shared
+        // Raft-log fsync path (see nanobpm_raft_snapshot_* metrics).
+        crate::metrics::observe_snapshot_build(
+            serialize_dur,
+            fsync_start.elapsed(),
+            snapshot_bytes,
+        );
 
         // Record the durable pointer to this snapshot BEFORE anything unlinks the
         // one it replaces AND before build_snapshot returns: openraft may purge

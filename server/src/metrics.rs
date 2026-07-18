@@ -31,6 +31,19 @@ struct Metrics {
     /// admission throttle can read the *Raft-log* disk-saturation signal directly —
     /// on a failover node this is the fsync that saturates the shared disk.
     raft_fsync_seconds: Histogram,
+    /// Snapshot builds performed (one full state-machine serialize + `sync_all`).
+    /// Differenced with `raft_snapshot_serialize_seconds`/`raft_snapshot_fsync_seconds`
+    /// to attribute the returning-owner recovery notch to snapshot-build IO.
+    raft_snapshot_builds_total: IntCounter,
+    /// Wall time of the `serde_json` state-machine serialize inside each snapshot
+    /// build. On a returning owner with a large resident SM this dominates.
+    raft_snapshot_serialize_seconds: Histogram,
+    /// Wall time of the snapshot file `sync_all()` inside each build — the media
+    /// barrier that contends with the Raft-log fsync path and stalls appends.
+    raft_snapshot_fsync_seconds: Histogram,
+    /// Serialized bytes of the most recently built snapshot (resident-SM size
+    /// proxy: why a returning owner's builds are heavier than a survivor's).
+    raft_snapshot_bytes: IntGauge,
     /// Time a caller spends awaiting its commit's durability (queueing behind
     /// other commits + the fsync itself). The closed-loop latency clients feel.
     commit_wait_seconds: Histogram,
@@ -349,6 +362,39 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .buckets(latency_buckets.clone()),
     )
     .expect("valid histogram opts");
+
+    // Snapshot-build IO timings can reach seconds for a large resident state
+    // machine (the returning-owner recovery notch), so give them a wider tail
+    // than the sub-second latency_buckets.
+    let snapshot_buckets = vec![
+        0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+    ];
+    let raft_snapshot_builds_total = IntCounter::new(
+        "nanobpm_raft_snapshot_builds_total",
+        "Snapshot builds performed (full state-machine serialize + sync_all).",
+    )
+    .expect("valid counter opts");
+    let raft_snapshot_serialize_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "nanobpm_raft_snapshot_serialize_seconds",
+            "Wall time of the state-machine serialize inside each snapshot build.",
+        )
+        .buckets(snapshot_buckets.clone()),
+    )
+    .expect("valid histogram opts");
+    let raft_snapshot_fsync_seconds = Histogram::with_opts(
+        HistogramOpts::new(
+            "nanobpm_raft_snapshot_fsync_seconds",
+            "Wall time of the snapshot file sync_all() inside each build.",
+        )
+        .buckets(snapshot_buckets),
+    )
+    .expect("valid histogram opts");
+    let raft_snapshot_bytes = IntGauge::new(
+        "nanobpm_raft_snapshot_bytes",
+        "Serialized bytes of the most recently built snapshot (resident-SM size proxy).",
+    )
+    .expect("valid gauge opts");
 
     let commit_wait_seconds = Histogram::with_opts(
         HistogramOpts::new(
@@ -786,6 +832,10 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .register(Box::new(commit_batch_size.clone()))
         .and(registry.register(Box::new(fsync_seconds.clone())))
         .and(registry.register(Box::new(raft_fsync_seconds.clone())))
+        .and(registry.register(Box::new(raft_snapshot_builds_total.clone())))
+        .and(registry.register(Box::new(raft_snapshot_serialize_seconds.clone())))
+        .and(registry.register(Box::new(raft_snapshot_fsync_seconds.clone())))
+        .and(registry.register(Box::new(raft_snapshot_bytes.clone())))
         .and(registry.register(Box::new(commit_wait_seconds.clone())))
         .and(registry.register(Box::new(commits_total.clone())))
         .and(registry.register(Box::new(writes_total.clone())))
@@ -851,6 +901,10 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         commit_batch_size,
         fsync_seconds,
         raft_fsync_seconds,
+        raft_snapshot_builds_total,
+        raft_snapshot_serialize_seconds,
+        raft_snapshot_fsync_seconds,
+        raft_snapshot_bytes,
         commit_wait_seconds,
         commits_total,
         writes_total,
@@ -956,6 +1010,21 @@ pub fn observe_raft_fsync(dur: Duration) {
 pub fn raft_fsync_sum_count() -> (f64, u64) {
     let h = &METRICS.raft_fsync_seconds;
     (h.get_sample_sum(), h.get_sample_count())
+}
+
+/// Records one snapshot build: the state-machine serialize time, the file
+/// `sync_all()` time, and the serialized byte size. Lets a bounce soak attribute
+/// the returning-owner recovery notch to snapshot-build IO contention (a large
+/// resident SM makes the serialize + fsync stall the shared Raft-log fsync path).
+pub fn observe_snapshot_build(serialize: Duration, fsync: Duration, bytes: u64) {
+    METRICS.raft_snapshot_builds_total.inc();
+    METRICS
+        .raft_snapshot_serialize_seconds
+        .observe(serialize.as_secs_f64());
+    METRICS
+        .raft_snapshot_fsync_seconds
+        .observe(fsync.as_secs_f64());
+    METRICS.raft_snapshot_bytes.set(bytes as i64);
 }
 
 /// A durable write was enqueued (pipeline depth +1).
