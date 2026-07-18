@@ -771,6 +771,19 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // runs the same blocking serialize the old `to_vec` did — but into a
         // buffered writer, so the peak transient is one buffer, not the whole
         // serialized state twice.
+        //
+        // Fix B: cap concurrent snapshot builds across this node's partitions. While
+        // the resident SM is large (a returning owner / failover incumbent, see
+        // `snapshot_recovery_engaged`) take the whole pool so the co-hosted reclaim
+        // builds serialize onto the shared disk one at a time instead of piling four
+        // simultaneous large fsyncs (~7x fsync amplification). Held across the
+        // serialize + `sync_all` (+ the durable-pointer fsync) until this returns.
+        let build_permits = if snapshot_recovery_engaged() {
+            snapshot_build_concurrency()
+        } else {
+            1
+        };
+        let _build_permit = snapshot_build_sem().acquire_many(build_permits).await.ok();
         let path = self
             .sm
             .snapshot_dir
@@ -778,15 +791,27 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         let file = std::fs::File::create(&path)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         let mut writer = std::io::BufWriter::new(file);
+        let serialize_start = std::time::Instant::now();
         serde_json::to_writer(&mut writer, &self.captured)
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
         let file = writer
             .into_inner()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e.into_error()))?;
+        let serialize_dur = serialize_start.elapsed();
+        let snapshot_bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
         // Durable enough to serve to a follower even across a crash: the log is
         // still the authoritative tier, but a torn snapshot must never be shipped.
+        let fsync_start = std::time::Instant::now();
         file.sync_all()
             .map_err(|e| StorageIOError::write_snapshot(Some(meta.signature()), &e))?;
+        // Attribute the returning-owner recovery notch to snapshot-build IO: a
+        // large resident SM makes this serialize + sync_all stall the shared
+        // Raft-log fsync path (see nanobpm_raft_snapshot_* metrics).
+        crate::metrics::observe_snapshot_build(
+            serialize_dur,
+            fsync_start.elapsed(),
+            snapshot_bytes,
+        );
 
         // Record the durable pointer to this snapshot BEFORE anything unlinks the
         // one it replaces AND before build_snapshot returns: openraft may purge
@@ -1089,6 +1114,55 @@ fn raft_env_u64(key: &str, default: u64) -> u64 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Max concurrent Raft snapshot builds across all of a node's partitions
+/// (`NANOBPMN_RAFT_SNAPSHOT_BUILD_CONCURRENCY`, default 2, floored at 1).
+fn snapshot_build_concurrency() -> u32 {
+    raft_env_u64("NANOBPMN_RAFT_SNAPSHOT_BUILD_CONCURRENCY", 2).clamp(1, 4096) as u32
+}
+
+/// Serialized-snapshot byte threshold above which a node is treated as being in the
+/// "large state machine" window — a returning owner draining a deep reclaim backlog,
+/// or a failover incumbent — that makes snapshot builds expensive
+/// (`NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES`, default 32 MiB).
+fn snapshot_recovery_bytes_threshold() -> u64 {
+    raft_env_u64("NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES", 32 * 1024 * 1024)
+}
+
+/// Whether this node's resident state machine is currently large enough that its
+/// snapshot builds are expensive (the returning-owner recovery window).
+///
+/// Keyed on the size of the last-built snapshot rather than a leadership signal:
+/// `recovery_fsync_load_active` clears the instant a returning owner reclaims
+/// leadership of its partitions, but the expensive build storm runs for the whole
+/// time it then spends applying the deep reclaim backlog. The SM size directly
+/// tracks that cost and self-releases as the backlog drains, so both the build
+/// concurrency limiter (Fix B) and the cadence stretch (Fix C) engage exactly while
+/// builds are large and disengage once the SM is back to its lean steady-state size.
+pub fn snapshot_recovery_engaged() -> bool {
+    crate::metrics::last_snapshot_bytes() as u64 >= snapshot_recovery_bytes_threshold()
+}
+
+/// Process-global limiter on concurrent snapshot builds (Fix B for the
+/// returning-owner recovery notch).
+///
+/// A returning owner reclaims all its co-hosted partitions (e.g. 2,5,8,11) at once;
+/// they cross their `LogsSinceLast` threshold together and call
+/// [`build_snapshot`](PartitionStateMachine::build_snapshot) at nearly the same
+/// instant. Each build does a blocking `serde_json` serialize + `sync_all` of a
+/// large (~130 MB) state machine, so four fire simultaneously onto the one shared
+/// disk and the fsync latency amplifies ~7x (≈96 ms un-contended → ≈711 ms under
+/// 4-way contention), stalling the shared Raft-log fsync path and the
+/// completion-paced admission servo. This semaphore caps how many build at once;
+/// while the SM is large (see [`snapshot_recovery_engaged`]) a build takes the
+/// *whole* pool (exclusive) so the co-hosted reclaim builds run strictly one at a
+/// time.
+fn snapshot_build_sem() -> &'static tokio::sync::Semaphore {
+    static SNAPSHOT_BUILD_SEM: std::sync::OnceLock<tokio::sync::Semaphore> =
+        std::sync::OnceLock::new();
+    SNAPSHOT_BUILD_SEM
+        .get_or_init(|| tokio::sync::Semaphore::new(snapshot_build_concurrency() as usize))
 }
 
 /// The per-partition snapshot cadence, in applied log entries, with a bounded
@@ -1979,6 +2053,47 @@ mod tests {
         // Byte threshold disabled (0): only quiescence triggers.
         assert!(!should_compact(200, 100, i64::MAX, 0, Some(150)));
         assert!(should_compact(200, 100, i64::MAX, 0, Some(200)));
+    }
+
+    #[test]
+    fn snapshot_build_concurrency_defaults_and_floors() {
+        // Env-free default is 2 concurrent builds (steady-state co-hosted partitions
+        // rarely coincide thanks to the jitter, so a small cap is unobtrusive).
+        // The env var is read at process start via the OnceLock, so here we only
+        // assert the pure default + floor of the helper.
+        let c = snapshot_build_concurrency();
+        assert!(c >= 1, "concurrency must be floored at 1, got {c}");
+        // The semaphore is sized from the same helper, so it always has >=1 permit
+        // (acquire_many(concurrency) for the exclusive recovery path can succeed).
+        assert!(snapshot_build_sem().available_permits() >= 1);
+    }
+
+    #[test]
+    fn snapshot_recovery_engages_on_large_sm_not_small() {
+        use std::time::Duration;
+        let thresh = snapshot_recovery_bytes_threshold();
+        assert!(thresh > 0, "recovery byte threshold must be positive");
+
+        // A lean steady-state snapshot (well under the threshold) leaves the
+        // build-concurrency limiter + cadence stretch disengaged.
+        crate::metrics::observe_snapshot_build(Duration::ZERO, Duration::ZERO, 1024);
+        assert!(
+            !snapshot_recovery_engaged(),
+            "small SM ({} bytes) must not engage recovery gating (threshold {thresh})",
+            crate::metrics::last_snapshot_bytes(),
+        );
+
+        // A large resident SM (a returning owner draining a deep reclaim backlog)
+        // crosses the threshold and engages both fixes.
+        crate::metrics::observe_snapshot_build(Duration::ZERO, Duration::ZERO, thresh + 1);
+        assert!(
+            snapshot_recovery_engaged(),
+            "large SM ({} bytes) must engage recovery gating (threshold {thresh})",
+            crate::metrics::last_snapshot_bytes(),
+        );
+
+        // Reset the process-global gauge so we don't perturb other tests.
+        crate::metrics::observe_snapshot_build(Duration::ZERO, Duration::ZERO, 0);
     }
 
     #[test]
