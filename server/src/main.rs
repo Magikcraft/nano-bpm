@@ -7799,6 +7799,12 @@ impl ServerImpl {
         {
             let topology = server.engine.topology().clone();
             let transport = server.raft_transport();
+            // ADR 0003 replication tier: in `leader-durable` mode a non-owned
+            // replica is a NON-VOTING async learner (the leader's on-disk log is
+            // the sole durability point); in `quorum` mode it is a voter whose
+            // durable log backs the write quorum. This distinction decides whether
+            // a followed partition may be hosted fresh on (re)boot (below).
+            let leader_durable = server.replication_mode == ReplicationMode::LeaderDurable;
 
             // Host a member for every partition this node replicates. For a
             // partition this node OWNS, the Raft state machine drives the SAME
@@ -7839,8 +7845,30 @@ impl ServerImpl {
                 // to install the snapshot. An OWNED partition reaching this loop
                 // (only when the hand-off flag is off) has no other snapshot source,
                 // so it must still resume its on-disk lineage and re-form its group.
+                //
+                // Leader-durable rejoin fix: a followed (non-owned) partition's
+                // replica engine can diverge from the leader at the SAME log index.
+                // Retirement (leader-local completion + exporter eviction) never
+                // enters the raft log, so during this node's outage the leader
+                // completes+evicts instances and purges those entries; the returning
+                // follower then resumes a durable snapshot it self-built from its
+                // pre-outage peak, which openraft considers in-sync (its index ==
+                // the leader's) and never overwrites — freezing the replica engine
+                // at that stale peak (millions of orphaned Active instances / GBs of
+                // live heap; there is no raft-level purge-hole to trip the fallback
+                // above). In leader-durable mode the follower is a non-voting async
+                // learner, so its on-disk log is a best-effort copy, NOT a durability
+                // source — host it as a FRESH receiver so the leader installs its
+                // authoritative CURRENT snapshot, discarding the stale local one (and
+                // shedding the never-resumed durable follower journal). In quorum
+                // mode the follower is a voter whose durable log backs the write
+                // quorum, so it must resume on disk (purge-hole aware).
                 let log_dir = if evict_terminal {
-                    purge_hole_aware_log_dir(p)
+                    if followed_partition_hosts_fresh(evict_terminal, leader_durable) {
+                        None
+                    } else {
+                        purge_hole_aware_log_dir(p)
+                    }
                 } else {
                     raft_log_dir_for(p)
                 };
@@ -7959,7 +7987,6 @@ impl ServerImpl {
             // forms the group as the SOLE voter and adds the other replicas as
             // learners (below), so a write acks on the leader alone and ships to the
             // learners asynchronously — `acks=1` for the workflow log.
-            let leader_durable = server.replication_mode == ReplicationMode::LeaderDurable;
             for p in topology.replica_partitions() {
                 if topology.leader_of(p) != topology.node_id {
                     continue;
@@ -14488,6 +14515,29 @@ fn purge_hole_aware_log_dir(partition: u64) -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Whether a **followed** (non-owned) replica partition should be hosted as a
+/// FRESH receiver on (re)boot instead of resuming its durable on-disk log.
+///
+/// True only for a followed partition in **leader-durable** mode. There the
+/// follower is a non-voting async learner: the leader's on-disk log is the sole
+/// durability point, and the follower's copy is best-effort. Crucially, the
+/// follower's replica engine can diverge from the leader at the SAME log index —
+/// retirement (leader-local completion + exporter eviction) never enters the raft
+/// log, so during an outage the leader retires+purges instances the returning
+/// follower can no longer replay. Resuming the self-built durable snapshot then
+/// freezes the replica engine at its pre-outage peak (openraft sees the follower's
+/// index == the leader's, `apply_lag=0`, and never overwrites it) — the RF>1
+/// hot-state balloon. Hosting fresh makes the leader install its authoritative
+/// current snapshot instead.
+///
+/// A **quorum-mode** follower is a voter whose durable log backs the write quorum,
+/// so it must NEVER be hosted fresh — that would discard committed, quorum-counted
+/// entries. An **owned** partition (`evict_terminal == false`) is likewise never
+/// hosted fresh here (it has no other snapshot source in this loop).
+fn followed_partition_hosts_fresh(evict_terminal: bool, leader_durable: bool) -> bool {
+    evict_terminal && leader_durable
+}
+
 /// Number of engine partitions to run, from `NANOBPMN_PARTITIONS`.
 ///
 /// Defaults to 1 (single-writer, today's behavior exactly — partition 0 mints
@@ -19428,6 +19478,36 @@ mod clustered_startup_tests {
             replica.with(|j| j.cold_spill_configured()).await,
             "configured spill => replica engine inherits the cold store"
         );
+    }
+
+    /// On (re)boot, a followed (non-owned) replica partition must be hosted as a
+    /// FRESH receiver in leader-durable mode so the leader installs its
+    /// authoritative current snapshot — otherwise the returning follower resumes a
+    /// self-built durable snapshot frozen at its pre-outage peak (the RF>1
+    /// hot-state balloon: millions of orphaned Active instances / GBs of live heap,
+    /// with no raft-level purge-hole to trip the existing fallback). The
+    /// quorum-mode carve-out is safety-critical: a quorum follower is a VOTER whose
+    /// durable log backs the write quorum, so it must NEVER be hosted fresh (that
+    /// would discard committed, quorum-counted entries). An owned partition is also
+    /// never hosted fresh here. Regression for the leader-durable rejoin memory leak.
+    #[test]
+    fn followed_partition_hosts_fresh_only_in_leader_durable() {
+        // Followed (non-owned) replica: fresh ONLY under leader-durable.
+        assert!(
+            followed_partition_hosts_fresh(true, true),
+            "leader-durable follower must host fresh so the leader installs its snapshot"
+        );
+        assert!(
+            !followed_partition_hosts_fresh(true, false),
+            "quorum-mode follower is a voter — must resume its durable (quorum) log, never fresh"
+        );
+        // Owned partition (evict_terminal == false): never hosted fresh here,
+        // regardless of mode (it has no other snapshot source in this loop).
+        assert!(
+            !followed_partition_hosts_fresh(false, true),
+            "an owned partition must resume its durable lineage, not host fresh"
+        );
+        assert!(!followed_partition_hosts_fresh(false, false));
     }
 }
 
