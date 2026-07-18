@@ -106,6 +106,18 @@ pub struct Engine {
     /// variable rows must be deleted from the store. Only populated when
     /// [`track_dirty_vars`] is set.
     forgotten_vars: HashSet<Key>,
+    /// Follower-only safety net for the retirement digest (RF>1). A leader completes
+    /// and exporter-evicts an instance and broadcasts its key, but under leader-durable
+    /// the ack happens on the leader before the async learner has applied the
+    /// instance's `CreateInstance`, so [`Engine::retire_instances`] finds the key
+    /// absent. Rather than drop the retirement (and leak the instance once its create
+    /// lands), the absent key is remembered here; the next `apply_command_at` that
+    /// materializes it retires it immediately. Populated only on a follower replica
+    /// (a leader never receives a retirement digest, so this stays empty and the
+    /// per-command check is free). Bounded — it only ever holds keys in the brief
+    /// window between a retirement and its create, so it drains continuously. NOT
+    /// part of the snapshot; pure host-side bookkeeping, never affects determinism.
+    retired_tombstones: HashSet<Key>,
 }
 
 /// A unit of internal work in the processing loop — one transition of the BPMN
@@ -179,6 +191,7 @@ impl Engine {
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
+            retired_tombstones: HashSet::new(),
         }
     }
 
@@ -277,6 +290,7 @@ impl Engine {
             track_dirty_vars: false,
             dirty_vars: HashSet::new(),
             forgotten_vars: HashSet::new(),
+            retired_tombstones: HashSet::new(),
         }
     }
 
@@ -1787,6 +1801,23 @@ impl Engine {
 
         self.run(&mut log, queue);
         self.complete_finished_instances(&mut log);
+        // Follower-only safety net: if a retirement digest raced ahead of an
+        // instance's create on this replica (leader-durable async-learner lag), the
+        // key was tombstoned; now that the create has materialized the instance,
+        // reap it immediately so it cannot linger as a never-retired `Active` shell.
+        // Near-free when nothing is pending (a leader never tombstones).
+        if !self.retired_tombstones.is_empty() {
+            let created: Vec<Key> = log
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                    _ => None,
+                })
+                .collect();
+            if !created.is_empty() {
+                self.reap_tombstoned(&created);
+            }
+        }
         Ok(log)
     }
 

@@ -72,6 +72,7 @@ use openraft::{
 use serde::{Deserialize, Serialize};
 
 use crate::deepthi::DeepthiHandle;
+#[cfg(test)]
 use crate::journal::Journal;
 use crate::raft_net::{NullTransport, PartitionNetwork, RaftTransport, SnapshotSendProgress};
 
@@ -675,7 +676,7 @@ impl PartitionStateMachine {
             .await??;
         self.engine
             .with(move |journal| {
-                *journal = Journal::in_memory_from_snapshot(captured);
+                journal.restore_engine_from_snapshot(captured);
             })
             .await;
         Ok(())
@@ -1042,12 +1043,15 @@ impl RaftStateMachine<RaftConfig> for Arc<PartitionStateMachine> {
         .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?
         .map_err(|e| StorageIOError::read_snapshot(Some(meta.signature()), &e))?;
 
-        // Rebuild the engine actor's state directly from the captured snapshot.
+        // Rebuild the engine actor's state from the captured snapshot IN PLACE.
         // The engine journal is in-memory under Raft (the Raft log is the durable
-        // tier), so replacing it wholesale is the install.
+        // tier), so adopting the snapshot's engine state is the install — but the
+        // journal's read-model exporter wiring (and partition id / var store /
+        // spill tiers) MUST survive it, or an owned partition catching up via a
+        // snapshot install stops projecting and leaks its completed backlog.
         self.engine
             .with(move |journal| {
-                *journal = Journal::in_memory_from_snapshot(captured);
+                journal.restore_engine_from_snapshot(captured);
             })
             .await;
 
@@ -2233,12 +2237,29 @@ mod tests {
     #[tokio::test]
     async fn snapshot_captures_compact_state_and_installs_into_a_fresh_replica() {
         // A source state machine accrues live state directly through its engine
-        // actor (the same effect `apply` has), then snapshots it.
+        // actor (the same effect `apply` has), then snapshots it. It holds one
+        // auto-completing instance (start->end "p", terminal on create) AND one
+        // that parks on a service-task job (stays Active), so the install path is
+        // exercised for both a terminal shell and a live instance.
+        let wait_proc = ProcessBuilder::new("w")
+            .start_event("s")
+            .service_task("t", "work")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .expect("valid process");
         let src = DeepthiHandle::spawn(Journal::in_memory_partition(0), 0, None);
         src.with(|j| {
             let _ = j
                 .apply_command_at(deploy_command(), 1)
                 .expect("deploy applies");
+        })
+        .await;
+        src.with(move |j| {
+            let _ = j
+                .apply_command_at(Command::DeployProcess(wait_proc), 2)
+                .expect("deploy wait proc applies");
         })
         .await;
         src.with(|j| {
@@ -2250,11 +2271,27 @@ mod tests {
                         tags: Vec::new(),
                         business_id: None,
                     },
-                    2,
+                    3,
                 )
                 .expect("create applies");
         })
         .await;
+        let active_key = src
+            .with(|j| {
+                let (ev, _) = j
+                    .apply_command_at(
+                        Command::CreateInstance {
+                            process_id: "w".into(),
+                            variables: Default::default(),
+                            tags: Vec::new(),
+                            business_id: None,
+                        },
+                        4,
+                    )
+                    .expect("create applies");
+                ev.iter().find_map(|e| e.instance_key()).unwrap()
+            })
+            .await;
 
         let mut src_sm: Arc<PartitionStateMachine> =
             Arc::new(PartitionStateMachine::new_temp(src.clone(), 0).expect("snapshot dir"));
@@ -2302,13 +2339,26 @@ mod tests {
 
         let src_state = src.with(|j| j.state().clone()).await;
         let dst_state = dst.with(|j| j.state().clone()).await;
+        // The deployed definitions transfer verbatim in the snapshot.
         assert_eq!(
-            src_state, dst_state,
-            "the installed replica's state matches the source exactly"
+            src_state.processes, dst_state.processes,
+            "the deployed definitions transferred in the snapshot"
         );
         assert!(
             !dst_state.processes.is_empty(),
             "the deployed definition transferred in the snapshot"
+        );
+        // Install sheds the source's terminal shells (they are done and already
+        // durable in the read model at the source; they never flow through this
+        // replica's exporter), but the live instance transfers intact.
+        assert!(
+            dst_state.instances.contains_key(&active_key),
+            "the in-flight instance transferred and stays resident after install"
+        );
+        assert_eq!(
+            dst_state.instances.len(),
+            1,
+            "only the in-flight instance is resident; the terminal shell was shed"
         );
     }
 
