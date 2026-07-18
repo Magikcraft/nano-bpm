@@ -5747,6 +5747,7 @@ impl ServerImpl {
         await_completion: bool,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        origin_protocol: &str,
     ) -> Result<serde_json::Value, (u16, String)> {
         // Placement protection (ADR 0014): a node that is saturated sheds the
         // forwarded create back to the ingress node (503 with the placement-shed
@@ -5888,7 +5889,13 @@ impl ServerImpl {
         };
         let (process_id, version, definition_key, instance_key, sync_completed, routable, commit) =
             outcome?;
-        crate::metrics::record_create("rest");
+        // Count the forwarded create exactly once, here at the committing owner,
+        // under the ORIGINAL client transport (`origin_protocol`) rather than a
+        // hardcoded "rest". The forwarding node deliberately does NOT record a
+        // create it hands off (see `create_via_raft` / `create_for_stream`), so
+        // `nanobpm_creates_total` reflects real instances 1:1 instead of
+        // double-counting every forwarded create (once at ingress, once here).
+        crate::metrics::record_create(origin_protocol);
         commit.wait().await;
         if !routable.is_empty() {
             self.drive_subscription_routing(routable).await;
@@ -6012,6 +6019,7 @@ impl ServerImpl {
                     await_completion,
                     fetch_variables,
                     request_timeout,
+                    "rest",
                 )
                 .await
             }
@@ -6230,6 +6238,7 @@ impl ServerImpl {
                     business_id.clone(),
                     fetch_variables.clone(),
                     request_timeout,
+                    "stream",
                 )
                 .await;
 
@@ -10278,6 +10287,10 @@ impl ServerImpl {
             self.drive_subscription_routing(routable).await;
         }
         self.signal_jobs_available();
+        // Non-Raft local commit for a stream create: count it once, here at the
+        // node that mints the instance. (Under Raft this function returns early
+        // via `create_via_raft`, which records on its own local-commit branch.)
+        crate::metrics::record_create("stream");
         Ok((instance_key, sync_completed))
     }
 
@@ -10383,6 +10396,7 @@ impl ServerImpl {
                 false,
                 None,
                 None,
+                "stream",
             )
             .await
             .map_err(|e| (502u16, e.to_string()))?;
@@ -10528,6 +10542,12 @@ impl ServerImpl {
                     self.drive_subscription_routing(routable).await;
                 }
                 self.signal_jobs_available();
+                // Local commit on a partition THIS node leads: count the stream
+                // create once, here. The forward branches below deliberately do
+                // NOT record — the owner they forward to records it (via
+                // `create_forwarded`, under the "stream" origin), so a forwarded
+                // create is counted exactly once instead of twice.
+                crate::metrics::record_create("stream");
                 Ok((instance_key, sync_completed))
             }
             Err(e) if Self::create_should_forward(&e) => {
