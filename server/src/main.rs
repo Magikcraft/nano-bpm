@@ -13950,6 +13950,10 @@ async fn main() {
                 if tick_server.lease_digest && !tick_server.raft.is_empty() {
                     tick_server.run_lease_digest(now).await;
                 }
+                // NOTE: the RF>1 follower-retirement broadcast used to live here, at
+                // the tail of the clock tick. It now runs on its own decoupled
+                // interval (see the retirement-broadcast tick below) so heavy-payload
+                // clock-tick stalls cannot starve it.
             }
         });
     }
