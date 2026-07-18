@@ -48,6 +48,7 @@ impl Engine {
             track_dirty_vars: false,
             dirty_vars: std::collections::HashSet::new(),
             forgotten_vars: std::collections::HashSet::new(),
+            retired_tombstones: std::collections::HashSet::new(),
         }
     }
 
@@ -238,12 +239,39 @@ impl Engine {
     /// been applied — a benign, self-healing miss for a lagging learner, which is
     /// re-snapshotted from the leader anyway). Returns the number removed.
     pub fn retire_instances(&mut self, keys: &[Key]) -> usize {
-        let victims: HashSet<Key> = keys
+        // Cap the tombstone set defensively. It normally holds only keys in the
+        // brief window between a retirement digest and the create it races ahead of
+        // (drained the moment that create applies), so it stays tiny; the cap only
+        // guards a pathological stream of retirements for keys that never arrive.
+        const MAX_TOMBSTONES: usize = 1 << 20;
+        let mut victims: HashSet<Key> = HashSet::new();
+        for &k in keys {
+            if self.state.instances.contains_key(&k) {
+                victims.insert(k);
+            } else if self.retired_tombstones.len() < MAX_TOMBSTONES {
+                // The create has not been applied here yet (async learner lag).
+                // Remember the retirement so the create is reaped on arrival.
+                self.retired_tombstones.insert(k);
+            }
+        }
+        self.remove_instance_set(&victims)
+    }
+
+    /// Retires any freshly-created instance whose retirement digest already arrived
+    /// (raced ahead of its `CreateInstance` on this follower replica). Called at the
+    /// end of [`Engine::apply_command_at`] with the instance keys the command just
+    /// materialized; a no-op (and near-free) when no retirement is pending. Returns
+    /// the number reaped so the caller can drop them from any spill/cold store too.
+    pub(super) fn reap_tombstoned(&mut self, created: &[Key]) -> usize {
+        if self.retired_tombstones.is_empty() {
+            return 0;
+        }
+        let hit: HashSet<Key> = created
             .iter()
             .copied()
-            .filter(|k| self.state.instances.contains_key(k))
+            .filter(|k| self.retired_tombstones.remove(k))
             .collect();
-        self.remove_instance_set(&victims)
+        self.remove_instance_set(&hit)
     }
 
     /// Shared removal pass for [`Engine::evict_instances`] and

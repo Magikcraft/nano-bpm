@@ -4772,6 +4772,71 @@ fn retire_instances_drops_active_shells_and_ignores_absent() {
         .any(|j| j.instance_key == a || j.instance_key == b));
     assert!(engine.state().jobs.values().any(|j| j.instance_key == keep));
 }
+
+/// The retire-before-create race: under leader-durable the leader completes and
+/// broadcasts a retirement digest before the async learner has applied the
+/// instance's `CreateInstance`. `retire_instances` then finds the key absent and
+/// must tombstone it so the instance is reaped the moment its create materializes
+/// — otherwise it leaks as a never-retired `Active` shell.
+#[test]
+fn retire_before_create_tombstones_and_reaps_on_arrival() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+
+    // Minting is deterministic for an identical command sequence, but a create
+    // consumes several local keys (instance + job + tokens), so the instance key
+    // is not simply `prev + 1`. Learn the key the create WILL mint from a twin
+    // engine driven with the identical sequence.
+    let future_key = {
+        let mut twin = Engine::new();
+        twin.apply_command(Command::DeployProcess(linear_with_task()))
+            .unwrap();
+        twin.apply_command(Command::create_instance("order"))
+            .unwrap()
+            .iter()
+            .find_map(|e| e.instance_key())
+            .unwrap()
+    };
+
+    // Retire `future_key` BEFORE it exists on this engine, exactly as a digest
+    // that raced ahead of the replicated create.
+    assert_eq!(
+        engine.retire_instances(&[future_key]),
+        0,
+        "nothing present yet"
+    );
+    assert!(engine.instance(future_key).is_none());
+
+    // Now the create arrives and mints exactly that key. It must be reaped
+    // immediately, not left Active.
+    let created = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    assert_eq!(created, future_key, "the create mints the tombstoned key");
+    assert!(
+        engine.instance(created).is_none(),
+        "the tombstoned instance is reaped on arrival (no leak)"
+    );
+    assert!(!engine
+        .state()
+        .jobs
+        .values()
+        .any(|j| j.instance_key == created));
+
+    // A subsequent, untombstoned create is unaffected.
+    let live = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    assert!(engine.instance(live).is_some());
+}
 fn assert_job_index_consistent(engine: &Engine) {
     use std::collections::{BTreeSet, HashMap, HashSet};
     let mut expected: HashMap<String, BTreeSet<(i32, Key)>> = HashMap::new();
