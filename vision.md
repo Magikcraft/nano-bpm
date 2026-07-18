@@ -14,9 +14,12 @@ A process automation engine that is:
 
 - **Fast** — designed around a single-writer engine core, a purpose-built Raft log,
   and a command-stream protocol that keeps latency low and throughput high.
-- **Highly scalable** — partitioned, replicated, and memory-disciplined so that a
-  single cluster can absorb workloads that would previously have required painful
-  vertical scaling or architectural compromise.
+- **Highly scalable — in both directions** — partitioned, replicated, and
+  memory-disciplined so that a single cluster can absorb workloads that would
+  previously have required painful vertical scaling. And, just as importantly, nano
+  scales *down*: it runs in small, resource-constrained environments where a heavy
+  engine simply cannot go, opening opportunities at the edge and in constrained
+  deployments that were never addressable before.
 - **Compatible** — a drop-in replacement for teams already running Camunda 8, so
   that adopting nano is a migration measured in hours, not quarters.
 
@@ -43,22 +46,27 @@ why. Then we will overmatch them — not by matching a checklist, but by being c
 demonstrably better on the features that decide real evaluations. Where a competitor
 is strong, we aim to be stronger; where they set the bar, we clear it and raise it.
 
-### 4. Enter new markets through scale
+### 4. Enter new markets through scale — up and down
 
 nano's scalability is not just a bigger number on a benchmark — it changes which
-problems are solvable and which customers are addressable. Workloads that were once
-"too high volume," "too cost-sensitive," or "too operationally heavy" for a process
-engine become viable. That reach opens markets that were previously closed to us.
+problems are solvable and which customers are addressable. Scaling *up*, workloads
+that were once "too high volume," "too cost-sensitive," or "too operationally heavy"
+for a process engine become viable. Scaling *down*, nano runs in small,
+resource-constrained environments — the edge, embedded contexts, modest hardware —
+where a traditional engine cannot fit at all. Both directions open markets that were
+previously closed to us.
 
 ## How we work
 
 nano engineering is **fast, fluid, and fun.**
 
 We are engineers who operate in — and actively maintain — a frictionless environment.
-Fast tooling, clean feedback loops, honest benchmarks, and a bias toward removing
-obstacles for each other are part of the product, not overhead around it. The quality
-of the engine and the quality of the experience of building it are the same discipline
-viewed from two sides. We keep both sharp.
+That environment is built from simple engineering disciplines, not top-down
+bureaucracy. It rests on **simplicity** and **trust**: fast tooling, clean feedback
+loops, honest benchmarks, and a bias toward removing obstacles for each other. These
+are part of the product, not overhead around it. The quality of the engine and the
+quality of the experience of building it are the same discipline viewed from two
+sides. We keep both sharp.
 
 ## Principles
 
@@ -66,9 +74,10 @@ viewed from two sides. We keep both sharp.
   extend their ideas with gratitude and hindsight, not disdain.
 - **Compatibility is sacred.** Drop-in means drop-in. We protect the migration
   promise on every change.
-- **Scale is a market strategy.** Every order of magnitude we unlock is a door into
-  a market that was previously shut.
-- **Frictionless by design.** A frictionless environment is something we build and
-  defend on purpose, for our users and for ourselves.
+- **Scale is a market strategy — both ways.** Every order of magnitude we unlock,
+  up or down, is a door into a market that was previously shut.
+- **Frictionless by design.** A frictionless environment is built from simple
+  engineering disciplines, simplicity, and trust — never top-down bureaucracy. We
+  build and defend it on purpose, for our users and for ourselves.
 - **Overmatch, don't match.** We measure ourselves against the best and aim to clear
   the bar with room to spare.
