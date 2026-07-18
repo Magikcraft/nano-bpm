@@ -323,6 +323,15 @@ pub enum ClientFrame {
         fetch_variables: Option<Vec<String>>,
         #[serde(default)]
         request_timeout: Option<i64>,
+        /// The ingress protocol of the ORIGINAL client call on the forwarding
+        /// node (`"stream"` or `"rest"`). The owner records the create under
+        /// this label so `nanobpm_creates_total` reflects the client transport,
+        /// counted exactly once at the committing owner — the forwarding node
+        /// does not record a create it hands off. `#[serde(default)]` keeps the
+        /// frame wire-compatible with peers that predate the field (a missing
+        /// value is treated as `"rest"`).
+        #[serde(default)]
+        origin_protocol: Option<String>,
     },
     /// **Intra-cluster only.** A gateway forwards a GET-by-key read to the peer
     /// that owns the key's partition. Each node only projects its own partitions
@@ -1203,7 +1212,6 @@ async fn handle_client_frame(
                                     .await
                                 {
                                     Ok((instance_key, sync_completed)) => {
-                                        crate::metrics::record_create("stream");
                                         conn.send(ServerFrame::CommandResult {
                                             corr,
                                             status: 200,
@@ -1230,7 +1238,6 @@ async fn handle_client_frame(
                             .await
                         {
                             Ok((instance_key, sync_completed)) => {
-                                crate::metrics::record_create("stream");
                                 conn.send(ServerFrame::CommandResult {
                                     corr,
                                     status: 200,
@@ -1289,7 +1296,6 @@ async fn handle_client_frame(
                             .await
                         {
                             Ok((instance_key, sync_completed)) => {
-                                crate::metrics::record_create("stream");
                                 conn.send(ServerFrame::CommandResult {
                                     corr,
                                     status: 200,
@@ -1319,7 +1325,6 @@ async fn handle_client_frame(
                 .await
             {
                 Ok((instance_key, sync_completed)) => {
-                    crate::metrics::record_create("stream");
                     conn.send(ServerFrame::CommandResult {
                         corr,
                         status: 200,
@@ -1623,6 +1628,7 @@ async fn handle_client_frame(
             await_completion,
             fetch_variables,
             request_timeout,
+            origin_protocol,
         } => {
             // Local-only: create on one of THIS peer's own partitions and answer
             // with the full result JSON. The peer never re-forwards, so there is
@@ -1650,6 +1656,7 @@ async fn handle_client_frame(
                         await_completion,
                         fetch_variables,
                         request_timeout,
+                        origin_protocol.as_deref().unwrap_or("rest"),
                     )
                     .await
                 {
@@ -3204,6 +3211,41 @@ mod asyncapi_spec_guard {
                 .unwrap()
                 .to_string();
             assert_eq!(got, t, "client type {t:?} round-trips to a different tag");
+        }
+    }
+
+    #[test]
+    fn forward_create_origin_protocol_round_trips_and_defaults_to_none() {
+        // Regression for the create double-count fix: an intra-cluster
+        // `ForwardCreate` carries the ORIGINAL client transport so the owner can
+        // record the create exactly once under the true protocol. The field must
+        // round-trip, and — for wire-compatibility with peers that predate it — a
+        // frame WITHOUT `originProtocol` must decode to `None` (the handler then
+        // treats a missing value as "rest").
+        let with_origin = json!({
+            "type": "forwardCreate",
+            "corr": 7,
+            "processDefinitionId": "demo",
+            "originProtocol": "stream",
+        });
+        match serde_json::from_value::<ClientFrame>(with_origin).expect("decodes") {
+            ClientFrame::ForwardCreate {
+                origin_protocol, ..
+            } => assert_eq!(origin_protocol.as_deref(), Some("stream")),
+            other => panic!("expected ForwardCreate, got {other:?}"),
+        }
+
+        // Backward-compatible: the field is absent on an older peer's frame.
+        let without_origin = json!({
+            "type": "forwardCreate",
+            "corr": 8,
+            "processDefinitionId": "demo",
+        });
+        match serde_json::from_value::<ClientFrame>(without_origin).expect("decodes") {
+            ClientFrame::ForwardCreate {
+                origin_protocol, ..
+            } => assert_eq!(origin_protocol, None),
+            other => panic!("expected ForwardCreate, got {other:?}"),
         }
     }
 }

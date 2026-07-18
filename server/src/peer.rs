@@ -697,6 +697,7 @@ impl PeerLink {
         await_completion: bool,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        origin_protocol: &str,
     ) -> Result<PeerResult, PeerError> {
         self.request(|corr| ClientFrame::ForwardCreate {
             corr,
@@ -708,6 +709,7 @@ impl PeerLink {
             await_completion,
             fetch_variables,
             request_timeout,
+            origin_protocol: Some(origin_protocol.to_string()),
         })
         .await
     }
@@ -730,6 +732,7 @@ impl PeerLink {
         business_id: Option<String>,
         fetch_variables: Option<Vec<String>>,
         request_timeout: Option<i64>,
+        origin_protocol: &str,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(deadline, |corr| ClientFrame::ForwardCreate {
             corr,
@@ -741,6 +744,7 @@ impl PeerLink {
             await_completion: false,
             fetch_variables,
             request_timeout,
+            origin_protocol: Some(origin_protocol.to_string()),
         })
         .await
     }
