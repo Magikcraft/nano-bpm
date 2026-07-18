@@ -772,13 +772,13 @@ impl RaftSnapshotBuilder<RaftConfig> for PartitionSnapshotBuilder {
         // buffered writer, so the peak transient is one buffer, not the whole
         // serialized state twice.
         //
-        // Fix B: cap concurrent snapshot builds across this node's partitions. In
-        // the recovery window (a returning owner / failover incumbent, per
-        // `recovery_fsync_relief`) take the whole pool so the co-hosted reclaim
-        // builds serialize onto the shared disk one at a time instead of piling
-        // four simultaneous large fsyncs (~7x fsync amplification). Held across the
+        // Fix B: cap concurrent snapshot builds across this node's partitions. While
+        // the resident SM is large (a returning owner / failover incumbent, see
+        // `snapshot_recovery_engaged`) take the whole pool so the co-hosted reclaim
+        // builds serialize onto the shared disk one at a time instead of piling four
+        // simultaneous large fsyncs (~7x fsync amplification). Held across the
         // serialize + `sync_all` (+ the durable-pointer fsync) until this returns.
-        let build_permits = if crate::raft_logstore::recovery_fsync_relief() {
+        let build_permits = if snapshot_recovery_engaged() {
             snapshot_build_concurrency()
         } else {
             1
@@ -1122,6 +1122,28 @@ fn snapshot_build_concurrency() -> u32 {
     raft_env_u64("NANOBPMN_RAFT_SNAPSHOT_BUILD_CONCURRENCY", 2).clamp(1, 4096) as u32
 }
 
+/// Serialized-snapshot byte threshold above which a node is treated as being in the
+/// "large state machine" window — a returning owner draining a deep reclaim backlog,
+/// or a failover incumbent — that makes snapshot builds expensive
+/// (`NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES`, default 32 MiB).
+fn snapshot_recovery_bytes_threshold() -> u64 {
+    raft_env_u64("NANOBPMN_RAFT_RECOVERY_SNAPSHOT_BYTES", 32 * 1024 * 1024)
+}
+
+/// Whether this node's resident state machine is currently large enough that its
+/// snapshot builds are expensive (the returning-owner recovery window).
+///
+/// Keyed on the size of the last-built snapshot rather than a leadership signal:
+/// `recovery_fsync_load_active` clears the instant a returning owner reclaims
+/// leadership of its partitions, but the expensive build storm runs for the whole
+/// time it then spends applying the deep reclaim backlog. The SM size directly
+/// tracks that cost and self-releases as the backlog drains, so both the build
+/// concurrency limiter (Fix B) and the cadence stretch (Fix C) engage exactly while
+/// builds are large and disengage once the SM is back to its lean steady-state size.
+pub fn snapshot_recovery_engaged() -> bool {
+    crate::metrics::last_snapshot_bytes() as u64 >= snapshot_recovery_bytes_threshold()
+}
+
 /// Process-global limiter on concurrent snapshot builds (Fix B for the
 /// returning-owner recovery notch).
 ///
@@ -1132,9 +1154,10 @@ fn snapshot_build_concurrency() -> u32 {
 /// large (~130 MB) state machine, so four fire simultaneously onto the one shared
 /// disk and the fsync latency amplifies ~7x (≈96 ms un-contended → ≈711 ms under
 /// 4-way contention), stalling the shared Raft-log fsync path and the
-/// completion-paced admission servo. This semaphore caps how many build at once; in
-/// the recovery window a build takes the *whole* pool (exclusive) so the co-hosted
-/// reclaim builds run strictly one at a time.
+/// completion-paced admission servo. This semaphore caps how many build at once;
+/// while the SM is large (see [`snapshot_recovery_engaged`]) a build takes the
+/// *whole* pool (exclusive) so the co-hosted reclaim builds run strictly one at a
+/// time.
 fn snapshot_build_sem() -> &'static tokio::sync::Semaphore {
     static SNAPSHOT_BUILD_SEM: std::sync::OnceLock<tokio::sync::Semaphore> =
         std::sync::OnceLock::new();
@@ -2043,6 +2066,34 @@ mod tests {
         // The semaphore is sized from the same helper, so it always has >=1 permit
         // (acquire_many(concurrency) for the exclusive recovery path can succeed).
         assert!(snapshot_build_sem().available_permits() >= 1);
+    }
+
+    #[test]
+    fn snapshot_recovery_engages_on_large_sm_not_small() {
+        use std::time::Duration;
+        let thresh = snapshot_recovery_bytes_threshold();
+        assert!(thresh > 0, "recovery byte threshold must be positive");
+
+        // A lean steady-state snapshot (well under the threshold) leaves the
+        // build-concurrency limiter + cadence stretch disengaged.
+        crate::metrics::observe_snapshot_build(Duration::ZERO, Duration::ZERO, 1024);
+        assert!(
+            !snapshot_recovery_engaged(),
+            "small SM ({} bytes) must not engage recovery gating (threshold {thresh})",
+            crate::metrics::last_snapshot_bytes(),
+        );
+
+        // A large resident SM (a returning owner draining a deep reclaim backlog)
+        // crosses the threshold and engages both fixes.
+        crate::metrics::observe_snapshot_build(Duration::ZERO, Duration::ZERO, thresh + 1);
+        assert!(
+            snapshot_recovery_engaged(),
+            "large SM ({} bytes) must engage recovery gating (threshold {thresh})",
+            crate::metrics::last_snapshot_bytes(),
+        );
+
+        // Reset the process-global gauge so we don't perturb other tests.
+        crate::metrics::observe_snapshot_build(Duration::ZERO, Duration::ZERO, 0);
     }
 
     #[test]

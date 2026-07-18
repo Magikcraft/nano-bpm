@@ -8212,16 +8212,20 @@ impl ServerImpl {
                 crate::raft_logstore::set_recovery_fsync_relief(
                     server.recovery_fsync_load_active(),
                 );
-                // Fix C: stretch the Raft snapshot cadence while this node is a
-                // returning owner / failover incumbent. Its co-hosted partitions
-                // apply a large reclaim backlog in lockstep and would otherwise
-                // cross `LogsSinceLast` together and build ~80 snapshots during the
-                // window; a wider effective threshold cuts that build count (and the
-                // serialize + fsync IO it inflicts on the shared disk) while the
-                // state machine is large. Reset to 1.0x (permille 1000) the moment
-                // recovery clears, so the steady-state cadence is unchanged.
+                // Fix C: stretch the Raft snapshot cadence while this node's resident
+                // state machine is large (a returning owner draining a deep reclaim
+                // backlog / failover incumbent, see `snapshot_recovery_engaged`). Its
+                // co-hosted partitions apply a large reclaim backlog in lockstep and
+                // would otherwise cross `LogsSinceLast` together and build ~80
+                // snapshots during the window; a wider effective threshold cuts that
+                // build count (and the serialize + fsync IO it inflicts on the shared
+                // disk) while the state machine is large. Keyed on SM size rather than
+                // the displacement flag, which clears the instant leadership is
+                // reclaimed — long before the expensive build storm finishes draining
+                // the backlog. Reset to 1.0x (permille 1000) once the SM is back to its
+                // lean steady-state size, so the steady-state cadence is unchanged.
                 openraft::set_snapshot_logs_multiplier_permille(
-                    if server.recovery_fsync_load_active() {
+                    if crate::raft::snapshot_recovery_engaged() {
                         recovery_snapshot_logs_multiplier_permille()
                     } else {
                         1000

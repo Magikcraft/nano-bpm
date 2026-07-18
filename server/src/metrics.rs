@@ -1027,6 +1027,14 @@ pub fn observe_snapshot_build(serialize: Duration, fsync: Duration, bytes: u64) 
     METRICS.raft_snapshot_bytes.set(bytes as i64);
 }
 
+/// Serialized bytes of the most recently built snapshot — a proxy for the resident
+/// state-machine size. Used to detect the "large SM" window (a returning owner
+/// draining a deep reclaim backlog, or a failover incumbent) that makes snapshot
+/// builds expensive, so the build-concurrency limiter + cadence stretch engage.
+pub fn last_snapshot_bytes() -> i64 {
+    METRICS.raft_snapshot_bytes.get()
+}
+
 /// A durable write was enqueued (pipeline depth +1).
 pub fn inflight_inc() {
     METRICS.inflight.inc();
