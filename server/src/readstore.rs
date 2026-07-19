@@ -572,6 +572,35 @@ impl ReadStore {
         v.max(0) as usize
     }
 
+    /// Advances `exported_position` by `n` events **without** projecting them
+    /// into the instance/variable tables. Used by the remote-only projection
+    /// sink: the heavy projection is offloaded to a remote target, but this
+    /// shard is still the journal-compaction watermark keeper, so it must track
+    /// how far the log has been handed off. This is a single integer `UPDATE`
+    /// (tens of bytes of WAL) per batch — negligible next to full projection —
+    /// so it removes the read model's dominant disk cost while keeping the
+    /// compaction watermark honest. `n == 0` is a no-op.
+    ///
+    /// NOTE: like `export`, the watermark advances once the batch has been
+    /// handed to the sink, not once a remote target has durably acknowledged it;
+    /// ack-gated advancement (so a crash cannot compact past an un-acked batch)
+    /// is a later milestone (see issue #133).
+    pub fn advance_exported(&self, n: usize) -> rusqlite::Result<()> {
+        if n == 0 {
+            return Ok(());
+        }
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("read store write lock poisoned");
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.execute(
+            "UPDATE meta SET v = v + ?1 WHERE k = 'exported_position'",
+            params![n as i64],
+        )?;
+        Ok(())
+    }
+
     /// Drops and recreates the schema, resetting `exported_position` to 0. Used
     /// when the persisted position is ahead of the journal (a corrupt or
     /// truncated log), forcing a full rebuild by replay.
