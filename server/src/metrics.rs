@@ -147,6 +147,23 @@ struct Metrics {
     resident_var_bytes: IntGauge,
     /// Serialized event bytes queued to the journal writer but not yet fsynced+acked.
     journal_inflight_bytes: IntGauge,
+    /// Replication-window occupancy: net-live count of `ReplicatedBatch` values
+    /// process-wide (see `crate::raft::LIVE_BATCHES`). openraft retains the
+    /// recent, non-purged tail of each replicated log in memory (to catch up
+    /// lagging replicas without a fresh snapshot install); at idle this plateaus
+    /// near `retained_log_streams × KEEP_LOGS`. That retention lives outside the
+    /// `RaftLogStore` (which demotes its copies to disk), so it is invisible to
+    /// `nanobpm_raft_log_ram_bytes`. Paired with `raft_live_batch_bytes`, this
+    /// makes the retention legible as a bounded plateau — accounted replication
+    /// state, not a leak.
+    raft_live_batches: IntGauge,
+    /// Exact serialized byte footprint of the net-live `ReplicatedBatch`
+    /// population counted by `raft_live_batches`: each guard carries its batch's
+    /// size (see `crate::raft::LIVE_BATCH_BYTES`), so this is the true resident
+    /// cost regardless of which structure retains the batches. Dominates
+    /// resident heap under fat coalesced payloads yet stays bounded by the keep
+    /// window.
+    raft_live_batch_bytes: IntGauge,
 
     // ---- Capacity ceilings (the compressor/limiter LEDs, ADR 0013) ----
     /// The limiter "lit LED": 1 while this node is currently pressed against a
@@ -594,6 +611,18 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
+    let raft_live_batches = IntGauge::new(
+        "nanobpm_raft_live_batches",
+        "Replication-window occupancy: net-live ReplicatedBatch values process-wide (constructed/deserialized/cloned minus dropped). openraft keeps the recent non-purged log tail in memory to catch up lagging replicas; plateaus near retained_log_streams*KEEP_LOGS. Bounded, accounted replication state (not a leak); invisible to nanobpm_raft_log_ram_bytes.",
+    )
+    .expect("valid gauge");
+
+    let raft_live_batch_bytes = IntGauge::new(
+        "nanobpm_raft_live_batch_bytes",
+        "Exact serialized byte footprint of all net-live ReplicatedBatch values process-wide (each guard carries its batch's size, summed on construct/clone minus drop). The byte magnitude of the replication-window retention counted by nanobpm_raft_live_batches; dominates resident heap under fat coalesced payloads yet stays bounded by the keep window. Retention lives in openraft in-memory state, outside nanobpm_raft_log_ram_bytes.",
+    )
+    .expect("valid gauge");
+
     let journal_inflight_bytes = IntGauge::new(
         "nanobpm_journal_inflight_bytes",
         "Serialized event bytes queued to the background journal writer but not yet fsynced+acked (engine->writer in-flight; events_arc roughly doubles the true heap).",
@@ -864,6 +893,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(exporter_queue_bytes.clone())))
         .and(registry.register(Box::new(resident_var_bytes.clone())))
         .and(registry.register(Box::new(journal_inflight_bytes.clone())))
+        .and(registry.register(Box::new(raft_live_batches.clone())))
+        .and(registry.register(Box::new(raft_live_batch_bytes.clone())))
         .and(registry.register(Box::new(ceiling_active.clone())))
         .and(registry.register(Box::new(ceiling_hits_total.clone())))
         .and(registry.register(Box::new(job_type_activatable.clone())))
@@ -933,6 +964,8 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         exporter_queue_bytes,
         resident_var_bytes,
         journal_inflight_bytes,
+        raft_live_batches,
+        raft_live_batch_bytes,
         ceiling_active,
         ceiling_hits_total,
         job_type_activatable,
@@ -1105,6 +1138,20 @@ pub fn set_exporter_queue_bytes(bytes: u64) {
 /// in-flight pipeline copies, not resident variables.
 pub fn set_resident_var_bytes(bytes: u64) {
     METRICS.resident_var_bytes.set(bytes as i64);
+}
+
+/// Publishes the current net-live `ReplicatedBatch` count (see
+/// `crate::raft::LIVE_BATCHES`) to `nanobpm_raft_live_batches`. Called from the
+/// periodic metrics tick.
+pub fn set_raft_live_batches(n: i64) {
+    METRICS.raft_live_batches.set(n);
+}
+
+/// Publishes the current net-live `ReplicatedBatch` byte footprint (see
+/// `crate::raft::LIVE_BATCH_BYTES`) to `nanobpm_raft_live_batch_bytes`. Called
+/// from the periodic metrics tick.
+pub fn set_raft_live_batch_bytes(n: i64) {
+    METRICS.raft_live_batch_bytes.set(n);
 }
 
 /// `n` serialized event bytes were handed to the journal writer (in-flight +n).

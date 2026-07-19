@@ -98,23 +98,158 @@ pub struct ReplicatedCommand {
     pub now: u64,
 }
 
+/// Process-global net-live count of [`ReplicatedBatch`] instances. Every batch
+/// carries a [`BatchLiveGuard`] that increments this on construction (leader
+/// propose), deserialization (receive path — via serde's `default` for the
+/// skipped field) and clone, and decrements it on drop. Published to
+/// `nanobpm_raft_live_batches`.
+///
+/// This is the **replication-window occupancy** gauge. At idle it plateaus at
+/// roughly `retained_log_streams × KEEP_LOGS` (openraft retains the recent,
+/// non-purged tail of each replicated log in memory to catch up lagging
+/// replicas without a fresh snapshot install). That retention lives *outside*
+/// [`RaftLogStore`](crate::raft_logstore::RaftLogStore) (which demotes its own
+/// copies to disk), so it is invisible to `nanobpm_raft_log_ram_bytes`. This
+/// gauge (with [`LIVE_BATCH_BYTES`]) makes the retention legible: a bounded,
+/// throughput-proportional plateau — **accounted replication state, not a
+/// leak**.
+pub static LIVE_BATCHES: AtomicI64 = AtomicI64::new(0);
+
+/// Process-global net-live sum of the exact serialized byte size of every live
+/// [`ReplicatedBatch`], published to `nanobpm_raft_live_batch_bytes`. Each
+/// guard carries its batch's size (computed once, zero-alloc, via
+/// [`serialized_len`]) and adds/subtracts it here on construct/clone/drop, so
+/// this is the true resident byte footprint of the live batch population
+/// regardless of *which* structure (ours or openraft's) retains them. This is
+/// the byte magnitude of the replication-window retention counted by
+/// [`LIVE_BATCHES`]; under fat coalesced payloads it dominates resident heap yet
+/// stays bounded by the keep window.
+pub static LIVE_BATCH_BYTES: AtomicI64 = AtomicI64::new(0);
+
+/// The current net-live [`ReplicatedBatch`] count (see [`LIVE_BATCHES`]).
+pub fn live_batches() -> i64 {
+    LIVE_BATCHES.load(Ordering::Relaxed)
+}
+
+/// The current net-live [`ReplicatedBatch`] byte footprint (see
+/// [`LIVE_BATCH_BYTES`]).
+pub fn live_batch_bytes() -> i64 {
+    LIVE_BATCH_BYTES.load(Ordering::Relaxed)
+}
+
+/// The exact JSON-serialized byte length of `value`, computed without
+/// allocating an output buffer (a counting [`std::io::Write`] sink). Used to
+/// size a batch's payload for [`LIVE_BATCH_BYTES`] once, at construction /
+/// deserialization.
+fn serialized_len<T: Serialize>(value: &T) -> u64 {
+    #[derive(Default)]
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len() as u64;
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut c = Counter::default();
+    // Serialization of a well-formed value never fails against an infallible
+    // writer; fall back to 0 rather than panic on the metrics path.
+    match serde_json::to_writer(&mut c, value) {
+        Ok(()) => c.0,
+        Err(_) => 0,
+    }
+}
+
+/// RAII guard that keeps [`LIVE_BATCHES`]/[`LIVE_BATCH_BYTES`] in step with the
+/// count and byte footprint of live [`ReplicatedBatch`] values. `bytes` is this
+/// batch's serialized size, so `Clone` re-adds it and `Drop` subtracts exactly
+/// the same amount.
+#[derive(Debug)]
+pub struct BatchLiveGuard {
+    bytes: u64,
+}
+
+impl BatchLiveGuard {
+    fn with_bytes(bytes: u64) -> Self {
+        LIVE_BATCHES.fetch_add(1, Ordering::Relaxed);
+        LIVE_BATCH_BYTES.fetch_add(bytes as i64, Ordering::Relaxed);
+        BatchLiveGuard { bytes }
+    }
+}
+
+impl Default for BatchLiveGuard {
+    // Constructs a zero-byte guard; real construction/deserialization paths size
+    // the guard explicitly (`ReplicatedBatch::new`/its `Deserialize` impl).
+    fn default() -> Self {
+        Self::with_bytes(0)
+    }
+}
+
+impl Clone for BatchLiveGuard {
+    // A cloned batch is a distinct live value with the same footprint, so its
+    // guard must re-register both count and bytes (the derived clone would copy
+    // the fields without counting, driving the gauges negative on drop).
+    fn clone(&self) -> Self {
+        Self::with_bytes(self.bytes)
+    }
+}
+
+impl Drop for BatchLiveGuard {
+    fn drop(&mut self) {
+        LIVE_BATCHES.fetch_sub(1, Ordering::Relaxed);
+        LIVE_BATCH_BYTES.fetch_sub(self.bytes as i64, Ordering::Relaxed);
+    }
+}
+
 /// A **batch** of commands replicated as a single Raft log entry. Coalescing
 /// many concurrently-proposed commands into one entry amortizes openraft's
 /// per-entry overhead (one append + one replication round-trip + one apply
 /// round-trip + one engine-actor hop for the whole batch) across all of them —
 /// the dominant write-path cost under load. A batch of one (the default for a
 /// lone proposer, e.g. tests or deploy) is byte-for-byte the prior behavior.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ReplicatedBatch {
     pub items: Vec<ReplicatedCommand>,
+    /// Live-count/-bytes guard (see [`LIVE_BATCHES`]/[`LIVE_BATCH_BYTES`]).
+    /// Skipped on the wire (reconstructed on deserialize), so the replicated
+    /// bytes are unchanged.
+    #[serde(skip)]
+    _live: BatchLiveGuard,
+}
+
+// Manual `Deserialize` (rather than derive + `#[serde(skip)]`/`default`) so the
+// receive / log-read-back path — where openraft's retained copies are born —
+// sizes the guard from the just-deserialized `items`, keeping
+// `LIVE_BATCH_BYTES` exact regardless of which structure retains the batch.
+impl<'de> serde::Deserialize<'de> for ReplicatedBatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            items: Vec<ReplicatedCommand>,
+        }
+        let Wire { items } = Wire::deserialize(deserializer)?;
+        Ok(ReplicatedBatch::new(items))
+    }
 }
 
 impl ReplicatedBatch {
+    /// Build a batch from its commands, sizing the live-bytes guard once.
+    pub fn new(items: Vec<ReplicatedCommand>) -> Self {
+        let bytes = serialized_len(&items);
+        Self {
+            items,
+            _live: BatchLiveGuard::with_bytes(bytes),
+        }
+    }
+
     /// A single-command batch (the convenience path for `propose`).
     pub fn single(command: Command, now: u64) -> Self {
-        Self {
-            items: vec![ReplicatedCommand { command, now }],
-        }
+        Self::new(vec![ReplicatedCommand { command, now }])
     }
 }
 
@@ -1461,7 +1596,7 @@ impl Batcher {
                 }
                 let items: Vec<ReplicatedCommand> = subs.iter().map(|s| s.item.clone()).collect();
                 let n = items.len();
-                match raft.client_write(ReplicatedBatch { items }).await {
+                match raft.client_write(ReplicatedBatch::new(items)).await {
                     Ok(res) => {
                         let mut out = res.data.items;
                         if out.len() == n {
