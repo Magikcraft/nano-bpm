@@ -13627,6 +13627,8 @@ async fn main() {
                 if tick.is_multiple_of(4) {
                     metrics::set_resident_var_bytes(engine.resident_variable_bytes_total().await);
                 }
+                metrics::set_raft_live_batches(crate::raft::live_batches());
+                metrics::set_raft_live_batch_bytes(crate::raft::live_batch_bytes());
             }
         });
     }
