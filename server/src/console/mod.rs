@@ -773,7 +773,7 @@ struct MetricsDto {
 /// Per-node Raft recovery summary for the console cluster view. Lets the UI show
 /// "up but catching up" instead of a bare "up" while a restarted node reclaims
 /// leadership of its owned partitions (and the incumbent hands it back).
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 struct RecoveryDto {
     /// This node owns one or more partitions it does not yet lead — it is still
@@ -1049,19 +1049,34 @@ pub(super) async fn cluster_metrics(server: &ServerImpl) -> ClusterMetricsDto {
     .0
 }
 
-/// Probes one peer's `GET {base_url}/console/api/metrics` and parses its
-/// [`MetricsDto`]. A peer built without the `console` feature returns 404 here
-/// (mapped to an error string); the always-on health probe still reports it up.
+/// Fetches a peer's metrics for the cluster dashboard. Prefers the rich
+/// `GET {base_url}/console/api/metrics` JSON (present only when the peer is built
+/// with the `console` feature); if that peer has no console (404), transparently
+/// falls back to scraping the peer's always-on `GET {base_url}/metrics`
+/// Prometheus exposition and reconstructing a [`MetricsDto`] from it. This lets a
+/// single console node report metrics for console-less peers in the cluster.
 async fn probe_peer_metrics(base_url: &str) -> Result<MetricsDto, String> {
+    if base_url.is_empty() {
+        return Err("no address configured".to_string());
+    }
+    match probe_peer_console_metrics(base_url).await? {
+        Some(metrics) => Ok(metrics),
+        // Peer has no console feature — reconstruct from its Prometheus endpoint.
+        None => probe_peer_prometheus_metrics(base_url).await,
+    }
+}
+
+/// Issues a `GET {base_url}{path}` and returns `(status, body)`, sharing one
+/// plain-HTTP client + the health-probe timeout for both metrics probes.
+async fn peer_http_get(
+    base_url: &str,
+    path: &str,
+) -> Result<(hyper::StatusCode, hyper::body::Bytes), String> {
     use http_body_util::BodyExt;
     use hyper_util::client::legacy::Client;
     use hyper_util::rt::TokioExecutor;
 
-    if base_url.is_empty() {
-        return Err("no address configured".to_string());
-    }
-
-    let uri: hyper::Uri = format!("{}/console/api/metrics", base_url.trim_end_matches('/'))
+    let uri: hyper::Uri = format!("{}{}", base_url.trim_end_matches('/'), path)
         .parse()
         .map_err(|e| format!("bad peer url: {e}"))?;
 
@@ -1080,18 +1095,199 @@ async fn probe_peer_metrics(base_url: &str) -> Result<MetricsDto, String> {
         Ok::<_, String>((status, body))
     };
 
-    let (status, body) = tokio::time::timeout(HEALTH_PROBE_TIMEOUT, fut)
+    tokio::time::timeout(HEALTH_PROBE_TIMEOUT, fut)
         .await
-        .map_err(|_| "timeout".to_string())??;
+        .map_err(|_| "timeout".to_string())?
+}
 
+/// Probes `GET {base_url}/console/api/metrics`. `Ok(Some(_))` on success,
+/// `Ok(None)` when the peer has no console (404 — caller falls back to
+/// Prometheus), `Err` on any transport/parse failure.
+async fn probe_peer_console_metrics(base_url: &str) -> Result<Option<MetricsDto>, String> {
+    let (status, body) = peer_http_get(base_url, "/console/api/metrics").await?;
     if status.as_u16() == 404 {
-        return Err("no console on peer".to_string());
+        return Ok(None);
     }
     if !status.is_success() {
         return Err(format!("HTTP {}", status.as_u16()));
     }
+    serde_json::from_slice::<MetricsDto>(&body)
+        .map(Some)
+        .map_err(|e| format!("parse: {e}"))
+}
 
-    serde_json::from_slice::<MetricsDto>(&body).map_err(|e| format!("parse: {e}"))
+/// Scrapes a console-less peer's always-on `GET {base_url}/metrics` Prometheus
+/// exposition and reconstructs a [`MetricsDto`]. Every dashboard field maps to a
+/// permanent series except `active_instances` (an on-demand read-model `COUNT`,
+/// not a Prometheus gauge — approximated here by `nanobpm_active_backlog`) and
+/// `recovery` (per-partition leadership, not exported — left at its steady-state
+/// default). Both gaps close in Phase 2 once those are promoted to gauges.
+async fn probe_peer_prometheus_metrics(base_url: &str) -> Result<MetricsDto, String> {
+    let (status, body) = peer_http_get(base_url, "/metrics").await?;
+    if !status.is_success() {
+        return Err(format!("HTTP {}", status.as_u16()));
+    }
+    let text = std::str::from_utf8(&body).map_err(|e| format!("utf8: {e}"))?;
+    Ok(metrics_dto_from_prometheus(text))
+}
+
+/// A parsed Prometheus text-exposition scrape: one `(name{labels}, value)` per
+/// sample line (comments/blank lines skipped). nanobpm label values never
+/// contain spaces, so splitting each line on its first space is unambiguous.
+struct PromScrape(Vec<(String, f64)>);
+
+impl PromScrape {
+    fn parse(text: &str) -> Self {
+        let mut samples = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some(tok) = rest.split_whitespace().next() else {
+                continue;
+            };
+            let value = match tok {
+                "+Inf" => f64::INFINITY,
+                "-Inf" => f64::NEG_INFINITY,
+                "NaN" => f64::NAN,
+                other => match other.parse::<f64>() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+            };
+            samples.push((key.to_string(), value));
+        }
+        PromScrape(samples)
+    }
+
+    /// Value of a bare (label-free) series, e.g. `nanobpm_commit_inflight`.
+    fn gauge(&self, name: &str) -> f64 {
+        self.0
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
+    }
+
+    /// Value of the first series named `name` whose label set contains `frag`
+    /// (e.g. `protocol="rest"`).
+    fn labeled(&self, name: &str, frag: &str) -> f64 {
+        let prefix = format!("{name}{{");
+        self.0
+            .iter()
+            .find(|(k, _)| k.starts_with(&prefix) && k.contains(frag))
+            .map(|(_, v)| *v)
+            .unwrap_or(0.0)
+    }
+
+    /// Sum over every series named `name` regardless of labels (bare or any
+    /// label set), e.g. summing `nanobpm_admission_shed_total{reason=...}`.
+    fn sum(&self, name: &str) -> f64 {
+        let braced = format!("{name}{{");
+        self.0
+            .iter()
+            .filter(|(k, _)| k == name || k.starts_with(&braced))
+            .map(|(_, v)| *v)
+            .sum()
+    }
+}
+
+/// Reconstructs a [`MetricsDto`] from a peer's Prometheus scrape. Mirrors
+/// [`build_local_metrics`] field-for-field so a console-less peer reports the
+/// same shape as a console peer (see [`probe_peer_prometheus_metrics`] for the
+/// two approximated fields).
+fn metrics_dto_from_prometheus(text: &str) -> MetricsDto {
+    let s = PromScrape::parse(text);
+
+    let creates_rest = s.labeled("nanobpm_creates_total", "protocol=\"rest\"") as u64;
+    let creates_stream = s.labeled("nanobpm_creates_total", "protocol=\"stream\"") as u64;
+    let completions_rest = s.labeled("nanobpm_job_completions_total", "protocol=\"rest\"") as u64;
+    let completions_stream =
+        s.labeled("nanobpm_job_completions_total", "protocol=\"stream\"") as u64;
+
+    let mean_ms = |sum: f64, count: f64| {
+        if count == 0.0 {
+            0.0
+        } else {
+            sum / count * 1000.0
+        }
+    };
+    let mean = |sum: f64, count: f64| if count == 0.0 { 0.0 } else { sum / count };
+
+    let busy = s.gauge("nanobpm_journal_writer_busy_seconds");
+    let idle = s.gauge("nanobpm_journal_writer_idle_seconds");
+    let writer_busy_ratio = if busy + idle == 0.0 {
+        0.0
+    } else {
+        busy / (busy + idle)
+    };
+
+    let resident = s.labeled("nanobpm_jemalloc_bytes", "kind=\"resident\"");
+
+    let timestamp_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+
+    MetricsDto {
+        timestamp_ms,
+        // No always-on read-model COUNT gauge; active_backlog (created-completed)
+        // is the closest permanent proxy until Phase 2 exports the true count.
+        active_instances: s.gauge("nanobpm_active_backlog") as i64,
+
+        creates_rest,
+        creates_stream,
+        creates_total: creates_rest + creates_stream,
+        completions_rest,
+        completions_stream,
+        completions_total: completions_rest + completions_stream,
+
+        connections_active: s.gauge("nanobpm_stream_connections_active") as i64,
+        commit_inflight: s.gauge("nanobpm_commit_inflight") as i64,
+
+        commits_total: s.gauge("nanobpm_journal_commits_total") as u64,
+        writes_total: s.gauge("nanobpm_journal_writes_total") as u64,
+        bytes_total: s.gauge("nanobpm_journal_bytes_total") as u64,
+        credit_stalls_total: s.gauge("nanobpm_stream_credit_stalls_total") as u64,
+
+        fsync_mean_ms: mean_ms(
+            s.gauge("nanobpm_journal_fsync_seconds_sum"),
+            s.gauge("nanobpm_journal_fsync_seconds_count"),
+        ),
+        commit_wait_mean_ms: mean_ms(
+            s.gauge("nanobpm_commit_wait_seconds_sum"),
+            s.gauge("nanobpm_commit_wait_seconds_count"),
+        ),
+        commit_batch_mean: mean(
+            s.gauge("nanobpm_journal_commit_batch_size_sum"),
+            s.gauge("nanobpm_journal_commit_batch_size_count"),
+        ),
+        frame_processing_mean_ms: mean_ms(
+            s.gauge("nanobpm_stream_frame_processing_seconds_sum"),
+            s.gauge("nanobpm_stream_frame_processing_seconds_count"),
+        ),
+
+        writer_busy_ratio,
+
+        resident_bytes: (resident > 0.0).then_some(resident as u64),
+
+        ceiling_throughput: s.labeled("nanobpm_ceiling_active", "ceiling=\"throughput\"") != 0.0,
+        ceiling_memory: s.labeled("nanobpm_ceiling_active", "ceiling=\"memory\"") != 0.0,
+        pending_create_queue: s.gauge("nanobpm_pending_create_queue") as i64,
+        active_backlog: s.gauge("nanobpm_active_backlog") as i64,
+        admission_backlog_limit: s.labeled("nanobpm_admission_limit", "limit=\"backlog\"") as i64,
+        admission_create_queue_limit: s.labeled("nanobpm_admission_limit", "limit=\"create_queue\"")
+            as i64,
+        admission_shed_total: s.sum("nanobpm_admission_shed_total") as u64,
+
+        // Per-partition leadership is not exported to Prometheus; a remote
+        // console-less peer reports steady-state recovery until Phase 2.
+        recovery: RecoveryDto::default(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2488,5 +2684,102 @@ async fn proj_recv_live(
             Err(broadcast::error::RecvError::Lagged(_)) => continue,
             Err(broadcast::error::RecvError::Closed) => return None,
         }
+    }
+}
+
+#[cfg(test)]
+mod prom_scrape_tests {
+    use super::*;
+
+    /// A minimal but representative slice of a real `/metrics` exposition,
+    /// exercising bare gauges, protocol-labelled counters, histogram sum/count,
+    /// multi-label sums, and the jemalloc/ceiling label lookups.
+    const SAMPLE: &str = r#"
+# HELP nanobpm_creates_total Process instance creates by protocol (rest|stream).
+# TYPE nanobpm_creates_total counter
+nanobpm_creates_total{protocol="rest"} 10
+nanobpm_creates_total{protocol="stream"} 90
+nanobpm_job_completions_total{protocol="rest"} 5
+nanobpm_job_completions_total{protocol="stream"} 45
+nanobpm_stream_connections_active 4
+nanobpm_commit_inflight 2
+nanobpm_journal_commits_total 1000
+nanobpm_journal_writes_total 2000
+nanobpm_journal_bytes_total 3000
+nanobpm_stream_credit_stalls_total 7
+nanobpm_journal_fsync_seconds_sum 2
+nanobpm_journal_fsync_seconds_count 100
+nanobpm_commit_wait_seconds_sum 0.5
+nanobpm_commit_wait_seconds_count 50
+nanobpm_journal_commit_batch_size_sum 400
+nanobpm_journal_commit_batch_size_count 100
+nanobpm_stream_frame_processing_seconds_sum 1
+nanobpm_stream_frame_processing_seconds_count 200
+nanobpm_journal_writer_busy_seconds 30
+nanobpm_journal_writer_idle_seconds 10
+nanobpm_jemalloc_bytes{kind="allocated"} 111
+nanobpm_jemalloc_bytes{kind="resident"} 999
+nanobpm_ceiling_active{ceiling="throughput"} 1
+nanobpm_ceiling_active{ceiling="memory"} 0
+nanobpm_pending_create_queue 3
+nanobpm_active_backlog 42
+nanobpm_admission_limit{limit="backlog"} 500
+nanobpm_admission_limit{limit="create_queue"} 900
+nanobpm_admission_shed_total{reason="active_backlog"} 4
+nanobpm_admission_shed_total{reason="create_queue"} 6
+"#;
+
+    #[test]
+    fn reconstructs_metrics_dto_from_prometheus_text() {
+        let m = metrics_dto_from_prometheus(SAMPLE);
+
+        assert_eq!(m.creates_rest, 10);
+        assert_eq!(m.creates_stream, 90);
+        assert_eq!(m.creates_total, 100);
+        assert_eq!(m.completions_rest, 5);
+        assert_eq!(m.completions_stream, 45);
+        assert_eq!(m.completions_total, 50);
+
+        assert_eq!(m.connections_active, 4);
+        assert_eq!(m.commit_inflight, 2);
+        assert_eq!(m.commits_total, 1000);
+        assert_eq!(m.writes_total, 2000);
+        assert_eq!(m.bytes_total, 3000);
+        assert_eq!(m.credit_stalls_total, 7);
+
+        // 2s / 100 * 1000 = 20 ms; 0.5s / 50 * 1000 = 10 ms.
+        assert!((m.fsync_mean_ms - 20.0).abs() < 1e-9);
+        assert!((m.commit_wait_mean_ms - 10.0).abs() < 1e-9);
+        // 400 / 100 = 4.0 mean batch; 1s / 200 * 1000 = 5 ms frame.
+        assert!((m.commit_batch_mean - 4.0).abs() < 1e-9);
+        assert!((m.frame_processing_mean_ms - 5.0).abs() < 1e-9);
+        // busy 30 / (30 + 10) = 0.75.
+        assert!((m.writer_busy_ratio - 0.75).abs() < 1e-9);
+
+        assert_eq!(m.resident_bytes, Some(999));
+        assert!(m.ceiling_throughput);
+        assert!(!m.ceiling_memory);
+        assert_eq!(m.pending_create_queue, 3);
+        assert_eq!(m.active_backlog, 42);
+        // active_instances proxies active_backlog until Phase 2.
+        assert_eq!(m.active_instances, 42);
+        assert_eq!(m.admission_backlog_limit, 500);
+        assert_eq!(m.admission_create_queue_limit, 900);
+        // Summed across both shed reasons.
+        assert_eq!(m.admission_shed_total, 10);
+
+        // Leadership isn't in Prometheus — steady-state default.
+        assert!(!m.recovery.recovering);
+        assert_eq!(m.recovery.owned, 0);
+    }
+
+    #[test]
+    fn missing_series_default_to_zero_not_panic() {
+        let m = metrics_dto_from_prometheus("nanobpm_commit_inflight 1\n");
+        assert_eq!(m.commit_inflight, 1);
+        assert_eq!(m.creates_total, 0);
+        assert_eq!(m.resident_bytes, None);
+        assert_eq!(m.fsync_mean_ms, 0.0);
+        assert!(!m.ceiling_throughput);
     }
 }
