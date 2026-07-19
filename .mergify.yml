@@ -55,7 +55,7 @@ queue_rules:
 merge_protections:
   - name: required CI checks
     description: All required CI jobs must be green (or skipped) before merge.
-    conditions:
+    if:
       - base=main
     success_conditions:
       - check-success=rustfmt (pinned nightly)
