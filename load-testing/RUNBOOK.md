@@ -93,6 +93,58 @@ Notes:
 
 ---
 
+## The node launcher (embedded base64 in `deploy.sh`)
+
+Each node is started by a small systemd launcher, `~/node-launch-verify.sh`, that
+`deploy.sh` writes to every node before starting it. **The launcher is stored
+base64-encoded in the `LB64="..."` variable inside `deploy.sh`** (so the whole
+deploy is a single self-contained script with no side files to copy). `deploy.sh`
+does `echo "$LB64" | base64 -d > ~/node-launch-verify.sh` on each node, then runs
+it via `nohup ... $MAXBKLOG $CAP $LIVENESS "$EXP_MODE" "$EXP_ENDPOINT"`.
+
+A **decoded, human-readable copy is committed** at
+[`scripts/node-launch-verify.reference.sh`](scripts/node-launch-verify.reference.sh).
+**These two must stay in sync** — the reference is documentation only; the live
+copy is the base64 blob.
+
+### What the launcher pins (the OOTB cluster under test)
+
+RF=3, 12 partitions, `NANOBPMN_RAFT=1`, `REPLICATION=leader-durable`,
+`DURABILITY=sync`, `JOURNAL=segmented`, `DATA_DIR=$HOME/nano-data`, all adaptive
+rails on (`VAR_SPILL`/`COLD_SPILL`=700 MB, `HISTORY_RETENTION`=6000 MB,
+`EXPORTER_QUEUE`, `MEM_WATERMARK`), `SLA_MODE=latency`. Positional args:
+
+| arg | var | meaning |
+|-----|-----|---------|
+| `$1` | `MAXBKLOG` | `default` (omit → adaptive) \| `off` \| N (explicit `NANOBPMN_ADMISSION_MAX_BACKLOG`) |
+| `$2` | `CAP` | `NANOBPMN_ADMISSION_MAX_CREATE_QUEUE` (default 100000) |
+| `$3` | `LIVENESS` | `NANOBPMN_STREAM_LIVENESS_MS` (default 600000) |
+| `$4` | `EXP_MODE` | read-model exporter: `sqlite` (default) \| `tee` \| `remote` → `NANOBPMN_READ_EXPORTER` |
+| `$5` | `EXP_ENDPOINT` | central exporter batch URL → `NANOBPMN_EXPORTER_ENDPOINT` |
+
+`deploy.sh` forwards `$4`/`$5` from its own env `NANO_EXP_MODE` /
+`NANO_EXP_ENDPOINT`, so the remote-exporter A/B (see below) needs **no
+re-encoding** — just `NANO_EXP_MODE=remote NANO_EXP_ENDPOINT=... deploy.sh`.
+
+### Editing the launcher (decode → edit → re-encode)
+
+To change anything *other* than the parameterized args, edit the reference, then
+regenerate `LB64`:
+
+```bash
+cd load-testing/scripts
+# 1. edit node-launch-verify.reference.sh (skip its 5 header comment lines)
+# 2. regenerate the blob from the body only:
+tail -n +6 node-launch-verify.reference.sh > /tmp/launcher.sh
+NEWB64=$(base64 -i /tmp/launcher.sh | tr -d '\n')
+# 3. paste $NEWB64 into the LB64="..." assignment in deploy.sh
+# 4. verify they round-trip:
+grep -oE 'LB64="[^"]+"' deploy.sh | sed 's/LB64="//;s/"$//' | base64 -d \
+  | diff - /tmp/launcher.sh && echo "in sync"
+```
+
+---
+
 ## Post-mortem: the "50 KB soak wedge" (2026-07-12)
 
 A 50 KB soak time-series showed completions collapsing to ~0 mid-run while the
@@ -207,6 +259,136 @@ Mitigations, both in place:
 
 Keep the build host (node0) tidy: `cargo clean` in `~/build-console` and remove
 stale `~/nano-gw-*` / old `~/nano-data` between build cycles.
+
+---
+
+## Disk Attribution Probe (raft-log vs read-model)
+
+`disk-attribution.sh` answers one question: **is a soak raft-log-bound or
+read-model-bound on disk?** — which decides whether moving the read-model
+exporter off-node (below) can lift the ceiling. Run it during a soak:
+
+```bash
+# on the loadbox, alongside a running soak:
+~/disk-attribution.sh sample 10          # one 10 s window, per node
+~/disk-attribution.sh watch  10 30       # 30 windows
+```
+
+Per node it prints, over the window:
+
+| field | source | meaning |
+|-------|--------|---------|
+| `dev`   | `/sys/block/<dev>/stat` f7 | **gross device write MB/s** — the real ~276 MB/s PD-ceiling signal |
+| `wiops` | `/sys/block/<dev>/stat` f5 | gross device write IOPS (the fsync/small-write signal) |
+| `app`   | `/proc/<nano-gw>/io write_bytes` | gross logical write MB/s by the server process |
+| `syscw` | `/proc/<nano-gw>/io syscw` | `write()` syscalls/s |
+| `raft`  | `du nano-data/raft/` Δ | net growth MB/s of the **Raft log** |
+| `rm`    | `du nano-data/read-model.*` Δ | net growth MB/s of the **read model** (the exporter offload target) |
+| `var` / `spill` / `jrnl` | `du` Δ | var-store / var-spill / engine-journal net growth |
+
+**Reading it.** `dev` is the absolute disk load (near the PD cap ⇒ disk-bound;
+well below it while throughput won't rise ⇒ **CPU/raft-commit bound**). The
+per-component columns are *net* on-disk growth, so their **sum is less than
+`app`/`dev`** — the gap is write amplification + Raft/SQLite compaction churn.
+Use the columns for **attribution** (which store grows fastest), `dev`/`app` for
+the load:
+
+- `rm`+`var`+`spill` dominate **and** `dev` near the cap → **read-model/payload
+  disk is the wall** → remote-exporter mode should free it.
+- `raft` dominates, or `dev` is low while throughput is capped → **raft/CPU
+  bound** → moving the exporter will **not** help (this is the 0-byte regime).
+
+Reference (idle cluster): all columns ~0 (sanity check that the probe attaches
+to the device + `nano-gw` PID + `nano-data` paths correctly).
+
+---
+
+## Remote read-model exporter (Elasticsearch) — the off-node experiment
+
+**Goal.** Measure how much removing per-node read-model projection frees the
+cluster, by running nodes in `remote` mode against a central exporter VM that
+projects to Elasticsearch. This only moves the needle in a **read-model-bound**
+regime — use **50 KB payloads** (`scenario.sh 50kb ...`), not negligible; at
+0-byte the nodes are raft/CPU-bound and there is nothing on the read-model disk
+to offload (confirm first with the Disk Attribution Probe above).
+
+Architecture (see the pluggable-exporter epic, issue #133, and `nano-exporter`):
+
+```
+ nodes (NANOBPMN_READ_EXPORTER=remote)          central VM: nano-exporter-0
+   per-shard RemoteSink --HTTP POST /ingest-->  nano-exporter :9700 --_bulk--> Elasticsearch :9200
+   (keeps only the compaction watermark)        (RemoteTarget = ElasticsearchTarget)
+```
+
+Node side ships each shard's event batch and advances only its local compaction
+watermark (one integer write) instead of the full instance+variable projection.
+
+### 1. Provision the central exporter VM (once)
+
+```bash
+gcloud compute instances create nano-exporter-0 \
+  --zone us-central1-a --project camunda-researchanddevelopment \
+  --machine-type c2-standard-8 --image-family debian-12 --image-project debian-cloud \
+  --boot-disk-size 200 --boot-disk-type pd-ssd
+# same VPC/subnet as the nodes (10.128.0.0/20) so nodes reach it on the internal IP.
+```
+
+Install Docker + run single-node Elasticsearch (security off for the experiment —
+private subnet only), then run `nano-exporter` pointing at it:
+
+```bash
+# on nano-exporter-0:
+sudo apt-get update && sudo apt-get install -y docker.io
+sudo docker run -d --name es -p 9200:9200 \
+  -e discovery.type=single-node -e xpack.security.enabled=false \
+  -e "ES_JAVA_OPTS=-Xms8g -Xmx8g" docker.elastic.co/elasticsearch/elasticsearch:8.14.0
+# stage the nano-exporter binary (built from server/, bin target `nano-exporter`)
+NANO_EXPORTER_ES_URL=http://localhost:9200 NANO_EXPORTER_ES_INDEX=nano-events \
+  NANO_EXPORTER_BIND=0.0.0.0:9700 nohup ./nano-exporter >~/nano-exporter.log 2>&1 &
+curl -s localhost:9700/health   # -> ok
+```
+
+Build the `nano-exporter` binary the same way as the server (it is a second bin
+in the `server` crate): `cargo build --release --bin nano-exporter`, stage the
+artifact to `nano-exporter-0:~/nano-exporter`.
+
+### 2. Run the A/B (wipe between arms — golden rule)
+
+Let `EXP=http://<nano-exporter-0 internal IP>:9700/ingest`.
+
+```bash
+# Arm A — baseline (local SQLite exporter, current default):
+~/deploy.sh default && PROD_CONNS=256 MAXPAR=224 ~/soak.sh 50kb 30m es-armA-local &
+~/disk-attribution.sh watch 15 40 | tee ~/attr-armA.log     # capture per-node disk split
+
+# Arm B — remote exporter (nodes project off-node to ES):
+NANO_EXP_MODE=remote NANO_EXP_ENDPOINT="$EXP" ~/deploy.sh default \
+  && PROD_CONNS=256 MAXPAR=224 ~/soak.sh 50kb 30m es-armB-remote &
+~/disk-attribution.sh watch 15 40 | tee ~/attr-armB.log
+```
+
+Confirm the mode took on each node: the launch log line ends `exporter=remote`
+(`ssh <node> 'tail -1 ~/nano-launch.log'`), and ES fills:
+`curl -s "$ES/_cat/indices/nano-events?v"` shows a rising `docs.count`.
+
+### 3. What to expect / how to read the result
+
+- **Arm B node `dev` and `rm` should drop sharply** (read-model projection left
+  the node; only the raft log + watermark remain) while **achieved creates/s
+  rises** if the read-model disk was the binding constraint.
+- If throughput is **unchanged** between arms, the nodes were **raft/CPU-bound**,
+  not read-model-disk-bound — the exporter was never the wall (expected at low
+  payload; re-run at larger payload to load the read-model path).
+- Watch `nano-exporter-0`: if its ES `_bulk` can't keep up, `HttpBatchTransport`
+  backpressures the node exporter thread (bounded queue, never drops) — that
+  shows up as node-side create-accept backpressure, not data loss.
+
+**Durability note.** In `remote` mode the compaction watermark advances on
+*enqueue*, not on ES ack, so a node crash with batches still in flight loses that
+downstream data (engine correctness is unaffected — that path is Raft-durable).
+This is acceptable for the throughput experiment; ack-gated delivery is M3 in
+#133. Use `tee` mode (local SQLite authoritative **and** mirror to ES) if you
+need the read model to survive locally during the run.
 
 ---
 
