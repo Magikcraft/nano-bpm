@@ -1306,11 +1306,25 @@ impl ReadExporterCfg {
             .max(1)
     }
 
+    /// Number of POSTs the per-shard HTTP transport keeps in flight at once
+    /// (pipeline depth). Each POST is a full round-trip to the central exporter
+    /// and on to Elasticsearch, so delivering one-at-a-time (`= 1`) makes that
+    /// latency the throughput ceiling; overlapping several lifts it. `= 1`
+    /// restores strictly-ordered delivery for a future order-sensitive target.
+    fn transport_concurrency() -> usize {
+        std::env::var("NANOBPMN_EXPORTER_CONCURRENCY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8usize)
+            .max(1)
+    }
+
     fn transport(endpoint: &Option<String>) -> std::sync::Arc<dyn remote_sink::BatchTransport> {
         match endpoint {
             Some(ep) => std::sync::Arc::new(remote_sink::HttpBatchTransport::new(
                 ep.clone(),
                 Self::transport_capacity(),
+                Self::transport_concurrency(),
             )),
             None => {
                 tracing::warn!(

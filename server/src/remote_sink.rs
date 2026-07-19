@@ -189,24 +189,41 @@ struct HttpBatch {
 /// The per-shard exporter runs on a plain OS thread (outside any tokio context)
 /// and `reqwest` here is async-only, so delivery is driven by ONE dedicated
 /// sender thread hosting a current-thread runtime. `send` enqueues onto a
-/// bounded [`SyncSender`]; a full queue BLOCKS the caller (backpressure), never
-/// drops — upholding the never-lose-a-batch invariant. A single consumer
-/// preserves per-shard order. Failed POSTs are retried with a capped backoff so
-/// a transient outage of the central service stalls (and backpressures) the
-/// pipeline rather than losing data.
+/// bounded [`tokio::sync::mpsc`] channel; a full queue BLOCKS the caller
+/// (backpressure), never drops — upholding the never-lose-a-batch invariant.
+///
+/// **Pipelined delivery.** Each POST is a full network round-trip to the central
+/// exporter and on to Elasticsearch; delivering strictly one-at-a-time made that
+/// round-trip latency the throughput ceiling (one in-flight POST per shard). The
+/// sender therefore keeps up to `concurrency` POSTs in flight at once (a
+/// [`tokio::sync::Semaphore`] bounds it), overlapping the round-trips. When all
+/// permits are taken the recv loop stalls, the channel fills, and `send` blocks —
+/// so backpressure still holds end-to-end.
+///
+/// **Ordering.** With `concurrency > 1`, batches for this shard may be delivered
+/// out of order (and a retried batch may land after a later one). That is safe
+/// for the reference append-only target: each event is an independent document,
+/// and remote delivery is already best-effort — the journal-compaction watermark
+/// advances on *enqueue*, not on remote ack (ack-gated ordering is a later
+/// milestone, #133). `concurrency = 1` restores strictly-ordered, one-at-a-time
+/// delivery for a future order-sensitive target. Failed POSTs (5xx / network)
+/// are retried with a capped backoff; a permanent 4xx is dropped (counted) so a
+/// poison batch cannot head-of-line-block the pipeline.
 pub struct HttpBatchTransport {
-    tx: std::sync::mpsc::SyncSender<HttpBatch>,
+    tx: tokio::sync::mpsc::Sender<HttpBatch>,
     depth: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl HttpBatchTransport {
     /// Spawns the sender thread. `endpoint` is the central exporter's batch URL
-    /// (e.g. `http://exporter-host:9200/ingest`); `capacity` bounds the in-RAM
-    /// queue of undelivered batches (backpressure threshold).
-    pub fn new(endpoint: String, capacity: usize) -> Self {
-        let (tx, rx) = std::sync::mpsc::sync_channel::<HttpBatch>(capacity.max(1));
+    /// (e.g. `http://exporter-host:9700/ingest`); `capacity` bounds the in-RAM
+    /// queue of undelivered batches (backpressure threshold); `concurrency`
+    /// bounds the number of POSTs kept in flight at once (pipeline depth).
+    pub fn new(endpoint: String, capacity: usize, concurrency: usize) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<HttpBatch>(capacity.max(1));
         let depth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let depth_bg = depth.clone();
+        let concurrency = concurrency.max(1);
         std::thread::Builder::new()
             .name("nanobpmn-exporter-http".into())
             .spawn(move || {
@@ -221,54 +238,23 @@ impl HttpBatchTransport {
                     }
                 };
                 let client = reqwest::Client::new();
+                let sem = Arc::new(tokio::sync::Semaphore::new(concurrency));
                 rt.block_on(async move {
-                    while let Ok(batch) = rx.recv() {
-                        depth_bg.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                        let mut backoff = std::time::Duration::from_millis(50);
-                        loop {
-                            let res = client
-                                .post(&endpoint)
-                                .header("x-nano-partition", batch.partition)
-                                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                                .body(batch.payload.clone())
-                                .send()
-                                .await;
-                            match res {
-                                Ok(r) if r.status().is_success() => break,
-                                Ok(r) if r.status().is_client_error() => {
-                                    // A 4xx (e.g. 413 Payload Too Large, 400 Bad
-                                    // Request) is PERMANENT for this exact body:
-                                    // retrying the identical bytes can never
-                                    // succeed and would head-of-line-block every
-                                    // batch behind it, freezing the whole export
-                                    // pipeline (the M2 wedge). Drop it (loud),
-                                    // count it, and move on — remote delivery is
-                                    // best-effort (the compaction watermark
-                                    // already advanced on enqueue), so a poison
-                                    // batch must not wedge the node.
-                                    tracing::error!(
-                                        "remote exporter: partition {} POST -> {} \
-                                         (permanent; dropping {}-byte batch)",
-                                        batch.partition,
-                                        r.status(),
-                                        batch.payload.len()
-                                    );
-                                    crate::metrics::record_read_model_export_drop();
-                                    break;
-                                }
-                                Ok(r) => tracing::warn!(
-                                    "remote exporter: partition {} POST -> {}",
-                                    batch.partition,
-                                    r.status()
-                                ),
-                                Err(e) => tracing::warn!(
-                                    "remote exporter: partition {} POST failed: {e}",
-                                    batch.partition
-                                ),
-                            }
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
-                        }
+                    while let Some(batch) = rx.recv().await {
+                        // Bound in-flight POSTs: this awaits (stalling the recv
+                        // loop → filling the channel → blocking `send`) once
+                        // `concurrency` deliveries are already outstanding.
+                        let Ok(permit) = sem.clone().acquire_owned().await else {
+                            break; // semaphore closed — shutting down
+                        };
+                        let client = client.clone();
+                        let endpoint = endpoint.clone();
+                        let depth_task = depth_bg.clone();
+                        tokio::spawn(async move {
+                            deliver_batch(&client, &endpoint, &batch).await;
+                            depth_task.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                            drop(permit);
+                        });
                     }
                 });
             })
@@ -277,11 +263,65 @@ impl HttpBatchTransport {
     }
 }
 
+/// Delivers one batch, retrying transient failures with a capped backoff and
+/// dropping a permanent 4xx (so it cannot head-of-line-block). Returns once the
+/// batch is either acked (2xx) or permanently dropped.
+async fn deliver_batch(client: &reqwest::Client, endpoint: &str, batch: &HttpBatch) {
+    let mut backoff = std::time::Duration::from_millis(50);
+    loop {
+        let res = client
+            .post(endpoint)
+            .header("x-nano-partition", batch.partition)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(batch.payload.clone())
+            .send()
+            .await;
+        match res {
+            Ok(r) if r.status().is_success() => return,
+            Ok(r) if r.status().is_client_error() => {
+                // A 4xx (e.g. 413 Payload Too Large, 400 Bad Request) is
+                // PERMANENT for this exact body: retrying the identical bytes can
+                // never succeed and would hold a delivery slot forever, throttling
+                // the pipeline (and, at concurrency 1, freezing it — the M2
+                // wedge). Drop it (loud), count it, and move on — remote delivery
+                // is best-effort (the compaction watermark already advanced on
+                // enqueue), so a poison batch must not wedge the node.
+                tracing::error!(
+                    "remote exporter: partition {} POST -> {} (permanent; dropping {}-byte batch)",
+                    batch.partition,
+                    r.status(),
+                    batch.payload.len()
+                );
+                crate::metrics::record_read_model_export_drop();
+                return;
+            }
+            Ok(r) => tracing::warn!(
+                "remote exporter: partition {} POST -> {}",
+                batch.partition,
+                r.status()
+            ),
+            Err(e) => tracing::warn!(
+                "remote exporter: partition {} POST failed: {e}",
+                batch.partition
+            ),
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(std::time::Duration::from_secs(5));
+    }
+}
+
 impl BatchTransport for HttpBatchTransport {
     fn send(&self, partition: u64, payload: Vec<u8>) {
         self.depth
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.tx.send(HttpBatch { partition, payload }).is_err() {
+        // Called from the exporter's plain OS thread (never inside a tokio
+        // runtime), so `blocking_send` is safe: it blocks the caller when the
+        // channel is full, which is the intended backpressure.
+        if self
+            .tx
+            .blocking_send(HttpBatch { partition, payload })
+            .is_err()
+        {
             // Receiver gone (shutdown): undo the depth bump.
             self.depth
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -584,5 +624,98 @@ mod tests {
     fn serialize_chunks_empty_is_no_chunks() {
         let chunks = serialize_chunks(&[], 4096).unwrap();
         assert!(chunks.is_empty());
+    }
+
+    /// Spawns a throwaway mock exporter on 127.0.0.1 that holds each request for
+    /// `hold` and records the peak number of *simultaneous* in-flight requests.
+    /// Returns (address, peak-counter, delivered-counter).
+    fn spawn_mock_exporter(
+        hold: std::time::Duration,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let peak = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let peak_bg = peak.clone();
+        let delivered_bg = delivered.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                addr_tx.send(listener.local_addr().unwrap()).unwrap();
+                let cur = Arc::new(AtomicUsize::new(0));
+                loop {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let (peak, delivered, cur) =
+                        (peak_bg.clone(), delivered_bg.clone(), cur.clone());
+                    tokio::spawn(async move {
+                        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                        let now = cur.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(now, Ordering::SeqCst);
+                        let mut buf = [0u8; 8192];
+                        let _ = sock.read(&mut buf).await;
+                        tokio::time::sleep(hold).await;
+                        delivered.fetch_add(1, Ordering::SeqCst);
+                        cur.fetch_sub(1, Ordering::SeqCst);
+                        let _ = sock
+                            .write_all(b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n")
+                            .await;
+                    });
+                }
+            });
+        });
+        (addr_rx.recv().unwrap(), peak, delivered)
+    }
+
+    #[test]
+    fn http_transport_pipelines_concurrent_posts() {
+        use std::sync::atomic::Ordering;
+        let (addr, peak, delivered) = spawn_mock_exporter(std::time::Duration::from_millis(150));
+        let endpoint = format!("http://{addr}/ingest");
+        let transport = HttpBatchTransport::new(endpoint, 64, 4);
+        for i in 0..8u64 {
+            transport.send(i, format!("[{{\"n\":{i}}}]").into_bytes());
+        }
+        // Serial (concurrency 1) would take ~8*150ms=1.2s; concurrency 4 ~300ms.
+        // Poll for all deliveries with generous slack for CI scheduling.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while delivered.load(Ordering::SeqCst) < 8 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(delivered.load(Ordering::SeqCst), 8, "all batches delivered");
+        assert!(
+            peak.load(Ordering::SeqCst) >= 2,
+            "expected pipelined (concurrent) delivery, peak was {}",
+            peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(transport.queued(), 0, "outstanding depth drains to zero");
+    }
+
+    #[test]
+    fn http_transport_concurrency_one_is_strictly_serial() {
+        use std::sync::atomic::Ordering;
+        let (addr, peak, delivered) = spawn_mock_exporter(std::time::Duration::from_millis(40));
+        let endpoint = format!("http://{addr}/ingest");
+        let transport = HttpBatchTransport::new(endpoint, 64, 1);
+        for i in 0..5u64 {
+            transport.send(i, format!("[{{\"n\":{i}}}]").into_bytes());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while delivered.load(Ordering::SeqCst) < 5 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(delivered.load(Ordering::SeqCst), 5, "all batches delivered");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            1,
+            "concurrency=1 must never have two POSTs in flight (ordered delivery)"
+        );
     }
 }
