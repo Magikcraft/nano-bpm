@@ -65,7 +65,7 @@ use crate::backpressure::{
 use crate::deepthi::DeepthiHandle;
 use crate::journal::{Commit, ExportBatch, Journal, SharedWriter};
 use crate::partition::Partitions;
-use crate::readstore::{ExportOutcome, ReadModel, ReadStore};
+use crate::readstore::{ExportOutcome, ProjectionSink, ReadModel, ReadStore};
 
 /// Default long-poll window (ms) when a client passes `requestTimeout` 0.
 const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 5_000;
@@ -1433,7 +1433,7 @@ fn retry_until_ok<T, E>(
 #[allow(clippy::too_many_arguments)]
 fn spawn_exporter(
     rx: mpsc::Receiver<ExportBatch>,
-    store: Arc<ReadStore>,
+    store: Arc<dyn ProjectionSink>,
     queued: Arc<AtomicU64>,
     retention: ShardRetention,
     engine: Partitions,
@@ -1628,7 +1628,7 @@ fn spawn_exporter(
                         ShardRetention::Fixed(cap) => cap,
                     };
                     if target_keep != 0 {
-                        match store.prune_terminal_instances(target_keep, PRUNE_BATCH_MAX) {
+                        match store.prune_terminal(target_keep, PRUNE_BATCH_MAX) {
                             Ok(n) if n > 0 => {
                                 tracing::debug!("history retention: evicted {n} terminal instances")
                             }

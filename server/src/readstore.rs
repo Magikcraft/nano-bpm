@@ -410,6 +410,54 @@ pub struct ExportOutcome {
     pub inflight_delta: i64,
 }
 
+/// The projection sink the per-shard exporter thread writes into. Abstracts the
+/// read model behind the single `export` seam so the sink can be the built-in
+/// local SQLite store (the default) or, in later milestones, a tee/remote sink
+/// that streams the record log into an external system (data lake / warehouse)
+/// and decouples read-model disk IOPS from the node (see issue #133).
+///
+/// The exporter thread is the one ordered point every projected event flows
+/// through, in strict log (fsync) order, off the command-commit/ack hot path.
+/// Any implementation MUST uphold the invariants the exporter relies on:
+///
+/// * **Idempotent** — projecting an overlapping prefix again (e.g. after a
+///   restart replays from the last durable watermark) must be a no-op for the
+///   already-applied events and yield an `inflight_delta`/`terminal_keys` that
+///   count only *genuine* state transitions, never raw event occurrences.
+/// * **Never lose a batch** — `export` must fully apply the batch or return an
+///   error (so the exporter retries); it must not partially apply and report
+///   success. `exported_position` (the compaction watermark) advances by event
+///   count on the exporter thread only after `export` succeeds, so a silently
+///   dropped batch is unrecoverable read-model loss.
+/// * **Per-shard order** — events within a shard arrive log-ordered; the sink
+///   must preserve that order.
+pub trait ProjectionSink: Send + Sync {
+    /// Projects a batch of consecutive, log-ordered journal events, returning the
+    /// exact in-flight delta and the keys of instances that genuinely reached a
+    /// terminal state in this batch. See the trait-level invariants.
+    fn export(&self, events: &[&Event]) -> anyhow::Result<ExportOutcome>;
+
+    /// Caps retained terminal instances at `max_keep`, deleting up to
+    /// `max_delete` of the oldest beyond the cap (0 = unbounded). Returns the
+    /// number evicted. A no-op for append-only sinks that don't retain state.
+    fn prune_terminal(&self, max_keep: usize, max_delete: usize) -> anyhow::Result<usize> {
+        let _ = (max_keep, max_delete);
+        Ok(0)
+    }
+}
+
+impl ProjectionSink for ReadStore {
+    fn export(&self, events: &[&Event]) -> anyhow::Result<ExportOutcome> {
+        Ok(ReadStore::export(self, events)?)
+    }
+
+    fn prune_terminal(&self, max_keep: usize, max_delete: usize) -> anyhow::Result<usize> {
+        Ok(ReadStore::prune_terminal_instances(
+            self, max_keep, max_delete,
+        )?)
+    }
+}
+
 impl ReadStore {
     /// Opens the read store at `path`, or an in-memory database when `path` is
     /// `None`. A persistent database whose schema version does not match (or
