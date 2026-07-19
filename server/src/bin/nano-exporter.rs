@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use serde_json::Value;
@@ -42,9 +42,20 @@ async fn main() {
     let target = build_target();
     tracing::info!("nano-exporter: target = {}", target.name());
 
+    // axum defaults request bodies to 2 MiB; a drained 50 KB-payload export
+    // batch blows past that and returns 413, which (before the node-side chunk +
+    // drop fix) poisoned the export pipeline. Raise the limit generously so a
+    // full chunked batch is accepted. Overridable via NANO_EXPORTER_MAX_BODY_BYTES.
+    let max_body = std::env::var("NANO_EXPORTER_MAX_BODY_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(64 * 1024 * 1024);
+
     let app = Router::new()
         .route("/ingest", post(ingest))
         .route("/health", get(|| async { "ok" }))
+        .layer(DefaultBodyLimit::max(max_body))
         .with_state(target);
 
     let listener = tokio::net::TcpListener::bind(&bind)

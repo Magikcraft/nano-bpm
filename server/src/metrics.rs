@@ -80,6 +80,13 @@ struct Metrics {
     /// with the retention pruner / WAL checkpoint; sustained growth is the signal
     /// to widen `busy_timeout` or the exporter-queue budget.
     read_model_export_retries_total: IntCounter,
+    /// How many read-model export batches the remote transport dropped after a
+    /// PERMANENT delivery failure (a 4xx such as `413 Payload Too Large` or
+    /// `400 Bad Request`), where retrying the identical bytes can never succeed
+    /// and would head-of-line-block the whole export queue. A non-zero value
+    /// means the remote exporter rejected a batch as unacceptable; the node
+    /// dropped it (delivery is best-effort in remote mode) rather than wedging.
+    read_model_export_drops_total: IntCounter,
     /// Active falcon WebSocket connections.
     stream_connections_active: IntGauge,
     /// Time spent processing each falcon frame (read + apply + reply).
@@ -486,6 +493,15 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter");
 
+    let read_model_export_drops_total = IntCounter::new(
+        "nanobpm_read_model_export_drops_total",
+        "Read-model export batches dropped by the remote transport after a \
+         permanent delivery failure (a 4xx client error such as 413/400) that \
+         retrying could never fix; dropped to avoid head-of-line-blocking the \
+         export queue (best-effort remote delivery).",
+    )
+    .expect("valid counter");
+
     let stream_connections_active = IntGauge::new(
         "nanobpm_stream_connections_active",
         "Active falcon WebSocket connections.",
@@ -876,6 +892,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(stream_frames_total.clone())))
         .and(registry.register(Box::new(stream_credit_stalls_total.clone())))
         .and(registry.register(Box::new(read_model_export_retries_total.clone())))
+        .and(registry.register(Box::new(read_model_export_drops_total.clone())))
         .and(registry.register(Box::new(stream_connections_active.clone())))
         .and(registry.register(Box::new(stream_frame_processing_seconds.clone())))
         .and(registry.register(Box::new(peer_connect_attempts_total.clone())))
@@ -947,6 +964,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         stream_frames_total,
         stream_credit_stalls_total,
         read_model_export_retries_total,
+        read_model_export_drops_total,
         stream_connections_active,
         stream_frame_processing_seconds,
         peer_connect_attempts_total,
@@ -1454,6 +1472,16 @@ pub fn record_stream_credit_stall() {
 /// work, not just the number of contended batches.
 pub fn record_read_model_export_retry() {
     METRICS.read_model_export_retries_total.inc();
+}
+
+/// Records one read-model export batch permanently dropped by the remote
+/// transport after a 4xx client error (e.g. `413 Payload Too Large`) that
+/// retrying could never fix. Dropping avoids head-of-line-blocking the export
+/// queue; in remote mode delivery is best-effort (the compaction watermark
+/// already advanced on enqueue), so a poison batch is logged + counted, not
+/// allowed to wedge the pipeline.
+pub fn record_read_model_export_drop() {
+    METRICS.read_model_export_drops_total.inc();
 }
 
 /// Falcon connection opened (+1).
