@@ -34,6 +34,7 @@ mod raft_logstore;
 mod raft_net;
 mod readstore;
 mod recovery_throttle;
+mod remote_sink;
 mod seglog;
 mod stub_impls;
 mod varspill;
@@ -1247,7 +1248,12 @@ fn open_sharded_read_model(
 /// A read-model shard paired with the export channel feeding it and the
 /// partition's exporter-queue byte gauge (shared with the writer, which
 /// increments it, and the create-admission path, which reads it).
-type ShardChannel = (Arc<ReadStore>, mpsc::Receiver<ExportBatch>, Arc<AtomicU64>);
+type ShardChannel = (
+    u64,
+    Arc<ReadStore>,
+    mpsc::Receiver<ExportBatch>,
+    Arc<AtomicU64>,
+);
 
 /// Wires a per-partition sharded read model to its journals and spawns one
 /// exporter thread per shard, so read-model projection scales with cores instead
@@ -1257,6 +1263,82 @@ type ShardChannel = (Arc<ReadStore>, mpsc::Receiver<ExportBatch>, Arc<AtomicU64>
 /// exporter must be wired before `ServerImpl::new` so a fresh journal's seed
 /// deployment is projected. Threads are spawned after so they can route hot-state
 /// eviction back to the owning partition.
+/// Read-model exporter deployment mode (pluggable-exporter epic, issue #133).
+/// Selected once at startup from `NANOBPMN_READ_EXPORTER`:
+/// * `sqlite` (default) — local authoritative SQLite projection, as today.
+/// * `tee` — local SQLite projection AND mirror each batch to a remote target.
+/// * `remote` — remote-only projection; the local shard is kept solely as the
+///   journal-compaction watermark keeper (one integer write per batch).
+///
+/// `NANOBPMN_EXPORTER_ENDPOINT` gives the central exporter's batch URL; it is
+/// required for `tee`/`remote` (falling back to a no-op transport, logged, if
+/// unset so a misconfiguration degrades to local-only rather than losing data).
+enum ReadExporterCfg {
+    Sqlite,
+    Tee { endpoint: Option<String> },
+    Remote { endpoint: Option<String> },
+}
+
+impl ReadExporterCfg {
+    fn from_env() -> Self {
+        let endpoint = std::env::var("NANOBPMN_EXPORTER_ENDPOINT")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        match std::env::var("NANOBPMN_READ_EXPORTER")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "tee" => ReadExporterCfg::Tee { endpoint },
+            "remote" => ReadExporterCfg::Remote { endpoint },
+            _ => ReadExporterCfg::Sqlite,
+        }
+    }
+
+    /// Bounded queue depth (batches) for the per-shard HTTP transport before it
+    /// backpressures the exporter thread.
+    fn transport_capacity() -> usize {
+        std::env::var("NANOBPMN_EXPORTER_QUEUE_DEPTH")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1024usize)
+            .max(1)
+    }
+
+    fn transport(endpoint: &Option<String>) -> std::sync::Arc<dyn remote_sink::BatchTransport> {
+        match endpoint {
+            Some(ep) => std::sync::Arc::new(remote_sink::HttpBatchTransport::new(
+                ep.clone(),
+                Self::transport_capacity(),
+            )),
+            None => {
+                tracing::warn!(
+                    "read-model exporter: remote mode selected but NANOBPMN_EXPORTER_ENDPOINT unset; using no-op transport"
+                );
+                std::sync::Arc::new(remote_sink::NullTransport::default())
+            }
+        }
+    }
+
+    /// Wraps the concrete shard into the configured projection sink.
+    fn build_sink(&self, pid: u64, shard: Arc<ReadStore>) -> Arc<dyn ProjectionSink> {
+        match self {
+            ReadExporterCfg::Sqlite => shard,
+            ReadExporterCfg::Remote { endpoint } => Arc::new(remote_sink::RemoteSink::new(
+                pid,
+                shard,
+                Self::transport(endpoint),
+            )),
+            ReadExporterCfg::Tee { endpoint } => Arc::new(remote_sink::TeeSink::new(
+                pid,
+                shard,
+                Self::transport(endpoint),
+            )),
+        }
+    }
+}
+
 fn build_server(
     mut journals: Vec<Journal>,
     store: Arc<ReadModel>,
@@ -1278,7 +1360,7 @@ fn build_server(
         let queued = Arc::new(AtomicU64::new(0));
         gauges.insert(pid, queued.clone());
         senders.insert(pid, (tx, queued.clone()));
-        pending.push((shard, rx, queued));
+        pending.push((pid, shard, rx, queued));
     }
     for journal in journals.iter_mut() {
         let pid = journal.partition_id();
@@ -1338,16 +1420,29 @@ fn build_server(
         let local_gauges: Vec<Arc<AtomicU64>> = ordered.iter().map(|p| gauges[p].clone()).collect();
         server.engine.set_exporter_backpressure(local_gauges, high);
     }
-    for (shard, rx, queued) in pending {
+    let exporter_mode = ReadExporterCfg::from_env();
+    match &exporter_mode {
+        ReadExporterCfg::Sqlite => {}
+        ReadExporterCfg::Tee { endpoint } => tracing::info!(
+            "read-model exporter: tee (local SQLite + remote {})",
+            endpoint.as_deref().unwrap_or("<unset>")
+        ),
+        ReadExporterCfg::Remote { endpoint } => tracing::info!(
+            "read-model exporter: remote-only ({}); local shard kept as compaction watermark",
+            endpoint.as_deref().unwrap_or("<unset>")
+        ),
+    }
+    for (pid, shard, rx, queued) in pending {
         // Adaptive (disk-pressure) retention prunes in a dedicated per-shard
         // thread so eviction does not compete for CPU with projection inside the
         // saturated exporter thread. `Off`/`Fixed` need no such thread.
         if let ShardRetention::Adaptive { high_bytes } = shard_retention {
             spawn_adaptive_pruner(shard.clone(), high_bytes);
         }
+        let sink = exporter_mode.build_sink(pid, shard);
         spawn_exporter(
             rx,
-            shard,
+            sink,
             queued,
             shard_retention,
             server.engine.clone(),
