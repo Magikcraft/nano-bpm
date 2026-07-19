@@ -2808,14 +2808,16 @@ fn default_history_high_bytes() -> u64 {
 }
 
 /// Resolved read-model history retention policy (see [`retention_from_env`]).
+#[derive(Debug, PartialEq, Eq)]
 enum RetentionCfg {
-    /// No pruning — history grows with cumulative throughput (the default).
+    /// No pruning — history grows with cumulative throughput. Opt-in via
+    /// `NANOBPMN_HISTORY_RETENTION=off` (the adaptive policy is the default).
     Off,
     /// Cap the retained terminal set at a fixed total instance count.
     Fixed(usize),
     /// Prune terminal instances under disk pressure so the read-model store's
     /// total on-disk size tracks `total_high_bytes` instead of growing without
-    /// bound.
+    /// bound. The default when nothing is configured.
     Adaptive { total_high_bytes: u64 },
 }
 
@@ -2839,39 +2841,132 @@ const PRUNE_BATCH_MAX: usize = 16_384;
 ///
 /// Retention bounds the *read model* (projected completed-instance history),
 /// which is otherwise unbounded and — under sustained high throughput — the
-/// dominant disk consumer (the journal is compacted independently). It is
-/// **off by default** (byte-for-byte today's behaviour: full history retained).
+/// dominant memory/disk consumer (each terminal instance keeps its full variable
+/// payload; the journal is compacted independently). It defaults to **adaptive**
+/// (disk-pressure-driven) so the read model is bounded out of the box; a
+/// large-payload workload that previously grew the store without limit now holds
+/// near a disk-fraction budget instead.
 ///
-/// - `NANOBPMN_HISTORY_RETENTION=adaptive`/`auto`/`dynamic`: disk-pressure-driven
-///   pruning. The store's total on-disk size is held near
+/// - `NANOBPMN_HISTORY_RETENTION=adaptive`/`auto`/`dynamic` (**default**):
+///   disk-pressure-driven pruning. The store's total on-disk size is held near
 ///   `NANOBPMN_HISTORY_RETENTION_MB` (default: [`HISTORY_DISK_FRACTION_PCT`]% of
 ///   the data-dir filesystem capacity, or [`DEFAULT_HISTORY_MB`] MiB when the
-///   capacity can't be detected). Opt-in.
-/// - Otherwise: the legacy fixed cap via `NANOBPMN_HISTORY_MAX_INSTANCES`
-///   (unset/`0` = unbounded, the default; `>0` = cap the terminal set at that
-///   many instances).
+///   capacity can't be detected).
+/// - `NANOBPMN_HISTORY_RETENTION=off`/`none`/`disabled`: no pruning — full
+///   history retained, growing without bound (the pre-1.0 behaviour). Opt-in.
+/// - `NANOBPMN_HISTORY_MAX_INSTANCES=<n>` (`n > 0`): legacy fixed cap — retain at
+///   most `n` terminal instances (takes precedence over the adaptive default).
 fn retention_from_env() -> RetentionCfg {
-    match std::env::var("NANOBPMN_HISTORY_RETENTION")
-        .ok()
-        .as_deref()
-        .map(str::trim)
-    {
-        Some("adaptive") | Some("auto") | Some("dynamic") => {
-            let high = std::env::var("NANOBPMN_HISTORY_RETENTION_MB")
-                .ok()
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .filter(|n| *n > 0)
-                .map(|mb| mb * 1024 * 1024)
-                .unwrap_or_else(default_history_high_bytes);
-            RetentionCfg::Adaptive {
-                total_high_bytes: high,
-            }
-        }
-        _ => match history_max_instances_from_env() {
-            0 => RetentionCfg::Off,
+    resolve_retention(
+        std::env::var("NANOBPMN_HISTORY_RETENTION")
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        history_max_instances_from_env(),
+        adaptive_history_high_bytes_from_env(),
+    )
+}
+
+/// Pure policy selection for [`retention_from_env`] (extracted so the default and
+/// opt-out branches are unit-testable without mutating process env):
+/// - explicit `off`/`none`/`disabled`/`0` -> [`RetentionCfg::Off`] (unbounded);
+/// - explicit `adaptive`/`auto`/`dynamic` -> [`RetentionCfg::Adaptive`];
+/// - else a positive `max_instances` -> [`RetentionCfg::Fixed`];
+/// - else (unset / unrecognised, no fixed cap) -> the adaptive default.
+fn resolve_retention(
+    retention: Option<&str>,
+    max_instances: usize,
+    high_bytes: u64,
+) -> RetentionCfg {
+    match retention {
+        Some("off") | Some("none") | Some("disabled") | Some("0") => RetentionCfg::Off,
+        Some("adaptive") | Some("auto") | Some("dynamic") => RetentionCfg::Adaptive {
+            total_high_bytes: high_bytes,
+        },
+        // Unset (or any other value): honour the legacy fixed cap when explicitly
+        // set, otherwise fall through to the adaptive default so the read model is
+        // bounded without any configuration.
+        _ => match max_instances {
+            0 => RetentionCfg::Adaptive {
+                total_high_bytes: high_bytes,
+            },
             cap => RetentionCfg::Fixed(cap),
         },
     }
+}
+
+#[cfg(test)]
+mod retention_policy_tests {
+    use super::{RetentionCfg, resolve_retention};
+
+    const BUDGET: u64 = 4096;
+
+    #[test]
+    fn unset_defaults_to_adaptive() {
+        assert_eq!(
+            resolve_retention(None, 0, BUDGET),
+            RetentionCfg::Adaptive {
+                total_high_bytes: BUDGET
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_off_disables_pruning() {
+        for v in ["off", "none", "disabled", "0"] {
+            assert_eq!(resolve_retention(Some(v), 0, BUDGET), RetentionCfg::Off);
+        }
+    }
+
+    #[test]
+    fn explicit_adaptive_uses_budget() {
+        for v in ["adaptive", "auto", "dynamic"] {
+            assert_eq!(
+                resolve_retention(Some(v), 0, BUDGET),
+                RetentionCfg::Adaptive {
+                    total_high_bytes: BUDGET
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn positive_max_instances_takes_the_fixed_cap() {
+        // No retention var set, but a legacy fixed cap is configured.
+        assert_eq!(
+            resolve_retention(None, 500, BUDGET),
+            RetentionCfg::Fixed(500)
+        );
+    }
+
+    #[test]
+    fn explicit_off_beats_a_fixed_cap() {
+        assert_eq!(
+            resolve_retention(Some("off"), 500, BUDGET),
+            RetentionCfg::Off
+        );
+    }
+
+    #[test]
+    fn unrecognised_value_falls_through_to_the_default() {
+        assert_eq!(
+            resolve_retention(Some("bogus"), 0, BUDGET),
+            RetentionCfg::Adaptive {
+                total_high_bytes: BUDGET
+            }
+        );
+    }
+}
+
+/// The adaptive read-model retention byte budget: `NANOBPMN_HISTORY_RETENTION_MB`
+/// when set (`> 0`), else [`default_history_high_bytes`].
+fn adaptive_history_high_bytes_from_env() -> u64 {
+    std::env::var("NANOBPMN_HISTORY_RETENTION_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or_else(default_history_high_bytes)
 }
 
 /// The resolved exporter-queue backpressure policy (see
