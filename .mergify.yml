@@ -1,0 +1,74 @@
+# Mergify merge queue for `main`.
+#
+# Why Mergify instead of GitHub's native merge queue: native merge queue is
+# Enterprise-Cloud-only for private repos, so this Team-plan repo can't require
+# it. Mergify is a GitHub App that gives us the same "always-green main" queue
+# plus BATCHING — the CI-minutes lever native Team can't offer.
+#
+# Behaviour (mirrors the old native auto-merge-on-green, minus the O(n^2) rebase
+# churn): every non-draft PR to `main` is auto-queued once the required CI
+# checks pass, then squash-merged. The queue rebases each PR on the real,
+# up-to-date `main` and validates it there, so a stale PR is retested against
+# current `main` automatically — no branch-update commits.
+#
+# CI-minutes posture (deliberately frugal):
+#   * mode: serial + max_parallel_checks: 1  -> NO speculative parallel checks
+#     (speculative checks trade CI minutes for latency; we don't want that).
+#   * batch_size 1..5                          -> when PRs land together they're
+#     combined into ONE CI run; when traffic is light each batch is just 1 PR
+#     (low latency). This is the win over the old one-PR-at-a-time flow.
+#   * batch_max_wait_time 5 min                -> wait briefly to fill a batch.
+#
+# SETUP (out-of-band, cannot be done from the repo):
+#   1. Install the Mergify GitHub App on Magikcraft/nano-bpm:
+#        https://github.com/apps/mergify/installations/new
+#   2. Confirm the plan (free for open source / <=5 active contributors on
+#      private, then per-active-contributor). Dashboard: https://dashboard.mergify.com
+#   3. Keep `main` branch protection's required status checks as-is; keep
+#      "require branches up to date" (strict) OFF — the queue handles freshness.
+#   4. This PR removes .github/workflows/automerge.yml so native auto-merge and
+#      Mergify don't both try to merge. Merge this PR only AFTER the app is
+#      installed, for an atomic cutover.
+
+merge_queue:
+  # Serial + single check stream = fewest CI runs. Speculative parallel checks
+  # (max_parallel_checks > 1) would spend more CI to cut latency; we opt out.
+  mode: serial
+  max_parallel_checks: 1
+  # If a human merges something outside the queue, re-evaluate the queue.
+  reset_on_external_merge: always
+
+queue_rules:
+  - name: default
+    merge_method: squash
+    # Dynamic batching: 1 PR when the queue is light (fast), up to 5 combined
+    # into a single CI run when PRs pile up (cheap). Failures are auto-bisected.
+    batch_size:
+      min: 1
+      max: 5
+    batch_max_wait_time: 5 min
+
+# The gate. These are the same 7 required checks configured on `main` branch
+# protection. `processos (clippy + test)` is change-gated in ci.yml (skipped for
+# PRs that don't touch processos/engine-core/ci.yml), and a skipped check never
+# reports `success`, so it's accepted as either success OR skipped.
+merge_protections:
+  - name: required CI checks
+    description: All required CI jobs must be green (or skipped) before merge.
+    conditions:
+      - base=main
+    success_conditions:
+      - check-success=rustfmt (pinned nightly)
+      - check-success=engine-core (clippy + test)
+      - check-success=engine-wasm-ffi (dist + verify)
+      - check-success=server (clippy + test)
+      - check-success=@nanobpm/nano-bernd (build + test)
+      - check-success=io.github.jwulf:nano-bernd (JVM, Chicory)
+      - or:
+          - check-success=processos (clippy + test)
+          - check-skipped=processos (clippy + test)
+
+merge_protections_settings:
+  # Auto-queue every PR that satisfies the merge protections (i.e. all required
+  # checks green). Equivalent to the old "auto-merge every non-draft PR" flow.
+  auto_merge_conditions: true
