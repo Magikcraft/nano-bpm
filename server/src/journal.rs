@@ -944,25 +944,50 @@ impl Journal {
         }
     }
 
-    /// Like [`Journal::in_memory_from_events`] but rebuilds the engine from a
-    /// compact [`EngineSnapshot`](nanobpmn_engine_core::EngineSnapshot) instead of
-    /// replaying an event log — the state-based install path for a bounded Raft
-    /// state-machine snapshot.
-    pub fn in_memory_from_snapshot(snapshot: nanobpmn_engine_core::EngineSnapshot) -> Self {
-        Self {
-            engine: Engine::from_snapshot(snapshot),
-            partition_id: 0,
-            writer: None,
-            writer_thread: None,
-            seg: None,
-            exporter: None,
-            shared_exporter: None,
-            fresh: false,
-            spill: None,
-            cold: None,
-            varstore: None,
-            spill_check_skip: 0,
+    /// Adopt the engine state captured by a Raft snapshot **in place**, preserving
+    /// this journal's read-model exporter wiring, partition id, authoritative var
+    /// store and spill tiers.
+    ///
+    /// Used by the Raft install-snapshot ([`crate::raft`] `install_snapshot`) and
+    /// boot-restore (`restore_from_current_snapshot`) paths. A snapshot install
+    /// must NOT tear down the journal's exporter binding: an owned partition that
+    /// catches up via a snapshot install (e.g. a returning owner reclaiming its
+    /// partitions after a bounce) would otherwise silently stop projecting to the
+    /// read model, so its own completed instances would never be eviction-reaped
+    /// and would pile up unbounded in hot state. Owned partitions rely on the
+    /// exporter — not self-eviction (`evict_terminal`) — to shed terminal
+    /// instances, so dropping the exporter leaks the whole reclaimed backlog.
+    ///
+    /// The received snapshot is a full, self-contained
+    /// [`nanobpmn_engine_core::EngineSnapshot`] (control state + variables), so
+    /// the engine is fully resident afterward; the preserved var store / spill
+    /// tiers only participate in later spill write-through / rehydrate.
+    ///
+    /// The snapshot's `State` is cloned wholesale by [`Engine::snapshot`], so it
+    /// carries the source's resident **terminal** (Completed/Terminated) shells —
+    /// the exporter-lag / retirement backlog the leader held at build time. Those
+    /// instances are done and already durable in the read model at their source;
+    /// they never flow through THIS node's exporter (they arrived by snapshot, not
+    /// as replayed events), so nothing would ever evict them and they would pin
+    /// hot state on a reclaiming owner. Shed them here so the installed hot state
+    /// holds only in-flight instances — the same invariant the boot replay
+    /// establishes with its post-catch-up `evict_completed` sweep.
+    pub fn restore_engine_from_snapshot(&mut self, snapshot: nanobpmn_engine_core::EngineSnapshot) {
+        // Config the snapshot body does not carry, re-applied onto the new engine.
+        let lenient = self.engine.lenient_completion();
+        self.engine = Engine::from_snapshot(snapshot);
+        self.engine.set_lenient_completion(lenient);
+        // If lean-snapshot mode is wired, re-enable dirty-var tracking on the
+        // fresh engine and re-seed the dirty set so the next checkpoint rewrites
+        // the full resident variable state into the authoritative store
+        // (idempotent — mirrors `set_varstore`).
+        if self.varstore.is_some() {
+            self.engine.set_track_dirty_vars(true);
+            self.engine.mark_all_dirty();
         }
+        // Drop the snapshot's terminal shells: hot state keeps only in-flight work.
+        self.engine.evict_completed();
+        self.fresh = false;
     }
 
     /// Reads and deserializes every event from the journal log at `path` (an
@@ -1571,6 +1596,26 @@ impl Journal {
     /// once the read model is caught up). Mirrors [`Engine::evict_completed`].
     pub fn evict_completed(&mut self) -> usize {
         self.engine.evict_completed()
+    }
+
+    /// The owner-side low-water mark broadcast to this partition's follower
+    /// replicas. Passes through to [`Engine::retirement_low_water`].
+    pub fn retirement_low_water(&self) -> Key {
+        self.engine.retirement_low_water()
+    }
+
+    /// Follower-side reconciliation sweep: drops every resident replica instance
+    /// below the owner's `low_water` (and forgets their spilled rows), bounded to
+    /// `max_remove` per call. Mirrors [`Engine::retire_below`]; the loss-tolerant
+    /// convergence backstop for the best-effort per-key retirement digest.
+    pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> usize {
+        let reaped = self.engine.retire_below(low_water, max_remove);
+        if !reaped.is_empty()
+            && let Some(store) = self.spill_store()
+        {
+            store.forget(&reaped);
+        }
+        reaped.len()
     }
 
     /// Shrinks the hot-state map capacities to fit their live contents, returning
@@ -2537,6 +2582,75 @@ mod tests {
             journal.engine.resident_spillable_count(),
             1,
             "the hard-cap backstop sheds the backlog down to hard_cap"
+        );
+    }
+
+    #[test]
+    fn restore_engine_from_snapshot_preserves_exporter_and_evicts_completions() {
+        // Regression: a Raft snapshot install/restore must NOT drop the journal's
+        // read-model exporter wiring. An owned partition reclaiming via a snapshot
+        // install relies on the exporter (not self-eviction) to shed its completed
+        // instances; if the exporter is torn down the completed backlog piles up
+        // unbounded in hot state (the ~830k-per-partition leak on a returning
+        // owner). Prove the exporter survives the install and still sees events.
+
+        // A "received" snapshot from a peer: a deployed demo + one still-live
+        // instance AND one already-completed instance (the exporter-lag / terminal
+        // shell a leader carries at snapshot-build time — `Engine::snapshot` clones
+        // the whole state including terminal instances).
+        let (captured, completed_key) = {
+            let mut src = Journal::in_memory_partition(0);
+            let _ = src.apply_command(Command::DeployProcess(demo())).unwrap();
+            // Instance #1: drive it to Completed and leave it resident.
+            let (ev, _) = src.apply_command(Command::create_instance("demo")).unwrap();
+            let done_key = ev.iter().find_map(|e| e.instance_key()).unwrap();
+            let jobs = src.activate_jobs("demo-work", "w", 1, 1_000, 0);
+            let _ = src
+                .apply_command(Command::complete_job(jobs[0].key))
+                .unwrap();
+            assert!(matches!(
+                src.instance(done_key).map(|i| i.state),
+                Some(nanobpmn_engine_core::ProcessInstanceState::Completed)
+            ));
+            // Instance #2: parked on its job, still Active.
+            let _ = src.apply_command(Command::create_instance("demo")).unwrap();
+            (src.engine_snapshot(), done_key)
+        };
+
+        // The local owned journal: exporter wired at boot, then a snapshot lands.
+        let (tx, rx) = mpsc::channel::<ExportBatch>();
+        let mut journal = Journal::in_memory_partition(0);
+        journal.set_exporter(tx, Arc::new(AtomicU64::new(0)));
+
+        journal.restore_engine_from_snapshot(captured);
+
+        // The snapshot's terminal shell is shed (it never flows through this node's
+        // exporter, so it must not linger in hot state), while the live instance
+        // stays resident.
+        assert!(!journal.is_fresh());
+        assert_eq!(journal.state().processes.len(), 1);
+        assert!(
+            journal.instance(completed_key).is_none(),
+            "an installed snapshot's terminal instance must be evicted from hot state"
+        );
+        assert_eq!(
+            journal.state().instances.len(),
+            1,
+            "only the in-flight instance remains resident after the install"
+        );
+
+        // The exporter is still wired: a subsequent command's events flow to the
+        // read-model channel.
+        let (events, _) = journal
+            .apply_command(Command::create_instance("demo"))
+            .unwrap();
+        let key = events.iter().find_map(|e| e.instance_key()).unwrap();
+        let batch = rx
+            .try_recv()
+            .expect("exporter must still receive events after a snapshot install");
+        assert!(
+            batch.events.iter().any(|e| e.instance_key() == Some(key)),
+            "the created instance's events must reach the preserved exporter"
         );
     }
 }
