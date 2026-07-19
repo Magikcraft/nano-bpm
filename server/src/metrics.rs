@@ -327,6 +327,14 @@ struct Metrics {
     /// healthy write path. A single node-level gauge (no labels).
     tier1_pressure: prometheus::IntGauge,
 
+    /// ADR-0020 Tier-1 export-queue fill signal, `nanobpm_exporter_fill_permille`
+    /// (0–1000+): the *least-full* local read-model export shard's queue occupancy
+    /// as a per-mille of its adaptive budget — the create-admission input fused into
+    /// the Tier-1 guard (`for_create` steers each create to the least-full shard,
+    /// so the min governs). 0 = drained / export backpressure unconfigured; ≥1000 =
+    /// every shard at budget. A single node-level gauge (no labels).
+    exporter_fill_permille: prometheus::IntGauge,
+
     // ---- Per-command engine-actor profiling (NANOBPM_CMD_PROFILE) ----
     /// Wall time of a single applied [`Command`](nanobpmn_engine_core::Command)
     /// on the engine actor, labelled by `kind`. Its `_count`/`_sum` give the mean
@@ -845,7 +853,12 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
-    // Per-command actor profiling. Time buckets span 1µs .. ~16s (the multi-second
+    let exporter_fill_permille = prometheus::IntGauge::new(
+        "nanobpm_exporter_fill_permille",
+        "ADR-0020 Tier-1 export-queue fill in per-mille (0-1000+): the least-full local read-model export shard's queue occupancy as a fraction of its adaptive budget (the min governs because for_create steers to the least-full shard). 0 = drained / export backpressure unconfigured; >=1000 = every shard at budget.",
+    )
+    .expect("valid gauge");
+
     let cmd_seconds = prometheus::HistogramVec::new(
         HistogramOpts::new(
             "nanobpm_cmd_seconds",
@@ -939,6 +952,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(backlog_governor.clone())))
         .and(registry.register(Box::new(tier2_pressure.clone())))
         .and(registry.register(Box::new(tier1_pressure.clone())))
+        .and(registry.register(Box::new(exporter_fill_permille.clone())))
         .and(registry.register(Box::new(cmd_seconds.clone())))
         .and(registry.register(Box::new(cmd_alloc_bytes.clone())))
         .and(registry.register(Box::new(engine_cardinality.clone())))
@@ -1011,6 +1025,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         backlog_governor,
         tier2_pressure,
         tier1_pressure,
+        exporter_fill_permille,
         cmd_seconds,
         cmd_alloc_bytes,
         engine_cardinality,
@@ -1290,6 +1305,14 @@ pub fn set_tier2_pressure(proc: &str, permille: i64) {
 /// saturated. 0 = healthy.
 pub fn set_tier1_pressure(permille: i64) {
     METRICS.tier1_pressure.set(permille);
+}
+
+/// Publishes the ADR-0020 Tier-1 export-queue fill signal in per-mille
+/// (`nanobpm_exporter_fill_permille`) — the least-full local read-model export
+/// shard's queue occupancy as a fraction of its adaptive budget, fused into the
+/// Tier-1 guard. 0 = drained / export backpressure unconfigured.
+pub fn set_exporter_fill_permille(permille: i64) {
+    METRICS.exporter_fill_permille.set(permille);
 }
 
 /// Publishes the per-job-type worker-provisioning gauges: waiting jobs, live

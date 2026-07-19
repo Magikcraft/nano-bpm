@@ -1298,12 +1298,22 @@ impl ReadExporterCfg {
 
     /// Bounded queue depth (batches) for the per-shard HTTP transport before it
     /// backpressures the exporter thread.
+    ///
+    /// This channel is a THIN hand-off, NOT a buffer: each queued batch holds a
+    /// serialized chunk up to `MAX_BODY_BYTES` (4 MiB), and there is one channel
+    /// per owned shard, so a deep default (the old 1024) let the transport
+    /// silently accumulate GBs of undelivered payloads — invisible to
+    /// `exporter_queue_bytes` — inflating RSS into the memory watermark and
+    /// hard-clipping admission (bang-bang oscillation). The queue is sized to
+    /// just keep the `concurrency` in-flight POSTs fed; when it fills, `send`
+    /// blocks the exporter thread and backpressure is expressed through the
+    /// single, visible, adaptively-metered engine export queue instead.
     fn transport_capacity() -> usize {
         std::env::var("NANOBPMN_EXPORTER_QUEUE_DEPTH")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1024usize)
-            .max(1)
+            .unwrap_or_else(|| Self::transport_concurrency().saturating_mul(2))
+            .max(2)
     }
 
     /// Number of POSTs the per-shard HTTP transport keeps in flight at once
@@ -2609,9 +2619,12 @@ fn admission_max_create_queue_from_env() -> usize {
 /// memory limit. Higher than the spill high-water (65%): spill should engage
 /// first to offload resting variables to disk, and this last-resort create-shed
 /// only bites when live memory keeps climbing past that toward an OOM. Leaves
-/// ~20% headroom for non-jemalloc RSS (thread stacks, SQLite page cache, kernel
-/// socket buffers) before the OOM killer would engage.
-const MEM_WATERMARK_FRACTION_PCT: u64 = 80;
+/// ~15% headroom for non-jemalloc RSS (thread stacks, SQLite page cache, kernel
+/// socket buffers) before the OOM killer would engage. Raised 80→85 once the
+/// hidden export-transport buffer was bounded (see [`AppState::transport_capacity`])
+/// and the export queue got a graded Tier-1 shed (so RSS no longer over-shoots the
+/// watermark in a burst) — recovering ~5% of the box for sustained throughput.
+const MEM_WATERMARK_FRACTION_PCT: u64 = 85;
 /// Never auto-derive a watermark below this — on a tiny limit a sub-256 MiB
 /// ceiling would shed against the engine's own baseline working set.
 const MIN_MEM_WATERMARK_BYTES: u64 = 256 * 1024 * 1024;
@@ -3095,12 +3108,18 @@ enum ExporterQueueCfg {
 const DEFAULT_EXPORTER_QUEUE_MB: u64 = 512;
 /// Adaptive exporter-queue budget as a percentage of the detected memory limit.
 /// The queue is a transient buffer smoothing projection bursts, not durable
-/// state, so it takes a small slice of RAM well below the spill watermark.
-const EXPORTER_QUEUE_LIMIT_FRACTION_PCT: u64 = 6;
+/// state. Raised 6→30 alongside the 85% watermark and the graded Tier-1 export
+/// shed: giving the queue real headroom lets it absorb an ES/remote-drain stall
+/// smoothly (the Tier-1 knee paces intake *before* it fills) instead of the old
+/// tiny 6% queue slamming full and bang-banging the binary shed. Still well below
+/// the spill/OOM watermark, and per-shard-capped by
+/// [`MAX_EXPORTER_QUEUE_PER_SHARD_BYTES`].
+const EXPORTER_QUEUE_LIMIT_FRACTION_PCT: u64 = 30;
 /// Never auto-derive a per-shard exporter-queue budget above this. Caps the
 /// worst-case resident backlog on very large boxes so "adaptive" still means
-/// bounded, not "a couple of GB per shard".
-const MAX_EXPORTER_QUEUE_PER_SHARD_BYTES: u64 = 512 * 1024 * 1024;
+/// bounded. Raised 512 MiB→3 GiB to match the wider fraction above (on the 62 GiB
+/// soak boxes, 30% ≈ 18.6 GiB / ~4 shards ≈ 4.6 GiB/shard, clamped here to 3 GiB).
+const MAX_EXPORTER_QUEUE_PER_SHARD_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 /// Never auto-derive a per-shard budget below this — too small a queue sheds on
 /// every micro-burst and needlessly caps throughput.
 const MIN_EXPORTER_QUEUE_PER_SHARD_BYTES: u64 = 64 * 1024 * 1024;
@@ -11826,21 +11845,14 @@ impl ServerImpl {
                 ));
             }
         }
-        // Exporter-queue backpressure: shed once every local read-model shard's
-        // export queue is at budget, so the resident backlog of committed-but-
-        // unprojected events (each holding a full copy of its variables) stays
-        // bounded under a large-variable flood. `for_create` steers to a shard
-        // with headroom first, so this only fires when the whole node is
-        // saturated — never blocking the shared journal writer. A shed create is
-        // never journaled, so durability/at-least-once are intact.
-        if self.engine.exporter_all_saturated() {
-            crate::metrics::record_admission_shed("exporter");
-            return Some(
-                "Admission control: all read-model export queues are at capacity. \
-                 Retry after a backoff."
-                    .to_string(),
-            );
-        }
+        // Exporter-queue backpressure is now a graded Tier-1 input (the export
+        // queue's fill fraction feeds the same shared-write-path guard as the raft-
+        // fsync knee, shedding an even-spread fraction of creates as it saturates),
+        // so it is no longer a binary all-or-nothing rail here — that gate
+        // bang-banged the queue (full-admit until saturated, then full-shed until
+        // drained). `for_create` still steers each create to the least-full shard,
+        // and the coarse `mem_watermark` resident-memory rail below remains the
+        // last-resort OOM backstop. See `GlobalGuard::exporter_permille`.
         // In-flight create-payload gate: shed once the estimated payload bytes of
         // creates in the submit→apply window are at/above the watermark. This is
         // the precise, proactive memory rail — it bounds the engine `Low`-mailbox
@@ -11949,23 +11961,29 @@ impl ServerImpl {
     }
 
     /// ADR-0020 **Tier-1** global engine-saturation admission gate. Sheds a paced
-    /// fraction of *all* creates when the engine's shared write path (raft-log
-    /// fsync) is the bottleneck — the class that saturates every definition at
-    /// once, which per-definition Tier-2 cannot see. Actuates only in
-    /// [`SlaMode::Latency`] with the feature enabled (the monitor keeps the guard's
-    /// published pressure at zero otherwise). Cheap on the hot path: a single brief
-    /// mutex on the guard's published pressure; zero-pressure (the common case)
-    /// never sheds.
+    /// fraction of *all* creates when a shared write path is the bottleneck — the
+    /// class that saturates every definition at once, which per-definition Tier-2
+    /// cannot see. Two fused inputs (the guard publishes the *max*):
+    /// - **raft-log fsync latency** — actuates only in [`SlaMode::Latency`] with the
+    ///   feature enabled (the monitor feeds the guard `active=false` otherwise, which
+    ///   zeroes this term).
+    /// - **read-model export-queue fill** — a memory-protection rail that actuates in
+    ///   *all* SLA modes (an unbounded export backlog pins committed-but-unprojected
+    ///   variables in RAM regardless of the latency policy). It self-gates to zero
+    ///   when export backpressure is unconfigured.
+    ///
+    /// Because the export term must bite in admission mode too, this gate no longer
+    /// early-returns on the SLA mode — it trusts the guard's published pressure,
+    /// which the monitor keeps at zero when *neither* input is saturated. Cheap on
+    /// the hot path: a single brief mutex on the published pressure; zero-pressure
+    /// (the common case) never sheds.
     pub(crate) fn tier1_should_shed(&self) -> Option<String> {
-        if !self.sla_mode.get().sheds_for_latency() {
-            return None;
-        }
         if self.guard.should_shed() {
             crate::metrics::record_admission_shed("tier1_global");
             return Some(
-                "Admission control (ADR-0020 Tier-1): the engine's shared write path (raft-log \
-                 fsync) is saturated; intake is throttled to preserve end-to-end latency. Retry \
-                 after a backoff."
+                "Admission control (ADR-0020 Tier-1): a shared write path (raft-log fsync or the \
+                 read-model export queue) is saturated; intake is throttled to bound latency and \
+                 resident memory. Retry after a backoff."
                     .to_string(),
             );
         }
@@ -14540,10 +14558,23 @@ async fn main() {
                         // admission throttle (below) and only sheds past a wide
                         // hard-ceiling backstop — shedding the recovering owner's own
                         // creates on the soft knee buys no aggregate-latency benefit.
-                        let tier1_permille =
-                            monitor_server
-                                .guard
-                                .step(fsync_avg_us, tier1_active, recovering);
+                        // Second Tier-1 saturation input: the read-model export
+                        // queue's least-full-shard fill (per-mille of budget →
+                        // fraction; `for_create` steers creates to the least-full
+                        // shard, so the min governs create admission). Fused into the
+                        // same guard so a saturating export path sheds a *graded*
+                        // fraction of intake (replacing the old binary "all shards at
+                        // budget → shed every create" gate that bang-banged the queue).
+                        let exporter_fill_permille =
+                            monitor_server.engine.exporter_min_fill_permille();
+                        crate::metrics::set_exporter_fill_permille(exporter_fill_permille as i64);
+                        let exporter_fill = exporter_fill_permille as f64 / 1000.0;
+                        let tier1_permille = monitor_server.guard.step(
+                            fsync_avg_us,
+                            tier1_active,
+                            recovering,
+                            exporter_fill,
+                        );
                         crate::metrics::set_tier1_pressure(tier1_permille as i64);
                         let cap = recovery_throttle.observe(fsync_avg_us, recovering);
                         monitor_server
