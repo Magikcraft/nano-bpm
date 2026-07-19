@@ -1017,6 +1017,19 @@ pub struct Tier1Config {
     /// mode and the fsync `enabled` switch — it is memory protection. `1.0` reverts
     /// to the near-binary "only shed when fully over budget" behaviour; the exporter
     /// term is inert whenever export-queue backpressure is unconfigured (fill = 0).
+    ///
+    /// Default `0.5` (was `0.8`). Under a hard downstream-drain bottleneck (e.g. an
+    /// ES that can only absorb a fraction of the offered create rate) the queue
+    /// settles at a high steady-state fill — the proportional controller balances
+    /// where shed ≈ overload fraction, so an 80%-shed regime parks fill near
+    /// `knee + 0.8·(1−knee)`. With a narrow band (knee 0.8 → fill parks ~0.96) the
+    /// small drain bursts of a batching exporter whip the shed across the *entire*
+    /// 0→1000 range and, worse, any dip *below* the knee snaps pressure to 0 → a
+    /// full-admit burst that re-saturates the queue (a residual limit cycle seen on
+    /// the 50 KB ES soak). Widening the band (knee 0.5) keeps pressure strictly
+    /// positive while the queue is still 70 %+ full, so it modulates smoothly around
+    /// the operating point instead of bang-banging — while still shedding nothing
+    /// when the queue drains below half (ES keeping up).
     pub exporter_knee: f64,
 }
 
@@ -1033,7 +1046,7 @@ impl Default for Tier1Config {
             baseline_floor_us: 500.0,
             recovery_relax: true,
             recovery_ratio: 4.0,
-            exporter_knee: 0.8,
+            exporter_knee: 0.5,
         }
     }
 }
