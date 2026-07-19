@@ -149,6 +149,13 @@ column is the early warning for the ENOSPC crash class.
 `deploy.sh` (preflight) and `soak.sh` (watchdog) so a run can never silently fill
 a disk and crash a node with ENOSPC. See RUNBOOK.md → *Disk sizing*.
 
+### `disk-attribution.sh` — raft-log vs read-model write split
+`sample [INTERVAL_S=10]` / `watch [INTERVAL_S=10] [ITERS=30]`. Per node, splits
+disk writes into device gross (MB/s + IOPS), process gross, and per-store net
+growth (`raft` / `rm` / `var` / `spill` / `jrnl`) so you can prove whether a soak
+is raft-log-bound or read-model-bound. See RUNBOOK.md → *Disk Attribution Probe*
+and *Remote read-model exporter*.
+
 ### `backlog-recovery.sh` — backlog injection → recovery self-heal scenario
 Proves the cluster self-heals from a large standing backlog: INJECT (no workers)
 → SETTLE → RECOVER (workers only) → NORMAL. Emits `VERDICT: PASS/FAIL`.
