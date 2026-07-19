@@ -21,10 +21,63 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use nanobpmn_engine_core::{Event, Key};
 
 use crate::readstore::{ExportOutcome, ProjectionSink, ReadStore};
+
+/// Max serialized size (bytes) of a single outbound export POST body. A drained
+/// batch is split into as many order-preserving JSON-array chunks as needed to
+/// keep each POST under this budget, so a large batch is delivered as several
+/// POSTs rather than rejected by the exporter as `413 Payload Too Large` (which
+/// used to poison the pipeline). Kept well under the exporter's request body
+/// limit (see `nano-exporter`'s `DefaultBodyLimit`). Overridable via
+/// `NANOBPMN_EXPORTER_MAX_BODY_BYTES` (default 4 MiB).
+fn max_body_bytes() -> usize {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("NANOBPMN_EXPORTER_MAX_BODY_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(4 * 1024 * 1024)
+    })
+}
+
+/// Serializes a log-ordered event slice into one or more order-preserving JSON
+/// arrays, each with a serialized size at or under `budget` bytes. A single
+/// event larger than `budget` is emitted alone (it cannot be split further — the
+/// exporter body limit must accommodate the largest single event). The
+/// concatenation of the chunks' element sequences equals the input order, so
+/// per-shard delivery order is preserved.
+fn serialize_chunks(events: &[&Event], budget: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+    let mut chunks = Vec::new();
+    let mut cur: Vec<u8> = Vec::new();
+    let mut count = 0usize;
+    for &event in events {
+        let enc = serde_json::to_vec(event)?;
+        // Bytes added to the in-progress array by appending this element:
+        // a separating comma when not the first element, plus the element.
+        let add = enc.len() + usize::from(count > 0);
+        // Close and flush the current chunk when the next element would push it
+        // (including the closing `]`) over budget. Never flush an empty chunk —
+        // an oversized single event still goes out on its own.
+        if count > 0 && cur.len() + add + 1 > budget {
+            cur.push(b']');
+            chunks.push(std::mem::take(&mut cur));
+            count = 0;
+        }
+        cur.push(if count == 0 { b'[' } else { b',' });
+        cur.extend_from_slice(&enc);
+        count += 1;
+    }
+    if count > 0 {
+        cur.push(b']');
+        chunks.push(cur);
+    }
+    Ok(chunks)
+}
 
 /// Ephemeral, in-RAM index of a shard's currently-Active instance keys.
 ///
@@ -182,6 +235,27 @@ impl HttpBatchTransport {
                                 .await;
                             match res {
                                 Ok(r) if r.status().is_success() => break,
+                                Ok(r) if r.status().is_client_error() => {
+                                    // A 4xx (e.g. 413 Payload Too Large, 400 Bad
+                                    // Request) is PERMANENT for this exact body:
+                                    // retrying the identical bytes can never
+                                    // succeed and would head-of-line-block every
+                                    // batch behind it, freezing the whole export
+                                    // pipeline (the M2 wedge). Drop it (loud),
+                                    // count it, and move on — remote delivery is
+                                    // best-effort (the compaction watermark
+                                    // already advanced on enqueue), so a poison
+                                    // batch must not wedge the node.
+                                    tracing::error!(
+                                        "remote exporter: partition {} POST -> {} \
+                                         (permanent; dropping {}-byte batch)",
+                                        batch.partition,
+                                        r.status(),
+                                        batch.payload.len()
+                                    );
+                                    crate::metrics::record_read_model_export_drop();
+                                    break;
+                                }
                                 Ok(r) => tracing::warn!(
                                     "remote exporter: partition {} POST -> {}",
                                     batch.partition,
@@ -261,11 +335,12 @@ impl ProjectionSink for RemoteSink {
         // in-flight gauge, and must be exact and synchronous regardless of the
         // remote target's state.
         let outcome = self.index.apply(events);
-        // Serialize as a JSON array of events (`&[&Event]` serializes as an
-        // array of the referenced events) and hand to the transport. The
-        // transport owns delivery ordering and backpressure.
-        let payload = serde_json::to_vec(&events)?;
-        self.transport.send(self.partition, payload);
+        // Serialize as one or more JSON arrays, each under the body budget, so a
+        // large drained batch is split across several POSTs instead of being
+        // rejected `413 Payload Too Large`. Order is preserved across chunks.
+        for chunk in serialize_chunks(events, max_body_bytes())? {
+            self.transport.send(self.partition, chunk);
+        }
         // Advance the compaction watermark by the batch's event count so the
         // journal can still compact past a handed-off prefix. Cheap integer
         // write — the payload never touches this shard.
@@ -311,8 +386,12 @@ impl ProjectionSink for TeeSink {
         // never-drop-a-batch invariant holds for the canonical read model. Only
         // mirror to the remote once the local projection succeeded.
         let outcome = self.local.export(events)?;
-        match serde_json::to_vec(&events) {
-            Ok(payload) => self.transport.send(self.partition, payload),
+        match serialize_chunks(events, max_body_bytes()) {
+            Ok(chunks) => {
+                for chunk in chunks {
+                    self.transport.send(self.partition, chunk);
+                }
+            }
             Err(e) => {
                 crate::metrics::record_read_model_export_retry();
                 tracing::warn!("tee: remote mirror serialization failed (local unaffected): {e}");
@@ -445,5 +524,65 @@ mod tests {
         assert_eq!(local.exported_position(), 1);
         // Batch mirrored to the transport exactly once.
         assert_eq!(transport.dropped(), 1);
+    }
+
+    #[test]
+    fn serialize_chunks_single_when_under_budget() {
+        let evs = [created(1), created(2), completed(1)];
+        let refs: Vec<&Event> = evs.iter().collect();
+        let chunks = serialize_chunks(&refs, 4 * 1024 * 1024).unwrap();
+        assert_eq!(chunks.len(), 1);
+        // Round-trips as a JSON array of exactly the input events, in order.
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&chunks[0]).unwrap();
+        assert_eq!(parsed.len(), 3);
+    }
+
+    #[test]
+    fn serialize_chunks_splits_over_budget_preserving_order() {
+        // Ten events; a tiny budget forces multiple chunks. Every chunk must be
+        // a valid JSON array, none may exceed the budget (except a lone oversized
+        // event), and concatenating the chunks' elements must equal the input.
+        let evs: Vec<Event> = (0..10).map(|k| created(k as Key)).collect();
+        let refs: Vec<&Event> = evs.iter().collect();
+        let one = serde_json::to_vec(refs[0]).unwrap().len();
+        let budget = one * 3; // ~a couple events per chunk
+        let chunks = serialize_chunks(&refs, budget).unwrap();
+        assert!(chunks.len() > 1, "expected the batch to split");
+        let mut total = 0usize;
+        for chunk in &chunks {
+            let parsed: Vec<serde_json::Value> = serde_json::from_slice(chunk).unwrap();
+            assert!(!parsed.is_empty());
+            total += parsed.len();
+            // A multi-element chunk must respect the budget.
+            if parsed.len() > 1 {
+                assert!(
+                    chunk.len() <= budget,
+                    "chunk {} exceeded budget",
+                    chunk.len()
+                );
+            }
+        }
+        assert_eq!(
+            total, 10,
+            "no event may be lost or duplicated across chunks"
+        );
+    }
+
+    #[test]
+    fn serialize_chunks_emits_oversized_single_event_alone() {
+        // A single event larger than the budget cannot be split: it must still
+        // be emitted (on its own) rather than dropped or looped forever.
+        let evs = [created(1)];
+        let refs: Vec<&Event> = evs.iter().collect();
+        let chunks = serialize_chunks(&refs, 1).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&chunks[0]).unwrap();
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[test]
+    fn serialize_chunks_empty_is_no_chunks() {
+        let chunks = serialize_chunks(&[], 4096).unwrap();
+        assert!(chunks.is_empty());
     }
 }
