@@ -13,6 +13,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Required checks must run on the merge queue's temporary batch branches for
+  # the queue to gate on them. The queue builds `main` + the earlier-queued PRs
+  # + this PR and validates the combined result, so a stale PR is retested
+  # against current main automatically — no branch-update commits, no O(n^2)
+  # rebase churn.
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -40,6 +46,10 @@ jobs:
       - uses: dorny/paths-filter@v3
         id: filter
         with:
+          # On a merge_group event the checkout HEAD is the batch branch; diff it
+          # against the SHA the group was based on so detection reflects the
+          # combined batch. push/PR events auto-detect their base (empty string).
+          base: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || '' }}
           filters: |
             processos:
               - 'processos/**'
@@ -199,7 +209,12 @@ jobs:
     # dep tree (DuckDB/arrow), so skipping it on unrelated PRs — docs, scripts,
     # other crates — remains a worthwhile CI-minute saver.
     needs: changes
-    if: ${{ needs.changes.outputs.processos == 'true' }}
+    # In the merge queue, ALWAYS run (a batch may combine PRs touching processos
+    # even when change-detection's per-event base misses it): a skipped required
+    # check counts as passing, which must never hide an unvalidated change at the
+    # final gate. PR/push runs keep the change-detection minute-saving, which is
+    # where the bulk of runs happen.
+    if: ${{ github.event_name == 'merge_group' || needs.changes.outputs.processos == 'true' }}
     env:
       SCCACHE_GHA_ENABLED: 'true'
       RUSTC_WRAPPER: 'sccache'
