@@ -390,6 +390,73 @@ This is acceptable for the throughput experiment; ack-gated delivery is M3 in
 #133. Use `tee` mode (local SQLite authoritative **and** mirror to ES) if you
 need the read model to survive locally during the run.
 
+### 4. Isolating the node ceiling — blackhole the downstream
+
+The A/B above only shows the *exporter-bound* rate if ES can't keep up. To find
+the **true node (raft/engine) ceiling** — i.e. how fast the nodes go once the
+read model is fully off-node and the downstream is free — remove the ES
+bottleneck entirely instead of scaling ES. Two levers, cheapest first:
+
+**(a) Lean ES "sink" template** (cut per-doc ES cost ~2×; keep if you still want
+real indexing). The default dynamic mapping full-text-analyzes the 50 KB
+payloads — pure waste for a throughput sink:
+
+```bash
+ES=http://<nano-exporter-0 ip>:9200
+curl -s -XPUT "$ES/_index_template/nano-events" -H 'content-type: application/json' -d '{
+  "index_patterns":["nano-events*"],"priority":500,
+  "template":{"settings":{"number_of_shards":6,"number_of_replicas":0,
+    "refresh_interval":"60s","translog.durability":"async",
+    "translog.sync_interval":"30s","translog.flush_threshold_size":"2gb"},
+    "mappings":{"enabled":false}}}'
+curl -s -XDELETE "$ES/nano-events"; curl -s -XPUT "$ES/nano-events"   # recreate under template
+```
+
+Even with this, a single c2-standard-8 ES stays disk-IOPS-bound (~8 write threads
+pinned, ~16% CPU) and only reaches ~2/3 of a 9k/s offer.
+
+**(b) Blackhole downstream (`StdoutTarget`)** — the definitive isolator. Relaunch
+`nano-exporter` with **no** `NANO_EXPORTER_ES_URL` (→ `StdoutTarget`, parse +
+discard) and `RUST_LOG=warn` (suppresses the per-batch log so it's a true sink):
+
+```bash
+# on nano-exporter-0 (see ~/run-exporter-blackhole.sh):
+pkill -f nano-exporter; sleep 1
+RUST_LOG=warn NANO_EXPORTER_BIND=0.0.0.0:9700 nohup ~/nano-exporter >~/nano-exporter.log 2>&1 &
+curl -s localhost:9700/health   # ok ; POST /ingest -> 204
+# verify blackhole: ES nano-events _count stays FLAT during the run.
+```
+
+Then push the offered rate with the `RATE` knob (per node) to find where admitted
+plateaus:
+
+```bash
+RATE=6000 DUR=240 ~/soak-exporter.sh   # 18k/s offered
+RATE=9000 DUR=180 ~/soak-exporter.sh   # 27k/s offered
+```
+
+**Measured result (3× c2-standard-8, RF3/12-part, 50 KB, binsha 167bc91a):**
+
+| Offered | Admitted (agg) | shed_total | raft fsync | note |
+|---|---|---|---|---|
+| 9k/s  | ~9.1k (100%) | 0 | ~1.7 ms | nodes keep up |
+| 18k/s | ~11.8k (66%) | 0 | ~3.4 ms | plateau |
+| 27k/s | ~11.4k (42%) | 0 | ~3.3 ms | same plateau |
+
+- **Node ceiling ≈ 11.5k creates/s aggregate (~3.8k/node)** — identical at 18k and
+  27k offered, so it's the node, not the loadgen (loadbox load ~5/16).
+- **The wall is the raft-log fsync / single-writer write path**, not ES and not the
+  Tier-1 shredder: `shed_total=0` at every rate (pure flow-control back-pressure),
+  while fsync latency **doubles ~1.7→3.4 ms** past ~9k/s and parks at the adaptive
+  Tier-1 knee.
+- **The remote exporter is worth ~2.6×**: ES-bound ~4.5k/s → raft-bound ~11.5k/s,
+  purely by removing the read-model's disk contention.
+- **RSS** rises to ~30–34 GB under sustained load (retained 50 KB working set) and
+  **reclaims to ~9 GB when idle** — throughput-proportional working set, not a leak.
+
+To restore real ES indexing afterwards: `~/run-exporter.sh` (sets
+`NANO_EXPORTER_ES_URL=http://localhost:9200`).
+
 ---
 
 ## Metric glossary (gotchas)
