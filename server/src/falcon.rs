@@ -3315,8 +3315,9 @@ mod asyncapi_spec_guard {
 
 #[cfg(test)]
 mod msgpack_frame {
-    use super::ClientFrame;
     use serde_json::{Map, Value};
+
+    use super::ClientFrame;
 
     /// A client may send the identical `ClientFrame` envelope msgpack-encoded on
     /// the binary channel. Encoding named maps (`to_vec_named`, the client
