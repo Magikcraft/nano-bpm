@@ -701,16 +701,20 @@ async fn gateway_proxy(
 /// A point-in-time metrics snapshot for the dashboard. Counters are monotonic;
 /// the frontend derives throughput **rates** from the deltas of two successive
 /// polls (so this endpoint stays a cheap, stateless reading). `activeInstances`
-/// is read on demand from the read model only when this endpoint is polled — it
-/// is deliberately NOT an always-on `COUNT` in the engine tick loop, so opening
-/// the dashboard never perturbs a running performance demo.
+/// is the engine's live active-instance count (`created − completed`, the
+/// `nanobpm_active_backlog` gauge) — the same source the cluster view uses for
+/// remote nodes. It is deliberately NOT a read-model `COUNT`, so the number stays
+/// truthful even when the read-model exporter is remote/blackholed (its projection
+/// shipped off-box) and never perturbs a running performance demo.
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct MetricsDto {
     /// Server clock at snapshot time (ms). The frontend uses successive
     /// timestamps as the exact dt for rate computation.
     timestamp_ms: u64,
-    /// Active (non-terminal) process instances in this node's read model.
+    /// Live active (non-terminal) process instances on this node, taken from the
+    /// engine's `created − completed` backlog — not the read model, so it stays
+    /// accurate when the read-model exporter is remote/blackholed.
     active_instances: i64,
 
     // Throughput counters (monotonic, split by protocol).
@@ -907,7 +911,7 @@ fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
 
     MetricsDto {
         timestamp_ms,
-        active_instances: server.store.active_instance_count() as i64,
+        active_instances: s.active_backlog,
 
         creates_rest: s.creates_rest,
         creates_stream: s.creates_stream,
