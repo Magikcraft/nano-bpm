@@ -3107,19 +3107,26 @@ enum ExporterQueueCfg {
 /// mode is selected but the memory limit can't be detected (non-Linux dev box).
 const DEFAULT_EXPORTER_QUEUE_MB: u64 = 512;
 /// Adaptive exporter-queue budget as a percentage of the detected memory limit.
-/// The queue is a transient buffer smoothing projection bursts, not durable
-/// state. Raised 6→30 alongside the 85% watermark and the graded Tier-1 export
-/// shed: giving the queue real headroom lets it absorb an ES/remote-drain stall
-/// smoothly (the Tier-1 knee paces intake *before* it fills) instead of the old
-/// tiny 6% queue slamming full and bang-banging the binary shed. Still well below
-/// the spill/OOM watermark, and per-shard-capped by
-/// [`MAX_EXPORTER_QUEUE_PER_SHARD_BYTES`].
-const EXPORTER_QUEUE_LIMIT_FRACTION_PCT: u64 = 30;
+/// The queue is a transient buffer smoothing projection/ES-drain bursts, not
+/// durable state, so it only needs to absorb a few seconds of downstream-drain
+/// jitter (ES ≈ 125 MB/s ⇒ ~1 GB buffers ~8 s). It was briefly raised to 30 %
+/// (~13 GB) chasing "headroom", but that turned the queue into a huge slow
+/// integrator: under a sustained drain bottleneck it stores ~100 s of overload
+/// and forces a slow (~60–130 s) fill/drain *relaxation oscillation* in the
+/// proportional export shed. Sized back to 12 % (≈4 GB total on the 62 GiB soak
+/// boxes) so the integrator — and therefore the swing amplitude/period and the
+/// resident RAM — is small; the graded Tier-1 export shed (see
+/// `Tier1Config::exporter_knee`) paces intake proportionally at any queue size,
+/// so a big buffer is not needed to avoid the old binary cliff. Still per-shard
+/// capped by [`MAX_EXPORTER_QUEUE_PER_SHARD_BYTES`] and well below the spill/OOM
+/// watermark.
+const EXPORTER_QUEUE_LIMIT_FRACTION_PCT: u64 = 12;
 /// Never auto-derive a per-shard exporter-queue budget above this. Caps the
 /// worst-case resident backlog on very large boxes so "adaptive" still means
-/// bounded. Raised 512 MiB→3 GiB to match the wider fraction above (on the 62 GiB
-/// soak boxes, 30% ≈ 18.6 GiB / ~4 shards ≈ 4.6 GiB/shard, clamped here to 3 GiB).
-const MAX_EXPORTER_QUEUE_PER_SHARD_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+/// bounded. 1 GiB/shard: enough to smooth seconds of ES-drain jitter, small
+/// enough that the proportional export shed settles quickly (a 3 GiB/shard queue
+/// was a slow integrator that drove the residual relaxation oscillation).
+const MAX_EXPORTER_QUEUE_PER_SHARD_BYTES: u64 = 1024 * 1024 * 1024;
 /// Never auto-derive a per-shard budget below this — too small a queue sheds on
 /// every micro-burst and needlessly caps throughput.
 const MIN_EXPORTER_QUEUE_PER_SHARD_BYTES: u64 = 64 * 1024 * 1024;
