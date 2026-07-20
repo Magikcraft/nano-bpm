@@ -1594,20 +1594,30 @@ impl Batcher {
                         Err(_) => break,
                     }
                 }
-                let items: Vec<ReplicatedCommand> = subs.iter().map(|s| s.item.clone()).collect();
-                let n = items.len();
+                // Move each command into the batch (no per-command payload clone —
+                // a 50 KB-variable `CreateInstance` is expensive to deep-clone) and
+                // keep the response one-shots aside, paired by position, to fulfil
+                // once the entry commits and applies.
+                let n = subs.len();
+                let mut items: Vec<ReplicatedCommand> = Vec::with_capacity(n);
+                let mut resps: Vec<tokio::sync::oneshot::Sender<anyhow::Result<ReplicatedItem>>> =
+                    Vec::with_capacity(n);
+                for s in subs {
+                    items.push(s.item);
+                    resps.push(s.resp);
+                }
                 match raft.client_write(ReplicatedBatch::new(items)).await {
                     Ok(res) => {
                         let mut out = res.data.items;
                         if out.len() == n {
-                            for (s, item) in subs.into_iter().zip(out.drain(..)) {
-                                let _ = s.resp.send(Ok(item));
+                            for (resp, item) in resps.into_iter().zip(out.drain(..)) {
+                                let _ = resp.send(Ok(item));
                             }
                         } else {
                             // apply returns exactly one item per command; an arity
                             // mismatch is a bug, surface it rather than mis-pair.
-                            for s in subs {
-                                let _ = s.resp.send(Err(anyhow::anyhow!(
+                            for resp in resps {
+                                let _ = resp.send(Err(anyhow::anyhow!(
                                     "raft batch response arity mismatch ({} != {n})",
                                     out.len()
                                 )));
@@ -1616,8 +1626,8 @@ impl Batcher {
                     }
                     Err(e) => {
                         let msg = e.to_string();
-                        for s in subs {
-                            let _ = s.resp.send(Err(anyhow::anyhow!("{msg}")));
+                        for resp in resps {
+                            let _ = resp.send(Err(anyhow::anyhow!("{msg}")));
                         }
                     }
                 }
