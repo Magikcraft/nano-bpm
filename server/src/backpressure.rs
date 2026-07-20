@@ -1018,18 +1018,21 @@ pub struct Tier1Config {
     /// to the near-binary "only shed when fully over budget" behaviour; the exporter
     /// term is inert whenever export-queue backpressure is unconfigured (fill = 0).
     ///
-    /// Default `0.5` (was `0.8`). Under a hard downstream-drain bottleneck (e.g. an
-    /// ES that can only absorb a fraction of the offered create rate) the queue
-    /// settles at a high steady-state fill — the proportional controller balances
-    /// where shed ≈ overload fraction, so an 80%-shed regime parks fill near
-    /// `knee + 0.8·(1−knee)`. With a narrow band (knee 0.8 → fill parks ~0.96) the
-    /// small drain bursts of a batching exporter whip the shed across the *entire*
-    /// 0→1000 range and, worse, any dip *below* the knee snaps pressure to 0 → a
-    /// full-admit burst that re-saturates the queue (a residual limit cycle seen on
-    /// the 50 KB ES soak). Widening the band (knee 0.5) keeps pressure strictly
-    /// positive while the queue is still 70 %+ full, so it modulates smoothly around
-    /// the operating point instead of bang-banging — while still shedding nothing
-    /// when the queue drains below half (ES keeping up).
+    /// Default `0.3` (was `0.5`, orig `0.8`). Two coupled control-loop fixes make
+    /// the export shed *smooth* under a hard downstream (ES) drain bottleneck: this
+    /// knee, and a right-sized export queue (see `EXPORTER_QUEUE_LIMIT_FRACTION_PCT`).
+    /// The exporter term is a *proportional* controller on queue fill — its gain is
+    /// `1000/(1−knee)` per-mille per unit-fill, so a *lower* knee is *lower* gain
+    /// (0.3 → 1429; 0.5 → 2000; 0.8 → 5000) and a wider proportional band, both of
+    /// which damp the loop. A low knee also shrinks the empty-queue "honeymoon" (the
+    /// full-admit window before fill first reaches the knee) that otherwise
+    /// overshoots and forces a deep corrective shed. It keeps a small dead-band
+    /// (zero shed below 30 % fill) so a queue that is comfortably draining never
+    /// sheds. `1.0` reverts to the near-binary "only shed when fully over budget"
+    /// behaviour; the exporter term is inert whenever export-queue backpressure is
+    /// unconfigured (fill = 0). A soak of knee 0.5 with a 13 GB queue still showed a
+    /// slow (~60–130 s) relaxation oscillation (admit cycling ~800↔5300/bucket);
+    /// knee 0.3 + a ~4 GB queue removes the big slow integrator and the honeymoon.
     pub exporter_knee: f64,
 }
 
@@ -1046,7 +1049,7 @@ impl Default for Tier1Config {
             baseline_floor_us: 500.0,
             recovery_relax: true,
             recovery_ratio: 4.0,
-            exporter_knee: 0.5,
+            exporter_knee: 0.3,
         }
     }
 }
