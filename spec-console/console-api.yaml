@@ -1067,6 +1067,9 @@ components:
         - residentBytes
         - ceilingThroughput
         - ceilingMemory
+        - ceilingExporter
+        - ceilingFlowControl
+        - exporterFillPermille
         - pendingCreateQueue
         - activeBacklog
         - admissionBacklogLimit
@@ -1096,6 +1099,9 @@ components:
         residentBytes: { type: integer, format: int64, nullable: true }
         ceilingThroughput: { type: boolean }
         ceilingMemory: { type: boolean }
+        ceilingExporter: { type: boolean }
+        ceilingFlowControl: { type: boolean }
+        exporterFillPermille: { type: integer, format: int64 }
         pendingCreateQueue: { type: integer, format: int64 }
         activeBacklog: { type: integer, format: int64 }
         admissionBacklogLimit: { type: integer, format: int64 }

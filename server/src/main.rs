@@ -11999,7 +11999,7 @@ impl ServerImpl {
 
     /// The capacity ceilings this node is currently pressed against — the
     /// compressor/limiter LEDs of ADR 0013, surfaced as Prometheus gauges by the
-    /// monitor tick. Returns `(throughput, memory)`:
+    /// monitor tick. Returns `(throughput, memory, exporter, flow_control)`:
     /// - **throughput** — create-processing concurrency at/above the AIMD limit,
     ///   or the active-backlog latency gate at/above its limit. Reported in
     ///   *both* SLA modes: the ceiling is equally real whether the mode clips
@@ -12009,11 +12009,22 @@ impl ServerImpl {
     ///   limit (create-queue depth, exporter saturation, in-flight pipeline
     ///   bytes, resident-memory watermark) — the same rails
     ///   [`admission_shed`](Self::admission_shed) enforces.
+    /// - **exporter** — the read-model export queue has crossed the Tier-1 knee,
+    ///   so the [`GlobalGuard`](crate::backpressure::GlobalGuard) is shedding a
+    ///   *graded* fraction of create intake to bound the export backlog: export
+    ///   lag is compressing throughput. Distinct from the **memory** rail, which
+    ///   only trips at the hard all-shards-at-budget backstop.
+    /// - **flow_control** — producer create-submission is being back-pressured
+    ///   *right now* at the Falcon/REST admission edge: either the
+    ///   completion-paced credit servo is metering grants, or a hard admission
+    ///   block (create-latency pressure or the drain-stall valve) is withholding
+    ///   credit entirely, so the consumer/producer clients' submission windows
+    ///   are draining.
     ///
     /// Cheap: relaxed atomic loads plus the same cheap partition sums the
     /// admission gate already uses; no engine round-trip. Called from the ~1 Hz
     /// monitor tick, never the hot path.
-    pub(crate) fn ceiling_state(&self) -> (bool, bool) {
+    pub(crate) fn ceiling_state(&self) -> (bool, bool, bool, bool) {
         let processing = self.processing.load(Ordering::Relaxed);
         let mut throughput = self.backpressure.should_shed(processing);
         let backlog_limit = self.backlog_cap.load(Ordering::Relaxed);
@@ -12039,7 +12050,22 @@ impl ServerImpl {
         if !memory && self.mem_watermark_bytes > 0 {
             memory = self.mem_pressure_bytes.load(Ordering::Relaxed) >= self.mem_watermark_bytes;
         }
-        (throughput, memory)
+
+        // Exporter-lag ceiling: the export queue's least-full shard has crossed
+        // the Tier-1 knee, so the guard is shedding a graded fraction of intake to
+        // hold the export backlog — export lag is compressing throughput. Uses the
+        // same fill signal and knee the guard actuates on, so the LED and the shed
+        // are always consistent.
+        let exporter_fill = self.engine.exporter_min_fill_permille() as f64 / 1000.0;
+        let exporter = self.guard.exporter_shed_permille(exporter_fill) > 0;
+
+        // Falcon/REST flow-control ceiling: create-submission credit is being
+        // back-pressured to the producers right now — the completion-paced servo
+        // is metering grants, or a hard admission block (create-latency pressure /
+        // drain-stall valve) is withholding credit entirely.
+        let flow_control = self.drain_guard().is_metering() || self.create_admission_blocked();
+
+        (throughput, memory, exporter, flow_control)
     }
 
     /// Graded **create-acceptance headroom** occupancy in `[0, CREATE_OCCUPANCY_SCALE]`
@@ -14235,6 +14261,8 @@ async fn main() {
             // reset to 0 instead of leaving a stale non-zero series.
             let mut throughput_lit = false;
             let mut memory_lit = false;
+            let mut exporter_lit = false;
+            let mut flow_control_lit = false;
             let mut seen_job_types: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             // Compressor state for the backlog governor. ρ (engine-actor saturation)
@@ -14314,11 +14342,15 @@ async fn main() {
             loop {
                 interval.tick().await;
 
-                let (throughput, memory) = monitor_server.ceiling_state();
+                let (throughput, memory, exporter, flow_control) = monitor_server.ceiling_state();
                 crate::metrics::set_ceiling_active("throughput", throughput, throughput_lit);
                 crate::metrics::set_ceiling_active("memory", memory, memory_lit);
+                crate::metrics::set_ceiling_active("exporter", exporter, exporter_lit);
+                crate::metrics::set_ceiling_active("flow_control", flow_control, flow_control_lit);
                 throughput_lit = throughput;
                 memory_lit = memory;
+                exporter_lit = exporter;
+                flow_control_lit = flow_control;
 
                 // Publish the raw input signals + configured thresholds behind the
                 // ceiling LED, so a dashboard can see pressure climb toward each shed

@@ -1270,6 +1270,15 @@ impl GlobalGuard {
         (((fill - knee) / span).clamp(0.0, 1.0) * 1000.0).round() as u32
     }
 
+    /// The graded export-queue shed fraction (per-mille) this guard *would* apply
+    /// for a given export-queue fill fraction — `0` below the knee, ramping to
+    /// `1000` at/above budget (see [`exporter_permille`](Self::exporter_permille)).
+    /// Read by the capacity-ceiling LED so the "exporter" meter lights exactly when
+    /// export lag has crossed the knee and is actively compressing create intake.
+    pub fn exporter_shed_permille(&self, fill: f64) -> u32 {
+        Self::exporter_permille(self.cfg.exporter_knee, fill)
+    }
+
     /// Publish (and return) the combined shed fraction: the max of the fsync-knee
     /// pressure and the export-queue pressure. One published per-mille drives the
     /// single even-spread [`should_shed`](Self::should_shed) actuator for both
