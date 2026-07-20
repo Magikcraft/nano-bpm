@@ -185,6 +185,7 @@ export type MetricsSnapshot = {
     ceilingExporter: boolean;
     ceilingFlowControl: boolean;
     exporterFillPermille: number;
+    slaMode: 'latency' | 'admission';
     pendingCreateQueue: number;
     activeBacklog: number;
     admissionBacklogLimit: number;

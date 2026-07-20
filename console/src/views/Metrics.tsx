@@ -61,11 +61,17 @@ export default function Metrics() {
 
           {/* Capacity ceiling — the clipping LEDs (ADR 0013) */}
           <section>
-            <SectionLabel>Capacity ceiling</SectionLabel>
+            <div className="mb-2 flex items-center gap-2">
+              <SectionLabel>Capacity ceiling</SectionLabel>
+              <span className="-mt-1">
+                <SlaBadge mode={data.slaMode} />
+              </span>
+            </div>
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
               <CeilingLed
                 label="Throughput"
                 active={data.ceilingThroughput}
+                help={CEILING_HELP.throughput}
                 detail={
                   data.admissionBacklogLimit > 0
                     ? `backlog ${data.activeBacklog.toLocaleString()} / ${data.admissionBacklogLimit.toLocaleString()}`
@@ -75,6 +81,7 @@ export default function Metrics() {
               <CeilingLed
                 label="Memory"
                 active={data.ceilingMemory}
+                help={CEILING_HELP.memory}
                 detail={
                   data.admissionCreateQueueLimit > 0
                     ? `create queue ${data.pendingCreateQueue.toLocaleString()} / ${data.admissionCreateQueueLimit.toLocaleString()}`
@@ -84,6 +91,7 @@ export default function Metrics() {
               <CeilingLed
                 label="Exporter"
                 active={data.ceilingExporter}
+                help={CEILING_HELP.exporter}
                 detail={`export queue fill ${(data.exporterFillPermille / 10).toFixed(1)}%${
                   data.ceilingExporter ? " · shedding intake" : ""
                 }`}
@@ -91,6 +99,7 @@ export default function Metrics() {
               <CeilingLed
                 label="Flow control"
                 active={data.ceilingFlowControl}
+                help={CEILING_HELP.flowControl}
                 detail={
                   data.ceilingFlowControl
                     ? "back-pressuring producers"
@@ -182,6 +191,7 @@ export default function Metrics() {
                     <tr className="border-b border-edge text-left text-fg-faint">
                       <th className="px-3 py-2 font-medium">Node</th>
                       <th className="px-3 py-2 font-medium">Status</th>
+                      <th className="px-3 py-2 font-medium">SLA</th>
                       <th className="px-3 py-2 text-right font-medium">Active</th>
                       <th className="px-3 py-2 text-right font-medium">Created</th>
                       <th className="px-3 py-2 text-right font-medium">Completed</th>
@@ -251,6 +261,13 @@ export default function Metrics() {
                             </span>
                           )}
                         </td>
+                        <td className="px-3 py-2">
+                          {n.metrics ? (
+                            <SlaBadge mode={n.metrics.slaMode} />
+                          ) : (
+                            <span className="text-fg-faint">—</span>
+                          )}
+                        </td>
                         <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.activeInstances.toLocaleString() ?? "—"}</td>
                         <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.createsTotal.toLocaleString() ?? "—"}</td>
                         <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.completionsTotal.toLocaleString() ?? "—"}</td>
@@ -286,19 +303,25 @@ export default function Metrics() {
 /// A capacity-ceiling "clipping" LED, styled like a mixing-desk gain-reduction
 /// indicator: a green dot while there is headroom, a pulsing red dot + "CLIPPING"
 /// while the node is pressed against the limit. `detail` shows the live pressure
-/// vs. its shed threshold.
+/// vs. its shed threshold; `help` (if given) surfaces a hover explanation of what
+/// the ceiling measures and how it behaves across SLA modes.
 function CeilingLed({
   label,
   active,
   detail,
+  help,
 }: {
   label: string;
   active: boolean;
   detail: string;
+  help?: string;
 }) {
   return (
     <Card className="px-4 py-3">
-      <div className="text-xs uppercase tracking-wide text-fg-faint">{label} ceiling</div>
+      <div className="flex items-center text-xs uppercase tracking-wide text-fg-faint">
+        {label} ceiling
+        {help && <InfoDot text={help} />}
+      </div>
       <div className="mt-1 flex items-center gap-2">
         <span
           className={`inline-block h-3 w-3 rounded-full ${
@@ -313,6 +336,57 @@ function CeilingLed({
     </Card>
   );
 }
+
+/// A small "?" affordance that reveals `text` on hover (native tooltip, so it
+/// works without extra layout/portal machinery and supports multi-line text via
+/// "\n"). Also exposed via aria-label for assistive tech.
+function InfoDot({ text }: { text: string }) {
+  return (
+    <span
+      title={text}
+      aria-label={text}
+      className="ml-1 inline-flex h-3.5 w-3.5 cursor-help items-center justify-center rounded-full border border-edge text-[9px] font-bold normal-case text-fg-faint hover:border-fg-muted hover:text-fg"
+    >
+      ?
+    </span>
+  );
+}
+
+/// The current per-node SLA mode as a coloured badge with a hover explanation of
+/// both modes. `latency` (preserve latency) is the calm/info state; `admission`
+/// (accept latency to keep admitting) is flagged amber since it lets the backlog
+/// and end-to-end latency grow.
+function SlaBadge({ mode }: { mode: "latency" | "admission" }) {
+  const admission = mode === "admission";
+  return (
+    <Badge tone={admission ? "warn" : "info"} className="normal-case">
+      SLA: {admission ? "admission" : "latency"}
+      <InfoDot text={SLA_HELP} />
+    </Badge>
+  );
+}
+
+const SLA_HELP =
+  "SLA mode — configurable per node, switchable at runtime. Governs how the capacity ceilings above behave.\n" +
+  "• Latency: preserve end-to-end latency. At the ceiling, shed new createProcessInstance calls (503) so accepted instances keep completing fast.\n" +
+  "• Admission: preserve admission (accept latency). Drop the proactive active-backlog governor and run at the true drain ceiling, letting latency and backlog grow to the memory-safety rails.";
+
+const CEILING_HELP = {
+  throughput:
+    "Throughput ceiling — create-processing concurrency (AIMD limiter) and/or the active-backlog governor are at their limit.\n" +
+    "• Latency mode: both the AIMD limiter and the proactive backlog governor shed new creates (503) to hold end-to-end latency.\n" +
+    "• Admission mode: the backlog governor is off, so this reflects only the AIMD engine-overload guard — latency and backlog are allowed to grow.",
+  memory:
+    "Memory ceiling — an always-on memory-safety rail is at its limit: submitted create-queue depth, in-flight pipeline bytes, or the resident-memory watermark.\n" +
+    "Identical in both SLA modes — these survival rails prevent OOM regardless of policy, and are the backlog backstop in Admission mode.",
+  exporter:
+    "Exporter ceiling — the read-model export queue has crossed the Tier-1 knee, so a graded fraction of create intake is being shed to bound export lag: exporter backpressure is compressing throughput.\n" +
+    "Same in both SLA modes (memory protection). In Admission mode it is typically the main create throttle, since the latency governor is disabled.",
+  flowControl:
+    "Flow control ceiling — create-submission credit is being back-pressured to the Falcon/REST producer clients right now.\n" +
+    "• Both modes: the completion-paced drain servo meters credit grants, or the drain-stall valve hard-blocks creates (a liveness rail).\n" +
+    "• Latency mode only: also engages on create-latency submission pressure from the AIMD limiter.",
+};
 
 function fmt(n: number, digits: number): string {
   return n.toLocaleString(undefined, {
