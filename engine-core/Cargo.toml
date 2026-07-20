@@ -16,19 +16,9 @@ license = "Apache-2.0"
 # `Arc`-shared `variables` payload on `ProcessInstance`; it has no effect when
 # the `serde` feature is off.
 serde = { version = "1", optional = true, features = ["derive", "rc"] }
-# `rmp-serde` powers the opt-in msgpack variable codec (see `packed.rs`): a
-# compact binary encoding of the create/job `variables` payload that rides the
-# hot path opaquely (Zeebe-style) so replica followers need not inflate a
-# `HashMap<String, Value>`. Gated behind the `msgpack` feature so the default
-# build stays dependency-free for the mobile/wasm embed targets.
-rmp-serde = { version = "1.3", optional = true }
 
 [features]
 serde = ["dep:serde"]
-# Opt-in msgpack variable codec. Implies `serde` (the codec (de)serializes the
-# `serde`-derived `Value`/`HashMap`). Hosts that evaluate FEEL conditions on
-# packed payloads (i.e. the server) must enable this; pure embedders need not.
-msgpack = ["dep:rmp-serde", "serde"]
 # Exposes the coarse C-ABI surface in `ffi.rs` (paired with the `cdylib`
 # crate-type below) so a non-Rust host can embed the engine via FFI/wasm.
 ffi = []

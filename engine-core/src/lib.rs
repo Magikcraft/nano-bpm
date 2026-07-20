@@ -73,8 +73,6 @@ mod command;
 mod engine;
 mod event;
 mod model;
-#[cfg(feature = "msgpack")]
-pub mod packed;
 mod state;
 
 pub mod bpmn;

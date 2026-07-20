@@ -1096,13 +1096,12 @@ impl ServerImpl {
         rpc: &str,
         zip: bool,
     ) -> Result<serde_json::Value, (u16, String)> {
-        // Base64/inflate the wire payload, then decode msgpack straight into the
-        // RPC (cheaper than serde_json for the large variable-map payload — this
-        // is the 8-follower AppendEntries decode hotspot).
-        let bytes = crate::raft_net::decode_rpc_payload(rpc, zip)
+        // Decompress (large payloads ride deflate+base64) before parsing the RPC
+        // straight from JSON — no intermediate `serde_json::Value` DOM.
+        let rpc = crate::raft_net::decode_rpc_payload(rpc, zip)
             .map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
-        let req: crate::raft_net::RaftRpcRequest = rmp_serde::from_slice(&bytes)
-            .map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
+        let req: crate::raft_net::RaftRpcRequest =
+            serde_json::from_str(&rpc).map_err(|e| (400u16, format!("malformed raft rpc: {e}")))?;
         let part = self.raft.get(partition).ok_or_else(|| {
             (
                 404u16,

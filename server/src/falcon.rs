@@ -1020,24 +1020,8 @@ async fn reader_loop(
                 };
                 handle_client_frame(server, registry, conn, default_worker, frame).await;
             }
-            Message::Binary(bytes) => {
-                // Opt-in msgpack fast path: the **same** `ClientFrame` envelope,
-                // msgpack-encoded by the client instead of JSON text. Decoding
-                // into the identical type lets every command fall through the one
-                // `handle_client_frame` dispatch below — no duplicated create /
-                // placement / admission logic, JSON stays the compat default.
-                let frame: ClientFrame = match rmp_serde::from_slice(&bytes) {
-                    Ok(frame) => frame,
-                    Err(e) => {
-                        conn.send(ServerFrame::CommandResult {
-                            corr: 0,
-                            status: 400,
-                            body: Some(Value::String(format!("malformed msgpack frame: {e}"))),
-                        });
-                        continue;
-                    }
-                };
-                handle_client_frame(server, registry, conn, default_worker, frame).await;
+            Message::Binary(_) => {
+                // Protocol is JSON text; ignore binary frames.
             }
             Message::Close(_) => break,
             // Ping/Pong are handled by the transport.
@@ -3310,47 +3294,5 @@ mod asyncapi_spec_guard {
             } => assert_eq!(origin_protocol, None),
             other => panic!("expected ForwardCreate, got {other:?}"),
         }
-    }
-}
-
-#[cfg(test)]
-mod msgpack_frame {
-    use serde_json::{Map, Value};
-
-    use super::ClientFrame;
-
-    /// A client may send the identical `ClientFrame` envelope msgpack-encoded on
-    /// the binary channel. Encoding named maps (`to_vec_named`, the client
-    /// contract) round-trips through the internally-tagged enum + `serde_json`
-    /// variable payload exactly as JSON does — so the binary path decodes into
-    /// the same type and reuses `handle_client_frame` with zero duplication.
-    #[test]
-    fn create_instance_round_trips_via_msgpack() {
-        let mut vars = Map::new();
-        vars.insert("amount".into(), Value::from(42));
-        vars.insert("name".into(), Value::from("north-wind"));
-        let frame = ClientFrame::CreateInstance {
-            corr: 7,
-            process_definition_id: Some("order".into()),
-            process_definition_key: None,
-            variables: Some(vars),
-            await_completion: Some(false),
-            fetch_variables: None,
-            request_timeout: None,
-        };
-        let bytes = rmp_serde::to_vec_named(&frame).expect("encodes");
-        let back: ClientFrame = rmp_serde::from_slice(&bytes).expect("decodes");
-        // msgpack is a strict subset of what JSON carries here; assert the
-        // decoded frame matches by re-serializing both to canonical JSON.
-        let a = serde_json::to_value(&frame).unwrap();
-        let b = serde_json::to_value(&back).unwrap();
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn heartbeat_round_trips_via_msgpack() {
-        let bytes = rmp_serde::to_vec_named(&ClientFrame::Heartbeat).expect("encodes");
-        let back: ClientFrame = rmp_serde::from_slice(&bytes).expect("decodes");
-        assert!(matches!(back, ClientFrame::Heartbeat));
     }
 }

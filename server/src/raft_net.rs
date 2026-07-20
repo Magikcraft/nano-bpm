@@ -64,59 +64,56 @@ pub enum RaftRpcResponse {
     InstallSnapshot(InstallSnapshotResponse<NodeId>),
 }
 
-/// Serialized size (bytes) at or above which a Raft RPC payload is deflated
-/// before it crosses the wire. Small control RPCs (Vote, empty-entry heartbeats)
-/// stay below this and skip deflate; only the heavy AppendEntries /
-/// InstallSnapshot payloads carrying large variable blobs are compressed —
-/// exactly the case a user with big process variables hits. 1 KiB comfortably
-/// clears the control traffic while catching anything with a non-trivial
-/// variable map.
+/// Serialized-JSON size (bytes) at or above which a Raft RPC payload is
+/// deflate+base64 compressed before it crosses the wire. Small control RPCs
+/// (Vote, empty-entry heartbeats) stay below this and are sent as raw JSON, so
+/// they pay no compression cost; only the heavy AppendEntries / InstallSnapshot
+/// payloads carrying large variable blobs are compressed — exactly the case a
+/// user with big process variables hits. 1 KiB comfortably clears the control
+/// traffic while catching anything with a non-trivial variable map.
 pub(crate) const RAFT_RPC_COMPRESS_THRESHOLD: usize = 1024;
 
-/// Encodes a serialized (msgpack) Raft RPC for the wire.
-///
-/// The request is msgpack rather than JSON: msgpack (de)serialization of the
-/// `Command`'s `HashMap<String, Value>` variable payload is materially cheaper
-/// than `serde_json` (no string escaping, binary scalars, length-prefixed
-/// strings), which is the CPU wall on the 8-follower AppendEntries decode path.
-/// Because msgpack is binary it is always base64-encoded to ride the JSON falcon
-/// frame; large payloads are deflated first. Returns `(wire, deflated)`.
-/// Deflate failures fall back to the raw (still base64) bytes — never an error.
-pub(crate) fn encode_rpc_payload(bytes: Vec<u8>) -> (String, bool) {
-    use base64::Engine;
-    let b64 = |b: &[u8]| base64::engine::general_purpose::STANDARD.encode(b);
-    if bytes.len() < RAFT_RPC_COMPRESS_THRESHOLD {
-        return (b64(&bytes), false);
+/// Encodes a serialized-JSON Raft RPC for the wire, compressing it (raw deflate,
+/// then base64 so it rides the JSON falcon frame without escaping) only
+/// when it is large enough to be worth it. Returns `(payload, compressed)`.
+/// Compression failures fall back to the raw JSON — never an error.
+pub(crate) fn encode_rpc_payload(json: String) -> (String, bool) {
+    if json.len() < RAFT_RPC_COMPRESS_THRESHOLD {
+        return (json, false);
     }
     use std::io::Write;
 
+    use base64::Engine;
     use flate2::{Compression, write::DeflateEncoder};
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
-    if enc.write_all(&bytes).is_err() {
-        return (b64(&bytes), false);
+    if enc.write_all(json.as_bytes()).is_err() {
+        return (json, false);
     }
     match enc.finish() {
-        Ok(z) => (b64(&z), true),
-        Err(_) => (b64(&bytes), false),
+        Ok(bytes) => (
+            base64::engine::general_purpose::STANDARD.encode(bytes),
+            true,
+        ),
+        Err(_) => (json, false),
     }
 }
 
-/// Reverses [`encode_rpc_payload`]: base64-decodes the wire string and inflates
-/// it iff `deflated`, returning the raw msgpack bytes.
-pub(crate) fn decode_rpc_payload(payload: &str, deflated: bool) -> Result<Vec<u8>, String> {
-    use base64::Engine;
-    let raw = base64::engine::general_purpose::STANDARD
-        .decode(payload.as_bytes())
-        .map_err(|e| format!("raft rpc base64 decode: {e}"))?;
-    if !deflated {
-        return Ok(raw);
+/// Reverses [`encode_rpc_payload`]: returns the raw JSON, decompressing iff
+/// `compressed`.
+pub(crate) fn decode_rpc_payload(payload: &str, compressed: bool) -> Result<String, String> {
+    if !compressed {
+        return Ok(payload.to_string());
     }
     use std::io::Read;
 
+    use base64::Engine;
     use flate2::read::DeflateDecoder;
-    let mut out = Vec::new();
-    DeflateDecoder::new(&raw[..])
-        .read_to_end(&mut out)
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.as_bytes())
+        .map_err(|e| format!("raft rpc base64 decode: {e}"))?;
+    let mut out = String::new();
+    DeflateDecoder::new(&bytes[..])
+        .read_to_string(&mut out)
         .map_err(|e| format!("raft rpc inflate: {e}"))?;
     Ok(out)
 }
@@ -415,12 +412,11 @@ impl RaftTransport for PeerTransport {
         req: RaftRpcRequest,
     ) -> BoxFuture<'a, Result<RaftRpcResponse, TransportError>> {
         Box::pin(async move {
-            // Serialize the request to msgpack (cheaper (de)serialization of the
-            // large variable-map payload than JSON on the follower decode path),
-            // then base64/deflate it for the wire; small control RPCs skip
-            // deflate. Response stays JSON — it carries no variable payload.
-            let mp = rmp_serde::to_vec_named(&req).map_err(|e| TransportError(e.to_string()))?;
-            let (rpc, compressed) = encode_rpc_payload(mp);
+            // Serialize the request straight to a JSON string (no intermediate
+            // `serde_json::Value` DOM), then compress it for the wire when the
+            // payload is large (big variable blobs); small control RPCs stay raw.
+            let json = serde_json::to_string(&req).map_err(|e| TransportError(e.to_string()))?;
+            let (rpc, compressed) = encode_rpc_payload(json);
             let link = self
                 .peers
                 .link(target as u32)
@@ -449,39 +445,33 @@ mod codec_tests {
     use super::*;
 
     #[test]
-    fn small_payloads_ride_base64_uncompressed_and_round_trip() {
-        // Small control RPC: below the deflate threshold, base64 only.
-        let bytes = rmp_serde::to_vec_named(&RaftRpcRequest::Vote(VoteRequest::new(
-            openraft::Vote::new(1, 0),
-            None,
-        )))
-        .unwrap();
-        assert!(bytes.len() < RAFT_RPC_COMPRESS_THRESHOLD);
-        let (payload, zip) = encode_rpc_payload(bytes.clone());
-        assert!(!zip, "small RPC must not be deflated");
-        assert_eq!(decode_rpc_payload(&payload, zip).unwrap(), bytes);
+    fn small_payloads_ride_raw_and_round_trip() {
+        let json =
+            r#"{"Vote":{"vote":{"leader_id":1,"committed":true},"last_log_id":null}}"#.to_string();
+        let (payload, zip) = encode_rpc_payload(json.clone());
+        assert!(!zip, "small RPC must not be compressed");
+        assert_eq!(payload, json);
+        assert_eq!(decode_rpc_payload(&payload, zip).unwrap(), json);
     }
 
     #[test]
     fn large_payloads_compress_and_round_trip() {
-        // A big, highly-compressible blob (the large-variable case this targets).
-        let bytes = vec![b'x'; 8192];
-        assert!(bytes.len() >= RAFT_RPC_COMPRESS_THRESHOLD);
-        let (payload, zip) = encode_rpc_payload(bytes.clone());
-        assert!(zip, "large RPC must be deflated");
+        // A big, highly-compressible variable blob (the case this targets).
+        let json = format!(r#"{{"AppendEntries":{{"blob":"{}"}}}}"#, "x".repeat(8192));
+        assert!(json.len() >= RAFT_RPC_COMPRESS_THRESHOLD);
+        let (payload, zip) = encode_rpc_payload(json.clone());
+        assert!(zip, "large RPC must be compressed");
         assert!(
-            payload.len() < bytes.len(),
+            payload.len() < json.len(),
             "compression should shrink the payload"
         );
-        assert_eq!(decode_rpc_payload(&payload, zip).unwrap(), bytes);
+        assert_eq!(decode_rpc_payload(&payload, zip).unwrap(), json);
     }
 
     #[test]
-    fn decode_roundtrips_uncompressed_base64() {
-        let bytes = vec![1u8, 2, 3, 250, 0, 128];
-        let (payload, zip) = encode_rpc_payload(bytes.clone());
-        assert!(!zip);
-        assert_eq!(decode_rpc_payload(&payload, zip).unwrap(), bytes);
+    fn decode_passthrough_when_not_compressed() {
+        let raw = "{\"k\":1}";
+        assert_eq!(decode_rpc_payload(raw, false).unwrap(), raw);
     }
 
     #[test]
