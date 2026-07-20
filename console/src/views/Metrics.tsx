@@ -1,4 +1,4 @@
-import { useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { nodeConsoleUrl } from "../lib/api";
 import { metricsStore } from "../lib/metricsStore";
 import { Badge, Button, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
@@ -320,7 +320,7 @@ function CeilingLed({
     <Card className="px-4 py-3">
       <div className="flex items-center text-xs uppercase tracking-wide text-fg-faint">
         {label} ceiling
-        {help && <InfoDot text={help} />}
+        {help && <InfoPopover text={help} />}
       </div>
       <div className="mt-1 flex items-center gap-2">
         <span
@@ -337,17 +337,56 @@ function CeilingLed({
   );
 }
 
-/// A small "?" affordance that reveals `text` on hover (native tooltip, so it
-/// works without extra layout/portal machinery and supports multi-line text via
-/// "\n"). Also exposed via aria-label for assistive tech.
-function InfoDot({ text }: { text: string }) {
+/// A small "i" info affordance that toggles a click-triggered popover with
+/// `text`. The popover closes on outside-click or Escape and supports multi-line
+/// text via "\n". Click (not hover) so the explanation stays put while reading.
+function InfoPopover({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLSpanElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
   return (
-    <span
-      title={text}
-      aria-label={text}
-      className="ml-1 inline-flex h-3.5 w-3.5 cursor-help items-center justify-center rounded-full border border-edge text-[9px] font-bold normal-case text-fg-faint hover:border-fg-muted hover:text-fg"
-    >
-      ?
+    <span ref={ref} className="relative ml-1 inline-flex">
+      <button
+        type="button"
+        aria-label={text}
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className={`inline-flex h-3.5 w-3.5 cursor-pointer items-center justify-center rounded-full border font-serif text-[9px] font-bold italic normal-case leading-none outline-none focus-visible:ring-2 focus-visible:ring-accent/60 ${
+          open
+            ? "border-fg-muted text-fg"
+            : "border-edge text-fg-faint hover:border-fg-muted hover:text-fg"
+        }`}
+      >
+        i
+      </button>
+      {open && (
+        <div
+          role="tooltip"
+          className="absolute left-0 top-5 z-50 w-72 rounded-lg border border-edge bg-raised p-3 text-left text-[11px] font-normal normal-case leading-snug tracking-normal text-fg shadow-lg"
+        >
+          {text.split("\n").map((line, i) => (
+            <p key={i} className={i === 0 ? "" : "mt-1.5"}>
+              {line}
+            </p>
+          ))}
+        </div>
+      )}
     </span>
   );
 }
@@ -361,7 +400,7 @@ function SlaBadge({ mode }: { mode: "latency" | "admission" }) {
   return (
     <Badge tone={admission ? "warn" : "info"} className="normal-case">
       SLA: {admission ? "admission" : "latency"}
-      <InfoDot text={SLA_HELP} />
+      <InfoPopover text={SLA_HELP} />
     </Badge>
   );
 }
