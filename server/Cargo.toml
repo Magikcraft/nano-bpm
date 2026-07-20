@@ -10,7 +10,7 @@ nanobpm-gateway-rest = { path = "../generated" }
 # Generated console API layer (models + axum router + per-tag Api traits) from
 # spec-console/console-api.yaml. Only needed with the `console` feature.
 nanobpm-console-api = { path = "../generated-console", optional = true }
-nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
+nanobpmn-engine-core = { path = "../engine-core", features = ["serde", "msgpack"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }
@@ -59,6 +59,10 @@ flate2 = "1.1.9"
 # in the lock as a transitive flate2 dep, so promoting it is offline-safe.
 crc32fast = "1"
 base64 = "0.22.1"
+# Opt-in msgpack decoder for the Falcon binary channel: a client may send the
+# very same `ClientFrame` envelope msgpack-encoded (instead of JSON text) for a
+# cheaper, client-serialized fast path. JSON text remains the compat default.
+rmp-serde = "1.3"
 tower-http = { version = "0.7.0", features = ["cors"] }
 # Unix filesystem stats (statvfs) for the disk-relative adaptive read-model
 # retention watermark. Unix-only; the feature falls back to a fixed default off
