@@ -179,6 +179,11 @@ struct Metrics {
     /// always-in-circuit memory-safety rails — create-queue depth, exporter
     /// saturation, in-flight pipeline bytes, resident-memory watermark).
     ceiling_active: prometheus::IntGaugeVec,
+    /// Current SLA mode as an info-style gauge: the active `mode` series is `1`,
+    /// the other `0` (`mode=latency|admission`). Configurable per node and
+    /// switchable at runtime, so every node publishes its own — the console reads
+    /// it (self + each scraped peer) to show the mode cluster-wide.
+    sla_mode: prometheus::IntGaugeVec,
     /// Cumulative count of ceiling "hits" — incremented on each rising edge
     /// (headroom → at-limit) per `ceiling`. Lets a dashboard show how often the
     /// limiter engaged over a window, like a peak-hold on a gain-reduction meter.
@@ -656,16 +661,25 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let ceiling_active = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_ceiling_active",
-            "Capacity-ceiling LED: 1 while pressed against the limit, else 0 (ceiling=throughput|memory).",
+            "Capacity-ceiling LED: 1 while pressed against the limit, else 0 (ceiling=throughput|memory|exporter|flow_control).",
         ),
         &["ceiling"],
+    )
+    .expect("valid gauge vec");
+
+    let sla_mode = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_sla_mode",
+            "Active SLA mode (info gauge): 1 for the current mode, 0 otherwise (mode=latency|admission).",
+        ),
+        &["mode"],
     )
     .expect("valid gauge vec");
 
     let ceiling_hits_total = IntCounterVec::new(
         Opts::new(
             "nanobpm_ceiling_hits_total",
-            "Rising-edge count of capacity-ceiling hits (ceiling=throughput|memory).",
+            "Rising-edge count of capacity-ceiling hits (ceiling=throughput|memory|exporter|flow_control).",
         ),
         &["ceiling"],
     )
@@ -926,6 +940,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(raft_live_batches.clone())))
         .and(registry.register(Box::new(raft_live_batch_bytes.clone())))
         .and(registry.register(Box::new(ceiling_active.clone())))
+        .and(registry.register(Box::new(sla_mode.clone())))
         .and(registry.register(Box::new(ceiling_hits_total.clone())))
         .and(registry.register(Box::new(job_type_activatable.clone())))
         .and(registry.register(Box::new(job_type_workers.clone())))
@@ -999,6 +1014,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         raft_live_batches,
         raft_live_batch_bytes,
         ceiling_active,
+        sla_mode,
         ceiling_hits_total,
         job_type_activatable,
         job_type_workers,
@@ -1214,6 +1230,23 @@ pub fn set_ceiling_active(ceiling: &str, active: bool, previously_active: bool) 
             .with_label_values(&[ceiling])
             .inc();
     }
+}
+
+/// Publishes the current SLA mode as the `nanobpm_sla_mode` info gauge: sets the
+/// active mode's series to `1` and the other to `0`. Idempotent and cheap;
+/// called from the ~1 Hz monitor tick (and once at startup) so the exported mode
+/// always reflects the latest runtime switch. `mode` is [`SlaMode::as_str`]
+/// (`latency` | `admission`); any other value is treated as `latency`.
+pub fn set_sla_mode(mode: &str) {
+    let admission = mode == "admission";
+    METRICS
+        .sla_mode
+        .with_label_values(&["admission"])
+        .set(i64::from(admission));
+    METRICS
+        .sla_mode
+        .with_label_values(&["latency"])
+        .set(i64::from(!admission));
 }
 
 /// Publishes the admission-ceiling input signals — the raw numbers behind the
@@ -1719,6 +1752,24 @@ mod tests {
             gather()
                 .contains("nanobpm_job_type_dispatched_total{job_type=\"test-dispatch-type\"} 8")
         );
+    }
+
+    #[test]
+    fn set_sla_mode_publishes_active_series_and_clears_the_other() {
+        set_sla_mode("admission");
+        let g = gather();
+        assert!(g.contains("nanobpm_sla_mode{mode=\"admission\"} 1"));
+        assert!(g.contains("nanobpm_sla_mode{mode=\"latency\"} 0"));
+
+        // Switching flips exactly one series to 1 and the other to 0 (info gauge).
+        set_sla_mode("latency");
+        let g = gather();
+        assert!(g.contains("nanobpm_sla_mode{mode=\"latency\"} 1"));
+        assert!(g.contains("nanobpm_sla_mode{mode=\"admission\"} 0"));
+
+        // Any unrecognised value fails safe to latency (never silently admission).
+        set_sla_mode("bogus");
+        assert!(gather().contains("nanobpm_sla_mode{mode=\"latency\"} 1"));
     }
 
     #[test]

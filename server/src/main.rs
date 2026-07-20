@@ -650,6 +650,7 @@ impl ServerImpl {
 
         let sla_mode = parse_sla_mode(std::env::var("NANOBPMN_SLA_MODE").ok().as_deref());
         tracing::info!("SLA mode at ceiling: {}", sla_mode.describe());
+        crate::metrics::set_sla_mode(sla_mode.as_str());
         let sla_mode = SharedSlaMode::new(sla_mode);
 
         // Runnable (task-job) backlog: the parked-excluded load signal the
@@ -11532,6 +11533,7 @@ impl ServerImpl {
     pub(crate) fn set_sla_mode(&self, mode: SlaMode) {
         let previous = self.sla_mode.get();
         self.sla_mode.set(mode);
+        crate::metrics::set_sla_mode(mode.as_str());
         if previous != mode {
             tracing::info!(
                 "SLA mode switched at runtime: {} -> {}",
