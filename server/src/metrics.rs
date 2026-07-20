@@ -179,6 +179,11 @@ struct Metrics {
     /// always-in-circuit memory-safety rails — create-queue depth, exporter
     /// saturation, in-flight pipeline bytes, resident-memory watermark).
     ceiling_active: prometheus::IntGaugeVec,
+    /// Current SLA mode as an info-style gauge: the active `mode` series is `1`,
+    /// the other `0` (`mode=latency|admission`). Configurable per node and
+    /// switchable at runtime, so every node publishes its own — the console reads
+    /// it (self + each scraped peer) to show the mode cluster-wide.
+    sla_mode: prometheus::IntGaugeVec,
     /// Cumulative count of ceiling "hits" — incremented on each rising edge
     /// (headroom → at-limit) per `ceiling`. Lets a dashboard show how often the
     /// limiter engaged over a window, like a peak-hold on a gain-reduction meter.
@@ -326,6 +331,14 @@ struct Metrics {
     /// shared write path (raft-log fsync) has crossed its latency knee. 0 =
     /// healthy write path. A single node-level gauge (no labels).
     tier1_pressure: prometheus::IntGauge,
+
+    /// ADR-0020 Tier-1 export-queue fill signal, `nanobpm_exporter_fill_permille`
+    /// (0–1000+): the *least-full* local read-model export shard's queue occupancy
+    /// as a per-mille of its adaptive budget — the create-admission input fused into
+    /// the Tier-1 guard (`for_create` steers each create to the least-full shard,
+    /// so the min governs). 0 = drained / export backpressure unconfigured; ≥1000 =
+    /// every shard at budget. A single node-level gauge (no labels).
+    exporter_fill_permille: prometheus::IntGauge,
 
     // ---- Per-command engine-actor profiling (NANOBPM_CMD_PROFILE) ----
     /// Wall time of a single applied [`Command`](nanobpmn_engine_core::Command)
@@ -648,16 +661,25 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let ceiling_active = prometheus::IntGaugeVec::new(
         Opts::new(
             "nanobpm_ceiling_active",
-            "Capacity-ceiling LED: 1 while pressed against the limit, else 0 (ceiling=throughput|memory).",
+            "Capacity-ceiling LED: 1 while pressed against the limit, else 0 (ceiling=throughput|memory|exporter|flow_control).",
         ),
         &["ceiling"],
+    )
+    .expect("valid gauge vec");
+
+    let sla_mode = prometheus::IntGaugeVec::new(
+        Opts::new(
+            "nanobpm_sla_mode",
+            "Active SLA mode (info gauge): 1 for the current mode, 0 otherwise (mode=latency|admission).",
+        ),
+        &["mode"],
     )
     .expect("valid gauge vec");
 
     let ceiling_hits_total = IntCounterVec::new(
         Opts::new(
             "nanobpm_ceiling_hits_total",
-            "Rising-edge count of capacity-ceiling hits (ceiling=throughput|memory).",
+            "Rising-edge count of capacity-ceiling hits (ceiling=throughput|memory|exporter|flow_control).",
         ),
         &["ceiling"],
     )
@@ -845,7 +867,12 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid gauge");
 
-    // Per-command actor profiling. Time buckets span 1µs .. ~16s (the multi-second
+    let exporter_fill_permille = prometheus::IntGauge::new(
+        "nanobpm_exporter_fill_permille",
+        "ADR-0020 Tier-1 export-queue fill in per-mille (0-1000+): the least-full local read-model export shard's queue occupancy as a fraction of its adaptive budget (the min governs because for_create steers to the least-full shard). 0 = drained / export backpressure unconfigured; >=1000 = every shard at budget.",
+    )
+    .expect("valid gauge");
+
     let cmd_seconds = prometheus::HistogramVec::new(
         HistogramOpts::new(
             "nanobpm_cmd_seconds",
@@ -913,6 +940,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(raft_live_batches.clone())))
         .and(registry.register(Box::new(raft_live_batch_bytes.clone())))
         .and(registry.register(Box::new(ceiling_active.clone())))
+        .and(registry.register(Box::new(sla_mode.clone())))
         .and(registry.register(Box::new(ceiling_hits_total.clone())))
         .and(registry.register(Box::new(job_type_activatable.clone())))
         .and(registry.register(Box::new(job_type_workers.clone())))
@@ -939,6 +967,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(backlog_governor.clone())))
         .and(registry.register(Box::new(tier2_pressure.clone())))
         .and(registry.register(Box::new(tier1_pressure.clone())))
+        .and(registry.register(Box::new(exporter_fill_permille.clone())))
         .and(registry.register(Box::new(cmd_seconds.clone())))
         .and(registry.register(Box::new(cmd_alloc_bytes.clone())))
         .and(registry.register(Box::new(engine_cardinality.clone())))
@@ -985,6 +1014,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         raft_live_batches,
         raft_live_batch_bytes,
         ceiling_active,
+        sla_mode,
         ceiling_hits_total,
         job_type_activatable,
         job_type_workers,
@@ -1011,6 +1041,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         backlog_governor,
         tier2_pressure,
         tier1_pressure,
+        exporter_fill_permille,
         cmd_seconds,
         cmd_alloc_bytes,
         engine_cardinality,
@@ -1201,6 +1232,23 @@ pub fn set_ceiling_active(ceiling: &str, active: bool, previously_active: bool) 
     }
 }
 
+/// Publishes the current SLA mode as the `nanobpm_sla_mode` info gauge: sets the
+/// active mode's series to `1` and the other to `0`. Idempotent and cheap;
+/// called from the ~1 Hz monitor tick (and once at startup) so the exported mode
+/// always reflects the latest runtime switch. `mode` is [`SlaMode::as_str`]
+/// (`latency` | `admission`); any other value is treated as `latency`.
+pub fn set_sla_mode(mode: &str) {
+    let admission = mode == "admission";
+    METRICS
+        .sla_mode
+        .with_label_values(&["admission"])
+        .set(i64::from(admission));
+    METRICS
+        .sla_mode
+        .with_label_values(&["latency"])
+        .set(i64::from(!admission));
+}
+
 /// Publishes the admission-ceiling input signals — the raw numbers behind the
 /// `nanobpm_ceiling_active` LED: the create-apply queue depth, the active-instance
 /// backlog, and the resident-memory estimate. Called ~1 Hz from the monitor loop,
@@ -1290,6 +1338,14 @@ pub fn set_tier2_pressure(proc: &str, permille: i64) {
 /// saturated. 0 = healthy.
 pub fn set_tier1_pressure(permille: i64) {
     METRICS.tier1_pressure.set(permille);
+}
+
+/// Publishes the ADR-0020 Tier-1 export-queue fill signal in per-mille
+/// (`nanobpm_exporter_fill_permille`) — the least-full local read-model export
+/// shard's queue occupancy as a fraction of its adaptive budget, fused into the
+/// Tier-1 guard. 0 = drained / export backpressure unconfigured.
+pub fn set_exporter_fill_permille(permille: i64) {
+    METRICS.exporter_fill_permille.set(permille);
 }
 
 /// Publishes the per-job-type worker-provisioning gauges: waiting jobs, live
@@ -1595,6 +1651,9 @@ pub struct MetricsSnapshot {
     // behind them so a dashboard can show pressure vs. its shed threshold.
     pub ceiling_throughput_active: bool,
     pub ceiling_memory_active: bool,
+    pub ceiling_exporter_active: bool,
+    pub ceiling_flow_control_active: bool,
+    pub exporter_fill_permille: i64,
     pub pending_create_queue: i64,
     pub active_backlog: i64,
     pub admission_backlog_limit: i64,
@@ -1645,6 +1704,10 @@ pub fn snapshot() -> MetricsSnapshot {
 
         ceiling_throughput_active: m.ceiling_active.with_label_values(&["throughput"]).get() != 0,
         ceiling_memory_active: m.ceiling_active.with_label_values(&["memory"]).get() != 0,
+        ceiling_exporter_active: m.ceiling_active.with_label_values(&["exporter"]).get() != 0,
+        ceiling_flow_control_active: m.ceiling_active.with_label_values(&["flow_control"]).get()
+            != 0,
+        exporter_fill_permille: m.exporter_fill_permille.get(),
         pending_create_queue: m.pending_create_queue.get(),
         active_backlog: m.active_backlog.get(),
         admission_backlog_limit: m.admission_limit.with_label_values(&["backlog"]).get(),
@@ -1689,6 +1752,24 @@ mod tests {
             gather()
                 .contains("nanobpm_job_type_dispatched_total{job_type=\"test-dispatch-type\"} 8")
         );
+    }
+
+    #[test]
+    fn set_sla_mode_publishes_active_series_and_clears_the_other() {
+        set_sla_mode("admission");
+        let g = gather();
+        assert!(g.contains("nanobpm_sla_mode{mode=\"admission\"} 1"));
+        assert!(g.contains("nanobpm_sla_mode{mode=\"latency\"} 0"));
+
+        // Switching flips exactly one series to 1 and the other to 0 (info gauge).
+        set_sla_mode("latency");
+        let g = gather();
+        assert!(g.contains("nanobpm_sla_mode{mode=\"latency\"} 1"));
+        assert!(g.contains("nanobpm_sla_mode{mode=\"admission\"} 0"));
+
+        // Any unrecognised value fails safe to latency (never silently admission).
+        set_sla_mode("bogus");
+        assert!(gather().contains("nanobpm_sla_mode{mode=\"latency\"} 1"));
     }
 
     #[test]

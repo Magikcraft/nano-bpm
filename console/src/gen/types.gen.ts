@@ -182,6 +182,10 @@ export type MetricsSnapshot = {
     residentBytes: number | null;
     ceilingThroughput: boolean;
     ceilingMemory: boolean;
+    ceilingExporter: boolean;
+    ceilingFlowControl: boolean;
+    exporterFillPermille: number;
+    slaMode: 'latency' | 'admission';
     pendingCreateQueue: number;
     activeBacklog: number;
     admissionBacklogLimit: number;

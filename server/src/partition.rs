@@ -410,6 +410,26 @@ impl Partitions {
         }
     }
 
+    /// The **least-full** local shard's exporter-queue fill, in per-mille of its
+    /// budget (`0` = empty … `1000` = at budget, `>1000` = over). Because
+    /// `for_create` steers each create to the *least*-full shard, the create-
+    /// admission pressure is the *minimum* fill across shards — the same condition
+    /// [`exporter_all_saturated`](Self::exporter_all_saturated) tests at the `1000`
+    /// point, generalised to a graded signal for the Tier-1 guard. `0` when
+    /// backpressure is disabled or the budget is `0`. Cheap relaxed loads.
+    pub fn exporter_min_fill_permille(&self) -> u64 {
+        match self.exporter_bp.get() {
+            None => 0,
+            Some(bp) if bp.budget == 0 => 0,
+            Some(bp) => bp
+                .gauges
+                .iter()
+                .map(|g| g.load(Ordering::Relaxed).saturating_mul(1000) / bp.budget)
+                .min()
+                .unwrap_or(0),
+        }
+    }
+
     /// Cluster-wide create *placement*: round-robins over **every** partition in
     /// the cluster and returns the remote node that owns the chosen partition, or
     /// `None` when it is local (create here, the fast path). This lets a single

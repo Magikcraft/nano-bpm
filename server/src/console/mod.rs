@@ -753,6 +753,21 @@ struct MetricsDto {
     ceiling_throughput: bool,
     /// 1 while pressed against the always-on memory-safety rails.
     ceiling_memory: bool,
+    /// 1 while export lag has crossed the Tier-1 knee and the global guard is
+    /// shedding a graded fraction of create intake — export backpressure is
+    /// compressing throughput (distinct from the hard `ceiling_memory` backstop).
+    ceiling_exporter: bool,
+    /// 1 while producer create-submission is being flow-controlled at the
+    /// Falcon/REST edge — the completion-paced credit servo is metering grants,
+    /// or a hard admission block is withholding credit from the clients.
+    ceiling_flow_control: bool,
+    /// Least-full export shard fill in per-mille of budget (0 = empty … 1000 = at
+    /// budget) — the live signal behind the `ceiling_exporter` LED.
+    exporter_fill_permille: i64,
+    /// This node's active SLA mode (`latency` | `admission`). Per node, since it
+    /// is configurable at startup (`NANOBPMN_SLA_MODE`) and switchable at runtime,
+    /// and governs how the capacity ceilings behave.
+    sla_mode: String,
     /// Live submitted-but-not-yet-applied create-queue depth (the OOM signal).
     pending_create_queue: i64,
     /// Live active-instance backlog (created − completed).
@@ -920,6 +935,10 @@ fn build_local_metrics(server: &ServerImpl) -> MetricsDto {
 
         ceiling_throughput: s.ceiling_throughput_active,
         ceiling_memory: s.ceiling_memory_active,
+        ceiling_exporter: s.ceiling_exporter_active,
+        ceiling_flow_control: s.ceiling_flow_control_active,
+        exporter_fill_permille: s.exporter_fill_permille,
+        sla_mode: server.sla_mode().as_str().to_string(),
         pending_create_queue: s.pending_create_queue,
         active_backlog: s.active_backlog,
         admission_backlog_limit: s.admission_backlog_limit,
@@ -1277,6 +1296,16 @@ fn metrics_dto_from_prometheus(text: &str) -> MetricsDto {
 
         ceiling_throughput: s.labeled("nanobpm_ceiling_active", "ceiling=\"throughput\"") != 0.0,
         ceiling_memory: s.labeled("nanobpm_ceiling_active", "ceiling=\"memory\"") != 0.0,
+        ceiling_exporter: s.labeled("nanobpm_ceiling_active", "ceiling=\"exporter\"") != 0.0,
+        ceiling_flow_control: s.labeled("nanobpm_ceiling_active", "ceiling=\"flow_control\"")
+            != 0.0,
+        exporter_fill_permille: s.gauge("nanobpm_exporter_fill_permille") as i64,
+        sla_mode: if s.labeled("nanobpm_sla_mode", "mode=\"admission\"") != 0.0 {
+            "admission"
+        } else {
+            "latency"
+        }
+        .to_string(),
         pending_create_queue: s.gauge("nanobpm_pending_create_queue") as i64,
         active_backlog: s.gauge("nanobpm_active_backlog") as i64,
         admission_backlog_limit: s.labeled("nanobpm_admission_limit", "limit=\"backlog\"") as i64,
@@ -2721,6 +2750,11 @@ nanobpm_jemalloc_bytes{kind="allocated"} 111
 nanobpm_jemalloc_bytes{kind="resident"} 999
 nanobpm_ceiling_active{ceiling="throughput"} 1
 nanobpm_ceiling_active{ceiling="memory"} 0
+nanobpm_ceiling_active{ceiling="exporter"} 1
+nanobpm_ceiling_active{ceiling="flow_control"} 0
+nanobpm_sla_mode{mode="latency"} 0
+nanobpm_sla_mode{mode="admission"} 1
+nanobpm_exporter_fill_permille 640
 nanobpm_pending_create_queue 3
 nanobpm_active_backlog 42
 nanobpm_admission_limit{limit="backlog"} 500
@@ -2759,6 +2793,10 @@ nanobpm_admission_shed_total{reason="create_queue"} 6
         assert_eq!(m.resident_bytes, Some(999));
         assert!(m.ceiling_throughput);
         assert!(!m.ceiling_memory);
+        assert!(m.ceiling_exporter);
+        assert!(!m.ceiling_flow_control);
+        assert_eq!(m.exporter_fill_permille, 640);
+        assert_eq!(m.sla_mode, "admission");
         assert_eq!(m.pending_create_queue, 3);
         assert_eq!(m.active_backlog, 42);
         // active_instances proxies active_backlog until Phase 2.
@@ -2781,5 +2819,6 @@ nanobpm_admission_shed_total{reason="create_queue"} 6
         assert_eq!(m.resident_bytes, None);
         assert_eq!(m.fsync_mean_ms, 0.0);
         assert!(!m.ceiling_throughput);
+        assert_eq!(m.sla_mode, "latency");
     }
 }
