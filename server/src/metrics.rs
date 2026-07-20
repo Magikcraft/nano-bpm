@@ -1618,6 +1618,9 @@ pub struct MetricsSnapshot {
     // behind them so a dashboard can show pressure vs. its shed threshold.
     pub ceiling_throughput_active: bool,
     pub ceiling_memory_active: bool,
+    pub ceiling_exporter_active: bool,
+    pub ceiling_flow_control_active: bool,
+    pub exporter_fill_permille: i64,
     pub pending_create_queue: i64,
     pub active_backlog: i64,
     pub admission_backlog_limit: i64,
@@ -1668,6 +1671,10 @@ pub fn snapshot() -> MetricsSnapshot {
 
         ceiling_throughput_active: m.ceiling_active.with_label_values(&["throughput"]).get() != 0,
         ceiling_memory_active: m.ceiling_active.with_label_values(&["memory"]).get() != 0,
+        ceiling_exporter_active: m.ceiling_active.with_label_values(&["exporter"]).get() != 0,
+        ceiling_flow_control_active: m.ceiling_active.with_label_values(&["flow_control"]).get()
+            != 0,
+        exporter_fill_permille: m.exporter_fill_permille.get(),
         pending_create_queue: m.pending_create_queue.get(),
         active_backlog: m.active_backlog.get(),
         admission_backlog_limit: m.admission_limit.with_label_values(&["backlog"]).get(),

@@ -81,6 +81,22 @@ export default function Metrics() {
                     : `create queue ${data.pendingCreateQueue.toLocaleString()} · rail off`
                 }
               />
+              <CeilingLed
+                label="Exporter"
+                active={data.ceilingExporter}
+                detail={`export queue fill ${(data.exporterFillPermille / 10).toFixed(1)}%${
+                  data.ceilingExporter ? " · shedding intake" : ""
+                }`}
+              />
+              <CeilingLed
+                label="Flow control"
+                active={data.ceilingFlowControl}
+                detail={
+                  data.ceilingFlowControl
+                    ? "back-pressuring producers"
+                    : "producer credit clear"
+                }
+              />
               <Stat
                 label="Create queue"
                 value={data.pendingCreateQueue.toLocaleString()}
