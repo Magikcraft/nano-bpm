@@ -290,6 +290,14 @@ pub struct ProcessInstance {
     /// so it needs no separate drain/rehydrate wiring.
     #[cfg_attr(feature = "serde", serde(default))]
     pub multi_instances: HashMap<Key, MultiInstanceState>,
+    /// Active ad-hoc sub-process containers in this instance, keyed by the
+    /// container element instance (which is also the ad-hoc token scope). Empty
+    /// (the default) for instances with no ad-hoc activity and when
+    /// deserializing snapshots written before ad-hoc runtime support existed.
+    /// Rides along in [`InstanceSnapshot::instance`] on spill like
+    /// `multi_instances`, so it needs no separate drain/rehydrate wiring.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub adhoc_instances: HashMap<Key, AdHocState>,
     /// Non-root variable scopes: each scope-owning element instance (embedded
     /// sub-process, multi-instance body, multi-instance child) mapped to its
     /// parent scope-owner. The root (process-instance) scope is implicit — its
@@ -338,6 +346,32 @@ pub struct MultiInstanceState {
     pub active: std::collections::BTreeSet<Key>,
     /// Collected per-child output, positioned by the child's 0-based index.
     pub output_values: Vec<Option<Value>>,
+}
+
+/// Runtime state of an active ad-hoc sub-process container (ADR 0023 seam 2).
+/// The container element instance is itself the ad-hoc token scope: activated
+/// "tool" children run inside it and the container's `outputCollection`
+/// accumulates here. Reconstructed from the ad-hoc events, so it rides along in
+/// the owning [`ProcessInstance`] with no bespoke snapshot handling.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AdHocState {
+    /// The `adHocSubProcess` container element id.
+    pub element_id: ElementId,
+    /// The container's `zeebe:adHoc outputCollection` result-variable name, if
+    /// declared — each activated tool's `output_element` is appended here.
+    pub output_collection: Option<String>,
+    /// The container's `zeebe:adHoc outputElement` FEEL expression, evaluated in
+    /// each completed tool's scope and appended to `output_collection`.
+    pub output_element: Option<String>,
+    /// Element instances of tool children still running this turn. The container
+    /// re-emits its agent job once this drains (and no completion was signalled).
+    pub active: std::collections::BTreeSet<Key>,
+    /// Accumulated tool outputs (the agent's `outputCollection` memory), in
+    /// activation-completion order.
+    pub output_values: Vec<Value>,
+    /// How many agent-job turns have run (drives the metrics + runaway guard).
+    pub iterations: u32,
 }
 
 /// Why an incident was raised. Maps to a recovery story and to the REST
@@ -1051,6 +1085,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     incidents: Vec::new(),
                     variables_spilled: false,
                     multi_instances: HashMap::new(),
+                    adhoc_instances: HashMap::new(),
                     scope_parents: HashMap::new(),
                     scope_variables: HashMap::new(),
                 },
@@ -1790,6 +1825,94 @@ pub fn apply(state: &mut State, event: &Event) {
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.multi_instances.remove(body_key);
+            }
+        }
+
+        // An ad-hoc container activated: register its runtime state. Its variable
+        // scope is registered separately by the surrounding
+        // `VariableScopeCreated` (the container element instance is the scope).
+        Event::AdHocActivated {
+            instance_key,
+            container_key,
+            element_id,
+            output_collection,
+            output_element,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.adhoc_instances.insert(
+                    *container_key,
+                    AdHocState {
+                        element_id: element_id.clone(),
+                        output_collection: output_collection.clone(),
+                        output_element: output_element.clone(),
+                        active: std::collections::BTreeSet::new(),
+                        output_values: Vec::new(),
+                        iterations: 0,
+                    },
+                );
+            }
+        }
+
+        // An ad-hoc tool child activated: register its own variable scope (holding
+        // the activate-element seed variables, parented to the container scope)
+        // and mark it active in its container.
+        Event::AdHocToolActivated {
+            instance_key,
+            container_key,
+            child_key,
+            local_variables,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.scope_parents.insert(*child_key, *container_key);
+                instance
+                    .scope_variables
+                    .insert(*child_key, local_variables.clone());
+                if let Some(adhoc) = instance.adhoc_instances.get_mut(container_key) {
+                    adhoc.active.insert(*child_key);
+                }
+            }
+        }
+
+        // An ad-hoc tool child completed: append its output to the container's
+        // accumulated results and drop it from the active set. Its local scope is
+        // torn down by the child's `ElementCompleted` event.
+        Event::AdHocToolCompleted {
+            instance_key,
+            container_key,
+            child_key,
+            output,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                if let Some(adhoc) = instance.adhoc_instances.get_mut(container_key) {
+                    adhoc.active.remove(child_key);
+                    if let Some(value) = output {
+                        adhoc.output_values.push(value.clone());
+                    }
+                }
+            }
+        }
+
+        // The ad-hoc container's agent job re-emitted for the next turn: bump the
+        // iteration counter.
+        Event::AdHocIterated {
+            instance_key,
+            container_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                if let Some(adhoc) = instance.adhoc_instances.get_mut(container_key) {
+                    adhoc.iterations = adhoc.iterations.saturating_add(1);
+                }
+            }
+        }
+
+        // An ad-hoc container completed: drop its runtime state. The aggregated
+        // output and the outgoing flow are carried by surrounding events.
+        Event::AdHocCompleted {
+            instance_key,
+            container_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.adhoc_instances.remove(container_key);
             }
         }
 

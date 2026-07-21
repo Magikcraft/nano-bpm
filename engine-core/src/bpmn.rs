@@ -1178,6 +1178,17 @@ impl ProcessAcc {
                 }
             }
 
+            // ADR 0023 seam 2 (runtime): the inner "tool" activities are pruned
+            // from the executable graph — an ad-hoc container is flattened to a
+            // single job-bearing activity, so its tools are never reached by
+            // ordinary token flow. They are NOT lost: the catalog above captures
+            // each tool's id + kind (job type), which is all the runtime needs to
+            // activate one when the agent's job result requests it (the container
+            // scope + activate-element seeding drive execution, not the flat
+            // element graph). Keeping tools out of `self.nodes`/`flows` also keeps
+            // `ProcessDefinition.elements` — and thus the processos model
+            // round-trip — identical to a plain container, avoiding a modeler
+            // cascade over arbitrary inner activities.
             if !pruned.is_empty() {
                 self.nodes.retain(|n| !pruned.contains(&n.id));
                 self.flows.retain(|f| {
