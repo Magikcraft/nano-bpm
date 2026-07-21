@@ -93,7 +93,7 @@ interface DataSource {
   query(sql: string, params?: unknown[]): Promise<Row[]>;
   exec(sql: string, params?: unknown[]): Promise<{ changed: number }>;
   tx<T>(fn: (t: DataSource) => Promise<T>): Promise<T>;
-  schema(): Promise<TableMeta[]>;   // powers both the DB Manager and form data-binding
+  schema(): Promise<TableMeta[]>;   // powers the DB Manager, form data-binding, and the ADR 0029 domain types
 }
 ```
 
