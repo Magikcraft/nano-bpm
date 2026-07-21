@@ -2,15 +2,28 @@
   "name": "@nanobpm/nano-app-schema",
   "version": "0.0.0",
   "private": true,
-  "description": "Source of truth for the Urban App manifest (nano.app.json): the JSON Schema (ADR 0027) plus its generated TypeScript types. See README.md.",
+  "description": "The Urban App manifest (nano.app.json): the JSON Schema (ADR 0027) + generated TypeScript types, the project symbol index (ADR 0029) and the fail-closed validator (ADR 0027 §4). See README.md.",
   "type": "module",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./schema": "./nano-app.schema.json"
+  },
   "scripts": {
     "gen": "node scripts/gen-types.mjs",
     "validate": "node scripts/validate.mjs",
-    "test": "npm run validate && npm run gen -- --check"
+    "typecheck": "tsc --noEmit",
+    "test:unit": "node --test test/*.test.mjs",
+    "test": "npm run validate && npm run gen -- --check && npm run typecheck && npm run test:unit"
   },
   "devDependencies": {
     "ajv": "^8.17.1",
-    "json-schema-to-typescript": "^15.0.3"
+    "json-schema-to-typescript": "^15.0.3",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "bpmn-moddle": "^9.0.4",
+    "dmn-moddle": "^11.0.0",
+    "zeebe-bpmn-moddle": "^1.17.0"
   }
 }
