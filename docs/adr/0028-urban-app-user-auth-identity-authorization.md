@@ -12,6 +12,8 @@ and the identity tables — users, roles, sessions — and the row-level-scoping
 ADR 0026 (`0026-urban-human-surfaces-and-run-model.md`, whose **auth/identity open question** this
 ADR resolves — login/admin surfaces + the action-API middleware are the enforcement points),
 ADR 0027 (`0027-urban-app-manifest-spec.md`, whose manifest gains the **security policy** block),
+ADR 0030 (`0030-domain-process-duality.md`, whose "a store has no identity — identity is a layer
+above it" reframes the tenancy gap below into *carry-a-key-and-filter*),
 `spec/{users,roles,groups,tenants,authorizations,authentication}.yaml` (the platform already mirrors
 **Camunda's identity/authz API shape** — the parity vocabulary), `server/src/stub_impls.rs`
 (those endpoints are currently **stubs**, so the gateway does not yet *enforce* identity), and
@@ -143,7 +145,17 @@ user — forward-looking, gated on the engine gaps below.
 
 - **Engine has no tenancy** (`engine-core`): true **multi-tenant** apps (Tier 2 + tenant isolation)
   are deferred to an engine seam. **Single-tenant multi-user** (many users, one shared workspace)
-  works now, entirely in the App tier.
+  works now, entirely in the App tier. *Reframed (ADR 0030 §4/Consequences):* this seam is smaller
+  than "grow tenancy." A store has no identity — identity is a layer *above* it (Postgres RLS is a
+  `WHERE tenant = …` over tables that know nothing of users; app-level filters are the same one tier
+  up). So the engine need not learn what a user *is*; it needs only to **(a)** carry an *opaque
+  scoping key* on the reachable records (process instances, jobs, user tasks, messages, and their
+  read-model rows) and **(b)** honour it at every access seam — instance reads, task/instance queries,
+  and, the one place it is more than a `WHERE` clause, the *pushed* surfaces (job-activation **streams**
+  and **message correlation**, where the key must ride the subscription and be honoured at dispatch).
+  Identity *resolution* (principal → roles → tenant) stays App-tier, exactly as this ADR already
+  places it; this mirrors Camunda's own opaque `tenantId` (the broker carries the key, Identity
+  resolves membership).
 - **Gateway identity endpoints are stubs** (`stub_impls.rs`): App-user auth (Layer 1) does not depend
   on them; only Layer-2 *identity propagation* to the engine does.
 - **Row-level data scoping** (per-user/tenant isolation) is an ADR 0024 design question (Postgres RLS

@@ -3,6 +3,9 @@
 Status: **Proposed.**
 Date: 2026-07-21.
 Relates to:
+ADR 0030 (`0030-domain-process-duality.md`, the **charter** this ADR implements — matter/motion/
+director as co-first-class primitives, the authoring-symmetry test, and "the method became a process";
+0029 is the *how* beneath 0030's *why*),
 ADR 0022 (`0022-nano-rad-application.md`, **Urban** — §A's manifest references models by id; §E's
 workers/llm reference the same symbols),
 ADR 0024 (`0024-urban-data-layer-datasource-abstraction.md`, the datasource whose `schema()` is
@@ -122,6 +125,15 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
   index — one source of truth for both authoring and validation.
 - Delphi-grade continuity: **form field → process variable → DMN → worker → SQLite column** all name
   the *same* type, resolvable and autocompletable end to end.
+- **Both motion and matter become first-class** (ADR 0030 §2): the domain type is the shared spine
+  that makes the process (motion) the *type's dynamics* and the type (matter) the *process's phase
+  space*. The **authoring-symmetry** test of ADR 0030 §3 lands here — the §1 index enables
+  *process-first* authoring (the type accretes from what tasks touch, §5's on-ramp), and the type
+  registry (§4) enables *domain-first* authoring (declare the type, bind the models to it); both
+  directions resolve against one index.
+- **Domain-shaped observability.** Because the domain is reified, a read model can be shaped by the
+  *business noun* ("Orders awaiting payment") rather than the *engine noun* ("instances parked at
+  `Task_3`") — the most visible payoff of making matter first-class (ADR 0030 §5).
 - The engine is untouched — untyped, fast, Zeebe-faithful. Typing is a tooling layer that adds no
   runtime cost and cannot destabilize the hot path.
 - The datasource-as-spine reuses ADR 0024's `schema()` exactly as intended; nothing new in the data
