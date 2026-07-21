@@ -2221,6 +2221,7 @@ pub(super) fn extensions_overview() -> serde_json::Value {
         .map(|e| {
             serde_json::json!({
                 "id": e.id, "kind": e.kind, "displayName": e.display_name, "builtin": e.builtin,
+                "icon": e.icon,
                 "fileTypes": e.file_types, "templates": e.templates,
                 "themes": e.themes,
                 "toolchainAvailable": extensions::toolchain_available(e),
