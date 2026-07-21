@@ -63,6 +63,7 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
   const processIds = index && new Set(index.processes.map((p) => p.id));
   const messageNames = index && new Set(index.messages);
   const decisionIds = index && new Set(index.decisions.map((d) => d.id));
+  const typeIds = new Set(Object.keys(manifest.types ?? {}));
 
   // data.default names a declared source.
   if (manifest.data?.default != null && !sourceNames.has(manifest.data.default)) {
@@ -86,6 +87,11 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     }
     if (t.action?.message != null && messageNames && !messageNames.has(t.action.message)) {
       push(`/triggers/${i}/action/message`, `no model declares a message named "${t.action.message}"`, "unknown-message");
+    }
+    // bodyType names a declared domain type — the FEEL scope for this trigger's
+    // action expressions (ADR 0029 §5). Intra-manifest, runs without an index.
+    if (t.bodyType != null && !typeIds.has(t.bodyType)) {
+      push(`/triggers/${i}/bodyType`, `bodyType "${t.bodyType}" is not a declared domain type`, "unknown-type");
     }
   });
 
@@ -114,7 +120,6 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
   // types[].fields[].type is a primitive or resolves to another declared type id
   // (nominal — ADR 0029 §4 / ADR 0031). This runs without an index (intra-manifest).
   const primitives = new Set<string>(DOMAIN_PRIMITIVES);
-  const typeIds = new Set(Object.keys(manifest.types ?? {}));
   for (const [id, t] of Object.entries(manifest.types ?? {}) as [string, any][]) {
     for (const [fieldKey, f] of Object.entries(t?.fields ?? {}) as [string, any][]) {
       const ft = f?.type;

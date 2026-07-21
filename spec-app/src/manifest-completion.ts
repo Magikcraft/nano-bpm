@@ -21,6 +21,7 @@ export type ReferenceSite =
   | "message" // trigger action.message — a bpmn:message name
   | "decision" // llm.<agent>.output.decision — a DMN decision id
   | "field-type" // types.<id>.fields.<key>.type — a primitive or declared type id
+  | "body-type" // triggers[].bodyType — a declared domain type id (FEEL scope)
   | "datasource" // data.default — a declared datasource id
   | "agent"; // surfaces.<name>.agent / workers[].llm — a declared llm agent id
 
@@ -31,7 +32,8 @@ export type CandidateKind =
   | "primitive"
   | "type"
   | "datasource"
-  | "agent";
+  | "agent"
+  | "variable"; // a FEEL variable-path segment (ADR 0029 §5)
 
 export interface CompletionCandidate {
   /** The literal id/name to insert (unquoted). */
@@ -42,7 +44,7 @@ export interface CompletionCandidate {
 }
 
 export interface ManifestCompletion {
-  site: ReferenceSite;
+  site: ReferenceSite | "feel";
   /** Offset span of the string *content* (between the quotes) to replace. */
   range: { start: number; end: number };
   candidates: CompletionCandidate[];
@@ -54,6 +56,11 @@ export type CompletionIndex = Pick<SymbolIndex, "processes" | "messages" | "deci
 interface StringSite {
   /** Object-property key path to this string value (array indices omitted). */
   path: string[];
+  /**
+   * Fully navigable path including array element indices, so callers can walk
+   * the parsed manifest to the exact node (e.g. `["triggers", 0, "bodyType"]`).
+   */
+  navPath: (string | number)[];
   /** True when the located string is a value (not an object key). */
   isValue: boolean;
   /** Offset of the first content char (just after the opening quote). */
@@ -73,9 +80,15 @@ function locateString(text: string, offset: number): StringSite | null {
     // for the root and for containers that are array elements — the array
     // already contributed its key).
     enteredKey?: string;
+    // For a container that is an array element: its index within the parent
+    // array (undefined otherwise).
+    arrayIndex?: number;
     // In an object: the key whose value is currently expected (set when a key
     // string closes, cleared on `,`). Undefined ⇒ the next string is a key.
     pendingKey?: string;
+    // In an array: count of elements separated so far (the index of the element
+    // currently being scanned).
+    elemIndex?: number;
   };
   const stack: Frame[] = [];
   let inString = false;
@@ -119,7 +132,14 @@ function locateString(text: string, offset: number): StringSite | null {
         const parent = top();
         const enteredKey =
           parent && parent.kind === "obj" ? parent.pendingKey : undefined;
-        stack.push({ kind: c === "{" ? "obj" : "arr", enteredKey });
+        const arrayIndex =
+          parent && parent.kind === "arr" ? parent.elemIndex ?? 0 : undefined;
+        stack.push({
+          kind: c === "{" ? "obj" : "arr",
+          enteredKey,
+          arrayIndex,
+          elemIndex: c === "[" ? 0 : undefined,
+        });
         break;
       }
       case "}":
@@ -129,6 +149,7 @@ function locateString(text: string, offset: number): StringSite | null {
       case ",": {
         const f = top();
         if (f && f.kind === "obj") f.pendingKey = undefined;
+        else if (f && f.kind === "arr") f.elemIndex = (f.elemIndex ?? 0) + 1;
         break;
       }
       default:
@@ -139,15 +160,24 @@ function locateString(text: string, offset: number): StringSite | null {
   if (!inString) return null;
 
   // Build the object-key path from the stack's enteredKeys plus the top object's
-  // pending key (the immediate property being valued).
+  // pending key (the immediate property being valued). navPath additionally
+  // threads array element indices so callers can address the exact node.
   const path: string[] = [];
-  for (const f of stack) if (f.enteredKey !== undefined) path.push(f.enteredKey);
+  const navPath: (string | number)[] = [];
+  for (const f of stack) {
+    if (f.enteredKey !== undefined) {
+      path.push(f.enteredKey);
+      navPath.push(f.enteredKey);
+    }
+    if (f.arrayIndex !== undefined) navPath.push(f.arrayIndex);
+  }
   const f = top();
   const isValue = !stringIsKey;
   if (f && f.kind === "obj" && isValue && f.pendingKey !== undefined) {
     path.push(f.pendingKey);
+    navPath.push(f.pendingKey);
   }
-  return { path, isValue, contentStart: stringStart };
+  return { path, navPath, isValue, contentStart: stringStart };
 }
 
 /** Scan forward from the cursor to the end of the current string content. */
@@ -183,6 +213,10 @@ function classify(path: string[]): ReferenceSite | null {
     case "type":
       // types.<id>.fields.<key>.type
       if (at(3) === "fields") return "field-type";
+      return null;
+    case "bodyType":
+      // triggers[].bodyType
+      if (at(2) === "triggers") return "body-type";
       return null;
     case "default":
       if (at(2) === "data") return "datasource";
@@ -237,6 +271,12 @@ function candidatesFor(
       }));
       return [...primitives, ...types];
     }
+    case "body-type":
+      return Object.keys(record(manifest, "types") ?? {}).map((id) => ({
+        value: id,
+        kind: "type" as const,
+        detail: "domain type",
+      }));
     case "datasource":
       return Object.keys(record(record(manifest, "data"), "sources") ?? {}).map((id) => ({
         value: id,
@@ -250,9 +290,94 @@ function candidatesFor(
   }
 }
 
+/** Detect the FEEL-expression field the cursor path names (ADR 0029 §5). */
+function feelFieldOf(path: string[]): "variables" | "correlationKey" | null {
+  const last = path[path.length - 1];
+  if ((last === "variables" || last === "correlationKey") && path[path.length - 2] === "action") {
+    return last;
+  }
+  return null;
+}
+
+/** The trigger object owning this FEEL field, resolved via the navigable path. */
+function triggerOf(
+  manifest: unknown,
+  navPath: (string | number)[],
+): Record<string, unknown> | undefined {
+  const i = navPath.indexOf("triggers");
+  if (i < 0 || typeof navPath[i + 1] !== "number") return undefined;
+  const triggers = (manifest as { triggers?: unknown }).triggers;
+  const t = Array.isArray(triggers) ? triggers[navPath[i + 1] as number] : undefined;
+  return t && typeof t === "object" ? (t as Record<string, unknown>) : undefined;
+}
+
+interface FieldDef {
+  type?: string;
+  list?: boolean;
+}
+
+/** Declared fields of a domain type id (empty when the id is unknown/absent). */
+function fieldsOf(manifest: unknown, typeId: string | undefined): Record<string, FieldDef> {
+  if (!typeId) return {};
+  const t = record(record(manifest, "types"), typeId);
+  return (t && (record(t, "fields") as Record<string, FieldDef>)) ?? {};
+}
+
 /**
- * The public entry point: what reference completions apply at `offset`, or null
- * when the cursor is not inside a recognized reference value.
+ * FEEL variable-path completion (ADR 0029 §5). Completes the dotted path segment
+ * under the caret against the type in scope (the trigger's `bodyType`): `body`
+ * at the root, then `body.<field>` walking declared nested domain types. The
+ * replacement range is just the current segment, so completing mid-expression
+ * (`= {room: body.roo|}`) rewrites only `roo`.
+ */
+function feelCandidates(
+  manifest: unknown,
+  bodyType: string | undefined,
+  text: string,
+  offset: number,
+  contentStart: number,
+): { candidates: CompletionCandidate[]; range: { start: number; end: number } } {
+  // Isolate the dotted path being typed: scan left over identifier/dot chars,
+  // right over the rest of the current identifier.
+  let s = offset;
+  while (s > contentStart && /[A-Za-z0-9_.]/.test(text[s - 1])) s--;
+  let e = offset;
+  while (e < text.length && /[A-Za-z0-9_]/.test(text[e])) e++;
+  const segs = text.slice(s, offset).split(".");
+  const seg = segs[segs.length - 1];
+  const range = { start: offset - seg.length, end: e };
+  const prefix = segs.slice(0, -1); // the resolved portion before the caret
+
+  // Root position (no dot yet): offer `body`, the event-body binding.
+  if (prefix.length === 0) {
+    return {
+      candidates: [{ value: "body", kind: "variable", detail: bodyType ?? "event body" }],
+      range,
+    };
+  }
+  // Paths must be rooted at `body`; anything else is out of the resolvable scope.
+  if (prefix[0] !== "body") return { candidates: [], range };
+
+  // Walk declared nested types from bodyType through the prefix segments. Stop at
+  // unknown fields, lists (FEEL indexes those) and primitives — none expose
+  // further declared paths.
+  let curType = bodyType;
+  for (const p of prefix.slice(1)) {
+    const f = fieldsOf(manifest, curType)[p];
+    if (!f || f.list) return { candidates: [], range };
+    curType = f.type;
+  }
+  const candidates = Object.entries(fieldsOf(manifest, curType)).map(([key, f]) => ({
+    value: key,
+    kind: "variable" as const,
+    detail: f.list ? `${f.type ?? "?"}[]` : f.type,
+  }));
+  return { candidates, range };
+}
+
+/**
+ * The public entry point: what completions apply at `offset`, or null when the
+ * cursor is not inside a recognized reference value or FEEL expression.
  */
 export function manifestCompletionAt(
   text: string,
@@ -262,6 +387,22 @@ export function manifestCompletionAt(
 ): ManifestCompletion | null {
   const loc = locateString(text, offset);
   if (!loc || !loc.isValue) return null;
+
+  // FEEL fields resolve variable paths against the trigger's bodyType (§5),
+  // which is distinct from whole-string reference completion.
+  if (feelFieldOf(loc.path)) {
+    const trigger = triggerOf(manifest, loc.navPath);
+    const bodyType = typeof trigger?.bodyType === "string" ? trigger.bodyType : undefined;
+    const { candidates, range } = feelCandidates(
+      manifest,
+      bodyType,
+      text,
+      offset,
+      loc.contentStart,
+    );
+    return { site: "feel", range, candidates };
+  }
+
   const site = classify(loc.path);
   if (!site) return null;
   return {

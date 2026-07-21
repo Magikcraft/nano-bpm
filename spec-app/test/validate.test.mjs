@@ -99,6 +99,17 @@ test("a field type that is neither a primitive nor a declared type is rejected w
   assert.deepEqual(codesFor(result, "/types/reading/fields/ref/type"), ["unknown-type"]);
 });
 
+test("a trigger bodyType must name a declared domain type (ADR 0029 §5)", () => {
+  const m = manifest();
+  m.types = { reading: { fields: { room: { type: "string" } } } };
+  m.triggers[0].bodyType = "reading"; // resolves
+  m.triggers[1] = { ...m.triggers[0], id: "other", bodyType: "no-such-type" }; // dangling
+  const result = validateManifest(m); // intra-manifest rule, no index needed
+  assert.equal(result.ok, false);
+  assert.deepEqual(codesFor(result, "/triggers/0/bodyType"), []);
+  assert.deepEqual(codesFor(result, "/triggers/1/bodyType"), ["unknown-type"]);
+});
+
 test("resolveDomainTypes unions declared registry types with form-inferred candidates", async () => {
   const index = await buildSymbolIndex(models);
   const m = manifest();

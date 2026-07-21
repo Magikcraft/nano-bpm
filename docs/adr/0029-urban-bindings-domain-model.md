@@ -122,6 +122,15 @@ values, DMN inputs — autocomplete **variable paths** from the resolved type in
 process `variables` type, plus the trigger event's shape). A maker picks `body.room` from a list, not
 by remembering it. Wrong-path references become diagnostics instead of runtime `null`s.
 
+**The scope binding (implemented).** A trigger event's shape is supplied by an optional typed
+reference `trigger.bodyType`, whose value is a `types` registry id (validated to resolve, like every
+other reference). With it declared, the action's FEEL fields complete `body.<field>` from that domain
+type, walking nested declared types (`body.sensor.id`); list fields are leaves (FEEL indexes them).
+Absent a `bodyType`, only the `body` root is offered. This is the same "typed reference replaces a
+free-string id" move as §2, applied to the FEEL scope. Form-default and DMN-input scopes reuse the
+same resolver and are the next increment; wrong-path *diagnostics* (vs. autocomplete) follow once the
+FEEL path walker is shared with the validator.
+
 ### 6. Codegen — the domain types flow into TypeScript
 
 The ADR 0027 generator (`generate-app-manifest.sh`) additionally emits **TypeScript types for the

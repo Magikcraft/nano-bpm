@@ -221,6 +221,10 @@
           "type": "string",
           "description": "Inbound auth policy for a webhook, e.g. 'hmac:sensors' referencing a connection (ADR 0025)."
         },
+        "bodyType": {
+          "$ref": "#/$defs/slug",
+          "description": "Optional: id of a `types` registry domain type declaring this source's event body shape. It puts a type in scope for the action's FEEL expressions (variables/correlationKey), so `body.<field>` autocompletes and wrong paths become diagnostics (ADR 0029 §5)."
+        },
         "action": { "$ref": "#/$defs/triggerAction" }
       }
     },

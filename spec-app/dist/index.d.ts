@@ -108,8 +108,8 @@ export interface DomainTypeResolution {
  */
 export declare function resolveDomainTypes(manifest: unknown, index?: SymbolIndex): DomainTypeResolution;
 /** The kinds of reference a manifest string value can be. */
-export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "datasource" | "agent";
-export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "datasource" | "agent";
+export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "datasource" | "agent";
+export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "datasource" | "agent" | "variable";
 export interface CompletionCandidate {
 	/** The literal id/name to insert (unquoted). */
 	value: string;
@@ -118,7 +118,7 @@ export interface CompletionCandidate {
 	detail?: string;
 }
 export interface ManifestCompletion {
-	site: ReferenceSite;
+	site: ReferenceSite | "feel";
 	/** Offset span of the string *content* (between the quotes) to replace. */
 	range: {
 		start: number;
@@ -129,8 +129,8 @@ export interface ManifestCompletion {
 /** Just the parts of the index this engine reads (keeps callers flexible). */
 export type CompletionIndex = Pick<SymbolIndex, "processes" | "messages" | "decisions">;
 /**
- * The public entry point: what reference completions apply at `offset`, or null
- * when the cursor is not inside a recognized reference value.
+ * The public entry point: what completions apply at `offset`, or null when the
+ * cursor is not inside a recognized reference value or FEEL expression.
  */
 export declare function manifestCompletionAt(text: string, offset: number, manifest: unknown, index?: CompletionIndex): ManifestCompletion | null;
 export interface Diagnostic {
@@ -340,6 +340,10 @@ interface Trigger {
 	 * Inbound auth policy for a webhook, e.g. 'hmac:sensors' referencing a connection (ADR 0025).
 	 */
 	auth?: string;
+	/**
+	 * Lowercase kebab-case slug.
+	 */
+	bodyType?: string;
 	action: TriggerAction;
 }
 interface Connection {
