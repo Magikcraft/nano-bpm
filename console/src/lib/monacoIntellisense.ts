@@ -28,6 +28,8 @@ export function completionKind(
       return K.Function;
     case "method":
       return K.Method;
+    case "constructor":
+      return K.Constructor;
     case "class":
       return K.Class;
     case "struct":
