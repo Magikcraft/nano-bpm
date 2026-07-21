@@ -170,6 +170,12 @@ still holds: Deno+App now, Rust/Java+App later. The console gains an **App** pro
 workspace tabs are exactly the existing editors (BPMN/DMN/Form) plus new **Triggers**, **Data**,
 and **Surfaces** panels that edit *this manifest*.
 
+**Specified in ADR 0027** (`0027-urban-app-manifest-spec.md`): `nano.app.json` as a validated,
+**spec-first** schema (`spec-app/nano-app.schema.json` generating both Rust and TS types), its
+ownership boundary with the existing `nanobpm.project.json` (IDE/toolchain) file, fail-closed
+validation at console/compile/boot, `${VAR:-default}` secret substitution at boot, and the console
+**App** project type (`app: "urban"`).
+
 ### (B) Trigger runtime
 
 A trigger source produces events; each trigger's `action` maps the event to **start a process**
