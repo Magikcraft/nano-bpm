@@ -39,6 +39,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::StartEvent => "startEvent",
         ElementKind::EndEvent => "endEvent",
         ElementKind::ServiceTask { .. } => "serviceTask",
+        ElementKind::BusinessRuleTask { .. } => "businessRuleTask",
         ElementKind::UserTask(_) => "userTask",
         ElementKind::ExclusiveGateway => "exclusiveGateway",
         ElementKind::ParallelGateway => "parallelGateway",
@@ -2040,6 +2041,25 @@ fn emit_element(
             out.push_str("      </bpmn:extensionElements>\n");
             emit_multi_instance(el, out);
             out.push_str("    </bpmn:serviceTask>\n");
+        }
+        ElementKind::BusinessRuleTask {
+            decision_id,
+            result_variable,
+        } => {
+            out.push_str(&format!("    <bpmn:businessRuleTask id=\"{eid}\"{na}>\n"));
+            out.push_str("      <bpmn:extensionElements>\n");
+            let result_attr = result_variable
+                .as_deref()
+                .map(|r| format!(" resultVariable=\"{}\"", xml_escape(r)))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "        <zeebe:calledDecision decisionId=\"{}\"{result_attr}/>\n",
+                xml_escape(decision_id)
+            ));
+            emit_io_mapping(el, out);
+            out.push_str("      </bpmn:extensionElements>\n");
+            emit_multi_instance(el, out);
+            out.push_str("    </bpmn:businessRuleTask>\n");
         }
         ElementKind::UserTask(props) => {
             out.push_str(&format!("    <bpmn:userTask id=\"{eid}\"{na}>\n"));
