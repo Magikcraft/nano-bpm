@@ -2,7 +2,7 @@
 // and `resolveBodyPath` type-walking. `node --test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bodyPaths, resolveBodyPath, isDeclaredType } from "../src/feel.ts";
+import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope } from "../src/feel.ts";
 
 const manifest = {
   types: {
@@ -71,4 +71,46 @@ test("isDeclaredType distinguishes registry types from primitives/unknowns", () 
   assert.equal(isDeclaredType(manifest, "reading"), true);
   assert.equal(isDeclaredType(manifest, "string"), false);
   assert.equal(isDeclaredType(manifest, undefined), false);
+});
+
+test("scopeVarsForType returns fields, recursing into nested declared types", () => {
+  const vars = scopeVarsForType(manifest, "reading");
+  assert.deepEqual(vars.map((v) => v.name).sort(), ["meta", "readings", "room", "sensor", "temp"]);
+  const room = vars.find((v) => v.name === "room");
+  assert.deepEqual({ ...room }, { name: "room", type: "string", list: false });
+  // a nested declared type carries its fields as entries; lists too (FEEL projects them)
+  const sensor = vars.find((v) => v.name === "sensor");
+  assert.deepEqual(sensor.entries.map((e) => e.name).sort(), ["id", "tags"]);
+  const readings = vars.find((v) => v.name === "readings");
+  assert.equal(readings.list, true);
+  assert.deepEqual(readings.entries.map((e) => e.name).sort(), ["id", "tags"]);
+  // primitives / json carry no entries
+  assert.equal(vars.find((v) => v.name === "temp").entries, undefined);
+  assert.equal(vars.find((v) => v.name === "meta").entries, undefined);
+});
+
+test("scopeVarsForType breaks cycles in the nominal type graph", () => {
+  const m = { types: { node: { fields: { next: { type: "node" }, label: { type: "string" } } } } };
+  const vars = scopeVarsForType(m, "node");
+  assert.deepEqual(vars.map((v) => v.name).sort(), ["label", "next"]);
+  const next = vars.find((v) => v.name === "next");
+  // `next` is the same type already on the path — it does not expand (no loop),
+  // but is still offered as a variable with its type hint.
+  assert.deepEqual({ ...next }, { name: "next", type: "node", list: false });
+  assert.equal(next.entries, undefined);
+});
+
+test("decisionScope resolves the type bound to a decision, else undefined", () => {
+  const m = {
+    types: manifest.types,
+    bindings: [{ decision: "triage", type: "reading" }, { form: "f", type: "reading" }],
+  };
+  const vars = decisionScope(m, "triage");
+  assert.deepEqual(vars.map((v) => v.name).sort(), ["meta", "readings", "room", "sensor", "temp"]);
+  // no binding for this decision → undefined (contribute no domain variables)
+  assert.equal(decisionScope(m, "other"), undefined);
+  // a binding whose type isn't declared → undefined
+  const m2 = { types: manifest.types, bindings: [{ decision: "d", type: "ghost" }] };
+  assert.equal(decisionScope(m2, "d"), undefined);
+  assert.equal(decisionScope(m, undefined), undefined);
 });

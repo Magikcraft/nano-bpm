@@ -34,6 +34,7 @@ import {
   type ProjectFile,
 } from "../lib/api";
 import { Button, inputClass } from "../components/ui";
+import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import {
   subscribe as subscribeDebug,
   snapshot as debugSnapshot,
@@ -638,6 +639,37 @@ function EditorPane({
   const deployedInSync =
     lastDeployedXml != null && lastDeployedXml === content && !dirty;
 
+  // The App manifest supplies the domain type bound to each decision (ADR 0029
+  // §5), which scopes the DMN input-expression FEEL autocomplete. Load it (root
+  // nano.app.json) while a decision is open; reload on file switch so recent
+  // binding edits are reflected. Absent/invalid manifest → no bound variables.
+  const [manifestText, setManifestText] = useState<string | null>(null);
+  useEffect(() => {
+    if (kind !== "dmn") {
+      setManifestText(null);
+      return;
+    }
+    let alive = true;
+    projectFileEx(name, "nano.app.json")
+      .then((f) => alive && setManifestText(f.binary ? null : f.text))
+      .catch(() => alive && setManifestText(null));
+    return () => {
+      alive = false;
+    };
+  }, [name, kind, path]);
+  const manifest = useMemo<unknown>(() => {
+    if (!manifestText) return undefined;
+    try {
+      return JSON.parse(manifestText);
+    } catch {
+      return undefined;
+    }
+  }, [manifestText]);
+  const dmnGetVariables = useCallback(
+    (decisionId: string | undefined) => decisionFeelVariables(manifest, decisionId),
+    [manifest],
+  );
+
   useEffect(() => {
     let alive = true;
     setContent(null);
@@ -1058,7 +1090,9 @@ function EditorPane({
             )}
           </div>
         )}
-        {kind === "dmn" && <DmnModeler ref={dmnRef} onChange={() => setDirty(true)} />}
+        {kind === "dmn" && (
+          <DmnModeler ref={dmnRef} onChange={() => setDirty(true)} getVariables={dmnGetVariables} />
+        )}
         {kind === "form" && (
           <div className="relative h-full">
             {/*

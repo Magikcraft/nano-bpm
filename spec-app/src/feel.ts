@@ -94,3 +94,55 @@ export function bodyPaths(feel: string): string[][] {
   }
   return out;
 }
+
+/**
+ * A neutral variable-scope node (ADR 0029 §5). An editor-agnostic tree the
+ * console maps onto its FEEL editor's variable shape (e.g. dmn-js / feel-editor
+ * `Variable`), so the type-in-scope logic stays here (tested) and the editor
+ * wiring stays thin. `entries` are the fields of a nested declared type.
+ */
+export interface ScopeVar {
+  name: string;
+  /** The field's declared type or primitive — a short hint for the editor. */
+  type?: string;
+  list?: boolean;
+  entries?: ScopeVar[];
+}
+
+/**
+ * The fields of `typeId` as a scope tree, recursing into nested declared types
+ * (lists included — FEEL projects a list of records). Cycles in the nominal type
+ * graph are broken by tracking the types on the current path, so a self- or
+ * mutually-recursive type resolves one level deep without looping.
+ */
+export function scopeVarsForType(manifest: unknown, typeId: string | undefined): ScopeVar[] {
+  const walk = (id: string | undefined, seen: ReadonlySet<string>): ScopeVar[] => {
+    if (!id || seen.has(id) || !isDeclaredType(manifest, id)) return [];
+    const next = new Set(seen).add(id);
+    return Object.entries(fieldsOf(manifest, id)).map(([name, f]) => {
+      const v: ScopeVar = { name, type: f.type, list: f.list === true };
+      const entries = walk(f.type, next);
+      if (entries.length > 0) v.entries = entries;
+      return v;
+    });
+  };
+  return walk(typeId, new Set());
+}
+
+/**
+ * The variable scope for a decision's input-expression FEEL: the fields of the
+ * domain type bound to `decisionId` in `bindings[]` (ADR 0029 §5). Returns
+ * `undefined` when the decision has no binding, or the binding's type is not a
+ * declared type — callers then contribute no domain variables (never a wrong scope).
+ */
+export function decisionScope(manifest: unknown, decisionId: string | undefined): ScopeVar[] | undefined {
+  if (!decisionId) return undefined;
+  const bindings = (manifest as { bindings?: unknown })?.bindings;
+  if (!Array.isArray(bindings)) return undefined;
+  const binding = bindings.find(
+    (b) => b && typeof b === "object" && (b as { decision?: unknown }).decision === decisionId,
+  ) as { type?: unknown } | undefined;
+  const typeId = typeof binding?.type === "string" ? binding.type : undefined;
+  if (!isDeclaredType(manifest, typeId)) return undefined;
+  return scopeVarsForType(manifest, typeId);
+}

@@ -153,6 +153,33 @@ export declare function resolveBodyPath(manifest: unknown, bodyType: string | un
  * never yields a spurious path to flag.
  */
 export declare function bodyPaths(feel: string): string[][];
+/**
+ * A neutral variable-scope node (ADR 0029 §5). An editor-agnostic tree the
+ * console maps onto its FEEL editor's variable shape (e.g. dmn-js / feel-editor
+ * `Variable`), so the type-in-scope logic stays here (tested) and the editor
+ * wiring stays thin. `entries` are the fields of a nested declared type.
+ */
+export interface ScopeVar {
+	name: string;
+	/** The field's declared type or primitive — a short hint for the editor. */
+	type?: string;
+	list?: boolean;
+	entries?: ScopeVar[];
+}
+/**
+ * The fields of `typeId` as a scope tree, recursing into nested declared types
+ * (lists included — FEEL projects a list of records). Cycles in the nominal type
+ * graph are broken by tracking the types on the current path, so a self- or
+ * mutually-recursive type resolves one level deep without looping.
+ */
+export declare function scopeVarsForType(manifest: unknown, typeId: string | undefined): ScopeVar[];
+/**
+ * The variable scope for a decision's input-expression FEEL: the fields of the
+ * domain type bound to `decisionId` in `bindings[]` (ADR 0029 §5). Returns
+ * `undefined` when the decision has no binding, or the binding's type is not a
+ * declared type — callers then contribute no domain variables (never a wrong scope).
+ */
+export declare function decisionScope(manifest: unknown, decisionId: string | undefined): ScopeVar[] | undefined;
 /** The kinds of reference a manifest string value can be. */
 export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "form-ref" | "datasource" | "agent";
 export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "form" | "datasource" | "agent" | "variable";
