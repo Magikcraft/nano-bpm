@@ -35,6 +35,7 @@ const KIND_ICON: Record<CandidateKind, monaco.languages.CompletionItemKind> = {
   decision: monaco.languages.CompletionItemKind.Function,
   primitive: monaco.languages.CompletionItemKind.Keyword,
   type: monaco.languages.CompletionItemKind.Struct,
+  form: monaco.languages.CompletionItemKind.File,
   datasource: monaco.languages.CompletionItemKind.Module,
   agent: monaco.languages.CompletionItemKind.Value,
   variable: monaco.languages.CompletionItemKind.Field,
