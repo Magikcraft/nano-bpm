@@ -108,6 +108,7 @@ impl TestEngine {
         self.apply(Command::CompleteJob {
             job_key: key,
             variables,
+            adhoc_result: None,
         })
         .map_err(|e| js_err(&format!("complete error: {e}")))?;
         to_json(&self.snapshot_value(None))

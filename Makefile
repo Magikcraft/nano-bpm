@@ -187,6 +187,10 @@ engine-wasm-ffi: ## Build the FFI cdylib for wasm32 and verify its exports (need
 engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest into dist/engine-wasm-ffi/ (needs wasm-opt/binaryen)
 	node $(ENGINE_DIR)/scripts/emit-dist.mjs
 
+.PHONY: engine-wasm-check
+engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)
+	cd $(WASM_DIR) && cargo check --target wasm32-unknown-unknown
+
 .PHONY: processos-build
 processos-build: ## Build ProcessOS, the separate optimization-plane server (Stage T1: Insights)
 	cd processos && cargo build

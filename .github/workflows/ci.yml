@@ -141,6 +141,8 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y binaryen
       - name: Build + verify + emit dist
         run: make engine-wasm-ffi-dist
+      - name: Type-check console engine-wasm crate (wasm32)
+        run: make engine-wasm-check
       - name: Show manifest
         run: cat dist/engine-wasm-ffi/manifest.json
       - name: Upload dist artifact
