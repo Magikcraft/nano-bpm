@@ -31,6 +31,11 @@
     "runtime": { "$ref": "#/$defs/runtime" },
     "models": { "$ref": "#/$defs/models" },
     "data": { "$ref": "#/$defs/data" },
+    "types": {
+      "type": "object",
+      "description": "The domain type registry (ADR 0029 §4, ADR 0031). Named record types keyed by a stable id — the *nominal* identity every reference resolves against. A type's fields project onto three shapes: form field (face), process variable (motion) and datasource row (rest); the Process-Relational Mapper (ADR 0031) generates the mapping. Types here are the transient/declared source; a datasource table is the other (ADR 0029 §4).",
+      "additionalProperties": { "$ref": "#/$defs/domainType" }
+    },
     "triggers": {
       "type": "array",
       "items": { "$ref": "#/$defs/trigger" },
@@ -59,6 +64,58 @@
       "type": "string",
       "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
       "description": "Lowercase kebab-case slug."
+    },
+    "domainType": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fields"],
+      "description": "A named domain record type (ADR 0029 §4, ADR 0031). Its map key is the stable id; matching is nominal (by id), consistent with model reference pickers.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Human-readable label. The map key remains the stable id every reference uses."
+        },
+        "match": {
+          "enum": ["nominal", "structural"],
+          "default": "nominal",
+          "description": "Identity discipline. `nominal` (default): references resolve by this type's id. `structural` is a reserved escape hatch (match by field shape) — declared here but not yet honoured by the validator/mapper."
+        },
+        "table": {
+          "$ref": "#/$defs/slug",
+          "description": "Optional datasource table this type binds to as its rest projection (ADR 0031 rest bank). Absent = transient / non-persisted (ADR 0029 §4.2). Table existence is validated once the datasource schema() runtime (ADR 0024) lands; the shape is checked now."
+        },
+        "fields": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": { "$ref": "#/$defs/domainField" },
+          "description": "Field name → field definition. Field names are the keys the form field, the variable path and the datasource column share (ADR 0029 §4)."
+        }
+      }
+    },
+    "domainField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type"],
+      "description": "A single field of a domain type.",
+      "properties": {
+        "type": {
+          "description": "A primitive type, or the id of another domain type in the registry (nominal reference). Primitive ids take precedence over an identically named type.",
+          "anyOf": [
+            { "enum": ["string", "number", "integer", "boolean", "date", "datetime", "json"] },
+            { "$ref": "#/$defs/slug" }
+          ]
+        },
+        "optional": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the field may be absent."
+        },
+        "list": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether the field is a list of `type` rather than a single value."
+        }
+      }
     },
     "envTemplate": {
       "type": "string",

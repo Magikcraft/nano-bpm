@@ -96,6 +96,12 @@ export interface AppManifest {
   models?: Models;
   data?: Data;
   /**
+   * The domain type registry (ADR 0029 §4, ADR 0031). Named record types keyed by a stable id — the *nominal* identity every reference resolves against. A type's fields project onto three shapes: form field (face), process variable (motion) and datasource row (rest); the Process-Relational Mapper (ADR 0031) generates the mapping. Types here are the transient/declared source; a datasource table is the other (ADR 0029 §4).
+   */
+  types?: {
+    [k: string]: DomainType;
+  };
+  /**
    * Event sources bound to engine actions (ADR 0025).
    */
   triggers?: Trigger[];
@@ -161,6 +167,46 @@ export interface DataSource {
    * Path to a migrations directory.
    */
   migrations?: string;
+}
+/**
+ * A named domain record type (ADR 0029 §4, ADR 0031). Its map key is the stable id; matching is nominal (by id), consistent with model reference pickers.
+ */
+export interface DomainType {
+  /**
+   * Human-readable label. The map key remains the stable id every reference uses.
+   */
+  name?: string;
+  /**
+   * Identity discipline. `nominal` (default): references resolve by this type's id. `structural` is a reserved escape hatch (match by field shape) — declared here but not yet honoured by the validator/mapper.
+   */
+  match?: "nominal" | "structural";
+  /**
+   * Optional datasource table this type binds to as its rest projection (ADR 0031 rest bank). Absent = transient / non-persisted (ADR 0029 §4.2). Table existence is validated once the datasource schema() runtime (ADR 0024) lands; the shape is checked now.
+   */
+  table?: string;
+  /**
+   * Field name → field definition. Field names are the keys the form field, the variable path and the datasource column share (ADR 0029 §4).
+   */
+  fields: {
+    [k: string]: DomainField;
+  };
+}
+/**
+ * A single field of a domain type.
+ */
+export interface DomainField {
+  /**
+   * A primitive type, or the id of another domain type in the registry (nominal reference). Primitive ids take precedence over an identically named type.
+   */
+  type: ("string" | "number" | "integer" | "boolean" | "date" | "datetime" | "json") | Slug;
+  /**
+   * Whether the field may be absent.
+   */
+  optional?: boolean;
+  /**
+   * Whether the field is a list of `type` rather than a single value.
+   */
+  list?: boolean;
 }
 export interface Trigger {
   id: Slug;

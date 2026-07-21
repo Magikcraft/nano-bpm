@@ -14,6 +14,7 @@
 import Ajv2020 from "ajv/dist/2020.js";
 import schema from "../nano-app.schema.json" with { type: "json" };
 import type { SymbolIndex } from "./symbol-index.ts";
+import { DOMAIN_PRIMITIVES } from "./symbol-index.ts";
 
 export interface Diagnostic {
   severity: "error";
@@ -107,6 +108,23 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     const decision = binding?.output?.decision;
     if (decision != null && decisionIds && !decisionIds.has(decision)) {
       push(`/llm/${name}/output/decision`, `no model declares a decision with id "${decision}"`, "unknown-decision");
+    }
+  }
+
+  // types[].fields[].type is a primitive or resolves to another declared type id
+  // (nominal — ADR 0029 §4 / ADR 0031). This runs without an index (intra-manifest).
+  const primitives = new Set<string>(DOMAIN_PRIMITIVES);
+  const typeIds = new Set(Object.keys(manifest.types ?? {}));
+  for (const [id, t] of Object.entries(manifest.types ?? {}) as [string, any][]) {
+    for (const [fieldKey, f] of Object.entries(t?.fields ?? {}) as [string, any][]) {
+      const ft = f?.type;
+      if (typeof ft === "string" && !primitives.has(ft) && !typeIds.has(ft)) {
+        push(
+          `/types/${id}/fields/${fieldKey}/type`,
+          `field type "${ft}" is neither a primitive nor a declared domain type`,
+          "unknown-type",
+        );
+      }
     }
   }
 

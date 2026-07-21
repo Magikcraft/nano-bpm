@@ -32,18 +32,46 @@ export interface FormSymbol {
 	id: string;
 	fields: FormFieldSymbol[];
 }
+/** The primitive field types a domain type (ADR 0029 §4 / ADR 0031) may use. */
+export type DomainPrimitive = "string" | "number" | "integer" | "boolean" | "date" | "datetime" | "json";
+export declare const DOMAIN_PRIMITIVES: readonly DomainPrimitive[];
+export interface InferredField {
+	key: string;
+	type: DomainPrimitive;
+}
+/**
+ * A candidate domain record inferred from a form's fields — the ADR 0029 §4
+ * on-ramp: the maker either promotes it into the `types` registry or binds it
+ * to a datasource table. Inference is heuristic (form keys are free strings),
+ * so it is a suggestion, never a silently-invented schema.
+ */
+export interface InferredRecord {
+	/** Candidate type id — the source form's id. */
+	id: string;
+	source: "form";
+	sourcePath: string;
+	fields: InferredField[];
+}
 export interface SymbolIndex {
 	processes: ProcessSymbol[];
 	/** All declared bpmn:message names (targets of action.message). */
 	messages: string[];
 	decisions: DecisionSymbol[];
 	forms: FormSymbol[];
+	/** Candidate domain records inferred from forms (ADR 0029 §4 promotion on-ramp). */
+	inferredRecords: InferredRecord[];
 	/** Non-fatal problems encountered while parsing a model file. */
 	parseErrors: {
 		path: string;
 		message: string;
 	}[];
 }
+/**
+ * Map a form-js component `type` to a domain primitive (ADR 0029 §4). Heuristic
+ * and deliberately conservative — anything not clearly numeric/boolean/temporal
+ * falls back to `string`, and the maker confirms on promotion.
+ */
+export declare function formTypeToPrimitive(formType: string): DomainPrimitive;
 /**
  * Build the symbol index from a project's model files. Parse failures are
  * collected in `parseErrors` rather than thrown, so one malformed model does not
@@ -52,6 +80,33 @@ export interface SymbolIndex {
 export declare function buildSymbolIndex(models: ModelFile[]): Promise<SymbolIndex>;
 /** Classify a model file by extension (helper for callers listing a project dir). */
 export declare function modelKindOf(path: string): ModelFile["kind"] | undefined;
+export interface ResolvedField {
+	key: string;
+	/** A primitive, or the id of another declared type (nominal). */
+	type: string;
+	optional: boolean;
+	list: boolean;
+}
+export interface ResolvedDomainType {
+	id: string;
+	name?: string;
+	/** Identity discipline; "nominal" today (the structural escape hatch is reserved). */
+	match: "nominal" | "structural";
+	/** Datasource table this type binds to as its rest projection, if any. */
+	table?: string;
+	fields: ResolvedField[];
+}
+export interface DomainTypeResolution {
+	/** Types declared in the manifest `types` registry. */
+	declared: ResolvedDomainType[];
+	/** Form-inferred candidates not already declared — a maker may promote these. */
+	inferred: InferredRecord[];
+}
+/**
+ * Resolve the domain types a maker can reference. Pass the project `index` to
+ * include form-inferred candidates; omit it for the declared registry alone.
+ */
+export declare function resolveDomainTypes(manifest: unknown, index?: SymbolIndex): DomainTypeResolution;
 export interface Diagnostic {
 	severity: "error";
 	/** JSON Pointer (RFC 6901) to the offending node. */
@@ -140,6 +195,12 @@ export interface AppManifest {
 	models?: Models;
 	data?: Data;
 	/**
+	 * The domain type registry (ADR 0029 §4, ADR 0031). Named record types keyed by a stable id — the *nominal* identity every reference resolves against. A type's fields project onto three shapes: form field (face), process variable (motion) and datasource row (rest); the Process-Relational Mapper (ADR 0031) generates the mapping. Types here are the transient/declared source; a datasource table is the other (ADR 0029 §4).
+	 */
+	types?: {
+		[k: string]: DomainType;
+	};
+	/**
 	 * Event sources bound to engine actions (ADR 0025).
 	 */
 	triggers?: Trigger[];
@@ -196,6 +257,40 @@ interface DataSource {
 	 * Path to a migrations directory.
 	 */
 	migrations?: string;
+}
+interface DomainType {
+	/**
+	 * Human-readable label. The map key remains the stable id every reference uses.
+	 */
+	name?: string;
+	/**
+	 * Identity discipline. `nominal` (default): references resolve by this type's id. `structural` is a reserved escape hatch (match by field shape) — declared here but not yet honoured by the validator/mapper.
+	 */
+	match?: "nominal" | "structural";
+	/**
+	 * Optional datasource table this type binds to as its rest projection (ADR 0031 rest bank). Absent = transient / non-persisted (ADR 0029 §4.2). Table existence is validated once the datasource schema() runtime (ADR 0024) lands; the shape is checked now.
+	 */
+	table?: string;
+	/**
+	 * Field name → field definition. Field names are the keys the form field, the variable path and the datasource column share (ADR 0029 §4).
+	 */
+	fields: {
+		[k: string]: DomainField;
+	};
+}
+interface DomainField {
+	/**
+	 * A primitive type, or the id of another domain type in the registry (nominal reference). Primitive ids take precedence over an identically named type.
+	 */
+	type: ("string" | "number" | "integer" | "boolean" | "date" | "datetime" | "json") | Slug;
+	/**
+	 * Whether the field may be absent.
+	 */
+	optional?: boolean;
+	/**
+	 * Whether the field is a list of `type` rather than a single value.
+	 */
+	list?: boolean;
 }
 interface Trigger {
 	id: Slug;
