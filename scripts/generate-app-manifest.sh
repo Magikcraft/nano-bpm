@@ -30,7 +30,7 @@ fi
 cd "${SPEC_DIR}"
 
 if [[ ! -d node_modules ]]; then
-  echo "Installing spec-app dev dependencies (ajv, json-schema-to-typescript)"
+  echo "Installing spec-app dev dependencies (ajv, json-schema-to-typescript, esbuild)"
   npm install --no-audit --no-fund
 fi
 
@@ -44,5 +44,11 @@ else
   echo "Generating TypeScript AppManifest types into spec-app/gen/"
   npm run --silent gen
 fi
+
+# Build the browser-consumable package artifact (dist/index.js + dist/index.d.ts)
+# — a self-contained ESM bundle + flattened declarations the console imports
+# without re-bundling the moddle parsers. Committed like gen/ and console/dist.
+echo "Building spec-app dist/ (bundled ESM + declarations)"
+npm run --silent build
 
 echo "Done."
