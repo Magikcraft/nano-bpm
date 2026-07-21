@@ -201,6 +201,33 @@ jobs:
       - name: Verify + test
         run: mvn --batch-mode --no-transfer-progress verify
 
+  spec-app:
+    name: spec-app (Urban App manifest)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: spec-app
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+      - name: Install (locked)
+        # `npm ci` pins the exact dep versions from package-lock.json so the
+        # esbuild bundle CI rebuilds is byte-identical to the committed one.
+        run: npm ci
+      - name: Test (validate + gen --check + typecheck + unit)
+        run: npm test
+      - name: Rebuild committed dist/ artifact
+        # spec-app/dist (bundled ESM + flattened .d.ts) is committed and imported
+        # by the web console. It is a build artifact, so it can drift if src/ is
+        # edited without a rebuild. Rebuild it here...
+        run: npm run build
+      - name: Fail if dist/ is stale
+        # ...and fail the build if the committed artifact doesn't match a fresh
+        # build (the maker forgot `npm run build` / `make generate-app-manifest`).
+        run: git diff --exit-code -- dist
+
   processos:
     name: processos (clippy + test)
     runs-on: ubuntu-24.04

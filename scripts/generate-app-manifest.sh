@@ -51,4 +51,13 @@ fi
 echo "Building spec-app dist/ (bundled ESM + declarations)"
 npm run --silent build
 
+if [[ "${1:-}" == "--check" ]]; then
+  echo "Checking committed spec-app/dist/ is up to date"
+  if ! git -C "${PROJECT_ROOT}" diff --exit-code -- spec-app/dist; then
+    echo "error: spec-app/dist/ is stale. Run 'make generate-app-manifest'" >&2
+    echo "       (or 'npm run build' in spec-app/) and commit the result." >&2
+    exit 1
+  fi
+fi
+
 echo "Done."
