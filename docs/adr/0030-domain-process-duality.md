@@ -141,7 +141,10 @@ irreducible, so Urban does not *eliminate* the domain wiring — it **encapsulat
 - **The domain owns the motion↔rest *projection*** — declare the type once and the mapping between
   "object-in-flight (process variables)" and "object-at-rest (datasource row)" is **generated, not
   hand-written.** The two workers every Camunda customer writes — persist-to-DB and rehydrate-from-DB
-  — vanish, because the domain model *is* the projection.
+  — vanish, because the domain model *is* the projection. ADR 0031 names this mechanism the
+  **Process-Relational Mapper**: an ORM whose third bank is the engine, mapping the domain type across
+  *tense* (in-flight vs. at-rest) as well as space, with the datasource's Drizzle schema (ADR 0024) as
+  its rest bank.
 
 ### 5. The method became a process — and the read model becomes domain-shaped
 
