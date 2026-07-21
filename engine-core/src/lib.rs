@@ -76,7 +76,10 @@ mod model;
 mod state;
 
 pub mod bpmn;
+pub mod dmn;
 pub mod feel;
+
+mod xml;
 
 #[cfg(feature = "ffi")]
 pub mod ffi;
