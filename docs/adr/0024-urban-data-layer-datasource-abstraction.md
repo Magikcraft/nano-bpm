@@ -152,6 +152,10 @@ substrate; (b) the alias must be able to become Postgres while the engine journa
 the two have different lifecycles (App data is the maker's domain model; the journal is engine
 internals). They share the App's data directory but not a file or a durability model.
 
+The datasource is also where ADR 0028's multi-user identity lives: the `ApplicationConfiguration`
+entity and the users/roles/sessions tables are rows in an App datasource, which is why per-user/
+tenant **row-level scoping** (Postgres RLS vs. app-level filters) is a shared open question here.
+
 ## Phased plan
 
 1. **datasource-core** — the §2 `DataSource` interface + the SQLite driver + manifest §1 parsing

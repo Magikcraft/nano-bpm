@@ -148,8 +148,9 @@ default `:8080`).
 ## Open questions
 
 - **Auth/identity on the served surfaces** — who may view `/tasks`, complete a task, or call an
-  action? First-party auth (none / shared-secret / OIDC) and how the manifest expresses it; ties to
-  ADR 0025 webhook auth and ADR 0024 secrets.
+  action? **Resolved in ADR 0028** (`0028-urban-app-user-auth-identity-authorization.md`): tiered
+  App-user auth (none / local username+password / OIDC social) with role-based rules enforced by
+  middleware on this ADR's action API + surfaces, backed by the `ApplicationConfiguration` entity.
 - **Form data binding on submit** — how a rendered form's payload maps to `createInstance` variables
   vs. `complete` variables, and how ADR 0024 bound controls (option lists from a datasource) are
   fetched by the viewer at render time.
