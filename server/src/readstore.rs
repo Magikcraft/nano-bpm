@@ -31,7 +31,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bumped whenever the schema or projection changes; a stored database with a
 /// different version is dropped and rebuilt from the journal.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA: &str = "
 CREATE TABLE process_definitions (
@@ -105,6 +105,47 @@ CREATE TABLE variables (
     process_definition_id  TEXT NOT NULL,
     process_definition_key TEXT NOT NULL,
     UNIQUE(scope_key, name)
+);
+CREATE TABLE decision_requirements (
+    drg_id        TEXT PRIMARY KEY,
+    drg_key       INTEGER NOT NULL,
+    name          TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    resource_name TEXT NOT NULL DEFAULT '',
+    xml           TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE decision_definitions (
+    decision_id                   TEXT PRIMARY KEY,
+    decision_key                  INTEGER NOT NULL,
+    name                          TEXT NOT NULL,
+    version                       INTEGER NOT NULL,
+    decision_requirements_key     INTEGER NOT NULL,
+    decision_requirements_id      TEXT NOT NULL,
+    decision_requirements_name    TEXT NOT NULL DEFAULT '',
+    decision_requirements_version INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE decision_instances (
+    eval_instance_key         TEXT PRIMARY KEY,
+    decision_evaluation_key   INTEGER NOT NULL,
+    idx                       INTEGER NOT NULL,
+    decision_id               TEXT NOT NULL,
+    decision_key              INTEGER NOT NULL,
+    decision_name             TEXT NOT NULL,
+    decision_type             TEXT NOT NULL,
+    version                   INTEGER NOT NULL,
+    decision_requirements_id  TEXT NOT NULL,
+    decision_requirements_key INTEGER NOT NULL,
+    root_decision_key         INTEGER NOT NULL,
+    instance_key              INTEGER NOT NULL,
+    element_instance_key      INTEGER NOT NULL,
+    process_definition_key    TEXT NOT NULL DEFAULT '',
+    state                     TEXT NOT NULL,
+    evaluation_failure        TEXT,
+    evaluation_date_ms        INTEGER NOT NULL,
+    result_json               TEXT NOT NULL,
+    inputs_json               TEXT NOT NULL,
+    rules_json                TEXT NOT NULL,
+    tenant_id                 TEXT NOT NULL
 );
 ";
 
@@ -180,6 +221,7 @@ fn incident_kind_code(k: IncidentKind) -> i64 {
         IncidentKind::NoMatchingSequenceFlow => 1,
         IncidentKind::UnhandledError => 2,
         IncidentKind::ExpressionEvaluation => 3,
+        IncidentKind::DecisionEvaluation => 4,
     }
 }
 fn incident_kind_from(code: i64) -> IncidentKind {
@@ -187,6 +229,7 @@ fn incident_kind_from(code: i64) -> IncidentKind {
         1 => IncidentKind::NoMatchingSequenceFlow,
         2 => IncidentKind::UnhandledError,
         3 => IncidentKind::ExpressionEvaluation,
+        4 => IncidentKind::DecisionEvaluation,
         _ => IncidentKind::JobNoRetries,
     }
 }
@@ -268,6 +311,70 @@ pub struct VariableRow {
     pub value: String,
     pub process_definition_id: String,
     pub process_definition_key: String,
+}
+
+/// A projected decision-instance record (one per evaluated decision in a
+/// `businessRuleTask`'s decision evaluation), materialized from
+/// [`Event::DecisionEvaluated`] for the DecisionInstance query API.
+pub struct DecisionInstanceRow {
+    /// `<decisionEvaluationKey>-<index>`, the decision instance's unique id.
+    pub eval_instance_key: String,
+    pub decision_evaluation_key: Key,
+    /// 1-based index of this decision within its evaluation.
+    pub idx: i64,
+    pub decision_id: String,
+    pub decision_key: Key,
+    pub decision_name: String,
+    /// Camunda decision type spelling (e.g. `DECISION_TABLE`).
+    pub decision_type: String,
+    pub version: i32,
+    pub decision_requirements_id: String,
+    pub decision_requirements_key: Key,
+    pub root_decision_key: Key,
+    pub instance_key: Key,
+    pub element_instance_key: Key,
+    /// The owning process definition key (decimal string), or empty when the
+    /// instance row is not colocated in this shard.
+    pub process_definition_key: String,
+    /// Camunda decision-instance state spelling (`EVALUATED` / `FAILED`).
+    pub state: String,
+    pub evaluation_failure: Option<String>,
+    pub evaluation_date_ms: u64,
+    /// The decision output as a JSON-document string.
+    pub result_json: String,
+    /// Serialized `Vec<EvaluatedInput>` (engine-core DMN audit).
+    pub inputs_json: String,
+    /// Serialized `Vec<MatchedRule>` (engine-core DMN audit).
+    pub rules_json: String,
+    pub tenant_id: String,
+}
+
+/// A projected decision-requirements-graph (one per DRG id, latest version).
+#[derive(Debug, Clone)]
+pub struct DecisionRequirementsRow {
+    pub drg_id: String,
+    pub drg_key: Key,
+    pub name: String,
+    pub version: i32,
+    /// Synthesized `{drg_id}.dmn` (the engine does not retain the original name).
+    pub resource_name: String,
+    /// The verbatim DMN XML the graph was parsed from (empty for graphs built
+    /// programmatically rather than parsed).
+    pub xml: String,
+}
+
+/// A projected decision definition (one per decision id, latest version) with its
+/// owning DRG's id/name/version denormalized in for querying.
+#[derive(Debug, Clone)]
+pub struct DecisionDefinitionRow {
+    pub decision_id: String,
+    pub decision_key: Key,
+    pub name: String,
+    pub version: i32,
+    pub decision_requirements_key: Key,
+    pub decision_requirements_id: String,
+    pub decision_requirements_name: String,
+    pub decision_requirements_version: i32,
 }
 
 /// WAL autocheckpoint threshold in pages for the read-model store. Default 12288
@@ -1091,6 +1198,28 @@ impl ReadStore {
         .expect("query incident")
     }
 
+    /// All decision-instance rows in this shard.
+    pub fn decision_instances(&self) -> Vec<DecisionInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let sql = format!("SELECT {DECISION_INSTANCE_COLS} FROM decision_instances");
+        let mut stmt = conn.prepare(&sql).expect("prepare decision_instances");
+        let rows = stmt
+            .query_map([], map_decision_instance)
+            .expect("query decision_instances");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// A single decision-instance by its `<decisionEvaluationKey>-<index>` id.
+    pub fn decision_instance(&self, eval_instance_key: &str) -> Option<DecisionInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let sql = format!(
+            "SELECT {DECISION_INSTANCE_COLS} FROM decision_instances WHERE eval_instance_key = ?1"
+        );
+        conn.query_row(&sql, params![eval_instance_key], map_decision_instance)
+            .optional()
+            .expect("query decision_instance")
+    }
+
     pub fn process_definitions(&self) -> Vec<ProcessDefinitionRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
@@ -1108,7 +1237,87 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
-    /// The verbatim BPMN XML for the process definition with `key`, or `None`
+    pub fn decision_requirements(&self) -> Vec<DecisionRequirementsRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DECISION_REQUIREMENTS_COLS} FROM decision_requirements"
+            ))
+            .expect("prepare decision_requirements");
+        let rows = stmt
+            .query_map([], map_decision_requirements)
+            .expect("query decision_requirements");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// A single decision-requirements graph by its numeric key.
+    pub fn decision_requirements_by_key(&self, key: Key) -> Option<DecisionRequirementsRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!(
+                "SELECT {DECISION_REQUIREMENTS_COLS} FROM decision_requirements WHERE drg_key = ?1"
+            ),
+            params![key as i64],
+            map_decision_requirements,
+        )
+        .optional()
+        .expect("query decision_requirements_by_key")
+    }
+
+    /// The verbatim DMN XML for the DRG with `key`, or `None` when no such graph
+    /// is projected. Empty-string XML (a graph built programmatically rather than
+    /// parsed) is returned as `Some("")`.
+    pub fn decision_requirements_xml(&self, key: Key) -> Option<String> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT xml FROM decision_requirements WHERE drg_key = ?1",
+            params![key as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query decision_requirements_xml")
+    }
+
+    pub fn decision_definitions(&self) -> Vec<DecisionDefinitionRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DECISION_DEFINITION_COLS} FROM decision_definitions"
+            ))
+            .expect("prepare decision_definitions");
+        let rows = stmt
+            .query_map([], map_decision_definition)
+            .expect("query decision_definitions");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// A single decision definition by its numeric key.
+    pub fn decision_definition_by_key(&self, key: Key) -> Option<DecisionDefinitionRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!("SELECT {DECISION_DEFINITION_COLS} FROM decision_definitions WHERE decision_key = ?1"),
+            params![key as i64],
+            map_decision_definition,
+        )
+        .optional()
+        .expect("query decision_definition_by_key")
+    }
+
+    /// The DMN XML of the DRG owning the decision definition with `key`, or `None`
+    /// when no such decision is projected.
+    pub fn decision_definition_xml(&self, key: Key) -> Option<String> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT r.xml FROM decision_definitions d \
+             JOIN decision_requirements r ON r.drg_key = d.decision_requirements_key \
+             WHERE d.decision_key = ?1",
+            params![key as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query decision_definition_xml")
+    }
+
     /// when no such definition is projected (only the latest version per process
     /// id is retained, mirroring the engine). Empty-string XML (a definition
     /// built programmatically rather than parsed) is returned as `Some("")`.
@@ -1290,7 +1499,61 @@ impl ReadModel {
         None
     }
 
-    // --- scans: concatenate across shards (partition-disjoint) ---
+    pub fn decision_requirements(&self) -> Vec<DecisionRequirementsRow> {
+        for s in &self.shards {
+            let defs = s.decision_requirements();
+            if !defs.is_empty() {
+                return defs;
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn decision_requirements_by_key(&self, key: Key) -> Option<DecisionRequirementsRow> {
+        for s in &self.shards {
+            if let Some(row) = s.decision_requirements_by_key(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn decision_requirements_xml(&self, key: Key) -> Option<String> {
+        for s in &self.shards {
+            if let Some(xml) = s.decision_requirements_xml(key) {
+                return Some(xml);
+            }
+        }
+        None
+    }
+
+    pub fn decision_definitions(&self) -> Vec<DecisionDefinitionRow> {
+        for s in &self.shards {
+            let defs = s.decision_definitions();
+            if !defs.is_empty() {
+                return defs;
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn decision_definition_by_key(&self, key: Key) -> Option<DecisionDefinitionRow> {
+        for s in &self.shards {
+            if let Some(row) = s.decision_definition_by_key(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn decision_definition_xml(&self, key: Key) -> Option<String> {
+        for s in &self.shards {
+            if let Some(xml) = s.decision_definition_xml(key) {
+                return Some(xml);
+            }
+        }
+        None
+    }
 
     pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
         self.shards
@@ -1309,6 +1572,28 @@ impl ReadModel {
 
     pub fn incidents(&self) -> Vec<IncidentRow> {
         self.shards.iter().flat_map(|s| s.incidents()).collect()
+    }
+
+    /// Every decision-instance row across all shards. Decision instances live in
+    /// the shard of their owning process instance (routed by `max_key`), so a
+    /// full listing must concatenate across shards.
+    pub fn decision_instances(&self) -> Vec<DecisionInstanceRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.decision_instances())
+            .collect()
+    }
+
+    /// A single decision-instance by its composite `<key>-<idx>` id. The row is
+    /// keyed by a string (not a partition-encoding numeric key), so its shard is
+    /// unknown — scan every shard for the first match.
+    pub fn decision_instance(&self, eval_instance_key: &str) -> Option<DecisionInstanceRow> {
+        for s in &self.shards {
+            if let Some(row) = s.decision_instance(eval_instance_key) {
+                return Some(row);
+            }
+        }
+        None
     }
 
     pub fn variables(&self) -> Vec<VariableRow> {
@@ -1465,6 +1750,68 @@ fn map_variable(r: &rusqlite::Row) -> rusqlite::Result<VariableRow> {
     })
 }
 
+/// Column list for `decision_instances` selects, shared by scan and point lookup.
+const DECISION_INSTANCE_COLS: &str = "eval_instance_key, decision_evaluation_key, idx, decision_id, \
+     decision_key, decision_name, decision_type, version, decision_requirements_id, \
+     decision_requirements_key, root_decision_key, instance_key, element_instance_key, \
+     process_definition_key, state, evaluation_failure, evaluation_date_ms, result_json, \
+     inputs_json, rules_json, tenant_id";
+
+fn map_decision_instance(r: &rusqlite::Row) -> rusqlite::Result<DecisionInstanceRow> {
+    Ok(DecisionInstanceRow {
+        eval_instance_key: r.get(0)?,
+        decision_evaluation_key: r.get::<_, i64>(1)? as Key,
+        idx: r.get(2)?,
+        decision_id: r.get(3)?,
+        decision_key: r.get::<_, i64>(4)? as Key,
+        decision_name: r.get(5)?,
+        decision_type: r.get(6)?,
+        version: r.get(7)?,
+        decision_requirements_id: r.get(8)?,
+        decision_requirements_key: r.get::<_, i64>(9)? as Key,
+        root_decision_key: r.get::<_, i64>(10)? as Key,
+        instance_key: r.get::<_, i64>(11)? as Key,
+        element_instance_key: r.get::<_, i64>(12)? as Key,
+        process_definition_key: r.get(13)?,
+        state: r.get(14)?,
+        evaluation_failure: r.get(15)?,
+        evaluation_date_ms: r.get::<_, i64>(16)? as u64,
+        result_json: r.get(17)?,
+        inputs_json: r.get(18)?,
+        rules_json: r.get(19)?,
+        tenant_id: r.get(20)?,
+    })
+}
+
+const DECISION_REQUIREMENTS_COLS: &str = "drg_id, drg_key, name, version, resource_name, xml";
+
+fn map_decision_requirements(r: &rusqlite::Row) -> rusqlite::Result<DecisionRequirementsRow> {
+    Ok(DecisionRequirementsRow {
+        drg_id: r.get(0)?,
+        drg_key: r.get::<_, i64>(1)? as Key,
+        name: r.get(2)?,
+        version: r.get(3)?,
+        resource_name: r.get(4)?,
+        xml: r.get(5)?,
+    })
+}
+
+const DECISION_DEFINITION_COLS: &str = "decision_id, decision_key, name, version, \
+     decision_requirements_key, decision_requirements_id, decision_requirements_name, \
+     decision_requirements_version";
+
+fn map_decision_definition(r: &rusqlite::Row) -> rusqlite::Result<DecisionDefinitionRow> {
+    Ok(DecisionDefinitionRow {
+        decision_id: r.get(0)?,
+        decision_key: r.get::<_, i64>(1)? as Key,
+        name: r.get(2)?,
+        version: r.get(3)?,
+        decision_requirements_key: r.get::<_, i64>(4)? as Key,
+        decision_requirements_id: r.get(5)?,
+        decision_requirements_name: r.get(6)?,
+        decision_requirements_version: r.get(7)?,
+    })
+}
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
 /// the wire: strings are JSON-quoted (so a string `myValue` becomes `"myValue"`),
 /// numbers and booleans render bare, and lists/objects render as JSON.
@@ -2009,6 +2356,193 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
             variables,
         } => {
             upsert_variables(tx, *instance_key, *scope_key, variables)?;
+        }
+
+        Event::DecisionRequirementsDeployed {
+            decision_requirements_key,
+            version,
+            drg,
+            ..
+        } => {
+            // Latest version per DRG id (a redeploy replaces), mirroring the
+            // engine's `state.decision_requirements`. The resource name is not
+            // retained by the engine, so it is synthesized from the DRG id (as the
+            // process read model does for BPMN); the raw XML is carried on the DRG.
+            let resource_name = format!("{}.dmn", drg.id);
+            tx.cexecute(
+                "INSERT INTO decision_requirements (drg_id, drg_key, name, version, resource_name, xml) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(drg_id) DO UPDATE SET drg_key = excluded.drg_key, \
+                 name = excluded.name, version = excluded.version, \
+                 resource_name = excluded.resource_name, xml = excluded.xml",
+                params![
+                    drg.id,
+                    *decision_requirements_key as i64,
+                    drg.name,
+                    version,
+                    resource_name,
+                    drg.xml,
+                ],
+            )?;
+        }
+
+        Event::DecisionDeployed {
+            decision_requirements_key,
+            decision_key,
+            decision_id,
+            decision_name,
+            version,
+            ..
+        } => {
+            // Resolve the owning DRG's id/name/version (its
+            // DecisionRequirementsDeployed was projected first, in emission order).
+            let (drg_id, drg_name, drg_version): (String, String, i32) = tx
+                .cquery_row(
+                    "SELECT drg_id, name, version FROM decision_requirements WHERE drg_key = ?1",
+                    params![*decision_requirements_key as i64],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            tx.cexecute(
+                "INSERT INTO decision_definitions \
+                 (decision_id, decision_key, name, version, decision_requirements_key, \
+                  decision_requirements_id, decision_requirements_name, decision_requirements_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 ON CONFLICT(decision_id) DO UPDATE SET decision_key = excluded.decision_key, \
+                 name = excluded.name, version = excluded.version, \
+                 decision_requirements_key = excluded.decision_requirements_key, \
+                 decision_requirements_id = excluded.decision_requirements_id, \
+                 decision_requirements_name = excluded.decision_requirements_name, \
+                 decision_requirements_version = excluded.decision_requirements_version",
+                params![
+                    decision_id,
+                    *decision_key as i64,
+                    decision_name,
+                    version,
+                    *decision_requirements_key as i64,
+                    drg_id,
+                    drg_name,
+                    drg_version,
+                ],
+            )?;
+        }
+
+        Event::DecisionEvaluated {
+            instance_key,
+            element_instance_key,
+            decision_key: root_decision_key,
+            evaluated_decisions,
+            evaluated_at,
+            ..
+        } => {
+            // The owning process definition key (join within this shard; the
+            // businessRuleTask instance is projected here). Empty when absent.
+            let process_definition_key: String = tx
+                .cquery_row(
+                    "SELECT process_definition_key FROM process_instances WHERE key = ?1",
+                    params![*instance_key as i64],
+                    |r| r.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            // One decision-instance row per evaluated decision (required
+            // decisions first, root decision last), indexed 1-based within the
+            // evaluation, mirroring Zeebe's decision-instance records.
+            for (i, ed) in evaluated_decisions.iter().enumerate() {
+                let idx = (i + 1) as i64;
+                let eval_instance_key = format!("{root_decision_key}-{idx}");
+                let (decision_key, version, drg_id, drg_key): (i64, i32, String, i64) = tx
+                    .cquery_row(
+                        "SELECT decision_key, version, decision_requirements_id, \
+                         decision_requirements_key FROM decision_definitions WHERE decision_id = ?1",
+                        params![ed.decision_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+                    .unwrap_or((*root_decision_key as i64, 1, String::new(), 0));
+                let result_json = serde_json::to_string(&crate::value_to_json(&ed.decision_output))
+                    .unwrap_or_else(|_| "null".to_string());
+                let inputs_json = serde_json::to_string(
+                    &ed.evaluated_inputs
+                        .iter()
+                        .map(|inp| {
+                            serde_json::json!({
+                                "inputId": inp.input_id,
+                                "inputName": inp.input_name,
+                                "inputValue": serde_json::to_string(&crate::value_to_json(&inp.input_value))
+                                    .unwrap_or_else(|_| "null".to_string()),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|_| "[]".to_string());
+                let rules_json = serde_json::to_string(
+                    &ed.matched_rules
+                        .iter()
+                        .map(|rule| {
+                            serde_json::json!({
+                                "ruleId": rule.rule_id,
+                                "ruleIndex": rule.rule_index,
+                                "evaluatedOutputs": rule
+                                    .evaluated_outputs
+                                    .iter()
+                                    .map(|out| {
+                                        serde_json::json!({
+                                            "outputId": out.output_id,
+                                            "outputName": out.output_name,
+                                            "outputValue": serde_json::to_string(&crate::value_to_json(&out.output_value))
+                                                .unwrap_or_else(|_| "null".to_string()),
+                                        })
+                                    })
+                                    .collect::<Vec<_>>(),
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap_or_else(|_| "[]".to_string());
+                let decision_type = crate::dmn_decision_type_name(&ed.decision_type);
+                tx.cexecute(
+                    "INSERT INTO decision_instances \
+                     (eval_instance_key, decision_evaluation_key, idx, decision_id, decision_key, \
+                      decision_name, decision_type, version, decision_requirements_id, \
+                      decision_requirements_key, root_decision_key, instance_key, \
+                      element_instance_key, process_definition_key, state, evaluation_failure, \
+                      evaluation_date_ms, result_json, inputs_json, rules_json, tenant_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
+                      ?16, ?17, ?18, ?19, ?20, ?21) \
+                     ON CONFLICT(eval_instance_key) DO NOTHING",
+                    params![
+                        eval_instance_key,
+                        *root_decision_key as i64,
+                        idx,
+                        ed.decision_id,
+                        decision_key,
+                        ed.decision_name,
+                        decision_type,
+                        version,
+                        drg_id,
+                        drg_key,
+                        *root_decision_key as i64,
+                        *instance_key as i64,
+                        *element_instance_key as i64,
+                        process_definition_key,
+                        "EVALUATED",
+                        Option::<String>::None,
+                        *evaluated_at as i64,
+                        result_json,
+                        inputs_json,
+                        rules_json,
+                        "<default>",
+                    ],
+                )?;
+            }
         }
 
         // Events with no queryable read-model projection.

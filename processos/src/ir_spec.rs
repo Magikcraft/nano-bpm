@@ -101,6 +101,24 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         ],
     },
     KindSpec {
+        keyword: "businessRuleTask",
+        doc: "DMN-bound task. Evaluates `decisionId` natively in-engine (no job) and merges the output.",
+        attrs: &[
+            AttrSpec {
+                key: "decisionId",
+                required: true,
+                ty: AttrType::Str,
+                doc: "Raw `zeebe:calledDecision decisionId` (literal id or FEEL).",
+            },
+            AttrSpec {
+                key: "resultVariable",
+                required: false,
+                ty: AttrType::Str,
+                doc: "Variable to bind the decision output to; if absent a map output is spread.",
+            },
+        ],
+    },
+    KindSpec {
         keyword: "userTask",
         doc: "Native user task. A human claims and completes it via the user-task API.",
         attrs: &[
@@ -754,6 +772,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         StartEvent => "startEvent",
         EndEvent => "endEvent",
         ServiceTask { .. } => "serviceTask",
+        BusinessRuleTask { .. } => "businessRuleTask",
         UserTask(_) => "userTask",
         ExclusiveGateway => "exclusiveGateway",
         ParallelGateway => "parallelGateway",
@@ -789,6 +808,13 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
             ElementKind::ServiceTask {
                 job_type: "worker".into(),
                 priority: Some("50".into()),
+            },
+        ),
+        (
+            "businessRuleTask",
+            ElementKind::BusinessRuleTask {
+                decision_id: "greeting".into(),
+                result_variable: Some("greeting".into()),
             },
         ),
         (

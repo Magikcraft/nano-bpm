@@ -19,6 +19,11 @@ pub enum Command {
     /// deployment. All processes share one deployment key; each is assigned its
     /// own process-definition key and a per-id version.
     DeployResources(Vec<ProcessDefinition>),
+    /// Atomically register one or more decision requirements graphs (parsed
+    /// `.dmn` resources) as a deployment. Each DRG is assigned a
+    /// decision-requirements key and a per-DRG-id version; each decision it
+    /// contains is indexed by id for `businessRuleTask`/EvaluateDecision lookup.
+    DeployDecisionRequirements(Vec<crate::dmn::DecisionRequirementsGraph>),
     /// Start a new instance of a previously deployed process, seeding it with the
     /// given variables (used by exclusive-gateway conditions), optional tags, and
     /// an optional business id.
@@ -252,6 +257,7 @@ impl Command {
         match self {
             Command::DeployProcess(_) => "deploy_process",
             Command::DeployResources(_) => "deploy_resources",
+            Command::DeployDecisionRequirements(_) => "deploy_decision_requirements",
             Command::CreateInstance { .. } => "create_instance",
             Command::CompleteJob { .. } => "complete_job",
             Command::AssignUserTask { .. } => "assign_user_task",

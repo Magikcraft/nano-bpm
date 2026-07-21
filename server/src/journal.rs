@@ -1176,7 +1176,14 @@ impl Journal {
         self.engine.install_deployment(events);
         let deployed: Vec<Event> = events
             .iter()
-            .filter(|e| matches!(e, Event::ProcessDeployed { .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::ProcessDeployed { .. }
+                        | Event::DecisionRequirementsDeployed { .. }
+                        | Event::DecisionDeployed { .. }
+                )
+            })
             .cloned()
             .collect();
         self.persist(&Arc::new(deployed))

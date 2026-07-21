@@ -318,6 +318,20 @@ pub enum ElementKind {
         job_type: String,
         priority: Option<String>,
     },
+    /// A business rule task bound to a DMN decision via `zeebe:calledDecision`.
+    /// On activation the engine evaluates the referenced decision natively
+    /// against the element's variables and, on success, merges the decision
+    /// output into the instance under `result_variable` (or, if `None`, spreads a
+    /// map output's entries). Unlike a service task there is no job and no
+    /// worker — evaluation is synchronous. `decision_id` is the *raw*
+    /// (un-evaluated) decision-id expression (a literal id, or a FEEL expression
+    /// when prefixed with `=`), resolved against the instance variables at
+    /// activation. A business rule task that instead carries a `zeebe:taskDefinition`
+    /// (job-worker style) is modelled as a [`ElementKind::ServiceTask`].
+    BusinessRuleTask {
+        decision_id: String,
+        result_variable: Option<String>,
+    },
     /// A (native/Zeebe) user task. On activation it creates a user task that a
     /// human claims and completes; the token rests until the user task is
     /// completed ([`crate::Command::CompleteUserTask`]). Unlike a service task it
@@ -1123,6 +1137,26 @@ impl ProcessBuilder {
     /// Adds an exclusive (XOR) gateway.
     pub fn exclusive_gateway(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::ExclusiveGateway)
+    }
+
+    /// Adds a business rule task bound to the DMN decision `decision_id`
+    /// (a literal id, or a `=`-prefixed FEEL expression resolved at activation).
+    /// On success the decision output is merged into the instance under
+    /// `result_variable`, or — when `None` — a map output's entries are spread
+    /// into the instance scope.
+    pub fn business_rule_task(
+        self,
+        id: impl Into<String>,
+        decision_id: impl Into<String>,
+        result_variable: Option<String>,
+    ) -> Self {
+        self.add(
+            id,
+            ElementKind::BusinessRuleTask {
+                decision_id: decision_id.into(),
+                result_variable,
+            },
+        )
     }
 
     /// Adds a (native) user task: on activation it creates a user task that a

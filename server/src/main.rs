@@ -1016,9 +1016,8 @@ impl ServerImpl {
 /// `processDefinitionKey`. `install_deployment` applies only these events (never
 /// arming a second copy of a start subscription/timer).
 fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
-    deploy_journal
-        .engine()
-        .state()
+    let state = deploy_journal.engine().state();
+    let mut events: Vec<Event> = state
         .processes
         .values()
         .map(|deployed| Event::ProcessDeployed {
@@ -1029,30 +1028,80 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
             version: deployed.version,
             process: deployed.definition.clone(),
         })
-        .collect()
+        .collect();
+    // Re-emit each deployed DRG followed by its decisions so a freshly seeded
+    // replica can evaluate business rule tasks. DecisionRequirementsDeployed
+    // must precede its DecisionDeployed events (the applier resolves the DRG by
+    // key), so emit them grouped per DRG.
+    for drg in state.decision_requirements.values() {
+        events.push(Event::DecisionRequirementsDeployed {
+            deployment_key: 0,
+            decision_requirements_key: drg.key,
+            version: drg.version,
+            drg: drg.drg.clone(),
+        });
+        for decision in state
+            .decisions
+            .values()
+            .filter(|d| d.decision_requirements_key == drg.key)
+        {
+            events.push(Event::DecisionDeployed {
+                deployment_key: 0,
+                decision_requirements_key: decision.decision_requirements_key,
+                decision_key: decision.key,
+                decision_id: decision.decision_id.clone(),
+                decision_name: decision.decision_name.clone(),
+                version: decision.version,
+            });
+        }
+    }
+    events
 }
 
-/// Parses every deployment resource up front so a deploy is all-or-nothing,
-/// returning the parsed process definitions and a map from process id to its
-/// originating resource name. `Err` is `(title, detail)` for a 400 response.
-#[allow(clippy::type_complexity)]
+/// The parsed content of a deploy request: BPMN process definitions and DMN
+/// decision requirements graphs, each with a map from its id back to the
+/// originating resource file name (for the deployment response).
+struct ParsedDeploy {
+    processes: Vec<ProcessDefinition>,
+    process_resource_names: std::collections::HashMap<String, String>,
+    decisions: Vec<nanobpmn_engine_core::dmn::DecisionRequirementsGraph>,
+    /// DRG id -> resource name.
+    drg_resource_names: std::collections::HashMap<String, String>,
+}
+
+/// Parses every deployment resource up front so a deploy is all-or-nothing.
+/// A resource whose file name ends in `.dmn` is parsed as a DMN decision
+/// requirements graph; everything else is parsed as BPMN (`.bpmn` or unnamed).
+/// `Err` is `(title, detail)` for a 400 response.
 fn parse_deploy_resources(
     resources: &[(String, String)],
-) -> Result<
-    (
-        Vec<ProcessDefinition>,
-        std::collections::HashMap<String, String>,
-    ),
-    (&'static str, String),
-> {
+) -> Result<ParsedDeploy, (&'static str, String)> {
     let mut processes = Vec::new();
-    let mut resource_names: std::collections::HashMap<String, String> =
+    let mut process_resource_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut decisions = Vec::new();
+    let mut drg_resource_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for (resource_name, xml) in resources {
+        if resource_name.to_ascii_lowercase().ends_with(".dmn") {
+            match nanobpmn_engine_core::dmn::parse_dmn(xml) {
+                Ok(drg) => {
+                    drg_resource_names.insert(drg.id.clone(), resource_name.clone());
+                    decisions.push(drg);
+                }
+                Err(e) => {
+                    return Err((
+                        "Invalid DMN",
+                        format!("Failed to parse '{resource_name}': {e}."),
+                    ));
+                }
+            }
+            continue;
+        }
         match parse_bpmn(xml) {
             Ok(defs) => {
                 for def in defs {
-                    resource_names.insert(def.id.clone(), resource_name.clone());
+                    process_resource_names.insert(def.id.clone(), resource_name.clone());
                     processes.push(def);
                 }
             }
@@ -1064,7 +1113,12 @@ fn parse_deploy_resources(
             }
         }
     }
-    Ok((processes, resource_names))
+    Ok(ParsedDeploy {
+        processes,
+        process_resource_names,
+        decisions,
+        drg_resource_names,
+    })
 }
 
 impl Default for ServerImpl {
@@ -1173,7 +1227,12 @@ fn rebuild_read_model_legacy(
     let mut per_shard: std::collections::HashMap<u64, Vec<&Event>> =
         shards.iter().map(|(p, _)| (*p, Vec::new())).collect();
     for e in events {
-        if matches!(e, Event::ProcessDeployed { .. }) {
+        if matches!(
+            e,
+            Event::ProcessDeployed { .. }
+                | Event::DecisionRequirementsDeployed { .. }
+                | Event::DecisionDeployed { .. }
+        ) {
             for bucket in per_shard.values_mut() {
                 bucket.push(e);
             }
@@ -1181,6 +1240,15 @@ fn rebuild_read_model_legacy(
         }
         let p = (nanobpmn_engine_core::partition_of(e.max_key()) as usize)
             .min(num_partitions.saturating_sub(1)) as u64;
+        let p = if let Event::DecisionEvaluated { instance_key, .. } = e {
+            // Colocate the decision instance with its owning process instance
+            // (so the `process_definition_key` join resolves), not with the
+            // higher-numbered decision key its `max_key` might otherwise pick.
+            (nanobpmn_engine_core::partition_of(*instance_key) as usize)
+                .min(num_partitions.saturating_sub(1)) as u64
+        } else {
+            p
+        };
         if let Some(bucket) = per_shard.get_mut(&p) {
             bucket.push(e);
         }
@@ -6788,12 +6856,440 @@ impl ServerImpl {
         ))
     }
 
+    /// Returns a single decision instance by its `<decisionEvaluationKey>-<index>`
+    /// id from the read model. A pure read; scans every owned shard because the
+    /// composite id does not encode a partition.
+    async fn get_decision_instance_impl(
+        &self,
+        path_params: &models::GetDecisionInstancePathParams,
+    ) -> Result<apis::decision_instance::GetDecisionInstanceResponse, ()> {
+        use apis::decision_instance::GetDecisionInstanceResponse as Resp;
+
+        let key = &path_params.decision_evaluation_instance_key;
+        match self.store.decision_instance(key) {
+            Some(row) => Ok(Resp::Status200_TheDecisionInstanceIsSuccessfullyReturned(
+                decision_instance_get_result(&row),
+            )),
+            None => Ok(
+                Resp::Status404_TheDecisionInstanceWithTheGivenKeyWasNotFound(problem(
+                    "Decision instance not found",
+                    404,
+                    format!("No decision instance with key '{key}'."),
+                )),
+            ),
+        }
+    }
+
+    /// Searches decision instances in the read model, applying the filter algebra,
+    /// multi-field sort, and pagination shared by the other `search*` endpoints.
+    async fn search_decision_instances_impl(
+        &self,
+        body: &Option<models::DecisionInstanceSearchQuery>,
+    ) -> Result<apis::decision_instance::SearchDecisionInstancesResponse, ()> {
+        use apis::decision_instance::SearchDecisionInstancesResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let rows = self.store.decision_instances();
+
+        let mut matched: Vec<&readstore::DecisionInstanceRow> = rows
+            .iter()
+            .filter(|row| match filter {
+                None => true,
+                Some(f) => {
+                    query::match_decision_evaluation_instance_key(
+                        &f.decision_evaluation_instance_key,
+                        &row.eval_instance_key,
+                    ) && query::match_decision_instance_state(&f.state, &row.state)
+                        && f.evaluation_failure.as_ref().is_none_or(|want| {
+                            row.evaluation_failure.as_deref() == Some(want.as_str())
+                        })
+                        && f.decision_definition_id
+                            .as_ref()
+                            .is_none_or(|want| want == &row.decision_id)
+                        && f.decision_definition_name
+                            .as_ref()
+                            .is_none_or(|want| want == &row.decision_name)
+                        && f.decision_definition_version
+                            .is_none_or(|want| want == row.version)
+                        && f.decision_definition_type
+                            .as_ref()
+                            .is_none_or(|want| want.to_string() == row.decision_type)
+                        && f.tenant_id
+                            .as_ref()
+                            .is_none_or(|want| want == &row.tenant_id)
+                        && f.decision_evaluation_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.decision_evaluation_key.to_string())
+                        && f.process_definition_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.process_definition_key)
+                        && f.process_instance_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.instance_key.to_string())
+                        && query::match_decision_definition_key(
+                            &f.decision_definition_key,
+                            &row.decision_key.to_string(),
+                        )
+                        && query::match_element_instance_key(
+                            &f.element_instance_key,
+                            &row.element_instance_key.to_string(),
+                        )
+                        && query::match_decision_definition_key(
+                            &f.root_decision_definition_key,
+                            &row.root_decision_key.to_string(),
+                        )
+                        && query::match_decision_requirements_key(
+                            &f.decision_requirements_key,
+                            &row.decision_requirements_key.to_string(),
+                        )
+                }
+            })
+            .collect();
+
+        // A synthetic, unique numeric key for stable sort tiebreak + cursors: the
+        // evaluation key scaled past the small within-evaluation index.
+        let entity_key = |row: &readstore::DecisionInstanceRow| -> u64 {
+            row.decision_evaluation_key
+                .wrapping_mul(1000)
+                .wrapping_add(row.idx as u64)
+        };
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::DecisionInstanceSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |row, field| match field {
+                "evaluationDate" => query::SortVal::Num(row.evaluation_date_ms as i64),
+                "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
+                "decisionDefinitionName" => query::SortVal::Str(row.decision_name.clone()),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
+                "decisionDefinitionVersion" => query::SortVal::Num(row.version as i64),
+                "decisionDefinitionType" => query::SortVal::Str(row.decision_type.clone()),
+                "processInstanceKey" => query::SortVal::Num(row.instance_key as i64),
+                "state" => query::SortVal::Str(row.state.clone()),
+                "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
+                "decisionEvaluationInstanceKey" => {
+                    query::SortVal::Str(row.eval_instance_key.clone())
+                }
+                _ => query::SortVal::Num(entity_key(row) as i64),
+            },
+            |row| entity_key(row),
+        );
+
+        let sorted: Vec<(u64, &readstore::DecisionInstanceRow)> = matched
+            .into_iter()
+            .map(|row| (entity_key(row), row))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::DecisionInstanceResult> = page
+            .items
+            .into_iter()
+            .map(decision_instance_result)
+            .collect();
+
+        Ok(Resp::Status200_TheDecisionInstanceSearchResult(
+            models::DecisionInstanceSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    async fn get_decision_definition_impl(
+        &self,
+        path_params: &models::GetDecisionDefinitionPathParams,
+    ) -> Result<apis::decision_definition::GetDecisionDefinitionResponse, ()> {
+        use apis::decision_definition::GetDecisionDefinitionResponse as Resp;
+
+        let raw = &path_params.decision_definition_key;
+        let key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheDecisionDefinitionWithTheGivenKeyWasNotFound(problem(
+                        "Decision definition not found",
+                        404,
+                        format!("Decision definition key '{raw}' is not a valid key."),
+                    )),
+                );
+            }
+        };
+
+        match self.store.decision_definition_by_key(key) {
+            Some(row) => Ok(Resp::Status200_TheDecisionDefinitionIsSuccessfullyReturned(
+                decision_definition_result(&row),
+            )),
+            None => Ok(
+                Resp::Status404_TheDecisionDefinitionWithTheGivenKeyWasNotFound(problem(
+                    "Decision definition not found",
+                    404,
+                    format!("No decision definition with key {key}."),
+                )),
+            ),
+        }
+    }
+
+    async fn get_decision_definition_xml_impl(
+        &self,
+        path_params: &models::GetDecisionDefinitionXmlPathParams,
+    ) -> Result<apis::decision_definition::GetDecisionDefinitionXmlResponse, ()> {
+        use apis::decision_definition::GetDecisionDefinitionXmlResponse as Resp;
+
+        let raw = &path_params.decision_definition_key;
+        let key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheDecisionDefinitionWithTheGivenKeyWasNotFound(problem(
+                        "Decision definition not found",
+                        404,
+                        format!("Decision definition key '{raw}' is not a valid key."),
+                    )),
+                );
+            }
+        };
+
+        match self.store.decision_definition_xml(key) {
+            Some(xml) => {
+                Ok(Resp::Status200_TheXMLOfTheDecisionDefinitionIsSuccessfullyReturned(xml))
+            }
+            None => Ok(
+                Resp::Status404_TheDecisionDefinitionWithTheGivenKeyWasNotFound(problem(
+                    "Decision definition not found",
+                    404,
+                    format!("No decision definition with key {key}."),
+                )),
+            ),
+        }
+    }
+
+    async fn search_decision_definitions_impl(
+        &self,
+        body: &Option<models::DecisionDefinitionSearchQuery>,
+    ) -> Result<apis::decision_definition::SearchDecisionDefinitionsResponse, ()> {
+        use apis::decision_definition::SearchDecisionDefinitionsResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let rows = self.store.decision_definitions();
+
+        let mut matched: Vec<&readstore::DecisionDefinitionRow> = rows
+            .iter()
+            .filter(|row| match filter {
+                None => true,
+                Some(f) => {
+                    // The read model keeps only the latest version per decision, so
+                    // `isLatestVersion=true` matches all rows and `false` matches none.
+                    f.is_latest_version.is_none_or(|want| want)
+                        && f.decision_definition_id
+                            .as_ref()
+                            .is_none_or(|want| want == &row.decision_id)
+                        && f.name.as_ref().is_none_or(|want| want == &row.name)
+                        && f.version.is_none_or(|want| want == row.version)
+                        && f.decision_requirements_id
+                            .as_ref()
+                            .is_none_or(|want| want == &row.decision_requirements_id)
+                        && f.tenant_id.as_ref().is_none_or(|want| want == "<default>")
+                        && f.decision_definition_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.decision_key.to_string())
+                        && f.decision_requirements_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.decision_requirements_key.to_string())
+                        && f.decision_requirements_name
+                            .as_ref()
+                            .is_none_or(|want| want == &row.decision_requirements_name)
+                        && f.decision_requirements_version
+                            .is_none_or(|want| want == row.decision_requirements_version)
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::DecisionDefinitionSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |row, field| match field {
+                "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
+                "name" => query::SortVal::Str(row.name.clone()),
+                "version" => query::SortVal::Num(row.version as i64),
+                "decisionRequirementsId" => {
+                    query::SortVal::Str(row.decision_requirements_id.clone())
+                }
+                "decisionRequirementsKey" => {
+                    query::SortVal::Num(row.decision_requirements_key as i64)
+                }
+                "decisionRequirementsName" => {
+                    query::SortVal::Str(row.decision_requirements_name.clone())
+                }
+                "decisionRequirementsVersion" => {
+                    query::SortVal::Num(row.decision_requirements_version as i64)
+                }
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(row.decision_key as i64),
+            },
+            |row| row.decision_key,
+        );
+
+        let sorted: Vec<(u64, &readstore::DecisionDefinitionRow)> = matched
+            .into_iter()
+            .map(|row| (row.decision_key, row))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::DecisionDefinitionResult> = page
+            .items
+            .into_iter()
+            .map(decision_definition_result)
+            .collect();
+
+        Ok(Resp::Status200_TheDecisionDefinitionSearchResult(
+            models::DecisionDefinitionSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    async fn get_decision_requirements_impl(
+        &self,
+        path_params: &models::GetDecisionRequirementsPathParams,
+    ) -> Result<apis::decision_requirements::GetDecisionRequirementsResponse, ()> {
+        use apis::decision_requirements::GetDecisionRequirementsResponse as Resp;
+
+        let raw = &path_params.decision_requirements_key;
+        let key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheDecisionRequirementsWithTheGivenKeyWasNotFound(problem(
+                        "Decision requirements not found",
+                        404,
+                        format!("Decision requirements key '{raw}' is not a valid key."),
+                    )),
+                );
+            }
+        };
+
+        match self.store.decision_requirements_by_key(key) {
+            Some(row) => Ok(
+                Resp::Status200_TheDecisionRequirementsIsSuccessfullyReturned(
+                    decision_requirements_result(&row),
+                ),
+            ),
+            None => Ok(
+                Resp::Status404_TheDecisionRequirementsWithTheGivenKeyWasNotFound(problem(
+                    "Decision requirements not found",
+                    404,
+                    format!("No decision requirements with key {key}."),
+                )),
+            ),
+        }
+    }
+
+    async fn get_decision_requirements_xml_impl(
+        &self,
+        path_params: &models::GetDecisionRequirementsXmlPathParams,
+    ) -> Result<apis::decision_requirements::GetDecisionRequirementsXmlResponse, ()> {
+        use apis::decision_requirements::GetDecisionRequirementsXmlResponse as Resp;
+
+        let raw = &path_params.decision_requirements_key;
+        let key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheDecisionRequirementsWithTheGivenKeyWasNotFound(problem(
+                        "Decision requirements not found",
+                        404,
+                        format!("Decision requirements key '{raw}' is not a valid key."),
+                    )),
+                );
+            }
+        };
+
+        match self.store.decision_requirements_xml(key) {
+            Some(xml) => {
+                Ok(Resp::Status200_TheXMLOfTheDecisionRequirementsIsSuccessfullyReturned(xml))
+            }
+            None => Ok(
+                Resp::Status404_TheDecisionRequirementsWithTheGivenKeyWasNotFound(problem(
+                    "Decision requirements not found",
+                    404,
+                    format!("No decision requirements with key {key}."),
+                )),
+            ),
+        }
+    }
+
+    async fn search_decision_requirements_impl(
+        &self,
+        body: &Option<models::DecisionRequirementsSearchQuery>,
+    ) -> Result<apis::decision_requirements::SearchDecisionRequirementsResponse, ()> {
+        use apis::decision_requirements::SearchDecisionRequirementsResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let rows = self.store.decision_requirements();
+
+        let mut matched: Vec<&readstore::DecisionRequirementsRow> = rows
+            .iter()
+            .filter(|row| match filter {
+                None => true,
+                Some(f) => {
+                    f.decision_requirements_name
+                        .as_ref()
+                        .is_none_or(|want| want == &row.name)
+                        && f.decision_requirements_id
+                            .as_ref()
+                            .is_none_or(|want| want == &row.drg_id)
+                        && f.decision_requirements_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.drg_key.to_string())
+                        && f.version.is_none_or(|want| want == row.version)
+                        && f.tenant_id.as_ref().is_none_or(|want| want == "<default>")
+                        && f.resource_name
+                            .as_ref()
+                            .is_none_or(|want| want == &row.resource_name)
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::DecisionRequirementsSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |row, field| match field {
+                "decisionRequirementsId" => query::SortVal::Str(row.drg_id.clone()),
+                "decisionRequirementsKey" => query::SortVal::Num(row.drg_key as i64),
+                "decisionRequirementsName" => query::SortVal::Str(row.name.clone()),
+                "version" => query::SortVal::Num(row.version as i64),
+                "resourceName" => query::SortVal::Str(row.resource_name.clone()),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
+                _ => query::SortVal::Num(row.drg_key as i64),
+            },
+            |row| row.drg_key,
+        );
+
+        let sorted: Vec<(u64, &readstore::DecisionRequirementsRow)> =
+            matched.into_iter().map(|row| (row.drg_key, row)).collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::DecisionRequirementsResult> = page
+            .items
+            .into_iter()
+            .map(decision_requirements_result)
+            .collect();
+
+        Ok(Resp::Status200_TheDecisionRequirementsSearchResult(
+            models::DecisionRequirementsSearchQueryResult::new(page.response, items),
+        ))
+    }
+
     async fn search_process_instances_impl(
         &self,
         body: &Option<models::ProcessInstanceSearchQuery>,
     ) -> Result<apis::process_instance::SearchProcessInstancesResponse, ()> {
         use apis::process_instance::SearchProcessInstancesResponse as Resp;
-
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let instances = self.store.process_instances();
 
@@ -7759,7 +8255,7 @@ impl ServerImpl {
         // Falcon protocol and return its answer. Single-node always owns
         // partition 0, so this is the unchanged local path.
         if self.engine.topology().is_local(0) {
-            let (processes, resource_names) = match parse_deploy_resources(&resources) {
+            let parsed = match parse_deploy_resources(&resources) {
                 Ok(parsed) => parsed,
                 Err((title, detail)) => {
                     return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
@@ -7768,7 +8264,13 @@ impl ServerImpl {
                 }
             };
             match self
-                .deploy_resources_locally(processes, &resource_names, &tenant_id)
+                .deploy_resources_locally(
+                    parsed.processes,
+                    &parsed.process_resource_names,
+                    parsed.decisions,
+                    &parsed.drg_resource_names,
+                    &tenant_id,
+                )
                 .await
             {
                 Ok((result, events)) => {
@@ -7791,31 +8293,254 @@ impl ServerImpl {
         }
     }
 
-    /// Deploys already-parsed `processes` on this node's deployment partition
-    /// (durable) and replicates the definition(s) in-memory to its other owned
-    /// partitions. Returns the typed deployment result and the minted
-    /// `ProcessDeployed` events (for cross-node broadcast). The caller must be the
+    /// Standalone decision evaluation: `POST /v2/decision-definitions/evaluation`
+    /// (Zeebe `EvaluateDecision`). Resolves the deployed decision by id (latest
+    /// version) or by key, evaluates it natively against the request variables,
+    /// and maps the native DMN result onto the REST `EvaluateDecisionResult`
+    /// (including the per-decision audit trail and any evaluation failure).
+    ///
+    /// This is a pure read against the in-memory decision registry, which is
+    /// replicated onto every owned partition, so it runs on any local partition
+    /// without cross-node forwarding.
+    async fn evaluate_decision_impl(
+        &self,
+        body: &models::DecisionEvaluationInstruction,
+    ) -> Result<apis::decision_definition::EvaluateDecisionResponse, ()> {
+        use apis::decision_definition::EvaluateDecisionResponse as Resp;
+
+        // Unpack the request variant (by id, latest version, or by key).
+        let (by_id, by_key_str, variables_map, tenant_id) = match body {
+            models::DecisionEvaluationInstruction::DecisionEvaluationById(b) => (
+                Some(b.decision_definition_id.clone()),
+                None,
+                b.variables.clone(),
+                b.tenant_id.clone(),
+            ),
+            models::DecisionEvaluationInstruction::DecisionEvaluationByKey(b) => (
+                None,
+                Some(b.decision_definition_key.0.clone()),
+                b.variables.clone(),
+                b.tenant_id.clone(),
+            ),
+        };
+        let tenant_id = tenant_id.unwrap_or_else(|| "<default>".to_string());
+        let variables = variables_map
+            .as_ref()
+            .map(from_object_map)
+            .unwrap_or_default();
+        let by_key: Option<nanobpmn_engine_core::Key> = match &by_key_str {
+            Some(s) => match s.parse() {
+                Ok(k) => Some(k),
+                Err(_) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid decision key",
+                        400,
+                        format!("Decision definition key '{s}' is not a valid key."),
+                    )));
+                }
+            },
+            None => None,
+        };
+
+        // Evaluate on any owned partition (the decision registry is replicated
+        // to all of them), resolving each evaluated decision's deployment key
+        // and version inside the actor while the state is borrowed.
+        let by_id_owned = by_id.clone();
+        let handle = match self.engine.all().first() {
+            Some(h) => h,
+            None => {
+                return Ok(
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "No engine partition",
+                        500,
+                        "This node hosts no engine partition to evaluate the decision.".to_string(),
+                    )),
+                );
+            }
+        };
+        type PerDecision = (nanobpmn_engine_core::Key, i32);
+        let evaluation: Option<(nanobpmn_engine_core::DecisionEvaluation, Vec<PerDecision>)> =
+            handle
+                .with(move |journal| {
+                    let engine = journal.engine();
+                    let eval = engine.evaluate_deployed_decision(
+                        by_id_owned.as_deref(),
+                        by_key,
+                        &variables,
+                    )?;
+                    let per_decision: Vec<PerDecision> = eval
+                        .result
+                        .evaluated_decisions
+                        .iter()
+                        .map(|ed| {
+                            engine
+                                .deployed_decision_key_version(&ed.decision_id)
+                                .unwrap_or((eval.decision_key, eval.version))
+                        })
+                        .collect();
+                    Some((eval, per_decision))
+                })
+                .await;
+
+        let (eval, per_decision) = match evaluation {
+            Some(t) => t,
+            None => {
+                let reference = by_id
+                    .map(|id| format!("id '{id}'"))
+                    .or_else(|| by_key_str.map(|k| format!("key '{k}'")))
+                    .unwrap_or_else(|| "the given reference".to_string());
+                return Ok(Resp::Status404_TheDecisionIsNotFound(problem(
+                    "Decision not found",
+                    404,
+                    format!("No deployed decision with {reference}."),
+                )));
+            }
+        };
+
+        // Map the native DMN audit trail onto the REST result.
+        let evaluated_decisions: Vec<models::EvaluatedDecisionResult> = eval
+            .result
+            .evaluated_decisions
+            .iter()
+            .zip(per_decision.iter())
+            .map(|(ed, (key, version))| {
+                let matched_rules = ed
+                    .matched_rules
+                    .iter()
+                    .map(|rule| {
+                        let evaluated_outputs = rule
+                            .evaluated_outputs
+                            .iter()
+                            .map(|out| {
+                                models::EvaluatedDecisionOutputItem::new(
+                                    out.output_id.clone(),
+                                    out.output_name.clone().unwrap_or_default(),
+                                    dmn_value_to_string(&out.output_value),
+                                    nanobpm_gateway_rest::types::Nullable::Present(
+                                        rule.rule_id.clone(),
+                                    ),
+                                    nanobpm_gateway_rest::types::Nullable::Present(
+                                        rule.rule_index as i32,
+                                    ),
+                                )
+                            })
+                            .collect();
+                        models::MatchedDecisionRuleItem::new(
+                            rule.rule_id.clone(),
+                            rule.rule_index as i32,
+                            evaluated_outputs,
+                        )
+                    })
+                    .collect();
+                let evaluated_inputs = ed
+                    .evaluated_inputs
+                    .iter()
+                    .map(|inp| {
+                        models::EvaluatedDecisionInputItem::new(
+                            inp.input_id.clone(),
+                            inp.input_name.clone().unwrap_or_default(),
+                            dmn_value_to_string(&inp.input_value),
+                        )
+                    })
+                    .collect();
+                models::EvaluatedDecisionResult::new(
+                    ed.decision_id.clone(),
+                    ed.decision_name.clone(),
+                    *version,
+                    dmn_decision_type_name(&ed.decision_type).to_string(),
+                    dmn_value_to_string(&ed.decision_output),
+                    tenant_id.clone(),
+                    matched_rules,
+                    evaluated_inputs,
+                    models::DecisionDefinitionKey(key.to_string()),
+                    format!("{key}-1"),
+                )
+            })
+            .collect();
+
+        let (failed_id, failure_message) = match &eval.result.failure {
+            Some(f) => (
+                nanobpm_gateway_rest::types::Nullable::Present(f.failed_decision_id.clone()),
+                nanobpm_gateway_rest::types::Nullable::Present(f.message.clone()),
+            ),
+            None => (
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+            ),
+        };
+
+        let result = models::EvaluateDecisionResult::new(
+            eval.decision_id.clone(),
+            models::DecisionDefinitionKey(eval.decision_key.to_string()),
+            eval.decision_name.clone(),
+            eval.version,
+            models::DecisionEvaluationKey(eval.decision_key.to_string()),
+            models::DecisionInstanceKey(format!("{}-1", eval.decision_key)),
+            eval.decision_requirements_id.clone(),
+            models::DecisionRequirementsKey(eval.decision_requirements_key.to_string()),
+            evaluated_decisions,
+            failed_id,
+            failure_message,
+            dmn_value_to_string(&eval.result.decision_output),
+            tenant_id,
+        );
+        Ok(Resp::Status200_TheDecisionWasEvaluated(result))
+    }
+
+    /// Deploys already-parsed `processes` and DMN `decisions` on this node's
+    /// deployment partition (durable) and replicates the definition(s) in-memory
+    /// to its other owned partitions. Returns the typed deployment result and the
+    /// minted deployment events (for cross-node broadcast). The caller must be the
     /// partition-0 owner. `Err` carries `(title, detail)` for a 400.
     async fn deploy_resources_locally(
         &self,
         processes: Vec<ProcessDefinition>,
         resource_names: &std::collections::HashMap<String, String>,
+        decisions: Vec<nanobpmn_engine_core::dmn::DecisionRequirementsGraph>,
+        drg_resource_names: &std::collections::HashMap<String, String>,
         tenant_id: &str,
     ) -> Result<(models::DeploymentResult, Arc<Vec<Event>>), (&'static str, String)> {
         let requested_ids: Vec<String> = processes.iter().map(|p| p.id.clone()).collect();
+        let requested_drg_ids: Vec<String> = decisions.iter().map(|d| d.id.clone()).collect();
         // The closure returns, besides the emitted events and commit, the
         // resolved (key, version) for every *requested* process id read back from
         // post-apply state. An idempotent redeploy emits no event but must still
         // be reported with its existing version, so the response is built from
         // this resolution rather than from the events alone.
         type Resolved = Vec<(String, u64, i32)>;
-        let deploy_result: Result<(Arc<Vec<Event>>, Commit, Resolved), String> = self
+        // Resolved decisions: (decision_id, name, key, version, drg_id, drg_key).
+        type ResolvedDecisions = Vec<(String, String, u64, i32, String, u64)>;
+        // Resolved DRGs: (drg_id, name, key, version).
+        type ResolvedDrgs = Vec<(String, String, u64, i32)>;
+        #[allow(clippy::type_complexity)]
+        let deploy_result: Result<
+            (
+                Arc<Vec<Event>>,
+                Commit,
+                Resolved,
+                ResolvedDrgs,
+                ResolvedDecisions,
+            ),
+            String,
+        > = self
             .engine
             .deploy_partition()
             .with(move |engine| {
                 let (events, commit) = engine
                     .apply_command(Command::DeployResources(processes))
                     .map_err(|e| e.to_string())?;
+                // Deploy any DMN decisions in the same durable batch. Their events
+                // are appended so the whole deployment broadcasts/replicates as one.
+                let mut all_events = (*events).clone();
+                let mut commit = commit;
+                if !decisions.is_empty() {
+                    let (dec_events, dec_commit) = engine
+                        .apply_command(Command::DeployDecisionRequirements(decisions))
+                        .map_err(|e| e.to_string())?;
+                    all_events.extend((*dec_events).iter().cloned());
+                    commit = dec_commit;
+                }
+                let events = Arc::new(all_events);
                 let resolved: Resolved = requested_ids
                     .iter()
                     .filter_map(|id| {
@@ -7826,11 +8551,43 @@ impl ServerImpl {
                             .map(|d| (id.clone(), d.key, d.version))
                     })
                     .collect();
-                Ok((events, commit, resolved))
+                let resolved_drgs: ResolvedDrgs = requested_drg_ids
+                    .iter()
+                    .filter_map(|id| {
+                        engine
+                            .state()
+                            .decision_requirements
+                            .get(id)
+                            .map(|d| (id.clone(), d.drg.name.clone(), d.key, d.version))
+                    })
+                    .collect();
+                let resolved_decisions: ResolvedDecisions = requested_drg_ids
+                    .iter()
+                    .filter_map(|id| engine.state().decision_requirements.get(id))
+                    .flat_map(|drg| {
+                        drg.drg
+                            .decisions
+                            .iter()
+                            .filter_map(|d| {
+                                engine.state().decisions.get(&d.id).map(|dep| {
+                                    (
+                                        dep.decision_id.clone(),
+                                        dep.decision_name.clone(),
+                                        dep.key,
+                                        dep.version,
+                                        drg.drg.id.clone(),
+                                        drg.key,
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                Ok((events, commit, resolved, resolved_drgs, resolved_decisions))
             })
             .await;
-        let (events, commit, resolved) = match deploy_result {
-            Ok(triple) => triple,
+        let (events, commit, resolved, resolved_drgs, resolved_decisions) = match deploy_result {
+            Ok(t) => t,
             Err(e) => return Err(("Invalid deployment", e)),
         };
         // Replicate the new definition(s) to the other local partitions so any of
@@ -7853,7 +8610,7 @@ impl ServerImpl {
                 _ => None,
             })
             .unwrap_or_else(|| "0".to_string());
-        let deployments = resolved
+        let mut deployments: Vec<models::DeploymentMetadataResult> = resolved
             .into_iter()
             .map(|(process_id, process_definition_key, version)| {
                 let resource_name = resource_names.get(&process_id).cloned().unwrap_or_default();
@@ -7873,6 +8630,44 @@ impl ServerImpl {
                 )
             })
             .collect();
+        // One metadata entry per deployed decision requirements graph...
+        for (drg_id, drg_name, drg_key, version) in resolved_drgs {
+            let resource_name = drg_resource_names.get(&drg_id).cloned().unwrap_or_default();
+            let drg_result = models::DeploymentDecisionRequirementsResult::new(
+                drg_id,
+                drg_name,
+                version,
+                resource_name,
+                tenant_id.to_string(),
+                models::DecisionRequirementsKey(drg_key.to_string()),
+            );
+            deployments.push(models::DeploymentMetadataResult::new(
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Present(drg_result),
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+            ));
+        }
+        // ...and one per decision it contains.
+        for (decision_id, name, decision_key, version, drg_id, drg_key) in resolved_decisions {
+            let decision_result = models::DeploymentDecisionResult::new(
+                decision_id,
+                version,
+                name,
+                tenant_id.to_string(),
+                drg_id,
+                models::DecisionDefinitionKey(decision_key.to_string()),
+                models::DecisionRequirementsKey(drg_key.to_string()),
+            );
+            deployments.push(models::DeploymentMetadataResult::new(
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Present(decision_result),
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+            ));
+        }
 
         let result = models::DeploymentResult::new(
             models::DeploymentKey(deployment_key),
@@ -7893,10 +8688,15 @@ impl ServerImpl {
         resources: Vec<(String, String)>,
         tenant_id: String,
     ) -> Result<serde_json::Value, (u16, String)> {
-        let (processes, resource_names) =
-            parse_deploy_resources(&resources).map_err(|(_, detail)| (400u16, detail))?;
+        let parsed = parse_deploy_resources(&resources).map_err(|(_, detail)| (400u16, detail))?;
         let (result, events) = self
-            .deploy_resources_locally(processes, &resource_names, &tenant_id)
+            .deploy_resources_locally(
+                parsed.processes,
+                &parsed.process_resource_names,
+                parsed.decisions,
+                &parsed.drg_resource_names,
+                &tenant_id,
+            )
             .await
             .map_err(|(_, detail)| (400u16, detail))?;
         self.broadcast_deployment(&events).await;
@@ -7973,7 +8773,14 @@ impl ServerImpl {
         }
         let deployed: Vec<Event> = events
             .iter()
-            .filter(|e| matches!(e, Event::ProcessDeployed { .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::ProcessDeployed { .. }
+                        | Event::DecisionRequirementsDeployed { .. }
+                        | Event::DecisionDeployed { .. }
+                )
+            })
             .cloned()
             .collect();
         if deployed.is_empty() {
@@ -12268,6 +13075,7 @@ fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum
         IncidentKind::NoMatchingSequenceFlow => models::IncidentErrorTypeEnum::ConditionError,
         IncidentKind::ExpressionEvaluation => models::IncidentErrorTypeEnum::ExtractValueError,
         IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
+        IncidentKind::DecisionEvaluation => models::IncidentErrorTypeEnum::DecisionEvaluationError,
     }
 }
 
@@ -12310,6 +13118,196 @@ fn incident_result(incident: &readstore::IncidentRow) -> models::IncidentResult 
         types::Nullable::Null,
         models::ElementInstanceKey(incident.element_instance_key.to_string()),
         job_key,
+    )
+}
+
+/// Parses a stored `inputs_json` array into the generated input items.
+fn decision_instance_inputs(inputs_json: &str) -> Vec<models::EvaluatedDecisionInputItem> {
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(inputs_json).unwrap_or_default();
+    parsed
+        .into_iter()
+        .map(|v| {
+            models::EvaluatedDecisionInputItem::new(
+                v.get("inputId")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                v.get("inputName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                v.get("inputValue")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Parses a stored `rules_json` array into the generated matched-rule items.
+fn decision_instance_rules(rules_json: &str) -> Vec<models::MatchedDecisionRuleItem> {
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(rules_json).unwrap_or_default();
+    parsed
+        .into_iter()
+        .map(|rule| {
+            let rule_id = rule
+                .get("ruleId")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let rule_index = rule.get("ruleIndex").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let outputs = rule
+                .get("evaluatedOutputs")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|out| {
+                    models::EvaluatedDecisionOutputItem::new(
+                        out.get("outputId")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        out.get("outputName")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        out.get("outputValue")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        types::Nullable::Present(rule_id.clone()),
+                        types::Nullable::Present(rule_index),
+                    )
+                })
+                .collect();
+            models::MatchedDecisionRuleItem::new(rule_id, rule_index, outputs)
+        })
+        .collect()
+}
+
+/// Projects a [`DecisionInstanceRow`] into the generated `DecisionInstanceResult`
+/// (the search-result shape, which omits the input/rule audit).
+fn decision_definition_result(
+    row: &readstore::DecisionDefinitionRow,
+) -> models::DecisionDefinitionResult {
+    models::DecisionDefinitionResult::new(
+        row.decision_id.clone(),
+        models::DecisionDefinitionKey(row.decision_key.to_string()),
+        row.decision_requirements_id.clone(),
+        models::DecisionRequirementsKey(row.decision_requirements_key.to_string()),
+        row.decision_requirements_name.clone(),
+        row.decision_requirements_version,
+        row.name.clone(),
+        "<default>".to_string(),
+        row.version,
+    )
+}
+
+fn decision_requirements_result(
+    row: &readstore::DecisionRequirementsRow,
+) -> models::DecisionRequirementsResult {
+    models::DecisionRequirementsResult::new(
+        row.drg_id.clone(),
+        models::DecisionRequirementsKey(row.drg_key.to_string()),
+        row.name.clone(),
+        row.resource_name.clone(),
+        "<default>".to_string(),
+        row.version,
+    )
+}
+
+fn decision_instance_result(
+    row: &readstore::DecisionInstanceRow,
+) -> models::DecisionInstanceResult {
+    let evaluation_date =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
+            .unwrap_or_else(epoch);
+    let process_definition_key = if row.process_definition_key.is_empty() {
+        types::Nullable::Null
+    } else {
+        types::Nullable::Present(models::ProcessDefinitionKey(
+            row.process_definition_key.clone(),
+        ))
+    };
+    let evaluation_failure = match &row.evaluation_failure {
+        Some(f) => types::Nullable::Present(f.clone()),
+        None => types::Nullable::Null,
+    };
+    models::DecisionInstanceResult::new(
+        row.decision_id.clone(),
+        models::DecisionDefinitionKey(row.decision_key.to_string()),
+        row.decision_name.clone(),
+        row.decision_type
+            .parse()
+            .unwrap_or(models::DecisionDefinitionTypeEnum::Unknown),
+        row.version,
+        row.eval_instance_key.clone(),
+        models::DecisionEvaluationKey(row.decision_evaluation_key.to_string()),
+        types::Nullable::Present(models::ElementInstanceKey(
+            row.element_instance_key.to_string(),
+        )),
+        evaluation_date,
+        evaluation_failure,
+        process_definition_key,
+        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
+        row.result_json.clone(),
+        models::DecisionDefinitionKey(row.root_decision_key.to_string()),
+        types::Nullable::Null,
+        row.state
+            .parse()
+            .unwrap_or(models::DecisionInstanceStateEnum::Unknown),
+        row.tenant_id.clone(),
+    )
+}
+
+/// Projects a [`DecisionInstanceRow`] into the generated
+/// `DecisionInstanceGetQueryResult` (adds the evaluated-input/matched-rule audit
+/// to the search-result shape).
+fn decision_instance_get_result(
+    row: &readstore::DecisionInstanceRow,
+) -> models::DecisionInstanceGetQueryResult {
+    let evaluation_date =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
+            .unwrap_or_else(epoch);
+    let process_definition_key = if row.process_definition_key.is_empty() {
+        types::Nullable::Null
+    } else {
+        types::Nullable::Present(models::ProcessDefinitionKey(
+            row.process_definition_key.clone(),
+        ))
+    };
+    let evaluation_failure = match &row.evaluation_failure {
+        Some(f) => types::Nullable::Present(f.clone()),
+        None => types::Nullable::Null,
+    };
+    models::DecisionInstanceGetQueryResult::new(
+        row.decision_id.clone(),
+        models::DecisionDefinitionKey(row.decision_key.to_string()),
+        row.decision_name.clone(),
+        row.decision_type
+            .parse()
+            .unwrap_or(models::DecisionDefinitionTypeEnum::Unknown),
+        row.version,
+        row.eval_instance_key.clone(),
+        models::DecisionEvaluationKey(row.decision_evaluation_key.to_string()),
+        types::Nullable::Present(models::ElementInstanceKey(
+            row.element_instance_key.to_string(),
+        )),
+        evaluation_date,
+        evaluation_failure,
+        process_definition_key,
+        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
+        row.result_json.clone(),
+        models::DecisionDefinitionKey(row.root_decision_key.to_string()),
+        types::Nullable::Null,
+        row.state
+            .parse()
+            .unwrap_or(models::DecisionInstanceStateEnum::Unknown),
+        row.tenant_id.clone(),
+        decision_instance_inputs(&row.inputs_json),
+        decision_instance_rules(&row.rules_json),
     )
 }
 
@@ -12780,6 +13778,29 @@ pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
                 .map(|(k, v)| (k.clone(), value_to_json(v)))
                 .collect(),
         ),
+    }
+}
+
+/// Serialises a DMN [`Value`] into the JSON-document string the REST decision
+/// evaluation result carries in its `output`/`inputValue`/`outputValue` fields
+/// (Zeebe encodes these as JSON strings, e.g. `"hallo"`, `42`, `{"x":1}`).
+fn dmn_value_to_string(value: &Value) -> String {
+    serde_json::to_string(&value_to_json(value)).unwrap_or_else(|_| "null".to_string())
+}
+
+/// The Zeebe/Camunda REST name for a DMN decision logic type.
+pub(crate) fn dmn_decision_type_name(
+    kind: &nanobpmn_engine_core::dmn::DecisionType,
+) -> &'static str {
+    use nanobpmn_engine_core::dmn::DecisionType::*;
+    match kind {
+        DecisionTable => "DECISION_TABLE",
+        LiteralExpression => "LITERAL_EXPRESSION",
+        Context => "CONTEXT",
+        Invocation => "INVOCATION",
+        List => "LIST",
+        Relation => "RELATION",
+        Unknown => "UNKNOWN",
     }
 }
 
@@ -13628,7 +14649,12 @@ async fn main() {
                     let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
                         owned.iter().map(|p| (*p, Vec::new())).collect();
                     for event in events {
-                        if matches!(event, Event::ProcessDeployed { .. }) {
+                        if matches!(
+                            event,
+                            Event::ProcessDeployed { .. }
+                                | Event::DecisionRequirementsDeployed { .. }
+                                | Event::DecisionDeployed { .. }
+                        ) {
                             for bucket in per_owned.values_mut() {
                                 bucket.push(event.clone());
                             }
@@ -15857,7 +16883,13 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("order-flow".to_string(), "order.bpmn".to_string());
         node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy message-start process on the owner");
 
@@ -15944,7 +16976,13 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("await-payment".to_string(), "await.bpmn".to_string());
         let (_result, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -16007,6 +17045,443 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test]
+    async fn deploys_dmn_and_business_rule_task_evaluates_decision() {
+        // End-to-end server-side DMN parity check: a mixed `.dmn` + `.bpmn`
+        // deployment lands on the deployment partition, and an instance whose
+        // businessRuleTask calls the deployed decision evaluates it synchronously
+        // and runs straight through to completion.
+        let server = ServerImpl::default();
+
+        // A greeting decision table: `lang` in -> `result` string out.
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+              <rule id="r2"><inputEntry id="ie2"><text>"de"</text></inputEntry>
+                <outputEntry id="oe2"><text>"hallo"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+
+        // A process with a businessRuleTask calling the `greeting` decision and
+        // binding its output under the `greeting` variable.
+        let proc = ProcessBuilder::new("greeter")
+            .start_event("s")
+            .business_rule_task("decide", "greeting", Some("greeting".to_string()))
+            .end_event("e")
+            .connect("s", "decide")
+            .connect("decide", "e")
+            .build()
+            .expect("valid businessRuleTask process");
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("greeter".to_string(), "greeter.bpmn".to_string());
+
+        let (result, _events) = server
+            .deploy_resources_locally(vec![proc], &proc_names, vec![drg], &drg_names, "<default>")
+            .await
+            .expect("mixed dmn+bpmn deploy succeeds");
+
+        // The deployment result reports the process, the DRG, and its decision.
+        use nanobpm_gateway_rest::types::Nullable;
+        assert!(
+            result
+                .deployments
+                .iter()
+                .any(|m| matches!(m.process_definition, Nullable::Present(_))),
+            "process metadata present"
+        );
+        assert!(
+            result
+                .deployments
+                .iter()
+                .any(|m| matches!(m.decision_requirements, Nullable::Present(_))),
+            "decision-requirements metadata present"
+        );
+        assert!(
+            result
+                .deployments
+                .iter()
+                .any(|m| matches!(m.decision_definition, Nullable::Present(_))),
+            "decision-definition metadata present"
+        );
+
+        // Creating an instance evaluates the decision synchronously: the
+        // businessRuleTask has no job to wait on, so the instance completes.
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("lang".to_string(), Value::Str("de".into()));
+        let (_instance_key, completed) = server
+            .create_for_stream(Some("greeter".into()), None, variables)
+            .await
+            .expect("create the businessRuleTask instance");
+        assert!(
+            completed,
+            "the businessRuleTask evaluates the decision and completes synchronously"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_decision_api_returns_native_dmn_result() {
+        // The standalone EvaluateDecision API (POST /v2/decision-definitions/
+        // evaluation) resolves a deployed decision by id, evaluates it natively,
+        // and maps the DMN result (output + audit trail) onto the REST result.
+        use nanobpm_gateway_rest::apis::decision_definition::EvaluateDecisionResponse as Resp;
+        let server = ServerImpl::default();
+
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+              <rule id="r2"><inputEntry id="ie2"><text>"de"</text></inputEntry>
+                <outputEntry id="oe2"><text>"hallo"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+        server
+            .deploy_resources_locally(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![drg],
+                &drg_names,
+                "<default>",
+            )
+            .await
+            .expect("DMN-only deploy succeeds");
+
+        // Evaluate by id with `lang = "de"`.
+        let mut variables = std::collections::HashMap::new();
+        variables.insert(
+            "lang".to_string(),
+            nanobpm_gateway_rest::types::Object(serde_json::json!("de")),
+        );
+        let mut by_id = models::DecisionEvaluationById::new("greeting".to_string());
+        by_id.variables = Some(variables);
+        let body = models::DecisionEvaluationInstruction::DecisionEvaluationById(by_id);
+
+        let resp = server
+            .evaluate_decision_impl(&body)
+            .await
+            .expect("handler returns a response");
+        let result = match resp {
+            Resp::Status200_TheDecisionWasEvaluated(r) => r,
+            other => panic!("expected 200 evaluation, got {other:?}"),
+        };
+        assert_eq!(result.decision_definition_id, "greeting");
+        assert_eq!(result.decision_definition_name, "Greeting");
+        assert_eq!(result.output, "\"hallo\"");
+        assert_eq!(result.decision_requirements_id, "greeting-drg");
+        assert!(
+            matches!(
+                result.failure_message,
+                nanobpm_gateway_rest::types::Nullable::Null
+            ),
+            "a successful evaluation carries no failure message"
+        );
+        assert_eq!(result.evaluated_decisions.len(), 1);
+        let evaluated = &result.evaluated_decisions[0];
+        assert_eq!(evaluated.decision_definition_type, "DECISION_TABLE");
+        assert_eq!(evaluated.matched_rules.len(), 1);
+        assert_eq!(evaluated.evaluated_inputs.len(), 1);
+        assert_eq!(evaluated.evaluated_inputs[0].input_value, "\"de\"");
+
+        // An unknown decision id is a 404.
+        let unknown = models::DecisionEvaluationInstruction::DecisionEvaluationById(
+            models::DecisionEvaluationById::new("nope".to_string()),
+        );
+        let resp = server
+            .evaluate_decision_impl(&unknown)
+            .await
+            .expect("handler returns a response");
+        assert!(
+            matches!(resp, Resp::Status404_TheDecisionIsNotFound(_)),
+            "an unknown decision id is a 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_rule_task_records_a_decision_instance_in_the_read_model() {
+        // Phase 5 parity: a `businessRuleTask` evaluation emits a `DecisionEvaluated`
+        // event that the read-model exporter projects into a queryable decision
+        // instance, surfaced by the search + get DecisionInstance endpoints.
+        use apis::decision_instance::GetDecisionInstanceResponse as GetResp;
+        use apis::decision_instance::SearchDecisionInstancesResponse as SearchResp;
+        let server = ServerImpl::default();
+
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+              <rule id="r2"><inputEntry id="ie2"><text>"de"</text></inputEntry>
+                <outputEntry id="oe2"><text>"hallo"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+
+        let proc = ProcessBuilder::new("greeter")
+            .start_event("s")
+            .business_rule_task("decide", "greeting", Some("greeting".to_string()))
+            .end_event("e")
+            .connect("s", "decide")
+            .connect("decide", "e")
+            .build()
+            .expect("valid businessRuleTask process");
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("greeter".to_string(), "greeter.bpmn".to_string());
+
+        server
+            .deploy_resources_locally(vec![proc], &proc_names, vec![drg], &drg_names, "<default>")
+            .await
+            .expect("mixed dmn+bpmn deploy succeeds");
+
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("lang".to_string(), Value::Str("de".into()));
+        let (instance_key, completed) = server
+            .create_for_stream(Some("greeter".into()), None, variables)
+            .await
+            .expect("create the businessRuleTask instance");
+        assert!(completed, "the businessRuleTask completes synchronously");
+
+        // The read model is populated by the async exporter thread; poll the
+        // search endpoint until the decision instance is projected.
+        let mut found = None;
+        for _ in 0..200 {
+            let resp = server
+                .search_decision_instances_impl(&None)
+                .await
+                .expect("search returns a response");
+            let SearchResp::Status200_TheDecisionInstanceSearchResult(result) = resp else {
+                panic!("expected a 200 search result");
+            };
+            if let Some(item) = result.items.into_iter().next() {
+                found = Some(item);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let item = found.expect("the decision instance is projected into the read model");
+        assert_eq!(item.decision_definition_id, "greeting");
+        assert_eq!(item.decision_definition_name, "Greeting");
+        assert_eq!(
+            item.decision_definition_type,
+            models::DecisionDefinitionTypeEnum::DecisionTable
+        );
+        assert_eq!(item.result, "\"hallo\"");
+        assert_eq!(item.state, models::DecisionInstanceStateEnum::Evaluated);
+        assert!(
+            matches!(&item.process_instance_key, nanobpm_gateway_rest::types::Nullable::Present(k) if k.0 == instance_key.to_string()),
+            "the decision instance links back to its process instance"
+        );
+        assert!(
+            matches!(
+                &item.process_definition_key,
+                nanobpm_gateway_rest::types::Nullable::Present(_)
+            ),
+            "the owning process definition key is resolved"
+        );
+
+        // Fetch the same instance by its composite id; the get result carries the
+        // evaluated-input/matched-rule audit trail.
+        let path = models::GetDecisionInstancePathParams {
+            decision_evaluation_instance_key: item.decision_evaluation_instance_key.clone(),
+        };
+        let resp = server
+            .get_decision_instance_impl(&path)
+            .await
+            .expect("get returns a response");
+        let GetResp::Status200_TheDecisionInstanceIsSuccessfullyReturned(got) = resp else {
+            panic!("expected a 200 get result");
+        };
+        assert_eq!(got.decision_definition_id, "greeting");
+        assert_eq!(got.evaluated_inputs.len(), 1);
+        assert_eq!(got.evaluated_inputs[0].input_value, "\"de\"");
+        assert_eq!(got.matched_rules.len(), 1);
+        assert_eq!(got.matched_rules[0].evaluated_outputs.len(), 1);
+        assert_eq!(
+            got.matched_rules[0].evaluated_outputs[0].output_value,
+            "\"hallo\""
+        );
+
+        // An unknown composite id is a 404.
+        let missing = models::GetDecisionInstancePathParams {
+            decision_evaluation_instance_key: "999999-9".to_string(),
+        };
+        let resp = server
+            .get_decision_instance_impl(&missing)
+            .await
+            .expect("get returns a response");
+        assert!(
+            matches!(
+                resp,
+                GetResp::Status404_TheDecisionInstanceWithTheGivenKeyWasNotFound(_)
+            ),
+            "an unknown decision instance id is a 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn dmn_deployment_is_queryable_via_definition_and_requirements_endpoints() {
+        // Deploying a `.dmn` projects one decision-requirements graph and one
+        // decision definition into the read model, both queryable by key + search,
+        // and the raw DMN XML round-trips through the two `*Xml` endpoints.
+        use apis::decision_definition::GetDecisionDefinitionResponse as DefGet;
+        use apis::decision_definition::GetDecisionDefinitionXmlResponse as DefXml;
+        use apis::decision_definition::SearchDecisionDefinitionsResponse as DefSearch;
+        use apis::decision_requirements::GetDecisionRequirementsResponse as ReqGet;
+        use apis::decision_requirements::GetDecisionRequirementsXmlResponse as ReqXml;
+        use apis::decision_requirements::SearchDecisionRequirementsResponse as ReqSearch;
+        let server = ServerImpl::default();
+
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+        server
+            .deploy_resources_locally(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![drg],
+                &drg_names,
+                "<default>",
+            )
+            .await
+            .expect("DMN-only deploy succeeds");
+
+        // Poll the definition search until the async exporter projects the row.
+        let mut def = None;
+        for _ in 0..200 {
+            let resp = server
+                .search_decision_definitions_impl(&None)
+                .await
+                .expect("search returns a response");
+            let DefSearch::Status200_TheDecisionDefinitionSearchResult(result) = resp else {
+                panic!("expected a 200 definition search result");
+            };
+            if let Some(item) = result.items.into_iter().next() {
+                def = Some(item);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let def = def.expect("the decision definition is projected");
+        assert_eq!(def.decision_definition_id, "greeting");
+        assert_eq!(def.name, "Greeting");
+        assert_eq!(def.decision_requirements_id, "greeting-drg");
+        assert_eq!(def.decision_requirements_name, "Greeting DRG");
+        assert_eq!(def.version, 1);
+        assert_eq!(def.decision_requirements_version, 1);
+        let def_key = def.decision_definition_key.0.clone();
+        let req_key = def.decision_requirements_key.0.clone();
+
+        // Get the definition by key.
+        let resp = server
+            .get_decision_definition_impl(&models::GetDecisionDefinitionPathParams {
+                decision_definition_key: def_key.clone(),
+            })
+            .await
+            .expect("get returns a response");
+        let DefGet::Status200_TheDecisionDefinitionIsSuccessfullyReturned(got) = resp else {
+            panic!("expected a 200 definition get");
+        };
+        assert_eq!(got.decision_definition_id, "greeting");
+
+        // The definition XML endpoint returns the raw DRG XML.
+        let resp = server
+            .get_decision_definition_xml_impl(&models::GetDecisionDefinitionXmlPathParams {
+                decision_definition_key: def_key.clone(),
+            })
+            .await
+            .expect("xml returns a response");
+        let DefXml::Status200_TheXMLOfTheDecisionDefinitionIsSuccessfullyReturned(xml) = resp
+        else {
+            panic!("expected a 200 definition xml");
+        };
+        assert_eq!(xml, dmn_xml, "the raw DMN XML round-trips");
+
+        // The requirements graph is queryable too.
+        let resp = server
+            .get_decision_requirements_impl(&models::GetDecisionRequirementsPathParams {
+                decision_requirements_key: req_key.clone(),
+            })
+            .await
+            .expect("get returns a response");
+        let ReqGet::Status200_TheDecisionRequirementsIsSuccessfullyReturned(req) = resp else {
+            panic!("expected a 200 requirements get");
+        };
+        assert_eq!(req.decision_requirements_id, "greeting-drg");
+        assert_eq!(req.decision_requirements_name, "Greeting DRG");
+        assert_eq!(req.resource_name, "greeting-drg.dmn");
+        assert_eq!(req.version, 1);
+
+        let resp = server
+            .search_decision_requirements_impl(&None)
+            .await
+            .expect("search returns a response");
+        let ReqSearch::Status200_TheDecisionRequirementsSearchResult(result) = resp else {
+            panic!("expected a 200 requirements search");
+        };
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].decision_requirements_id, "greeting-drg");
+
+        let resp = server
+            .get_decision_requirements_xml_impl(&models::GetDecisionRequirementsXmlPathParams {
+                decision_requirements_key: req_key.clone(),
+            })
+            .await
+            .expect("xml returns a response");
+        let ReqXml::Status200_TheXMLOfTheDecisionRequirementsIsSuccessfullyReturned(xml) = resp
+        else {
+            panic!("expected a 200 requirements xml");
+        };
+        assert_eq!(xml, dmn_xml, "the raw DMN XML round-trips");
+
+        // Unknown/invalid keys are 404s on every endpoint.
+        assert!(matches!(
+            server
+                .get_decision_definition_impl(&models::GetDecisionDefinitionPathParams {
+                    decision_definition_key: "999999".to_string(),
+                })
+                .await
+                .unwrap(),
+            DefGet::Status404_TheDecisionDefinitionWithTheGivenKeyWasNotFound(_)
+        ));
+        assert!(matches!(
+            server
+                .get_decision_requirements_xml_impl(&models::GetDecisionRequirementsXmlPathParams {
+                    decision_requirements_key: "not-a-key".to_string(),
+                })
+                .await
+                .unwrap(),
+            ReqXml::Status404_TheDecisionRequirementsWithTheGivenKeyWasNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn message_start_dispatches_instances_across_the_node_boundary() {
         // Message-start subscriptions live only on the deploy owner (node 0). The
         // round-robin start dispatcher must spread the created instances over the
@@ -16055,7 +17530,13 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         let (_result, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -16283,7 +17764,13 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("review".to_string(), "review.bpmn".to_string());
         node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy the user-task process on the owner");
         let (instance, _) = node0
@@ -17100,7 +18587,13 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -17264,7 +18757,13 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -17460,7 +18959,13 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -17724,7 +19229,13 @@ mod clustered_startup_tests {
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         names.insert("auto".to_string(), "auto.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc, auto], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc, auto],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -20403,7 +21914,13 @@ mod subscription_placement_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("guarded".to_string(), "guarded.bpmn".to_string());
         server
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy the boundary process on every owned partition");
 
@@ -20474,7 +21991,13 @@ mod subscription_placement_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         server
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
             .await
             .expect("deploy the message-start process on every owned partition");
 

@@ -142,6 +142,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::StartEvent => "startEvent",
         ElementKind::EndEvent => "endEvent",
         ElementKind::ServiceTask { .. } => "serviceTask",
+        ElementKind::BusinessRuleTask { .. } => "businessRuleTask",
         ElementKind::UserTask(_) => "userTask",
         ElementKind::ExclusiveGateway => "exclusiveGateway",
         ElementKind::ParallelGateway => "parallelGateway",
@@ -178,6 +179,15 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             attrs.push(format!("jobType {}", quote(job_type)));
             if let Some(p) = priority {
                 attrs.push(format!("priority {}", quote(p)));
+            }
+        }
+        ElementKind::BusinessRuleTask {
+            decision_id,
+            result_variable,
+        } => {
+            attrs.push(format!("decisionId {}", quote(decision_id)));
+            if let Some(v) = result_variable {
+                attrs.push(format!("resultVariable {}", quote(v)));
             }
         }
         ElementKind::UserTask(props) => {
@@ -1044,6 +1054,10 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             job_type: attrs.require("jobType", id)?,
             priority: attrs.take("priority"),
         },
+        "businessRuleTask" => ElementKind::BusinessRuleTask {
+            decision_id: attrs.require("decisionId", id)?,
+            result_variable: attrs.take("resultVariable"),
+        },
         "userTask" => ElementKind::UserTask(nanobpmn_engine_core::UserTaskProps {
             assignee: attrs.take("assignee"),
             candidate_groups: attrs.take("candidateGroups"),
@@ -1134,6 +1148,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         ElementKind::StartEvent
         | ElementKind::EndEvent
         | ElementKind::ServiceTask { .. }
+        | ElementKind::BusinessRuleTask { .. }
         | ElementKind::UserTask(_)
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway

@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent
+element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -30,6 +30,13 @@ attrs-serviceTask   ::= "{" nl (indent2 attr-line-serviceTask nl)+ indent "}"
 attr-line-serviceTask  ::= attr-serviceTask-jobType | attr-serviceTask-priority | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 attr-serviceTask-jobType  ::= "jobType" sp attr-str   # The `zeebe:taskDefinition type` a worker subscribes to.
 attr-serviceTask-priority  ::= "priority" sp attr-str   # Raw priority expression (literal or FEEL); higher activates first.
+
+# businessRuleTask — DMN-bound task. Evaluates `decisionId` natively in-engine (no job) and merges the output.
+elem-businessRuleTask  ::= indent "businessRuleTask" sp id (sp string)? (sp attrs-businessRuleTask)? nl
+attrs-businessRuleTask   ::= "{" nl (indent2 attr-line-businessRuleTask nl)+ indent "}"
+attr-line-businessRuleTask  ::= attr-businessRuleTask-decisionId | attr-businessRuleTask-resultVariable | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-businessRuleTask-decisionId  ::= "decisionId" sp attr-str   # Raw `zeebe:calledDecision decisionId` (literal id or FEEL).
+attr-businessRuleTask-resultVariable  ::= "resultVariable" sp attr-str   # Variable to bind the decision output to; if absent a map output is spread.
 
 # userTask — Native user task. A human claims and completes it via the user-task API.
 elem-userTask  ::= indent "userTask" sp id (sp string)? (sp attrs-userTask)? nl

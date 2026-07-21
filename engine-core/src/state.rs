@@ -356,6 +356,11 @@ pub enum IncidentKind {
     ExpressionEvaluation,
     /// A thrown business error was not caught by any boundary event.
     UnhandledError,
+    /// A `businessRuleTask` failed to evaluate its decision — the decision id was
+    /// not found, or evaluation produced an error (bad FEEL, hit-policy
+    /// violation, missing input). Recoverable once the definition/inputs are
+    /// fixed and the incident is resolved.
+    DecisionEvaluation,
 }
 
 /// Lifecycle state of an incident. Incidents are retained after resolution (as
@@ -743,6 +748,47 @@ pub struct State {
     /// `L*_P = W_target·λ_P`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub created_by_process: HashMap<String, u64>,
+    /// Latest deployed decision requirements graph (parsed `.dmn`), keyed by DRG
+    /// id. Versioned per DRG id across deployments, like processes.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub decision_requirements: HashMap<String, DeployedDrg>,
+    /// Latest deployed decision, keyed by decision id, for
+    /// `businessRuleTask`/EvaluateDecision lookup. Points at the DRG it belongs
+    /// to so required-decision chains resolve.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub decisions: HashMap<String, DeployedDecision>,
+}
+
+/// A deployed decision requirements graph together with the identity the engine
+/// assigned it at deploy time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeployedDrg {
+    /// Unique key for this specific DRG (and version).
+    pub key: Key,
+    /// Version, incremented per DRG id across deployments (starts 1).
+    pub version: i32,
+    /// The parsed graph.
+    pub drg: crate::dmn::DecisionRequirementsGraph,
+}
+
+/// A deployed decision, indexed by id for evaluation lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeployedDecision {
+    /// Unique key for this specific decision (and version).
+    pub key: Key,
+    /// Version, incremented per decision id across deployments (starts 1).
+    pub version: i32,
+    /// The DRG this decision belongs to (needed to evaluate required decisions).
+    pub decision_requirements_key: Key,
+    /// The decision's id (the lookup key).
+    pub decision_id: String,
+    /// Human-readable name.
+    pub decision_name: String,
+    /// The full DRG this decision is part of, so evaluation can follow
+    /// `requiredDecision` references natively.
+    pub drg: crate::dmn::DecisionRequirementsGraph,
 }
 
 /// A self-contained snapshot of one process instance and every entity it owns
@@ -921,6 +967,57 @@ pub fn apply(state: &mut State, event: &Event) {
             );
         }
 
+        Event::DecisionRequirementsDeployed {
+            decision_requirements_key,
+            version,
+            drg,
+            ..
+        } => {
+            state.decision_requirements.insert(
+                drg.id.clone(),
+                DeployedDrg {
+                    key: *decision_requirements_key,
+                    version: *version,
+                    drg: drg.clone(),
+                },
+            );
+        }
+
+        Event::DecisionDeployed {
+            decision_requirements_key,
+            decision_key,
+            decision_id,
+            decision_name,
+            version,
+            ..
+        } => {
+            // The DRG carrying this decision was applied by the preceding
+            // DecisionRequirementsDeployed event; look it up to bind for eval.
+            if let Some(drg) = state
+                .decision_requirements
+                .values()
+                .find(|d| d.key == *decision_requirements_key)
+                .map(|d| d.drg.clone())
+            {
+                state.decisions.insert(
+                    decision_id.clone(),
+                    DeployedDecision {
+                        key: *decision_key,
+                        version: *version,
+                        decision_requirements_key: *decision_requirements_key,
+                        decision_id: decision_id.clone(),
+                        decision_name: decision_name.clone(),
+                        drg,
+                    },
+                );
+            }
+        }
+
+        Event::DecisionEvaluated { .. } => {
+            // Informational/audit only: the decision output is propagated to the
+            // instance via a separate VariablesUpdated event, and the record is
+            // surfaced to the exporter. No core state to mutate.
+        }
         Event::ProcessInstanceCreated {
             instance_key,
             process_id,

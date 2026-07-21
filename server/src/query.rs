@@ -293,6 +293,91 @@ pub fn match_incident_error_type(
     }
 }
 
+/// Matches a `DecisionDefinitionKeyFilterProperty` against a key's decimal
+/// string. Shared by the decision-instance search's `decisionDefinitionKey` and
+/// `rootDecisionDefinitionKey` filters.
+pub fn match_decision_definition_key(
+    filter: &Option<models::DecisionDefinitionKeyFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::DecisionDefinitionKeyFilterProperty::DecisionDefinitionKey(k)) => k.0 == value,
+        Some(models::DecisionDefinitionKeyFilterProperty::AdvancedDecisionDefinitionKeyFilter(
+            a,
+        )) => ops!(a, |k: &models::DecisionDefinitionKey| k.0.clone()).matches(Some(value)),
+    }
+}
+
+/// Matches a `DecisionRequirementsKeyFilterProperty` against a key's decimal
+/// string.
+pub fn match_decision_requirements_key(
+    filter: &Option<models::DecisionRequirementsKeyFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::DecisionRequirementsKeyFilterProperty::DecisionRequirementsKey(k)) => {
+            k.0 == value
+        }
+        Some(
+            models::DecisionRequirementsKeyFilterProperty::AdvancedDecisionRequirementsKeyFilter(a),
+        ) => ops!(a, |k: &models::DecisionRequirementsKey| k.0.clone()).matches(Some(value)),
+    }
+}
+
+/// Matches a `DecisionInstanceStateFilterProperty` against a state's wire
+/// spelling (`EVALUATED` / `FAILED`).
+pub fn match_decision_instance_state(
+    filter: &Option<models::DecisionInstanceStateFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::DecisionInstanceStateFilterProperty::DecisionInstanceStateEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(models::DecisionInstanceStateFilterProperty::AdvancedDecisionInstanceStateFilter(
+            a,
+        )) => ops!(
+            a,
+            |e: &models::DecisionInstanceStateEnum| e.to_string(),
+            like
+        )
+        .matches(Some(value)),
+    }
+}
+
+/// Matches a `DecisionEvaluationInstanceKeyFilterProperty` against a decision
+/// instance's `<key>-<idx>` id. The advanced filter mixes a `String` `$eq`/`$neq`
+/// with newtype `$in`/`$notIn`, so its [`Ops`] is assembled by hand.
+pub fn match_decision_evaluation_instance_key(
+    filter: &Option<models::DecisionEvaluationInstanceKeyFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::DecisionEvaluationInstanceKeyFilterProperty::String(s)) => s == value,
+        Some(
+            models::DecisionEvaluationInstanceKeyFilterProperty::AdvancedDecisionEvaluationInstanceKeyFilter(a),
+        ) => Ops {
+            eq: a.dollar_eq.clone(),
+            neq: a.dollar_neq.clone(),
+            exists: a.dollar_exists,
+            in_: a
+                .dollar_in
+                .as_ref()
+                .map(|v| v.iter().map(|k| k.0.clone()).collect()),
+            not_in: a
+                .dollar_not_in
+                .as_ref()
+                .map(|v| v.iter().map(|k| k.0.clone()).collect()),
+            like: None,
+        }
+        .matches(Some(value)),
+    }
+}
+
 /// Matches a `ProcessInstanceStateFilterProperty` against a state's wire
 /// spelling.
 pub fn match_process_instance_state(

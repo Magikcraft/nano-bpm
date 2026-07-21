@@ -51,6 +51,7 @@
 use std::collections::HashMap;
 
 use crate::model::{ProcessBuilder, ProcessDefinition};
+use crate::xml::{attr, local_name, tokenize, Token};
 
 /// An error encountered while parsing BPMN XML.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -123,7 +124,7 @@ impl std::error::Error for ParseError {}
 /// assert_eq!(defs[0].start_event, "s");
 /// ```
 pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
-    let tokens = tokenize(xml)?;
+    let tokens = tokenize(xml).map_err(|e| ParseError::MalformedXml(e.0))?;
 
     let mut processes: Vec<ProcessAcc> = Vec::new();
     let mut current: Option<ProcessAcc> = None;
@@ -283,15 +284,16 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     }
                                 }
                             }
-                            // zeebe:calledDecision decisionId="…" on a business-rule
-                            // task — use the decision id as the job type.
+                            // zeebe:calledDecision decisionId="…" resultVariable="…"
+                            // on a business-rule task — bind the node to a native
+                            // DMN decision (evaluated in-engine, no job).
                             "calledDecision" => {
                                 if let (Some(idx), Some(d)) =
                                     (cur_service_task, attr(attrs, "decisionId"))
                                 {
-                                    if acc.nodes[idx].job_type.is_none() {
-                                        acc.nodes[idx].job_type = Some(d.to_string());
-                                    }
+                                    acc.nodes[idx].decision_id = Some(d.to_string());
+                                    acc.nodes[idx].decision_result_variable =
+                                        attr(attrs, "resultVariable").map(str::to_string);
                                 }
                             }
                             "userTask" => {
@@ -930,6 +932,15 @@ struct NodeAcc {
     /// For a script task with an inline `zeebe:script`: the `resultVariable`
     /// the expression's result is stored under.
     script_result_variable: Option<String>,
+    /// For a business rule task with a `zeebe:calledDecision`: the decision id
+    /// (literal or FEEL expression) to evaluate natively. Its presence makes the
+    /// node a [`BusinessRuleTask`](crate::model::ElementKind::BusinessRuleTask)
+    /// instead of a job-based service task.
+    decision_id: Option<String>,
+    /// For a business rule task with a `zeebe:calledDecision`: the
+    /// `resultVariable` the decision output is stored under (`None` spreads a map
+    /// output into the scope).
+    decision_result_variable: Option<String>,
     /// For a conditional intermediate catch event: the FEEL `condition` (from a
     /// nested `conditionalEventDefinition`/`condition`) that must become `true`
     /// for the event to fire. Makes the node a
@@ -1043,6 +1054,8 @@ impl ProcessAcc {
             retries: None,
             script_expression: None,
             script_result_variable: None,
+            decision_id: None,
+            decision_result_variable: None,
             event_condition: None,
             multi_instance: None,
         });
@@ -1289,13 +1302,21 @@ impl ProcessAcc {
                 NodeKind::Service => {
                     // A scriptTask carrying an inline zeebe:script (expression +
                     // resultVariable) is an inline-FEEL script task, evaluated on
-                    // activation with no job; otherwise it is an ordinary
-                    // job-based service task.
+                    // activation with no job. A businessRuleTask carrying a
+                    // zeebe:calledDecision is a native DMN business rule task,
+                    // evaluated on activation with no job. Otherwise it is an
+                    // ordinary job-based service task.
                     if let (Some(expr), Some(rv)) = (
                         node.script_expression.clone(),
                         node.script_result_variable.clone(),
                     ) {
                         builder.script_task(node.id, expr, rv)
+                    } else if let Some(decision_id) = node.decision_id.clone() {
+                        builder.business_rule_task(
+                            node.id,
+                            decision_id,
+                            node.decision_result_variable.clone(),
+                        )
                     } else {
                         let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
                         builder.service_task_with_priority(node.id, job_type, node.job_priority)
@@ -1616,198 +1637,6 @@ fn parse_correlation_key(raw: &str) -> Option<String> {
     }
 }
 
-/// The local part of a possibly-namespaced XML name (`bpmn:process` -> `process`).
-fn local_name(name: &str) -> &str {
-    name.rsplit(':').next().unwrap_or(name)
-}
-
-/// Looks up an attribute by local name.
-fn attr<'a>(attrs: &'a [(String, String)], local: &str) -> Option<&'a str> {
-    attrs
-        .iter()
-        .find(|(k, _)| local_name(k) == local)
-        .map(|(_, v)| v.as_str())
-}
-
-/// A scanned XML token.
-enum Token {
-    Start {
-        name: String,
-        attrs: Vec<(String, String)>,
-        self_closing: bool,
-    },
-    End {
-        name: String,
-    },
-    Text(String),
-}
-
-/// A tiny, allocation-light XML scanner. Handles elements, attributes (single or
-/// double quoted), self-closing tags, comments, processing instructions,
-/// `DOCTYPE`, and `CDATA`. It does not validate the document.
-fn tokenize(xml: &str) -> Result<Vec<Token>, ParseError> {
-    let bytes = xml.as_bytes();
-    let mut tokens = Vec::new();
-    let mut i = 0;
-
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            // Text run up to the next '<'.
-            let start = i;
-            while i < bytes.len() && bytes[i] != b'<' {
-                i += 1;
-            }
-            let text = &xml[start..i];
-            if !text.trim().is_empty() {
-                tokens.push(Token::Text(unescape(text)));
-            }
-            continue;
-        }
-
-        // We are at '<'.
-        if xml[i..].starts_with("<!--") {
-            let end = find(xml, i + 4, "-->")?;
-            i = end + 3;
-        } else if xml[i..].starts_with("<![CDATA[") {
-            let end = find(xml, i + 9, "]]>")?;
-            tokens.push(Token::Text(xml[i + 9..end].to_string()));
-            i = end + 3;
-        } else if xml[i..].starts_with("<!") || xml[i..].starts_with("<?") {
-            // DOCTYPE / processing instruction / XML declaration: skip to '>'.
-            let end = find(xml, i + 2, ">")?;
-            i = end + 1;
-        } else if xml[i..].starts_with("</") {
-            let end = find(xml, i + 2, ">")?;
-            let name = xml[i + 2..end].trim().to_string();
-            tokens.push(Token::End { name });
-            i = end + 1;
-        } else {
-            // Start (or self-closing) tag. Find the closing '>' that is not
-            // inside a quoted attribute value.
-            let end = find_tag_end(xml, i + 1)?;
-            let inner = xml[i + 1..end].trim();
-            let (inner, self_closing) = match inner.strip_suffix('/') {
-                Some(stripped) => (stripped.trim_end(), true),
-                None => (inner, false),
-            };
-            let (name, attrs) = parse_tag(inner)?;
-            tokens.push(Token::Start {
-                name,
-                attrs,
-                self_closing,
-            });
-            i = end + 1;
-        }
-    }
-
-    Ok(tokens)
-}
-
-/// Finds the byte index of the next `needle` at or after `from`.
-fn find(haystack: &str, from: usize, needle: &str) -> Result<usize, ParseError> {
-    haystack[from..]
-        .find(needle)
-        .map(|p| from + p)
-        .ok_or_else(|| ParseError::MalformedXml(format!("expected `{needle}`")))
-}
-
-/// Finds the `>` ending a start tag, skipping any inside quoted attribute values.
-fn find_tag_end(xml: &str, from: usize) -> Result<usize, ParseError> {
-    let bytes = xml.as_bytes();
-    let mut i = from;
-    let mut quote: Option<u8> = None;
-    while i < bytes.len() {
-        let c = bytes[i];
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => {}
-            None if c == b'"' || c == b'\'' => quote = Some(c),
-            None if c == b'>' => return Ok(i),
-            None => {}
-        }
-        i += 1;
-    }
-    Err(ParseError::MalformedXml("unterminated tag".to_string()))
-}
-
-/// Splits a tag's inner text into its name and attributes.
-fn parse_tag(inner: &str) -> Result<(String, Vec<(String, String)>), ParseError> {
-    let inner = inner.trim();
-    let name_end = inner
-        .find(|c: char| c.is_whitespace())
-        .unwrap_or(inner.len());
-    let name = inner[..name_end].to_string();
-    if name.is_empty() {
-        return Err(ParseError::MalformedXml("empty tag name".to_string()));
-    }
-
-    let mut attrs = Vec::new();
-    let rest = inner[name_end..].trim_start();
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        // Attribute name up to '='.
-        let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let key = rest[key_start..i].trim();
-        // Skip whitespace and the '='.
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b'=' {
-            // Valueless attribute; ignore.
-            if key.is_empty() {
-                i += 1;
-            }
-            continue;
-        }
-        i += 1; // consume '='
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if i >= bytes.len() || (bytes[i] != b'"' && bytes[i] != b'\'') {
-            return Err(ParseError::MalformedXml(format!(
-                "attribute {key} has no quoted value"
-            )));
-        }
-        let q = bytes[i];
-        i += 1;
-        let val_start = i;
-        while i < bytes.len() && bytes[i] != q {
-            i += 1;
-        }
-        if i >= bytes.len() {
-            return Err(ParseError::MalformedXml(
-                "unterminated attribute".to_string(),
-            ));
-        }
-        let value = unescape(&rest[val_start..i]);
-        i += 1; // consume closing quote
-        if !key.is_empty() {
-            attrs.push((key.to_string(), value));
-        }
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-    }
-
-    Ok((name, attrs))
-}
-
-/// Expands the five predefined XML entities.
-fn unescape(s: &str) -> String {
-    if !s.contains('&') {
-        return s.to_string();
-    }
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1924,6 +1753,65 @@ mod tests {
             def.element("work").unwrap().kind,
             ElementKind::ServiceTask {
                 job_type: "do-work".to_string(),
+                priority: None,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_called_decision_as_a_business_rule_task() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="rules" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:businessRuleTask id="decide">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="rating" resultVariable="score" />
+      </bpmn:extensionElements>
+    </bpmn:businessRuleTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="decide" />
+    <bpmn:sequenceFlow id="f2" sourceRef="decide" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(xml).unwrap();
+        let def = &defs[0];
+        // A businessRuleTask carrying a zeebe:calledDecision becomes a native
+        // BusinessRuleTask (evaluated in-engine), not a job-based service task.
+        assert_eq!(
+            def.element("decide").unwrap().kind,
+            ElementKind::BusinessRuleTask {
+                decision_id: "rating".to_string(),
+                result_variable: Some("score".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_business_rule_task_with_task_definition_as_a_service_task() {
+        // A businessRuleTask that instead declares a job worker (zeebe:taskDefinition)
+        // stays a job-based service task — only calledDecision makes it native.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="rules2" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:businessRuleTask id="decide">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="ruler" />
+      </bpmn:extensionElements>
+    </bpmn:businessRuleTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="decide" />
+    <bpmn:sequenceFlow id="f2" sourceRef="decide" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(xml).unwrap();
+        assert_eq!(
+            defs[0].element("decide").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "ruler".to_string(),
                 priority: None,
             }
         );
