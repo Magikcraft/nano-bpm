@@ -107,7 +107,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         working-directory: engine-core
-        # nextest for the unit/integration suite (process isolation + retries,
+        # nextest for the unit/integration suite (process isolation,
         # consistent with the server job). nextest CANNOT run doctests, so the
         # crate's `///` examples (ProcessBuilder, parse_bpmn) run separately.
         run: cargo nextest run
@@ -290,7 +290,7 @@ jobs:
       - name: Test
         working-directory: processos
         # processos is a binary crate (no lib target) => no doctests, so nextest
-        # loses no coverage and gains process isolation + retries.
+        # loses no coverage and gains process isolation.
         run: cargo nextest run --no-default-features
 
   server:
@@ -338,10 +338,12 @@ jobs:
         # Run with nextest so the heavy, timing-sensitive integration tests
         # (`clustered_startup_tests` spin up multi-node Raft clusters on a
         # worker_threads=4 runtime; `seglog::tests` drive snapshot+tail recovery)
-        # run in a single-threaded group with a couple of retries — see
-        # .config/nextest.toml. This eliminates the cross-test CPU oversubscription
-        # AND absorbs the residual timing flakes that even a serial run hit on a
-        # slow runner, while the rest of the suite stays strict and parallel.
+        # run in a single-threaded group that reserves the whole test-thread
+        # pool — see .config/nextest.toml. This eliminates the cross-test CPU
+        # oversubscription that starved these timing-sensitive tests, so they run
+        # under the same uncontended conditions as locally. No retries: tests
+        # must pass on the first run; the whole suite stays strict and, apart
+        # from these serial-heavy tests, parallel.
         # (The server crate is a binary with no lib target, so there are no
         # doctests to run separately.)
         run: cargo nextest run --features console

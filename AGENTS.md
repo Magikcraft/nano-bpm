@@ -2,6 +2,10 @@
 
 Intermittently failing tests must always be root-caused and addressed as a product defect (code) or a production-line defect (test). We do not acknowledge the existence of such a thing as "flaky tests".
 
+## No Test Retries
+
+Tests must pass on the first run. We do not configure test retries anywhere (nextest `retries`, CI re-run-on-fail, etc.) — a retry only masks a real defect (product or test) and lets it reach `main`. If a test only passes on a retry, that is a defect to root-cause, not to paper over.
+
 ## Red/Green Discipline
 
 All bug fixes must have a test that reproduces the defect before modifying code. Red/Green—always.
