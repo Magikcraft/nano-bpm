@@ -2216,20 +2216,26 @@ pub(super) async fn projects_list() -> ApiResult {
 pub(super) fn extensions_overview() -> serde_json::Value {
     let exts = extensions::all_extensions();
     let trust = extensions::load_trust();
-    let list: Vec<_> = exts
-        .iter()
-        .map(|e| {
-            serde_json::json!({
-                "id": e.id, "kind": e.kind, "displayName": e.display_name, "builtin": e.builtin,
-                "icon": e.icon,
-                "fileTypes": e.file_types, "templates": e.templates,
-                "themes": e.themes,
-                "toolchainAvailable": extensions::toolchain_available(e),
-                "trusted": extensions::is_trusted(&e.id),
-            })
-        })
-        .collect();
+    let list: Vec<_> = exts.iter().map(extension_json).collect();
     serde_json::json!({ "extensions": list, "yolo": trust.yolo })
+}
+
+/// Enrich a pack manifest into the spec's `Extension` response shape. The
+/// generated model requires the computed `toolchainAvailable` and `trusted`
+/// fields on top of the raw manifest, so both the overview list and the
+/// install response must build entries through here — returning a bare
+/// manifest makes the generated round-trip panic on the missing fields.
+/// `toolchain_available` shells out (`<bin> --version`), so call this off the
+/// async runtime (it already runs inside sync/`spawn_blocking` contexts).
+fn extension_json(e: &extensions::ExtManifest) -> serde_json::Value {
+    serde_json::json!({
+        "id": e.id, "kind": e.kind, "displayName": e.display_name, "builtin": e.builtin,
+        "icon": e.icon,
+        "fileTypes": e.file_types, "templates": e.templates,
+        "themes": e.themes,
+        "toolchainAvailable": extensions::toolchain_available(e),
+        "trusted": extensions::is_trusted(&e.id),
+    })
 }
 
 /// `POST /console/api/projects` — scaffold a new project.
@@ -2293,8 +2299,12 @@ pub(super) async fn extensions_marketplace() -> ApiResult {
 
 /// `POST /console/api/extensions/install` — install a `nano-ide-ext-*` pkg from npm.
 pub(super) async fn extensions_install(pkg: String) -> ApiResult {
-    match tokio::task::spawn_blocking(move || extensions::install_from_npm(&pkg)).await {
-        Ok(Ok(m)) => Ok(serde_json::to_value(m).unwrap()),
+    match tokio::task::spawn_blocking(move || {
+        extensions::install_from_npm(&pkg).map(|m| extension_json(&m))
+    })
+    .await
+    {
+        Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
