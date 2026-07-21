@@ -104,7 +104,11 @@ Types come from two sources, in priority order:
 
 Everything then **references a type by name**: form fields bind to a type's fields; a process gets an
 optional declared `variables` type; DMN `typeRef`s map to the same registry; worker payloads are
-typed against it. The `enter-tax-form` fixture shows the on-ramp: the index *infers* a candidate
+typed against it. Matching is **nominal** — a reference resolves against the type's stable id (the
+`types` map key), not its shape — consistent with the id-based reference pickers (§1). Two records
+with identical fields but different ids are different types; a `structural` matching mode is reserved
+in the schema (`domainType.match`) as an escape hatch for later shape-based reuse, but is not yet
+honoured (see resolved open question 3). The `enter-tax-form` fixture shows the on-ramp: the index *infers* a candidate
 `taxSubmission` record from the form keys, and the maker either **promotes** it into the registry or
 **binds** it to a `taxSubmission` table — one gesture connects form, variable, and datasource. Turning
 a referenced type into its three coherent shapes — the form field (face), the process variable
@@ -161,8 +165,13 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
    maker import it (keeping the type surface curated)?
 2. **Process `variables`: required or optional schema?** Optional preserves the untyped ergonomics;
    required maximizes safety. Likely optional, opt-in per process.
-3. **Nominal vs structural** typing in the registry — does `taxSubmission` match by name or by shape
-   (affects DMN `typeRef` mapping and form reuse)?
+3. **Nominal vs structural** typing in the registry — ~~does `taxSubmission` match by name or by
+   shape~~ **Resolved (2026-07): nominal**, with a reserved structural escape hatch. A type is
+   identified by its stable `types` map key; references resolve by id, matching the id-based pickers
+   (§1). The schema carries a `domainType.match` enum (`nominal` default, `structural` reserved) so
+   shape-based reuse can be added later without a breaking change; the validator and the future PRM
+   honour only `nominal` for now. Implemented in the type registry (spec-app `types` block + validator,
+   PR #173). Shared resolution with ADR 0031 open question 6.
 4. **Relationship to FEEL's own type system** (context/list types) — does the registry generate FEEL
    type hints, or only TS?
 5. **Where the index lives** — a shared TS package imported by both the console and the Deno App's
