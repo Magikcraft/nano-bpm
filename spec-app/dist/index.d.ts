@@ -107,6 +107,32 @@ export interface DomainTypeResolution {
  * include form-inferred candidates; omit it for the declared registry alone.
  */
 export declare function resolveDomainTypes(manifest: unknown, index?: SymbolIndex): DomainTypeResolution;
+/** The kinds of reference a manifest string value can be. */
+export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "datasource" | "agent";
+export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "datasource" | "agent";
+export interface CompletionCandidate {
+	/** The literal id/name to insert (unquoted). */
+	value: string;
+	kind: CandidateKind;
+	/** Short human hint (e.g. a process name or "primitive"). */
+	detail?: string;
+}
+export interface ManifestCompletion {
+	site: ReferenceSite;
+	/** Offset span of the string *content* (between the quotes) to replace. */
+	range: {
+		start: number;
+		end: number;
+	};
+	candidates: CompletionCandidate[];
+}
+/** Just the parts of the index this engine reads (keeps callers flexible). */
+export type CompletionIndex = Pick<SymbolIndex, "processes" | "messages" | "decisions">;
+/**
+ * The public entry point: what reference completions apply at `offset`, or null
+ * when the cursor is not inside a recognized reference value.
+ */
+export declare function manifestCompletionAt(text: string, offset: number, manifest: unknown, index?: CompletionIndex): ManifestCompletion | null;
 export interface Diagnostic {
 	severity: "error";
 	/** JSON Pointer (RFC 6901) to the offending node. */
