@@ -181,8 +181,11 @@ byte-identical because everything the PRM adds lives *above* the engine contract
    milestone.
 5. **Which rest bank feeds the read model** — the PRM's domain projection or the engine's own read
    store (0012)? Two layers (domain view over process view) or one canonical noun?
-6. **Nominal vs structural** domain identity (shared with ADR 0029/0030) — does `Order` match by name
-   or by shape across face, motion, and rest, and how does that interact with DMN `typeRef`s?
+6. **Nominal vs structural** domain identity (shared with ADR 0029/0030) — ~~does `Order` match by name
+   or by shape across face, motion, and rest~~ **Resolved (2026-07): nominal** (by stable type id),
+   with a reserved `match: "structural"` escape hatch in the schema for later shape-based reuse; see
+   ADR 0029 open question 3 for the full rationale (implemented in PR #173). How nominal identity maps
+   onto DMN `typeRef`s remains open (ADR 0029 open question 6).
 7. **Relations across tense.** A classic ORM models associations at rest; when two resting entities
    relate but their *motions* are separate process instances, does the PRM model the relation only at
    rest (Drizzle FK) or also in motion (correlation between instances)?
