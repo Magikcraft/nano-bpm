@@ -85,6 +85,10 @@ generate: ## Generate the Rust REST layer + server stub impls from spec/ (needs 
 	./scripts/generate.sh
 	./scripts/generate-console.sh
 
+.PHONY: generate-app-manifest
+generate-app-manifest: ## Generate the Urban App manifest TypeScript types from spec-app/nano-app.schema.json (ADR 0027; needs Node)
+	./scripts/generate-app-manifest.sh
+
 $(GENERATED_DIR)/Cargo.toml:
 	$(MAKE) generate
 

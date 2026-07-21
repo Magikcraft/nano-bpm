@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  id="defs-heating" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:message id="Message_temp" name="temp-reading" />
+  <bpmn:process id="heating-cycle" name="Heating Cycle" isExecutable="true">
+    <bpmn:startEvent id="Start_1" />
+    <bpmn:userTask id="Confirm" name="Confirm heating">
+      <bpmn:extensionElements>
+        <zeebe:formDefinition formId="confirm-heating" />
+      </bpmn:extensionElements>
+    </bpmn:userTask>
+    <bpmn:serviceTask id="ReadThermostat" name="Read thermostat">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="read-thermostat" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+  </bpmn:process>
+  <bpmn:process id="temp-watch" name="Temp Watch" isExecutable="true">
+    <bpmn:startEvent id="Start_msg">
+      <bpmn:messageEventDefinition id="med_1" messageRef="Message_temp" />
+    </bpmn:startEvent>
+  </bpmn:process>
+</bpmn:definitions>

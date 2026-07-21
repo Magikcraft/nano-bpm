@@ -1,0 +1,9 @@
+{
+  "id": "confirm-heating",
+  "schemaVersion": 18,
+  "type": "default",
+  "components": [
+    { "type": "textfield", "key": "reading.room", "label": "Room" },
+    { "type": "number", "key": "reading.targetTemp", "label": "Target" }
+  ]
+}
