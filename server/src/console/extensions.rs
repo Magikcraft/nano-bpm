@@ -72,6 +72,84 @@ pub struct FileType {
     pub monaco_lang: String,
 }
 
+/// One completion item a pack offers for its language (see [`LangIntellisense`]).
+/// The console has a real language service only for TS/JS; other languages get
+/// this curated, SDK-derived data instead. Read as opaque data and forwarded to
+/// the console verbatim.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompletionSpec {
+    /// Text shown in the completion list.
+    pub label: String,
+    /// Monaco `CompletionItemKind` name (e.g. "method", "struct"); the console
+    /// maps it. Defaults to "value" client-side when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// Text inserted on accept. Defaults to `label`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub insert_text: Option<String>,
+    /// When true, `insertText` is a Monaco snippet (`${1:name}` placeholders).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<bool>,
+    /// Short right-aligned signature/type.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Markdown documentation shown in the details flyout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+}
+
+/// A hover card shown when the pointer rests on `symbol` (whole-word match).
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HoverSpec {
+    pub symbol: String,
+    /// Markdown rendered in the hover card.
+    pub contents: String,
+}
+
+/// One parameter within a [`SignatureSpec`].
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureParam {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+}
+
+/// One function/method signature surfaced by signature help.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SignatureSpec {
+    /// Identifier that, when followed by `(`, triggers this help.
+    pub trigger: String,
+    /// Full signature line shown in the popup.
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub documentation: Option<String>,
+    #[serde(default)]
+    pub parameters: Vec<SignatureParam>,
+}
+
+/// IntelliSense data a lang pack ships for one Monaco language. The console
+/// registers one provider per `monacoLang` and feeds it every pack's entries —
+/// no in-browser language server required. Read as data, forwarded verbatim.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LangIntellisense {
+    /// Monaco language id these entries apply to (e.g. "csharp", "rust").
+    pub monaco_lang: String,
+    /// Extra characters that reopen the completion popup (e.g. ["."]).
+    #[serde(default)]
+    pub trigger_characters: Vec<String>,
+    #[serde(default)]
+    pub completions: Vec<CompletionSpec>,
+    #[serde(default)]
+    pub hovers: Vec<HoverSpec>,
+    #[serde(default)]
+    pub signatures: Vec<SignatureSpec>,
+}
+
 /// One named way to run/compile the same project — used by packs whose
 /// example is a matrix (e.g. `example-java-throughput` has four
 /// transport/profile combos over one Java source). The Console offers
@@ -211,6 +289,11 @@ pub struct ExtManifest {
     /// Console colour themes this pack contributes (theme packs).
     #[serde(default)]
     pub themes: Vec<ThemeSpec>,
+    /// SDK-derived Monaco IntelliSense (completions/hovers/signatures) this pack
+    /// contributes, one entry per `monacoLang`. Optional; forwarded to the
+    /// console which registers providers per language.
+    #[serde(default)]
+    pub intellisense: Vec<LangIntellisense>,
 }
 
 /// Built-in language-pack icons: theme-robust lettermark tiles (a brand-coloured
@@ -255,6 +338,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 default: Some("deno (on PATH)".into()),
             }],
             themes: vec![],
+            intellisense: vec![],
         },
         ExtManifest {
             id: "deno-gui".into(),
@@ -273,6 +357,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             builtin: true,
             config_fields: vec![],
             themes: vec![],
+            intellisense: vec![],
         },
     ]
 }

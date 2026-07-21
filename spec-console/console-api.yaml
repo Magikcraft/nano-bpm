@@ -1602,8 +1602,64 @@ components:
         themes:
           type: array
           items: { $ref: '#/components/schemas/ExtensionTheme' }
+        intellisense:
+          type: array
+          description: >-
+            SDK-derived Monaco IntelliSense contributed by the pack, one entry per
+            monacoLang. Optional; the console registers completion/hover/signature
+            providers from these.
+          items: { $ref: '#/components/schemas/ExtensionIntellisense' }
         toolchainAvailable: { type: boolean }
         trusted: { type: boolean }
+    ExtensionCompletion:
+      type: object
+      required: [label]
+      properties:
+        label: { type: string }
+        kind: { type: string }
+        insertText: { type: string }
+        snippet: { type: boolean }
+        detail: { type: string }
+        documentation: { type: string }
+    ExtensionHover:
+      type: object
+      required: [symbol, contents]
+      properties:
+        symbol: { type: string }
+        contents: { type: string }
+    ExtensionSignatureParam:
+      type: object
+      required: [label]
+      properties:
+        label: { type: string }
+        documentation: { type: string }
+    ExtensionSignature:
+      type: object
+      required: [trigger, label]
+      properties:
+        trigger: { type: string }
+        label: { type: string }
+        documentation: { type: string }
+        parameters:
+          type: array
+          items: { $ref: '#/components/schemas/ExtensionSignatureParam' }
+    ExtensionIntellisense:
+      type: object
+      required: [monacoLang]
+      properties:
+        monacoLang: { type: string }
+        triggerCharacters:
+          type: array
+          items: { type: string }
+        completions:
+          type: array
+          items: { $ref: '#/components/schemas/ExtensionCompletion' }
+        hovers:
+          type: array
+          items: { $ref: '#/components/schemas/ExtensionHover' }
+        signatures:
+          type: array
+          items: { $ref: '#/components/schemas/ExtensionSignature' }
     ExtensionsOverview:
       type: object
       required: [extensions, yolo]
