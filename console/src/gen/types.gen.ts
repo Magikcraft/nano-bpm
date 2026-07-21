@@ -610,9 +610,15 @@ export type Marketplace = {
 
 export type ServerUpdateStatus = {
     /**
-     * The running server version.
+     * Installed version in the update channel's version space — the basis for the update comparison and shown next to latest. For the npm channel this is the launcher/plugin version; otherwise the running server build.
+     *
      */
     current: string;
+    /**
+     * The actual running server binary build (NANOBPM_VERSION). Present (and distinct from current) when the update unit versions in a different space than the server build, e.g. an npm-managed install.
+     *
+     */
+    serverVersion?: string;
     /**
      * Latest available version for the launch channel, or absent if it could not be resolved (offline, unknown channel, self-managed).
      *

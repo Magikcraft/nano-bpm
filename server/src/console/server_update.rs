@@ -33,7 +33,15 @@ const DOWNLOAD_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerUpdateStatus {
+    /// Installed version in the update channel's version space (what `latest`
+    /// is compared against and shown next to it). For the npm channel this is
+    /// the launcher/plugin version; otherwise the running server build.
     pub current: String,
+    /// The actual running server binary build (`NANOBPM_VERSION`). Kept distinct
+    /// from `current` because the npm update unit (the plugin) versions in a
+    /// different space than the server's own git-describe build.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest: Option<String>,
     pub update_available: bool,
@@ -122,11 +130,14 @@ fn semver_gt(latest: &str, current: &str) -> bool {
     false
 }
 
-/// Pure status assembly, separated from IO for testing. `latest` is whatever
-/// the (best-effort) resolver produced. The nag (`update_available`) fires only
-/// for a self-updatable install whose latest is strictly newer than current.
+/// Pure status assembly, separated from IO for testing. `current` is the
+/// installed version in the update channel's version space (the comparison
+/// basis); `server_version` is the actual running build. The nag
+/// (`update_available`) fires only for a self-updatable install whose `latest`
+/// is strictly newer than `current`.
 fn assemble(
     current: &str,
+    server_version: &str,
     method: &str,
     channel: Option<String>,
     launcher: Option<String>,
@@ -141,6 +152,9 @@ fn assemble(
     let update_hint = update_hint(method, launcher.as_deref());
     ServerUpdateStatus {
         current: current.to_string(),
+        // Only surface the running build separately when it differs from the
+        // channel-space `current` (i.e. an npm-managed install).
+        server_version: (server_version != current).then(|| server_version.to_string()),
         latest,
         update_available,
         can_self_update,
@@ -199,6 +213,9 @@ pub async fn status() -> ServerUpdateStatus {
     let channel = std::env::var("NANOBPMN_UPDATE_CHANNEL")
         .ok()
         .filter(|s| !s.is_empty());
+    let launcher_version = std::env::var("NANOBPMN_LAUNCHER_VERSION")
+        .ok()
+        .filter(|s| !s.is_empty());
     let method = install_method(binary_source.as_deref());
 
     let latest = if can_self_update(method) {
@@ -222,7 +239,20 @@ pub async fn status() -> ServerUpdateStatus {
         None
     };
 
-    assemble(CURRENT_VERSION, method, channel, launcher, latest)
+    // Comparison basis, in the channel's version space:
+    //  - npm channel: the launcher/plugin version (same space as `latest`, which
+    //    is `npm view <plugin>`). The plugin is the update unit; its platform
+    //    binary ships pinned to it.
+    //  - download channel: the running server build, since the download
+    //    `version.json` is written in the server's own version space.
+    let current = match channel.as_deref() {
+        Some("npm") => launcher_version
+            .clone()
+            .unwrap_or_else(|| CURRENT_VERSION.to_string()),
+        _ => CURRENT_VERSION.to_string(),
+    };
+
+    assemble(&current, CURRENT_VERSION, method, channel, launcher, latest)
 }
 
 #[cfg(test)]
@@ -264,6 +294,7 @@ mod tests {
         // A repo build with a "newer" latest available must NOT report an update.
         let s = assemble(
             "1.0.0",
+            "1.0.0",
             install_method(Some("repo-release")),
             Some("npm".into()),
             Some("c8ctl-plugin-nano".into()),
@@ -278,6 +309,7 @@ mod tests {
     fn managed_nags_only_when_newer() {
         let newer = assemble(
             "1.0.0",
+            "1.0.0",
             install_method(Some("managed-npm")),
             Some("npm".into()),
             Some("c8ctl-plugin-nano".into()),
@@ -288,6 +320,7 @@ mod tests {
         assert!(newer.update_hint.is_some());
 
         let same = assemble(
+            "1.0.1",
             "1.0.1",
             install_method(Some("managed-npm")),
             None,
@@ -302,6 +335,7 @@ mod tests {
     fn managed_without_resolved_latest_does_not_nag() {
         let s = assemble(
             "1.0.0",
+            "1.0.0",
             install_method(Some("managed-download")),
             Some("download".into()),
             Some("c8ctl-plugin-nano".into()),
@@ -310,5 +344,36 @@ mod tests {
         assert!(s.can_self_update);
         assert!(!s.update_available);
         assert!(s.latest.is_none());
+    }
+
+    #[test]
+    fn npm_channel_compares_in_launcher_version_space() {
+        // The npm update unit (plugin) versions independently of the server
+        // build. `current` is the plugin version (e.g. 0.2.0); `latest` from
+        // `npm view <plugin>` is the same space; the raw server build (e.g.
+        // 0.0.7) must NOT be the comparison basis, and is surfaced separately.
+        let s = assemble(
+            "0.2.0",             // current: plugin version (channel space)
+            "0.0.7-65-gdeadbee", // server_version: the running build
+            install_method(Some("managed-npm")),
+            Some("npm".into()),
+            Some("c8ctl-plugin-nano".into()),
+            Some("0.2.1".into()), // latest: plugin version
+        );
+        assert!(s.update_available, "0.2.1 > 0.2.0 in plugin space");
+        assert_eq!(s.current, "0.2.0");
+        assert_eq!(s.server_version.as_deref(), Some("0.0.7-65-gdeadbee"));
+
+        // Equal plugin versions => no nag even though the server build string
+        // looks numerically "older" than latest.
+        let same = assemble(
+            "0.2.1",
+            "0.0.7-65-gdeadbee",
+            install_method(Some("managed-npm")),
+            Some("npm".into()),
+            Some("c8ctl-plugin-nano".into()),
+            Some("0.2.1".into()),
+        );
+        assert!(!same.update_available);
     }
 }
