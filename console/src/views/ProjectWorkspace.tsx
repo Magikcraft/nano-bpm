@@ -589,6 +589,13 @@ function EditorPane({
   // the modeler. On switch back to Visual we import it so both surfaces stay in
   // sync; on Save from the XML tab we persist `bpmnXml` directly.
   const bpmnXmlDirtyRef = useRef(false);
+  // Form files open in the graphical form editor; the user can switch to a raw
+  // JSON editor to inspect/tweak the underlying schema. The editor stays mounted
+  // when the JSON tab is active so form state is preserved across toggles.
+  const [formView, setFormView] = useState<"visual" | "json">("visual");
+  const [formJson, setFormJson] = useState<string>("");
+  // Mirrors bpmnXmlDirtyRef for the form JSON tab.
+  const formJsonDirtyRef = useRef(false);
   // Track what we most recently deployed to <deployTarget> so we can enable
   // Start Instance only when the saved XML matches deployment. Primed once
   // on load by pulling the deployed XML for the file's primary process id;
@@ -631,6 +638,9 @@ function EditorPane({
     setBpmnView("visual");
     setBpmnXml("");
     bpmnXmlDirtyRef.current = false;
+    setFormView("visual");
+    setFormJson("");
+    formJsonDirtyRef.current = false;
     projectFileEx(name, path)
       .then((f) => {
         if (!alive) return;
@@ -643,15 +653,29 @@ function EditorPane({
     };
   }, [name, path]);
 
-  // Load the fetched document into the graphical editor once mounted.
+  // Load the fetched document into the graphical editor once mounted. A newly
+  // created (empty) model file is seeded with a valid blank document via the
+  // editor's createBlank() — importing empty/`{}` would fail to load — and
+  // marked dirty so a Save persists the seeded document.
   useEffect(() => {
     if (content == null) return;
+    const isEmpty = content.trim() === "";
+    const seeded = () => setDirty(true);
     if (kind === "bpmn" && bpmnRef.current) {
-      void bpmnRef.current.importXml(content).catch(() => void 0);
+      const ed = bpmnRef.current;
+      void (isEmpty ? ed.createBlank().then(seeded) : ed.importXml(content)).catch(
+        () => void 0,
+      );
     } else if (kind === "dmn" && dmnRef.current) {
-      void dmnRef.current.importXml(content).catch(() => void 0);
+      const ed = dmnRef.current;
+      void (isEmpty ? ed.createBlank().then(seeded) : ed.importXml(content)).catch(
+        () => void 0,
+      );
     } else if (kind === "form" && formRef.current) {
-      void formRef.current.importSchema(content || "{}").catch(() => void 0);
+      const ed = formRef.current;
+      void (isEmpty ? ed.createBlank().then(seeded) : ed.importSchema(content)).catch(
+        () => void 0,
+      );
     }
     // Only when the document first arrives for this path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -664,6 +688,7 @@ function EditorPane({
       if (kind === "bpmn" && bpmnView === "xml") body = bpmnXml;
       else if (kind === "bpmn" && bpmnRef.current) body = await bpmnRef.current.getXml();
       else if (kind === "dmn" && dmnRef.current) body = await dmnRef.current.getXml();
+      else if (kind === "form" && formView === "json") body = formJson;
       else if (kind === "form" && formRef.current) body = await formRef.current.getSchema();
       await saveProjectFile({ path: { name }, query: { path }, body, throwOnError: true });
       setContent(body);
@@ -687,12 +712,26 @@ function EditorPane({
           }
         }
       }
+      if (kind === "form") {
+        // Persisted body is now authoritative in both surfaces (mirrors bpmn).
+        setFormJson(body);
+        formJsonDirtyRef.current = false;
+        if (formView === "json" && formRef.current) {
+          try {
+            await formRef.current.importSchema(body);
+          } catch {
+            // Invalid JSON shouldn't normally reach here (Save with bad
+            // JSON is on the user), but don't turn a successful persist
+            // into a hard error.
+          }
+        }
+      }
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
     } finally {
       setSaving(false);
     }
-  }, [content, kind, name, path, bpmnView, bpmnXml]);
+  }, [content, kind, name, path, bpmnView, bpmnXml, formView, formJson]);
 
   // Prime lastDeployedXml on load — probes <deployTarget> for the currently
   // deployed BPMN of primaryProcessId. Silent on failure (network down, no
@@ -782,6 +821,33 @@ function EditorPane({
     [bpmnView, bpmnXml],
   );
 
+  // Switches the form editor between the graphical canvas and the raw JSON tab
+  // (mirrors switchBpmnView). Visual → JSON: pull the current schema. JSON →
+  // Visual: if the JSON was edited, import it back (errors surface via alert).
+  const switchFormView = useCallback(
+    async (next: "visual" | "json") => {
+      if (next === formView) return;
+      if (next === "json") {
+        const json = (await formRef.current?.getSchema()) ?? "";
+        setFormJson(json);
+        formJsonDirtyRef.current = false;
+        setFormView("json");
+      } else {
+        if (formJsonDirtyRef.current && formRef.current) {
+          try {
+            await formRef.current.importSchema(formJson);
+            formJsonDirtyRef.current = false;
+          } catch (e) {
+            alert(`Could not import form JSON: ${e instanceof Error ? e.message : String(e)}`);
+            return;
+          }
+        }
+        setFormView("visual");
+      }
+    },
+    [formView, formJson],
+  );
+
   // Cmd/Ctrl+S saves graphical editors too (CodeEditor has its own binding).
   useEffect(() => {
     if (kind === "code") return;
@@ -860,6 +926,23 @@ function EditorPane({
             ))}
           </div>
         )}
+        {kind === "form" && (
+          <div className="flex overflow-hidden rounded-md border border-edge-strong">
+            {(["visual", "json"] as const).map((mode) => (
+              <button
+                key={mode}
+                onClick={() => void switchFormView(mode)}
+                className={`px-3 py-1 text-xs font-medium uppercase transition-colors ${
+                  formView === mode
+                    ? "bg-accent text-on-accent"
+                    : "text-fg-muted hover:bg-hover"
+                }`}
+              >
+                {mode}
+              </button>
+            ))}
+          </div>
+        )}
         {kind === "bpmn" && (
           <>
             <button
@@ -911,7 +994,7 @@ function EditorPane({
         )}
         <button
           onClick={() => void save()}
-          disabled={saving || ((kind === "code" || kind === "md" || kind === "bpmn") && !dirty)}
+          disabled={saving || !dirty}
           className="rounded-md bg-accent px-3 py-1 text-xs font-medium text-on-accent transition-colors hover:bg-accent-strong disabled:opacity-40"
         >
           {saving ? "Saving…" : "Save"}
@@ -966,7 +1049,33 @@ function EditorPane({
           </div>
         )}
         {kind === "dmn" && <DmnModeler ref={dmnRef} onChange={() => setDirty(true)} />}
-        {kind === "form" && <FormEditor ref={formRef} onChange={() => setDirty(true)} />}
+        {kind === "form" && (
+          <div className="relative h-full">
+            {/*
+              Keep the form editor mounted while the JSON tab is active so schema
+              state survives toggling. The JSON editor is layered above via
+              absolute positioning (mirrors the BPMN visual/xml split).
+            */}
+            <div className={formView === "visual" ? "h-full" : "h-full invisible"}>
+              <FormEditor ref={formRef} onChange={() => setDirty(true)} />
+            </div>
+            {formView === "json" && (
+              <div className="absolute inset-0 bg-app">
+                <CodeEditor
+                  value={formJson}
+                  language="json"
+                  path={`file:///${name}/${path}`}
+                  onChange={(v) => {
+                    setFormJson(v);
+                    formJsonDirtyRef.current = true;
+                    setDirty(true);
+                  }}
+                  onSave={() => void save()}
+                />
+              </div>
+            )}
+          </div>
+        )}
         {kind === "md" &&
           (mdView === "preview" ? (
             <MarkdownPreview source={content} />
