@@ -10,6 +10,11 @@ ADR 0007 (`0007-rad-extension-system.md`, the npm-installable pack contract — 
 fourth specialization axis, `nano-ide-data-*`, beside `lang`/`app`/`trigger`),
 ADR 0008 (`0008-polyglot-language-packs.md`, the pack-axis precedent),
 ADR 0011 (`0011-editable-model-workbench.md`, the console authoring surfaces the **Data** panel joins),
+ADR 0029 (`0029-urban-bindings-domain-model.md`) / ADR 0030 (`0030-domain-process-duality.md`, the
+domain model + duality — this ADR's datasource is *state at rest*, one bank of the motion↔rest bridge;
+the domain type generates the persist/rehydrate projection, §5),
+ADR 0031 (`0031-process-relational-mapper.md`, the mapper for which this datasource is the **rest
+bank** — realized by a Drizzle schema behind the `driver`/`url` alias),
 `console/src/components/FormEditor.tsx` and `console/src/views/ProjectWorkspace.tsx` (the tab +
 Monaco pattern the Data panel reuses, most recently extended by the form JSON view in PR #147),
 `server/src/console/projects.rs` (the App scaffold + run/compile supervisor that will wire
@@ -142,6 +147,16 @@ This is what makes it *Urban* rather than a SQLite GUI bolted on:
   source, **read-only by default**; a source is writable to the agent only when the manifest opts
   it in. (This resolves the §E "which capabilities are safe as LLM tools" question for the data
   axis.)
+
+The datasource is also the **resting bank** of the motion↔rest bridge ADR 0030 §4 names. A domain
+type (ADR 0029) declared once is the *same* object in flight (process variables) and at rest (a row
+here), so the mapping between them — the persist / rehydrate that a Camunda maker writes as two
+hand-coded workers — is **generated from the type, not hand-written.** Keeping App data in its own
+datasource (§6) is what makes that resting bank *exist*; the projection is the wiring encapsulated at
+the domain layer rather than eliminated. The generator that emits it is the **Process-Relational
+Mapper** (ADR 0031), for which this datasource — its `driver`/`url` alias realized by a **Drizzle**
+schema — is the rest bank; the PRM crosses *tense* (in-flight vs. at-rest), so it generates the
+persist/rehydrate conjugation Drizzle alone cannot see.
 
 ### 6. App data is separate from the engine journal
 
