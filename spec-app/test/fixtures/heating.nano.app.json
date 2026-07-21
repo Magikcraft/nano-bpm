@@ -1,0 +1,39 @@
+{
+  "$schema": "https://nanobpm.dev/spec-app/nano-app.schema.json",
+  "schemaVersion": 1,
+  "id": "heating",
+  "name": "Heating",
+  "runtime": { "engine": "embedded", "node": "single" },
+  "models": {
+    "processes": ["processes/*.bpmn"],
+    "decisions": ["decisions/*.dmn"],
+    "forms": ["forms/*.form"]
+  },
+  "data": {
+    "default": "app",
+    "sources": {
+      "app": { "driver": "sqlite", "url": "file:./app.db", "migrations": "db/migrations" }
+    }
+  },
+  "triggers": [
+    { "id": "morning", "type": "cron", "spec": "0 6 * * *", "action": { "start": "heating-cycle" } },
+    { "id": "sensor", "type": "webhook", "path": "/hooks/temp", "auth": "hmac:sensors", "action": { "message": "temp-reading", "correlationKey": "= body.room" } },
+    { "id": "mail", "type": "imap", "connection": "mailbox", "action": { "start": "heating-cycle" } }
+  ],
+  "connections": {
+    "sensors": { "type": "hmac" },
+    "mailbox": { "type": "imap" }
+  },
+  "surfaces": {
+    "taskInbox": { "enabled": true },
+    "chat": { "enabled": true, "agent": "concierge" }
+  },
+  "workers": [
+    { "taskType": "read-thermostat", "handler": "workers/thermostat.ts" },
+    { "taskType": "classify", "llm": "classifier" }
+  ],
+  "llm": {
+    "classifier": { "provider": "env", "model": "${NANO_APP_LLM_MODEL}", "output": { "decision": "email-triage" } },
+    "concierge": { "provider": "env", "model": "${NANO_APP_LLM_MODEL}", "tools": ["start-process"] }
+  }
+}
