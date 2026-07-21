@@ -87,7 +87,7 @@ pub mod ffi;
 pub use command::{Command, UserTaskChangeset};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
-pub use engine::{ActivatedJob, Engine, EngineError};
+pub use engine::{ActivatedJob, DecisionEvaluation, Engine, EngineError};
 pub use event::Event;
 pub use feel::FeelError;
 pub use model::{

@@ -7856,6 +7856,200 @@ impl ServerImpl {
         }
     }
 
+    /// Standalone decision evaluation: `POST /v2/decision-definitions/evaluation`
+    /// (Zeebe `EvaluateDecision`). Resolves the deployed decision by id (latest
+    /// version) or by key, evaluates it natively against the request variables,
+    /// and maps the native DMN result onto the REST `EvaluateDecisionResult`
+    /// (including the per-decision audit trail and any evaluation failure).
+    ///
+    /// This is a pure read against the in-memory decision registry, which is
+    /// replicated onto every owned partition, so it runs on any local partition
+    /// without cross-node forwarding.
+    async fn evaluate_decision_impl(
+        &self,
+        body: &models::DecisionEvaluationInstruction,
+    ) -> Result<apis::decision_definition::EvaluateDecisionResponse, ()> {
+        use apis::decision_definition::EvaluateDecisionResponse as Resp;
+
+        // Unpack the request variant (by id, latest version, or by key).
+        let (by_id, by_key_str, variables_map, tenant_id) = match body {
+            models::DecisionEvaluationInstruction::DecisionEvaluationById(b) => (
+                Some(b.decision_definition_id.clone()),
+                None,
+                b.variables.clone(),
+                b.tenant_id.clone(),
+            ),
+            models::DecisionEvaluationInstruction::DecisionEvaluationByKey(b) => (
+                None,
+                Some(b.decision_definition_key.0.clone()),
+                b.variables.clone(),
+                b.tenant_id.clone(),
+            ),
+        };
+        let tenant_id = tenant_id.unwrap_or_else(|| "<default>".to_string());
+        let variables = variables_map
+            .as_ref()
+            .map(from_object_map)
+            .unwrap_or_default();
+        let by_key: Option<nanobpmn_engine_core::Key> = match &by_key_str {
+            Some(s) => match s.parse() {
+                Ok(k) => Some(k),
+                Err(_) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid decision key",
+                        400,
+                        format!("Decision definition key '{s}' is not a valid key."),
+                    )));
+                }
+            },
+            None => None,
+        };
+
+        // Evaluate on any owned partition (the decision registry is replicated
+        // to all of them), resolving each evaluated decision's deployment key
+        // and version inside the actor while the state is borrowed.
+        let by_id_owned = by_id.clone();
+        let handle = match self.engine.all().first() {
+            Some(h) => h,
+            None => {
+                return Ok(
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "No engine partition",
+                        500,
+                        "This node hosts no engine partition to evaluate the decision.".to_string(),
+                    )),
+                );
+            }
+        };
+        type PerDecision = (nanobpmn_engine_core::Key, i32);
+        let evaluation: Option<(nanobpmn_engine_core::DecisionEvaluation, Vec<PerDecision>)> =
+            handle
+                .with(move |journal| {
+                    let engine = journal.engine();
+                    let eval = engine.evaluate_deployed_decision(
+                        by_id_owned.as_deref(),
+                        by_key,
+                        &variables,
+                    )?;
+                    let per_decision: Vec<PerDecision> = eval
+                        .result
+                        .evaluated_decisions
+                        .iter()
+                        .map(|ed| {
+                            engine
+                                .deployed_decision_key_version(&ed.decision_id)
+                                .unwrap_or((eval.decision_key, eval.version))
+                        })
+                        .collect();
+                    Some((eval, per_decision))
+                })
+                .await;
+
+        let (eval, per_decision) = match evaluation {
+            Some(t) => t,
+            None => {
+                let reference = by_id
+                    .map(|id| format!("id '{id}'"))
+                    .or_else(|| by_key_str.map(|k| format!("key '{k}'")))
+                    .unwrap_or_else(|| "the given reference".to_string());
+                return Ok(Resp::Status404_TheDecisionIsNotFound(problem(
+                    "Decision not found",
+                    404,
+                    format!("No deployed decision with {reference}."),
+                )));
+            }
+        };
+
+        // Map the native DMN audit trail onto the REST result.
+        let evaluated_decisions: Vec<models::EvaluatedDecisionResult> = eval
+            .result
+            .evaluated_decisions
+            .iter()
+            .zip(per_decision.iter())
+            .map(|(ed, (key, version))| {
+                let matched_rules = ed
+                    .matched_rules
+                    .iter()
+                    .map(|rule| {
+                        let evaluated_outputs = rule
+                            .evaluated_outputs
+                            .iter()
+                            .map(|out| {
+                                models::EvaluatedDecisionOutputItem::new(
+                                    out.output_id.clone(),
+                                    out.output_name.clone().unwrap_or_default(),
+                                    dmn_value_to_string(&out.output_value),
+                                    nanobpm_gateway_rest::types::Nullable::Present(
+                                        rule.rule_id.clone(),
+                                    ),
+                                    nanobpm_gateway_rest::types::Nullable::Present(
+                                        rule.rule_index as i32,
+                                    ),
+                                )
+                            })
+                            .collect();
+                        models::MatchedDecisionRuleItem::new(
+                            rule.rule_id.clone(),
+                            rule.rule_index as i32,
+                            evaluated_outputs,
+                        )
+                    })
+                    .collect();
+                let evaluated_inputs = ed
+                    .evaluated_inputs
+                    .iter()
+                    .map(|inp| {
+                        models::EvaluatedDecisionInputItem::new(
+                            inp.input_id.clone(),
+                            inp.input_name.clone().unwrap_or_default(),
+                            dmn_value_to_string(&inp.input_value),
+                        )
+                    })
+                    .collect();
+                models::EvaluatedDecisionResult::new(
+                    ed.decision_id.clone(),
+                    ed.decision_name.clone(),
+                    *version,
+                    dmn_decision_type_name(&ed.decision_type).to_string(),
+                    dmn_value_to_string(&ed.decision_output),
+                    tenant_id.clone(),
+                    matched_rules,
+                    evaluated_inputs,
+                    models::DecisionDefinitionKey(key.to_string()),
+                    format!("{key}-1"),
+                )
+            })
+            .collect();
+
+        let (failed_id, failure_message) = match &eval.result.failure {
+            Some(f) => (
+                nanobpm_gateway_rest::types::Nullable::Present(f.failed_decision_id.clone()),
+                nanobpm_gateway_rest::types::Nullable::Present(f.message.clone()),
+            ),
+            None => (
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+            ),
+        };
+
+        let result = models::EvaluateDecisionResult::new(
+            eval.decision_id.clone(),
+            models::DecisionDefinitionKey(eval.decision_key.to_string()),
+            eval.decision_name.clone(),
+            eval.version,
+            models::DecisionEvaluationKey(eval.decision_key.to_string()),
+            models::DecisionInstanceKey(format!("{}-1", eval.decision_key)),
+            eval.decision_requirements_id.clone(),
+            models::DecisionRequirementsKey(eval.decision_requirements_key.to_string()),
+            evaluated_decisions,
+            failed_id,
+            failure_message,
+            dmn_value_to_string(&eval.result.decision_output),
+            tenant_id,
+        );
+        Ok(Resp::Status200_TheDecisionWasEvaluated(result))
+    }
+
     /// Deploys already-parsed `processes` and DMN `decisions` on this node's
     /// deployment partition (durable) and replicates the definition(s) in-memory
     /// to its other owned partitions. Returns the typed deployment result and the
@@ -12956,6 +13150,27 @@ pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
     }
 }
 
+/// Serialises a DMN [`Value`] into the JSON-document string the REST decision
+/// evaluation result carries in its `output`/`inputValue`/`outputValue` fields
+/// (Zeebe encodes these as JSON strings, e.g. `"hallo"`, `42`, `{"x":1}`).
+fn dmn_value_to_string(value: &Value) -> String {
+    serde_json::to_string(&value_to_json(value)).unwrap_or_else(|_| "null".to_string())
+}
+
+/// The Zeebe/Camunda REST name for a DMN decision logic type.
+fn dmn_decision_type_name(kind: &nanobpmn_engine_core::dmn::DecisionType) -> &'static str {
+    use nanobpmn_engine_core::dmn::DecisionType::*;
+    match kind {
+        DecisionTable => "DECISION_TABLE",
+        LiteralExpression => "LITERAL_EXPRESSION",
+        Context => "CONTEXT",
+        Invocation => "INVOCATION",
+        List => "LIST",
+        Relation => "RELATION",
+        Unknown => "UNKNOWN",
+    }
+}
+
 /// The minted message key from a `CorrelateMessage`'s events: the heading
 /// [`Event::MessagePublished`] always carries it.
 fn message_key_of(events: &[Event]) -> u64 {
@@ -16268,6 +16483,87 @@ mod clustered_startup_tests {
         assert!(
             completed,
             "the businessRuleTask evaluates the decision and completes synchronously"
+        );
+    }
+
+    #[tokio::test]
+    async fn evaluate_decision_api_returns_native_dmn_result() {
+        // The standalone EvaluateDecision API (POST /v2/decision-definitions/
+        // evaluation) resolves a deployed decision by id, evaluates it natively,
+        // and maps the DMN result (output + audit trail) onto the REST result.
+        use nanobpm_gateway_rest::apis::decision_definition::EvaluateDecisionResponse as Resp;
+        let server = ServerImpl::default();
+
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+              <rule id="r2"><inputEntry id="ie2"><text>"de"</text></inputEntry>
+                <outputEntry id="oe2"><text>"hallo"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+        server
+            .deploy_resources_locally(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![drg],
+                &drg_names,
+                "<default>",
+            )
+            .await
+            .expect("DMN-only deploy succeeds");
+
+        // Evaluate by id with `lang = "de"`.
+        let mut variables = std::collections::HashMap::new();
+        variables.insert(
+            "lang".to_string(),
+            nanobpm_gateway_rest::types::Object(serde_json::json!("de")),
+        );
+        let mut by_id = models::DecisionEvaluationById::new("greeting".to_string());
+        by_id.variables = Some(variables);
+        let body = models::DecisionEvaluationInstruction::DecisionEvaluationById(by_id);
+
+        let resp = server
+            .evaluate_decision_impl(&body)
+            .await
+            .expect("handler returns a response");
+        let result = match resp {
+            Resp::Status200_TheDecisionWasEvaluated(r) => r,
+            other => panic!("expected 200 evaluation, got {other:?}"),
+        };
+        assert_eq!(result.decision_definition_id, "greeting");
+        assert_eq!(result.decision_definition_name, "Greeting");
+        assert_eq!(result.output, "\"hallo\"");
+        assert_eq!(result.decision_requirements_id, "greeting-drg");
+        assert!(
+            matches!(result.failure_message, nanobpm_gateway_rest::types::Nullable::Null),
+            "a successful evaluation carries no failure message"
+        );
+        assert_eq!(result.evaluated_decisions.len(), 1);
+        let evaluated = &result.evaluated_decisions[0];
+        assert_eq!(evaluated.decision_definition_type, "DECISION_TABLE");
+        assert_eq!(evaluated.matched_rules.len(), 1);
+        assert_eq!(evaluated.evaluated_inputs.len(), 1);
+        assert_eq!(evaluated.evaluated_inputs[0].input_value, "\"de\"");
+
+        // An unknown decision id is a 404.
+        let unknown = models::DecisionEvaluationInstruction::DecisionEvaluationById(
+            models::DecisionEvaluationById::new("nope".to_string()),
+        );
+        let resp = server
+            .evaluate_decision_impl(&unknown)
+            .await
+            .expect("handler returns a response");
+        assert!(
+            matches!(resp, Resp::Status404_TheDecisionIsNotFound(_)),
+            "an unknown decision id is a 404"
         );
     }
 

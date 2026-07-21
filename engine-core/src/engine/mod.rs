@@ -688,6 +688,46 @@ impl Engine {
         Ok(())
     }
 
+    /// Evaluates a deployed decision on demand for the standalone
+    /// EvaluateDecision API. Resolves the decision by id (latest version) or, if
+    /// `by_id` is `None`, by decision key, evaluates it against `variables`
+    /// natively, and returns the deployment metadata together with the full
+    /// evaluation result (including any failure). This is a pure read: it does
+    /// not mint keys, emit events, or mutate state. Returns `None` when no such
+    /// decision is deployed.
+    pub fn evaluate_deployed_decision(
+        &self,
+        by_id: Option<&str>,
+        by_key: Option<Key>,
+        variables: &HashMap<String, Value>,
+    ) -> Option<DecisionEvaluation> {
+        let deployed = match (by_id, by_key) {
+            (Some(id), _) => self.state.decisions.get(id)?.clone(),
+            (None, Some(key)) => self.state.decisions.values().find(|d| d.key == key)?.clone(),
+            (None, None) => return None,
+        };
+        let result = crate::dmn::evaluate(&deployed.drg, &deployed.decision_id, variables);
+        Some(DecisionEvaluation {
+            decision_key: deployed.key,
+            version: deployed.version,
+            decision_id: deployed.decision_id.clone(),
+            decision_name: deployed.decision_name.clone(),
+            decision_requirements_key: deployed.decision_requirements_key,
+            decision_requirements_id: deployed.drg.id.clone(),
+            result,
+        })
+    }
+
+    /// Deployment key and version of a deployed decision by id (latest version),
+    /// or `None` if not deployed. Used by the EvaluateDecision API to stamp each
+    /// evaluated decision in a graph with its own deployment identity.
+    pub fn deployed_decision_key_version(&self, decision_id: &str) -> Option<(Key, i32)> {
+        self.state
+            .decisions
+            .get(decision_id)
+            .map(|d| (d.key, d.version))
+    }
+
     /// Applies a command using the engine's current clock reading (see
     /// [`Engine::apply_command_at`]). Tests and hosts that do not need accurate
     /// timestamps can use this; the default clock is `0`.
@@ -3885,6 +3925,27 @@ pub struct ActivatedJob {
     /// the (up to 50 KB) value tree on the single command thread; the response
     /// mapper encodes it to JSON off-thread by borrowing.
     pub variables: Arc<HashMap<String, Value>>,
+}
+
+/// The outcome of a standalone [`Engine::evaluate_deployed_decision`] call: the
+/// deployment metadata of the resolved decision plus the full native DMN
+/// evaluation result. Surfaced to the EvaluateDecision REST API.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionEvaluation {
+    /// Unique key of the evaluated decision definition (and version).
+    pub decision_key: Key,
+    /// Version of the evaluated decision definition.
+    pub version: i32,
+    /// The evaluated decision's id.
+    pub decision_id: String,
+    /// The evaluated decision's human-readable name.
+    pub decision_name: String,
+    /// Unique key of the decision requirements graph it belongs to.
+    pub decision_requirements_key: Key,
+    /// Id of the decision requirements graph it belongs to.
+    pub decision_requirements_id: String,
+    /// The native DMN evaluation result (output, per-decision audit, failure).
+    pub result: crate::dmn::DecisionEvaluationResult,
 }
 
 /// Whether a job can be activated at the logical instant `now`: it is created

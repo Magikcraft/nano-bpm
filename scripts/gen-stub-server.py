@@ -37,6 +37,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("process_instance", "cancel_process_instance"): "self.cancel_process_instance_impl(path_params).await",
     ("job", "complete_job"): "self.complete_job_impl(path_params, body).await",
     ("resource", "create_deployment"): "self.create_deployment_impl(body).await",
+    ("decision_definition", "evaluate_decision"): "self.evaluate_decision_impl(body).await",
     ("job", "activate_jobs"): "self.activate_jobs_impl(body).await",
     ("job", "fail_job"): "self.fail_job_impl(path_params, body).await",
     ("job", "throw_job_error"): "self.throw_job_error_impl(path_params, body).await",
