@@ -547,8 +547,46 @@ export type Extension = {
     fileTypes: Array<ExtensionFileType>;
     templates: Array<ExtensionTemplate>;
     themes?: Array<ExtensionTheme>;
+    /**
+     * SDK-derived Monaco IntelliSense contributed by the pack, one entry per monacoLang. Optional; the console registers completion/hover/signature providers from these.
+     */
+    intellisense?: Array<ExtensionIntellisense>;
     toolchainAvailable: boolean;
     trusted: boolean;
+};
+
+export type ExtensionCompletion = {
+    label: string;
+    kind?: string;
+    insertText?: string;
+    snippet?: boolean;
+    detail?: string;
+    documentation?: string;
+};
+
+export type ExtensionHover = {
+    symbol: string;
+    contents: string;
+};
+
+export type ExtensionSignatureParam = {
+    label: string;
+    documentation?: string;
+};
+
+export type ExtensionSignature = {
+    trigger: string;
+    label: string;
+    documentation?: string;
+    parameters?: Array<ExtensionSignatureParam>;
+};
+
+export type ExtensionIntellisense = {
+    monacoLang: string;
+    triggerCharacters?: Array<string>;
+    completions?: Array<ExtensionCompletion>;
+    hovers?: Array<ExtensionHover>;
+    signatures?: Array<ExtensionSignature>;
 };
 
 export type ExtensionsOverview = {
