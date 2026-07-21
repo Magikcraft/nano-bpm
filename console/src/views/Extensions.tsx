@@ -9,6 +9,7 @@ import {
   type MarketEntry,
 } from "../gen";
 import { registerFileTypesFromOverview } from "../lib/editorLang";
+import { setIntellisenseFromOverview } from "../lib/langIntellisense";
 import { useTheme } from "../theme/ThemeProvider";
 import { isThemeSpec } from "../theme/themes";
 import { Badge, Button, Card, ErrorText, Input, PageHeader, SectionLabel } from "../components/ui";
@@ -38,6 +39,7 @@ export default function Extensions() {
     // Refresh Monaco's ext→language map so a pack installed just now lights
     // up in the editor without a page reload.
     registerFileTypesFromOverview(next);
+    setIntellisenseFromOverview(next);
   };
   const loadMarket = async () => {
     setMarketErr(null);

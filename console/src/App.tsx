@@ -10,6 +10,7 @@ import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
 import { getExtensions, getMarketplace, getTopology } from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
+import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -249,7 +250,10 @@ export default function App() {
   // other codepath that might mutate the extension set.
   useEffect(() => {
     getExtensions({ throwOnError: true })
-      .then(({ data }) => registerFileTypesFromOverview(data))
+      .then(({ data }) => {
+        registerFileTypesFromOverview(data);
+        setIntellisenseFromOverview(data);
+      })
       .catch(() => {
         /* ignore — the static fallback table still covers the common cases */
       });

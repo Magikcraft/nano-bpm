@@ -152,6 +152,7 @@ function acquireTypes(code: string): void {
 // installed lang packs at runtime.
 import { languageForFile } from "../lib/editorLang";
 export { languageForFile };
+import { initMonacoIntellisense } from "../lib/monacoIntellisense";
 
 // --- Cross-file IntelliSense: sibling + shared-library models --------------
 // A worker is a folder of files, and shared logic lives under `@lib/…`. For the
@@ -175,6 +176,16 @@ function registerModels(models: ExtraModel[], activePath?: string): void {
     }
   }
 }
+
+// --- Pack-fed IntelliSense providers ---------------------------------------
+// TS/JS get Monaco's real language service; every other language relies on the
+// curated, SDK-derived data a lang pack ships (see lib/langIntellisense.ts,
+// populated from the extensions overview). The provider layer lives in
+// lib/monacoIntellisense.ts — imported only here, inside the lazily-loaded
+// editor chunk — and reads the shared store live so later pack installs take
+// effect without a reload.
+initMonacoIntellisense();
+
 
 export default function CodeEditor({
   value,
