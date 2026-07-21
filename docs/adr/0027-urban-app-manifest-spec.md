@@ -13,8 +13,8 @@ value, not a replacement),
 `server/src/console/projects.rs` (`ProjectConfig` / **`nanobpm.project.json`** — the *IDE/toolchain*
 descriptor whose ownership boundary with `nano.app.json` this ADR draws, `:191-265`),
 `spec-console/console-api.yaml` + `scripts/generate-console.sh` (the **spec-first + codegen**
-precedent this ADR follows — one schema generating both the Rust and TS types, so the two never
-drift).
+precedent this ADR follows — one schema generating typed models so hand-written types can't drift;
+here the generated types are TypeScript on both consuming sides, not Rust↔TS).
 
 ## Context
 
@@ -34,11 +34,14 @@ missing is everything needed to actually build against it:
 4. **The console App project type** — how it is created and how its panels edit the manifest while
    Run/Compile keeps flowing through the existing supervisor.
 
-The repo already has the right pattern for (1)+(2): the console API is **spec-first** —
-`spec-console/console-api.yaml` generates *both* the server Rust models and the console TS models
-via `generate-console.sh`, precisely so hand-written DTOs can't drift from the wire (see the console
-codegen discipline). The App manifest is the same problem — one document consumed by the Rust
-runtime *and* the TS console — and takes the same solution.
+The repo already has the right *pattern* for (1)+(2): the console API is **spec-first** —
+`spec-console/console-api.yaml` generates typed models via `generate-console.sh`, precisely so
+hand-written DTOs can't drift from the schema (see the console codegen discipline). The App manifest
+takes the same solution but with a different consumer topology: it is **not** a Rust↔TS wire
+contract. The Urban App is a **Deno/TypeScript** binary, so the manifest is authored in TypeScript
+(the console App panels) and consumed in TypeScript (the Deno App's boot loader) — two *separate* TS
+codebases that must agree on one schema. The Rust server never parses `nano.app.json`; it handles the
+project's files as opaque bytes (workspace API) and reads only `nanobpm.project.json` for run/compile.
 
 ## Decision (proposed)
 
@@ -48,8 +51,8 @@ Keep **two** files with disjoint ownership; neither duplicates the other.
 
 | File | Owns | Read by | Lifecycle |
 |---|---|---|---|
-| **`nanobpm.project.json`** (`ProjectConfig`, exists) | *How the project builds/runs in the IDE*: `lang`/`app` pack, `toolchain` argv, `deployTarget`, run configs, `env` | the console **supervisor** | IDE/tooling concern |
-| **`nano.app.json`** (this ADR) | *What the App **is** at runtime*: models, data, triggers, surfaces, workers, llm | the **compiled App** at boot + the console **App panels** | ships inside the binary |
+| **`nanobpm.project.json`** (`ProjectConfig`, exists) | *How the project builds/runs in the IDE*: `lang`/`app` pack, `toolchain` argv, `deployTarget`, run configs, `env` | the console **supervisor** (Rust) | IDE/tooling concern |
+| **`nano.app.json`** (this ADR) | *What the App **is** at runtime*: models, data, triggers, surfaces, workers, llm | the **Deno App** at boot + the console **App panels** (both TypeScript) | ships inside the binary |
 
 **Boundary rule:** anything the *supervisor* needs to spawn/compile a process lives in
 `nanobpm.project.json`; anything the *running App* needs to behave lives in `nano.app.json`. The
@@ -84,17 +87,22 @@ Every value may use `${VAR:-default}` substitution (§5). Every block's detailed
 its ADR (0024/0025/0026/0022 §E); this ADR owns the *envelope*, the *cross-reference rules*, and the
 *codegen*.
 
-### 3. Spec-first: one schema, generated types (the anti-drift decision)
+### 3. Spec-first: one schema, generated TypeScript types (the anti-drift decision)
 
 The canonical source of truth is a **JSON Schema** at `spec-app/nano-app.schema.json`, a sibling of
-`spec-console/`. A generator (`scripts/generate-app-manifest.sh`) emits, from that one schema:
+`spec-console/`. A generator (`scripts/generate-app-manifest.sh`) emits, from that one schema, the
+**TypeScript** `AppManifest` types shared by the manifest's two TypeScript consumers:
 
-- the **Rust** `AppManifest` types (consumed by the server console *and* the Urban runtime), and
-- the **TypeScript** types (consumed by the console App panels and the App template's loader).
+- the **console App panels** (authoring — Triggers/Data/Surfaces editors), and
+- the **Deno App's boot loader/validator** (running — a *separate* TS codebase).
 
-This is exactly the `console-api.yaml → generate-console.sh → {Rust, TS}` discipline, applied to the
-manifest, so a new manifest field cannot be silently dropped by a hand-written DTO on one side. The
-schema is also publishable as the `$schema` a maker's editor uses for `nano.app.json` autocompletion.
+Both being TypeScript does not remove the drift risk — they are two independent codebases — so one
+generated type from one schema is what keeps "how the IDE writes the manifest" and "how the App reads
+it" in lock-step, the same discipline `generate-console.sh` applies to the console wire types. The
+schema is also published as the `$schema` a maker's editor uses for `nano.app.json` autocompletion.
+(No Rust type is generated: the Rust server never parses the manifest — §Context. If a concrete Rust
+consumer ever emerges, the same schema can additionally emit Rust via `typify`, but that is not
+needed for v1.)
 
 ### 4. Validation — fail-closed at three gates
 
@@ -133,7 +141,8 @@ types). Run/Compile flow through the **existing supervisor** unchanged — the A
 ## Phased plan
 
 1. **manifest-schema** — author `spec-app/nano-app.schema.json` (envelope + the 0024/0025/0026/§E
-   blocks) and `generate-app-manifest.sh` emitting Rust + TS types; wire into `make generate`.
+   blocks) and `generate-app-manifest.sh` emitting the TypeScript `AppManifest` types; wire into
+   `make generate` and publish the `$schema`.
 2. **manifest-validator** — the shared cross-reference validator + the three fail-closed gates (§4);
    the boot gate first (it protects the runtime).
 3. **app-project-type** — the `app: "urban"` scaffold + the Triggers/Data/Surfaces typed panels over
@@ -144,8 +153,8 @@ types). Run/Compile flow through the **existing supervisor** unchanged — the A
 ## Consequences
 
 - The manifest becomes the **keystone** ADR 0022 called it — a validated contract every Urban
-  subsystem (0024/0025/0026, §E) binds through, with one generated type on both the Rust and TS
-  sides so authoring and running share one schema.
+  subsystem (0024/0025/0026, §E) binds through, with one generated TypeScript type shared by the
+  authoring side (console panels) and the running side (the Deno App) so both agree on one schema.
 - The `nanobpm.project.json` / `nano.app.json` split keeps IDE/toolchain concerns out of the shipping
   App and vice-versa; the existing supervisor and project config are untouched.
 - Fail-closed validation turns whole classes of "silent runtime no-op" (a mistyped trigger target, a
@@ -156,9 +165,9 @@ types). Run/Compile flow through the **existing supervisor** unchanged — the A
 
 ## Open questions
 
-- **Generator choice** — Rust from JSON Schema via `typify`/`schemars`, TS via
-  `json-schema-to-typescript`? Or reuse the OpenAPI toolchain by expressing the manifest as an
-  OpenAPI `components.schemas` fragment for symmetry with `console-api.yaml`?
+- **Generator choice** — TS from JSON Schema via `json-schema-to-typescript`, or express the manifest
+  as an OpenAPI `components.schemas` fragment and reuse the existing `openapi-ts` toolchain for
+  symmetry with `console-api.yaml`? Either way the output is TypeScript (§3).
 - **One file vs. includes** — does a larger App want `nano.app.json` to `$ref`/include per-concern
   files (e.g. `triggers.json`) so the panels edit smaller documents, or stay single-file for
   shareability?
