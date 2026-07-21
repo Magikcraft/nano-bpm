@@ -98,9 +98,13 @@ persona — a person automating their laptop, business, or home — wants the **
 zero-ops, single-node, embedded, one binary. Those personas want different defaults, and trying
 to serve both from one default is what makes "install it like Delphi" die on setup friction.
 
-> **Decision driver:** For Nano **Apps**, the default runtime is **embedded Bernd, single node,
-> App-owned journal + database** — not a cluster. Scaling out to remote/cluster Nano stays a
-> one-line transport config (per ADR 0005), never the starting point.
+> **Decision driver:** For Nano **Apps**, *development* always targets the **engine already running in
+> the IDE** (ADR 0026 §4) — a maker never stands up an engine to build; they deploy into the console's
+> live Nano. *Shipping* then offers **two targets, chosen by config, never a rewrite** (ADR 0005): a
+> **self-contained single-file binary** with the engine embedded ("look — no server"), or a **hosted
+> frontend against a remote Nano cluster** (single- or multi-node). The self-contained binary is the
+> **on-ramp** — the fastest way to hand someone a working App — and the cluster is where an App **grows
+> up** for real workloads. Embedded is a *ship mode and the on-ramp*, not a default *runtime*.
 
 ## Decision (proposed)
 
@@ -303,12 +307,25 @@ That is what keeps switch-over parity for Camunda users.
 
 ### Runtime & packaging
 
-- **Default = embedded Bernd, single node** (ADR 0005), App-owned journal + SQLite, no external
-  server. `deno compile --include public --include db main.ts` emits one self-contained binary:
-  engine + triggers + surfaces + data + frontend. Install = copy one file and run.
-- **Opt-in scale-out**: `runtime.engine: "remote" | "cluster"` flips the SDK transport to a
-  remote Nano/Camunda cluster with **no source change** (the ADR 0005 transport seam). RAD makers
-  never start here; growth is a one-line change, not a rewrite.
+The dev loop and the ship targets are distinct decisions (this refines an earlier framing that named
+embedded the *default runtime*; per ADR 0026 §4 and the run-model correction, dev is always the IDE
+engine and embedded is one of two *ship* modes):
+
+- **Develop against the IDE's running engine** (ADR 0026 §4). A maker deploys into the console's live
+  Nano (default `:8080`); there is no per-App engine to start. This is the fast RAD loop, and it is the
+  same regardless of which target the App will eventually ship to.
+- **Ship A — self-contained binary (the on-ramp).** `deno compile --include public --include db
+  main.ts` emits one file: engine (embedded Bernd, ADR 0005) + triggers + surfaces + data + frontend.
+  Install = copy one file and run — "look, no server." The fastest way to hand someone a working App,
+  and the emotional core of the Delphi lineage.
+- **Ship B — hosted frontend on a remote cluster (where it grows up).** `runtime.engine: "remote" |
+  "cluster"` points the **same App source** at a remote Nano — single-node or multi-node — via the ADR
+  0005 transport seam, with **no source change**. Where production workloads live once an App outgrows
+  the single file.
+
+Both ship targets are the *same App source*; embedded-vs-hosted is a compile/config choice, not a
+rewrite. RAD makers never *start* by operating a cluster — they develop in the IDE and ship the
+on-ramp binary first — but growth to a hosted cluster is a one-line change when it comes.
 
 ## Consequences
 
