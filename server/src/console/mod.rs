@@ -39,6 +39,7 @@ pub mod config;
 pub mod extensions;
 mod generated_api;
 pub mod projects;
+pub mod server_update;
 pub mod trace;
 pub mod worker_export;
 pub mod workers;
@@ -2296,6 +2297,20 @@ pub(super) async fn extensions_marketplace() -> ApiResult {
         Ok(Err(e)) => Err((StatusCode::BAD_GATEWAY, e)),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
+}
+
+/// `GET /console/api/server/update` — server version + self-update status.
+pub(super) async fn server_update() -> ApiResult {
+    Ok(
+        serde_json::to_value(server_update::status().await).unwrap_or_else(|_| {
+            serde_json::json!({
+                "current": env!("NANOBPM_VERSION"),
+                "updateAvailable": false,
+                "canSelfUpdate": false,
+                "installMethod": "unknown",
+            })
+        }),
+    )
 }
 
 /// `POST /console/api/extensions/install` — install a `nano-ide-ext-*` pkg from npm.

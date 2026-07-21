@@ -608,6 +608,45 @@ export type Marketplace = {
     entries: Array<MarketEntry>;
 };
 
+export type ServerUpdateStatus = {
+    /**
+     * The running server version.
+     */
+    current: string;
+    /**
+     * Latest available version for the launch channel, or absent if it could not be resolved (offline, unknown channel, self-managed).
+     *
+     */
+    latest?: string;
+    /**
+     * True only when a self-updatable install has a newer latest than current. Always false for self-managed / dev binaries.
+     *
+     */
+    updateAvailable: boolean;
+    /**
+     * True when the launcher manages this binary (managed npm platform package or managed download) and can perform an in-place update.
+     *
+     */
+    canSelfUpdate: boolean;
+    /**
+     * How the running binary was provisioned, as reported by the launcher.
+     *
+     */
+    installMethod: 'managed-npm' | 'managed-download' | 'configured' | 'flag' | 'repo-release' | 'repo-debug' | 'unknown';
+    /**
+     * Update channel the launcher resolves latest from (npm or download).
+     */
+    channel?: string;
+    /**
+     * Identifier of the launcher that started the server (e.g. c8ctl-plugin-nano).
+     */
+    launcher?: string;
+    /**
+     * Human-readable guidance for updating (method-specific).
+     */
+    updateHint?: string;
+};
+
 export type ExtPkgRequest = {
     pkg: string;
 };
@@ -1889,6 +1928,22 @@ export type SetActiveRunConfigResponses = {
 };
 
 export type SetActiveRunConfigResponse = SetActiveRunConfigResponses[keyof SetActiveRunConfigResponses];
+
+export type GetServerUpdateData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/server/update';
+};
+
+export type GetServerUpdateResponses = {
+    /**
+     * Server update status
+     */
+    200: ServerUpdateStatus;
+};
+
+export type GetServerUpdateResponse = GetServerUpdateResponses[keyof GetServerUpdateResponses];
 
 export type GetExtensionsData = {
     body?: never;
