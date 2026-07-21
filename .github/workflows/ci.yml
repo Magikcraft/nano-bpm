@@ -240,6 +240,18 @@ jobs:
       - name: Install mold linker
         run: sudo apt-get update && sudo apt-get install -y mold
       - uses: taiki-e/install-action@nextest
+      # rust-cache prunes the prebuilt DuckDB that libduckdb-sys downloads into
+      # target/duckdb-download/ (it is not a recognised cargo artifact) but keeps
+      # the build-script fingerprint + its cached rustc-link-search output. On a
+      # cache hit cargo then skips build.rs, never re-downloads the lib, and the
+      # recorded -L path is empty => `mold: library not found: duckdb` at link
+      # time (Clippy passes since it doesn't link; the Test step is the first to
+      # link, so it's where it fails). Invalidate just the libduckdb-sys
+      # build-script fingerprint so it re-runs and re-materialises the lib during
+      # Clippy; the heavy compiled rlibs stay cached.
+      - name: Re-materialise the prebuilt DuckDB lib (rust-cache prunes it)
+        working-directory: processos
+        run: rm -rf target/*/.fingerprint/libduckdb-sys-* target/*/build/libduckdb-sys-*
       - name: Clippy
         working-directory: processos
         run: cargo clippy --no-default-features --all-targets -- -D warnings
