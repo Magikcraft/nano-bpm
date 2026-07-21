@@ -66,10 +66,6 @@ pub const TEMPLATES: &[(&str, &str)] = &[
         "Throughput (falcon) — same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
     ),
     (
-        "rust-throughput",
-        "Throughput (Rust) — native pipelined falcon (where stream beats REST)",
-    ),
-    (
         "gui-starter",
         "GUI app — served-UI binary (Deno.serve) for a process application",
     ),
@@ -1006,163 +1002,6 @@ pipelining native producer (Rust beats REST ~32k vs ~20k).\n\n\
 }
 
 // ---------------------------------------------------------------------------
-// Rust throughput template (lang pack: rust) — native pipelined producer/worker
-// ---------------------------------------------------------------------------
-
-const RUST_CARGO_TOML: &str = r#"[package]
-name = "throughput-rust"
-version = "0.1.0"
-edition = "2021"
-
-[[bin]]
-name = "throughput-rust"
-path = "src/main.rs"
-
-[dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "multipart"] }
-tokio = { version = "1", features = ["full"] }
-serde_json = "1"
-
-[profile.release]
-opt-level = 3
-"#;
-
-const RUST_THROUGHPUT_MAIN: &str = r#"// Throughput (Rust) — pipelined producer + concurrent drainer against the engine.
-//
-// Unlike the JS demos (single-socket, await-per-create), a native producer
-// pipelines creates concurrently across pooled connections, while drainers
-// activate and complete jobs concurrently so the process actually runs end to
-// end. A live per-second line shows creates/s and completes/s as it works.
-// cargo run --release.  Tunables (env): PROD_CONNS, WORKER_CONNS, DURATION_SECS.
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
-#[tokio::main(flavor = "multi_thread")]
-async fn main() {
-    let base = std::env::var("NANOBPMN_BASE_URL").unwrap_or_else(|_| "http://localhost:8080".into());
-    let base = base.trim_end_matches('/').to_string();
-    let pid = std::env::var("PID").unwrap_or_else(|_| "throughput-demo".into());
-    let job_type = std::env::var("JOB_TYPE").unwrap_or_else(|_| "tick".into());
-    let conns: usize = env("PROD_CONNS", 256);
-    let workers: usize = env("WORKER_CONNS", 64);
-    let secs: u64 = env("DURATION_SECS", 15) as u64;
-    let client = reqwest::Client::builder().pool_max_idle_per_host(usize::MAX).build().unwrap();
-
-    println!("deploying throughput.bpmn -> {base}");
-    match deploy(&client, &base).await {
-        Ok(true) => println!("deployed process '{pid}' (job type '{job_type}')"),
-        Ok(false) => eprintln!("warning: deploy returned non-success — is the gateway at {base}?"),
-        Err(e) => { eprintln!("deploy failed: {e}"); return; }
-    }
-    println!("running {secs}s with {conns} producer + {workers} drainer connections...");
-
-    let created = Arc::new(AtomicU64::new(0));
-    let failed = Arc::new(AtomicU64::new(0));
-    let done = Arc::new(AtomicU64::new(0));
-    let create_url = format!("{base}/v2/process-instances");
-    let activate_url = format!("{base}/v2/jobs/activation");
-    let body = serde_json::json!({ "processDefinitionId": pid, "awaitCompletion": false }).to_string();
-    let activate = serde_json::json!({ "type": job_type, "maxJobsToActivate": 100, "timeout": 30000 }).to_string();
-    let t0 = Instant::now();
-    let dur = Duration::from_secs(secs);
-    let mut tasks = Vec::new();
-
-    // Live progress: one line per second with the per-second deltas, so you can
-    // watch the run rather than waiting for a single summary at the end.
-    {
-        let (created, done, failed) = (created.clone(), done.clone(), failed.clone());
-        tasks.push(tokio::spawn(async move {
-            let (mut pc, mut pd) = (0u64, 0u64);
-            while t0.elapsed() < dur {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let (c, d, f) = (created.load(Ordering::Relaxed), done.load(Ordering::Relaxed), failed.load(Ordering::Relaxed));
-                println!("t={:>2}s  created {c} (+{}/s)  completed {d} (+{}/s)  errors {f}", t0.elapsed().as_secs(), c - pc, d - pd);
-                pc = c; pd = d;
-            }
-        }));
-    }
-
-    // Producers: pipeline awaitCompletion:false creates across pooled connections.
-    for _ in 0..conns {
-        let (c, u, b, n, fe) = (client.clone(), create_url.clone(), body.clone(), created.clone(), failed.clone());
-        tasks.push(tokio::spawn(async move {
-            while t0.elapsed() < dur {
-                match c.post(&u).header("content-type", "application/json").body(b.clone()).send().await {
-                    Ok(r) if r.status().is_success() => { n.fetch_add(1, Ordering::Relaxed); }
-                    _ => { fe.fetch_add(1, Ordering::Relaxed); }
-                }
-            }
-        }));
-    }
-
-    // Drainers: activate up to 100 jobs, then complete the batch concurrently —
-    // sequential completion would bottleneck the drain far below the create rate.
-    for _ in 0..workers {
-        let (c, base, n, au, req) = (client.clone(), base.clone(), done.clone(), activate_url.clone(), activate.clone());
-        tasks.push(tokio::spawn(async move {
-            while t0.elapsed() < dur {
-                let Ok(r) = c.post(&au).header("content-type", "application/json").body(req.clone()).send().await else { continue };
-                let j: serde_json::Value = r.json().await.unwrap_or_default();
-                let Some(jobs) = j.get("jobs").and_then(|v| v.as_array()) else { continue };
-                let mut batch = Vec::new();
-                for job in jobs {
-                    if let Some(k) = job.get("jobKey").and_then(|v| v.as_str()) {
-                        let (c, base, k) = (c.clone(), base.clone(), k.to_string());
-                        batch.push(tokio::spawn(async move {
-                            c.post(format!("{base}/v2/jobs/{k}/completion"))
-                                .header("content-type", "application/json").body("{}").send().await
-                                .map(|r| r.status().is_success()).unwrap_or(false)
-                        }));
-                    }
-                }
-                for b in batch { if let Ok(true) = b.await { n.fetch_add(1, Ordering::Relaxed); } }
-            }
-        }));
-    }
-
-    for t in tasks { let _ = t.await; }
-    let (c, d, f) = (created.load(Ordering::Relaxed), done.load(Ordering::Relaxed), failed.load(Ordering::Relaxed));
-    let s = secs.max(1);
-    println!("=== {c} created (~{}/s), {d} completed (~{}/s), {f} errors over {secs}s ===", c / s, d / s);
-}
-
-fn env(k: &str, def: usize) -> usize {
-    std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(def)
-}
-
-async fn deploy(client: &reqwest::Client, base: &str) -> Result<bool, String> {
-    let xml = include_str!("../resources/processes/throughput.bpmn");
-    let form = reqwest::multipart::Form::new().part(
-        "resources",
-        reqwest::multipart::Part::text(xml).file_name("throughput.bpmn").mime_str("text/xml").map_err(|e| e.to_string())?,
-    );
-    let r = client.post(format!("{base}/v2/deployments")).multipart(form).send().await.map_err(|e| e.to_string())?;
-    Ok(r.status().is_success())
-}
-"#;
-
-fn rust_throughput_readme() -> String {
-    "# Throughput (Rust)\n\n\
-A native producer that pipelines creates across pooled connections while \
-drainers activate and complete jobs concurrently, so the process runs end to \
-end. A live per-second line streams creates/s and completes/s to this console \
-as it runs. cargo runs it: press **Run** (needs the Rust toolchain installed; \
-the IDE detects `cargo`).\n\n\
-## Tunables (env)\n\n\
-`PROD_CONNS` (producer connections, default 256), `WORKER_CONNS` (drainer \
-connections, default 64), `DURATION_SECS` (default 15).\n\n\
-## A/B (native, clean engine, async durability)\n\n\
-| Metric | REST | Falcon |\n\
-|---|---|---|\n\
-| Peak instances/sec | ~20k | **~32k** |\n\
-| Engine memory | high | **~4x lower** |\n\n\
-In JS the SDK awaits one create at a time so REST wins; a native pipelining \
-producer flips it. Swap the reqwest loop for the stream client for the headline.\n"
-        .into()
-}
-
-// ---------------------------------------------------------------------------
 // GUI app template (app pack: deno-gui) — served-UI binary
 // ---------------------------------------------------------------------------
 
@@ -1240,7 +1079,7 @@ pub fn create_project(
     // resources/processes/*.bpmn from the built-in fallthrough.
     let is_builtin_template = matches!(
         template,
-        "starter" | "throughput" | "throughput-stream" | "rust-throughput" | "gui-starter"
+        "starter" | "throughput" | "throughput-stream" | "gui-starter"
     );
     if !is_builtin_template && let Some((m, src)) = super::extensions::template_source(template) {
         mk(dir.clone())?;
@@ -1309,9 +1148,11 @@ pub fn create_project(
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
-    let mut cfg_lang = "deno".to_string();
+    // All remaining built-in scaffolds are Deno-flavoured (Rust/Java are
+    // pack-provided), so lang/main are fixed; only `gui-starter` varies `app`.
+    let cfg_lang = "deno".to_string();
     let mut cfg_app = "console";
-    let mut cfg_main = "main.ts".to_string();
+    let cfg_main = "main.ts".to_string();
 
     if template == "throughput" {
         let worker = dir.join("workers").join("tick");
@@ -1336,19 +1177,6 @@ pub fn create_project(
                 .join("throughput.bpmn"),
             DEMO_PROCESS_BPMN,
         )?;
-    } else if template == "rust-throughput" {
-        mk(dir.join("src"))?;
-        w(dir.join("Cargo.toml"), RUST_CARGO_TOML)?;
-        w(dir.join("src").join("main.rs"), RUST_THROUGHPUT_MAIN)?;
-        w(dir.join("README.md"), &rust_throughput_readme())?;
-        w(
-            dir.join("resources")
-                .join("processes")
-                .join("throughput.bpmn"),
-            DEMO_PROCESS_BPMN,
-        )?;
-        cfg_lang = "rust".to_string();
-        cfg_main = "src/main.rs".to_string();
     } else if template == "gui-starter" {
         mk(dir.join("public"))?;
         w(dir.join("deno.json"), GUI_DENO_JSON)?;
@@ -1386,10 +1214,7 @@ pub fn create_project(
     // stays None here — its absence is how the Console distinguishes a built-in
     // template from a pack-contributed one.
     cfg.template = Some(
-        if matches!(
-            template,
-            "throughput" | "throughput-stream" | "rust-throughput" | "gui-starter"
-        ) {
+        if matches!(template, "throughput" | "throughput-stream" | "gui-starter") {
             template
         } else {
             "starter"
@@ -2782,18 +2607,6 @@ mod tests {
             let files = ProjectSupervisor::discover_deployables(&root, &["models".into()]).await;
             assert!(files.is_empty(), "symlink escape must be rejected");
         }
-    }
-
-    #[test]
-    fn rust_template_sets_lang_and_cargo_files() {
-        let _g = lock();
-        let root = temp_root();
-        let cfg = create_project("rdemo", "", "rust-throughput").expect("create");
-        assert_eq!(cfg.lang, "rust");
-        assert_eq!(cfg.main, "src/main.rs");
-        let dir = root.join("rdemo");
-        assert!(dir.join("Cargo.toml").is_file());
-        assert!(dir.join("src/main.rs").is_file());
     }
 
     #[test]
