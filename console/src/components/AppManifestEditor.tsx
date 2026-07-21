@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CodeEditor from "./CodeEditor";
 import { Badge, Button, SectionLabel } from "./ui";
 import { projectFileEx } from "../lib/api";
+import { setManifestSource } from "../lib/manifestIntellisense";
 import { saveProjectFile, type FileNode } from "../gen";
 import {
   buildSymbolIndex,
@@ -17,6 +18,10 @@ import {
 export function isAppManifestPath(path: string): boolean {
   return path === "nano.app.json" || path.endsWith("/nano.app.json");
 }
+
+/** Stable virtual URI for the manifest's Monaco model, so the manifest
+ * IntelliSense provider can scope itself to exactly this document. */
+const MANIFEST_URI = "file:///nano.app.json";
 
 function flattenFiles(nodes: FileNode[]): string[] {
   const out: string[] = [];
@@ -127,6 +132,19 @@ export default function AppManifestEditor({
     return { diagnostics: validateManifest(value, index).diagnostics, parsed: value };
   }, [content, idx]);
 
+  // Keep the manifest IntelliSense provider (ADR 0029 §2) fed with the latest
+  // parsed manifest + symbol index. A ref-cell means the provider reads fresh
+  // state on each completion request without re-registering per keystroke.
+  const sourceRef = useRef<{ manifest: unknown; index: SymbolIndex | undefined }>({
+    manifest: undefined,
+    index: undefined,
+  });
+  sourceRef.current = {
+    manifest: parsed,
+    index: idx.status === "ready" ? idx.index : undefined,
+  };
+  useEffect(() => setManifestSource(MANIFEST_URI, () => sourceRef.current), []);
+
   const save = useCallback(async () => {
     if (content == null) return;
     setSaving(true);
@@ -186,6 +204,7 @@ export default function AppManifestEditor({
           <CodeEditor
             value={content}
             language="json"
+            path={MANIFEST_URI}
             onChange={(v) => {
               setContent(v);
               setDirty(true);
