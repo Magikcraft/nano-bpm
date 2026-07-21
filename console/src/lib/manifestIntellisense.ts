@@ -37,13 +37,15 @@ const KIND_ICON: Record<CandidateKind, monaco.languages.CompletionItemKind> = {
   type: monaco.languages.CompletionItemKind.Struct,
   datasource: monaco.languages.CompletionItemKind.Module,
   agent: monaco.languages.CompletionItemKind.Value,
+  variable: monaco.languages.CompletionItemKind.Field,
 };
 
 function ensureProvider(): void {
   if (registered) return;
   registered = true;
   monaco.languages.registerCompletionItemProvider("json", {
-    triggerCharacters: ['"', "-"],
+    // `.` triggers FEEL variable-path completion inside trigger action fields.
+    triggerCharacters: ['"', "-", "."],
     provideCompletionItems(model, position) {
       const cell = sources.get(model.uri.toString());
       if (!cell) return { suggestions: [] };

@@ -230,6 +230,10 @@ export interface Trigger {
    * Inbound auth policy for a webhook, e.g. 'hmac:sensors' referencing a connection (ADR 0025).
    */
   auth?: string;
+  /**
+   * Lowercase kebab-case slug.
+   */
+  bodyType?: string;
   action: TriggerAction;
 }
 /**
