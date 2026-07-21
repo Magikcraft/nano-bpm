@@ -591,6 +591,80 @@ pub struct Element {
     pub multi_instance: Option<MultiInstance>,
 }
 
+/// The BPMN ad-hoc sub-process implementation type (Camunda `zeebe:adHoc`).
+///
+/// `JobWorker` is the agentic path: the container is backed by a job worker (the
+/// AI Agent connector) that decides which inner elements to activate and returns
+/// them in the job result. `BpmnTask` is the declarative path: the elements to
+/// activate come from a FEEL `activeElementsCollection`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AdHocImplementationType {
+    /// Agentic: a job worker returns the elements to activate (default).
+    #[default]
+    JobWorker,
+    /// Declarative: a FEEL `activeElementsCollection` names the elements.
+    BpmnTask,
+}
+
+/// The kind of an ad-hoc "tool" (an inner activatable element of an
+/// [`AdHocSubProcessDef`]), captured so the container's tool catalog is
+/// self-describing without re-reading the pruned elements.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum AdHocToolKind {
+    /// A job-based task; `job_type` is its resolved `zeebe:taskDefinition` type.
+    ServiceTask { job_type: String },
+    /// A native user task (human-in-the-loop tool).
+    UserTask,
+    /// A call activity; `process_id` is the invoked process id, if declared.
+    CallActivity { process_id: Option<String> },
+    /// Any other element kind usable as a tool.
+    Other,
+}
+
+/// A single activatable inner element ("tool") of an ad-hoc sub-process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AdHocTool {
+    pub element_id: ElementId,
+    pub kind: AdHocToolKind,
+}
+
+/// The retained metadata + tool catalog of one `adHocSubProcess`.
+///
+/// Nano keeps the container itself as a single job-bearing activity in the
+/// executable graph and does not (yet) run its inner tools by token flow; this
+/// struct preserves what the pruned inner elements were, plus the `zeebe:adHoc`
+/// wiring, so the Camunda agentic contract can be honoured later (ADR 0023:
+/// activate-element execution) without re-parsing. It is non-executable metadata
+/// today — engine token flow does not read it.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AdHocSubProcessDef {
+    /// Id of the `adHocSubProcess` element these tools belong to.
+    pub container_id: ElementId,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub impl_type: AdHocImplementationType,
+    /// Raw (un-evaluated) `<completionCondition>` FEEL text, if declared.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub completion_condition: Option<String>,
+    /// Raw `zeebe:adHoc activeElementsCollection` FEEL expression (declarative
+    /// `BpmnTask` variant), if declared.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub active_elements_collection: Option<String>,
+    /// Raw `zeebe:adHoc outputCollection` result-variable name, if declared.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub output_collection: Option<String>,
+    /// Raw `zeebe:adHoc outputElement` FEEL expression mapping each tool result
+    /// into the output collection, if declared.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub output_element: Option<String>,
+    /// The inner activatable elements, in document order.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub tools: Vec<AdHocTool>,
+}
+
 /// An executable process definition: a set of [`Element`]s plus the id of the
 /// single start event where new instances begin.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -608,6 +682,12 @@ pub struct ProcessDefinition {
     /// snapshotted) but no engine logic reads it.
     #[cfg_attr(feature = "serde", serde(default))]
     pub xml: String,
+    /// Retained ad-hoc sub-process tool catalogs, one per `adHocSubProcess`.
+    /// Non-executable metadata today (see [`AdHocSubProcessDef`]); defaulted
+    /// empty when absent or when deserializing definitions written before this
+    /// field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub adhoc: Vec<AdHocSubProcessDef>,
 }
 
 impl ProcessDefinition {
@@ -655,6 +735,7 @@ impl ProcessDefinition {
             elements,
             start_event: self.start_event.clone(),
             xml: self.xml.clone(),
+            adhoc: self.adhoc.clone(),
         })
     }
 }
@@ -1508,6 +1589,7 @@ impl ProcessBuilder {
             // Programmatically built definitions have no source XML; parse_bpmn
             // overwrites this with the verbatim resource for parsed deployments.
             xml: String::new(),
+            adhoc: Vec::new(),
         })
     }
 }
