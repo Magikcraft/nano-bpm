@@ -1360,7 +1360,7 @@ components:
     # ---- Projects (camelCase wire fields) --------------------------------
     ProjectSummary:
       type: object
-      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running]
+      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running, lang]
       properties:
         name: { type: string }
         description: { type: string }
@@ -1371,6 +1371,20 @@ components:
         forms: { type: integer, format: int32 }
         workers: { type: integer, format: int32 }
         running: { type: boolean }
+        lang:
+          type: string
+          description: >-
+            Language pack id driving the project (e.g. "deno", "rust", "java").
+            The console resolves the card's language icon by matching this to an
+            Extension of kind "lang".
+        template:
+          type: string
+          description: >-
+            Id of the scaffold template the project was created from (e.g.
+            "starter", "throughput", "java-starter"), when known. Surfaced on the
+            card so a bug can be traced back to the built-in template or pack.
+        scaffoldedFrom:
+          $ref: '#/components/schemas/ProjectScaffoldedFrom'
     ProjectRunConfig:
       type: object
       required: [id, label, run, compile]
@@ -1433,6 +1447,10 @@ components:
           additionalProperties: { type: string }
         toolchain: { $ref: '#/components/schemas/ProjectToolchain' }
         scaffoldedFrom: { $ref: '#/components/schemas/ProjectScaffoldedFrom' }
+        template:
+          type: string
+          description: >-
+            Id of the scaffold template this project was created from, when known.
         createdMs: { type: integer, format: int64 }
         updatedMs: { type: integer, format: int64 }
     FileNode:
@@ -1568,6 +1586,12 @@ components:
           type: string
           enum: [lang, app, example, theme]
         displayName: { type: string }
+        icon:
+          type: string
+          description: >-
+            Optional icon for the pack, as an inline SVG XML string (preferred)
+            or a data:/http: URL. Lang packs supply this so the console can badge
+            project cards with a language icon.
         builtin: { type: boolean }
         fileTypes:
           type: array

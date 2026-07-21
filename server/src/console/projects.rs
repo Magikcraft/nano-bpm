@@ -255,6 +255,13 @@ pub struct ProjectConfig {
     /// toolchain) and for a possible "Reset toolchain from pack" affordance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scaffolded_from: Option<ScaffoldedFrom>,
+    /// Id of the scaffold template this project was created from (e.g.
+    /// "starter", "throughput", "java-starter"), recorded at creation. Purely a
+    /// provenance breadcrumb the Console surfaces on the project card so a bug
+    /// can be traced to the built-in template or contributing pack. Absent on
+    /// projects scaffolded before this was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
     #[serde(default)]
     pub created_ms: u64,
     #[serde(default)]
@@ -384,6 +391,7 @@ impl ProjectConfig {
             env: std::collections::BTreeMap::new(),
             toolchain: None,
             scaffolded_from: None,
+            template: None,
             created_ms: ts,
             updated_ms: ts,
         }
@@ -605,7 +613,7 @@ fn starter_process(name: &str) -> String {
     let pid = format!("{name}-process");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs-{pid}" targetNamespace="http://nanobpm">
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs-{pid}" targetNamespace="http://nanobpm">
   <bpmn:process id="{pid}" isExecutable="true">
     <bpmn:startEvent id="start" />
     <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="task" />
@@ -617,6 +625,27 @@ fn starter_process(name: &str) -> String {
     <bpmn:sequenceFlow id="f2" sourceRef="task" targetRef="end" />
     <bpmn:endEvent id="end" />
   </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_{pid}">
+    <bpmndi:BPMNPlane id="BPMNPlane_{pid}" bpmnElement="{pid}">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="180" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="task_di" bpmnElement="task">
+        <dc:Bounds x="270" y="78" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="end_di" bpmnElement="end">
+        <dc:Bounds x="432" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="f1_di" bpmnElement="f1">
+        <di:waypoint x="216" y="118" />
+        <di:waypoint x="270" y="118" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="f2_di" bpmnElement="f2">
+        <di:waypoint x="370" y="118" />
+        <di:waypoint x="432" y="118" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
 </bpmn:definitions>
 "#
     )
@@ -1262,6 +1291,7 @@ pub fn create_project(
             pack: m.id.clone(),
             version: super::extensions::pack_version(&m.id),
         });
+        cfg.template = Some(template.to_string());
         write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
         return Ok(cfg);
     }
@@ -1351,6 +1381,21 @@ pub fn create_project(
     cfg.lang = cfg_lang;
     cfg.app = cfg_app.to_string();
     cfg.main = cfg_main;
+    // Record which built-in template was stamped out. Unknown ids fall through
+    // to the "starter" scaffold above, so that's what we record. `scaffolded_from`
+    // stays None here — its absence is how the Console distinguishes a built-in
+    // template from a pack-contributed one.
+    cfg.template = Some(
+        if matches!(
+            template,
+            "throughput" | "throughput-stream" | "rust-throughput" | "gui-starter"
+        ) {
+            template
+        } else {
+            "starter"
+        }
+        .to_string(),
+    );
     write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
     Ok(cfg)
 }
@@ -1400,6 +1445,18 @@ pub struct ProjectSummary {
     pub forms: usize,
     pub workers: usize,
     pub running: bool,
+    /// Language pack id (from the project config; default "deno"). The Console
+    /// resolves the card's language icon by matching this to a lang Extension.
+    pub lang: String,
+    /// Scaffold template id, when recorded. Absent on projects created before
+    /// this breadcrumb existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template: Option<String>,
+    /// Pack that scaffolded the project, when it came from an installed pack.
+    /// Absent for built-in templates (the `template` id alone then identifies
+    /// the built-in scaffold).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scaffolded_from: Option<ScaffoldedFrom>,
 }
 
 fn count_ext(dir: &Path, ext: &str) -> usize {
@@ -1446,6 +1503,9 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
             forms: count_ext(&res.join("forms"), "form"),
             workers: count_dirs(&path.join("workers")),
             running: false,
+            lang: cfg.lang,
+            template: cfg.template,
+            scaffolded_from: cfg.scaffolded_from,
         });
     }
     out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then(a.name.cmp(&b.name)));
@@ -3317,6 +3377,23 @@ mod tests {
         let cfg = create_project("demo", "a demo", "starter").expect("create");
         assert_eq!(cfg.name, "demo");
         assert_eq!(cfg.deploy_target, "http://localhost:8080");
+        // Built-in scaffold: the template id is recorded, but `scaffolded_from`
+        // stays None — its absence marks the template as built-in on the card.
+        assert_eq!(cfg.template.as_deref(), Some("starter"));
+        assert!(cfg.scaffolded_from.is_none());
+        // An unknown template falls through to the starter scaffold, so that's
+        // what gets recorded.
+        let g = create_project("guess", "", "no-such-template").expect("create");
+        assert_eq!(g.template.as_deref(), Some("starter"));
+        // The tile summary surfaces the language + template breadcrumb.
+        let summary = list_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "demo")
+            .expect("demo listed");
+        assert_eq!(summary.lang, "deno");
+        assert_eq!(summary.template.as_deref(), Some("starter"));
+        assert!(summary.scaffolded_from.is_none());
         let dir = root.join("demo");
         assert!(dir.join("main.ts").is_file());
         assert!(dir.join("deno.json").is_file());

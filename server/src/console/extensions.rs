@@ -182,6 +182,11 @@ pub struct ExtManifest {
     pub id: String,
     pub kind: ExtKind,
     pub display_name: String,
+    /// Optional pack icon: an inline SVG XML string (preferred) or a data:/http:
+    /// URL. Lang packs supply this so the Console can badge project cards with a
+    /// language icon. Built-in packs embed a small brand glyph below.
+    #[serde(default)]
+    pub icon: Option<String>,
     #[serde(default)]
     pub file_types: Vec<FileType>,
     #[serde(default)]
@@ -208,6 +213,14 @@ pub struct ExtManifest {
     pub themes: Vec<ThemeSpec>,
 }
 
+/// Built-in language-pack icons: theme-robust lettermark tiles (a brand-coloured
+/// rounded square with a white glyph) rendered as an `<img>` on project cards.
+/// A colored tile stays legible on both the light and dark console themes (an
+/// `<img>`-loaded SVG can't inherit `currentColor`). Published packs may ship
+/// their own richer SVG via `nano-ide.ext.json`'s `icon`.
+const ICON_DENO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#3178C6"/><text x="12" y="16.5" font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="700" fill="#fff" text-anchor="middle">TS</text></svg>"##;
+const ICON_RUST: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#CE422B"/><g fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 4.5v2M12 17.5v2M4.5 12h2M17.5 12h2M6.7 6.7l1.4 1.4M15.9 15.9l1.4 1.4M17.3 6.7l-1.4 1.4M8.1 15.9l-1.4 1.4"/></g></svg>"##;
+
 /// The built-in first-party packs — always available, offline, unremovable.
 /// Deno is the legacy lang+app runtime (empty toolchain => internal Deno path).
 pub fn builtin_extensions() -> Vec<ExtManifest> {
@@ -216,6 +229,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             id: "deno".into(),
             kind: ExtKind::Lang,
             display_name: "Deno (TypeScript)".into(),
+            icon: Some(ICON_DENO.into()),
             file_types: vec![
                 FileType {
                     ext: ".ts".into(),
@@ -247,6 +261,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             id: "rust".into(),
             kind: ExtKind::Lang,
             display_name: "Rust".into(),
+            icon: Some(ICON_RUST.into()),
             file_types: vec![FileType {
                 ext: ".rs".into(),
                 monaco_lang: "rust".into(),
@@ -277,6 +292,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             id: "deno-gui".into(),
             kind: ExtKind::App,
             display_name: "Deno GUI app".into(),
+            icon: None,
             file_types: vec![],
             templates: vec![TemplateSpec {
                 id: "gui-starter".into(),

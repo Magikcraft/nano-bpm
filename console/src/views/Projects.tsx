@@ -10,6 +10,20 @@ import {
 } from "../gen";
 import { Button, Card, EmptyState, Input, PageHeader, inputClass } from "../components/ui";
 
+/// Resolved language-pack presentation for a project card: the pack's icon
+/// (inline SVG markup or a data:/http: URL) and its human-facing name.
+type LangMeta = { icon?: string; displayName: string };
+
+/// Turn a pack `icon` (raw SVG markup, or an already-usable data:/http: URL)
+/// into an `<img src>`. Inline SVG is wrapped in a `data:` URI so it renders
+/// sandboxed (no script execution), which also means it can't inherit theme
+/// colours — pack icons are authored as self-coloured tiles for that reason.
+function iconSrc(icon: string): string {
+  const s = icon.trim();
+  if (s.startsWith("<")) return `data:image/svg+xml,${encodeURIComponent(s)}`;
+  return s;
+}
+
 /// Mirrors the server's `is_safe_name` (console/workspace.rs) so the New Project
 /// form can validate in real time instead of failing on submit. Returns a
 /// human-readable error, or `null` when the name is acceptable.
@@ -37,6 +51,7 @@ export default function Projects() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [denoAvailable, setDenoAvailable] = useState(true);
   const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
+  const [langMeta, setLangMeta] = useState<Record<string, LangMeta>>({});
   const [newTemplate, setNewTemplate] = useState("starter");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -51,6 +66,11 @@ export default function Projects() {
       setProjects(res.projects);
       setDenoAvailable(res.denoAvailable);
       setTemplates(res.templates ?? []);
+      const meta: Record<string, LangMeta> = {};
+      for (const e of res.extensions?.extensions ?? []) {
+        if (e.kind === "lang") meta[e.id] = { icon: e.icon, displayName: e.displayName };
+      }
+      setLangMeta(meta);
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -203,7 +223,7 @@ export default function Projects() {
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((p) => (
-            <ProjectTile key={p.name} project={p} onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)} onDelete={() => void remove(p.name)} onRename={() => void rename(p.name)} />
+            <ProjectTile key={p.name} project={p} lang={langMeta[p.lang]} onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)} onDelete={() => void remove(p.name)} onRename={() => void rename(p.name)} />
           ))}
         </div>
       )}
@@ -213,15 +233,18 @@ export default function Projects() {
 
 function ProjectTile({
   project,
+  lang,
   onOpen,
   onDelete,
   onRename,
 }: {
   project: ProjectSummary;
+  lang?: LangMeta;
   onOpen: () => void;
   onDelete: () => void;
   onRename: () => void;
 }) {
+  const langLabel = lang?.displayName ?? project.lang;
   return (
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
       <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex">
@@ -242,6 +265,21 @@ function ProjectTile({
       </div>
       <button onClick={onOpen} className="flex flex-1 flex-col text-left">
         <div className="flex items-center gap-2">
+          {lang?.icon ? (
+            <img
+              src={iconSrc(lang.icon)}
+              alt={langLabel}
+              title={langLabel}
+              className="h-5 w-5 shrink-0 rounded-sm"
+            />
+          ) : (
+            <span
+              title={langLabel}
+              className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm bg-inset text-[9px] font-bold uppercase text-fg-faint"
+            >
+              {(project.lang || "?").slice(0, 2)}
+            </span>
+          )}
           <span className="truncate text-base font-semibold text-fg">{project.name}</span>
           {project.running && (
             <span className="inline-flex items-center gap-1 rounded-full bg-ok/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ok">
@@ -258,9 +296,35 @@ function ProjectTile({
           <Stat label="forms" value={project.forms} />
           <Stat label="workers" value={project.workers} />
         </div>
-        <div className="mt-3 truncate text-[11px] text-fg-faint">→ {project.deployTarget}</div>
+        <TemplateProvenance project={project} />
+        <div className="mt-2 truncate text-[11px] text-fg-faint">→ {project.deployTarget}</div>
       </button>
     </Card>
+  );
+}
+
+/// Where this project came from: the scaffold template id plus its origin —
+/// a contributing pack (with version when known) or a built-in. Lets a bug in
+/// generated project scaffolding be traced straight to the pack or built-in
+/// template that produced it. Renders nothing for projects predating the
+/// breadcrumb.
+function TemplateProvenance({ project }: { project: ProjectSummary }) {
+  if (!project.template) return null;
+  const from = project.scaffoldedFrom;
+  const origin = from
+    ? `${from.pack}${from.version ? ` v${from.version}` : ""}`
+    : "built-in";
+  return (
+    <div
+      className="mt-2 flex items-center gap-1 truncate text-[11px] text-fg-faint"
+      title={`Scaffolded from the “${project.template}” template (${origin})`}
+    >
+      <span aria-hidden>⧉</span>
+      <span className="truncate">
+        <span className="text-fg-muted">{project.template}</span>
+        <span className="text-fg-faint"> · {origin}</span>
+      </span>
+    </div>
   );
 }
 

@@ -387,6 +387,15 @@ export type ProjectSummary = {
     forms: number;
     workers: number;
     running: boolean;
+    /**
+     * Language pack id driving the project (e.g. "deno", "rust", "java"). The console resolves the card's language icon by matching this to an Extension of kind "lang".
+     */
+    lang: string;
+    /**
+     * Id of the scaffold template the project was created from (e.g. "starter", "throughput", "java-starter"), when known. Surfaced on the card so a bug can be traced back to the built-in template or pack.
+     */
+    template?: string;
+    scaffoldedFrom?: ProjectScaffoldedFrom;
 };
 
 export type ProjectRunConfig = {
@@ -430,6 +439,10 @@ export type ProjectConfig = {
     };
     toolchain?: ProjectToolchain;
     scaffoldedFrom?: ProjectScaffoldedFrom;
+    /**
+     * Id of the scaffold template this project was created from, when known.
+     */
+    template?: string;
     createdMs: number;
     updatedMs: number;
 };
@@ -526,6 +539,10 @@ export type Extension = {
     id: string;
     kind: 'lang' | 'app' | 'example' | 'theme';
     displayName: string;
+    /**
+     * Optional icon for the pack, as an inline SVG XML string (preferred) or a data:/http: URL. Lang packs supply this so the console can badge project cards with a language icon.
+     */
+    icon?: string;
     builtin: boolean;
     fileTypes: Array<ExtensionFileType>;
     templates: Array<ExtensionTemplate>;
