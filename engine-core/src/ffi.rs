@@ -480,6 +480,7 @@ pub unsafe extern "C" fn nbpmn_complete_job(engine: *mut Engine, job_key: u64) -
     let cmd = Command::CompleteJob {
         job_key,
         variables: Default::default(),
+        adhoc_result: None,
     };
     match engine.apply_command(cmd) {
         Ok(_) => 0,

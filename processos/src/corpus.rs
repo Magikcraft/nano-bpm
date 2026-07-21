@@ -650,13 +650,8 @@ fn run_path(
                     clock,
                 );
             } else {
-                let _ = engine.apply_command_at(
-                    Command::CompleteJob {
-                        job_key,
-                        variables: HashMap::new(),
-                    },
-                    clock,
-                );
+                let _ = engine
+                    .apply_command_at(Command::complete_job_with(job_key, HashMap::new()), clock);
             }
         }
     }

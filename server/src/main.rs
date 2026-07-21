@@ -54,8 +54,9 @@ use http::StatusCode;
 use nanobpm_gateway_rest::{apis, models, types};
 use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
-    ActivatedJob, Command, EngineError, Event, IncidentKind, IncidentState, Key, MAX_PARTITION_ID,
-    ProcessBuilder, ProcessDefinition, ProcessInstanceState, Value, partition_of,
+    ActivatedJob, AdHocActivateElement, AdHocJobResult, Command, EngineError, Event, IncidentKind,
+    IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
+    Value, partition_of,
 };
 
 use crate::backpressure::{
@@ -4138,6 +4139,10 @@ impl ServerImpl {
             })
             .unwrap_or_default();
 
+        // Optional agentic ad-hoc sub-process result (Camunda `JobResult`).
+        // `None` for ordinary completions, keeping that path byte-unchanged.
+        let adhoc_result = adhoc_result_from_completion(body);
+
         // Cluster: if a peer owns the job's partition, forward over the command
         // stream and map its answer back (single-node always owns every key).
         if let Some(node) = self.route_by_leader(job_key) {
@@ -4148,16 +4153,19 @@ impl ServerImpl {
                     types::Nullable::Present(map) => wire_variables(Some(map)),
                     types::Nullable::Null => None,
                 });
-            return Ok(self.forward_complete_job(node, job_key, wire).await);
+            return Ok(self
+                .forward_complete_job(node, job_key, wire, adhoc_result)
+                .await);
         }
 
+        let command = match adhoc_result {
+            Some(result) => Command::complete_job_with_result(job_key, variables, result),
+            None => Command::complete_job_with(job_key, variables),
+        };
         let result = self
             .engine
             .by_key(job_key)
-            .with(move |engine| {
-                engine
-                    .apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
-            })
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         match result {
             Ok((events, commit)) => {
@@ -5589,11 +5597,15 @@ impl ServerImpl {
         node: u32,
         job_key: u64,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
+        adhoc_result: Option<AdHocJobResult>,
     ) -> apis::job::CompleteJobResponse {
         use apis::job::CompleteJobResponse as Resp;
         let res =
             match self.peer_link(node).await {
-                Ok(link) => link.complete_job(job_key.to_string(), variables).await,
+                Ok(link) => {
+                    link.complete_job(job_key.to_string(), variables, adhoc_result)
+                        .await
+                }
                 Err((s, m)) => {
                     return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
                         problem("Peer error", s, m),
@@ -5729,9 +5741,13 @@ impl ServerImpl {
         node: u32,
         job_key: u64,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
+        adhoc_result: Option<AdHocJobResult>,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
-            Ok(link) => match link.complete_job(job_key.to_string(), variables).await {
+            Ok(link) => match link
+                .complete_job(job_key.to_string(), variables, adhoc_result)
+                .await
+            {
                 Ok(r) => (r.status, r.body),
                 Err(e) => (502, Some(serde_json::Value::String(e.to_string()))),
             },
@@ -11423,19 +11439,19 @@ impl ServerImpl {
         &self,
         job_key: u64,
         variables: std::collections::HashMap<String, Value>,
+        adhoc_result: Option<AdHocJobResult>,
     ) -> Result<Commit, (u16, String)> {
+        let command = match adhoc_result {
+            Some(result) => Command::complete_job_with_result(job_key, variables, result),
+            None => Command::complete_job_with(job_key, variables),
+        };
         if !self.raft.is_empty() {
-            return self
-                .propose_job_for_stream(job_key, Command::complete_job_with(job_key, variables))
-                .await;
+            return self.propose_job_for_stream(job_key, command).await;
         }
         let result = self
             .engine
             .by_key(job_key)
-            .with(move |engine| {
-                engine
-                    .apply_command_at(Command::complete_job_with(job_key, variables), now_millis())
-            })
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
             .await;
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
@@ -12621,6 +12637,42 @@ fn to_object_map(
 }
 
 /// Converts a REST `Object` (JSON) variable map into engine variables.
+/// Extracts the agentic ad-hoc sub-process result from a job-completion request
+/// body (Camunda `JobResult` discriminated on `type == "adHocSubProcess"`).
+///
+/// Returns `None` for an ordinary completion or a `userTask` result, so the
+/// non-agentic path stays byte-unchanged. Plumbed to the engine command today
+/// (ADR 0023 seam 3); the engine does not yet act on it.
+fn adhoc_result_from_completion(
+    body: &Option<models::JobCompletionRequest>,
+) -> Option<AdHocJobResult> {
+    let result = body.as_ref()?.result.as_ref()?;
+    let adhoc = match result {
+        models::JobResult::JobResultAdHocSubProcess(a) => a,
+        models::JobResult::JobResultUserTask(_) => return None,
+    };
+    let activate_elements = adhoc
+        .activate_elements
+        .as_ref()
+        .map(|els| {
+            els.iter()
+                .map(|el| AdHocActivateElement {
+                    element_id: el.element_id.clone().unwrap_or_default(),
+                    variables: match el.variables.as_ref() {
+                        Some(types::Nullable::Present(map)) => from_object_map(map),
+                        _ => std::collections::HashMap::new(),
+                    },
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(AdHocJobResult {
+        activate_elements,
+        completion_condition_fulfilled: adhoc.is_completion_condition_fulfilled.unwrap_or(false),
+        cancel_remaining_instances: adhoc.is_cancel_remaining_instances.unwrap_or(false),
+    })
+}
+
 fn from_object_map(
     variables: &std::collections::HashMap<String, types::Object>,
 ) -> std::collections::HashMap<String, Value> {
@@ -16100,7 +16152,7 @@ mod clustered_startup_tests {
 
         // Forward the completion to node 0 over the wire and map its answer back.
         use apis::job::CompleteJobResponse as R;
-        let resp = node1.forward_complete_job(owner, job_key, None).await;
+        let resp = node1.forward_complete_job(owner, job_key, None, None).await;
         assert!(
             matches!(resp, R::Status204_TheJobWasCompletedSuccessfully),
             "the forwarded completion should succeed (204)"
@@ -16108,7 +16160,7 @@ mod clustered_startup_tests {
 
         // The completion really mutated node 0's state: completing the same job
         // again is rejected (it is no longer an activated job).
-        let again = node1.forward_complete_job(owner, job_key, None).await;
+        let again = node1.forward_complete_job(owner, job_key, None, None).await;
         assert!(
             !matches!(again, R::Status204_TheJobWasCompletedSuccessfully),
             "re-completing an already-completed job must not return 204, got a success"
@@ -16649,7 +16701,7 @@ mod clustered_startup_tests {
             .expect("the job's partition is owned by node 0");
         assert_eq!(owner, 0);
         let (status, _) = node1
-            .forward_complete_job_stream(owner, job_key, None)
+            .forward_complete_job_stream(owner, job_key, None, None)
             .await;
         assert!(
             is_ok_status(status),
@@ -16658,7 +16710,7 @@ mod clustered_startup_tests {
 
         // Re-completing the same job is rejected — proof it mutated node 0's state.
         let (again, _) = node1
-            .forward_complete_job_stream(owner, job_key, None)
+            .forward_complete_job_stream(owner, job_key, None, None)
             .await;
         assert!(
             !is_ok_status(again),
@@ -17134,7 +17186,7 @@ mod clustered_startup_tests {
         let job_key = job_key.expect("the parked job activates on the leader");
 
         let commit = node0
-            .complete_job_for_stream(job_key, Default::default())
+            .complete_job_for_stream(job_key, Default::default(), None)
             .await
             .expect("raft-routed complete commits via quorum");
         commit.wait().await;
@@ -17142,7 +17194,7 @@ mod clustered_startup_tests {
         // Re-completing the same job is rejected THROUGH the Raft log, proving the
         // first completion mutated the leader's durable state via propose().
         let err = match node0
-            .complete_job_for_stream(job_key, Default::default())
+            .complete_job_for_stream(job_key, Default::default(), None)
             .await
         {
             Ok(_) => panic!("re-complete of a completed job must be rejected"),
@@ -17292,7 +17344,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the parked job activates on the leader");
         node0
-            .complete_job_for_stream(job_key, Default::default())
+            .complete_job_for_stream(job_key, Default::default(), None)
             .await
             .expect("raft-routed complete commits via quorum")
             .wait()
@@ -17510,7 +17562,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the parked job activates on the new leader after failover");
         new_leader
-            .complete_job_for_stream(job_key, Default::default())
+            .complete_job_for_stream(job_key, Default::default(), None)
             .await
             .expect("complete commits via the new quorum")
             .wait()
@@ -17810,7 +17862,7 @@ mod clustered_startup_tests {
             for j in jobs {
                 let job_key = j.job_key.0.parse::<u64>().expect("numeric job key");
                 new_leader
-                    .complete_job_for_stream(job_key, Default::default())
+                    .complete_job_for_stream(job_key, Default::default(), None)
                     .await
                     .expect("complete commits via the new quorum")
                     .wait()
@@ -18364,7 +18416,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the leased-but-uncompleted job re-activates after failover");
         new_leader
-            .complete_job_for_stream(job_key, Default::default())
+            .complete_job_for_stream(job_key, Default::default(), None)
             .await
             .expect("complete commits via the new quorum")
             .wait()
@@ -18893,7 +18945,7 @@ mod clustered_startup_tests {
         let job_key =
             job_key.expect("the auto-promoted leader serves activateJobs for partition 0");
         node1
-            .complete_job_for_stream(job_key, Default::default())
+            .complete_job_for_stream(job_key, Default::default(), None)
             .await
             .expect("the auto-promoted leader commits the completion")
             .wait()
@@ -20532,7 +20584,7 @@ mod subscription_placement_tests {
             .find(|k| nanobpmn_engine_core::partition_of(*k) == p_inst)
             .expect("our instance's job is activatable");
         server
-            .complete_job_for_stream(job_key, std::collections::HashMap::new())
+            .complete_job_for_stream(job_key, std::collections::HashMap::new(), None)
             .await
             .expect("complete succeeds")
             .wait()
@@ -20763,5 +20815,70 @@ mod variable_record_projection_tests {
         let r = variable_search_result(&v, false);
         assert_eq!(r.scope_key.0, r.process_instance_key.0);
         assert_eq!(r.scope_key, models::ScopeKey("1001".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod adhoc_result_mapping_tests {
+    use super::*;
+
+    /// An ordinary completion (no `result`) maps to `None`, so the non-agentic
+    /// path builds a plain `complete_job_with` command.
+    #[test]
+    fn plain_completion_has_no_adhoc_result() {
+        assert!(adhoc_result_from_completion(&None).is_none());
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: None,
+        };
+        assert!(adhoc_result_from_completion(&Some(body)).is_none());
+    }
+
+    /// A `userTask` result is not an ad-hoc result.
+    #[test]
+    fn user_task_result_is_not_an_adhoc_result() {
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(
+                models::JobResultUserTask::new(),
+            )),
+        };
+        assert!(adhoc_result_from_completion(&Some(body)).is_none());
+    }
+
+    /// The Camunda `adHocSubProcess` `JobResult` maps field-for-field onto the
+    /// engine's `AdHocJobResult`, including per-element activation variables.
+    #[test]
+    fn adhoc_result_maps_activate_elements_and_flags() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert(
+            "query".to_string(),
+            types::Object(serde_json::json!("bananas")),
+        );
+        let element = models::JobResultActivateElement {
+            element_id: Some("Search_Recipe".to_string()),
+            variables: Some(types::Nullable::Present(vars)),
+        };
+        let adhoc = models::JobResultAdHocSubProcess {
+            activate_elements: Some(vec![element]),
+            is_completion_condition_fulfilled: Some(true),
+            is_cancel_remaining_instances: Some(false),
+            r_type: Some("adHocSubProcess".to_string()),
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultAdHocSubProcess(adhoc)),
+        };
+
+        let mapped = adhoc_result_from_completion(&Some(body)).expect("adhoc result");
+        assert_eq!(mapped.activate_elements.len(), 1);
+        assert_eq!(mapped.activate_elements[0].element_id, "Search_Recipe");
+        assert_eq!(
+            mapped.activate_elements[0].variables.get("query"),
+            Some(&Value::Str("bananas".to_string()))
+        );
+        assert!(mapped.completion_condition_fulfilled);
+        assert!(!mapped.cancel_remaining_instances);
+        assert!(!mapped.is_empty());
     }
 }

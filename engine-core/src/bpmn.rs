@@ -488,6 +488,23 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                         attr(attrs, "priority").map(str::to_string);
                                 }
                             }
+                            "adHoc" => {
+                                // zeebe:adHoc inside an adHocSubProcess: the
+                                // agentic wiring — outputCollection/outputElement
+                                // gather each activated tool's result, and
+                                // activeElementsCollection (declarative variant)
+                                // names elements to activate via FEEL. The ad-hoc
+                                // container is tracked as cur_service_task.
+                                if let Some(idx) = cur_service_task {
+                                    let n = &mut acc.nodes[idx];
+                                    n.adhoc_output_collection =
+                                        attr(attrs, "outputCollection").map(str::to_string);
+                                    n.adhoc_output_element =
+                                        attr(attrs, "outputElement").map(str::to_string);
+                                    n.adhoc_active_elements =
+                                        attr(attrs, "activeElementsCollection").map(str::to_string);
+                                }
+                            }
                             "sequenceFlow" => {
                                 let idx = acc.add_flow(attrs);
                                 if !self_closing {
@@ -881,6 +898,15 @@ struct NodeAcc {
     /// True for an `adHocSubProcess`: kept as a single Service job activity while
     /// its contained elements are pruned at build (see `build`).
     is_adhoc: bool,
+    /// `zeebe:adHoc outputCollection` on an ad-hoc container, if declared.
+    adhoc_output_collection: Option<String>,
+    /// `zeebe:adHoc outputElement` FEEL expression on an ad-hoc container.
+    adhoc_output_element: Option<String>,
+    /// `zeebe:adHoc activeElementsCollection` FEEL expression (declarative
+    /// `BpmnTask` variant) on an ad-hoc container.
+    adhoc_active_elements: Option<String>,
+    /// An ad-hoc container's `<completionCondition>` FEEL text, if declared.
+    adhoc_completion_condition: Option<String>,
     /// For an exclusive gateway: the id of its `default="..."` sequence flow, if
     /// declared. That flow becomes the gateway's fallback (taken only when no
     /// other outgoing condition matches), regardless of document order.
@@ -1007,6 +1033,10 @@ impl ProcessAcc {
             parent: self.scope_stack.last().cloned(),
             user_task: crate::model::UserTaskProps::default(),
             is_adhoc: false,
+            adhoc_output_collection: None,
+            adhoc_output_element: None,
+            adhoc_active_elements: None,
+            adhoc_completion_condition: None,
             default_flow: None,
             io: crate::model::IoMapping::default(),
             timer_expr: None,
@@ -1044,9 +1074,14 @@ impl ProcessAcc {
     ) -> Result<ProcessDefinition, ParseError> {
         // Ad-hoc sub-processes are kept as a single Service job activity; the
         // elements they contain (agent "tools", invoked out-of-band rather than by
-        // token flow) are pruned, along with any sequence flows or boundary events
-        // that reference them. A node is pruned when its parent chain reaches an
-        // ad-hoc node, so nesting at any depth is handled.
+        // token flow) are pruned from the executable graph, along with any
+        // sequence flows or boundary events that reference them. A node is pruned
+        // when its parent chain reaches an ad-hoc node, so nesting at any depth is
+        // handled. Before pruning, the tools + `zeebe:adHoc` wiring are captured
+        // into `adhoc_catalog` as non-executable metadata so the Camunda agentic
+        // activate-element contract can be honoured later (ADR 0023) without
+        // re-parsing.
+        let mut adhoc_catalog: Vec<crate::model::AdHocSubProcessDef> = Vec::new();
         let adhoc_ids: std::collections::HashSet<String> = self
             .nodes
             .iter()
@@ -1069,12 +1104,67 @@ impl ProcessAcc {
                 }
                 false
             };
+            // The nearest enclosing ad-hoc container of `id`, if any.
+            let nearest_adhoc = |id: &str| -> Option<String> {
+                let mut cur = parent_of.get(id).copied();
+                while let Some(p) = cur {
+                    if adhoc_ids.contains(p) {
+                        return Some(p.to_string());
+                    }
+                    cur = parent_of.get(p).copied();
+                }
+                None
+            };
             let pruned: std::collections::HashSet<String> = self
                 .nodes
                 .iter()
                 .filter(|n| inside_adhoc(&n.id))
                 .map(|n| n.id.clone())
                 .collect();
+
+            // One catalog entry per ad-hoc container, in document order.
+            let mut index: HashMap<String, usize> = HashMap::new();
+            for n in self.nodes.iter().filter(|n| n.is_adhoc) {
+                index.insert(n.id.clone(), adhoc_catalog.len());
+                // A container backed by a job (taskDefinition) is the agentic
+                // JOB_WORKER variant; one that only declares an
+                // activeElementsCollection is the declarative BPMN_TASK variant.
+                let impl_type = if n.job_type.is_none() && n.adhoc_active_elements.is_some() {
+                    crate::model::AdHocImplementationType::BpmnTask
+                } else {
+                    crate::model::AdHocImplementationType::JobWorker
+                };
+                adhoc_catalog.push(crate::model::AdHocSubProcessDef {
+                    container_id: n.id.clone(),
+                    impl_type,
+                    completion_condition: n.adhoc_completion_condition.clone(),
+                    active_elements_collection: n.adhoc_active_elements.clone(),
+                    output_collection: n.adhoc_output_collection.clone(),
+                    output_element: n.adhoc_output_element.clone(),
+                    tools: Vec::new(),
+                });
+            }
+            // Assign each pruned tool to its nearest ad-hoc container, preserving
+            // document order.
+            for n in self.nodes.iter().filter(|n| pruned.contains(&n.id)) {
+                let kind = match n.kind {
+                    NodeKind::Service => crate::model::AdHocToolKind::ServiceTask {
+                        job_type: n.job_type.clone().unwrap_or_else(|| n.id.clone()),
+                    },
+                    NodeKind::User => crate::model::AdHocToolKind::UserTask,
+                    NodeKind::Call => crate::model::AdHocToolKind::CallActivity {
+                        process_id: n.called_process_id.clone(),
+                    },
+                    _ => crate::model::AdHocToolKind::Other,
+                };
+                if let Some(pos) = nearest_adhoc(&n.id).and_then(|c| index.get(&c).copied()) {
+                    adhoc_catalog[pos].tools.push(crate::model::AdHocTool {
+                        element_id: n.id.clone(),
+                        kind,
+                    });
+                }
+            }
+
             if !pruned.is_empty() {
                 self.nodes.retain(|n| !pruned.contains(&n.id));
                 self.flows.retain(|f| {
@@ -1424,10 +1514,12 @@ impl ProcessAcc {
                 (false, None) => builder.connect(source, target),
             };
         }
-        builder.build().map_err(|e| ParseError::InvalidProcess {
+        let mut def = builder.build().map_err(|e| ParseError::InvalidProcess {
             process_id: self.id,
             reason: e.to_string(),
-        })
+        })?;
+        def.adhoc = adhoc_catalog;
+        Ok(def)
     }
 }
 
@@ -1910,6 +2002,8 @@ mod tests {
               <bpmn:adHocSubProcess id="agent" name="Agentic investigation">
                 <bpmn:extensionElements>
                   <zeebe:taskDefinition type="io.camunda.agenticai:aiagent-job-worker:1" />
+                  <zeebe:adHoc outputCollection="toolCallResults"
+                               outputElement="={ id: toolCall._meta.id }" />
                 </bpmn:extensionElements>
                 <bpmn:serviceTask id="tool_issue_credit">
                   <bpmn:extensionElements>
@@ -1940,10 +2034,89 @@ mod tests {
         );
         assert_eq!(def.element("s").unwrap().outgoing[0].to, "agent");
         assert_eq!(def.element("agent").unwrap().outgoing[0].to, "e");
-        // and: the contained tool activities (and their internal flow) are pruned.
+        // and: the contained tool activities (and their internal flow) are pruned
+        // from the executable graph.
         assert!(def.element("tool_issue_credit").is_none());
         assert!(def.element("tool_review").is_none());
         assert!(def.element("tool_gw").is_none());
+
+        // and: the ad-hoc tool catalog + zeebe:adHoc wiring is retained as
+        // metadata (ADR 0023 Tier-1 substrate).
+        assert_eq!(def.adhoc.len(), 1);
+        let cat = &def.adhoc[0];
+        assert_eq!(cat.container_id, "agent");
+        assert_eq!(
+            cat.impl_type,
+            crate::model::AdHocImplementationType::JobWorker
+        );
+        assert_eq!(cat.output_collection.as_deref(), Some("toolCallResults"));
+        assert_eq!(
+            cat.output_element.as_deref(),
+            Some("={ id: toolCall._meta.id }")
+        );
+        // Tools are captured in document order with their kinds; the inner
+        // gateway is not an activatable tool and is captured as `Other`.
+        let ids: Vec<&str> = cat.tools.iter().map(|t| t.element_id.as_str()).collect();
+        assert_eq!(ids, vec!["tool_issue_credit", "tool_review", "tool_gw"]);
+        assert_eq!(
+            cat.tools[0].kind,
+            crate::model::AdHocToolKind::ServiceTask {
+                job_type: "io.camunda:http-json:1".to_string()
+            }
+        );
+        assert_eq!(cat.tools[1].kind, crate::model::AdHocToolKind::UserTask);
+        assert_eq!(cat.tools[2].kind, crate::model::AdHocToolKind::Other);
+    }
+
+    #[test]
+    fn should_retain_the_tool_catalog_from_the_camunda_golden_fixture() {
+        // The unmodified Camunda AI Agent ad-hoc example (see
+        // engine-core/tests/fixtures/adhoc-agent/README.md). It must parse and
+        // expose its JOB_WORKER ad-hoc container + tool catalog.
+        let xml = include_str!(
+            "../tests/fixtures/adhoc-agent/ai-agent-chat-with-tools/ai-agent-chat-with-tools.bpmn"
+        );
+        let defs = parse_bpmn(xml).unwrap();
+        let def = defs
+            .iter()
+            .find(|d| d.adhoc.iter().any(|a| a.container_id == "AI_Agent"))
+            .expect("the AI_Agent ad-hoc container should be catalogued");
+        let cat = def
+            .adhoc
+            .iter()
+            .find(|a| a.container_id == "AI_Agent")
+            .unwrap();
+        assert_eq!(
+            cat.impl_type,
+            crate::model::AdHocImplementationType::JobWorker
+        );
+        assert_eq!(cat.output_collection.as_deref(), Some("toolCallResults"));
+        // The fixture's tool set (see the fixtures README table). These are the
+        // activities nested inside the AI_Agent ad-hoc container.
+        for tool in [
+            "LoadUserByID",
+            "ListUsers",
+            "Search_Recipe",
+            "GetDateAndTime",
+            "SuperfluxProduct",
+            "SendEmail",
+            "Jokes_API",
+            "Fetch_URL",
+            "AskHumanToSendEmail",
+            "Handle_Message",
+        ] {
+            assert!(
+                cat.tools.iter().any(|t| t.element_id == tool),
+                "tool {tool} should be in the catalog"
+            );
+        }
+        // The agent container is still one job in the executable graph, and the
+        // tools are pruned from it.
+        assert!(matches!(
+            def.element("AI_Agent").unwrap().kind,
+            ElementKind::ServiceTask { .. }
+        ));
+        assert!(def.element("Search_Recipe").is_none());
     }
 
     #[test]
