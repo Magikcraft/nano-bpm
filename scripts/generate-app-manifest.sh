@@ -30,7 +30,7 @@ fi
 cd "${SPEC_DIR}"
 
 if [[ ! -d node_modules ]]; then
-  echo "Installing spec-app dev dependencies (ajv, json-schema-to-typescript)"
+  echo "Installing spec-app dev dependencies (ajv, json-schema-to-typescript, esbuild)"
   npm install --no-audit --no-fund
 fi
 
@@ -43,6 +43,21 @@ if [[ "${1:-}" == "--check" ]]; then
 else
   echo "Generating TypeScript AppManifest types into spec-app/gen/"
   npm run --silent gen
+fi
+
+# Build the browser-consumable package artifact (dist/index.js + dist/index.d.ts)
+# — a self-contained ESM bundle + flattened declarations the console imports
+# without re-bundling the moddle parsers. Committed like gen/ and console/dist.
+echo "Building spec-app dist/ (bundled ESM + declarations)"
+npm run --silent build
+
+if [[ "${1:-}" == "--check" ]]; then
+  echo "Checking committed spec-app/dist/ is up to date"
+  if ! git -C "${PROJECT_ROOT}" diff --exit-code -- spec-app/dist; then
+    echo "error: spec-app/dist/ is stale. Run 'make generate-app-manifest'" >&2
+    echo "       (or 'npm run build' in spec-app/) and commit the result." >&2
+    exit 1
+  fi
 fi
 
 echo "Done."

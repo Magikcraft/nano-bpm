@@ -8,6 +8,7 @@
 // Parsing uses the same moddle/form-js model the editors use, so the index can
 // never disagree with what a maker actually drew.
 
+/// <reference path="./moddle-shims.d.ts" />
 import BpmnModdle from "bpmn-moddle";
 import DmnModdle from "dmn-moddle";
 import zeebe from "zeebe-bpmn-moddle/resources/zeebe.json" with { type: "json" };

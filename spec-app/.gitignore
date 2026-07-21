@@ -1,1 +1,7 @@
 node_modules/
+
+# dist/ is a committed build artifact (a bundled ESM + flattened .d.ts the
+# console imports without re-bundling moddle). Re-include it against the repo-
+# root `dist/` ignore, which targets the wasm FFI tree, not this package.
+!dist/
+!dist/**
