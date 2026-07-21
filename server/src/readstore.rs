@@ -180,6 +180,7 @@ fn incident_kind_code(k: IncidentKind) -> i64 {
         IncidentKind::NoMatchingSequenceFlow => 1,
         IncidentKind::UnhandledError => 2,
         IncidentKind::ExpressionEvaluation => 3,
+        IncidentKind::DecisionEvaluation => 4,
     }
 }
 fn incident_kind_from(code: i64) -> IncidentKind {
@@ -187,6 +188,7 @@ fn incident_kind_from(code: i64) -> IncidentKind {
         1 => IncidentKind::NoMatchingSequenceFlow,
         2 => IncidentKind::UnhandledError,
         3 => IncidentKind::ExpressionEvaluation,
+        4 => IncidentKind::DecisionEvaluation,
         _ => IncidentKind::JobNoRetries,
     }
 }

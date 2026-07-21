@@ -1016,9 +1016,8 @@ impl ServerImpl {
 /// `processDefinitionKey`. `install_deployment` applies only these events (never
 /// arming a second copy of a start subscription/timer).
 fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
-    deploy_journal
-        .engine()
-        .state()
+    let state = deploy_journal.engine().state();
+    let mut events: Vec<Event> = state
         .processes
         .values()
         .map(|deployed| Event::ProcessDeployed {
@@ -1029,30 +1028,80 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
             version: deployed.version,
             process: deployed.definition.clone(),
         })
-        .collect()
+        .collect();
+    // Re-emit each deployed DRG followed by its decisions so a freshly seeded
+    // replica can evaluate business rule tasks. DecisionRequirementsDeployed
+    // must precede its DecisionDeployed events (the applier resolves the DRG by
+    // key), so emit them grouped per DRG.
+    for drg in state.decision_requirements.values() {
+        events.push(Event::DecisionRequirementsDeployed {
+            deployment_key: 0,
+            decision_requirements_key: drg.key,
+            version: drg.version,
+            drg: drg.drg.clone(),
+        });
+        for decision in state
+            .decisions
+            .values()
+            .filter(|d| d.decision_requirements_key == drg.key)
+        {
+            events.push(Event::DecisionDeployed {
+                deployment_key: 0,
+                decision_requirements_key: decision.decision_requirements_key,
+                decision_key: decision.key,
+                decision_id: decision.decision_id.clone(),
+                decision_name: decision.decision_name.clone(),
+                version: decision.version,
+            });
+        }
+    }
+    events
 }
 
-/// Parses every deployment resource up front so a deploy is all-or-nothing,
-/// returning the parsed process definitions and a map from process id to its
-/// originating resource name. `Err` is `(title, detail)` for a 400 response.
-#[allow(clippy::type_complexity)]
+/// The parsed content of a deploy request: BPMN process definitions and DMN
+/// decision requirements graphs, each with a map from its id back to the
+/// originating resource file name (for the deployment response).
+struct ParsedDeploy {
+    processes: Vec<ProcessDefinition>,
+    process_resource_names: std::collections::HashMap<String, String>,
+    decisions: Vec<nanobpmn_engine_core::dmn::DecisionRequirementsGraph>,
+    /// DRG id -> resource name.
+    drg_resource_names: std::collections::HashMap<String, String>,
+}
+
+/// Parses every deployment resource up front so a deploy is all-or-nothing.
+/// A resource whose file name ends in `.dmn` is parsed as a DMN decision
+/// requirements graph; everything else is parsed as BPMN (`.bpmn` or unnamed).
+/// `Err` is `(title, detail)` for a 400 response.
 fn parse_deploy_resources(
     resources: &[(String, String)],
-) -> Result<
-    (
-        Vec<ProcessDefinition>,
-        std::collections::HashMap<String, String>,
-    ),
-    (&'static str, String),
-> {
+) -> Result<ParsedDeploy, (&'static str, String)> {
     let mut processes = Vec::new();
-    let mut resource_names: std::collections::HashMap<String, String> =
+    let mut process_resource_names: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut decisions = Vec::new();
+    let mut drg_resource_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for (resource_name, xml) in resources {
+        if resource_name.to_ascii_lowercase().ends_with(".dmn") {
+            match nanobpmn_engine_core::dmn::parse_dmn(xml) {
+                Ok(drg) => {
+                    drg_resource_names.insert(drg.id.clone(), resource_name.clone());
+                    decisions.push(drg);
+                }
+                Err(e) => {
+                    return Err((
+                        "Invalid DMN",
+                        format!("Failed to parse '{resource_name}': {e}."),
+                    ));
+                }
+            }
+            continue;
+        }
         match parse_bpmn(xml) {
             Ok(defs) => {
                 for def in defs {
-                    resource_names.insert(def.id.clone(), resource_name.clone());
+                    process_resource_names.insert(def.id.clone(), resource_name.clone());
                     processes.push(def);
                 }
             }
@@ -1064,7 +1113,12 @@ fn parse_deploy_resources(
             }
         }
     }
-    Ok((processes, resource_names))
+    Ok(ParsedDeploy {
+        processes,
+        process_resource_names,
+        decisions,
+        drg_resource_names,
+    })
 }
 
 impl Default for ServerImpl {
@@ -1173,7 +1227,12 @@ fn rebuild_read_model_legacy(
     let mut per_shard: std::collections::HashMap<u64, Vec<&Event>> =
         shards.iter().map(|(p, _)| (*p, Vec::new())).collect();
     for e in events {
-        if matches!(e, Event::ProcessDeployed { .. }) {
+        if matches!(
+            e,
+            Event::ProcessDeployed { .. }
+                | Event::DecisionRequirementsDeployed { .. }
+                | Event::DecisionDeployed { .. }
+        ) {
             for bucket in per_shard.values_mut() {
                 bucket.push(e);
             }
@@ -7759,7 +7818,7 @@ impl ServerImpl {
         // Falcon protocol and return its answer. Single-node always owns
         // partition 0, so this is the unchanged local path.
         if self.engine.topology().is_local(0) {
-            let (processes, resource_names) = match parse_deploy_resources(&resources) {
+            let parsed = match parse_deploy_resources(&resources) {
                 Ok(parsed) => parsed,
                 Err((title, detail)) => {
                     return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
@@ -7768,7 +7827,13 @@ impl ServerImpl {
                 }
             };
             match self
-                .deploy_resources_locally(processes, &resource_names, &tenant_id)
+                .deploy_resources_locally(
+                    parsed.processes,
+                    &parsed.process_resource_names,
+                    parsed.decisions,
+                    &parsed.drg_resource_names,
+                    &tenant_id,
+                )
                 .await
             {
                 Ok((result, events)) => {
@@ -7791,31 +7856,54 @@ impl ServerImpl {
         }
     }
 
-    /// Deploys already-parsed `processes` on this node's deployment partition
-    /// (durable) and replicates the definition(s) in-memory to its other owned
-    /// partitions. Returns the typed deployment result and the minted
-    /// `ProcessDeployed` events (for cross-node broadcast). The caller must be the
+    /// Deploys already-parsed `processes` and DMN `decisions` on this node's
+    /// deployment partition (durable) and replicates the definition(s) in-memory
+    /// to its other owned partitions. Returns the typed deployment result and the
+    /// minted deployment events (for cross-node broadcast). The caller must be the
     /// partition-0 owner. `Err` carries `(title, detail)` for a 400.
     async fn deploy_resources_locally(
         &self,
         processes: Vec<ProcessDefinition>,
         resource_names: &std::collections::HashMap<String, String>,
+        decisions: Vec<nanobpmn_engine_core::dmn::DecisionRequirementsGraph>,
+        drg_resource_names: &std::collections::HashMap<String, String>,
         tenant_id: &str,
     ) -> Result<(models::DeploymentResult, Arc<Vec<Event>>), (&'static str, String)> {
         let requested_ids: Vec<String> = processes.iter().map(|p| p.id.clone()).collect();
+        let requested_drg_ids: Vec<String> = decisions.iter().map(|d| d.id.clone()).collect();
         // The closure returns, besides the emitted events and commit, the
         // resolved (key, version) for every *requested* process id read back from
         // post-apply state. An idempotent redeploy emits no event but must still
         // be reported with its existing version, so the response is built from
         // this resolution rather than from the events alone.
         type Resolved = Vec<(String, u64, i32)>;
-        let deploy_result: Result<(Arc<Vec<Event>>, Commit, Resolved), String> = self
+        // Resolved decisions: (decision_id, name, key, version, drg_id, drg_key).
+        type ResolvedDecisions = Vec<(String, String, u64, i32, String, u64)>;
+        // Resolved DRGs: (drg_id, name, key, version).
+        type ResolvedDrgs = Vec<(String, String, u64, i32)>;
+        #[allow(clippy::type_complexity)]
+        let deploy_result: Result<
+            (Arc<Vec<Event>>, Commit, Resolved, ResolvedDrgs, ResolvedDecisions),
+            String,
+        > = self
             .engine
             .deploy_partition()
             .with(move |engine| {
                 let (events, commit) = engine
                     .apply_command(Command::DeployResources(processes))
                     .map_err(|e| e.to_string())?;
+                // Deploy any DMN decisions in the same durable batch. Their events
+                // are appended so the whole deployment broadcasts/replicates as one.
+                let mut all_events = (*events).clone();
+                let mut commit = commit;
+                if !decisions.is_empty() {
+                    let (dec_events, dec_commit) = engine
+                        .apply_command(Command::DeployDecisionRequirements(decisions))
+                        .map_err(|e| e.to_string())?;
+                    all_events.extend((*dec_events).iter().cloned());
+                    commit = dec_commit;
+                }
+                let events = Arc::new(all_events);
                 let resolved: Resolved = requested_ids
                     .iter()
                     .filter_map(|id| {
@@ -7826,11 +7914,43 @@ impl ServerImpl {
                             .map(|d| (id.clone(), d.key, d.version))
                     })
                     .collect();
-                Ok((events, commit, resolved))
+                let resolved_drgs: ResolvedDrgs = requested_drg_ids
+                    .iter()
+                    .filter_map(|id| {
+                        engine
+                            .state()
+                            .decision_requirements
+                            .get(id)
+                            .map(|d| (id.clone(), d.drg.name.clone(), d.key, d.version))
+                    })
+                    .collect();
+                let resolved_decisions: ResolvedDecisions = requested_drg_ids
+                    .iter()
+                    .filter_map(|id| engine.state().decision_requirements.get(id))
+                    .flat_map(|drg| {
+                        drg.drg
+                            .decisions
+                            .iter()
+                            .filter_map(|d| {
+                                engine.state().decisions.get(&d.id).map(|dep| {
+                                    (
+                                        dep.decision_id.clone(),
+                                        dep.decision_name.clone(),
+                                        dep.key,
+                                        dep.version,
+                                        drg.drg.id.clone(),
+                                        drg.key,
+                                    )
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect();
+                Ok((events, commit, resolved, resolved_drgs, resolved_decisions))
             })
             .await;
-        let (events, commit, resolved) = match deploy_result {
-            Ok(triple) => triple,
+        let (events, commit, resolved, resolved_drgs, resolved_decisions) = match deploy_result {
+            Ok(t) => t,
             Err(e) => return Err(("Invalid deployment", e)),
         };
         // Replicate the new definition(s) to the other local partitions so any of
@@ -7853,7 +7973,7 @@ impl ServerImpl {
                 _ => None,
             })
             .unwrap_or_else(|| "0".to_string());
-        let deployments = resolved
+        let mut deployments: Vec<models::DeploymentMetadataResult> = resolved
             .into_iter()
             .map(|(process_id, process_definition_key, version)| {
                 let resource_name = resource_names.get(&process_id).cloned().unwrap_or_default();
@@ -7873,6 +7993,44 @@ impl ServerImpl {
                 )
             })
             .collect();
+        // One metadata entry per deployed decision requirements graph...
+        for (drg_id, drg_name, drg_key, version) in resolved_drgs {
+            let resource_name = drg_resource_names.get(&drg_id).cloned().unwrap_or_default();
+            let drg_result = models::DeploymentDecisionRequirementsResult::new(
+                drg_id,
+                drg_name,
+                version,
+                resource_name,
+                tenant_id.to_string(),
+                models::DecisionRequirementsKey(drg_key.to_string()),
+            );
+            deployments.push(models::DeploymentMetadataResult::new(
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Present(drg_result),
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+            ));
+        }
+        // ...and one per decision it contains.
+        for (decision_id, name, decision_key, version, drg_id, drg_key) in resolved_decisions {
+            let decision_result = models::DeploymentDecisionResult::new(
+                decision_id,
+                version,
+                name,
+                tenant_id.to_string(),
+                drg_id,
+                models::DecisionDefinitionKey(decision_key.to_string()),
+                models::DecisionRequirementsKey(drg_key.to_string()),
+            );
+            deployments.push(models::DeploymentMetadataResult::new(
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Present(decision_result),
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+            ));
+        }
 
         let result = models::DeploymentResult::new(
             models::DeploymentKey(deployment_key),
@@ -7893,10 +8051,15 @@ impl ServerImpl {
         resources: Vec<(String, String)>,
         tenant_id: String,
     ) -> Result<serde_json::Value, (u16, String)> {
-        let (processes, resource_names) =
-            parse_deploy_resources(&resources).map_err(|(_, detail)| (400u16, detail))?;
+        let parsed = parse_deploy_resources(&resources).map_err(|(_, detail)| (400u16, detail))?;
         let (result, events) = self
-            .deploy_resources_locally(processes, &resource_names, &tenant_id)
+            .deploy_resources_locally(
+                parsed.processes,
+                &parsed.process_resource_names,
+                parsed.decisions,
+                &parsed.drg_resource_names,
+                &tenant_id,
+            )
             .await
             .map_err(|(_, detail)| (400u16, detail))?;
         self.broadcast_deployment(&events).await;
@@ -7973,7 +8136,14 @@ impl ServerImpl {
         }
         let deployed: Vec<Event> = events
             .iter()
-            .filter(|e| matches!(e, Event::ProcessDeployed { .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::ProcessDeployed { .. }
+                        | Event::DecisionRequirementsDeployed { .. }
+                        | Event::DecisionDeployed { .. }
+                )
+            })
             .cloned()
             .collect();
         if deployed.is_empty() {
@@ -12268,6 +12438,9 @@ fn incident_error_type_enum(kind: IncidentKind) -> models::IncidentErrorTypeEnum
         IncidentKind::NoMatchingSequenceFlow => models::IncidentErrorTypeEnum::ConditionError,
         IncidentKind::ExpressionEvaluation => models::IncidentErrorTypeEnum::ExtractValueError,
         IncidentKind::UnhandledError => models::IncidentErrorTypeEnum::UnhandledErrorEvent,
+        IncidentKind::DecisionEvaluation => {
+            models::IncidentErrorTypeEnum::DecisionEvaluationError
+        }
     }
 }
 
@@ -13628,7 +13801,12 @@ async fn main() {
                     let mut per_owned: std::collections::HashMap<u64, Vec<Event>> =
                         owned.iter().map(|p| (*p, Vec::new())).collect();
                     for event in events {
-                        if matches!(event, Event::ProcessDeployed { .. }) {
+                        if matches!(
+                            event,
+                            Event::ProcessDeployed { .. }
+                                | Event::DecisionRequirementsDeployed { .. }
+                                | Event::DecisionDeployed { .. }
+                        ) {
                             for bucket in per_owned.values_mut() {
                                 bucket.push(event.clone());
                             }
@@ -15857,7 +16035,7 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("order-flow".to_string(), "order.bpmn".to_string());
         node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy message-start process on the owner");
 
@@ -15944,7 +16122,7 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("await-payment".to_string(), "await.bpmn".to_string());
         let (_result, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -16007,6 +16185,93 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test]
+    async fn deploys_dmn_and_business_rule_task_evaluates_decision() {
+        // End-to-end server-side DMN parity check: a mixed `.dmn` + `.bpmn`
+        // deployment lands on the deployment partition, and an instance whose
+        // businessRuleTask calls the deployed decision evaluates it synchronously
+        // and runs straight through to completion.
+        let server = ServerImpl::default();
+
+        // A greeting decision table: `lang` in -> `result` string out.
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+              <rule id="r2"><inputEntry id="ie2"><text>"de"</text></inputEntry>
+                <outputEntry id="oe2"><text>"hallo"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+
+        // A process with a businessRuleTask calling the `greeting` decision and
+        // binding its output under the `greeting` variable.
+        let proc = ProcessBuilder::new("greeter")
+            .start_event("s")
+            .business_rule_task("decide", "greeting", Some("greeting".to_string()))
+            .end_event("e")
+            .connect("s", "decide")
+            .connect("decide", "e")
+            .build()
+            .expect("valid businessRuleTask process");
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("greeter".to_string(), "greeter.bpmn".to_string());
+
+        let (result, _events) = server
+            .deploy_resources_locally(
+                vec![proc],
+                &proc_names,
+                vec![drg],
+                &drg_names,
+                "<default>",
+            )
+            .await
+            .expect("mixed dmn+bpmn deploy succeeds");
+
+        // The deployment result reports the process, the DRG, and its decision.
+        use nanobpm_gateway_rest::types::Nullable;
+        assert!(
+            result
+                .deployments
+                .iter()
+                .any(|m| matches!(m.process_definition, Nullable::Present(_))),
+            "process metadata present"
+        );
+        assert!(
+            result
+                .deployments
+                .iter()
+                .any(|m| matches!(m.decision_requirements, Nullable::Present(_))),
+            "decision-requirements metadata present"
+        );
+        assert!(
+            result
+                .deployments
+                .iter()
+                .any(|m| matches!(m.decision_definition, Nullable::Present(_))),
+            "decision-definition metadata present"
+        );
+
+        // Creating an instance evaluates the decision synchronously: the
+        // businessRuleTask has no job to wait on, so the instance completes.
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("lang".to_string(), Value::Str("de".into()));
+        let (_instance_key, completed) = server
+            .create_for_stream(Some("greeter".into()), None, variables)
+            .await
+            .expect("create the businessRuleTask instance");
+        assert!(
+            completed,
+            "the businessRuleTask evaluates the decision and completes synchronously"
+        );
+    }
+
+    #[tokio::test]
     async fn message_start_dispatches_instances_across_the_node_boundary() {
         // Message-start subscriptions live only on the deploy owner (node 0). The
         // round-robin start dispatcher must spread the created instances over the
@@ -16055,7 +16320,7 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         let (_result, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -16283,7 +16548,7 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("review".to_string(), "review.bpmn".to_string());
         node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy the user-task process on the owner");
         let (instance, _) = node0
@@ -17100,7 +17365,7 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -17264,7 +17529,7 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -17460,7 +17725,7 @@ mod clustered_startup_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -17724,7 +17989,7 @@ mod clustered_startup_tests {
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         names.insert("auto".to_string(), "auto.bpmn".to_string());
         let (_r, events) = node0
-            .deploy_resources_locally(vec![proc, auto], &names, "<default>")
+            .deploy_resources_locally(vec![proc, auto], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy on the owner");
         node1.install_replicated_deployment(events.to_vec()).await;
@@ -20403,7 +20668,7 @@ mod subscription_placement_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("guarded".to_string(), "guarded.bpmn".to_string());
         server
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy the boundary process on every owned partition");
 
@@ -20474,7 +20739,7 @@ mod subscription_placement_tests {
         let mut names = std::collections::HashMap::new();
         names.insert("intake".to_string(), "intake.bpmn".to_string());
         server
-            .deploy_resources_locally(vec![proc], &names, "<default>")
+            .deploy_resources_locally(vec![proc], &names, Vec::new(), &std::collections::HashMap::new(), "<default>")
             .await
             .expect("deploy the message-start process on every owned partition");
 

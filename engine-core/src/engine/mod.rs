@@ -329,7 +329,12 @@ impl Engine {
             if state::partition_of(max_key) == self.partition_id {
                 self.next_local = self.next_local.max(state::local_of(max_key));
             }
-            if matches!(event, Event::ProcessDeployed { .. }) {
+            if matches!(
+                event,
+                Event::ProcessDeployed { .. }
+                    | Event::DecisionRequirementsDeployed { .. }
+                    | Event::DecisionDeployed { .. }
+            ) {
                 state::apply(&mut self.state, event);
             }
         }
@@ -361,6 +366,31 @@ impl Engine {
                     .state
                     .processes
                     .get(&process.id)
+                    .map(|d| *version > d.version)
+                    .unwrap_or(true);
+                if newer {
+                    state::apply(&mut self.state, event);
+                }
+            } else if let Event::DecisionRequirementsDeployed { drg, version, .. } = event {
+                let newer = self
+                    .state
+                    .decision_requirements
+                    .get(&drg.id)
+                    .map(|d| *version > d.version)
+                    .unwrap_or(true);
+                if newer {
+                    state::apply(&mut self.state, event);
+                }
+            } else if let Event::DecisionDeployed {
+                decision_id,
+                version,
+                ..
+            } = event
+            {
+                let newer = self
+                    .state
+                    .decisions
+                    .get(decision_id)
                     .map(|d| *version > d.version)
                     .unwrap_or(true);
                 if newer {
