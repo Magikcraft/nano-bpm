@@ -160,6 +160,26 @@ enum Step {
     /// children still running (an early completion-condition fire), write the
     /// output collection, and take the activity's outgoing flow.
     CompleteMiBody { instance_key: Key, body_key: Key },
+    /// Activate one ad-hoc "tool" child: instantiate `element_id` inside the
+    /// container's scope, seeded with the agent's `variables`, and mark it active
+    /// in the container. Created for each activate-element instruction an ad-hoc
+    /// agent job returns (ADR 0023 seam 2).
+    ActivateAdHocTool {
+        instance_key: Key,
+        container_key: Key,
+        element_id: String,
+        variables: HashMap<String, Value>,
+    },
+    /// Complete an ad-hoc container: write its aggregated `outputCollection`,
+    /// (when `cancel`) cancel any tool children still running, drop its runtime
+    /// state and take the container's outgoing flow. Driven by the agent
+    /// signalling completion / cancellation, or by the loop draining with no
+    /// further tools requested.
+    CompleteAdHoc {
+        instance_key: Key,
+        container_key: Key,
+        cancel: bool,
+    },
 }
 
 impl Engine {
@@ -793,7 +813,9 @@ impl Engine {
             }
 
             Command::CompleteJob {
-                job_key, variables, ..
+                job_key,
+                variables,
+                adhoc_result,
             } => {
                 let job = self
                     .state
@@ -846,12 +868,59 @@ impl Engine {
                         self.emit(&mut log, event);
                     }
                 }
-                // The parked service-task token resumes from ACTIVATED.
-                queue.push_back(Step::Complete {
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                });
+                // An ad-hoc container's agent job: instead of resuming the
+                // container token, drive the activate-element loop (ADR 0023
+                // seam 2). The container element id is in the definition's ad-hoc
+                // catalog; ordinary jobs (including the tools' own jobs) are not,
+                // so they fall through to the normal token resume below.
+                if self.adhoc_def_of(instance_key, &element_id).is_some() {
+                    let container_key = element_instance_key;
+                    let result = adhoc_result.unwrap_or_default();
+                    if result.cancel_remaining_instances {
+                        // Cancel any in-flight tools, then complete the container.
+                        queue.push_back(Step::CompleteAdHoc {
+                            instance_key,
+                            container_key,
+                            cancel: true,
+                        });
+                    } else {
+                        let already_active = self
+                            .state
+                            .instances
+                            .get(&instance_key)
+                            .and_then(|i| i.adhoc_instances.get(&container_key))
+                            .map(|a| a.active.len())
+                            .unwrap_or(0);
+                        let requested = result.activate_elements.len();
+                        for instr in result.activate_elements {
+                            queue.push_back(Step::ActivateAdHocTool {
+                                instance_key,
+                                container_key,
+                                element_id: instr.element_id,
+                                variables: instr.variables,
+                            });
+                        }
+                        // With no tool active and none requested, the agent has
+                        // nothing more to run this turn (it signals completion, or
+                        // simply returns no activations) — complete the container.
+                        // Otherwise the container parks until its tools drain, then
+                        // its agent job is re-emitted for the next turn.
+                        if already_active + requested == 0 {
+                            queue.push_back(Step::CompleteAdHoc {
+                                instance_key,
+                                container_key,
+                                cancel: false,
+                            });
+                        }
+                    }
+                } else {
+                    // The parked service-task token resumes from ACTIVATED.
+                    queue.push_back(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    });
+                }
             }
 
             Command::AssignUserTask {
@@ -2447,6 +2516,17 @@ impl Engine {
                 instance_key,
                 body_key,
             } => self.complete_multi_instance_body(instance_key, body_key),
+            Step::ActivateAdHocTool {
+                instance_key,
+                container_key,
+                element_id,
+                variables,
+            } => self.activate_adhoc_tool(instance_key, container_key, element_id, variables),
+            Step::CompleteAdHoc {
+                instance_key,
+                container_key,
+                cancel,
+            } => self.complete_adhoc_container(instance_key, container_key, cancel),
         }
     }
 
@@ -2509,6 +2589,13 @@ impl Engine {
         // its scope (so writes inside it can resolve/propagate correctly) and its
         // inputs are local to that scope, exactly like a leaf activity.
         let is_sub_process = matches!(kind, Some(ElementKind::SubProcess { .. }));
+        // An ad-hoc sub-process container (a job-bearing ServiceTask that appears
+        // in the definition's ad-hoc catalog): like a sub-process it is a variable
+        // scope — its activated tool children run inside it and its
+        // `outputCollection` accumulates there — so it always registers a scope
+        // (ADR 0023 seam 2).
+        let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
+        let is_adhoc_container = adhoc_def.is_some();
         let inputs = self.io_inputs(instance_key, &element_id);
 
         // The scoped variable view the activating element evaluates against: both
@@ -2525,7 +2612,7 @@ impl Engine {
         let element_vars = self.variables_for_element(instance_key, scope);
 
         let mut scope_registered = false;
-        if is_sub_process {
+        if is_sub_process || is_adhoc_container {
             events.push(Event::VariableScopeCreated {
                 instance_key,
                 scope_key: element_instance_key,
@@ -2571,6 +2658,19 @@ impl Engine {
                     priority,
                     retries,
                 });
+                // An ad-hoc container: register its runtime state alongside the
+                // agent job. The container element instance is the ad-hoc scope
+                // (created above); its tool children are activated by the agent's
+                // activate-element instructions on job completion (ADR 0023).
+                if let Some(def) = &adhoc_def {
+                    events.push(Event::AdHocActivated {
+                        instance_key,
+                        container_key: element_instance_key,
+                        element_id: element_id.clone(),
+                        output_collection: def.output_collection.clone(),
+                        output_element: def.output_element.clone(),
+                    });
+                }
                 // Arm timers/subscriptions for every attached boundary event.
                 events.extend(self.arm_boundary_events(
                     instance_key,
@@ -3208,6 +3308,293 @@ impl Engine {
         events
     }
 
+    /// The ad-hoc catalog entry for `element_id` in `instance_key`'s definition,
+    /// if that element is an ad-hoc sub-process container. Cloned so callers can
+    /// hold it across the `&mut self` event emission that follows. This is the
+    /// marker that gates all ad-hoc runtime behaviour (ADR 0023 seam 2), so the
+    /// container needs no bespoke `ElementKind` variant.
+    fn adhoc_def_of(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Option<crate::model::AdHocSubProcessDef> {
+        self.process_of_instance(instance_key)?
+            .adhoc
+            .iter()
+            .find(|d| d.container_id == element_id)
+            .cloned()
+    }
+
+    /// Activates one ad-hoc "tool" child (ADR 0023 seam 2): instantiates
+    /// `element_id` inside the container scope, seeding the agent's
+    /// activate-element `variables` as the child's local overlay, and marks it
+    /// active in the container. A service-task tool creates a job; any other kind
+    /// passes straight through to completion (which feeds the loop). v1 targets
+    /// single-activity tools (service/connector tasks); richer tool sub-graphs
+    /// are a deferred refinement.
+    fn activate_adhoc_tool(
+        &mut self,
+        instance_key: Key,
+        container_key: Key,
+        element_id: String,
+        variables: HashMap<String, Value>,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let child_key = self.mint_key();
+        // The scoped view the child evaluates its own FEEL attributes (job type,
+        // retries, priority) against: the container scope overlaid with the
+        // instruction's seed variables (applied via `AdHocToolActivated` below).
+        let mut child_vars = (*self.variables_for_element(instance_key, container_key)).clone();
+        child_vars.extend(variables.clone());
+
+        let mut events = vec![
+            Event::ElementActivating {
+                instance_key,
+                element_instance_key: child_key,
+                element_id: element_id.clone(),
+            },
+            Event::ElementActivated {
+                instance_key,
+                element_instance_key: child_key,
+                element_id: element_id.clone(),
+                scope: container_key,
+            },
+            Event::AdHocToolActivated {
+                instance_key,
+                container_key,
+                child_key,
+                local_variables: variables,
+            },
+        ];
+        let mut followups = Vec::new();
+        // The tool's kind (and job type) comes from the container's ad-hoc
+        // catalog, not the flat element graph: the parser flattens an ad-hoc
+        // container to a single job activity and prunes its inner tools, keeping
+        // each tool's id + kind in `ProcessDefinition.adhoc` (so the executable
+        // element map — and the processos model round-trip — stays identical to a
+        // plain container). A JOB_WORKER-style service-task tool emits a job; any
+        // other kind passes straight through to completion (feeding the loop).
+        // v1 targets single-activity tools; the catalog does not carry per-tool
+        // retries/priority, so those default (a later refinement).
+        let container_element_id = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+            .map(|a| a.element_id.clone());
+        let tool_job_type = container_element_id
+            .as_deref()
+            .and_then(|cid| self.adhoc_def_of(instance_key, cid))
+            .and_then(|def| {
+                def.tools.iter().find_map(|t| match &t.kind {
+                    crate::model::AdHocToolKind::ServiceTask { job_type }
+                        if t.element_id == element_id =>
+                    {
+                        Some(job_type.clone())
+                    }
+                    _ => None,
+                })
+            });
+        match tool_job_type {
+            Some(job_type) => {
+                let job_key = self.mint_key();
+                let job_type = self.resolve_job_type(&child_vars, &job_type);
+                let priority = self.resolve_priority(&child_vars, None);
+                let retries = self.resolve_retries(&child_vars, None);
+                events.push(Event::JobCreated {
+                    job_key,
+                    instance_key,
+                    element_instance_key: child_key,
+                    element_id,
+                    job_type,
+                    created_at: self.now,
+                    priority,
+                    retries,
+                });
+            }
+            None => {
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key: child_key,
+                    element_id,
+                });
+            }
+        }
+        (events, followups)
+    }
+
+    /// Completes one ad-hoc tool child: records its output (the container's
+    /// `outputElement` evaluated in the child's scope) into the container's
+    /// accumulated results, drops it from the active set, and — once the last
+    /// active tool of the turn completes — re-emits the container's agent job for
+    /// the next activate-element turn (ADR 0023 seam 2).
+    fn complete_adhoc_tool(
+        &mut self,
+        instance_key: Key,
+        child_eik: Key,
+        element_id: String,
+        container_key: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = vec![
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key: child_eik,
+                element_id: element_id.clone(),
+            },
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key: child_eik,
+                element_id,
+            },
+        ];
+        let (output_element, active_now, container_element_id) = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+        {
+            Some(a) => (
+                a.output_element.clone(),
+                a.active.len(),
+                a.element_id.clone(),
+            ),
+            None => return (events, Vec::new()),
+        };
+        // Collect this tool's output (evaluated in its local scope) — an entry in
+        // the agent's accumulated `outputCollection` memory.
+        let output = output_element.as_deref().and_then(|expr| {
+            let vars = self.variables_for_element(instance_key, child_eik);
+            crate::feel::eval(expr, &vars).ok()
+        });
+        events.push(Event::AdHocToolCompleted {
+            instance_key,
+            container_key,
+            child_key: child_eik,
+            output,
+        });
+        // `active_now` still counts this child (its removal above is not yet
+        // applied), so the last tool of the turn is the one leaving one active.
+        let others = active_now.saturating_sub(1);
+        if others == 0 {
+            // Every tool this turn has drained: re-emit the agent job so the agent
+            // inspects the accumulated results and decides the next turn (activate
+            // more tools, or signal completion).
+            events.push(Event::AdHocIterated {
+                instance_key,
+                container_key,
+            });
+            events.extend(self.adhoc_agent_job_events(
+                instance_key,
+                container_key,
+                container_element_id,
+            ));
+        }
+        (events, Vec::new())
+    }
+
+    /// Builds the `JobCreated` event that (re-)emits an ad-hoc container's agent
+    /// job on the container element instance, so the agent worker activates it to
+    /// inspect accumulated tool results and drive the next turn.
+    fn adhoc_agent_job_events(
+        &mut self,
+        instance_key: Key,
+        container_key: Key,
+        container_element_id: String,
+    ) -> Vec<Event> {
+        let job_type = match self.element_kind(instance_key, &container_element_id) {
+            Some(ElementKind::ServiceTask { job_type, .. }) => job_type,
+            _ => return Vec::new(),
+        };
+        let container_vars = self.variables_for_element(instance_key, container_key);
+        let job_type = self.resolve_job_type(&container_vars, &job_type);
+        let retries = self.resolve_retries(
+            &container_vars,
+            self.retries_of(instance_key, &container_element_id)
+                .as_deref(),
+        );
+        let priority = self.resolve_priority(&container_vars, None);
+        let job_key = self.mint_key();
+        vec![Event::JobCreated {
+            job_key,
+            instance_key,
+            element_instance_key: container_key,
+            element_id: container_element_id,
+            job_type,
+            created_at: self.now,
+            priority,
+            retries,
+        }]
+    }
+
+    /// Completes an ad-hoc container (ADR 0023 seam 2): when `cancel`, cancels any
+    /// tool children still running; writes the aggregated `outputCollection` into
+    /// the enclosing (flow) scope; drops the container's runtime state; and takes
+    /// the container's outgoing flow so the parent token continues.
+    fn complete_adhoc_container(
+        &mut self,
+        instance_key: Key,
+        container_key: Key,
+        cancel: bool,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let (element_id, output_collection, output_values, active) = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+        {
+            Some(a) => (
+                a.element_id.clone(),
+                a.output_collection.clone(),
+                a.output_values.clone(),
+                a.active.iter().copied().collect::<Vec<Key>>(),
+            ),
+            None => return (Vec::new(), Vec::new()),
+        };
+        let scope = self.scope_of(instance_key, container_key);
+
+        let mut events = Vec::new();
+        // Cancel any tools still running (a cancel-remaining-instances request).
+        if cancel {
+            for child in &active {
+                events.extend(self.cancel_mi_child_events(instance_key, *child));
+            }
+        }
+        // The output collection propagates OUT of the container to its enclosing
+        // (flow) scope — for a top-level container that is the root, collapsing to
+        // the flat `VariablesUpdated`.
+        if let Some(name) = output_collection {
+            let map = HashMap::from([(name, Value::List(output_values))]);
+            events.extend(self.propagated_updates(instance_key, scope, map, false));
+        }
+        events.push(Event::ElementCompleting {
+            instance_key,
+            element_instance_key: container_key,
+            element_id: element_id.clone(),
+        });
+        events.push(Event::ElementCompleted {
+            instance_key,
+            element_instance_key: container_key,
+            element_id: element_id.clone(),
+        });
+        events.push(Event::AdHocCompleted {
+            instance_key,
+            container_key,
+        });
+        let mut followups = Vec::new();
+        for flow in self.outgoing(instance_key, &element_id) {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: element_id.clone(),
+                to: flow.to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow.to,
+                scope,
+            });
+        }
+        (events, followups)
+    }
+
     fn complete(
         &mut self,
         instance_key: Key,
@@ -3229,6 +3616,24 @@ impl Engine {
                 .unwrap_or(false)
         {
             return self.complete_mi_child(instance_key, element_instance_key, element_id, scope);
+        }
+
+        // A completing element instance that is a directly-activated ad-hoc tool
+        // (its scope is an ad-hoc container and it is in that container's active
+        // set): its completion feeds the container's output collection and the
+        // activate-element loop rather than taking an outgoing flow. (v1 supports
+        // single-activity tools; a tool that is a multi-element sub-graph is a
+        // deferred refinement — see ADR 0023 §Subset.)
+        if scope != 0
+            && self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.adhoc_instances.get(&scope))
+                .map(|a| a.active.contains(&element_instance_key))
+                .unwrap_or(false)
+        {
+            return self.complete_adhoc_tool(instance_key, element_instance_key, element_id, scope);
         }
 
         if matches!(

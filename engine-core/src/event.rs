@@ -595,6 +595,55 @@ pub enum Event {
     /// [`Event::VariablesUpdated`] and its outgoing flow taken by the surrounding
     /// element-completion events.
     MultiInstanceCompleted { instance_key: Key, body_key: Key },
+    /// An ad-hoc sub-process container was activated (ADR 0023 seam 2). The
+    /// container element instance is the ad-hoc token scope; its agent job is
+    /// created by a surrounding [`Event::JobCreated`]. Carries the resolved
+    /// `output_collection`/`output_element` so the runtime state reconstructs
+    /// from the log. `container_key` is the container element instance.
+    AdHocActivated {
+        instance_key: Key,
+        container_key: Key,
+        element_id: ElementId,
+        output_collection: Option<String>,
+        output_element: Option<String>,
+    },
+    /// An ad-hoc tool child instance was activated (by an agent activate-element
+    /// instruction) inside `container_key`'s scope. `local_variables` are the
+    /// child's scope bindings (the instruction's seed variables), overlaid when
+    /// the child's job is activated or its FEEL evaluated. The child joins the
+    /// container's active set.
+    AdHocToolActivated {
+        instance_key: Key,
+        container_key: Key,
+        child_key: Key,
+        local_variables: HashMap<String, Value>,
+    },
+    /// An ad-hoc tool child completed: its `output` (the container's evaluated
+    /// `output_element`, if any) is appended to the container's accumulated
+    /// results and the child leaves the active set. Its local variable overlay
+    /// is dropped by the child's surrounding `ElementCompleted`.
+    AdHocToolCompleted {
+        instance_key: Key,
+        container_key: Key,
+        child_key: Key,
+        output: Option<Value>,
+    },
+    /// An ad-hoc container's agent job re-emitted for the next turn (a new
+    /// activate-element cycle). Bumps the container's iteration counter. The new
+    /// job itself is carried by a surrounding [`Event::JobCreated`].
+    AdHocIterated {
+        instance_key: Key,
+        container_key: Key,
+    },
+    /// An ad-hoc container completed (the agent signalled completion, or no tools
+    /// remained and none were requested, or a cancel was requested). Its runtime
+    /// state is dropped; the aggregated `output_collection` (when named) is
+    /// written by a surrounding [`Event::VariablesUpdated`] and its outgoing flow
+    /// taken by the surrounding element-completion events.
+    AdHocCompleted {
+        instance_key: Key,
+        container_key: Key,
+    },
     /// The **instance** partition tore down a cross-partition parked
     /// subscription (state [`crate::state::MessageSubscriptionState::Opening`],
     /// recorded by [`Event::MessageSubscriptionOpening`]) because the element it
@@ -730,6 +779,11 @@ impl Event {
             | Event::MultiInstanceChildActivated { instance_key, .. }
             | Event::MultiInstanceChildCompleted { instance_key, .. }
             | Event::MultiInstanceCompleted { instance_key, .. }
+            | Event::AdHocActivated { instance_key, .. }
+            | Event::AdHocToolActivated { instance_key, .. }
+            | Event::AdHocToolCompleted { instance_key, .. }
+            | Event::AdHocIterated { instance_key, .. }
+            | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::DecisionEvaluated { instance_key, .. }
@@ -892,6 +946,19 @@ impl Event {
                 child_key,
                 ..
             } => m = m.max(*body_key).max(*child_key),
+            Event::AdHocActivated { container_key, .. }
+            | Event::AdHocIterated { container_key, .. }
+            | Event::AdHocCompleted { container_key, .. } => m = m.max(*container_key),
+            Event::AdHocToolActivated {
+                container_key,
+                child_key,
+                ..
+            }
+            | Event::AdHocToolCompleted {
+                container_key,
+                child_key,
+                ..
+            } => m = m.max(*container_key).max(*child_key),
             Event::SignalCorrelated {
                 subscription_key,
                 signal_key,

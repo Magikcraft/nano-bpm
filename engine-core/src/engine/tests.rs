@@ -7421,3 +7421,243 @@ fn business_rule_task_spreads_map_output_without_result_variable() {
     assert_eq!(merged_var(&events, "priority"), Some(Value::Int(1)));
     let _ = inst;
 }
+
+// ---------------------------------------------------------------------------
+// Ad-hoc sub-process runtime (ADR 0023 seam 2): the agentic activate-element
+// loop. A JOB_WORKER ad-hoc container emits an "agent" job; the agent returns
+// `activateElements[]`; the engine activates those inner tools as real element
+// instances, drains them, re-emits the agent job for the next turn, and
+// completes the container (writing its `outputCollection`) when the agent
+// signals it is done.
+// ---------------------------------------------------------------------------
+
+fn adhoc_agent_process() -> ProcessDefinition {
+    // A top-level JOB_WORKER ad-hoc container ("agent") with two service-task
+    // tools. `outputElement="=result"` captures each tool's `result` output into
+    // the container's `outputCollection` ("results").
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+fn activate_element(id: &str) -> crate::model::AdHocActivateElement {
+    crate::model::AdHocActivateElement {
+        element_id: id.to_string(),
+        variables: HashMap::new(),
+    }
+}
+
+#[test]
+fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    // The container activated and emitted its agent job on the container element
+    // instance; its runtime state is registered but no tools are active yet.
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        0,
+        "no tools active before the first agent turn"
+    );
+
+    // Turn 1: the agent activates both tools. The engine instantiates them as
+    // real element instances (each a `tool` job) inside the container scope.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        2,
+        "both tools active after the agent's activate-element instruction"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "container parks while tools run"
+    );
+
+    // Drain the two tool jobs, each producing a `result`. The container captures
+    // each via `outputElement`; when the last drains, the agent job re-emits.
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool_jobs.len(), 2, "both tools produced jobs");
+    for (job, val) in tool_jobs.iter().zip(["A", "B"]) {
+        let mut vars = HashMap::new();
+        vars.insert("result".to_string(), Value::Str(val.to_string()));
+        engine
+            .apply_command(Command::complete_job_with(job.key, vars))
+            .unwrap();
+    }
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert_eq!(adhoc.active.len(), 0, "all tools drained");
+    assert_eq!(
+        adhoc.iterations, 1,
+        "agent job re-emitted for the next turn"
+    );
+    assert_eq!(adhoc.output_values.len(), 2, "two tool outputs accumulated");
+    assert!(
+        !engine.is_completed(inst),
+        "container still awaiting the agent"
+    );
+
+    // Turn 2: the agent returns no activations (it is done) → the container
+    // completes, writes its `outputCollection`, and takes its outgoing flow to
+    // the end event, completing the instance.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted");
+    // The container writes its `outputCollection` as it completes; a terminal
+    // instance drops its variable payload (ADR 0012), so we read the collection
+    // off the emitted `VariablesUpdated` rather than hot state.
+    let final_events = engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    assert!(
+        engine.is_completed(inst),
+        "container completed → instance done"
+    );
+    let results = final_events.iter().find_map(|e| match e {
+        Event::VariablesUpdated { variables, .. } => variables.get("results").cloned(),
+        _ => None,
+    });
+    let mut got = match results {
+        Some(Value::List(v)) => v,
+        other => panic!("expected outputCollection list, got {other:?}"),
+    };
+    got.sort_by_key(|v| match v {
+        Value::Str(s) => s.clone(),
+        _ => String::new(),
+    });
+    assert_eq!(
+        got,
+        vec![Value::Str("A".to_string()), Value::Str("B".to_string())],
+        "outputCollection holds both tool results"
+    );
+}
+
+#[test]
+fn adhoc_agent_cancel_remaining_instances_completes_container() {
+    // An agent that immediately asks to cancel/stop completes the container
+    // (v1: at a turn boundary there are no in-flight tools to cancel) and lets
+    // the instance flow on to its end event.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                cancel_remaining_instances: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(engine.is_completed(inst), "cancel completes the container");
+    assert!(
+        engine
+            .instance(inst)
+            .map(|i| i.adhoc_instances.is_empty())
+            .unwrap_or(true),
+        "ad-hoc runtime state torn down on completion"
+    );
+}
+
+#[test]
+fn plain_job_completion_ignores_absent_adhoc_result() {
+    // A completion of an ordinary (non-ad-hoc) service-task job carries no
+    // ad-hoc result and resumes the token normally — the ad-hoc branch must not
+    // intercept it.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "order");
+    let job = engine
+        .activate_jobs("payment", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.instance_key == inst)
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job(job.key))
+        .unwrap();
+    assert!(engine.is_completed(inst));
+    assert!(engine
+        .instance(inst)
+        .map(|i| i.adhoc_instances.is_empty())
+        .unwrap_or(true));
+}
