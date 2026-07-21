@@ -170,6 +170,12 @@ still holds: Deno+App now, Rust/Java+App later. The console gains an **App** pro
 workspace tabs are exactly the existing editors (BPMN/DMN/Form) plus new **Triggers**, **Data**,
 and **Surfaces** panels that edit *this manifest*.
 
+**Specified in ADR 0027** (`0027-urban-app-manifest-spec.md`): `nano.app.json` as a validated,
+**spec-first** schema (`spec-app/nano-app.schema.json` generating both Rust and TS types), its
+ownership boundary with the existing `nanobpm.project.json` (IDE/toolchain) file, fail-closed
+validation at console/compile/boot, `${VAR:-default}` secret substitution at boot, and the console
+**App** project type (`app: "urban"`).
+
 ### (B) Trigger runtime
 
 A trigger source produces events; each trigger's `action` maps the event to **start a process**
@@ -201,6 +207,12 @@ free, both rendering the **same** form-js schemas the FormEditor produces:
 Hand-built bespoke frontends remain fully supported (the `app-deno-gui` path); the inbox + chat
 are the *batteries-included default* so a maker is productive on day one.
 
+**Expanded in ADR 0026** (`0026-urban-human-surfaces-and-run-model.md`): the **App action API** (the
+UI trigger surface, with the attended-sync vs. unattended-inbox split against ADR 0025), the three
+UI-generation tiers, the form-js **viewer** as an App-side runtime dependency (distinct from the
+console's editor), and the develop/run loop (IDE engine on `:8080`, app under test on its own port,
+embedded-vs-remote as a compile-time choice).
+
 ### (D) Data layer — SQLite, App-owned
 
 Automations need durable local relational state. The App owns a **SQLite** database
@@ -209,6 +221,11 @@ manager: browse tables, run queries, edit the schema). Deno's SQLite bindings ba
 lives beside the App's journal. Workers and the chat agent read/write it through a thin
 App-data API (also exposed to FEEL for decisions). This is the "data-aware controls" of the
 Delphi analogy.
+
+**Expanded in ADR 0024** (`0024-urban-data-layer-datasource-abstraction.md`): the single SQLite
+`data` block above is generalized into named, env-swappable **datasources** (the BDE-alias seam),
+so an App develops on embedded SQLite and deploys on Postgres by config alone, with a
+`nano-ide-data-*` driver pack axis and the binding contract for forms/workers/FEEL.
 
 ### (E) LLM seam — two roles, both already-shaped slots
 
