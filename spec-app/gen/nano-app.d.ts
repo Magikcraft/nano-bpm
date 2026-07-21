@@ -1,0 +1,294 @@
+/**
+ * GENERATED — do not edit by hand.
+ *
+ * TypeScript types for the Urban App manifest (nano.app.json), generated from
+ * spec-app/nano-app.schema.json (ADR 0027). Regenerate with:  npm run gen
+ * (from spec-app/) or  make generate-app-manifest  (from the repo root).
+ */
+/**
+ * BPMN process globs.
+ */
+export type GlobList = string[];
+/**
+ * DMN decision globs.
+ */
+export type GlobList1 = string[];
+/**
+ * form-js form globs.
+ */
+export type GlobList2 = string[];
+/**
+ * A ${VAR} or ${VAR:-default} boot-time substitution reference (ADR 0027 §5). Resolved at App boot / IDE Run, never persisted. The validator checks the reference shape, not the resolved value.
+ */
+export type EnvTemplate = string;
+/**
+ * Lowercase kebab-case slug.
+ */
+export type Slug = string;
+/**
+ * Maps an event to exactly one engine call (ADR 0025 §1): start a process, or publish a CorrelateMessage.
+ */
+export type TriggerAction = {
+  /**
+   * Process id/name to start; variables seeded by a FEEL expression over the event body.
+   */
+  start?: string;
+  /**
+   * FEEL over the event body producing the started instance's variables.
+   */
+  variables?: string;
+  /**
+   * messageName to publish as a CorrelateMessage (correlates to a message-start subscription to start a new instance, or to a running-instance catch to feed a token — ADR 0025 §5).
+   */
+  message?: string;
+  /**
+   * FEEL over the event body producing the correlationKey (message actions).
+   */
+  correlationKey?: string;
+} & TriggerAction1;
+export type TriggerAction1 = {
+  [k: string]: unknown;
+};
+/**
+ * A service-task worker: either a referenced handler file or an llm binding (ADR 0022 §E).
+ */
+export type Worker = {
+  taskType: string;
+  /**
+   * Path to a handler file (language via ADR 0008 packs).
+   */
+  handler?: string;
+  /**
+   * Name of an llm[] binding used as the worker (LLM-as-worker).
+   */
+  llm?: string;
+} & Worker1;
+export type Worker1 = {
+  [k: string]: unknown;
+};
+export type SecurityMode = "none" | "local" | "oidc";
+
+/**
+ * Urban App manifest (nano.app.json) — the declared-data binding of an Urban RAD application (ADR 0027). Owns the envelope + cross-reference rules; each block's detail is owned by its ADR (data=0024, triggers=0025, surfaces=0026, security=0028, workers/llm=0022 §E). This file is the source of truth: TypeScript types are generated from it (scripts/generate-app-manifest.sh) and it doubles as the $schema editors use for nano.app.json autocompletion.
+ */
+export interface AppManifest {
+  /**
+   * Optional editor hint pointing at this schema for autocompletion.
+   */
+  $schema?: string;
+  /**
+   * Manifest schema version for forward-compat. Currently always 1.
+   */
+  schemaVersion: 1;
+  /**
+   * Stable App identifier (slug). Required.
+   */
+  id: string;
+  /**
+   * Human-readable App name. Required.
+   */
+  name: string;
+  /**
+   * Informational codename, surfaced as App.CODENAME (ADR 0015). Optional.
+   */
+  codename?: string;
+  runtime?: Runtime;
+  models?: Models;
+  data?: Data;
+  /**
+   * Event sources bound to engine actions (ADR 0025).
+   */
+  triggers?: Trigger[];
+  /**
+   * Named connections (credentials/endpoint) referenced by triggers/workers by id, so configs carry no inline secrets (ADR 0025 §1).
+   */
+  connections?: {
+    [k: string]: Connection;
+  };
+  surfaces?: Surfaces;
+  /**
+   * Service-task handlers: referenced files or an llm binding (ADR 0022 §E).
+   */
+  workers?: Worker[];
+  /**
+   * Named LLM bindings usable as workers or as a chat surface agent (ADR 0022 §E).
+   */
+  llm?: {
+    [k: string]: LlmBinding;
+  };
+  security?: Security;
+}
+/**
+ * The shipping topology of the compiled App (ADR 0005). Distinct from the IDE dev-loop deployTarget, which lives in nanobpm.project.json (ADR 0027 §1).
+ */
+export interface Runtime {
+  /**
+   * How the App reaches the engine at runtime.
+   */
+  engine?: "embedded" | "remote" | "cluster";
+  node?: "single" | "cluster";
+}
+/**
+ * Glob references to the models the editors produce (ADR 0027 §2). Each glob must resolve to at least one file (cross-reference rule, ADR 0027 §4).
+ */
+export interface Models {
+  processes?: GlobList;
+  decisions?: GlobList1;
+  forms?: GlobList2;
+}
+/**
+ * Named datasources — the BDE-alias abstraction (ADR 0024). Consumers bind by name, never by driver, so the same bundle runs on SQLite in the IDE and Postgres in production by flipping env only.
+ */
+export interface Data {
+  /**
+   * Name of the datasource used when a consumer names none.
+   */
+  default?: string;
+  sources: {
+    [k: string]: DataSource;
+  };
+}
+export interface DataSource {
+  /**
+   * Driver id. May be an env template so deployment flips SQLite to Postgres without a source change (ADR 0024 §1).
+   */
+  driver: ("sqlite" | "postgres") | EnvTemplate;
+  /**
+   * Connection URL, typically an env template (e.g. file:./app.db or ${NANO_APP_DB_URL:-file:./app.db}).
+   */
+  url: string;
+  /**
+   * Path to a migrations directory.
+   */
+  migrations?: string;
+}
+export interface Trigger {
+  id: Slug;
+  /**
+   * Source kind. Core (in-binary): cron | webhook | file. Pack sources add imap, mqtt, cloud, … (ADR 0025 §1).
+   */
+  type: string;
+  /**
+   * cron: the crontab spec (e.g. '0 6 * * *').
+   */
+  spec?: string;
+  /**
+   * webhook: the HTTP path served on the App backend (e.g. /hooks/temp).
+   */
+  path?: string;
+  /**
+   * Name of a connections[] entry supplying this source's credentials (e.g. imap mailbox).
+   */
+  connection?: string;
+  /**
+   * Inbound auth policy for a webhook, e.g. 'hmac:sensors' referencing a connection (ADR 0025).
+   */
+  auth?: string;
+  action: TriggerAction;
+}
+/**
+ * A named connection (credentials/endpoint). Shape is source-specific; secrets should be env templates, never inline literals (ADR 0025 §1).
+ */
+export interface Connection {
+  /**
+   * Connection kind (e.g. imap, mqtt, hmac).
+   */
+  type: string;
+}
+/**
+ * Batteries-included human surfaces generated from the manifest (ADR 0026).
+ */
+export interface Surfaces {
+  taskInbox?: TaskInboxSurface;
+  chat?: ChatSurface;
+}
+/**
+ * Generic task inbox: lists open user tasks and renders their .form to claim/complete (ADR 0026).
+ */
+export interface TaskInboxSurface {
+  enabled?: boolean;
+  path?: string;
+}
+/**
+ * Conversational surface whose LLM agent drives the action API via its tools (ADR 0026).
+ */
+export interface ChatSurface {
+  enabled?: boolean;
+  path?: string;
+  /**
+   * Name of an llm[] binding backing this chat (cross-reference rule, ADR 0027 §4).
+   */
+  agent?: string;
+}
+export interface LlmBinding {
+  /**
+   * LLM provider selector (e.g. 'env' to resolve from environment).
+   */
+  provider: string;
+  /**
+   * Model id, typically an env template (e.g. ${NANO_APP_LLM_MODEL}).
+   */
+  model: string;
+  /**
+   * Constrains the model's structured output (e.g. to a DMN decision).
+   */
+  output?: {
+    /**
+     * DMN decision id constraining the output shape.
+     */
+    decision?: string;
+  };
+  /**
+   * Action-API tools the agent may call (e.g. start-process, complete-task, query-data).
+   */
+  tools?: string[];
+}
+/**
+ * App-user auth/identity/authorization policy (ADR 0028). Default (block absent) is single-user, unsecured. Secrets are env templates resolved at boot, never persisted.
+ */
+export interface Security {
+  /**
+   * Enabled auth tier(s): none (default), local (username/password), oidc (social). A list combines them.
+   */
+  mode?: SecurityMode | SecurityMode[];
+  providers?: SecurityProvider[];
+  /**
+   * Role names; the maker may add domain roles beyond admin/user.
+   */
+  roles?: string[];
+  /**
+   * Role-based authorization: which roles may reach each action/surface/datasource (ADR 0028).
+   */
+  rules?: {
+    actions?: RoleMap;
+    surfaces?: RoleMap;
+    data?: {
+      [k: string]: {
+        [k: string]: string[];
+      };
+    };
+  };
+}
+export interface SecurityProvider {
+  id: string;
+  /**
+   * oidc: social/generic OIDC (Authorization Code + PKCE). password: local username/password.
+   */
+  type: "oidc" | "password";
+  /**
+   * OIDC preset shorthand (e.g. google, github, auth0).
+   */
+  preset?: string;
+  clientId?: string;
+  clientSecret?: string;
+  /**
+   * password providers: self sign-up policy.
+   */
+  signup?: "open" | "invite" | "closed";
+}
+/**
+ * Maps a pattern (e.g. 'start/*') to the list of roles permitted.
+ */
+export interface RoleMap {
+  [k: string]: string[];
+}

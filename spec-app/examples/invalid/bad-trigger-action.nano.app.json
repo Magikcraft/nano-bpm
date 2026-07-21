@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "bad",
+  "name": "Bad Trigger",
+  "triggers": [
+    { "id": "both", "type": "cron", "spec": "0 6 * * *",
+      "action": { "start": "x", "message": "y" } }
+  ]
+}
