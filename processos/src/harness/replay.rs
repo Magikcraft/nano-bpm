@@ -751,10 +751,7 @@ pub fn replay_instance_with_mocks(
                     apply_and_fold(
                         &mut engine,
                         &mut produced,
-                        Command::CompleteJob {
-                            job_key,
-                            variables: out,
-                        },
+                        Command::complete_job_with(job_key, out),
                         clock,
                     );
                 }
@@ -798,10 +795,7 @@ pub fn replay_instance_with_mocks(
                                 apply_and_fold(
                                     &mut engine,
                                     &mut produced,
-                                    Command::CompleteJob {
-                                        job_key,
-                                        variables: out,
-                                    },
+                                    Command::complete_job_with(job_key, out),
                                     clock,
                                 );
                             }
@@ -813,10 +807,7 @@ pub fn replay_instance_with_mocks(
                             apply_and_fold(
                                 &mut engine,
                                 &mut produced,
-                                Command::CompleteJob {
-                                    job_key,
-                                    variables: HashMap::new(),
-                                },
+                                Command::complete_job_with(job_key, HashMap::new()),
                                 clock,
                             );
                         }

@@ -174,10 +174,7 @@ pub fn run_instance(
                 apply_and_fold(
                     &mut engine,
                     &mut output,
-                    Command::CompleteJob {
-                        job_key,
-                        variables: out,
-                    },
+                    Command::complete_job_with(job_key, out),
                     clock,
                 );
             }

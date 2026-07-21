@@ -845,6 +845,7 @@ impl<'a> Parser<'a> {
                 elements,
                 start_event,
                 xml: String::new(),
+                adhoc: Vec::new(),
             },
             names,
         })
