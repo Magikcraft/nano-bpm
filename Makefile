@@ -91,8 +91,23 @@ $(GENERATED_DIR)/Cargo.toml:
 $(CONSOLE_GENERATED_DIR)/Cargo.toml:
 	./scripts/generate-console.sh
 
-$(STUB_IMPLS):
-	$(MAKE) generate
+# stub_impls.rs is generated (git-ignored) and wires each REST trait method to
+# its hand-written `*_impl` on ServerImpl via the delegation map in
+# scripts/gen-stub-server.py. Depend on that script so a changed delegation map
+# regenerates the stub: otherwise a stale local copy leaves newly wired `*_impl`
+# methods reachable only from tests, and since `make release` builds the bin
+# alone (no --all-targets), `warnings = "deny"` rejects them as dead code — a
+# failure CI never sees because it regenerates the stub and compiles tests.
+# When the generated apis already exist this is a fast, Java-free re-run of just
+# the Python stub step; otherwise fall back to a full `make generate`.
+$(STUB_IMPLS): scripts/gen-stub-server.py
+	@if [ -d "$(GENERATED_DIR)/src/apis" ]; then \
+		echo "Regenerating $(STUB_IMPLS) from $(GENERATED_DIR)/src/apis"; \
+		python3 scripts/gen-stub-server.py "$(GENERATED_DIR)/src/apis" "$(STUB_IMPLS)"; \
+		command -v rustfmt >/dev/null 2>&1 && rustfmt --edition 2024 "$(STUB_IMPLS)" || true; \
+	else \
+		$(MAKE) generate; \
+	fi
 
 .PHONY: build
 build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Compile the generated crate and the stub server
