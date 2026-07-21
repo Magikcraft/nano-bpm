@@ -55,6 +55,21 @@ test("indexes declared messages, decisions and form fields", async () => {
   ]);
 });
 
+test("infers a candidate domain record from a form's fields", async () => {
+  const index = await buildSymbolIndex(models);
+  assert.deepEqual(index.inferredRecords, [
+    {
+      id: "confirm-heating",
+      source: "form",
+      sourcePath: "confirm-heating.form",
+      fields: [
+        { key: "reading.room", type: "string" },
+        { key: "reading.targetTemp", type: "number" },
+      ],
+    },
+  ]);
+});
+
 test("collects parse errors without throwing on a malformed model", async () => {
   const index = await buildSymbolIndex([
     { path: "broken.form", kind: "form", text: "{ not json" },

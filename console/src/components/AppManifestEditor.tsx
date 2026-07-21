@@ -6,6 +6,7 @@ import { saveProjectFile, type FileNode } from "../gen";
 import {
   buildSymbolIndex,
   modelKindOf,
+  resolveDomainTypes,
   validateManifest,
   type Diagnostic,
   type SymbolIndex,
@@ -246,6 +247,7 @@ function ManifestInspector({
   const dataSources = Object.keys(
     (parsed as { data?: { sources?: Record<string, unknown> } } | undefined)?.data?.sources ?? {},
   );
+  const domain = resolveDomainTypes(parsed, index);
   return (
     <div className="space-y-5">
       {dataSources.length > 0 && (
@@ -255,6 +257,46 @@ function ManifestInspector({
             {dataSources.map((s) => (
               <li key={s}>
                 <code className="text-accent">{s}</code>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
+      {(domain.declared.length > 0 || domain.inferred.length > 0) && (
+        <section>
+          <SectionLabel>
+            Domain types ({domain.declared.length}
+            {domain.inferred.length > 0 ? ` +${domain.inferred.length} inferred` : ""})
+          </SectionLabel>
+          {domain.declared.length === 0 && (
+            <p className="text-sm text-fg-faint">
+              No types declared yet. The candidates below are inferred from forms — promote one into{" "}
+              <code>types</code> to reference it.
+            </p>
+          )}
+          <ul className="space-y-2 text-sm">
+            {domain.declared.map((t) => (
+              <li key={t.id}>
+                <code className="text-accent">{t.id}</code>
+                {t.name ? <span className="text-fg-muted"> — {t.name}</span> : null}
+                {t.table ? <span className="text-fg-faint"> · table {t.table}</span> : null}
+                {t.fields.length > 0 && (
+                  <div className="ml-3 text-xs text-fg-faint">
+                    {t.fields
+                      .map((f) => `${f.key}: ${f.type}${f.list ? "[]" : ""}${f.optional ? "?" : ""}`)
+                      .join(", ")}
+                  </div>
+                )}
+              </li>
+            ))}
+            {domain.inferred.map((r) => (
+              <li key={`inferred-${r.id}`} className="text-fg-muted">
+                <code className="text-fg-muted">{r.id}</code>
+                <Badge>inferred from form</Badge>
+                <div className="ml-3 text-xs text-fg-faint">
+                  {r.fields.map((f) => `${f.key}: ${f.type}`).join(", ")}
+                </div>
               </li>
             ))}
           </ul>

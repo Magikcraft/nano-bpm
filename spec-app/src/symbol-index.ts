@@ -53,12 +53,53 @@ export interface FormSymbol {
   fields: FormFieldSymbol[];
 }
 
+/** The primitive field types a domain type (ADR 0029 §4 / ADR 0031) may use. */
+export type DomainPrimitive =
+  | "string"
+  | "number"
+  | "integer"
+  | "boolean"
+  | "date"
+  | "datetime"
+  | "json";
+
+export const DOMAIN_PRIMITIVES: readonly DomainPrimitive[] = [
+  "string",
+  "number",
+  "integer",
+  "boolean",
+  "date",
+  "datetime",
+  "json",
+];
+
+export interface InferredField {
+  key: string;
+  type: DomainPrimitive;
+}
+
+/**
+ * A candidate domain record inferred from a form's fields — the ADR 0029 §4
+ * on-ramp: the maker either promotes it into the `types` registry or binds it
+ * to a datasource table. Inference is heuristic (form keys are free strings),
+ * so it is a suggestion, never a silently-invented schema.
+ */
+export interface InferredRecord {
+  /** Candidate type id — the source form's id. */
+  id: string;
+  source: "form";
+  sourcePath: string;
+  fields: InferredField[];
+}
+
 export interface SymbolIndex {
   processes: ProcessSymbol[];
   /** All declared bpmn:message names (targets of action.message). */
   messages: string[];
   decisions: DecisionSymbol[];
   forms: FormSymbol[];
+  /** Candidate domain records inferred from forms (ADR 0029 §4 promotion on-ramp). */
+  inferredRecords: InferredRecord[];
   /** Non-fatal problems encountered while parsing a model file. */
   parseErrors: { path: string; message: string }[];
 }
@@ -153,11 +194,37 @@ function collectFormFields(components: MEl[], out: FormFieldSymbol[]): void {
   }
 }
 
+/**
+ * Map a form-js component `type` to a domain primitive (ADR 0029 §4). Heuristic
+ * and deliberately conservative — anything not clearly numeric/boolean/temporal
+ * falls back to `string`, and the maker confirms on promotion.
+ */
+export function formTypeToPrimitive(formType: string): DomainPrimitive {
+  switch (formType) {
+    case "number":
+      return "number";
+    case "checkbox":
+      return "boolean";
+    case "datetime":
+      return "datetime";
+    default:
+      return "string";
+  }
+}
+
 function indexForm(model: ModelFile, index: SymbolIndex): void {
   const doc = JSON.parse(model.text) as MEl;
   const fields: FormFieldSymbol[] = [];
   collectFormFields((doc.components as MEl[]) || [], fields);
   index.forms.push({ id: doc.id, fields });
+  if (typeof doc.id === "string" && fields.length > 0) {
+    index.inferredRecords.push({
+      id: doc.id,
+      source: "form",
+      sourcePath: model.path,
+      fields: fields.map((f) => ({ key: f.key, type: formTypeToPrimitive(f.type) })),
+    });
+  }
 }
 
 /**
@@ -171,6 +238,7 @@ export async function buildSymbolIndex(models: ModelFile[]): Promise<SymbolIndex
     messages: [],
     decisions: [],
     forms: [],
+    inferredRecords: [],
     parseErrors: [],
   };
   for (const model of models) {

@@ -23,6 +23,25 @@
     }
   },
 
+  "types": {
+    "reading": {
+      "name": "Thermostat reading",
+      "table": "readings",
+      "fields": {
+        "room": { "type": "string" },
+        "targetTemp": { "type": "number" },
+        "takenAt": { "type": "datetime", "optional": true }
+      }
+    },
+    "schedule": {
+      "name": "Heating schedule",
+      "fields": {
+        "readings": { "type": "reading", "list": true },
+        "active": { "type": "boolean" }
+      }
+    }
+  },
+
   "triggers": [
     {
       "id": "morning",
