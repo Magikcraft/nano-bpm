@@ -75,6 +75,11 @@ pub enum Event {
         decision_id: String,
         decision_output: Value,
         evaluated_decisions: Vec<crate::dmn::EvaluatedDecision>,
+        /// Logical instant the decision was evaluated (the engine's clock
+        /// reading for the command). Defaulted to `0` so journals written before
+        /// this field existed still replay.
+        #[cfg_attr(feature = "serde", serde(default))]
+        evaluated_at: u64,
     },
 
     /// A new process instance was created (carries a single token at its start

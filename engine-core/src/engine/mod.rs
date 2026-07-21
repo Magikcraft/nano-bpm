@@ -3363,6 +3363,7 @@ impl Engine {
                 decision_id: resolved_id,
                 decision_output: result.decision_output,
                 evaluated_decisions: result.evaluated_decisions,
+                evaluated_at: self.now,
             });
         }
 

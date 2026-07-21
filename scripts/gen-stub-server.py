@@ -38,6 +38,8 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("job", "complete_job"): "self.complete_job_impl(path_params, body).await",
     ("resource", "create_deployment"): "self.create_deployment_impl(body).await",
     ("decision_definition", "evaluate_decision"): "self.evaluate_decision_impl(body).await",
+    ("decision_instance", "get_decision_instance"): "self.get_decision_instance_impl(path_params).await",
+    ("decision_instance", "search_decision_instances"): "self.search_decision_instances_impl(body).await",
     ("job", "activate_jobs"): "self.activate_jobs_impl(body).await",
     ("job", "fail_job"): "self.fail_job_impl(path_params, body).await",
     ("job", "throw_job_error"): "self.throw_job_error_impl(path_params, body).await",

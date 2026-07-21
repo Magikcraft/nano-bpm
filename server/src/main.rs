@@ -1240,6 +1240,15 @@ fn rebuild_read_model_legacy(
         }
         let p = (nanobpmn_engine_core::partition_of(e.max_key()) as usize)
             .min(num_partitions.saturating_sub(1)) as u64;
+        let p = if let Event::DecisionEvaluated { instance_key, .. } = e {
+            // Colocate the decision instance with its owning process instance
+            // (so the `process_definition_key` join resolves), not with the
+            // higher-numbered decision key its `max_key` might otherwise pick.
+            (nanobpmn_engine_core::partition_of(*instance_key) as usize)
+                .min(num_partitions.saturating_sub(1)) as u64
+        } else {
+            p
+        };
         if let Some(bucket) = per_shard.get_mut(&p) {
             bucket.push(e);
         }
@@ -6847,12 +6856,141 @@ impl ServerImpl {
         ))
     }
 
+    /// Returns a single decision instance by its `<decisionEvaluationKey>-<index>`
+    /// id from the read model. A pure read; scans every owned shard because the
+    /// composite id does not encode a partition.
+    async fn get_decision_instance_impl(
+        &self,
+        path_params: &models::GetDecisionInstancePathParams,
+    ) -> Result<apis::decision_instance::GetDecisionInstanceResponse, ()> {
+        use apis::decision_instance::GetDecisionInstanceResponse as Resp;
+
+        let key = &path_params.decision_evaluation_instance_key;
+        match self.store.decision_instance(key) {
+            Some(row) => Ok(Resp::Status200_TheDecisionInstanceIsSuccessfullyReturned(
+                decision_instance_get_result(&row),
+            )),
+            None => Ok(
+                Resp::Status404_TheDecisionInstanceWithTheGivenKeyWasNotFound(problem(
+                    "Decision instance not found",
+                    404,
+                    format!("No decision instance with key '{key}'."),
+                )),
+            ),
+        }
+    }
+
+    /// Searches decision instances in the read model, applying the filter algebra,
+    /// multi-field sort, and pagination shared by the other `search*` endpoints.
+    async fn search_decision_instances_impl(
+        &self,
+        body: &Option<models::DecisionInstanceSearchQuery>,
+    ) -> Result<apis::decision_instance::SearchDecisionInstancesResponse, ()> {
+        use apis::decision_instance::SearchDecisionInstancesResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let rows = self.store.decision_instances();
+
+        let mut matched: Vec<&readstore::DecisionInstanceRow> = rows
+            .iter()
+            .filter(|row| match filter {
+                None => true,
+                Some(f) => {
+                    query::match_decision_evaluation_instance_key(
+                        &f.decision_evaluation_instance_key,
+                        &row.eval_instance_key,
+                    ) && query::match_decision_instance_state(&f.state, &row.state)
+                        && f.evaluation_failure.as_ref().is_none_or(|want| {
+                            row.evaluation_failure.as_deref() == Some(want.as_str())
+                        })
+                        && f.decision_definition_id
+                            .as_ref()
+                            .is_none_or(|want| want == &row.decision_id)
+                        && f.decision_definition_name
+                            .as_ref()
+                            .is_none_or(|want| want == &row.decision_name)
+                        && f.decision_definition_version
+                            .is_none_or(|want| want == row.version)
+                        && f.decision_definition_type
+                            .as_ref()
+                            .is_none_or(|want| want.to_string() == row.decision_type)
+                        && f.tenant_id.as_ref().is_none_or(|want| want == &row.tenant_id)
+                        && f.decision_evaluation_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.decision_evaluation_key.to_string())
+                        && f.process_definition_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.process_definition_key)
+                        && f.process_instance_key
+                            .as_ref()
+                            .is_none_or(|want| want.0 == row.instance_key.to_string())
+                        && query::match_decision_definition_key(
+                            &f.decision_definition_key,
+                            &row.decision_key.to_string(),
+                        )
+                        && query::match_element_instance_key(
+                            &f.element_instance_key,
+                            &row.element_instance_key.to_string(),
+                        )
+                        && query::match_decision_definition_key(
+                            &f.root_decision_definition_key,
+                            &row.root_decision_key.to_string(),
+                        )
+                        && query::match_decision_requirements_key(
+                            &f.decision_requirements_key,
+                            &row.decision_requirements_key.to_string(),
+                        )
+                }
+            })
+            .collect();
+
+        // A synthetic, unique numeric key for stable sort tiebreak + cursors: the
+        // evaluation key scaled past the small within-evaluation index.
+        let entity_key = |row: &readstore::DecisionInstanceRow| -> u64 {
+            row.decision_evaluation_key
+                .wrapping_mul(1000)
+                .wrapping_add(row.idx as u64)
+        };
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::DecisionInstanceSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |row, field| match field {
+                "evaluationDate" => query::SortVal::Num(row.evaluation_date_ms as i64),
+                "decisionDefinitionId" => query::SortVal::Str(row.decision_id.clone()),
+                "decisionDefinitionName" => query::SortVal::Str(row.decision_name.clone()),
+                "decisionDefinitionKey" => query::SortVal::Num(row.decision_key as i64),
+                "decisionDefinitionVersion" => query::SortVal::Num(row.version as i64),
+                "decisionDefinitionType" => query::SortVal::Str(row.decision_type.clone()),
+                "processInstanceKey" => query::SortVal::Num(row.instance_key as i64),
+                "state" => query::SortVal::Str(row.state.clone()),
+                "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
+                "decisionEvaluationInstanceKey" => query::SortVal::Str(row.eval_instance_key.clone()),
+                _ => query::SortVal::Num(entity_key(row) as i64),
+            },
+            |row| entity_key(row),
+        );
+
+        let sorted: Vec<(u64, &readstore::DecisionInstanceRow)> =
+            matched.into_iter().map(|row| (entity_key(row), row)).collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::DecisionInstanceResult> =
+            page.items.into_iter().map(decision_instance_result).collect();
+
+        Ok(Resp::Status200_TheDecisionInstanceSearchResult(
+            models::DecisionInstanceSearchQueryResult::new(page.response, items),
+        ))
+    }
+
     async fn search_process_instances_impl(
         &self,
         body: &Option<models::ProcessInstanceSearchQuery>,
     ) -> Result<apis::process_instance::SearchProcessInstancesResponse, ()> {
         use apis::process_instance::SearchProcessInstancesResponse as Resp;
-
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
         let instances = self.store.process_instances();
 
@@ -12680,6 +12818,135 @@ fn incident_result(incident: &readstore::IncidentRow) -> models::IncidentResult 
     )
 }
 
+/// Parses a stored `inputs_json` array into the generated input items.
+fn decision_instance_inputs(inputs_json: &str) -> Vec<models::EvaluatedDecisionInputItem> {
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(inputs_json).unwrap_or_default();
+    parsed
+        .into_iter()
+        .map(|v| {
+            models::EvaluatedDecisionInputItem::new(
+                v.get("inputId").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("inputName").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                v.get("inputValue").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Parses a stored `rules_json` array into the generated matched-rule items.
+fn decision_instance_rules(rules_json: &str) -> Vec<models::MatchedDecisionRuleItem> {
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(rules_json).unwrap_or_default();
+    parsed
+        .into_iter()
+        .map(|rule| {
+            let rule_id = rule.get("ruleId").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let rule_index = rule.get("ruleIndex").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            let outputs = rule
+                .get("evaluatedOutputs")
+                .and_then(|x| x.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|out| {
+                    models::EvaluatedDecisionOutputItem::new(
+                        out.get("outputId").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        out.get("outputName").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        out.get("outputValue").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                        types::Nullable::Present(rule_id.clone()),
+                        types::Nullable::Present(rule_index),
+                    )
+                })
+                .collect();
+            models::MatchedDecisionRuleItem::new(rule_id, rule_index, outputs)
+        })
+        .collect()
+}
+
+/// Projects a [`DecisionInstanceRow`] into the generated `DecisionInstanceResult`
+/// (the search-result shape, which omits the input/rule audit).
+fn decision_instance_result(row: &readstore::DecisionInstanceRow) -> models::DecisionInstanceResult {
+    let evaluation_date =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
+            .unwrap_or_else(epoch);
+    let process_definition_key = if row.process_definition_key.is_empty() {
+        types::Nullable::Null
+    } else {
+        types::Nullable::Present(models::ProcessDefinitionKey(row.process_definition_key.clone()))
+    };
+    let evaluation_failure = match &row.evaluation_failure {
+        Some(f) => types::Nullable::Present(f.clone()),
+        None => types::Nullable::Null,
+    };
+    models::DecisionInstanceResult::new(
+        row.decision_id.clone(),
+        models::DecisionDefinitionKey(row.decision_key.to_string()),
+        row.decision_name.clone(),
+        row.decision_type
+            .parse()
+            .unwrap_or(models::DecisionDefinitionTypeEnum::Unknown),
+        row.version,
+        row.eval_instance_key.clone(),
+        models::DecisionEvaluationKey(row.decision_evaluation_key.to_string()),
+        types::Nullable::Present(models::ElementInstanceKey(row.element_instance_key.to_string())),
+        evaluation_date,
+        evaluation_failure,
+        process_definition_key,
+        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
+        row.result_json.clone(),
+        models::DecisionDefinitionKey(row.root_decision_key.to_string()),
+        types::Nullable::Null,
+        row.state
+            .parse()
+            .unwrap_or(models::DecisionInstanceStateEnum::Unknown),
+        row.tenant_id.clone(),
+    )
+}
+
+/// Projects a [`DecisionInstanceRow`] into the generated
+/// `DecisionInstanceGetQueryResult` (adds the evaluated-input/matched-rule audit
+/// to the search-result shape).
+fn decision_instance_get_result(
+    row: &readstore::DecisionInstanceRow,
+) -> models::DecisionInstanceGetQueryResult {
+    let evaluation_date =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.evaluation_date_ms as i64)
+            .unwrap_or_else(epoch);
+    let process_definition_key = if row.process_definition_key.is_empty() {
+        types::Nullable::Null
+    } else {
+        types::Nullable::Present(models::ProcessDefinitionKey(row.process_definition_key.clone()))
+    };
+    let evaluation_failure = match &row.evaluation_failure {
+        Some(f) => types::Nullable::Present(f.clone()),
+        None => types::Nullable::Null,
+    };
+    models::DecisionInstanceGetQueryResult::new(
+        row.decision_id.clone(),
+        models::DecisionDefinitionKey(row.decision_key.to_string()),
+        row.decision_name.clone(),
+        row.decision_type
+            .parse()
+            .unwrap_or(models::DecisionDefinitionTypeEnum::Unknown),
+        row.version,
+        row.eval_instance_key.clone(),
+        models::DecisionEvaluationKey(row.decision_evaluation_key.to_string()),
+        types::Nullable::Present(models::ElementInstanceKey(row.element_instance_key.to_string())),
+        evaluation_date,
+        evaluation_failure,
+        process_definition_key,
+        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
+        row.result_json.clone(),
+        models::DecisionDefinitionKey(row.root_decision_key.to_string()),
+        types::Nullable::Null,
+        row.state
+            .parse()
+            .unwrap_or(models::DecisionInstanceStateEnum::Unknown),
+        row.tenant_id.clone(),
+        decision_instance_inputs(&row.inputs_json),
+        decision_instance_rules(&row.rules_json),
+    )
+}
+
 /// Projects a [`ProcessInstanceRow`] into the generated `ProcessInstanceResult`.
 fn process_instance_result(
     instance: &readstore::ProcessInstanceRow,
@@ -13158,7 +13425,7 @@ fn dmn_value_to_string(value: &Value) -> String {
 }
 
 /// The Zeebe/Camunda REST name for a DMN decision logic type.
-fn dmn_decision_type_name(kind: &nanobpmn_engine_core::dmn::DecisionType) -> &'static str {
+pub(crate) fn dmn_decision_type_name(kind: &nanobpmn_engine_core::dmn::DecisionType) -> &'static str {
     use nanobpmn_engine_core::dmn::DecisionType::*;
     match kind {
         DecisionTable => "DECISION_TABLE",
@@ -16564,6 +16831,120 @@ mod clustered_startup_tests {
         assert!(
             matches!(resp, Resp::Status404_TheDecisionIsNotFound(_)),
             "an unknown decision id is a 404"
+        );
+    }
+
+    #[tokio::test]
+    async fn business_rule_task_records_a_decision_instance_in_the_read_model() {
+        // Phase 5 parity: a `businessRuleTask` evaluation emits a `DecisionEvaluated`
+        // event that the read-model exporter projects into a queryable decision
+        // instance, surfaced by the search + get DecisionInstance endpoints.
+        use apis::decision_instance::GetDecisionInstanceResponse as GetResp;
+        use apis::decision_instance::SearchDecisionInstancesResponse as SearchResp;
+        let server = ServerImpl::default();
+
+        let dmn_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="greeting-drg" name="Greeting DRG">
+          <decision id="greeting" name="Greeting">
+            <decisionTable hitPolicy="UNIQUE">
+              <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+              <output id="o1" name="result" typeRef="string" />
+              <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+                <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+              <rule id="r2"><inputEntry id="ie2"><text>"de"</text></inputEntry>
+                <outputEntry id="oe2"><text>"hallo"</text></outputEntry></rule>
+            </decisionTable>
+          </decision>
+        </definitions>"##;
+        let drg = nanobpmn_engine_core::dmn::parse_dmn(dmn_xml).expect("valid DMN");
+        let mut drg_names = std::collections::HashMap::new();
+        drg_names.insert(drg.id.clone(), "greeting.dmn".to_string());
+
+        let proc = ProcessBuilder::new("greeter")
+            .start_event("s")
+            .business_rule_task("decide", "greeting", Some("greeting".to_string()))
+            .end_event("e")
+            .connect("s", "decide")
+            .connect("decide", "e")
+            .build()
+            .expect("valid businessRuleTask process");
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("greeter".to_string(), "greeter.bpmn".to_string());
+
+        server
+            .deploy_resources_locally(vec![proc], &proc_names, vec![drg], &drg_names, "<default>")
+            .await
+            .expect("mixed dmn+bpmn deploy succeeds");
+
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("lang".to_string(), Value::Str("de".into()));
+        let (instance_key, completed) = server
+            .create_for_stream(Some("greeter".into()), None, variables)
+            .await
+            .expect("create the businessRuleTask instance");
+        assert!(completed, "the businessRuleTask completes synchronously");
+
+        // The read model is populated by the async exporter thread; poll the
+        // search endpoint until the decision instance is projected.
+        let mut found = None;
+        for _ in 0..200 {
+            let resp = server
+                .search_decision_instances_impl(&None)
+                .await
+                .expect("search returns a response");
+            let SearchResp::Status200_TheDecisionInstanceSearchResult(result) = resp else {
+                panic!("expected a 200 search result");
+            };
+            if let Some(item) = result.items.into_iter().next() {
+                found = Some(item);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let item = found.expect("the decision instance is projected into the read model");
+        assert_eq!(item.decision_definition_id, "greeting");
+        assert_eq!(item.decision_definition_name, "Greeting");
+        assert_eq!(item.decision_definition_type, models::DecisionDefinitionTypeEnum::DecisionTable);
+        assert_eq!(item.result, "\"hallo\"");
+        assert_eq!(item.state, models::DecisionInstanceStateEnum::Evaluated);
+        assert!(
+            matches!(&item.process_instance_key, nanobpm_gateway_rest::types::Nullable::Present(k) if k.0 == instance_key.to_string()),
+            "the decision instance links back to its process instance"
+        );
+        assert!(
+            matches!(&item.process_definition_key, nanobpm_gateway_rest::types::Nullable::Present(_)),
+            "the owning process definition key is resolved"
+        );
+
+        // Fetch the same instance by its composite id; the get result carries the
+        // evaluated-input/matched-rule audit trail.
+        let path = models::GetDecisionInstancePathParams {
+            decision_evaluation_instance_key: item.decision_evaluation_instance_key.clone(),
+        };
+        let resp = server
+            .get_decision_instance_impl(&path)
+            .await
+            .expect("get returns a response");
+        let GetResp::Status200_TheDecisionInstanceIsSuccessfullyReturned(got) = resp else {
+            panic!("expected a 200 get result");
+        };
+        assert_eq!(got.decision_definition_id, "greeting");
+        assert_eq!(got.evaluated_inputs.len(), 1);
+        assert_eq!(got.evaluated_inputs[0].input_value, "\"de\"");
+        assert_eq!(got.matched_rules.len(), 1);
+        assert_eq!(got.matched_rules[0].evaluated_outputs.len(), 1);
+        assert_eq!(got.matched_rules[0].evaluated_outputs[0].output_value, "\"hallo\"");
+
+        // An unknown composite id is a 404.
+        let missing = models::GetDecisionInstancePathParams {
+            decision_evaluation_instance_key: "999999-9".to_string(),
+        };
+        let resp = server
+            .get_decision_instance_impl(&missing)
+            .await
+            .expect("get returns a response");
+        assert!(
+            matches!(resp, GetResp::Status404_TheDecisionInstanceWithTheGivenKeyWasNotFound(_)),
+            "an unknown decision instance id is a 404"
         );
     }
 
