@@ -45,6 +45,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("decision_requirements", "get_decision_requirements_xml"): "self.get_decision_requirements_xml_impl(path_params).await",
     ("decision_requirements", "search_decision_requirements"): "self.search_decision_requirements_impl(body).await",
     ("decision_instance", "get_decision_instance"): "self.get_decision_instance_impl(path_params).await",
+    ("decision_instance", "delete_decision_instance"): "self.delete_decision_instance_impl(path_params).await",
     ("decision_instance", "search_decision_instances"): "self.search_decision_instances_impl(body).await",
     ("job", "activate_jobs"): "self.activate_jobs_impl(body).await",
     ("job", "fail_job"): "self.fail_job_impl(path_params, body).await",

@@ -1240,10 +1240,13 @@ fn rebuild_read_model_legacy(
         }
         let p = (nanobpmn_engine_core::partition_of(e.max_key()) as usize)
             .min(num_partitions.saturating_sub(1)) as u64;
-        let p = if let Event::DecisionEvaluated { instance_key, .. } = e {
-            // Colocate the decision instance with its owning process instance
-            // (so the `process_definition_key` join resolves), not with the
-            // higher-numbered decision key its `max_key` might otherwise pick.
+        let p = if let Event::DecisionEvaluated { instance_key, .. }
+        | Event::DecisionInstanceDeleted { instance_key, .. } = e
+        {
+            // Colocate the decision instance (and its later deletion) with its
+            // owning process instance (so the `process_definition_key` join
+            // resolves and the delete lands in the shard that holds the rows),
+            // not with the higher-numbered decision key its `max_key` might pick.
             (nanobpmn_engine_core::partition_of(*instance_key) as usize)
                 .min(num_partitions.saturating_sub(1)) as u64
         } else {
@@ -6875,6 +6878,75 @@ impl ServerImpl {
                     "Decision instance not found",
                     404,
                     format!("No decision instance with key '{key}'."),
+                )),
+            ),
+        }
+    }
+
+    /// Marks a decision instance for deletion: retracts every read-model row that
+    /// shares the given `decisionEvaluationKey` (one per evaluated decision in that
+    /// evaluation). Durable and replay-safe — it journals an
+    /// [`Event::DecisionInstanceDeleted`] on the owning process instance's
+    /// partition (resolved from the local read-model row), so the row is deleted in
+    /// the same shard that projected it and the deletion survives replay/rebuild.
+    ///
+    /// Scoped to this node's read model (like the decision-instance query
+    /// endpoints, which do not scatter-gather across peers): a `decisionEvaluationKey`
+    /// whose rows live only on a peer node returns 404 here.
+    async fn delete_decision_instance_impl(
+        &self,
+        path_params: &models::DeleteDecisionInstancePathParams,
+    ) -> Result<apis::decision_instance::DeleteDecisionInstanceResponse, ()> {
+        use apis::decision_instance::DeleteDecisionInstanceResponse as Resp;
+
+        let raw = &path_params.decision_evaluation_key;
+        let decision_evaluation_key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheDecisionInstanceIsNotFound(problem(
+                    "Decision instance not found",
+                    404,
+                    format!("Decision evaluation key '{raw}' is not a valid key."),
+                )));
+            }
+        };
+
+        // Resolve the owning process instance from the read model so the deletion
+        // event is journaled on the shard that holds the rows. No rows => 404.
+        let rows = self
+            .store
+            .decision_instances_by_evaluation_key(decision_evaluation_key);
+        let Some(instance_key) = rows.first().map(|r| r.instance_key) else {
+            return Ok(Resp::Status404_TheDecisionInstanceIsNotFound(problem(
+                "Decision instance not found",
+                404,
+                format!("No decision instance for evaluation key '{raw}'."),
+            )));
+        };
+
+        let result = self
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| {
+                engine.apply_command_at(
+                    Command::DeleteDecisionInstance {
+                        instance_key,
+                        decision_evaluation_key,
+                    },
+                    now_millis(),
+                )
+            })
+            .await;
+        match result {
+            Ok((_events, commit)) => {
+                commit.wait().await;
+                Ok(Resp::Status204_TheDecisionInstanceIsMarkedForDeletion)
+            }
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
                 )),
             ),
         }

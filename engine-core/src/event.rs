@@ -82,6 +82,18 @@ pub enum Event {
         evaluated_at: u64,
     },
 
+    /// A decision instance (all rows sharing `decision_evaluation_key`, i.e. the
+    /// root decision key of one [`Event::DecisionEvaluated`]) was marked for
+    /// deletion via the DeleteDecisionInstance management API. `instance_key` is
+    /// the owning process instance, carried purely so this event is journaled and
+    /// projected on the same partition/shard as the `DecisionEvaluated` it retracts
+    /// (the read model deletes the matching rows). Audit/projection-only: no core
+    /// engine state to mutate.
+    DecisionInstanceDeleted {
+        instance_key: Key,
+        decision_evaluation_key: Key,
+    },
+
     /// A new process instance was created (carries a single token at its start
     /// event) with its initial variables. `created_at` is the logical instant
     /// the instance was started, carried on the command (the engine never reads
@@ -787,6 +799,7 @@ impl Event {
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
             | Event::DecisionEvaluated { instance_key, .. }
+            | Event::DecisionInstanceDeleted { instance_key, .. }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. }
             | Event::DecisionRequirementsDeployed { .. }
@@ -838,6 +851,10 @@ impl Event {
                 decision_key,
                 ..
             } => m = m.max(*element_instance_key).max(*decision_key),
+            Event::DecisionInstanceDeleted {
+                decision_evaluation_key,
+                ..
+            } => m = m.max(*decision_evaluation_key),
             Event::DeploymentCreated { deployment_key } => m = m.max(*deployment_key),
             Event::ElementActivating {
                 element_instance_key,

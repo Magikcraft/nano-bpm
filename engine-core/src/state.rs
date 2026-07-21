@@ -1052,6 +1052,10 @@ pub fn apply(state: &mut State, event: &Event) {
             // instance via a separate VariablesUpdated event, and the record is
             // surfaced to the exporter. No core state to mutate.
         }
+        Event::DecisionInstanceDeleted { .. } => {
+            // Audit/projection-only: the read model deletes the retracted decision
+            // instance rows. No core engine state to mutate.
+        }
         Event::ProcessInstanceCreated {
             instance_key,
             process_id,

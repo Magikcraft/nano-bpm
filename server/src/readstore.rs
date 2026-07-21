@@ -1220,6 +1220,31 @@ impl ReadStore {
             .expect("query decision_instance")
     }
 
+    /// Every decision-instance row sharing a `decision_evaluation_key` (one per
+    /// evaluated decision in that evaluation), ordered by within-evaluation index.
+    /// Used by the DeleteDecisionInstance handler to resolve the owning process
+    /// instance (for partition routing) and to detect a not-found evaluation.
+    pub fn decision_instances_by_evaluation_key(
+        &self,
+        decision_evaluation_key: Key,
+    ) -> Vec<DecisionInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let sql = format!(
+            "SELECT {DECISION_INSTANCE_COLS} FROM decision_instances \
+             WHERE decision_evaluation_key = ?1 ORDER BY idx"
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .expect("prepare decision_instances_by_evaluation_key");
+        let rows = stmt
+            .query_map(
+                params![decision_evaluation_key as i64],
+                map_decision_instance,
+            )
+            .expect("query decision_instances_by_evaluation_key");
+        rows.filter_map(Result::ok).collect()
+    }
+
     pub fn process_definitions(&self) -> Vec<ProcessDefinitionRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
@@ -1594,6 +1619,19 @@ impl ReadModel {
             }
         }
         None
+    }
+
+    /// Every decision-instance row for a `decision_evaluation_key`, concatenated
+    /// across shards (the evaluation's rows live in a single shard, but which one
+    /// is unknown from the key alone).
+    pub fn decision_instances_by_evaluation_key(
+        &self,
+        decision_evaluation_key: Key,
+    ) -> Vec<DecisionInstanceRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.decision_instances_by_evaluation_key(decision_evaluation_key))
+            .collect()
     }
 
     pub fn variables(&self) -> Vec<VariableRow> {
@@ -2545,6 +2583,21 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
             }
         }
 
+        Event::DecisionInstanceDeleted {
+            decision_evaluation_key,
+            ..
+        } => {
+            // Retract every decision-instance row of this evaluation (one per
+            // evaluated decision). Idempotent: a replay or a broadcast to a shard
+            // that never held the rows deletes nothing. Because this is journaled
+            // on the owning instance's partition (same shard as the originating
+            // DecisionEvaluated), the deletion survives replay/rebuild.
+            tx.cexecute(
+                "DELETE FROM decision_instances WHERE decision_evaluation_key = ?1",
+                params![*decision_evaluation_key as i64],
+            )?;
+        }
+
         // Events with no queryable read-model projection.
         _ => {}
     }
@@ -3090,5 +3143,92 @@ mod definition_xml_tests {
             .unwrap();
         assert_eq!(after.key, before, "upsert keeps the variable key");
         assert_eq!(after.value, "99");
+    }
+}
+
+#[cfg(test)]
+mod decision_deletion_tests {
+    use nanobpmn_engine_core::dmn::{DecisionType, EvaluatedDecision};
+    use nanobpmn_engine_core::{Event, Value};
+
+    use super::ReadStore;
+
+    /// A DecisionEvaluated for process instance `instance_key`, whose root decision
+    /// (definition) key — the `decisionEvaluationKey` — is `eval_key`, carrying
+    /// `n` evaluated decisions (so it projects `n` decision-instance rows).
+    fn evaluated_event(instance_key: u64, eval_key: u64, n: usize) -> Event {
+        let evaluated_decisions = (0..n)
+            .map(|i| EvaluatedDecision {
+                decision_id: format!("d{i}"),
+                decision_name: format!("Decision {i}"),
+                decision_type: DecisionType::DecisionTable,
+                decision_output: Value::Int(i as i64),
+                evaluated_inputs: Vec::new(),
+                matched_rules: Vec::new(),
+            })
+            .collect();
+        Event::DecisionEvaluated {
+            instance_key,
+            element_instance_key: instance_key + 1,
+            element_id: "brt".to_string(),
+            decision_key: eval_key,
+            decision_id: "d0".to_string(),
+            decision_output: Value::Int(0),
+            evaluated_decisions,
+            evaluated_at: 123,
+        }
+    }
+
+    #[test]
+    fn decision_instance_deleted_retracts_all_rows_of_the_evaluation() {
+        let store = ReadStore::open(None).unwrap();
+        // Two evaluations: eval_key 100 (2 decisions) and eval_key 200 (1 decision).
+        store.export(&[&evaluated_event(5, 100, 2)]).unwrap();
+        store.export(&[&evaluated_event(9, 200, 1)]).unwrap();
+
+        assert_eq!(store.decision_instances_by_evaluation_key(100).len(), 2);
+        assert!(store.decision_instance("100-1").is_some());
+        assert!(store.decision_instance("100-2").is_some());
+        assert_eq!(store.decision_instances_by_evaluation_key(200).len(), 1);
+
+        // Delete evaluation 100: both of its rows go, evaluation 200 is untouched.
+        store
+            .export(&[&Event::DecisionInstanceDeleted {
+                instance_key: 5,
+                decision_evaluation_key: 100,
+            }])
+            .unwrap();
+
+        assert!(store.decision_instances_by_evaluation_key(100).is_empty());
+        assert!(store.decision_instance("100-1").is_none());
+        assert!(store.decision_instance("100-2").is_none());
+        assert_eq!(
+            store.decision_instances_by_evaluation_key(200).len(),
+            1,
+            "deleting one evaluation must not touch another"
+        );
+    }
+
+    #[test]
+    fn decision_instance_deleted_is_idempotent() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&evaluated_event(5, 100, 2)]).unwrap();
+
+        let del = Event::DecisionInstanceDeleted {
+            instance_key: 5,
+            decision_evaluation_key: 100,
+        };
+        store.export(&[&del]).unwrap();
+        // Re-delivery (replay/broadcast) of the same deletion is inert, not an error.
+        store.export(&[&del]).unwrap();
+        // A deletion for an evaluation that never existed is also a harmless no-op.
+        store
+            .export(&[&Event::DecisionInstanceDeleted {
+                instance_key: 7,
+                decision_evaluation_key: 999,
+            }])
+            .unwrap();
+
+        assert!(store.decision_instances_by_evaluation_key(100).is_empty());
     }
 }

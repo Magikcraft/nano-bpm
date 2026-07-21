@@ -24,6 +24,15 @@ pub enum Command {
     /// decision-requirements key and a per-DRG-id version; each decision it
     /// contains is indexed by id for `businessRuleTask`/EvaluateDecision lookup.
     DeployDecisionRequirements(Vec<crate::dmn::DecisionRequirementsGraph>),
+    /// Mark a decision instance (all rows sharing a `decision_evaluation_key`) for
+    /// deletion in the read model. `instance_key` is the owning process instance,
+    /// carried so the emitted [`Event::DecisionInstanceDeleted`] is journaled and
+    /// projected on the same partition/shard as its originating
+    /// [`Event::DecisionEvaluated`]. Audit-only: no core engine state changes.
+    DeleteDecisionInstance {
+        instance_key: Key,
+        decision_evaluation_key: Key,
+    },
     /// Start a new instance of a previously deployed process, seeding it with the
     /// given variables (used by exclusive-gateway conditions), optional tags, and
     /// an optional business id.
@@ -258,6 +267,7 @@ impl Command {
             Command::DeployProcess(_) => "deploy_process",
             Command::DeployResources(_) => "deploy_resources",
             Command::DeployDecisionRequirements(_) => "deploy_decision_requirements",
+            Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
             Command::CreateInstance { .. } => "create_instance",
             Command::CompleteJob { .. } => "complete_job",
             Command::AssignUserTask { .. } => "assign_user_task",
