@@ -110,6 +110,24 @@ test("a trigger bodyType must name a declared domain type (ADR 0029 §5)", () =>
   assert.deepEqual(codesFor(result, "/triggers/1/bodyType"), ["unknown-type"]);
 });
 
+test("a FEEL body path outside the bodyType is flagged (ADR 0029 §5)", () => {
+  const m = manifest();
+  m.types = { reading: { fields: { room: { type: "string" } } } };
+  m.triggers[0].bodyType = "reading";
+  m.triggers[0].action = { start: "heating-cycle", variables: "= {r: body.room, x: body.nope}" };
+  const result = validateManifest(m); // manifest-only: intra-manifest rule
+  assert.deepEqual(codesFor(result, "/triggers/0/action/variables"), ["unknown-path"]);
+});
+
+test("a FEEL body path that resolves raises no diagnostic", () => {
+  const m = manifest();
+  m.types = { reading: { fields: { room: { type: "string" } } } };
+  m.triggers[0].bodyType = "reading";
+  m.triggers[0].action = { message: "temp-reading", correlationKey: "= body.room" };
+  const result = validateManifest(m);
+  assert.deepEqual(codesFor(result, "/triggers/0/action/correlationKey"), []);
+});
+
 test("resolveDomainTypes unions declared registry types with form-inferred candidates", async () => {
   const index = await buildSymbolIndex(models);
   const m = manifest();

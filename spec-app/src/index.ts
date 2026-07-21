@@ -5,6 +5,7 @@
 
 export * from "./symbol-index.ts";
 export * from "./domain-types.ts";
+export * from "./feel.ts";
 export * from "./manifest-completion.ts";
 export * from "./validate.ts";
 export type { AppManifest } from "../gen/nano-app.d.ts";

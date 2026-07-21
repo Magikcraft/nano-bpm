@@ -15,6 +15,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import schema from "../nano-app.schema.json" with { type: "json" };
 import type { SymbolIndex } from "./symbol-index.ts";
 import { DOMAIN_PRIMITIVES } from "./symbol-index.ts";
+import { bodyPaths, isDeclaredType, resolveBodyPath } from "./feel.ts";
 
 export interface Diagnostic {
   severity: "error";
@@ -92,6 +93,26 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     // action expressions (ADR 0029 §5). Intra-manifest, runs without an index.
     if (t.bodyType != null && !typeIds.has(t.bodyType)) {
       push(`/triggers/${i}/bodyType`, `bodyType "${t.bodyType}" is not a declared domain type`, "unknown-type");
+    }
+    // With a resolvable bodyType in scope, the action's FEEL fields must only
+    // reference `body` paths that exist in that type — wrong paths become
+    // diagnostics instead of runtime nulls (ADR 0029 §5). The path walker is
+    // shared with the completer so autocomplete and validation cannot disagree.
+    if (t.bodyType != null && isDeclaredType(manifest, t.bodyType)) {
+      for (const field of ["variables", "correlationKey"] as const) {
+        const expr = t.action?.[field];
+        if (typeof expr !== "string") continue;
+        for (const segs of bodyPaths(expr)) {
+          const res = resolveBodyPath(manifest, t.bodyType, segs);
+          if (res.kind === "unknown") {
+            push(
+              `/triggers/${i}/action/${field}`,
+              `body path "body.${segs.join(".")}" has no field "${res.segment}" in domain type "${t.bodyType}"`,
+              "unknown-path",
+            );
+          }
+        }
+      }
     }
   });
 
