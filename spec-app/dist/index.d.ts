@@ -154,8 +154,8 @@ export declare function resolveBodyPath(manifest: unknown, bodyType: string | un
  */
 export declare function bodyPaths(feel: string): string[][];
 /** The kinds of reference a manifest string value can be. */
-export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "datasource" | "agent";
-export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "datasource" | "agent" | "variable";
+export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "form-ref" | "datasource" | "agent";
+export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "form" | "datasource" | "agent" | "variable";
 export interface CompletionCandidate {
 	/** The literal id/name to insert (unquoted). */
 	value: string;
@@ -173,7 +173,7 @@ export interface ManifestCompletion {
 	candidates: CompletionCandidate[];
 }
 /** Just the parts of the index this engine reads (keeps callers flexible). */
-export type CompletionIndex = Pick<SymbolIndex, "processes" | "messages" | "decisions">;
+export type CompletionIndex = Pick<SymbolIndex, "processes" | "messages" | "decisions" | "forms">;
 /**
  * The public entry point: what completions apply at `offset`, or null when the
  * cursor is not inside a recognized reference value or FEEL expression.
@@ -222,6 +222,23 @@ type TriggerAction = {
 	correlationKey?: string;
 } & TriggerAction1;
 type TriggerAction1 = {
+	[k: string]: unknown;
+};
+type Binding = {
+	/**
+	 * form-js form id (schema.id) whose default-value FEEL is scoped to `type`.
+	 */
+	form?: string;
+	/**
+	 * DMN decision id whose input-expression FEEL is scoped to `type`.
+	 */
+	decision?: string;
+	/**
+	 * Lowercase kebab-case slug.
+	 */
+	type: string;
+} & Binding1;
+type Binding1 = {
 	[k: string]: unknown;
 };
 type Worker = {
@@ -276,6 +293,10 @@ export interface AppManifest {
 	 * Event sources bound to engine actions (ADR 0025).
 	 */
 	triggers?: Trigger[];
+	/**
+	 * Declares the domain type in scope for a model's FEEL (ADR 0029 §5): a form's default-value expressions and a decision's input expressions autocomplete + validate against the bound type's fields. The same 'typed reference replaces a free-string id' move as trigger.bodyType, applied to forms and decisions.
+	 */
+	bindings?: Binding[];
 	/**
 	 * Named connections (credentials/endpoint) referenced by triggers/workers by id, so configs carry no inline secrets (ADR 0025 §1).
 	 */

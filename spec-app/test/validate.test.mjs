@@ -149,3 +149,33 @@ test("a declared type shadows its form-inferred candidate of the same id", async
   const resolution = resolveDomainTypes(m, index);
   assert.ok(!resolution.inferred.some((r) => r.id === "confirm-heating"));
 });
+
+test("bindings to a resolvable form/decision + declared type are valid (ADR 0029 §5)", async () => {
+  const index = await buildSymbolIndex(models);
+  const m = manifest();
+  m.types = { ...(m.types ?? {}), reading: { fields: { room: { type: "string" } } } };
+  m.bindings = [
+    { form: "confirm-heating", type: "reading" },
+    { decision: "email-triage", type: "reading" },
+  ];
+  const result = validateManifest(m, index);
+  assert.deepEqual(codesFor(result, "/bindings/0/form"), []);
+  assert.deepEqual(codesFor(result, "/bindings/1/decision"), []);
+  assert.deepEqual(codesFor(result, "/bindings/0/type"), []);
+});
+
+test("a binding to an unknown form/decision/type is rejected with pointers", async () => {
+  const index = await buildSymbolIndex(models);
+  const m = manifest();
+  m.bindings = [
+    { form: "no-such-form", type: "reading" },
+    { decision: "no-such-decision", type: "reading" },
+  ];
+  const result = validateManifest(m, index);
+  assert.equal(result.ok, false);
+  assert.deepEqual(codesFor(result, "/bindings/0/form"), ["unknown-form"]);
+  assert.deepEqual(codesFor(result, "/bindings/1/decision"), ["unknown-decision"]);
+  // "reading" is not declared here → both bindings flag the type.
+  assert.deepEqual(codesFor(result, "/bindings/0/type"), ["unknown-type"]);
+  assert.deepEqual(codesFor(result, "/bindings/1/type"), ["unknown-type"]);
+});
