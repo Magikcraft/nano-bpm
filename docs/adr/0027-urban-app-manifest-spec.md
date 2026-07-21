@@ -113,6 +113,12 @@ Cross-reference rules (beyond shape): every `models.*` glob resolves to ≥1 fil
 declared `llm`. These are the errors that otherwise surface as a confusing runtime drop (cf. ADR 0025
 §5's silent `CorrelateMessage` no-op).
 
+**Authoring-time enumeration.** ADR 0029 (`0029-urban-bindings-domain-model.md`) turns these
+after-the-fact rules into *pickers*: a project **symbol index** enumerates the valid ids so a maker
+selects a process/message/form/decision instead of typing one, and the §4 validator collapses into
+"the referenced id ∈ the index." It also adds the compile-time **domain type** layer the envelope
+binds against.
+
 ### 5. Env & secret substitution — resolved at boot, never persisted
 
 `${VAR}` / `${VAR:-default}` are resolved **at App boot** (and at IDE Run) from the environment,
