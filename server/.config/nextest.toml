@@ -1,15 +1,28 @@
 # The heavy server integration tests each spin up a multi-node Raft cluster on a
 # `worker_threads = 4` runtime (`clustered_startup_tests`) or drive snapshot+tail
-# journal recovery (`seglog::tests`). They are timing sensitive: on a small/slow
-# CI runner their fixed replication/failover readiness budgets are borderline,
-# and running them concurrently oversubscribes the CPUs. Put them in a
-# single-threaded group so they never contend with each other, and give just
-# them a couple of retries to absorb residual timing flakes. The rest of the
-# suite stays strict (no retries) and fully parallel.
+# journal recovery (`seglog::tests`). They are timing sensitive: their fixed
+# replication/failover readiness budgets (e.g. "the create ships to node 1"
+# within 8s) assume the tokio runtime makes steady progress, which only holds if
+# the process isn't starved of CPU.
+#
+# `max-threads = 1` (below) already stops these heavy tests from running
+# concurrently with EACH OTHER, but nextest still schedules up to `test-threads`
+# (= num-cpus) *other* tests alongside them. On a small CI runner that ambient
+# parallel load oversubscribes the cores and starves a cluster test's 4-worker
+# runtime, so its wall-clock budgets elapse before replication is scheduled — the
+# create never appears to "ship" and the test fails (even across retries, if the
+# runner stays saturated).
+#
+# `threads-required = 'num-test-threads'` fixes the root cause: each heavy test
+# reserves the ENTIRE test-thread pool, so it runs with NO other test executing
+# concurrently — the same uncontended condition under which these tests are
+# deterministic locally. The retries remain as a last-resort safety net; the rest
+# of the suite stays strict (no retries) and fully parallel.
 [test-groups]
 serial-heavy = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'test(clustered_startup_tests) or test(seglog::tests)'
 test-group = 'serial-heavy'
+threads-required = 'num-test-threads'
 retries = 2
