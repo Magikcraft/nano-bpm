@@ -69,6 +69,10 @@ pub const TEMPLATES: &[(&str, &str)] = &[
         "gui-starter",
         "GUI app — served-UI binary (Deno.serve) for a process application",
     ),
+    (
+        "urban-starter",
+        "Urban App — a RAD application (nano.app.json) with models, data, triggers & surfaces",
+    ),
 ];
 
 /// The scaffolder's full template menu: the offline built-ins from [`TEMPLATES`]
@@ -1046,6 +1050,127 @@ and serves `public/`. Press **Run**, open the port, or **Compile** to a binary \
 for a self-contained engine+UI binary.\n"
     )
 }
+
+// ── Urban App template (ADR 0022/0026/0027) ───────────────────────────────
+// An Urban App is a Deno/TypeScript RAD application: a `nano.app.json` manifest
+// (the source of truth, ADR 0027) declares its models, datasources, triggers
+// and surfaces; a Deno binary serves the generated UI and boots the App. The
+// scaffold lays down the manifest + the resource dirs the Console's model
+// editors read from (`resources/processes|decisions|forms`) + `db/migrations`
+// for the sqlite datasource + `public/` for static assets.
+
+const URBAN_DENO_JSON: &str = r#"{
+  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@lib/": "./lib/" },
+  "tasks": {
+    "start": "deno run --allow-net --allow-read --allow-write --allow-env main.ts"
+  }
+}
+"#;
+
+// The Urban App loader entrypoint. It reads `nano.app.json` (the manifest is the
+// source of truth), deploys the declared models, and serves the App. The full
+// manifest-driven UI/trigger runtime lands in a later slice (ADR 0026); for now
+// this boots the engine resources and serves `public/` + a start endpoint.
+const URBAN_MAIN_TS: &str = r#"// Urban App entrypoint. The `nano.app.json` manifest is the source of truth for
+// this application (models, datasources, triggers, surfaces). `deno compile
+// --include nano.app.json --include public` bundles it into a single binary.
+import { deployAllResources } from "@lib/nano.ts";
+
+const manifest = JSON.parse(await Deno.readTextFile("./nano.app.json"));
+const PORT = Number(Deno.env.get("PORT") ?? 8090);
+
+await deployAllResources();
+
+Deno.serve({ port: PORT }, async (req) => {
+  const url = new URL(req.url);
+  if (url.pathname === "/api/app") {
+    return Response.json({ id: manifest.id, name: manifest.name });
+  }
+  const path = url.pathname === "/" ? "/index.html" : url.pathname;
+  try {
+    return new Response(await Deno.readTextFile(`./public${path}`), {
+      headers: { "content-type": path.endsWith(".html") ? "text/html" : "text/plain" },
+    });
+  } catch {
+    return new Response("not found", { status: 404 });
+  }
+});
+console.log(`Urban App "${manifest.id}" serving on :${PORT}`);
+"#;
+
+const URBAN_INDEX_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Urban App</title>
+<style>body{font:16px system-ui;margin:3rem;max-width:40rem}</style></head>
+<body><h1 id="title">Urban App</h1><p>A Nano RAD application. Design its models, data,
+triggers and surfaces in the Console, then run or compile it to a binary.</p>
+<script>fetch('/api/app').then(r=>r.json()).then(a=>{title.textContent=a.name})</script>
+</body></html>
+"#;
+
+/// The scaffolded Urban manifest. Models point at the `resources/` dirs the
+/// Console model editors use; a single sqlite datasource with a `db/migrations`
+/// dir; the task inbox surface enabled. Valid against `spec-app/nano-app.schema.json`.
+fn urban_manifest(app_id: &str, display_name: &str) -> String {
+    format!(
+        r#"{{
+  "$schema": "https://nanobpm.dev/spec-app/nano-app.schema.json",
+  "schemaVersion": 1,
+  "id": "{app_id}",
+  "name": "{display_name}",
+  "models": {{
+    "processes": ["resources/processes/*.bpmn"],
+    "decisions": ["resources/decisions/*.dmn"],
+    "forms": ["resources/forms/*.form"]
+  }},
+  "data": {{
+    "default": "app",
+    "sources": {{
+      "app": {{
+        "driver": "sqlite",
+        "url": "file:./app.db",
+        "migrations": "db/migrations"
+      }}
+    }}
+  }},
+  "surfaces": {{
+    "taskInbox": {{ "enabled": true }}
+  }}
+}}
+"#
+    )
+}
+
+fn urban_readme(name: &str) -> String {
+    format!(
+        "# {name} (Urban App)\n\n\
+A Nano RAD application (ADR 0022). `nano.app.json` is the source of truth: it \
+declares the app's **models** (`resources/processes|decisions|forms`), \
+**data** (a sqlite datasource with migrations under `db/`), **triggers** and \
+**surfaces**. Design them in the Console's App panels, then **Run** the Deno \
+binary or **Compile** it (`deno compile --include nano.app.json --include public`).\n"
+    )
+}
+
+/// Lowercases and hyphen-slugs a project name into a manifest `id` matching the
+/// schema pattern `^[a-z0-9]+(?:-[a-z0-9]+)*$`. Falls back to `app` if empty.
+fn slugify_app_id(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "app".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
 /// overwriting any prior copy so project code imports the current version.
 pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     let dir = project_dir(name).ok_or_else(|| {
@@ -1079,7 +1204,7 @@ pub fn create_project(
     // resources/processes/*.bpmn from the built-in fallthrough.
     let is_builtin_template = matches!(
         template,
-        "starter" | "throughput" | "throughput-stream" | "gui-starter"
+        "starter" | "throughput" | "throughput-stream" | "gui-starter" | "urban-starter"
     );
     if !is_builtin_template && let Some((m, src)) = super::extensions::template_source(template) {
         mk(dir.clone())?;
@@ -1190,6 +1315,22 @@ pub fn create_project(
             &starter_process(name),
         )?;
         cfg_app = "deno-gui";
+    } else if template == "urban-starter" {
+        mk(dir.join("public"))?;
+        mk(dir.join("db").join("migrations"))?;
+        let app_id = slugify_app_id(name);
+        w(dir.join("deno.json"), URBAN_DENO_JSON)?;
+        w(dir.join("main.ts"), URBAN_MAIN_TS)?;
+        w(dir.join("nano.app.json"), &urban_manifest(&app_id, name))?;
+        w(dir.join("public").join("index.html"), URBAN_INDEX_HTML)?;
+        w(dir.join("README.md"), &urban_readme(name))?;
+        w(
+            dir.join("resources")
+                .join("processes")
+                .join(format!("{name}.bpmn")),
+            &starter_process(name),
+        )?;
+        cfg_app = "urban";
     } else {
         let starter_worker = dir.join("workers").join("do-work");
         mk(starter_worker.clone())?;
@@ -1214,7 +1355,10 @@ pub fn create_project(
     // stays None here — its absence is how the Console distinguishes a built-in
     // template from a pack-contributed one.
     cfg.template = Some(
-        if matches!(template, "throughput" | "throughput-stream" | "gui-starter") {
+        if matches!(
+            template,
+            "throughput" | "throughput-stream" | "gui-starter" | "urban-starter"
+        ) {
             template
         } else {
             "starter"
@@ -2618,6 +2762,43 @@ mod tests {
         let dir = root.join("gdemo");
         assert!(dir.join("public/index.html").is_file());
         assert!(dir.join("main.ts").is_file());
+    }
+
+    #[test]
+    fn urban_template_scaffolds_app_manifest_and_dirs() {
+        let _g = lock();
+        let root = temp_root();
+        let cfg = create_project("Home_Heating", "", "urban-starter").expect("create");
+        assert_eq!(cfg.app, "urban");
+        assert_eq!(cfg.template.as_deref(), Some("urban-starter"));
+        let dir = root.join("Home_Heating");
+        // Manifest is the source of truth; model + data + public dirs are scaffolded.
+        let manifest_path = dir.join("nano.app.json");
+        assert!(manifest_path.is_file(), "nano.app.json must exist");
+        assert!(dir.join("resources/processes").is_dir());
+        assert!(dir.join("resources/decisions").is_dir());
+        assert!(dir.join("resources/forms").is_dir());
+        assert!(dir.join("db/migrations").is_dir());
+        assert!(dir.join("public/index.html").is_file());
+        assert!(dir.join("main.ts").is_file());
+        // The manifest is valid JSON with a slugged id derived from the name.
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
+                .expect("manifest parses");
+        assert_eq!(manifest["schemaVersion"], 1);
+        assert_eq!(manifest["id"], "home-heating");
+        assert_eq!(manifest["name"], "Home_Heating");
+        assert_eq!(manifest["data"]["sources"]["app"]["driver"], "sqlite");
+        assert_eq!(manifest["surfaces"]["taskInbox"]["enabled"], true);
+    }
+
+    #[test]
+    fn slugify_app_id_matches_manifest_pattern() {
+        assert_eq!(slugify_app_id("Home Heating"), "home-heating");
+        assert_eq!(slugify_app_id("  My   App!! "), "my-app");
+        assert_eq!(slugify_app_id("already-good"), "already-good");
+        assert_eq!(slugify_app_id("!!!"), "app");
+        assert_eq!(slugify_app_id("v2 Beta"), "v2-beta");
     }
 
     #[test]
