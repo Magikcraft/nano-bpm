@@ -107,6 +107,52 @@ export interface DomainTypeResolution {
  * include form-inferred candidates; omit it for the declared registry alone.
  */
 export declare function resolveDomainTypes(manifest: unknown, index?: SymbolIndex): DomainTypeResolution;
+export interface FeelFieldDef {
+	type?: string;
+	list?: boolean;
+}
+/** Whether `id` names a declared domain type (not a primitive / unknown). */
+export declare function isDeclaredType(manifest: unknown, id: string | undefined): boolean;
+/** Declared fields of a domain type id (empty when the id is unknown/absent). */
+export declare function fieldsOf(manifest: unknown, typeId: string | undefined): Record<string, FeelFieldDef>;
+/** Outcome of resolving a dotted `body`-rooted path against the scope type. */
+export type PathResolution = 
+/** The full path resolves to a declared field. */
+{
+	kind: "ok";
+	type?: string;
+	list?: boolean;
+}
+/** Just `body` — the root, no segments to resolve. */
+ | {
+	kind: "root";
+}
+/** A segment is not a field of the (known) type at that point. */
+ | {
+	kind: "unknown";
+	segment: string;
+}
+/** The walk passed through a primitive `json`/unknown type — can't verify. */
+ | {
+	kind: "indeterminate";
+};
+/**
+ * Resolve `segs` (the path after `body`) against `bodyType`, walking nested
+ * declared types. Descending into a list of a declared type follows FEEL's list
+ * projection (`body.items.name`). The walk is deliberately conservative: it only
+ * reports `unknown` when a segment is definitively absent from a *declared* type
+ * at that point, and reports `indeterminate` (never a false error) once it hits a
+ * `json` field or an undeclared type whose shape it cannot know.
+ */
+export declare function resolveBodyPath(manifest: unknown, bodyType: string | undefined, segs: string[]): PathResolution;
+/**
+ * Extract the `body`-rooted dotted paths in a FEEL expression, as segment arrays
+ * *excluding* the leading `body`. Conservative on purpose: it matches only a
+ * standalone `body` identifier followed by one or more `.field` accessors, and
+ * skips anything followed by `[` (indexing) or `(` (a call) — so complex FEEL
+ * never yields a spurious path to flag.
+ */
+export declare function bodyPaths(feel: string): string[][];
 /** The kinds of reference a manifest string value can be. */
 export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "datasource" | "agent";
 export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "datasource" | "agent" | "variable";

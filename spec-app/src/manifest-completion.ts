@@ -14,6 +14,7 @@
 
 import { DOMAIN_PRIMITIVES } from "./symbol-index.ts";
 import type { SymbolIndex } from "./symbol-index.ts";
+import { fieldsOf } from "./feel.ts";
 
 /** The kinds of reference a manifest string value can be. */
 export type ReferenceSite =
@@ -309,18 +310,6 @@ function triggerOf(
   const triggers = (manifest as { triggers?: unknown }).triggers;
   const t = Array.isArray(triggers) ? triggers[navPath[i + 1] as number] : undefined;
   return t && typeof t === "object" ? (t as Record<string, unknown>) : undefined;
-}
-
-interface FieldDef {
-  type?: string;
-  list?: boolean;
-}
-
-/** Declared fields of a domain type id (empty when the id is unknown/absent). */
-function fieldsOf(manifest: unknown, typeId: string | undefined): Record<string, FieldDef> {
-  if (!typeId) return {};
-  const t = record(record(manifest, "types"), typeId);
-  return (t && (record(t, "fields") as Record<string, FieldDef>)) ?? {};
 }
 
 /**

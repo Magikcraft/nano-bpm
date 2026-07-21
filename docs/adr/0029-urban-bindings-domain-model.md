@@ -127,9 +127,14 @@ reference `trigger.bodyType`, whose value is a `types` registry id (validated to
 other reference). With it declared, the action's FEEL fields complete `body.<field>` from that domain
 type, walking nested declared types (`body.sensor.id`); list fields are leaves (FEEL indexes them).
 Absent a `bodyType`, only the `body` root is offered. This is the same "typed reference replaces a
-free-string id" move as §2, applied to the FEEL scope. Form-default and DMN-input scopes reuse the
-same resolver and are the next increment; wrong-path *diagnostics* (vs. autocomplete) follow once the
-FEEL path walker is shared with the validator.
+free-string id" move as §2, applied to the FEEL scope.
+
+**Wrong-path diagnostics (implemented).** The validator shares the completer's path walker (`feel.ts`),
+so a `body.<path>` that doesn't exist in the trigger's `bodyType` is flagged (`unknown-path`) instead
+of failing as a runtime `null`. It is conservative — it only flags a segment that is definitively
+absent from a *declared* type, and stays silent through `json`/undeclared shapes and complex FEEL
+(indexing, calls) it cannot verify, so it never raises a false error. Form-default and DMN-input
+scopes reuse the same resolver and are the next increment.
 
 ### 6. Codegen — the domain types flow into TypeScript
 
