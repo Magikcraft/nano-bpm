@@ -133,8 +133,18 @@ free-string id" move as §2, applied to the FEEL scope.
 so a `body.<path>` that doesn't exist in the trigger's `bodyType` is flagged (`unknown-path`) instead
 of failing as a runtime `null`. It is conservative — it only flags a segment that is definitively
 absent from a *declared* type, and stays silent through `json`/undeclared shapes and complex FEEL
-(indexing, calls) it cannot verify, so it never raises a false error. Form-default and DMN-input
-scopes reuse the same resolver and are the next increment.
+(indexing, calls) it cannot verify, so it never raises a false error.
+
+**Binding a type to a form / decision (implemented).** A trigger declares its scope inline
+(`bodyType`), but a form and a decision are separate model artifacts referenced by glob, so their
+scope is declared in a top-level `bindings[]` list: each entry binds one model — `{ form: <id> }` or
+`{ decision: <id> }` — to a `type` (a declared domain type id). The bound model's id resolves against
+the project symbol index (`unknown-form` / `unknown-decision`) and the type against the registry
+(`unknown-type`); the manifest editor autocompletes all three. This is the same typed-reference move,
+and it is the type-in-scope prerequisite for the in-editor step below. The FEEL *inside* the form's
+default-value fields and the decision's input expressions — edited in the form-js / dmn-js editors,
+which carry their own FEEL engines — is fed the bound type's fields as variable suggestions in a
+follow-up increment; that in-editor scope reuses the same resolved domain-type view (`domain-types.ts`).
 
 ### 6. Codegen — the domain types flow into TypeScript
 
