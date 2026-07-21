@@ -1,11 +1,14 @@
 use std::collections::HashMap;
 
-use crate::dmn::{evaluate, parse_dmn};
 use crate::dmn::model::{DecisionLogic, DecisionType, HitPolicy};
+use crate::dmn::{evaluate, parse_dmn};
 use crate::model::Value;
 
 fn ctx(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
-    pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect()
 }
 
 /// A decision requirements graph with a dependent decision, ported from Zeebe's
@@ -57,7 +60,10 @@ fn parses_drg_structure() {
     assert_eq!(drg.id, "force_users");
     assert_eq!(drg.decisions.len(), 2);
     let force_user = drg.decision("force_user").unwrap();
-    assert_eq!(force_user.required_decisions, vec!["jedi_or_sith".to_string()]);
+    assert_eq!(
+        force_user.required_decisions,
+        vec!["jedi_or_sith".to_string()]
+    );
     match &force_user.logic {
         DecisionLogic::DecisionTable(t) => {
             assert_eq!(t.hit_policy, HitPolicy::First);
@@ -71,7 +77,11 @@ fn parses_drg_structure() {
 #[test]
 fn evaluates_single_decision() {
     let drg = parse_dmn(FORCE_USER).unwrap();
-    let result = evaluate(&drg, "jedi_or_sith", &ctx(&[("lightsaberColor", Value::Str("red".into()))]));
+    let result = evaluate(
+        &drg,
+        "jedi_or_sith",
+        &ctx(&[("lightsaberColor", Value::Str("red".into()))]),
+    );
     assert!(!result.is_failure(), "{:?}", result.failure);
     assert_eq!(result.decision_output, Value::Str("Sith".into()));
 }
@@ -99,7 +109,10 @@ fn evaluates_required_decision_chain() {
     assert_eq!(root.decision_type, DecisionType::DecisionTable);
     assert_eq!(root.matched_rules.len(), 1);
     assert_eq!(root.matched_rules[0].rule_id, "fr1");
-    assert_eq!(root.evaluated_inputs[0].input_value, Value::Str("Jedi".into()));
+    assert_eq!(
+        root.evaluated_inputs[0].input_value,
+        Value::Str("Jedi".into())
+    );
 }
 
 #[test]
@@ -188,7 +201,11 @@ fn collect_sum_aggregates() {
 
 #[test]
 fn priority_hit_policy_uses_output_order() {
-    let rules = format!("{}{}", rule("&gt; 5", "\"low\""), rule("&gt; 1", "\"high\""));
+    let rules = format!(
+        "{}{}",
+        rule("&gt; 5", "\"low\""),
+        rule("&gt; 1", "\"high\"")
+    );
     // Priority: "high" listed before "low" wins over both matches.
     let ov = "<outputValues id=\"ov\"><text>\"high\",\"low\"</text></outputValues>";
     let drg = parse_dmn(&single_input_table("PRIORITY", &rules, ov)).unwrap();
@@ -251,7 +268,11 @@ fn literal_expression_decision() {
   </decision>
 </definitions>"#;
     let drg = parse_dmn(xml).unwrap();
-    let result = evaluate(&drg, "dec", &ctx(&[("a", Value::Int(2)), ("b", Value::Int(3))]));
+    let result = evaluate(
+        &drg,
+        "dec",
+        &ctx(&[("a", Value::Int(2)), ("b", Value::Int(3))]),
+    );
     assert_eq!(result.decision_output, Value::Int(5));
 }
 

@@ -7,12 +7,11 @@
 //! types are recorded as [`DecisionLogic::Unsupported`] so the graph still parses
 //! and unrelated decisions remain evaluable.
 
-use crate::xml::{parse_tree, Element};
-
 use super::model::{
     Aggregation, Decision, DecisionLogic, DecisionRequirementsGraph, DecisionRule, DecisionTable,
     HitPolicy, InputClause, OutputClause,
 };
+use crate::xml::{parse_tree, Element};
 
 /// An error encountered while parsing DMN XML.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,6 +59,7 @@ pub fn parse_dmn(xml: &str) -> Result<DecisionRequirementsGraph, DmnParseError> 
         name: root.attr("name").unwrap_or("").to_string(),
         namespace: root.attr("namespace").unwrap_or("").to_string(),
         decisions,
+        xml: xml.to_string(),
     })
 }
 

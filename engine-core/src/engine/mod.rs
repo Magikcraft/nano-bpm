@@ -703,7 +703,12 @@ impl Engine {
     ) -> Option<DecisionEvaluation> {
         let deployed = match (by_id, by_key) {
             (Some(id), _) => self.state.decisions.get(id)?.clone(),
-            (None, Some(key)) => self.state.decisions.values().find(|d| d.key == key)?.clone(),
+            (None, Some(key)) => self
+                .state
+                .decisions
+                .values()
+                .find(|d| d.key == key)?
+                .clone(),
             (None, None) => return None,
         };
         let result = crate::dmn::evaluate(&deployed.drg, &deployed.decision_id, variables);

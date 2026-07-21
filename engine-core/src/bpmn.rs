@@ -1637,7 +1637,6 @@ fn parse_correlation_key(raw: &str) -> Option<String> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

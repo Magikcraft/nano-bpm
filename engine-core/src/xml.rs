@@ -239,7 +239,9 @@ impl Element {
 
     /// All direct children with the given local name, in document order.
     pub fn children_named<'a>(&'a self, local: &'a str) -> impl Iterator<Item = &'a Element> + 'a {
-        self.children.iter().filter(move |c| c.local_name() == local)
+        self.children
+            .iter()
+            .filter(move |c| c.local_name() == local)
     }
 
     /// The direct text content of the first child with the given local name.
@@ -279,7 +281,9 @@ pub fn parse_tree(xml: &str) -> Result<Element, XmlError> {
                 }
             }
             Token::End { .. } => {
-                let finished = stack.pop().ok_or_else(|| XmlError("unbalanced end tag".into()))?;
+                let finished = stack
+                    .pop()
+                    .ok_or_else(|| XmlError("unbalanced end tag".into()))?;
                 if stack.is_empty() {
                     return Err(XmlError("unbalanced end tag".into()));
                 }
@@ -290,7 +294,9 @@ pub fn parse_tree(xml: &str) -> Result<Element, XmlError> {
             }
         }
     }
-    let mut root = stack.pop().ok_or_else(|| XmlError("empty document".into()))?;
+    let mut root = stack
+        .pop()
+        .ok_or_else(|| XmlError("empty document".into()))?;
     if !stack.is_empty() {
         return Err(XmlError("unbalanced start tag".into()));
     }

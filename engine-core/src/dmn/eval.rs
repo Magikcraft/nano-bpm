@@ -13,15 +13,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::feel;
-use crate::model::Value;
-
 use super::model::{
     Aggregation, Decision, DecisionEvaluationResult, DecisionLogic, DecisionRequirementsGraph,
     DecisionTable, DecisionType, EvaluatedDecision, EvaluatedInput, EvaluatedOutput,
     EvaluationFailure, HitPolicy, MatchedRule, OutputClause,
 };
 use super::parser::split_top_level_commas;
+use crate::feel;
+use crate::model::Value;
 
 /// The reserved context variable the input value is bound to while evaluating a
 /// unary test (and the target of the DMN input marker `?`).
@@ -84,7 +83,10 @@ fn eval_decision(
 
     if done.contains(decision_id) {
         // Already evaluated via another requirement path; its result is in ctx.
-        return Ok(ctx.get(decision.result_name()).cloned().unwrap_or(Value::Null));
+        return Ok(ctx
+            .get(decision.result_name())
+            .cloned()
+            .unwrap_or(Value::Null));
     }
     if !on_stack.insert(decision_id.to_string()) {
         return Err(EvaluationFailure {
@@ -276,10 +278,7 @@ fn row_value(outputs: &[OutputClause], per_output: &[Value]) -> Value {
     } else {
         let mut map = std::collections::BTreeMap::new();
         for (output, value) in outputs.iter().zip(per_output.iter()) {
-            let key = output
-                .name
-                .clone()
-                .unwrap_or_else(|| output.id.clone());
+            let key = output.name.clone().unwrap_or_else(|| output.id.clone());
             map.insert(key, value.clone());
         }
         Value::Map(map)
@@ -302,11 +301,17 @@ fn apply_hit_policy(
                     matched.len()
                 )));
             }
-            let output = matched.first().map(|m| m.row_output.clone()).unwrap_or(Value::Null);
+            let output = matched
+                .first()
+                .map(|m| m.row_output.clone())
+                .unwrap_or(Value::Null);
             Ok((output, all))
         }
         HitPolicy::First => {
-            let output = matched.first().map(|m| m.row_output.clone()).unwrap_or(Value::Null);
+            let output = matched
+                .first()
+                .map(|m| m.row_output.clone())
+                .unwrap_or(Value::Null);
             let selected = if matched.is_empty() { vec![] } else { vec![0] };
             Ok((output, selected))
         }
@@ -329,7 +334,8 @@ fn apply_hit_policy(
         HitPolicy::Priority => {
             let priorities = output_priorities(&table.outputs);
             let best = matched.iter().enumerate().min_by(|(_, a), (_, b)| {
-                priority_key(&a.per_output, &priorities).cmp(&priority_key(&b.per_output, &priorities))
+                priority_key(&a.per_output, &priorities)
+                    .cmp(&priority_key(&b.per_output, &priorities))
             });
             match best {
                 Some((i, m)) => Ok((m.row_output.clone(), vec![i])),
@@ -354,7 +360,12 @@ fn apply_hit_policy(
                 priority_key(&matched[a].per_output, &priorities)
                     .cmp(&priority_key(&matched[b].per_output, &priorities))
             });
-            let list = Value::List(order.iter().map(|&i| matched[i].row_output.clone()).collect());
+            let list = Value::List(
+                order
+                    .iter()
+                    .map(|&i| matched[i].row_output.clone())
+                    .collect(),
+            );
             Ok((list, order))
         }
     }

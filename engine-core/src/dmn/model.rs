@@ -19,6 +19,12 @@ pub struct DecisionRequirementsGraph {
     pub namespace: String,
     /// Every decision declared in the resource, in document order.
     pub decisions: Vec<Decision>,
+    /// The raw DMN XML the graph was parsed from, retained so the read model can
+    /// serve it back via `getDecisionDefinitionXml`/`getDecisionRequirementsXml`.
+    /// Defaulted to empty so journals/events written before this field existed
+    /// (and hand-built test graphs) still deserialize.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub xml: String,
 }
 
 impl DecisionRequirementsGraph {

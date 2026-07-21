@@ -303,9 +303,9 @@ pub fn match_decision_definition_key(
     match filter {
         None => true,
         Some(models::DecisionDefinitionKeyFilterProperty::DecisionDefinitionKey(k)) => k.0 == value,
-        Some(
-            models::DecisionDefinitionKeyFilterProperty::AdvancedDecisionDefinitionKeyFilter(a),
-        ) => ops!(a, |k: &models::DecisionDefinitionKey| k.0.clone()).matches(Some(value)),
+        Some(models::DecisionDefinitionKeyFilterProperty::AdvancedDecisionDefinitionKeyFilter(
+            a,
+        )) => ops!(a, |k: &models::DecisionDefinitionKey| k.0.clone()).matches(Some(value)),
     }
 }
 
@@ -337,9 +337,14 @@ pub fn match_decision_instance_state(
         Some(models::DecisionInstanceStateFilterProperty::DecisionInstanceStateEnum(e)) => {
             e.to_string() == value
         }
-        Some(
-            models::DecisionInstanceStateFilterProperty::AdvancedDecisionInstanceStateFilter(a),
-        ) => ops!(a, |e: &models::DecisionInstanceStateEnum| e.to_string(), like).matches(Some(value)),
+        Some(models::DecisionInstanceStateFilterProperty::AdvancedDecisionInstanceStateFilter(
+            a,
+        )) => ops!(
+            a,
+            |e: &models::DecisionInstanceStateEnum| e.to_string(),
+            like
+        )
+        .matches(Some(value)),
     }
 }
 

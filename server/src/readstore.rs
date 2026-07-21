@@ -31,7 +31,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 /// Bumped whenever the schema or projection changes; a stored database with a
 /// different version is dropped and rebuilt from the journal.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 const SCHEMA: &str = "
 CREATE TABLE process_definitions (
@@ -107,18 +107,22 @@ CREATE TABLE variables (
     UNIQUE(scope_key, name)
 );
 CREATE TABLE decision_requirements (
-    drg_id     TEXT PRIMARY KEY,
-    drg_key    INTEGER NOT NULL,
-    name       TEXT NOT NULL,
-    version    INTEGER NOT NULL
+    drg_id        TEXT PRIMARY KEY,
+    drg_key       INTEGER NOT NULL,
+    name          TEXT NOT NULL,
+    version       INTEGER NOT NULL,
+    resource_name TEXT NOT NULL DEFAULT '',
+    xml           TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE decision_definitions (
-    decision_id               TEXT PRIMARY KEY,
-    decision_key              INTEGER NOT NULL,
-    name                      TEXT NOT NULL,
-    version                   INTEGER NOT NULL,
-    decision_requirements_key INTEGER NOT NULL,
-    decision_requirements_id  TEXT NOT NULL
+    decision_id                   TEXT PRIMARY KEY,
+    decision_key                  INTEGER NOT NULL,
+    name                          TEXT NOT NULL,
+    version                       INTEGER NOT NULL,
+    decision_requirements_key     INTEGER NOT NULL,
+    decision_requirements_id      TEXT NOT NULL,
+    decision_requirements_name    TEXT NOT NULL DEFAULT '',
+    decision_requirements_version INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE decision_instances (
     eval_instance_key         TEXT PRIMARY KEY,
@@ -343,6 +347,34 @@ pub struct DecisionInstanceRow {
     /// Serialized `Vec<MatchedRule>` (engine-core DMN audit).
     pub rules_json: String,
     pub tenant_id: String,
+}
+
+/// A projected decision-requirements-graph (one per DRG id, latest version).
+#[derive(Debug, Clone)]
+pub struct DecisionRequirementsRow {
+    pub drg_id: String,
+    pub drg_key: Key,
+    pub name: String,
+    pub version: i32,
+    /// Synthesized `{drg_id}.dmn` (the engine does not retain the original name).
+    pub resource_name: String,
+    /// The verbatim DMN XML the graph was parsed from (empty for graphs built
+    /// programmatically rather than parsed).
+    pub xml: String,
+}
+
+/// A projected decision definition (one per decision id, latest version) with its
+/// owning DRG's id/name/version denormalized in for querying.
+#[derive(Debug, Clone)]
+pub struct DecisionDefinitionRow {
+    pub decision_id: String,
+    pub decision_key: Key,
+    pub name: String,
+    pub version: i32,
+    pub decision_requirements_key: Key,
+    pub decision_requirements_id: String,
+    pub decision_requirements_name: String,
+    pub decision_requirements_version: i32,
 }
 
 /// WAL autocheckpoint threshold in pages for the read-model store. Default 12288
@@ -1180,8 +1212,9 @@ impl ReadStore {
     /// A single decision-instance by its `<decisionEvaluationKey>-<index>` id.
     pub fn decision_instance(&self, eval_instance_key: &str) -> Option<DecisionInstanceRow> {
         let conn = self.conn.lock().expect("read store poisoned");
-        let sql =
-            format!("SELECT {DECISION_INSTANCE_COLS} FROM decision_instances WHERE eval_instance_key = ?1");
+        let sql = format!(
+            "SELECT {DECISION_INSTANCE_COLS} FROM decision_instances WHERE eval_instance_key = ?1"
+        );
         conn.query_row(&sql, params![eval_instance_key], map_decision_instance)
             .optional()
             .expect("query decision_instance")
@@ -1204,7 +1237,87 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
-    /// The verbatim BPMN XML for the process definition with `key`, or `None`
+    pub fn decision_requirements(&self) -> Vec<DecisionRequirementsRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DECISION_REQUIREMENTS_COLS} FROM decision_requirements"
+            ))
+            .expect("prepare decision_requirements");
+        let rows = stmt
+            .query_map([], map_decision_requirements)
+            .expect("query decision_requirements");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// A single decision-requirements graph by its numeric key.
+    pub fn decision_requirements_by_key(&self, key: Key) -> Option<DecisionRequirementsRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!(
+                "SELECT {DECISION_REQUIREMENTS_COLS} FROM decision_requirements WHERE drg_key = ?1"
+            ),
+            params![key as i64],
+            map_decision_requirements,
+        )
+        .optional()
+        .expect("query decision_requirements_by_key")
+    }
+
+    /// The verbatim DMN XML for the DRG with `key`, or `None` when no such graph
+    /// is projected. Empty-string XML (a graph built programmatically rather than
+    /// parsed) is returned as `Some("")`.
+    pub fn decision_requirements_xml(&self, key: Key) -> Option<String> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT xml FROM decision_requirements WHERE drg_key = ?1",
+            params![key as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query decision_requirements_xml")
+    }
+
+    pub fn decision_definitions(&self) -> Vec<DecisionDefinitionRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {DECISION_DEFINITION_COLS} FROM decision_definitions"
+            ))
+            .expect("prepare decision_definitions");
+        let rows = stmt
+            .query_map([], map_decision_definition)
+            .expect("query decision_definitions");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// A single decision definition by its numeric key.
+    pub fn decision_definition_by_key(&self, key: Key) -> Option<DecisionDefinitionRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!("SELECT {DECISION_DEFINITION_COLS} FROM decision_definitions WHERE decision_key = ?1"),
+            params![key as i64],
+            map_decision_definition,
+        )
+        .optional()
+        .expect("query decision_definition_by_key")
+    }
+
+    /// The DMN XML of the DRG owning the decision definition with `key`, or `None`
+    /// when no such decision is projected.
+    pub fn decision_definition_xml(&self, key: Key) -> Option<String> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT r.xml FROM decision_definitions d \
+             JOIN decision_requirements r ON r.drg_key = d.decision_requirements_key \
+             WHERE d.decision_key = ?1",
+            params![key as i64],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query decision_definition_xml")
+    }
+
     /// when no such definition is projected (only the latest version per process
     /// id is retained, mirroring the engine). Empty-string XML (a definition
     /// built programmatically rather than parsed) is returned as `Some("")`.
@@ -1386,7 +1499,61 @@ impl ReadModel {
         None
     }
 
-    // --- scans: concatenate across shards (partition-disjoint) ---
+    pub fn decision_requirements(&self) -> Vec<DecisionRequirementsRow> {
+        for s in &self.shards {
+            let defs = s.decision_requirements();
+            if !defs.is_empty() {
+                return defs;
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn decision_requirements_by_key(&self, key: Key) -> Option<DecisionRequirementsRow> {
+        for s in &self.shards {
+            if let Some(row) = s.decision_requirements_by_key(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn decision_requirements_xml(&self, key: Key) -> Option<String> {
+        for s in &self.shards {
+            if let Some(xml) = s.decision_requirements_xml(key) {
+                return Some(xml);
+            }
+        }
+        None
+    }
+
+    pub fn decision_definitions(&self) -> Vec<DecisionDefinitionRow> {
+        for s in &self.shards {
+            let defs = s.decision_definitions();
+            if !defs.is_empty() {
+                return defs;
+            }
+        }
+        Vec::new()
+    }
+
+    pub fn decision_definition_by_key(&self, key: Key) -> Option<DecisionDefinitionRow> {
+        for s in &self.shards {
+            if let Some(row) = s.decision_definition_by_key(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn decision_definition_xml(&self, key: Key) -> Option<String> {
+        for s in &self.shards {
+            if let Some(xml) = s.decision_definition_xml(key) {
+                return Some(xml);
+            }
+        }
+        None
+    }
 
     pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
         self.shards
@@ -1616,6 +1783,35 @@ fn map_decision_instance(r: &rusqlite::Row) -> rusqlite::Result<DecisionInstance
     })
 }
 
+const DECISION_REQUIREMENTS_COLS: &str = "drg_id, drg_key, name, version, resource_name, xml";
+
+fn map_decision_requirements(r: &rusqlite::Row) -> rusqlite::Result<DecisionRequirementsRow> {
+    Ok(DecisionRequirementsRow {
+        drg_id: r.get(0)?,
+        drg_key: r.get::<_, i64>(1)? as Key,
+        name: r.get(2)?,
+        version: r.get(3)?,
+        resource_name: r.get(4)?,
+        xml: r.get(5)?,
+    })
+}
+
+const DECISION_DEFINITION_COLS: &str = "decision_id, decision_key, name, version, \
+     decision_requirements_key, decision_requirements_id, decision_requirements_name, \
+     decision_requirements_version";
+
+fn map_decision_definition(r: &rusqlite::Row) -> rusqlite::Result<DecisionDefinitionRow> {
+    Ok(DecisionDefinitionRow {
+        decision_id: r.get(0)?,
+        decision_key: r.get::<_, i64>(1)? as Key,
+        name: r.get(2)?,
+        version: r.get(3)?,
+        decision_requirements_key: r.get::<_, i64>(4)? as Key,
+        decision_requirements_id: r.get(5)?,
+        decision_requirements_name: r.get(6)?,
+        decision_requirements_version: r.get(7)?,
+    })
+}
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
 /// the wire: strings are JSON-quoted (so a string `myValue` becomes `"myValue"`),
 /// numbers and booleans render bare, and lists/objects render as JSON.
@@ -2169,13 +2365,24 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
             ..
         } => {
             // Latest version per DRG id (a redeploy replaces), mirroring the
-            // engine's `state.decision_requirements`.
+            // engine's `state.decision_requirements`. The resource name is not
+            // retained by the engine, so it is synthesized from the DRG id (as the
+            // process read model does for BPMN); the raw XML is carried on the DRG.
+            let resource_name = format!("{}.dmn", drg.id);
             tx.cexecute(
-                "INSERT INTO decision_requirements (drg_id, drg_key, name, version) \
-                 VALUES (?1, ?2, ?3, ?4) \
+                "INSERT INTO decision_requirements (drg_id, drg_key, name, version, resource_name, xml) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(drg_id) DO UPDATE SET drg_key = excluded.drg_key, \
-                 name = excluded.name, version = excluded.version",
-                params![drg.id, *decision_requirements_key as i64, drg.name, version],
+                 name = excluded.name, version = excluded.version, \
+                 resource_name = excluded.resource_name, xml = excluded.xml",
+                params![
+                    drg.id,
+                    *decision_requirements_key as i64,
+                    drg.name,
+                    version,
+                    resource_name,
+                    drg.xml,
+                ],
             )?;
         }
 
@@ -2187,13 +2394,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
             version,
             ..
         } => {
-            // Resolve the owning DRG id (its DecisionRequirementsDeployed was
-            // projected first, in emission order).
-            let drg_id: String = tx
+            // Resolve the owning DRG's id/name/version (its
+            // DecisionRequirementsDeployed was projected first, in emission order).
+            let (drg_id, drg_name, drg_version): (String, String, i32) = tx
                 .cquery_row(
-                    "SELECT drg_id FROM decision_requirements WHERE drg_key = ?1",
+                    "SELECT drg_id, name, version FROM decision_requirements WHERE drg_key = ?1",
                     params![*decision_requirements_key as i64],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()
                 .ok()
@@ -2201,12 +2408,15 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
                 .unwrap_or_default();
             tx.cexecute(
                 "INSERT INTO decision_definitions \
-                 (decision_id, decision_key, name, version, decision_requirements_key, decision_requirements_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 (decision_id, decision_key, name, version, decision_requirements_key, \
+                  decision_requirements_id, decision_requirements_name, decision_requirements_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(decision_id) DO UPDATE SET decision_key = excluded.decision_key, \
                  name = excluded.name, version = excluded.version, \
                  decision_requirements_key = excluded.decision_requirements_key, \
-                 decision_requirements_id = excluded.decision_requirements_id",
+                 decision_requirements_id = excluded.decision_requirements_id, \
+                 decision_requirements_name = excluded.decision_requirements_name, \
+                 decision_requirements_version = excluded.decision_requirements_version",
                 params![
                     decision_id,
                     *decision_key as i64,
@@ -2214,6 +2424,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
                     version,
                     *decision_requirements_key as i64,
                     drg_id,
+                    drg_name,
+                    drg_version,
                 ],
             )?;
         }
