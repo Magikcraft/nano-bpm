@@ -5,6 +5,7 @@ import MarkdownPreview from "../components/MarkdownPreview";
 import BpmnModeler, { type BpmnModelerHandle } from "../components/BpmnModeler";
 import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
+import AppManifestEditor, { isAppManifestPath } from "../components/AppManifestEditor";
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 import {
   compileProject,
@@ -334,12 +335,21 @@ export default function ProjectWorkspace() {
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="min-h-0 flex-1 overflow-hidden border-b border-edge">
             {selected ? (
-              <EditorPane
-                key={selected}
-                name={name}
-                path={selected}
-                deployTarget={detail.config.deployTarget}
-              />
+              isAppManifestPath(selected) ? (
+                <AppManifestEditor
+                  key={selected}
+                  name={name}
+                  path={selected}
+                  files={detail.files}
+                />
+              ) : (
+                <EditorPane
+                  key={selected}
+                  name={name}
+                  path={selected}
+                  deployTarget={detail.config.deployTarget}
+                />
+              )
             ) : (
               <div className="flex h-full items-center justify-center text-sm text-fg-faint">
                 Select a file to edit

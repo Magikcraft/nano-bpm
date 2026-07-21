@@ -4,20 +4,34 @@
   "private": true,
   "description": "The Urban App manifest (nano.app.json): the JSON Schema (ADR 0027) + generated TypeScript types, the project symbol index (ADR 0029) and the fail-closed validator (ADR 0027 §4). See README.md.",
   "type": "module",
-  "types": "./src/index.ts",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./schema": "./nano-app.schema.json"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./schema": "./nano-app.schema.json",
+    "./source": "./src/index.ts"
   },
+  "files": [
+    "dist",
+    "nano-app.schema.json",
+    "gen",
+    "src"
+  ],
   "scripts": {
     "gen": "node scripts/gen-types.mjs",
     "validate": "node scripts/validate.mjs",
     "typecheck": "tsc --noEmit",
+    "build": "node scripts/build.mjs",
     "test:unit": "node --test test/*.test.mjs",
     "test": "npm run validate && npm run gen -- --check && npm run typecheck && npm run test:unit"
   },
   "devDependencies": {
     "ajv": "^8.17.1",
+    "dts-bundle-generator": "^9.5.1",
+    "esbuild": "^0.24.2",
     "json-schema-to-typescript": "^15.0.3",
     "typescript": "^5.9.3"
   },
