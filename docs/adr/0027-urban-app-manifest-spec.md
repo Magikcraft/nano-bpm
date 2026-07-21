@@ -78,14 +78,15 @@ manifest; handlers/workers are referenced *files*, not inline code). It carries 
   "data":     { "default": "app", "sources": { ... } },   // ADR 0024
   "triggers": [ ... ], "connections": { ... },            // ADR 0025
   "surfaces": { "taskInbox": {...}, "chat": {...} },       // ADR 0026
+  "security": { "mode": "none", "providers": [...], "roles": [...], "rules": {...} }, // ADR 0028
   "workers":  [ ... ],                                     // ADR 0022 §E (files or llm)
   "llm":      { ... }                                      // ADR 0022 §E
 }
 ```
 
 Every value may use `${VAR:-default}` substitution (§5). Every block's detailed schema is owned by
-its ADR (0024/0025/0026/0022 §E); this ADR owns the *envelope*, the *cross-reference rules*, and the
-*codegen*.
+its ADR (0024/0025/0026/**0028**/0022 §E); this ADR owns the *envelope*, the *cross-reference rules*,
+and the *codegen*.
 
 ### 3. Spec-first: one schema, generated TypeScript types (the anti-drift decision)
 
