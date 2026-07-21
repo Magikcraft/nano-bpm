@@ -10,14 +10,15 @@
 # (= num-cpus) *other* tests alongside them. On a small CI runner that ambient
 # parallel load oversubscribes the cores and starves a cluster test's 4-worker
 # runtime, so its wall-clock budgets elapse before replication is scheduled — the
-# create never appears to "ship" and the test fails (even across retries, if the
-# runner stays saturated).
+# create never appears to "ship" and the test fails if the runner stays saturated.
 #
 # `threads-required = 'num-test-threads'` fixes the root cause: each heavy test
 # reserves the ENTIRE test-thread pool, so it runs with NO other test executing
 # concurrently — the same uncontended condition under which these tests are
-# deterministic locally. The retries remain as a last-resort safety net; the rest
-# of the suite stays strict (no retries) and fully parallel.
+# deterministic locally. No retries: tests must pass on the first run (see
+# AGENTS.md, "No Test Retries"); a retry only masks a real defect. The whole
+# suite stays strict (zero retries) and, apart from these serial-heavy tests,
+# fully parallel.
 [test-groups]
 serial-heavy = { max-threads = 1 }
 
@@ -25,4 +26,3 @@ serial-heavy = { max-threads = 1 }
 filter = 'test(clustered_startup_tests) or test(seglog::tests)'
 test-group = 'serial-heavy'
 threads-required = 'num-test-threads'
-retries = 2
