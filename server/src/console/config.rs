@@ -538,18 +538,29 @@ mod tests {
 
     #[test]
     fn ide_config_lists_lang_packs_with_toolchains() {
+        // Only Deno ships in-box now; Rust/Java are externalised to installed
+        // packs, so the built-in listing just needs to surface the Deno runtime.
         let v = ide_config_json();
         let packs = v["langPacks"].as_array().unwrap();
-        assert!(packs.iter().any(|p| p["id"] == "deno"));
-        let rust = packs.iter().find(|p| p["id"] == "rust").expect("rust pack");
-        assert_eq!(rust["detect"][0], "cargo");
+        let deno = packs.iter().find(|p| p["id"] == "deno").expect("deno pack");
+        assert_eq!(deno["builtin"], true);
     }
 
     #[test]
     fn missing_pack_toolchain_carries_install_url() {
-        // The Rust pack declares an install URL used when cargo is absent.
-        let rust = extensions::lang_pack("rust").unwrap();
-        let dep = check_pack_toolchain(&rust).unwrap();
-        assert!(dep.install_url.starts_with("https://"));
+        // A pack's toolchain maps to a Dependency that carries the pack-declared
+        // install URL and a hint when the probe binary is absent. Pure unit test
+        // of the mapping — no pack is installed.
+        let m: extensions::ExtManifest = serde_json::from_str(
+            r#"{"id":"widget","kind":"lang","displayName":"Widget",
+                 "toolchain":{"detect":["widgetc","--version"],
+                   "installUrl":"https://example.com/install",
+                   "installHint":"`widgetc` was not found."}}"#,
+        )
+        .unwrap();
+        let dep = check_pack_toolchain(&m).unwrap();
+        assert_eq!(dep.install_url, "https://example.com/install");
+        assert!(!dep.present, "widgetc is not a real binary on the machine");
+        assert_eq!(dep.hint, "`widgetc` was not found.");
     }
 }

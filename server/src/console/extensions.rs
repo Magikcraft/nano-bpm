@@ -219,7 +219,6 @@ pub struct ExtManifest {
 /// `<img>`-loaded SVG can't inherit `currentColor`). Published packs may ship
 /// their own richer SVG via `nano-ide.ext.json`'s `icon`.
 const ICON_DENO: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#3178C6"/><text x="12" y="16.5" font-family="Helvetica,Arial,sans-serif" font-size="10" font-weight="700" fill="#fff" text-anchor="middle">TS</text></svg>"##;
-const ICON_RUST: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect width="24" height="24" rx="4" fill="#CE422B"/><g fill="none" stroke="#fff" stroke-width="1.5" stroke-linecap="round"><circle cx="12" cy="12" r="3"/><path d="M12 4.5v2M12 17.5v2M4.5 12h2M17.5 12h2M6.7 6.7l1.4 1.4M15.9 15.9l1.4 1.4M17.3 6.7l-1.4 1.4M8.1 15.9l-1.4 1.4"/></g></svg>"##;
 
 /// The built-in first-party packs — always available, offline, unremovable.
 /// Deno is the legacy lang+app runtime (empty toolchain => internal Deno path).
@@ -255,37 +254,6 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 env: Some("NANOBPMN_DENO_BIN".into()),
                 default: Some("deno (on PATH)".into()),
             }],
-            themes: vec![],
-        },
-        ExtManifest {
-            id: "rust".into(),
-            kind: ExtKind::Lang,
-            display_name: "Rust".into(),
-            icon: Some(ICON_RUST.into()),
-            file_types: vec![FileType {
-                ext: ".rs".into(),
-                monaco_lang: "rust".into(),
-            }],
-            templates: vec![TemplateSpec {
-                id: "rust-throughput".into(),
-                label: "Throughput (Rust) — native pipelined falcon A/B".into(),
-            }],
-            toolchain: Toolchain {
-                detect: vec!["cargo".into(), "--version".into()],
-                run: vec!["cargo".into(), "run".into(), "--release".into()],
-                compile: vec!["cargo".into(), "build".into(), "--release".into()],
-                targets: vec![],
-                run_configs: vec![],
-                install_url: Some("https://www.rust-lang.org/tools/install".into()),
-                install_hint: Some(
-                    "`cargo` was not found. Install the Rust toolchain (see the link) so `cargo` is on PATH. Until then, Rust projects cannot run or compile.".into(),
-                ),
-            },
-            requires: vec![],
-            app_dir: None,
-            summary: None,
-            builtin: true,
-            config_fields: vec![],
             themes: vec![],
         },
         ExtManifest {
@@ -774,21 +742,28 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
-    fn builtins_cover_deno_rust_gui() {
+    fn builtins_cover_deno_and_gui() {
+        // Rust (and Java) are pack-provided, not built-in — installing the
+        // nano-ide lang pack is what adds them. Only the Deno runtime ships in-box.
         let ids: BTreeSet<_> = builtin_extensions().into_iter().map(|e| e.id).collect();
-        assert!(ids.contains("deno") && ids.contains("rust") && ids.contains("deno-gui"));
+        assert!(ids.contains("deno") && ids.contains("deno-gui"));
+        assert!(
+            !ids.contains("rust"),
+            "rust is now pack-provided, not built-in"
+        );
     }
 
     #[test]
     fn builtins_are_always_trusted() {
-        assert!(is_trusted("rust"));
         assert!(is_trusted("deno"));
+        assert!(is_trusted("deno-gui"));
     }
 
     #[test]
     fn lang_lookup() {
-        assert_eq!(lang_pack("rust").unwrap().display_name, "Rust");
-        assert!(lang_pack("deno-gui").is_none());
+        // Deno is the only built-in lang pack; rust/java come from installed packs.
+        assert_eq!(lang_pack("deno").unwrap().display_name, "Deno (TypeScript)");
+        assert!(lang_pack("rust").is_none());
     }
 
     #[test]
@@ -800,10 +775,12 @@ mod tests {
 
     #[test]
     fn manifest_round_trips() {
-        let m = &builtin_extensions()[1];
+        let m = &builtin_extensions()[0];
+        assert_eq!(m.id, "deno");
         let s = serde_json::to_string(m).unwrap();
         let back: ExtManifest = serde_json::from_str(&s).unwrap();
-        assert_eq!(back.toolchain.run, vec!["cargo", "run", "--release"]);
+        assert_eq!(back.id, "deno");
+        assert_eq!(back.display_name, "Deno (TypeScript)");
     }
 
     #[test]
