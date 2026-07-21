@@ -88,14 +88,20 @@ and the *codegen*.
 ### 3. Spec-first: one schema, generated types (the anti-drift decision)
 
 The canonical source of truth is a **JSON Schema** at `spec-app/nano-app.schema.json`, a sibling of
-`spec-console/`. A generator (`scripts/generate-app-manifest.sh`) emits, from that one schema:
+`spec-console/`. A generator (`scripts/generate-app-manifest.sh`) emits, from that one schema, the
+**TypeScript** `AppManifest` types.
 
-- the **Rust** `AppManifest` types (consumed by the server console *and* the Urban runtime), and
-- the **TypeScript** types (consumed by the console App panels and the App template's loader).
+Both consumers of the manifest are TypeScript: the console **App panels** (authoring) and the Deno
+**App loader** (running). The manifest is *not* read by the Rust server — per §1 it is read by "the
+compiled App at boot + the console App panels", and the server handles project files as opaque bytes.
+So this is a **TS-only** codegen: unlike `console-api.yaml`, whose Rust side is the server itself,
+`nano.app.json` has no Rust consumer, and adding a Rust emitter would only invite drift against a type
+nothing reads. (Should a future Rust consumer appear — e.g. a server-side pre-flight validator — a
+`typify` Rust emitter can be added from the *same* schema without changing the source of truth.)
 
-This is exactly the `console-api.yaml → generate-console.sh → {Rust, TS}` discipline, applied to the
-manifest, so a new manifest field cannot be silently dropped by a hand-written DTO on one side. The
-schema is also publishable as the `$schema` a maker's editor uses for `nano.app.json` autocompletion.
+This applies the `console-api.yaml → generate-console.sh` spec-first discipline to the manifest, so a
+new manifest field cannot be silently dropped by a hand-written DTO. The schema is also publishable as
+the `$schema` a maker's editor uses for `nano.app.json` autocompletion.
 
 ### 4. Validation — fail-closed at three gates
 
@@ -134,7 +140,8 @@ types). Run/Compile flow through the **existing supervisor** unchanged — the A
 ## Phased plan
 
 1. **manifest-schema** — author `spec-app/nano-app.schema.json` (envelope + the 0024/0025/0026/§E
-   blocks) and `generate-app-manifest.sh` emitting Rust + TS types; wire into `make generate`.
+   blocks) and `generate-app-manifest.sh` emitting the TypeScript `AppManifest` types; wire into
+   `make generate` (via `make generate-app-manifest`).
 2. **manifest-validator** — the shared cross-reference validator + the three fail-closed gates (§4);
    the boot gate first (it protects the runtime).
 3. **app-project-type** — the `app: "urban"` scaffold + the Triggers/Data/Surfaces typed panels over

@@ -1,0 +1,90 @@
+{
+  "$schema": "https://nanobpm.dev/spec-app/nano-app.schema.json",
+  "schemaVersion": 1,
+  "id": "home-heating",
+  "name": "Home Heating",
+  "codename": "Urban",
+  "runtime": { "engine": "embedded", "node": "single" },
+
+  "models": {
+    "processes": ["processes/*.bpmn"],
+    "decisions": ["decisions/*.dmn"],
+    "forms": ["forms/*.form"]
+  },
+
+  "data": {
+    "default": "app",
+    "sources": {
+      "app": {
+        "driver": "${NANO_APP_DB_DRIVER:-sqlite}",
+        "url": "${NANO_APP_DB_URL:-file:./app.db}",
+        "migrations": "db/migrations"
+      }
+    }
+  },
+
+  "triggers": [
+    {
+      "id": "morning",
+      "type": "cron",
+      "spec": "0 6 * * *",
+      "action": { "start": "heating-cycle" }
+    },
+    {
+      "id": "sensor",
+      "type": "webhook",
+      "path": "/hooks/temp",
+      "auth": "hmac:sensors",
+      "action": { "message": "temp-reading", "correlationKey": "= body.room" }
+    },
+    {
+      "id": "inbox",
+      "type": "imap",
+      "connection": "mailbox",
+      "action": { "start": "triage-email" }
+    }
+  ],
+
+  "connections": {
+    "mailbox": { "type": "imap" },
+    "sensors": { "type": "hmac" }
+  },
+
+  "surfaces": {
+    "taskInbox": { "enabled": true, "path": "/tasks" },
+    "chat": { "enabled": true, "path": "/chat", "agent": "concierge" }
+  },
+
+  "workers": [
+    { "taskType": "read-thermostat", "handler": "workers/thermostat.ts" },
+    { "taskType": "classify", "llm": "classifier" }
+  ],
+
+  "llm": {
+    "classifier": {
+      "provider": "env",
+      "model": "${NANO_APP_LLM_MODEL}",
+      "output": { "decision": "email-triage" }
+    },
+    "concierge": {
+      "provider": "env",
+      "model": "${NANO_APP_LLM_MODEL}",
+      "tools": ["start-process", "complete-task", "query-data"]
+    }
+  },
+
+  "security": {
+    "mode": "oidc",
+    "providers": [
+      { "id": "google", "type": "oidc", "preset": "google", "clientId": "${GOOGLE_CLIENT_ID}", "clientSecret": "${GOOGLE_CLIENT_SECRET}" },
+      { "id": "github", "type": "oidc", "preset": "github", "clientId": "${GITHUB_CLIENT_ID}", "clientSecret": "${GITHUB_CLIENT_SECRET}" },
+      { "id": "local", "type": "password", "signup": "open" }
+    ],
+    "roles": ["admin", "user"],
+    "rules": {
+      "actions": { "start/*": ["user"], "admin/*": ["admin"] },
+      "surfaces": { "/tasks": ["user"], "/admin": ["admin"] },
+      "data": { "app": { "write": ["user"], "admin": ["admin"] } }
+    }
+  }
+}
