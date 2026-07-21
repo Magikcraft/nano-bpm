@@ -6,6 +6,9 @@ Relates to:
 ADR 0030 (`0030-domain-process-duality.md`, the **charter** this ADR implements — matter/motion/
 director as co-first-class primitives, the authoring-symmetry test, and "the method became a process";
 0029 is the *how* beneath 0030's *why*),
+ADR 0031 (`0031-process-relational-mapper.md`, the **mapper** that turns this ADR's declared types into
+three coherent projections — face/motion/rest — over Drizzle; §4's spine + registry are the material it
+maps),
 ADR 0022 (`0022-nano-rad-application.md`, **Urban** — §A's manifest references models by id; §E's
 workers/llm reference the same symbols),
 ADR 0024 (`0024-urban-data-layer-datasource-abstraction.md`, the datasource whose `schema()` is
@@ -103,7 +106,10 @@ Everything then **references a type by name**: form fields bind to a type's fiel
 optional declared `variables` type; DMN `typeRef`s map to the same registry; worker payloads are
 typed against it. The `enter-tax-form` fixture shows the on-ramp: the index *infers* a candidate
 `taxSubmission` record from the form keys, and the maker either **promotes** it into the registry or
-**binds** it to a `taxSubmission` table — one gesture connects form, variable, and datasource.
+**binds** it to a `taxSubmission` table — one gesture connects form, variable, and datasource. Turning
+a referenced type into its three coherent shapes — the form field (face), the process variable
+(motion), and the table row (rest) — is the **Process-Relational Mapper**'s job (ADR 0031); this ADR
+supplies the type material, 0031 maps it.
 
 ### 5. Variable-path autocomplete (the other half of "no spaghetti")
 
