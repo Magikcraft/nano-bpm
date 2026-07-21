@@ -789,6 +789,22 @@ impl Engine {
                 self.deploy_decisions(&mut log, graphs)?;
             }
 
+            Command::DeleteDecisionInstance {
+                instance_key,
+                decision_evaluation_key,
+            } => {
+                // Audit-only retraction: emit the event so the read-model
+                // projection deletes the matching decision-instance rows. No core
+                // engine state is touched (decision instances are not engine state).
+                self.emit(
+                    &mut log,
+                    Event::DecisionInstanceDeleted {
+                        instance_key,
+                        decision_evaluation_key,
+                    },
+                );
+            }
+
             Command::CreateInstance {
                 process_id,
                 variables,
