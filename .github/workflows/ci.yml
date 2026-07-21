@@ -211,7 +211,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          # test:unit runs `node --test` importing the `.ts` source directly, so
+          # this job needs a Node with TypeScript type-stripping on by default
+          # (>= 23.6 / current LTS). The other jobs stay on 20 (they use built JS).
+          node-version: '24'
       - name: Install (locked)
         # `npm ci` pins the exact dep versions from package-lock.json so the
         # esbuild bundle CI rebuilds is byte-identical to the committed one.
