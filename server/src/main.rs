@@ -16232,6 +16232,15 @@ fn ensure_data_dir(dir: &Path) -> Result<(), String> {
 mod clustered_startup_tests {
     use super::*;
 
+    // Generous poll budget for cluster-test *preconditions* that gate on
+    // background raft replication shipping a leader-durable create to a
+    // learner replica engine. Each loop breaks the instant the state arrives,
+    // so a large cap is free on healthy runs; it only adds patience on slow or
+    // loaded CI runners, where the previous fixed 8s (400 * 20ms) budget was
+    // too tight and starved these waits (creates never observed as shipped
+    // before the test proceeded). 30s = 1500 * 20ms.
+    const LEADER_SHIP_POLL_ITERS: usize = 1500;
+
     #[test]
     fn retry_until_ok_retries_transient_failures_then_returns_without_dropping() {
         // The read-model exporter must never drop a batch on a transient store
@@ -20092,7 +20101,7 @@ mod clustered_startup_tests {
             .engine_handle_for(0)
             .expect("new leader materializes partition 0");
         let mut present = false;
-        for _ in 0..400 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
             if handle
                 .with(move |journal| {
                     journal
@@ -20217,7 +20226,7 @@ mod clustered_startup_tests {
             .engine_handle_for(0)
             .expect("node 1 materializes a replica engine for partition 0");
         let mut replicated = false;
-        for _ in 0..400 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
             if learner_handle
                 .with(move |journal| {
                     journal
@@ -20270,7 +20279,7 @@ mod clustered_startup_tests {
             .engine_handle_for(0)
             .expect("node 1 materializes a replica engine for partition 0");
         let mut replicated = false;
-        for _ in 0..400 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
             if learner_handle
                 .with(move |journal| {
                     journal
@@ -20354,7 +20363,7 @@ mod clustered_startup_tests {
             .engine_handle_for(0)
             .expect("node 1 materializes a replica engine for partition 0");
         let mut replicated = false;
-        for _ in 0..400 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
             if learner_handle
                 .with(move |journal| journal.engine().state().instances.contains_key(&k1))
                 .await
@@ -20433,7 +20442,7 @@ mod clustered_startup_tests {
             .engine_handle_for(0)
             .expect("node 1 materializes a replica engine for partition 0");
         let mut shipped = false;
-        for _ in 0..400 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
             if node1_p0
                 .with(move |journal| {
                     journal
@@ -20588,7 +20597,7 @@ mod clustered_startup_tests {
             .engine_handle_for(0)
             .expect("node 1 materializes a replica engine for partition 0");
         let mut shipped = false;
-        for _ in 0..400 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
             if node1_p0
                 .with(move |journal| {
                     journal
@@ -21532,7 +21541,7 @@ mod clustered_startup_tests {
                 .engine_handle_for(0)
                 .expect("survivor materializes a replica engine for partition 0");
             let mut shipped = false;
-            for _ in 0..400 {
+            for _ in 0..LEADER_SHIP_POLL_ITERS {
                 if h.with(move |journal| {
                     journal
                         .engine()
