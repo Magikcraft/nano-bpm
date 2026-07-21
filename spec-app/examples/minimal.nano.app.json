@@ -1,0 +1,23 @@
+{
+  "$schema": "https://nanobpm.dev/spec-app/nano-app.schema.json",
+  "schemaVersion": 1,
+  "id": "todo",
+  "name": "Todo",
+  "models": {
+    "processes": ["processes/*.bpmn"],
+    "forms": ["forms/*.form"]
+  },
+  "data": {
+    "default": "app",
+    "sources": {
+      "app": {
+        "driver": "sqlite",
+        "url": "file:./app.db",
+        "migrations": "db/migrations"
+      }
+    }
+  },
+  "surfaces": {
+    "taskInbox": { "enabled": true }
+  }
+}

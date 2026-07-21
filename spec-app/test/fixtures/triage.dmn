@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="defs-triage" name="Triage" namespace="http://camunda.org/schema/1.0/dmn">
+  <decision id="email-triage" name="Email Triage">
+    <decisionTable id="dt"><output id="o" typeRef="string"/></decisionTable>
+  </decision>
+</definitions>
