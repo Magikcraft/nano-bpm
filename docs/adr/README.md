@@ -44,6 +44,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0029](0029-urban-bindings-domain-model.md) | Urban bindings & the domain model (typed references over untyped runtime) | Proposed | 2026-07-21 |
 | [0030](0030-domain-process-duality.md) | The domain–process duality: directed evolution of typed state | Proposed | 2026-07-21 |
 | [0031](0031-process-relational-mapper.md) | The Process-Relational Mapper (an ORM whose third bank is the engine) | Proposed | 2026-07-21 |
+| [0032](0032-domain-resource-api.md) | The domain-resource API (the Kogito seam: process instances as first-class REST resources) | Proposed | 2026-07-22 |
 
 ## Reading paths
 
@@ -60,6 +61,8 @@ The ADRs fall into a few coherent threads:
   parity), 0024 (data layer), 0025 (triggers), 0026 (human surfaces), 0027 (manifest spec), 0028
   (auth/identity), 0029 (bindings & domain model) — resting on the conceptual keystone **0030** (the
   domain–process duality: why Urban is a distinct kind of computing) and its mapping mechanism **0031**
-  (the Process-Relational Mapper: how one domain type stays coherent across form, engine, and database).
+  (the Process-Relational Mapper: how one domain type stays coherent across form, engine, and database),
+  and its API surface **0032** (the domain-resource API: the domain object as a first-class, typed,
+  self-describing REST resource whose CRUD verbs are its lifecycle — the Kogito seam).
 - **Philosophy / signature**: 0015 (artists sign their work) and 0030 (the computational primitive) —
   the pieces that state *why*, not just *what*.
