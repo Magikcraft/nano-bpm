@@ -284,15 +284,16 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     }
                                 }
                             }
-                            // zeebe:calledDecision decisionId="…" on a business-rule
-                            // task — use the decision id as the job type.
+                            // zeebe:calledDecision decisionId="…" resultVariable="…"
+                            // on a business-rule task — bind the node to a native
+                            // DMN decision (evaluated in-engine, no job).
                             "calledDecision" => {
                                 if let (Some(idx), Some(d)) =
                                     (cur_service_task, attr(attrs, "decisionId"))
                                 {
-                                    if acc.nodes[idx].job_type.is_none() {
-                                        acc.nodes[idx].job_type = Some(d.to_string());
-                                    }
+                                    acc.nodes[idx].decision_id = Some(d.to_string());
+                                    acc.nodes[idx].decision_result_variable =
+                                        attr(attrs, "resultVariable").map(str::to_string);
                                 }
                             }
                             "userTask" => {
@@ -931,6 +932,15 @@ struct NodeAcc {
     /// For a script task with an inline `zeebe:script`: the `resultVariable`
     /// the expression's result is stored under.
     script_result_variable: Option<String>,
+    /// For a business rule task with a `zeebe:calledDecision`: the decision id
+    /// (literal or FEEL expression) to evaluate natively. Its presence makes the
+    /// node a [`BusinessRuleTask`](crate::model::ElementKind::BusinessRuleTask)
+    /// instead of a job-based service task.
+    decision_id: Option<String>,
+    /// For a business rule task with a `zeebe:calledDecision`: the
+    /// `resultVariable` the decision output is stored under (`None` spreads a map
+    /// output into the scope).
+    decision_result_variable: Option<String>,
     /// For a conditional intermediate catch event: the FEEL `condition` (from a
     /// nested `conditionalEventDefinition`/`condition`) that must become `true`
     /// for the event to fire. Makes the node a
@@ -1044,6 +1054,8 @@ impl ProcessAcc {
             retries: None,
             script_expression: None,
             script_result_variable: None,
+            decision_id: None,
+            decision_result_variable: None,
             event_condition: None,
             multi_instance: None,
         });
@@ -1290,13 +1302,21 @@ impl ProcessAcc {
                 NodeKind::Service => {
                     // A scriptTask carrying an inline zeebe:script (expression +
                     // resultVariable) is an inline-FEEL script task, evaluated on
-                    // activation with no job; otherwise it is an ordinary
-                    // job-based service task.
+                    // activation with no job. A businessRuleTask carrying a
+                    // zeebe:calledDecision is a native DMN business rule task,
+                    // evaluated on activation with no job. Otherwise it is an
+                    // ordinary job-based service task.
                     if let (Some(expr), Some(rv)) = (
                         node.script_expression.clone(),
                         node.script_result_variable.clone(),
                     ) {
                         builder.script_task(node.id, expr, rv)
+                    } else if let Some(decision_id) = node.decision_id.clone() {
+                        builder.business_rule_task(
+                            node.id,
+                            decision_id,
+                            node.decision_result_variable.clone(),
+                        )
                     } else {
                         let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
                         builder.service_task_with_priority(node.id, job_type, node.job_priority)
@@ -1734,6 +1754,65 @@ mod tests {
             def.element("work").unwrap().kind,
             ElementKind::ServiceTask {
                 job_type: "do-work".to_string(),
+                priority: None,
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_called_decision_as_a_business_rule_task() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="rules" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:businessRuleTask id="decide">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="rating" resultVariable="score" />
+      </bpmn:extensionElements>
+    </bpmn:businessRuleTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="decide" />
+    <bpmn:sequenceFlow id="f2" sourceRef="decide" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(xml).unwrap();
+        let def = &defs[0];
+        // A businessRuleTask carrying a zeebe:calledDecision becomes a native
+        // BusinessRuleTask (evaluated in-engine), not a job-based service task.
+        assert_eq!(
+            def.element("decide").unwrap().kind,
+            ElementKind::BusinessRuleTask {
+                decision_id: "rating".to_string(),
+                result_variable: Some("score".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn should_parse_business_rule_task_with_task_definition_as_a_service_task() {
+        // A businessRuleTask that instead declares a job worker (zeebe:taskDefinition)
+        // stays a job-based service task — only calledDecision makes it native.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="rules2" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:businessRuleTask id="decide">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="ruler" />
+      </bpmn:extensionElements>
+    </bpmn:businessRuleTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="decide" />
+    <bpmn:sequenceFlow id="f2" sourceRef="decide" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let defs = parse_bpmn(xml).unwrap();
+        assert_eq!(
+            defs[0].element("decide").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "ruler".to_string(),
                 priority: None,
             }
         );

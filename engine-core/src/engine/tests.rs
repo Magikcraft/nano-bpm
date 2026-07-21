@@ -5673,6 +5673,16 @@ fn io_var(engine: &Engine, key: Key, name: &str) -> Option<Value> {
     engine.instance(key)?.variables.get(name).cloned()
 }
 
+/// The value a `VariablesUpdated` event in `events` merged for `name` (last
+/// wins), used to inspect variables that a completed instance no longer retains
+/// in hot state.
+fn merged_var(events: &[Event], name: &str) -> Option<Value> {
+    events.iter().rev().find_map(|e| match e {
+        Event::VariablesUpdated { variables, .. } => variables.get(name).cloned(),
+        _ => None,
+    })
+}
+
 #[test]
 fn input_mapping_merges_before_job_activation() {
     // A service task with an input mapping `y = x + 1`. On activation the mapped
@@ -7229,4 +7239,185 @@ fn flat_instance_activation_returns_the_shared_root_arc_without_copying() {
         Arc::ptr_eq(&still_flat, &root_arc),
         "root-scope activation stays zero-copy even when other scopes exist",
     );
+}
+
+// --- DMN business rule task (native decision evaluation) --------------------
+
+/// A one-decision DRG: a decision table `greeting` mapping `lang` -> a greeting
+/// string, single string output (scalar result).
+fn greeting_dmn() -> crate::dmn::DecisionRequirementsGraph {
+    let xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="drg" name="drg">
+      <decision id="greeting" name="Greeting">
+        <decisionTable hitPolicy="UNIQUE">
+          <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+          <output id="o1" name="result" typeRef="string" />
+          <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+            <outputEntry id="oe1"><text>"hello"</text></outputEntry></rule>
+          <rule id="r2"><inputEntry id="ie2"><text>"de"</text></inputEntry>
+            <outputEntry id="oe2"><text>"hallo"</text></outputEntry></rule>
+        </decisionTable>
+      </decision>
+    </definitions>"##;
+    crate::dmn::parse_dmn(xml).unwrap()
+}
+
+fn brt_process(decision_id: &str, result_variable: Option<String>) -> ProcessDefinition {
+    ProcessBuilder::new("brt")
+        .start_event("s")
+        .business_rule_task("decide", decision_id, result_variable)
+        .end_event("e")
+        .connect("s", "decide")
+        .connect("decide", "e")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn business_rule_task_evaluates_decision_and_binds_result_variable() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployDecisionRequirements(vec![greeting_dmn()]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(brt_process(
+            "greeting",
+            Some("greeting".to_string()),
+        )))
+        .unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("lang".to_string(), Value::Str("de".into()));
+    let events = engine
+        .apply_command(Command::create_instance_with("brt", vars))
+        .unwrap();
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The decision output was bound under the result variable...
+    assert_eq!(
+        merged_var(&events, "greeting"),
+        Some(Value::Str("hallo".into()))
+    );
+    // ...a DecisionEvaluated audit record was emitted...
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::DecisionEvaluated { decision_id, .. } if decision_id == "greeting"
+    )));
+    // ...and the instance ran straight through to completion (no job, no wait).
+    assert_eq!(
+        engine.instance(inst).map(|i| i.state),
+        Some(ProcessInstanceState::Completed)
+    );
+}
+
+#[test]
+fn business_rule_task_resolves_decision_id_via_feel_expression() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployDecisionRequirements(vec![greeting_dmn()]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(brt_process(
+            "=decisionToCall",
+            Some("out".to_string()),
+        )))
+        .unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("lang".to_string(), Value::Str("en".into()));
+    vars.insert("decisionToCall".to_string(), Value::Str("greeting".into()));
+    let events = engine
+        .apply_command(Command::create_instance_with("brt", vars))
+        .unwrap();
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(merged_var(&events, "out"), Some(Value::Str("hello".into())));
+    let _ = inst;
+}
+
+#[test]
+fn business_rule_task_unknown_decision_raises_incident() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(brt_process(
+            "missing",
+            Some("out".to_string()),
+        )))
+        .unwrap();
+    let events = engine
+        .apply_command(Command::create_instance_with("brt", HashMap::new()))
+        .unwrap();
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // An incident was raised and the instance is still active (parked).
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::IncidentRaised {
+            kind: crate::state::IncidentKind::DecisionEvaluation,
+            ..
+        }
+    )));
+    assert_eq!(
+        engine.instance(inst).map(|i| i.state),
+        Some(ProcessInstanceState::Active)
+    );
+}
+
+#[test]
+fn deploy_decision_requirements_indexes_decisions_and_is_idempotent() {
+    let mut engine = Engine::new();
+    let events = engine
+        .apply_command(Command::DeployDecisionRequirements(vec![greeting_dmn()]))
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::DecisionRequirementsDeployed { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::DecisionDeployed { decision_id, version, .. } if decision_id == "greeting" && *version == 1
+    )));
+    assert!(engine.state().decisions.contains_key("greeting"));
+
+    // Redeploying the identical DRG is a no-op (only DeploymentCreated).
+    let again = engine
+        .apply_command(Command::DeployDecisionRequirements(vec![greeting_dmn()]))
+        .unwrap();
+    assert!(!again
+        .iter()
+        .any(|e| matches!(e, Event::DecisionRequirementsDeployed { .. })));
+    assert_eq!(engine.state().decision_requirements["drg"].version, 1);
+}
+
+#[test]
+fn business_rule_task_spreads_map_output_without_result_variable() {
+    // A two-output decision table yields a map output; with no result variable
+    // its entries are spread into the instance scope.
+    let xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="drg2" name="drg2">
+      <decision id="scores" name="Scores">
+        <decisionTable hitPolicy="UNIQUE">
+          <input id="i1"><inputExpression id="e1" typeRef="string"><text>tier</text></inputExpression></input>
+          <output id="o1" name="discount" typeRef="number" />
+          <output id="o2" name="priority" typeRef="number" />
+          <rule id="r1"><inputEntry id="ie1"><text>"gold"</text></inputEntry>
+            <outputEntry id="oe1"><text>20</text></outputEntry>
+            <outputEntry id="oe2"><text>1</text></outputEntry></rule>
+        </decisionTable>
+      </decision>
+    </definitions>"##;
+    let drg = crate::dmn::parse_dmn(xml).unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployDecisionRequirements(vec![drg]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployProcess(brt_process("scores", None)))
+        .unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("tier".to_string(), Value::Str("gold".into()));
+    let events = engine
+        .apply_command(Command::create_instance_with("brt", vars))
+        .unwrap();
+    let inst = events.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(merged_var(&events, "discount"), Some(Value::Int(20)));
+    assert_eq!(merged_var(&events, "priority"), Some(Value::Int(1)));
+    let _ = inst;
 }

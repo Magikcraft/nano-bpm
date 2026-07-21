@@ -8,7 +8,8 @@
 use crate::model::Value;
 
 /// A parsed DMN resource: one or more [`Decision`]s and their requirements.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecisionRequirementsGraph {
     /// The `id` of the `<definitions>` element.
     pub id: String,
@@ -28,7 +29,8 @@ impl DecisionRequirementsGraph {
 }
 
 /// A single DMN decision and its decision logic.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Decision {
     pub id: String,
     pub name: String,
@@ -50,7 +52,8 @@ impl Decision {
 }
 
 /// The decision logic of a [`Decision`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DecisionLogic {
     DecisionTable(DecisionTable),
     /// A FEEL literal expression.
@@ -61,7 +64,8 @@ pub enum DecisionLogic {
 }
 
 /// A DMN decision table.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecisionTable {
     pub hit_policy: HitPolicy,
     pub aggregation: Option<Aggregation>,
@@ -71,7 +75,8 @@ pub struct DecisionTable {
 }
 
 /// An input column of a decision table.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct InputClause {
     pub id: String,
     pub label: Option<String>,
@@ -81,7 +86,8 @@ pub struct InputClause {
 }
 
 /// An output column of a decision table.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct OutputClause {
     pub id: String,
     pub label: Option<String>,
@@ -94,7 +100,8 @@ pub struct OutputClause {
 }
 
 /// A single rule (row) of a decision table.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecisionRule {
     pub id: String,
     /// One unary-test entry per input column, in column order.
@@ -105,6 +112,7 @@ pub struct DecisionRule {
 
 /// A DMN decision-table hit policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum HitPolicy {
     /// `U` — at most one rule may match (the default).
     Unique,
@@ -139,6 +147,7 @@ impl HitPolicy {
 
 /// The aggregator of a `COLLECT` hit policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Aggregation {
     Sum,
     Min,
@@ -161,6 +170,7 @@ impl Aggregation {
 
 /// The type of decision logic, mirroring Zeebe's `DecisionType`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DecisionType {
     DecisionTable,
     LiteralExpression,
@@ -172,7 +182,8 @@ pub enum DecisionType {
 }
 
 /// The result of evaluating a decision in a [`DecisionRequirementsGraph`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecisionEvaluationResult {
     /// The id of the root decision that was requested.
     pub decision_id: String,
@@ -194,14 +205,16 @@ impl DecisionEvaluationResult {
 }
 
 /// A decision-evaluation failure.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EvaluationFailure {
     pub message: String,
     pub failed_decision_id: String,
 }
 
 /// Details of one evaluated decision (for audit / exporter records).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EvaluatedDecision {
     pub decision_id: String,
     pub decision_name: String,
@@ -216,7 +229,8 @@ pub struct EvaluatedDecision {
 }
 
 /// An evaluated decision-table input.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EvaluatedInput {
     pub input_id: String,
     pub input_name: Option<String>,
@@ -224,7 +238,8 @@ pub struct EvaluatedInput {
 }
 
 /// A matched decision-table rule and its evaluated outputs.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MatchedRule {
     pub rule_id: String,
     /// The 1-based index of the rule in the decision table (rule order).
@@ -233,7 +248,8 @@ pub struct MatchedRule {
 }
 
 /// An evaluated decision-table output.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EvaluatedOutput {
     pub output_id: String,
     pub output_name: Option<String>,

@@ -41,6 +41,42 @@ pub enum Event {
         process: ProcessDefinition,
     },
 
+    /// A decision requirements graph (DRG, one parsed `.dmn` resource) was
+    /// registered as part of a deployment. Carries the parsed graph so the engine
+    /// can evaluate its decisions natively (`businessRuleTask`, EvaluateDecision).
+    DecisionRequirementsDeployed {
+        deployment_key: Key,
+        decision_requirements_key: Key,
+        version: i32,
+        drg: crate::dmn::DecisionRequirementsGraph,
+    },
+
+    /// A single decision inside a deployed DRG was registered, indexed for lookup
+    /// by id. One [`Event::DecisionRequirementsDeployed`] emits one of these per
+    /// decision it contains.
+    DecisionDeployed {
+        deployment_key: Key,
+        decision_requirements_key: Key,
+        decision_key: Key,
+        decision_id: String,
+        decision_name: String,
+        version: i32,
+    },
+
+    /// A decision was evaluated — by a `businessRuleTask` (with `instance_key` /
+    /// `element_id` set) or by the standalone EvaluateDecision API (both `0` /
+    /// empty). Carries the root output and the per-decision audit trail for
+    /// exporter parity with Zeebe's decision-evaluation records.
+    DecisionEvaluated {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        decision_key: Key,
+        decision_id: String,
+        decision_output: Value,
+        evaluated_decisions: Vec<crate::dmn::EvaluatedDecision>,
+    },
+
     /// A new process instance was created (carries a single token at its start
     /// event) with its initial variables. `created_at` is the logical instant
     /// the instance was started, carried on the command (the engine never reads
@@ -691,8 +727,11 @@ impl Event {
             | Event::MultiInstanceCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
+            | Event::DecisionEvaluated { instance_key, .. }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. }
+            | Event::DecisionRequirementsDeployed { .. }
+            | Event::DecisionDeployed { .. }
             | Event::DeploymentCreated { .. }
             | Event::MessagePublished { .. }
             | Event::SignalBroadcast { .. }
@@ -719,6 +758,27 @@ impl Event {
                 process_definition_key,
                 ..
             } => m = m.max(*deployment_key).max(*process_definition_key),
+            Event::DecisionRequirementsDeployed {
+                deployment_key,
+                decision_requirements_key,
+                ..
+            } => m = m.max(*deployment_key).max(*decision_requirements_key),
+            Event::DecisionDeployed {
+                deployment_key,
+                decision_requirements_key,
+                decision_key,
+                ..
+            } => {
+                m = m
+                    .max(*deployment_key)
+                    .max(*decision_requirements_key)
+                    .max(*decision_key)
+            }
+            Event::DecisionEvaluated {
+                element_instance_key,
+                decision_key,
+                ..
+            } => m = m.max(*element_instance_key).max(*decision_key),
             Event::DeploymentCreated { deployment_key } => m = m.max(*deployment_key),
             Event::ElementActivating {
                 element_instance_key,
