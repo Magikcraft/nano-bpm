@@ -88,8 +88,10 @@ pub use engine::{ActivatedJob, Engine, EngineError};
 pub use event::Event;
 pub use feel::FeelError;
 pub use model::{
-    BuildError, Condition, Element, ElementId, ElementKind, IoMapping, Mapping, MultiInstance,
-    ProcessBuilder, ProcessDefinition, SequenceFlow, TimerDef, TimerDefKind, UserTaskProps, Value,
+    AdHocActivateElement, AdHocImplementationType, AdHocJobResult, AdHocSubProcessDef, AdHocTool,
+    AdHocToolKind, BuildError, Condition, Element, ElementId, ElementKind, IoMapping, Mapping,
+    MultiInstance, ProcessBuilder, ProcessDefinition, SequenceFlow, TimerDef, TimerDefKind,
+    UserTaskProps, Value,
 };
 pub use state::{
     compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,

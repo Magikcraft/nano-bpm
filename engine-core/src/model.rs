@@ -665,8 +665,53 @@ pub struct AdHocSubProcessDef {
     pub tools: Vec<AdHocTool>,
 }
 
-/// An executable process definition: a set of [`Element`]s plus the id of the
-/// single start event where new instances begin.
+/// The result a JOB_WORKER ad-hoc sub-process agent returns when it completes
+/// the container job (Camunda's `JobResult` for `adHocSubProcess`,
+/// `JobResult.java`). All fields are optional/empty for an ordinary
+/// (non-agentic) job completion, so plain completions are byte-unchanged.
+///
+/// This is transport-plumbed today (ADR 0023 seam 3); the engine does not yet
+/// act on it — activate-element execution lands in the runtime seam.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AdHocJobResult {
+    /// Inner elements the agent asks the engine to activate this turn
+    /// (Camunda `activateElements[]`), in the order the agent returned them.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub activate_elements: Vec<AdHocActivateElement>,
+    /// The agent's assertion that the container's `<completionCondition>` is
+    /// satisfied (Camunda `isCompletionConditionFulfilled`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub completion_condition_fulfilled: bool,
+    /// Ask the engine to cancel any still-active inner elements (Camunda
+    /// `isCancelRemainingInstances`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub cancel_remaining_instances: bool,
+}
+
+impl AdHocJobResult {
+    /// True when the result carries no agentic instruction — i.e. an ordinary
+    /// job completion that happens to have been decoded through the ad-hoc
+    /// result shape. Used to keep non-agentic paths free of behaviour changes.
+    pub fn is_empty(&self) -> bool {
+        self.activate_elements.is_empty()
+            && !self.completion_condition_fulfilled
+            && !self.cancel_remaining_instances
+    }
+}
+
+/// One element-activation instruction inside an [`AdHocJobResult`] (Camunda
+/// `AdHocSubProcessActivateElementInstruction`: an `elementId` plus local
+/// variables to seed into the activated element's scope).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct AdHocActivateElement {
+    /// Id of the inner element (tool) to activate.
+    pub element_id: ElementId,
+    /// Local variables to seed into the activated element's scope.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variables: HashMap<String, Value>,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProcessDefinition {

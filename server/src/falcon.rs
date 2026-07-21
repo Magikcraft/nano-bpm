@@ -154,6 +154,11 @@ pub enum ClientFrame {
         job_key: String,
         #[serde(default)]
         variables: Option<Map<String, Value>>,
+        /// Optional agentic ad-hoc sub-process result (Camunda `JobResult`),
+        /// forwarded to the owning peer. `None`/skipped for ordinary
+        /// completions so the frame is byte-unchanged on the hot path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adhoc_result: Option<nanobpmn_engine_core::AdHocJobResult>,
     },
     /// Fail an activated job (unmetered drain).
     #[serde(rename_all = "camelCase")]
@@ -1393,6 +1398,7 @@ async fn handle_client_frame(
             corr,
             job_key,
             variables,
+            adhoc_result,
         } => {
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
@@ -1405,7 +1411,7 @@ async fn handle_client_frame(
                 let server = server.clone();
                 spawn_forward_stream_reply(conn, corr, async move {
                     let outcome = server
-                        .forward_complete_job_stream(node, key, variables)
+                        .forward_complete_job_stream(node, key, variables, adhoc_result)
                         .await;
                     crate::metrics::record_complete_outcome(if outcome.0 < 300 {
                         "forward_ok"
@@ -1422,7 +1428,9 @@ async fn handle_client_frame(
                         server,
                         conn,
                         corr,
-                        server.complete_job_for_stream(key, vars).await,
+                        server
+                            .complete_job_for_stream(key, vars, adhoc_result)
+                            .await,
                     );
                 } else {
                     // Under Raft, `complete_job_for_stream` awaits the full quorum
@@ -1431,7 +1439,9 @@ async fn handle_client_frame(
                     let server = server.clone();
                     let conn = conn.clone();
                     tokio::spawn(async move {
-                        let outcome = server.complete_job_for_stream(key, vars).await;
+                        let outcome = server
+                            .complete_job_for_stream(key, vars, adhoc_result)
+                            .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });
                 }

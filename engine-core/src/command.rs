@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{ProcessDefinition, Value};
+use crate::model::{AdHocJobResult, ProcessDefinition, Value};
 use crate::state::{Key, MessageSubscriptionKind};
 
 /// An instruction submitted to [`crate::Engine::apply_command`].
@@ -34,6 +34,16 @@ pub enum Command {
     CompleteJob {
         job_key: Key,
         variables: HashMap<String, Value>,
+        /// Optional agentic result for a JOB_WORKER ad-hoc sub-process container
+        /// job (Camunda `JobResult`). `None` for every ordinary completion, and
+        /// skipped on the wire so plain completions are byte-unchanged. Plumbed
+        /// through the transports today; the engine does not yet act on it
+        /// (ADR 0023 seam 3).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        adhoc_result: Option<AdHocJobResult>,
     },
     /// Assign a user task to `assignee`. The task must be in the `Created` state.
     /// When `allow_override` is `false` and the task already has an assignee, the
@@ -342,12 +352,31 @@ impl Command {
         Command::CompleteJob {
             job_key,
             variables: HashMap::new(),
+            adhoc_result: None,
         }
     }
 
     /// Convenience constructor for a `CompleteJob` that sets variables.
     pub fn complete_job_with(job_key: Key, variables: HashMap<String, Value>) -> Self {
-        Command::CompleteJob { job_key, variables }
+        Command::CompleteJob {
+            job_key,
+            variables,
+            adhoc_result: None,
+        }
+    }
+
+    /// Convenience constructor for a `CompleteJob` that carries an agentic
+    /// ad-hoc sub-process result (Camunda `JobResult`).
+    pub fn complete_job_with_result(
+        job_key: Key,
+        variables: HashMap<String, Value>,
+        adhoc_result: AdHocJobResult,
+    ) -> Self {
+        Command::CompleteJob {
+            job_key,
+            variables,
+            adhoc_result: Some(adhoc_result),
+        }
     }
 
     /// Convenience constructor for an `AssignUserTask` (allowing override).
@@ -514,7 +543,8 @@ mod kind_tests {
         assert_eq!(
             Command::CompleteJob {
                 job_key: 1,
-                variables: HashMap::new()
+                variables: HashMap::new(),
+                adhoc_result: None,
             }
             .kind(),
             "complete_job"

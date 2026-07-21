@@ -645,7 +645,9 @@ impl Engine {
                 );
             }
 
-            Command::CompleteJob { job_key, variables } => {
+            Command::CompleteJob {
+                job_key, variables, ..
+            } => {
                 let job = self
                     .state
                     .jobs
