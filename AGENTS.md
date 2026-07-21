@@ -27,3 +27,11 @@ There are no pre-existing failures or warnings, and you will not allow any to en
 ## BPMN Models need DI
 
 All BPMN Models need DI for rendering for humans.
+
+## PRs Auto-Merge
+
+This repository auto-merges pull requests once their checks pass (via the Mergify merge queue). Treat opening a PR as committing to `main`:
+
+- A branch must be **complete and correct before you open the PR** — do not plan to "add a follow-up commit" to an open PR, as it may already be merged and closed by the time you push.
+- After pushing to a branch with an open PR, **verify the PR actually picked up your commit** (`gh pr view <n> --json headRefOid`); if the PR has already merged, open a new PR off the latest `main` for the additional change.
+- Never leave a branch in a knowingly-broken intermediate state expecting a later fix to land in the same PR.
