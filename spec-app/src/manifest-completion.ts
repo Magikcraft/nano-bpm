@@ -20,9 +20,11 @@ import { fieldsOf } from "./feel.ts";
 export type ReferenceSite =
   | "process" // trigger action.start — a BPMN process id
   | "message" // trigger action.message — a bpmn:message name
-  | "decision" // llm.<agent>.output.decision — a DMN decision id
+  | "decision" // llm.<agent>.output.decision / bindings[].decision — a DMN decision id
   | "field-type" // types.<id>.fields.<key>.type — a primitive or declared type id
   | "body-type" // triggers[].bodyType — a declared domain type id (FEEL scope)
+  | "binding-type" // bindings[].type — a declared domain type id (model FEEL scope)
+  | "form-ref" // bindings[].form — a form-js form id
   | "datasource" // data.default — a declared datasource id
   | "agent"; // surfaces.<name>.agent / workers[].llm — a declared llm agent id
 
@@ -32,6 +34,7 @@ export type CandidateKind =
   | "decision"
   | "primitive"
   | "type"
+  | "form"
   | "datasource"
   | "agent"
   | "variable"; // a FEEL variable-path segment (ADR 0029 §5)
@@ -52,7 +55,7 @@ export interface ManifestCompletion {
 }
 
 /** Just the parts of the index this engine reads (keeps callers flexible). */
-export type CompletionIndex = Pick<SymbolIndex, "processes" | "messages" | "decisions">;
+export type CompletionIndex = Pick<SymbolIndex, "processes" | "messages" | "decisions" | "forms">;
 
 interface StringSite {
   /** Object-property key path to this string value (array indices omitted). */
@@ -208,12 +211,18 @@ function classify(path: string[]): ReferenceSite | null {
       if (at(2) === "action") return "message";
       return null;
     case "decision":
-      // llm.<agent>.output.decision
+      // llm.<agent>.output.decision, or bindings[].decision
       if (at(2) === "output") return "decision";
+      if (at(2) === "bindings") return "decision";
       return null;
     case "type":
-      // types.<id>.fields.<key>.type
+      // types.<id>.fields.<key>.type, or bindings[].type
       if (at(3) === "fields") return "field-type";
+      if (at(2) === "bindings") return "binding-type";
+      return null;
+    case "form":
+      // bindings[].form
+      if (at(2) === "bindings") return "form-ref";
       return null;
     case "bodyType":
       // triggers[].bodyType
@@ -277,6 +286,17 @@ function candidatesFor(
         value: id,
         kind: "type" as const,
         detail: "domain type",
+      }));
+    case "binding-type":
+      return Object.keys(record(manifest, "types") ?? {}).map((id) => ({
+        value: id,
+        kind: "type" as const,
+        detail: "domain type",
+      }));
+    case "form-ref":
+      return (index?.forms ?? []).map((f) => ({
+        value: f.id,
+        kind: "form" as const,
       }));
     case "datasource":
       return Object.keys(record(record(manifest, "data"), "sources") ?? {}).map((id) => ({

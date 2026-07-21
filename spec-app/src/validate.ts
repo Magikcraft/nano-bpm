@@ -154,6 +154,25 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     }
   }
 
+  // bindings[] declare the domain type in scope for a form's / decision's FEEL
+  // (ADR 0029 §5). The bound model (form id or decision id) must resolve against
+  // the project index, and the type must be a declared domain type. This puts a
+  // type in scope for that model's expressions the same way trigger.bodyType does
+  // for a trigger's action.
+  const formIds = index && new Set(index.forms.map((f) => f.id));
+  const bindings: any[] = manifest.bindings ?? [];
+  bindings.forEach((b, i) => {
+    if (b.form != null && formIds && !formIds.has(b.form)) {
+      push(`/bindings/${i}/form`, `no model declares a form with id "${b.form}"`, "unknown-form");
+    }
+    if (b.decision != null && decisionIds && !decisionIds.has(b.decision)) {
+      push(`/bindings/${i}/decision`, `no model declares a decision with id "${b.decision}"`, "unknown-decision");
+    }
+    if (b.type != null && !typeIds.has(b.type)) {
+      push(`/bindings/${i}/type`, `type "${b.type}" is not a declared domain type`, "unknown-type");
+    }
+  });
+
   return diags;
 }
 

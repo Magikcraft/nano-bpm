@@ -110,3 +110,50 @@ test("is tolerant of an unclosed manifest (mid-edit)", () => {
   assert.equal(r.site, "process");
   assert.equal(r.range.end, text.length);
 });
+
+// bindings[] — the form/decision → domain-type binding (ADR 0029 §5). The type
+// in scope for a model's FEEL. form and decision resolve against the index; type
+// resolves against the declared registry (same as trigger.bodyType).
+const bindIndex = {
+  ...index,
+  forms: [
+    { id: "intake-form", fields: [] },
+    { id: "triage-form", fields: [] },
+  ],
+};
+
+test("completes a form id under bindings[].form", () => {
+  const { text, offset } = at('{ "bindings": [ { "form": "‸" } ] }');
+  const r = manifestCompletionAt(text, offset, manifest, bindIndex);
+  assert.ok(r);
+  assert.equal(r.site, "form-ref");
+  assert.deepEqual(r.candidates.map((c) => c.value).sort(), ["intake-form", "triage-form"]);
+  assert.equal(r.candidates[0].kind, "form");
+});
+
+test("completes a decision id under bindings[].decision", () => {
+  const { text, offset } = at('{ "bindings": [ { "decision": "‸" } ] }');
+  const r = manifestCompletionAt(text, offset, manifest, bindIndex);
+  assert.ok(r);
+  assert.equal(r.site, "decision");
+  assert.deepEqual(r.candidates.map((c) => c.value), ["email-triage"]);
+});
+
+test("completes a declared type id under bindings[].type", () => {
+  const { text, offset } = at('{ "bindings": [ { "form": "intake-form", "type": "‸" } ] }');
+  const r = manifestCompletionAt(text, offset, manifest, bindIndex);
+  assert.ok(r);
+  assert.equal(r.site, "binding-type");
+  assert.deepEqual(r.candidates.map((c) => c.value).sort(), ["reading", "schedule"]);
+  assert.equal(r.candidates[0].kind, "type");
+});
+
+test("bindings[].form in the second element resolves via navPath index", () => {
+  const { text, offset } = at(
+    '{ "bindings": [ { "decision": "email-triage" }, { "form": "tri‸" } ] }',
+  );
+  const r = manifestCompletionAt(text, offset, manifest, bindIndex);
+  assert.ok(r);
+  assert.equal(r.site, "form-ref");
+  assert.equal(text.slice(r.range.start, r.range.end), "tri");
+});
