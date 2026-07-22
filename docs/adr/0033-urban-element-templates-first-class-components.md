@@ -77,8 +77,9 @@ A template's `zeebe:input` properties are FEEL expressions over process variable
 variable injection** shipped for DMN in #197: the domain type bound to the process (via `bindings[]`,
 ADR 0030) feeds the input-property autocomplete. `feel.ts` shares one `bindingScope` resolver behind
 `decisionScope` (DMN inputs) and `processScope` (component inputs, gateway conditions) — one tested
-scope model, many editors. Symmetrically, a component that declares its **output** domain type
-lets downstream tasks/forms/DMN autocomplete on its results: Delphi-grade continuity, component output →
+scope model, many editors. Symmetrically, a component that declares its **output** domain type (on its
+worker, `workers[].outputType`, joined by `taskType`) lets downstream tasks/forms/DMN autocomplete on
+its results: Delphi-grade continuity, component output →
 process variable → next component input, all typed, feeding the PRM registry (ADR 0029 §6 / 0031).
 
 ### 4. Components are distributed as a pack axis (ADR 0007)
@@ -132,8 +133,12 @@ input scoping (§3), and the pack axis (§4) are the increments below.
    component `zeebe:input`, gateway conditions, output mappings — uniformly. The template↔worker link
    stays inferred from `taskDefinition:type` ↔ `workers[].taskType`; no per-instance manifest entry is
    needed, and connectors (which declare no `taskType`) raise no false "missing worker" diagnostics.
-3. **Output-type declaration** — how a component template declares the domain type of its outputs so
-   §3's downstream typing works (a `zeebe:property`/metadata convention, or an Urban extension field).
+3. ~~**Output-type declaration**~~ — **resolved (PR #200).** A component declares its output domain
+   type on its **worker** (the runtime facet, ADR 0022), not the template JSON: `workers[].outputType`
+   names a declared domain type, joined to the component by `taskType` ↔ `zeebe:taskDefinition:type`.
+   Homing it on the manifest keeps it validated (fail-closed `unknown-type`) and tested in the schema
+   package, and avoids a non-standard extension field on the open template format. The modeler extracts
+   each service task's output-mapping targets and the schema package types them via `outputType`.
 4. **Chooser vs. palette** — adopt `bpmn-js-create-append-anything` for the append-anything popup, or
    keep a bespoke Urban palette.
 
@@ -145,5 +150,7 @@ input scoping (§3), and the pack axis (§4) are the increments below.
    fail-closed `unknown-process` validation + completion (`process-ref`) — PR #199. ✅
 4. **FEEL scoping** — `processScope` injects the bound type's fields into bpmn-js component-input FEEL
    autocomplete via a `variableResolver` service, mirroring #197's DMN injection — PR #199. ✅
-5. **output typing** — declare + consume a component's output domain type (§3, OQ3).
+5. **output typing** — `workers[].outputType` declares a component's output domain type; the modeler
+   extracts output-mapping targets and `componentOutputScope` types those process variables, so a task
+   placed after a component autocompletes on its result's fields (§3, OQ3) — PR #200. ✅
 6. **pack axis** — components as an ADR 0007 pack contribution (§4).

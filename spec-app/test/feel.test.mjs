@@ -2,7 +2,7 @@
 // and `resolveBodyPath` type-walking. `node --test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope, processScope } from "../src/feel.ts";
+import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope, processScope, outputTypeForTaskType, componentOutputScope } from "../src/feel.ts";
 
 const manifest = {
   types: {
@@ -127,4 +127,41 @@ test("processScope resolves the type bound to a process, else undefined (ADR 003
   const m2 = { types: manifest.types, bindings: [{ process: "p", type: "ghost" }] };
   assert.equal(processScope(m2, "p"), undefined);
   assert.equal(processScope(m, undefined), undefined);
+});
+
+test("outputTypeForTaskType resolves a worker's declared output type (ADR 0033 §3)", () => {
+  const m = {
+    types: manifest.types,
+    workers: [
+      { taskType: "read-thermostat", handler: "x", outputType: "reading" },
+      { taskType: "classify", llm: "c", outputType: "ghost" }, // undeclared type → undefined
+      { taskType: "noisy", handler: "y" }, // no outputType → undefined
+    ],
+  };
+  assert.equal(outputTypeForTaskType(m, "read-thermostat"), "reading");
+  assert.equal(outputTypeForTaskType(m, "classify"), undefined);
+  assert.equal(outputTypeForTaskType(m, "noisy"), undefined);
+  assert.equal(outputTypeForTaskType(m, "no-such-worker"), undefined);
+  assert.equal(outputTypeForTaskType(m, undefined), undefined);
+});
+
+test("componentOutputScope types each output-mapped variable by its worker (ADR 0033 §3)", () => {
+  const m = {
+    types: manifest.types,
+    workers: [
+      { taskType: "read-thermostat", handler: "x", outputType: "reading" },
+      { taskType: "classify", llm: "c" }, // untyped worker
+    ],
+  };
+  const scope = componentOutputScope(m, [
+    { taskType: "read-thermostat", target: "current" },
+    { taskType: "classify", target: "category" }, // untyped → skipped
+    { taskType: "read-thermostat", target: "current" }, // duplicate target → kept once
+    { taskType: "read-thermostat", target: "" }, // empty target → skipped
+  ]);
+  assert.deepEqual(scope.map((v) => v.name), ["current"]);
+  assert.equal(scope[0].type, "reading");
+  assert.deepEqual(scope[0].entries.map((e) => e.name).sort(), ["meta", "readings", "room", "sensor", "temp"]);
+  // no outputs, or all untyped → empty scope
+  assert.deepEqual(componentOutputScope(m, []), []);
 });

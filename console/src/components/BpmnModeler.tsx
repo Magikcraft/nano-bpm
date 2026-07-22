@@ -15,6 +15,7 @@ import CloudBehaviorsModule from "camunda-bpmn-js-behaviors/lib/camunda-cloud";
 import { getVariablesForElement as extractZeebeVariables } from "@bpmn-io/extract-process-variables/zeebe";
 import { urbanComponents } from "../lib/urbanComponents";
 import type { FeelVariable } from "../lib/feelVariables";
+import type { ComponentOutput } from "../lib/bpmnDomainVariables";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
@@ -30,6 +31,51 @@ interface Canvas {
 }
 interface Modeling {
   updateProperties(element: unknown, props: Record<string, unknown>): void;
+}
+
+// --- Component output extraction (ADR 0033 §3) -------------------------------
+// Walks the diagram's service tasks to pair each output-mapped process variable
+// with the `taskType` of the component that writes it. The schema package joins
+// these `{ taskType, target }` pairs against `workers[].outputType` to type the
+// variables, so a task placed after a component autocompletes on its result's
+// fields — component output → typed process variable → next component input.
+interface ModdleElement {
+  $type?: string;
+  type?: string;
+  target?: string;
+  values?: ModdleElement[];
+  outputParameters?: ModdleElement[];
+  extensionElements?: { values?: ModdleElement[] };
+}
+interface RegistryElement {
+  type?: string;
+  businessObject?: ModdleElement;
+}
+interface ElementRegistry {
+  getAll(): RegistryElement[];
+}
+
+const SERVICE_TASK_TYPES = new Set([
+  "bpmn:ServiceTask",
+  "bpmn:BusinessRuleTask",
+  "bpmn:ScriptTask",
+  "bpmn:SendTask",
+]);
+
+function collectComponentOutputs(registry: ElementRegistry): ComponentOutput[] {
+  const outputs: ComponentOutput[] = [];
+  for (const el of registry.getAll()) {
+    if (!el.type || !SERVICE_TASK_TYPES.has(el.type)) continue;
+    const ext = el.businessObject?.extensionElements?.values ?? [];
+    const taskDef = ext.find((v) => v.$type === "zeebe:TaskDefinition");
+    const taskType = typeof taskDef?.type === "string" ? taskDef.type : undefined;
+    if (!taskType) continue;
+    const io = ext.find((v) => v.$type === "zeebe:IoMapping");
+    for (const p of io?.outputParameters ?? []) {
+      if (typeof p.target === "string" && p.target) outputs.push({ taskType, target: p.target });
+    }
+  }
+  return outputs;
 }
 
 // --- Urban components palette (ADR 0033) -------------------------------------
@@ -102,11 +148,14 @@ interface BpmnModelerProps {
   /// Called once after the initial blank diagram has loaded, so the parent can
   /// read the starting process id.
   onReady?: () => void;
-  /// Supplies the domain variables in scope for the open diagram's process
-  /// (ADR 0030) so component-input / gateway FEEL autocomplete offers the bound
-  /// domain type's fields. Empty/absent → only bpmn-js's extracted process
-  /// variables are offered. Read live, so binding edits reflect without a remount.
-  getVariables?: () => FeelVariable[];
+  /// Supplies the domain variables in scope for the open diagram's process,
+  /// given the component outputs the modeler extracted. Combines the process's
+  /// bound-type `body` scope (ADR 0030) with the component-output scope (ADR
+  /// 0033 §3: each output-mapped variable typed by its worker's `outputType`),
+  /// so component-input / gateway FEEL autocomplete offers both. Empty/absent →
+  /// only bpmn-js's extracted process variables are offered. Read live, so
+  /// binding/output edits reflect without a remount.
+  getVariables?: (ctx: { taskOutputs: ComponentOutput[] }) => FeelVariable[];
 }
 
 const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
@@ -168,11 +217,18 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       // A `variableResolver` service the bpmn-js FEEL fields consult
       // (`useServiceIfAvailable('variableResolver', …)` in properties-panel and
       // element-templates). We keep bpmn-js's own extracted process variables
-      // (output mappings written upstream) and append the domain type bound to
-      // this diagram's process (ADR 0030), so component-input / gateway FEEL
-      // autocomplete offers `body.<field>` for the bound record. Read live via
-      // the ref so binding edits reflect without recreating the modeler.
+      // (output mappings written upstream) and append the domain scope: the type
+      // bound to this diagram's process (ADR 0030, `body`) plus each component
+      // output typed by its worker's `outputType` (ADR 0033 §3). Typed domain
+      // variables override the plain extracted ones of the same name so their
+      // fields autocomplete. Read live via the ref so binding/output edits
+      // reflect without recreating the modeler.
       class DomainVariableResolver {
+        static $inject = ["elementRegistry"];
+        private readonly elementRegistry: ElementRegistry;
+        constructor(elementRegistry: ElementRegistry) {
+          this.elementRegistry = elementRegistry;
+        }
         getVariablesForElement(bo: unknown): FeelVariable[] {
           let base: FeelVariable[] = [];
           try {
@@ -180,8 +236,19 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           } catch {
             base = [];
           }
-          const domain = getVariablesRef.current?.() ?? [];
-          return [...base, ...domain];
+          let taskOutputs: ComponentOutput[] = [];
+          try {
+            taskOutputs = collectComponentOutputs(this.elementRegistry);
+          } catch {
+            taskOutputs = [];
+          }
+          const domain = getVariablesRef.current?.({ taskOutputs }) ?? [];
+          // Dedupe by name; a typed domain variable supersedes its plain
+          // extracted counterpart so nested-field completion wins.
+          const byName = new Map<string, FeelVariable>();
+          for (const v of base) if (v?.name) byName.set(v.name, v);
+          for (const v of domain) if (v?.name) byName.set(v.name, v);
+          return [...byName.values()];
         }
       }
       const domainVariableResolverModule = {
