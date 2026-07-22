@@ -2235,6 +2235,7 @@ fn extension_json(e: &extensions::ExtManifest) -> serde_json::Value {
         "fileTypes": e.file_types, "templates": e.templates,
         "themes": e.themes,
         "intellisense": e.intellisense,
+        "components": extensions::pack_component_templates(&e.id),
         "toolchainAvailable": extensions::toolchain_available(e),
         "trusted": extensions::is_trusted(&e.id),
     })

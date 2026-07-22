@@ -1631,6 +1631,17 @@ components:
             monacoLang. Optional; the console registers completion/hover/signature
             providers from these.
           items: { $ref: '#/components/schemas/ExtensionIntellisense' }
+        components:
+          type: array
+          description: >-
+            Zeebe element templates the pack contributes as installable BPMN
+            components (ADR 0033 §4). The console merges these under a project's
+            own components (project wins on an id collision) to drive the palette.
+            Kept as free-form objects so the full element-template shape survives
+            the response round-trip; the modeler validates them at registration.
+          items:
+            type: object
+            additionalProperties: true
         toolchainAvailable: { type: boolean }
         trusted: { type: boolean }
     ExtensionCompletion:

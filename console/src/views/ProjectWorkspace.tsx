@@ -36,7 +36,7 @@ import {
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import { processFeelVariables, componentOutputFeelVariables, type ComponentOutput } from "../lib/bpmnDomainVariables";
-import { loadProjectComponents, type ElementTemplate } from "../lib/projectComponents";
+import { loadProjectComponents, loadPackComponents, combineComponents, type ElementTemplate } from "../lib/projectComponents";
 import {
   subscribe as subscribeDebug,
   snapshot as debugSnapshot,
@@ -672,6 +672,11 @@ function EditorPane({
   // palette + template chooser (ADR 0033 increment 2). Load them from the
   // project's component dirs while a BPMN model is open; reload when the file
   // tree changes so a newly-added component file appears. Absent → empty palette.
+  // The components (element templates) available for this BPMN model: the
+  // project's own (`components/` + `.camunda/element-templates/`, increment 2)
+  // layered over the set contributed by installed packs (ADR 0033 §4, increment
+  // 6). Load both when a BPMN model is open; reload on file switch. Project
+  // components win on an id collision. Absent → empty palette.
   const [components, setComponents] = useState<ElementTemplate[]>([]);
   useEffect(() => {
     if (kind !== "bpmn") {
@@ -679,9 +684,13 @@ function EditorPane({
       return;
     }
     let alive = true;
-    listProjectFiles({ path: { name }, throwOnError: true })
-      .then((res) => (alive ? loadProjectComponents(name, res.data.files) : []))
-      .then((c) => alive && setComponents(c))
+    Promise.all([
+      loadPackComponents(),
+      listProjectFiles({ path: { name }, throwOnError: true }).then((res) =>
+        loadProjectComponents(name, res.data.files),
+      ),
+    ])
+      .then(([pack, project]) => alive && setComponents(combineComponents(pack, project)))
       .catch(() => alive && setComponents([]));
     return () => {
       alive = false;
