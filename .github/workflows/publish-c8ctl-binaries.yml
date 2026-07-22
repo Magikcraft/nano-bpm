@@ -1,5 +1,5 @@
-# Cross-compiles the gateway server for all five targets, uploads them as assets
-# on the rolling `binaries` release of the PUBLIC plugin repo
+# Cross-compiles the gateway server for every release target, uploads them as
+# assets on the rolling `binaries` release of the PUBLIC plugin repo
 # (jwulf/c8ctl-plugin-nano), and then bumps a marker file in the plugin repo so
 # semantic-release cuts a new npm version that ships the fresh binaries.
 # This repo's name never appears in the plugin repo; only the assets do.
