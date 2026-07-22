@@ -139,7 +139,7 @@ pub fn router(server: ServerImpl) -> Router {
 
 /// Serves `index.html` for the SPA entry points (`/console`, `/console/`).
 async fn spa_index(headers: HeaderMap) -> Response {
-    serve_embedded("index.html", accepts_gzip(&headers))
+    serve_embedded("index.html", accepted_encodings(&headers))
 }
 
 /// Serves a built asset by path under `/console/`. Unknown paths that are not
@@ -150,27 +150,41 @@ async fn spa_asset(
     headers: HeaderMap,
 ) -> Response {
     let path = path.trim_start_matches('/');
-    let gz = accepts_gzip(&headers);
+    let enc = accepted_encodings(&headers);
     if Assets::get(path).is_some() {
-        serve_embedded(path, gz)
+        serve_embedded(path, enc)
     } else {
         // SPA fallback: let the client router resolve the route.
-        serve_embedded("index.html", gz)
+        serve_embedded("index.html", enc)
     }
 }
 
 /// Looks an asset up in the embedded bundle and returns it with a guessed
-/// content type, gzip-compressing the body when the client accepts it and the
-/// payload is worth compressing (text/JS/JSON/wasm/SVG above a small floor).
-/// `flate2` is already a dependency (used by the Raft wire), so this adds no new
-/// crate; the wasm bundle (~0.5 MB) drops to ~0.2 MB on the wire.
-fn serve_embedded(path: &str, accept_gzip: bool) -> Response {
+/// content type. Serving order (ADR 0034):
+///   1. a build-time precompressed sibling — `<path>.br` (Brotli) or `<path>.gz`
+///      (gzip) — when the client accepts that encoding. These are produced by
+///      `console/scripts/precompress.mjs` at max quality, so the gateway streams
+///      them with zero compression CPU on the hot path.
+///   2. otherwise the raw asset, gzip-ed on the fly when worth it. This keeps
+///      CI's stub bundle (no siblings) and any hand-built `dist` working.
+///   3. otherwise the raw bytes.
+fn serve_embedded(path: &str, enc: AcceptedEncodings) -> Response {
+    if enc.br
+        && let Some(resp) = precompressed_sibling(path, "br")
+    {
+        return resp;
+    }
+    if enc.gzip
+        && let Some(resp) = precompressed_sibling(path, "gzip")
+    {
+        return resp;
+    }
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream();
             let mime_str = mime.as_ref().to_string();
             let bytes = content.data.into_owned();
-            if accept_gzip
+            if enc.gzip
                 && is_compressible(&mime_str)
                 && bytes.len() >= 1024
                 && let Some(gz) = gzip(&bytes)
@@ -203,15 +217,58 @@ fn serve_embedded(path: &str, accept_gzip: bool) -> Response {
     }
 }
 
-/// True when the client's `Accept-Encoding` lists gzip.
-fn accepts_gzip(headers: &HeaderMap) -> bool {
-    headers
+/// Serves a build-time precompressed sibling of `path` (`<path>.br` or
+/// `<path>.gz`) if one is embedded, returning `None` so the caller falls back
+/// when it is absent. `encoding` is the `Content-Encoding` token (`"br"` /
+/// `"gzip"`); the content type is guessed from the *original* path so a
+/// `foo.js.br` is still served as JavaScript.
+fn precompressed_sibling(path: &str, encoding: &str) -> Option<Response> {
+    let sibling = format!("{path}.{}", if encoding == "br" { "br" } else { "gz" });
+    let content = Assets::get(&sibling)?;
+    let mime = mime_guess::from_path(path)
+        .first_or_octet_stream()
+        .as_ref()
+        .to_string();
+    Some(
+        (
+            [
+                (header::CONTENT_TYPE, mime),
+                (header::CONTENT_ENCODING, encoding.to_string()),
+                (header::VARY, "Accept-Encoding".to_string()),
+            ],
+            content.data.into_owned(),
+        )
+            .into_response(),
+    )
+}
+
+/// The content encodings a client advertised in `Accept-Encoding`.
+#[derive(Clone, Copy)]
+struct AcceptedEncodings {
+    br: bool,
+    gzip: bool,
+}
+
+/// Parses `Accept-Encoding` into the subset of encodings we can serve. `q=0`
+/// niceties are ignored — clients that list an encoding at all accept it.
+fn accepted_encodings(headers: &HeaderMap) -> AcceptedEncodings {
+    let mut enc = AcceptedEncodings {
+        br: false,
+        gzip: false,
+    };
+    if let Some(val) = headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.split(',')
-                .any(|e| e.trim().split(';').next() == Some("gzip"))
-        })
+    {
+        for token in val.split(',') {
+            match token.trim().split(';').next().map(str::trim) {
+                Some("br") => enc.br = true,
+                Some("gzip") => enc.gzip = true,
+                _ => {}
+            }
+        }
+    }
+    enc
 }
 
 /// Whether a MIME type benefits from gzip (text-like, JS/JSON, wasm, SVG).
@@ -269,7 +326,7 @@ async fn optimization() -> Response {
 
 /// Serves the Swagger UI shell at `/swagger`.
 async fn swagger_index(headers: HeaderMap) -> Response {
-    serve_embedded("swagger/index.html", accepts_gzip(&headers))
+    serve_embedded("swagger/index.html", accepted_encodings(&headers))
 }
 
 /// Serves Swagger UI assets and the bundled OpenAPI spec under `/swagger/`. All
@@ -280,14 +337,14 @@ async fn swagger_asset(
     headers: HeaderMap,
 ) -> Response {
     let path = path.trim_start_matches('/');
-    serve_embedded(&format!("swagger/{path}"), accepts_gzip(&headers))
+    serve_embedded(&format!("swagger/{path}"), accepted_encodings(&headers))
 }
 
 /// Serves the Falcon Protocol reference (AsyncAPI) at `/asyncapi`. The
 /// page is generated at build time from `docs/falcon.asyncapi.yaml`
 /// (see `console/scripts/copy-asyncapi.mjs`) into `dist/asyncapi/index.html`.
 async fn asyncapi_index(headers: HeaderMap) -> Response {
-    serve_embedded("asyncapi/index.html", accepts_gzip(&headers))
+    serve_embedded("asyncapi/index.html", accepted_encodings(&headers))
 }
 
 /// Serves any further assets under `/asyncapi/` (the page is currently a single
@@ -298,14 +355,14 @@ async fn asyncapi_asset(
     headers: HeaderMap,
 ) -> Response {
     let path = path.trim_start_matches('/');
-    serve_embedded(&format!("asyncapi/{path}"), accepts_gzip(&headers))
+    serve_embedded(&format!("asyncapi/{path}"), accepted_encodings(&headers))
 }
 
 /// Serves the bundled documentation website at `/docs`. The pages are generated
 /// at build time from `README.md` (see `console/scripts/build-docs.mjs`) into
 /// `dist/docs/*.html`, one page per README H2 section.
 async fn docs_index(headers: HeaderMap) -> Response {
-    serve_embedded("docs/index.html", accepts_gzip(&headers))
+    serve_embedded("docs/index.html", accepted_encodings(&headers))
 }
 
 /// Serves a documentation page (or asset) under `/docs/`. Page links are
@@ -316,9 +373,9 @@ async fn docs_asset(
     headers: HeaderMap,
 ) -> Response {
     let path = path.trim_start_matches('/').trim_end_matches('/');
-    let gz = accepts_gzip(&headers);
+    let enc = accepted_encodings(&headers);
     if path.is_empty() {
-        return serve_embedded("docs/index.html", gz);
+        return serve_embedded("docs/index.html", enc);
     }
     let last = path.rsplit('/').next().unwrap_or(path);
     let key = if last.contains('.') {
@@ -326,7 +383,7 @@ async fn docs_asset(
     } else {
         format!("docs/{path}.html")
     };
-    serve_embedded(&key, gz)
+    serve_embedded(&key, enc)
 }
 
 /// Serves the bundled whitepaper at `/whitepaper`. The page is generated at
@@ -334,7 +391,7 @@ async fn docs_asset(
 /// `console/scripts/build-whitepaper.mjs`) into `dist/whitepaper/index.html`, so
 /// it refreshes on every console build and is embedded in the release binary.
 async fn whitepaper_index(headers: HeaderMap) -> Response {
-    serve_embedded("whitepaper/index.html", accepts_gzip(&headers))
+    serve_embedded("whitepaper/index.html", accepted_encodings(&headers))
 }
 
 #[derive(Serialize)]
@@ -2860,5 +2917,46 @@ nanobpm_admission_shed_total{reason="create_queue"} 6
         assert_eq!(m.fsync_mean_ms, 0.0);
         assert!(!m.ceiling_throughput);
         assert_eq!(m.sla_mode, "latency");
+    }
+}
+
+#[cfg(test)]
+mod asset_encoding_tests {
+    use super::*;
+
+    fn accept(value: &str) -> AcceptedEncodings {
+        let mut headers = HeaderMap::new();
+        if !value.is_empty() {
+            headers.insert(header::ACCEPT_ENCODING, value.parse().unwrap());
+        }
+        accepted_encodings(&headers)
+    }
+
+    #[test]
+    fn parses_brotli_and_gzip_from_accept_encoding() {
+        let both = accept("br, gzip");
+        assert!(both.br && both.gzip);
+
+        let gz = accept("gzip");
+        assert!(!gz.br && gz.gzip);
+
+        let br = accept("br");
+        assert!(br.br && !br.gzip);
+    }
+
+    #[test]
+    fn tolerates_whitespace_quality_values_and_order() {
+        // q-values are stripped to the token; ordering and spacing don't matter.
+        let enc = accept("gzip;q=0.8,  br;q=1.0, deflate");
+        assert!(enc.br && enc.gzip);
+    }
+
+    #[test]
+    fn absent_or_unknown_encoding_accepts_nothing() {
+        let none = accept("");
+        assert!(!none.br && !none.gzip);
+
+        let other = accept("deflate, zstd");
+        assert!(!other.br && !other.gzip);
     }
 }
