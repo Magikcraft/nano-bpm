@@ -2167,6 +2167,17 @@ fn recovery_snapshot_logs_multiplier_permille() -> u64 {
 /// per-tick climb.
 const LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS: u32 = 2;
 
+/// How long a self-promote waits for the freshly formed single-voter group to
+/// establish leadership (its `current_leader` reads self) before returning. The
+/// hold-down above is a fixed *tick* budget; on its own it cannot outlast a
+/// leader transition that starvation stretches past a few ticks, and each
+/// re-promote rebuilds the group and bumps the epoch — the epoch climb. Making
+/// `promote_partition` block on the leadership *event* (up to this budget)
+/// removes the race: by the time the tick re-checks, leadership is already real.
+/// Sized above the raft election ceiling (`NANOBPMN_RAFT_ELECTION_MAX_MS`,
+/// default 1000ms) with margin for a starved runtime.
+const LEADER_DURABLE_PROMOTE_LEADERSHIP_WAIT_MS: u64 = 3000;
+
 /// Requester-side state for an in-flight leadership hand-off (see
 /// [`ServerImpl::handoff_pending`]). Tracks how long to keep suppressing the
 /// legacy self-promote while waiting for the incumbent to complete the openraft
@@ -9853,7 +9864,22 @@ impl ServerImpl {
     fn next_promotion_epoch(&self, p: u64) -> u64 {
         let me = self.engine.topology().node_id as u64;
         let mut map = self.promotion_epoch.lock().unwrap();
-        let next = map.get(&p).map(|(e, _)| *e).unwrap_or(0) + 1;
+        let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, u64::MAX));
+        // Idempotent for the incumbent-self: only step strictly PAST a *different*
+        // leader's epoch (the fence overtake). If WE already hold `p` at
+        // `cur_epoch`, re-assert the SAME epoch instead of climbing. The reclaim
+        // path can legitimately re-enter (a fresh single-voter group whose
+        // self-election has not yet surfaced in the metrics the recovery tick reads,
+        // so its post-promote hold-down lapses and it re-promotes) — an
+        // unconditional `+1` turned that benign re-entry into an unbounded epoch
+        // climb, the load-sensitive `leader_reject` storm. Tying the increment to
+        // "overtake a peer", not "promote again", makes the reclaim epoch
+        // deterministic (`incumbent + 1`) regardless of scheduling jitter.
+        let next = if cur_leader == me {
+            cur_epoch
+        } else {
+            cur_epoch + 1
+        };
         map.insert(p, (next, me));
         next
     }
@@ -9922,6 +9948,19 @@ impl ServerImpl {
         }
         self.raft.insert(part.clone());
         metrics::record_promote(p);
+        // Block until this fresh single-voter group has actually elected itself
+        // (its `current_leader` metric reads `me`) before returning. A sole voter
+        // normally wins in milliseconds, so this is a no-op wait in the common
+        // case; under CPU starvation it holds until the transition lands. This is
+        // what fences the reclaim epoch: the recovery tick sets a post-promote
+        // hold-down and re-checks leadership after this returns, so if leadership
+        // is already established it never re-promotes `p` at a climbing epoch
+        // while the metric merely lags. The budget comfortably exceeds the raft
+        // election ceiling (`NANOBPMN_RAFT_ELECTION_MAX_MS`, default 1s).
+        part.wait_for_self_leadership(std::time::Duration::from_millis(
+            LEADER_DURABLE_PROMOTE_LEADERSHIP_WAIT_MS,
+        ))
+        .await;
         tracing::info!(
             "leader-durable: node {me} promoted itself leader of partition {p} (epoch {epoch})"
         );
@@ -21069,6 +21108,22 @@ mod clustered_startup_tests {
             node0.next_promotion_epoch(0),
             2,
             "the owner reclaims at incumbent_epoch + 1 after soliciting, not epoch 1"
+        );
+        // Idempotent for the incumbent-self (deterministic, timing-free): re-entering
+        // the reclaim path — which happens under load when a fresh group's election
+        // has not yet surfaced and the post-promote hold-down lapses — must RE-ASSERT
+        // the same epoch, never climb. Before the fix an unconditional `+1` returned
+        // 3 here (then 4, 5, ...), the epoch storm that flaked
+        // `rejoined_owner_reclaims_a_partition_a_peer_leads` on CI with `Some((3,0))`.
+        assert_eq!(
+            node0.next_promotion_epoch(0),
+            2,
+            "a repeated self-promote re-asserts the same epoch (2), it does not climb to 3"
+        );
+        assert_eq!(
+            node0.next_promotion_epoch(0),
+            2,
+            "the epoch stays fenced at 2 no matter how many times the owner re-promotes"
         );
 
         for node in [&node0, &node1, &node2] {
