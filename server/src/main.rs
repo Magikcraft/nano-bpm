@@ -2167,6 +2167,17 @@ fn recovery_snapshot_logs_multiplier_permille() -> u64 {
 /// per-tick climb.
 const LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS: u32 = 2;
 
+/// How long a self-promote waits for the freshly formed single-voter group to
+/// establish leadership (its `current_leader` reads self) before returning. The
+/// hold-down above is a fixed *tick* budget; on its own it cannot outlast a
+/// leader transition that starvation stretches past a few ticks, and each
+/// re-promote rebuilds the group and bumps the epoch — the epoch climb. Making
+/// `promote_partition` block on the leadership *event* (up to this budget)
+/// removes the race: by the time the tick re-checks, leadership is already real.
+/// Sized above the raft election ceiling (`NANOBPMN_RAFT_ELECTION_MAX_MS`,
+/// default 1000ms) with margin for a starved runtime.
+const LEADER_DURABLE_PROMOTE_LEADERSHIP_WAIT_MS: u64 = 3000;
+
 /// Requester-side state for an in-flight leadership hand-off (see
 /// [`ServerImpl::handoff_pending`]). Tracks how long to keep suppressing the
 /// legacy self-promote while waiting for the incumbent to complete the openraft
@@ -9922,6 +9933,19 @@ impl ServerImpl {
         }
         self.raft.insert(part.clone());
         metrics::record_promote(p);
+        // Block until this fresh single-voter group has actually elected itself
+        // (its `current_leader` metric reads `me`) before returning. A sole voter
+        // normally wins in milliseconds, so this is a no-op wait in the common
+        // case; under CPU starvation it holds until the transition lands. This is
+        // what fences the reclaim epoch: the recovery tick sets a post-promote
+        // hold-down and re-checks leadership after this returns, so if leadership
+        // is already established it never re-promotes `p` at a climbing epoch
+        // while the metric merely lags. The budget comfortably exceeds the raft
+        // election ceiling (`NANOBPMN_RAFT_ELECTION_MAX_MS`, default 1s).
+        part.wait_for_self_leadership(std::time::Duration::from_millis(
+            LEADER_DURABLE_PROMOTE_LEADERSHIP_WAIT_MS,
+        ))
+        .await;
         tracing::info!(
             "leader-durable: node {me} promoted itself leader of partition {p} (epoch {epoch})"
         );
