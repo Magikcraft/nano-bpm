@@ -23,6 +23,10 @@ prometheus = { version = "0.13", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+# YAML for the optional runtime config file (ADR 0035). Chosen over TOML to match
+# the Kubernetes ecosystem operators deploy into. Only used to parse a small,
+# flat observability config at startup — no hot-path involvement.
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "fs", "io-util"] }
 # WebSocket *client* for the intra-cluster peer uplink: a node speaks the same
 # Falcon protocol it serves (axum's `ws` feature is server-only). Pinned

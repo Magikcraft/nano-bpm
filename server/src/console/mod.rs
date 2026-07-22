@@ -883,47 +883,17 @@ struct RecoveryDto {
     detail: String,
 }
 
-/// Computes this node's [`RecoveryDto`] from the live Raft metrics of the groups
-/// it hosts. Cheap: a borrow of each hosted partition's metrics watch.
-fn build_recovery(server: &ServerImpl) -> RecoveryDto {
-    let topology = server.engine.topology();
-    let me = topology.node_id;
-    let num_partitions = topology.num_partitions;
-
-    let mut owned = 0u32;
-    let mut reclaimed = 0u32;
-    let mut catching_up = 0u32;
-    let mut handing_off = 0u32;
-    let mut handoff_lag: Option<u64> = None;
-
-    if crate::raft_enabled() && topology.num_nodes() > 1 {
-        for p in 0..num_partitions {
-            let owner = topology.owner_of(p);
-            let part = server.raft_registry().get(p);
-            let live_leader = part
-                .as_ref()
-                .and_then(|part| part.raft.metrics().borrow().current_leader);
-            if owner == me {
-                owned += 1;
-                match live_leader {
-                    Some(l) if l as u32 == me => reclaimed += 1,
-                    // Owned but led by a peer (or no leader yet) => still catching up.
-                    _ => catching_up += 1,
-                }
-            } else if matches!(live_leader, Some(l) if l as u32 == me) {
-                // We lead a partition we don't own: a failover incumbent handing
-                // leadership back to `owner` once it has caught up.
-                handing_off += 1;
-                if let Some(lag) = part
-                    .as_ref()
-                    .and_then(|part| part.replication_lag(owner as u64))
-                {
-                    handoff_lag = Some(handoff_lag.map_or(lag, |m| m.max(lag)));
-                }
-            }
-        }
-    }
-
+/// Assembles a [`RecoveryDto`] from raw partition counts, deriving `recovering`
+/// and the human-readable `detail`. Shared by [`build_recovery`] (live engine
+/// state) and [`metrics_dto_from_prometheus`] (a peer's scraped gauges) so both
+/// render identical recovery summaries.
+fn recovery_dto_from_counts(
+    owned: u32,
+    reclaimed: u32,
+    catching_up: u32,
+    handing_off: u32,
+    handoff_lag: Option<u64>,
+) -> RecoveryDto {
     let recovering = catching_up > 0;
     let detail = if recovering {
         format!("reclaiming {catching_up}/{owned} partitions")
@@ -935,7 +905,6 @@ fn build_recovery(server: &ServerImpl) -> RecoveryDto {
     } else {
         String::new()
     };
-
     RecoveryDto {
         recovering,
         owned,
@@ -945,6 +914,20 @@ fn build_recovery(server: &ServerImpl) -> RecoveryDto {
         handoff_lag_entries: handoff_lag,
         detail,
     }
+}
+
+/// Computes this node's [`RecoveryDto`] from the live Raft metrics of the groups
+/// it hosts, via the base-build [`crate::recovery_counts`] (shared with the
+/// Prometheus `/metrics` exporter so a local and a scraped node agree).
+fn build_recovery(server: &ServerImpl) -> RecoveryDto {
+    let c = crate::recovery_counts(server);
+    recovery_dto_from_counts(
+        c.owned,
+        c.reclaimed,
+        c.catching_up,
+        c.handing_off,
+        c.handoff_lag_entries,
+    )
 }
 
 /// Builds this node's metrics snapshot DTO. Shared by `GET /console/api/metrics`
@@ -1207,10 +1190,11 @@ async fn probe_peer_console_metrics(base_url: &str) -> Result<Option<MetricsDto>
 
 /// Scrapes a console-less peer's always-on `GET {base_url}/metrics` Prometheus
 /// exposition and reconstructs a [`MetricsDto`]. Every dashboard field maps to a
-/// permanent series except `active_instances` (an on-demand read-model `COUNT`,
-/// not a Prometheus gauge — approximated here by `nanobpm_active_backlog`) and
-/// `recovery` (per-partition leadership, not exported — left at its steady-state
-/// default). Both gaps close in Phase 2 once those are promoted to gauges.
+/// permanent series. Since ADR 0035 the two formerly-approximated fields —
+/// `active_instances` (the true active COUNT) and `recovery` (per-partition
+/// leadership) — are exported as scrape-computed gauges, so a console-less peer
+/// now reports full fidelity; the old approximations remain only as a fallback
+/// for a pre-0035 peer (see [`metrics_dto_from_prometheus`]).
 async fn probe_peer_prometheus_metrics(base_url: &str) -> Result<MetricsDto, String> {
     let (status, body) = peer_http_get(base_url, "/metrics").await?;
     if !status.is_success() {
@@ -1262,6 +1246,13 @@ impl PromScrape {
             .unwrap_or(0.0)
     }
 
+    /// Value of a bare (label-free) series if present, else `None` — lets a
+    /// caller distinguish a legitimately-zero gauge from an absent one (e.g. a
+    /// pre-ADR-0035 peer that doesn't export it, so the caller can fall back).
+    fn get(&self, name: &str) -> Option<f64> {
+        self.0.iter().find(|(k, _)| k == name).map(|(_, v)| *v)
+    }
+
     /// Value of the first series named `name` whose label set contains `frag`
     /// (e.g. `protocol="rest"`).
     fn labeled(&self, name: &str, frag: &str) -> f64 {
@@ -1287,8 +1278,8 @@ impl PromScrape {
 
 /// Reconstructs a [`MetricsDto`] from a peer's Prometheus scrape. Mirrors
 /// [`build_local_metrics`] field-for-field so a console-less peer reports the
-/// same shape as a console peer (see [`probe_peer_prometheus_metrics`] for the
-/// two approximated fields).
+/// same shape — and, since ADR 0035, the same fidelity — as a console peer,
+/// falling back to the old proxies only for a pre-0035 peer.
 fn metrics_dto_from_prometheus(text: &str) -> MetricsDto {
     let s = PromScrape::parse(text);
 
@@ -1324,9 +1315,13 @@ fn metrics_dto_from_prometheus(text: &str) -> MetricsDto {
 
     MetricsDto {
         timestamp_ms,
-        // No always-on read-model COUNT gauge; active_backlog (created-completed)
-        // is the closest permanent proxy until Phase 2 exports the true count.
-        active_instances: s.gauge("nanobpm_active_backlog") as i64,
+        // Prefer the scrape-computed true COUNT (ADR 0035); fall back to the
+        // active_backlog (created−completed) proxy for a pre-0035 peer that
+        // doesn't export it.
+        active_instances: s
+            .get("nanobpm_active_instances")
+            .map(|v| v as i64)
+            .unwrap_or_else(|| s.gauge("nanobpm_active_backlog") as i64),
 
         creates_rest,
         creates_stream,
@@ -1383,9 +1378,25 @@ fn metrics_dto_from_prometheus(text: &str) -> MetricsDto {
             as i64,
         admission_shed_total: s.sum("nanobpm_admission_shed_total") as u64,
 
-        // Per-partition leadership is not exported to Prometheus; a remote
-        // console-less peer reports steady-state recovery until Phase 2.
-        recovery: RecoveryDto::default(),
+        // Per-partition leadership is now exported on scrape (ADR 0035); read it
+        // back when present, else default (pre-0035 peer).
+        recovery: recovery_from_prometheus(&s),
+    }
+}
+
+/// Reconstructs a [`RecoveryDto`] from a peer's scraped recovery gauges (ADR
+/// 0035). Returns the steady-state default when none are present (a pre-0035
+/// peer that doesn't export them).
+fn recovery_from_prometheus(s: &PromScrape) -> RecoveryDto {
+    match s.get("nanobpm_partition_owned") {
+        None => RecoveryDto::default(),
+        Some(owned) => recovery_dto_from_counts(
+            owned as u32,
+            s.gauge("nanobpm_partition_reclaimed") as u32,
+            s.gauge("nanobpm_partition_catching_up") as u32,
+            s.gauge("nanobpm_partition_handing_off") as u32,
+            s.get("nanobpm_handoff_lag_entries").map(|v| v as u64),
+        ),
     }
 }
 
@@ -2896,16 +2907,56 @@ nanobpm_admission_shed_total{reason="create_queue"} 6
         assert_eq!(m.sla_mode, "admission");
         assert_eq!(m.pending_create_queue, 3);
         assert_eq!(m.active_backlog, 42);
-        // active_instances proxies active_backlog until Phase 2.
+        // No nanobpm_active_instances in this (pre-0035) sample, so it falls
+        // back to the active_backlog proxy.
         assert_eq!(m.active_instances, 42);
         assert_eq!(m.admission_backlog_limit, 500);
         assert_eq!(m.admission_create_queue_limit, 900);
         // Summed across both shed reasons.
         assert_eq!(m.admission_shed_total, 10);
 
-        // Leadership isn't in Prometheus — steady-state default.
+        // No recovery gauges in this (pre-0035) sample — steady-state default.
         assert!(!m.recovery.recovering);
         assert_eq!(m.recovery.owned, 0);
+    }
+
+    /// A node exporting the ADR 0035 scrape-computed gauges reports full
+    /// fidelity: the true active COUNT and per-partition recovery, not proxies.
+    #[test]
+    fn full_fidelity_reads_promoted_gauges() {
+        let sample = r#"
+nanobpm_active_backlog 42
+nanobpm_active_instances 37
+nanobpm_partition_owned 4
+nanobpm_partition_reclaimed 2
+nanobpm_partition_catching_up 2
+nanobpm_partition_handing_off 0
+"#;
+        let m = metrics_dto_from_prometheus(sample);
+        // True COUNT wins over the active_backlog proxy.
+        assert_eq!(m.active_instances, 37);
+        assert!(m.recovery.recovering, "catching_up > 0 => recovering");
+        assert_eq!(m.recovery.owned, 4);
+        assert_eq!(m.recovery.reclaimed, 2);
+        assert_eq!(m.recovery.catching_up, 2);
+        assert_eq!(m.recovery.detail, "reclaiming 2/4 partitions");
+    }
+
+    /// The incumbent (handing-off) side, including the optional lag gauge.
+    #[test]
+    fn full_fidelity_handoff_side() {
+        let sample = r#"
+nanobpm_partition_owned 0
+nanobpm_partition_reclaimed 0
+nanobpm_partition_catching_up 0
+nanobpm_partition_handing_off 3
+nanobpm_handoff_lag_entries 1200
+"#;
+        let m = metrics_dto_from_prometheus(sample);
+        assert!(!m.recovery.recovering);
+        assert_eq!(m.recovery.handing_off, 3);
+        assert_eq!(m.recovery.handoff_lag_entries, Some(1200));
+        assert_eq!(m.recovery.detail, "handing back 3 (lag 1200)");
     }
 
     #[test]

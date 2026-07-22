@@ -35,6 +35,7 @@ mod raft_net;
 mod readstore;
 mod recovery_throttle;
 mod remote_sink;
+mod runtime_config;
 mod seglog;
 mod stub_impls;
 mod varspill;
@@ -14300,13 +14301,83 @@ async fn instances_debug_body(server: &ServerImpl) -> Response {
         .expect("instances debug response builds")
 }
 
-async fn metrics_handler() -> Response {
+/// Per-node partition leadership/recovery counts, derived purely from engine +
+/// Raft state (topology ownership vs. live leaders). Base-build (non-console) so
+/// both the Prometheus `/metrics` exporter and the console's richer
+/// `RecoveryDto` share one source of truth. Cheap: a borrow of each hosted
+/// partition's Raft metrics watch. All-zero in steady single-node / off-Raft.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RecoveryCounts {
+    /// Partitions this node statically owns (its steady-state leadership set).
+    pub owned: u32,
+    /// Owned partitions this node currently leads again (reclaimed / steady).
+    pub reclaimed: u32,
+    /// Owned partitions currently led by a peer failover incumbent — the ones
+    /// this node is still catching up on.
+    pub catching_up: u32,
+    /// Partitions this node leads on behalf of a peer owner (this node is the
+    /// failover incumbent, handing leadership back).
+    pub handing_off: u32,
+    /// Largest replication lag (log entries) of a returning owner this node is
+    /// handing a partition back to, when known (incumbent side only).
+    pub handoff_lag_entries: Option<u64>,
+}
+
+/// Computes this node's [`RecoveryCounts`] from the live Raft metrics of the
+/// partitions it hosts. See [`RecoveryCounts`]. Only meaningful with Raft
+/// enabled and more than one node; otherwise all-zero.
+pub(crate) fn recovery_counts(server: &ServerImpl) -> RecoveryCounts {
+    let topology = server.engine.topology();
+    let me = topology.node_id;
+    let num_partitions = topology.num_partitions;
+
+    let mut c = RecoveryCounts::default();
+    if !(raft_enabled() && topology.num_nodes() > 1) {
+        return c;
+    }
+
+    for p in 0..num_partitions {
+        let owner = topology.owner_of(p);
+        let part = server.raft_registry().get(p);
+        let live_leader = part
+            .as_ref()
+            .and_then(|part| part.raft.metrics().borrow().current_leader);
+        if owner == me {
+            c.owned += 1;
+            match live_leader {
+                Some(l) if l as u32 == me => c.reclaimed += 1,
+                // Owned but led by a peer (or no leader yet) => still catching up.
+                _ => c.catching_up += 1,
+            }
+        } else if matches!(live_leader, Some(l) if l as u32 == me) {
+            // We lead a partition we don't own: a failover incumbent handing
+            // leadership back to `owner` once it has caught up.
+            c.handing_off += 1;
+            if let Some(lag) = part
+                .as_ref()
+                .and_then(|part| part.replication_lag(owner as u64))
+            {
+                c.handoff_lag_entries = Some(c.handoff_lag_entries.map_or(lag, |m| m.max(lag)));
+            }
+        }
+    }
+    c
+}
+
+/// Builds the Prometheus text-exposition body for `GET /metrics`, including the
+/// base registry, jemalloc gauges, and two **scrape-computed** gauges promoted
+/// so console-less nodes report full fidelity (ADR 0035): the live active
+/// process-instance count and per-partition recovery/leadership. Both are
+/// computed here, on scrape — never in the engine tick loop — so a scrape is
+/// full-fidelity yet imposes zero steady-state cost and never perturbs a running
+/// perf demo.
+fn metrics_body(server: &ServerImpl) -> String {
+    use std::fmt::Write as _;
     let mut body = metrics::gather();
     // jemalloc memory decomposition: resident (≈RSS) vs allocated (true live
     // heap). A large resident−allocated gap = allocator-retained dirty pages
     // (reclaimable), not live data — the key signal for diagnosing RSS balloons.
     if let Some(m) = memory::stats() {
-        use std::fmt::Write as _;
         let _ = write!(
             body,
             "# HELP nanobpm_jemalloc_bytes jemalloc memory accounting by kind.\n\
@@ -14319,6 +14390,53 @@ async fn metrics_handler() -> Response {
             m.allocated, m.active, m.resident, m.mapped, m.retained,
         );
     }
+
+    // Scrape-computed active-instance COUNT. Deliberately not an always-on gauge
+    // (kept out of the hot path); computed here so a scrape reports the true
+    // count rather than the created−completed backlog proxy.
+    let _ = write!(
+        body,
+        "# HELP nanobpm_active_instances Live active process-instance count \
+             (created, not yet completed), computed on scrape.\n\
+         # TYPE nanobpm_active_instances gauge\n\
+         nanobpm_active_instances {}\n",
+        server.store.active_instance_count(),
+    );
+
+    // Scrape-computed per-partition recovery/leadership, so a console reading a
+    // console-less peer's /metrics reports its true "up but catching up" state
+    // rather than a steady-state default.
+    let rc = recovery_counts(server);
+    let _ = write!(
+        body,
+        "# HELP nanobpm_partition_owned Partitions this node statically owns.\n\
+         # TYPE nanobpm_partition_owned gauge\n\
+         nanobpm_partition_owned {}\n\
+         # HELP nanobpm_partition_reclaimed Owned partitions this node currently leads (reclaimed).\n\
+         # TYPE nanobpm_partition_reclaimed gauge\n\
+         nanobpm_partition_reclaimed {}\n\
+         # HELP nanobpm_partition_catching_up Owned partitions still led by a peer incumbent.\n\
+         # TYPE nanobpm_partition_catching_up gauge\n\
+         nanobpm_partition_catching_up {}\n\
+         # HELP nanobpm_partition_handing_off Partitions this node leads on behalf of a peer owner.\n\
+         # TYPE nanobpm_partition_handing_off gauge\n\
+         nanobpm_partition_handing_off {}\n",
+        rc.owned, rc.reclaimed, rc.catching_up, rc.handing_off,
+    );
+    if let Some(lag) = rc.handoff_lag_entries {
+        let _ = write!(
+            body,
+            "# HELP nanobpm_handoff_lag_entries Largest replication lag (entries) of a returning owner.\n\
+             # TYPE nanobpm_handoff_lag_entries gauge\n\
+             nanobpm_handoff_lag_entries {lag}\n",
+        );
+    }
+
+    body
+}
+
+async fn metrics_handler(server: ServerImpl) -> Response {
+    let body = metrics_body(&server);
     Response::builder()
         .status(StatusCode::OK)
         .header(
@@ -14541,9 +14659,14 @@ fn gateway_usage() -> String {
          Starts the gateway server. Configuration is via environment variables.\n\n\
          OPTIONS:\n  \
          -h, --help       Print this help\n  \
-         -V, --version    Print version\n\n\
+         -V, --version    Print version\n  \
+         --config <path>  Path to a YAML config file (also NANOBPMN_CONFIG)\n  \
+         --metrics <on|off>  Serve the Prometheus /metrics endpoint (default on)\n  \
+         --no-metrics     Disable the Prometheus /metrics endpoint\n\n\
          COMMON ENVIRONMENT VARIABLES:\n  \
          PORT                  TCP port to listen on (default 8080)\n  \
+         NANOBPMN_METRICS      on (default) | off — serve the /metrics endpoint\n  \
+         NANOBPMN_CONFIG       Path to a YAML config file (see docs/adr/0035)\n  \
          NANOBPMN_DATA_DIR     Directory for the journal + read-model database\n  \
          NANOBPMN_PARTITIONS   Partition count for the engine\n  \
          NANOBPMN_IDLE_PURGE_MS  Idle memory-purge interval ms (0 = off)\n  \
@@ -14579,6 +14702,10 @@ async fn main() {
         .with_writer(log_writer)
         .init();
     install_panic_hook();
+    // Runtime observability config (ADR 0035): resolves whether the Prometheus
+    // `/metrics` endpoint is served, from CLI flag > config file > env var >
+    // default. Resolved once here; used when assembling the router below.
+    let obs_config = crate::runtime_config::ObservabilityConfig::resolve();
     // Enable jemalloc's background page-decay thread where supported (Linux), so
     // freed memory returns to the OS automatically; on macOS the idle-purge tick
     // forces it instead.
@@ -15249,6 +15376,9 @@ async fn main() {
     // job state breakdown per led partition — used to characterize wedged
     // instances that never reach a terminal state after load drains).
     let dbg_server = server.clone();
+    // Captured for the Prometheus `/metrics` route (gated on obs_config.metrics),
+    // computed on scrape from live engine + Raft state.
+    let metrics_server = server.clone();
     // Captured for the /debug/peers diagnostic route (this node's gossiped
     // peer-pressure view + own create-load index — used to confirm whether a
     // rejoining peer is pinned out of create placement by a stale SHED reading).
@@ -15318,7 +15448,6 @@ async fn main() {
 
     let mut app = nanobpm_gateway_rest::server::new::<ServerImpl, ServerImpl, (), ()>(server)
         .merge(cs_router)
-        .route("/metrics", axum::routing::get(metrics_handler))
         .route(
             "/debug/raft",
             axum::routing::get(move || {
@@ -15363,6 +15492,21 @@ async fn main() {
             "/v2/system/memory",
             axum::routing::get(system_memory_handler),
         );
+
+    // Prometheus `/metrics` — registered only when enabled (ADR 0035). When
+    // disabled it 404s, removing the endpoint from the attack surface. Computed
+    // on scrape, so it costs nothing at steady state.
+    if obs_config.metrics {
+        app = app.route(
+            "/metrics",
+            axum::routing::get(move || {
+                let srv = metrics_server.clone();
+                async move { metrics_handler(srv).await }
+            }),
+        );
+    } else {
+        tracing::info!("Prometheus /metrics endpoint disabled by configuration");
+    }
 
     #[cfg(feature = "console")]
     {
