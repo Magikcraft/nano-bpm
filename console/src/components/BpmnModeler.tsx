@@ -6,6 +6,13 @@ import {
   ZeebePropertiesProviderModule,
 } from "bpmn-js-properties-panel";
 import ZeebeModdle from "zeebe-bpmn-moddle/resources/zeebe.json";
+import {
+  CloudElementTemplatesCoreModule,
+  CloudElementTemplatesPropertiesProviderModule,
+  type ElementTemplatesService,
+} from "bpmn-js-element-templates";
+import CloudBehaviorsModule from "camunda-bpmn-js-behaviors/lib/camunda-cloud";
+import { urbanComponents } from "../lib/urbanComponents";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
@@ -22,6 +29,54 @@ interface Canvas {
 interface Modeling {
   updateProperties(element: unknown, props: Record<string, unknown>): void;
 }
+
+// --- Urban components palette (ADR 0033) -------------------------------------
+// A diagram-js palette provider that adds an entry per installed Urban component
+// (an element template). Dragging one onto the canvas stamps a service task
+// pre-bound to the template's task type + input/output mappings — the "drag a
+// Delphi component off the palette" loop. Runtime behaviour is the matching
+// `workers[].taskType` (ADR 0022); the properties panel is the Object Inspector.
+interface PaletteService {
+  registerProvider(provider: unknown): void;
+}
+interface CreateService {
+  start(event: Event, shape: unknown): void;
+}
+
+class UrbanComponentsPaletteProvider {
+  // Explicit annotation so didi injection survives Vite minification.
+  static $inject = ["palette", "create", "elementTemplates"];
+  private readonly create: CreateService;
+  private readonly elementTemplates: ElementTemplatesService;
+
+  constructor(palette: PaletteService, create: CreateService, elementTemplates: ElementTemplatesService) {
+    this.create = create;
+    this.elementTemplates = elementTemplates;
+    palette.registerProvider(this);
+  }
+
+  getPaletteEntries(): Record<string, unknown> {
+    const entries: Record<string, unknown> = {};
+    for (const tpl of urbanComponents) {
+      const start = (event: Event) => {
+        const shape = this.elementTemplates.createElement(tpl);
+        this.create.start(event, shape);
+      };
+      entries[`create.urban-${tpl.id}`] = {
+        group: "urban-components",
+        className: "bpmn-icon-service-task",
+        title: tpl.name,
+        action: { dragstart: start, click: start },
+      };
+    }
+    return entries;
+  }
+}
+
+const urbanComponentsPaletteModule = {
+  __init__: ["urbanComponentsPaletteProvider"],
+  urbanComponentsPaletteProvider: ["type", UrbanComponentsPaletteProvider],
+};
 
 /// Imperative handle the Modeler view drives. Keeps the live bpmn document inside
 /// this component and exposes just the operations the toolbar needs.
@@ -108,10 +163,26 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           BpmnPropertiesPanelModule,
           BpmnPropertiesProviderModule,
           ZeebePropertiesProviderModule,
+          // Element templates (ADR 0033): the component model. Core registers the
+          // `elementTemplates` service + create-append behaviour; the provider
+          // renders the "Template" group (the component's Object Inspector); the
+          // cloud behaviours keep Zeebe extension elements consistent on edits.
+          CloudElementTemplatesCoreModule,
+          CloudElementTemplatesPropertiesProviderModule,
+          CloudBehaviorsModule,
+          urbanComponentsPaletteModule,
         ],
         moddleExtensions: { zeebe: ZeebeModdle },
       });
       modelerRef.current = modeler;
+      // Install the bundled Urban components so the palette + template chooser
+      // surface them. In the shipped design these come from installed component
+      // packs (ADR 0007) and the project; the spike bundles a sample set.
+      try {
+        modeler.get<ElementTemplatesService>("elementTemplates").set(urbanComponents);
+      } catch {
+        // Non-fatal: without the core module the palette simply shows nothing.
+      }
       const handleChanged = () => {
         if (suppressChange.current) return;
         onChangeRef.current?.();

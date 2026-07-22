@@ -45,6 +45,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0030](0030-domain-process-duality.md) | The domain–process duality: directed evolution of typed state | Proposed | 2026-07-21 |
 | [0031](0031-process-relational-mapper.md) | The Process-Relational Mapper (an ORM whose third bank is the engine) | Proposed | 2026-07-21 |
 | [0032](0032-domain-resource-api.md) | The domain-resource API (the Kogito seam: process instances as first-class REST resources) | Proposed | 2026-07-22 |
+| [0033](0033-urban-element-templates-first-class-components.md) | Element templates as first-class Urban components (the Delphi palette for the process canvas) | Proposed | 2026-07-22 |
 
 ## Reading paths
 
@@ -63,6 +64,8 @@ The ADRs fall into a few coherent threads:
   domain–process duality: why Urban is a distinct kind of computing) and its mapping mechanism **0031**
   (the Process-Relational Mapper: how one domain type stays coherent across form, engine, and database),
   and its API surface **0032** (the domain-resource API: the domain object as a first-class, typed,
-  self-describing REST resource whose CRUD verbs are its lifecycle — the Kogito seam).
+  self-describing REST resource whose CRUD verbs are its lifecycle — the Kogito seam), and its
+  component palette **0033** (element templates as first-class Urban components: the Delphi
+  drag-a-component ergonomic returns to the process canvas, fusing design/runtime/data).
 - **Philosophy / signature**: 0015 (artists sign their work) and 0030 (the computational primitive) —
   the pieces that state *why*, not just *what*.
