@@ -19539,7 +19539,18 @@ mod clustered_startup_tests {
         assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
 
         // Baseline: the leader (node 0) serves the read locally; the followers
-        // forward it to the leader.
+        // forward it to the leader. Leadership discovery settles asynchronously,
+        // so poll until the routes reflect a known leader rather than reading a
+        // single racy snapshot a starved CI runner can catch mid-election.
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if node0.read_route(instance_key).is_none()
+                && node1.read_route(instance_key) == Some(0)
+                && node2.read_route(instance_key) == Some(0)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(
             node0.read_route(instance_key),
             None,
