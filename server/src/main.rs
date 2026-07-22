@@ -14662,10 +14662,15 @@ fn gateway_usage() -> String {
          -V, --version    Print version\n  \
          --config <path>  Path to a YAML config file (also NANOBPMN_CONFIG)\n  \
          --metrics <on|off>  Serve the Prometheus /metrics endpoint (default on)\n  \
-         --no-metrics     Disable the Prometheus /metrics endpoint\n\n\
+         --no-metrics     Disable the Prometheus /metrics endpoint\n  \
+         --console-peer <url>  Run as a standalone off-cluster console scraping this\n                        \
+         gateway peer (repeatable). Engine-less; observability views only (ADR 0035)\n  \
+         --console-standalone <csv>  Same, as a comma-separated peer URL list\n\n\
          COMMON ENVIRONMENT VARIABLES:\n  \
          PORT                  TCP port to listen on (default 8080)\n  \
          NANOBPMN_METRICS      on (default) | off — serve the /metrics endpoint\n  \
+         NANOBPMN_CONSOLE_STANDALONE  Comma-separated peer URLs — run as a standalone\n                        \
+         off-cluster console instead of an engine (ADR 0035 §B)\n  \
          NANOBPMN_CONFIG       Path to a YAML config file (see docs/adr/0035)\n  \
          NANOBPMN_DATA_DIR     Directory for the journal + read-model database\n  \
          NANOBPMN_PARTITIONS   Partition count for the engine\n  \
@@ -14706,6 +14711,16 @@ async fn main() {
     // `/metrics` endpoint is served, from CLI flag > config file > env var >
     // default. Resolved once here; used when assembling the router below.
     let obs_config = crate::runtime_config::ObservabilityConfig::resolve();
+    // Standalone off-cluster console (ADR 0035 §B): when peers are configured,
+    // this process runs as an engine-less console that scrapes those peers over
+    // HTTP and serves the observability subset of the console. It never starts
+    // the engine, journal, or Raft, so branch out here — before any of that
+    // setup — and serve until shutdown.
+    #[cfg(feature = "console")]
+    if obs_config.is_standalone_console() {
+        console::standalone::run(obs_config.standalone_console_peers.clone()).await;
+        return;
+    }
     // Enable jemalloc's background page-decay thread where supported (Linux), so
     // freed memory returns to the OS automatically; on macOS the idle-purge tick
     // forces it instead.
