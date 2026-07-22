@@ -11,10 +11,27 @@ const backend = process.env.NANO_BACKEND ?? "http://127.0.0.1:8080";
 // by side; override with CONSOLE_PORT if 5173 is taken.
 const port = Number(process.env.CONSOLE_PORT ?? 5173);
 
+// The console ships two build profiles (ADR 0034): the full "studio" RAD IDE and
+// the lean "observe" operator surface. The profile is chosen at build time via
+// `VITE_CONSOLE_PROFILE` (default "studio"). We surface it to the app two ways:
+//   - `import.meta.env.VITE_CONSOLE_PROFILE` — for ordinary runtime gates.
+//   - a `define`d `__STUDIO__` boolean literal — for the `lazy(() => import())`
+//     anchors. `define` is applied by esbuild during *transform*, so the guarded
+//     `import()` folds to dead code before Rollup ever walks it. That matters: an
+//     imported `IS_STUDIO` const only tree-shakes *after* transform, by which
+//     point Vite's `?worker` plugin has already emitted Monaco's (6MB) worker
+//     chunks as orphans. A `define`d literal drops the import target outright.
+const profile =
+  process.env.VITE_CONSOLE_PROFILE === "observe" ? "observe" : "studio";
+const isStudio = profile === "studio";
+
 // The console is served by the gateway under the `/console/` path prefix
 // (see server/src/console/mod.rs), so the built asset URLs must be prefixed too.
 export default defineConfig({
   base: "/console/",
+  define: {
+    __STUDIO__: JSON.stringify(isStudio),
+  },
   plugins: [react(), tailwindcss()],
   // `@bpmn-io/form-js-editor` pins its own nested `preact` (10.15.x) while the
   // form *viewer* it renders through — plus `@bpmn-io/properties-panel` and

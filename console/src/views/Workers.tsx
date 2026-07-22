@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ComponentType } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createLibFile,
@@ -22,10 +22,28 @@ import { exportWorkersApp, type WorkerLogLine } from "../lib/api";
 import { languageForFile } from "../lib/editorLang";
 import type { ExtraModel } from "../components/CodeEditor";
 import { Button, PageHeader } from "../components/ui";
+import { IS_STUDIO } from "../lib/profile";
+
+type CodeEditorProps = {
+  value: string;
+  language: string;
+  path?: string;
+  readOnly?: boolean;
+  extraModels?: ExtraModel[];
+  onChange: (value: string) => void;
+  onSave?: () => void;
+};
 
 // Monaco is multi-MB; load it as a separate chunk only when an editor is shown
-// so the initial console bundle stays lean.
-const CodeEditor = lazy(() => import("../components/CodeEditor"));
+// so the initial console bundle stays lean. Gated on the `__STUDIO__` define
+// (ADR 0034): the operator ("observe") build hides the worker-authoring tab, and
+// guarding the `import()` on the folded literal lets esbuild drop the Monaco
+// chunk (ts.worker + typescript + editor, ~3.25MB gzip plus its orphan worker
+// bundles) from that build during transform. The `() => null` fallback keeps the
+// type honest and can never render (its call sites live behind IS_STUDIO).
+const CodeEditor: ComponentType<CodeEditorProps> = __STUDIO__
+  ? (lazy(() => import("../components/CodeEditor")) as ComponentType<CodeEditorProps>)
+  : () => null;
 
 function phaseBadge(phase: WorkerPhase): { label: string; cls: string; dot: string } {
   switch (phase) {
@@ -52,7 +70,9 @@ function fmtUptime(ms: number): string {
 
 export default function Workers() {
   const queryClient = useQueryClient();
-  const [tab, setTab] = useState<"editor" | "running">("editor");
+  const [tab, setTab] = useState<"editor" | "running">(
+    IS_STUDIO ? "editor" : "running",
+  );
   const [selected, setSelected] = useState<string | null>(null);
   // When true, the editor pane shows the shared `@lib/` library instead of a worker.
   const [showLib, setShowLib] = useState(false);
@@ -169,10 +189,17 @@ export default function Workers() {
       <div className="border-b border-edge px-6 pt-4">
         <PageHeader
           title="Embedded Workers"
-          subtitle="Author TypeScript job workers and run them as sandboxed Deno processes over the Falcon."
+          subtitle={
+            IS_STUDIO
+              ? "Author TypeScript job workers and run them as sandboxed Deno processes over the Falcon."
+              : "Monitor job workers running as sandboxed Deno processes over the Falcon."
+          }
           actions={
             <div className="flex gap-1 rounded-lg bg-inset p-1 text-sm">
-              {(["editor", "running"] as const).map((t) => (
+              {(IS_STUDIO
+                ? (["editor", "running"] as const)
+                : (["running"] as const)
+              ).map((t) => (
                 <button
                   key={t}
                   onClick={() => setTab(t)}

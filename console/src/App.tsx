@@ -11,16 +11,29 @@ import { useTheme } from "./theme/ThemeProvider";
 import { getExtensions, getMarketplace, getTopology } from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
+import { IS_STUDIO } from "./lib/profile";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
-const Projects = lazy(() => import("./views/Projects"));
-const ProjectWorkspace = lazy(() => import("./views/ProjectWorkspace"));
-const Explorer = lazy(() => import("./views/Explorer"));
+//
+// The studio-only views are additionally guarded by the compile-time
+// `__STUDIO__` literal (ADR 0034): in an `observe` build it folds to `false`, so
+// esbuild drops these `import()` anchors during transform and the IDE chunks
+// (Monaco's ts.worker/typescript, the bpmn/dmn/form modeler bundle) — and the
+// orphan `?worker` bundles Vite's worker plugin would otherwise emit — are never
+// produced. The anchors must guard on the raw `__STUDIO__` define, not the
+// imported `IS_STUDIO` const: an imported binding only tree-shakes after
+// transform, too late to stop the worker emit (see profile.ts).
+const Projects = __STUDIO__ ? lazy(() => import("./views/Projects")) : null;
+const ProjectWorkspace = __STUDIO__
+  ? lazy(() => import("./views/ProjectWorkspace"))
+  : null;
+const Extensions = __STUDIO__ ? lazy(() => import("./views/Extensions")) : null;
+// Operator surface — always present in both profiles.
 const Workers = lazy(() => import("./views/Workers"));
 const Metrics = lazy(() => import("./views/Metrics"));
 const Traces = lazy(() => import("./views/Traces"));
-const Extensions = lazy(() => import("./views/Extensions"));
+const Explorer = lazy(() => import("./views/Explorer"));
 const Config = lazy(() => import("./views/Config"));
 const Credits = lazy(() => import("./views/Credits"));
 
@@ -112,15 +125,19 @@ const icons = {
   ),
 } as const;
 
-const navItems: { to: string; label: string; icon: ReactNode }[] = [
-  { to: "/projects", label: "Projects", icon: icons.projects },
-  { to: "/extensions", label: "Extensions", icon: icons.extensions },
+const navItems: { to: string; label: string; icon: ReactNode; studio?: boolean }[] = [
+  { to: "/projects", label: "Projects", icon: icons.projects, studio: true },
+  { to: "/extensions", label: "Extensions", icon: icons.extensions, studio: true },
   { to: "/topology", label: "Topology", icon: icons.topology },
   { to: "/metrics", label: "Metrics", icon: icons.metrics },
   { to: "/explorer", label: "Explorer", icon: icons.explorer },
   { to: "/traces", label: "Traces", icon: icons.traces },
   { to: "/workers", label: "Workers", icon: icons.workers },
-];
+].filter((i) => IS_STUDIO || !i.studio);
+
+// Where "home" lands: the maker starts in Projects; the operator ("observe"
+// build, no Projects route) starts on Topology.
+const HOME_ROUTE = IS_STUDIO ? "/projects" : "/topology";
 
 function railItemClass(active: boolean): string {
   return `relative flex items-center gap-2.5 rounded-md px-3 py-2 text-sm no-underline transition-colors ${
@@ -216,6 +233,9 @@ export default function App() {
   // this is not gated by npm's search-index lag.
   const [updateCount, setUpdateCount] = useState(0);
   useEffect(() => {
+    // Studio-only: the operator ("observe") build has no Extensions view, so
+    // there's no badge to feed and no reason to poll npm.
+    if (!IS_STUDIO) return;
     let cancelled = false;
     const poll = () => {
       if (typeof document !== "undefined" && document.hidden) return;
@@ -249,6 +269,9 @@ export default function App() {
   // fast path; this navigation-triggered refetch is the safety net for any
   // other codepath that might mutate the extension set.
   useEffect(() => {
+    // The ext→language + IntelliSense maps only matter to the Monaco editors,
+    // which the operator ("observe") build doesn't ship.
+    if (!IS_STUDIO) return;
     getExtensions({ throwOnError: true })
       .then(({ data }) => {
         registerFileTypesFromOverview(data);
@@ -353,19 +376,23 @@ export default function App() {
           }
         >
           <Routes>
-            <Route path="/" element={<Navigate to="/projects" replace />} />
-            <Route path="/projects" element={<Projects />} />
-            <Route path="/projects/:name" element={<ProjectWorkspace />} />
-            <Route path="/extensions" element={<Extensions />} />
+            <Route path="/" element={<Navigate to={HOME_ROUTE} replace />} />
+            {/* Studio-only routes — absent (and tree-shaken) in observe builds.
+                RR6 ignores falsy children, so a null component drops the route. */}
+            {Projects && <Route path="/projects" element={<Projects />} />}
+            {ProjectWorkspace && (
+              <Route path="/projects/:name" element={<ProjectWorkspace />} />
+            )}
+            {Extensions && <Route path="/extensions" element={<Extensions />} />}
             <Route path="/config" element={<Config />} />
             <Route path="/credits" element={<Credits />} />
             <Route path="/topology" element={<Topology />} />
             <Route path="/metrics" element={<Metrics />} />
-            <Route path="/modeler" element={<Navigate to="/projects" replace />} />
+            <Route path="/modeler" element={<Navigate to={HOME_ROUTE} replace />} />
             <Route path="/explorer" element={<Explorer />} />
             <Route path="/traces" element={<Traces />} />
             <Route path="/workers" element={<Workers />} />
-            <Route path="*" element={<Navigate to="/projects" replace />} />
+            <Route path="*" element={<Navigate to={HOME_ROUTE} replace />} />
           </Routes>
         </Suspense>
       </main>
