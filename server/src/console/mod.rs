@@ -47,8 +47,20 @@ pub mod workspace;
 
 /// The built frontend bundle. Path is relative to this source file
 /// (`server/src/console/`), so it points at the repo-level `console/dist`.
+///
+/// ADR 0034 ships two console build profiles. The default `console` feature
+/// bakes in the full "studio" RAD IDE from `console/dist`. The additive
+/// `console-observe` feature swaps in the lean operator bundle from
+/// `console/dist-observe` (~158KB gzip vs ~4.7MB) — build it first with
+/// `npm run build:observe` in `console/`. Only one `Assets` is compiled.
+#[cfg(not(feature = "console-observe"))]
 #[derive(RustEmbed)]
 #[folder = "../console/dist"]
+struct Assets;
+
+#[cfg(feature = "console-observe")]
+#[derive(RustEmbed)]
+#[folder = "../console/dist-observe"]
 struct Assets;
 
 /// The standalone marketing landing page (self-contained: inline canvas particle

@@ -7,7 +7,9 @@
   "scripts": {
     "dev": "vite",
     "gen:api": "openapi-ts",
-    "build": "npm run gen:api && node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && node scripts/build-whitepaper.mjs && tsc && vite build",
+    "build:assets": "npm run gen:api && node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && node scripts/build-whitepaper.mjs && tsc",
+    "build": "npm run build:assets && vite build",
+    "build:observe": "npm run build:assets && VITE_CONSOLE_PROFILE=observe vite build --outDir dist-observe --emptyOutDir",
     "preview": "vite preview"
   },
   "dependencies": {

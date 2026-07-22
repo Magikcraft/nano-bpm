@@ -86,6 +86,11 @@ serde_json = "1"
 # does not require a built frontend under ../console/dist.
 [features]
 console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/process", "tokio/io-util"]
+# ADR 0034: build the console with the lean "observe" operator profile instead of
+# the full "studio" IDE. Additive over `console` — it only swaps the embedded
+# bundle from `console/dist` to `console/dist-observe` (~158KB gzip vs ~4.7MB),
+# so build that folder first with `npm run build:observe` in `console/`.
+console-observe = ["console"]
 # Diagnostic-only: builds jemalloc with heap profiling (--enable-prof) and turns
 # on sampled allocation-backtrace capture at startup. Adds per-allocation
 # sampling overhead, so it is NEVER enabled in a production build — it exists to
