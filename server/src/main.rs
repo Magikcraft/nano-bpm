@@ -9196,23 +9196,52 @@ impl ServerImpl {
                 }
                 // Leader-durable: register the remaining replicas as non-voting
                 // learners so they tail the log without gating the write quorum.
+                // `add_learner` is a membership-change write that requires this node
+                // to be an established leader that has committed a blank entry in its
+                // current term; immediately after `initialize` that may not have
+                // happened yet, so an early call can transiently fail
+                // (`ForwardToLeader`/`ChangeMembershipError`). It must therefore be
+                // RETRIED until it lands (mirroring the `initialize` loop above) —
+                // a fire-and-forget call silently drops the learner, breaking the
+                // leader-durable contract that every replica tails the log (the
+                // learner would never receive shipped entries). Bounded so a
+                // genuinely bad peer address can't wedge bootstrap forever.
                 if leader_durable {
                     for n in all_replicas.iter().copied() {
                         if n == topology.node_id {
                             continue;
                         }
                         let addr = topology.peer_addr(n).unwrap_or("").to_string();
-                        match part
-                            .add_learner(n as u64, openraft::BasicNode::new(addr))
-                            .await
-                        {
-                            Ok(()) => tracing::info!(
-                                "raft: node {} added node {n} as a learner for partition {p}",
+                        let mut added = false;
+                        for attempt in 0..100u32 {
+                            match part
+                                .add_learner(n as u64, openraft::BasicNode::new(addr.clone()))
+                                .await
+                            {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        "raft: node {} added node {n} as a learner for partition {p}",
+                                        topology.node_id,
+                                    );
+                                    added = true;
+                                    break;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "raft: add_learner node {n} for partition {p} failed \
+                                         (attempt {attempt}): {e}; retrying"
+                                    );
+                                }
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        }
+                        if !added {
+                            tracing::error!(
+                                "raft: node {} gave up adding node {n} as a learner for \
+                                 partition {p} after retries; the leader-durable replica set \
+                                 is incomplete",
                                 topology.node_id,
-                            ),
-                            Err(e) => tracing::warn!(
-                                "raft: add_learner node {n} for partition {p} failed: {e}"
-                            ),
+                            );
                         }
                     }
                 }
@@ -19227,8 +19256,6 @@ mod clustered_startup_tests {
         ServerImpl,
         Vec<tokio::task::JoinHandle<()>>,
     ) {
-        use crate::raft::RaftPartition;
-
         let mut listeners = Vec::new();
         let mut ports = Vec::new();
         for i in 0..3u32 {
@@ -19354,11 +19381,11 @@ mod clustered_startup_tests {
             nodes[p]
                 .raft_registry()
                 .get(p as u64)
-                .and_then(|part: Arc<RaftPartition>| part.raft.metrics().borrow().current_leader)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
                 == Some(p as u64)
         };
         let mut ok = false;
-        for _ in 0..500 {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
             if (0..3).all(leads_own) {
                 ok = true;
                 break;
@@ -20189,28 +20216,42 @@ mod clustered_startup_tests {
         // Membership for partition 0 (led by node 0): exactly one voter (node 0) and
         // two learners (nodes 1 and 2). This is what takes follower quorum off the
         // critical path.
+        //
+        // Poll rather than read once: `raft_bootstrap` (ADR 0003) forms the group
+        // with `initialize` — which self-elects the sole voter immediately (quorum
+        // = 1, so the boot helper's leadership gate is satisfied at once) — and only
+        // then issues the non-blocking `add_learner`s, which land in the membership
+        // config asynchronously. On a CPU-starved runner (nextest oversubscribes the
+        // per-test 4-worker runtimes) that async gap can outlast boot, so a single
+        // synchronous read here observed `learners == [1]` (or `[]`) and flaked.
         let part0 = node0
             .raft_registry()
             .get(0)
             .expect("node 0 hosts partition 0");
-        let metrics = part0.raft.metrics().borrow().clone();
-        let membership = metrics.membership_config.membership().clone();
-        let voters: Vec<u64> = membership.voter_ids().collect();
-        let learners: Vec<u64> = membership.learner_ids().collect();
+        let (mut voters, mut learners) = (Vec::new(), Vec::new());
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            let membership = part0
+                .raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .clone();
+            voters = membership.voter_ids().collect();
+            learners = membership.learner_ids().collect();
+            voters.sort_unstable();
+            learners.sort_unstable();
+            if voters == vec![0] && learners == vec![1, 2] {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert_eq!(
             voters,
             vec![0],
             "only the leader is a voter in leader-durable"
         );
-        assert_eq!(
-            {
-                let mut l = learners.clone();
-                l.sort_unstable();
-                l
-            },
-            vec![1, 2],
-            "the other two replicas are learners"
-        );
+        assert_eq!(learners, vec![1, 2], "the other two replicas are learners");
 
         // A create acks on the leader alone (no follower quorum gates it).
         let (instance_key, _c) = node0

@@ -50,6 +50,26 @@ export type TriggerAction1 = {
   [k: string]: unknown;
 };
 /**
+ * Binds one model — a form OR a decision — to the domain type in scope for its FEEL (ADR 0029 §5). Exactly one of form/decision.
+ */
+export type Binding = {
+  /**
+   * form-js form id (schema.id) whose default-value FEEL is scoped to `type`.
+   */
+  form?: string;
+  /**
+   * DMN decision id whose input-expression FEEL is scoped to `type`.
+   */
+  decision?: string;
+  /**
+   * Lowercase kebab-case slug.
+   */
+  type: string;
+} & Binding1;
+export type Binding1 = {
+  [k: string]: unknown;
+};
+/**
  * A service-task worker: either a referenced handler file or an llm binding (ADR 0022 §E).
  */
 export type Worker = {
@@ -105,6 +125,10 @@ export interface AppManifest {
    * Event sources bound to engine actions (ADR 0025).
    */
   triggers?: Trigger[];
+  /**
+   * Declares the domain type in scope for a model's FEEL (ADR 0029 §5): a form's default-value expressions and a decision's input expressions autocomplete + validate against the bound type's fields. The same 'typed reference replaces a free-string id' move as trigger.bodyType, applied to forms and decisions.
+   */
+  bindings?: Binding[];
   /**
    * Named connections (credentials/endpoint) referenced by triggers/workers by id, so configs carry no inline secrets (ADR 0025 §1).
    */
