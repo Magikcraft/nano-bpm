@@ -89,10 +89,12 @@ surface (and extensible later). It defines two settings; the `metrics` toggle sh
 - **`metrics`** — `on` (default) | `off`. When `off`, the `/metrics` route is **not registered** (so it
   404s, no handler compiled out — it's a runtime gate).
 - **`console`** — `studio` | `observe` | `off`. `off` doesn't mount the console router at all; `observe`
-  serves the operator subset and **refuses authoring (mutating) API requests with `403`** via a thin
-  middleware gate (any method other than GET/HEAD/OPTIONS on `/console/api/*`); `studio` is the default
-  full behaviour. (The runtime `observe`↔`studio` distinction over a studio *build* is a thin gate; the
-  byte-savings version remains the ADR 0034 build profile. `off` is the headless runtime.) Configured via
+  serves the operator (observability) subset and **refuses both mutating requests _and_ the authoring/IDE
+  API surface with `403`** via a thin middleware gate (any non-GET/HEAD/OPTIONS method on `/console/api/*`,
+  plus GET of the authoring prefixes `models`, `projects`, `lib`, `extensions`, `worker-sdk`, `deno-types`,
+  `config/ide`); `studio` is the default full behaviour. (The runtime `observe`↔`studio` distinction over a
+  studio *build* is a thin gate; the byte-savings version remains the ADR 0034 build profile. `off` is the
+  headless runtime.) Configured via
   `--console <off|observe|studio>`, env `NANOBPMN_CONSOLE`, or YAML `observability.console`.
 
 Resolution precedence, highest wins:
@@ -150,11 +152,13 @@ Unknown flags/keys warn and are ignored (forward-compatible), matching today's l
    config from PR 1.
 3. **PR 3 — the runtime console profile (§C's `console` setting).** ✅ `off | observe | studio` on the
    same config layer: `off` skips mounting the console router, `observe` applies a middleware gate that
-   refuses mutating `/console/api/*` requests with `403`, `studio` is the default. (Feature-gating the
-   authoring API off the base/observe *build* remains an ADR 0034 follow-up.)
+   refuses mutating `/console/api/*` requests **and disables the authoring/IDE API surface** (GET included)
+   with `403`, `studio` is the default. This realizes the ADR 0034 follow-up (**authoring API off**) at
+   runtime — no build-matrix change; the remaining build-time item is only the byte-*lean* variant.
 
 ## Follow-ups
 
-- Feature-gate the authoring API off the base/observe build (carried from ADR 0034) so `console=observe`
-  and a console-less build share one lean, mutation-free surface.
+- Byte-lean `observe`/console-less *build* (carried from ADR 0034): the runtime `observe` profile already
+  serves an authoring-disabled, mutation-free surface (PR 3); a dedicated build could additionally drop the
+  authoring JS/handlers from the artifact for size, at the cost of a wider build matrix.
 - Peer discovery for standalone mode beyond `/v2/topology` (e.g. DNS/service-discovery) if fleets grow.
