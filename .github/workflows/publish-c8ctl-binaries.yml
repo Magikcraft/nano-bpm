@@ -141,6 +141,7 @@ jobs:
           retention-days: 1
           path: |
             generated/
+            generated-console/
             server/src/stub_impls.rs
             console/dist/
 
@@ -172,8 +173,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Restore generated/, server/src/stub_impls.rs and console/dist into the
-      # workspace (all git-ignored, so no conflict with the checkout).
+      # Restore generated/, generated-console/, server/src/stub_impls.rs and
+      # console/dist into the workspace (all git-ignored, so no conflict with
+      # the checkout).
       - name: Download prebuilt sources
         uses: actions/download-artifact@v7
         with:
