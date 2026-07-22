@@ -89,6 +89,15 @@ the installable-component-library / Delphi-VCL analog, over 0007's existing cons
 the open element-template format means Urban is **Camunda-Marketplace-compatible both ways** for free:
 the whole connector catalog is importable, and Urban components export as standard templates.
 
+**Realized (increment 6):** a pack declares `components[]` in its `nano-ide.ext.json` — pack-relative
+paths to element-template JSON files (each a single template or an array). The host resolves + parses
+them (`extensions::pack_component_templates`, path-escape-guarded) and forwards the templates in the
+extensions overview as `Extension.components`. The console flattens every pack's contribution
+(`loadPackComponents`) and layers the open project's own components on top (`combineComponents` — the
+project wins on an id collision), driving the same palette + template chooser. The worker impl and
+domain-type facets of the pack contribution remain future work (they ride ADR 0022 / 0029's existing
+seams); this increment lands the *component template* axis.
+
 ### 5. Spike (this PR) — proving the loop end to end
 
 This PR wires the modeler and proves load → palette → Object Inspector → apply:
@@ -162,4 +171,7 @@ input scoping (§3), and the pack axis (§4) are the increments below.
 5. **output typing** — `workers[].outputType` declares a component's output domain type; the modeler
    extracts output-mapping targets and `componentOutputScope` types those process variables, so a task
    placed after a component autocompletes on its result's fields (§3, OQ3) — PR #200. ✅
-6. **pack axis** — components as an ADR 0007 pack contribution (§4).
+6. **pack axis** — an installed pack contributes components via a `components[]` array in its
+   `nano-ide.ext.json` (pack-relative paths to element-template JSON); the server reads + forwards them
+   in the extensions overview (`Extension.components`), and the console merges them **under** the project's
+   own components (project wins on an id collision) to drive the palette — PR (this). ✅

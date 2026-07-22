@@ -551,6 +551,12 @@ export type Extension = {
      * SDK-derived Monaco IntelliSense contributed by the pack, one entry per monacoLang. Optional; the console registers completion/hover/signature providers from these.
      */
     intellisense?: Array<ExtensionIntellisense>;
+    /**
+     * Zeebe element templates the pack contributes as installable BPMN components (ADR 0033 §4). The console merges these under a project's own components (project wins on an id collision) to drive the palette. Kept as free-form objects so the full element-template shape survives the response round-trip; the modeler validates them at registration.
+     */
+    components?: Array<{
+        [key: string]: unknown;
+    }>;
     toolchainAvailable: boolean;
     trusted: boolean;
 };

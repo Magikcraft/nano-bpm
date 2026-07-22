@@ -54,6 +54,7 @@ for explicitly-listed toolchain commands the user consents to.
   "displayName": "Rust",
   "fileTypes": [{ "ext": ".rs", "monacoLang": "rust", "grammar": "grammars/rust.tmLanguage.json" }],
   "templates": [{ "id": "rust-throughput", "label": "Throughput (Rust)", "dir": "templates/throughput" }],
+  "components": ["components/read-thermostat.json"], // BPMN component element templates (ADR 0033 §4)
   "toolchain": {                       // commands run on the USER's machine
     "detect": ["cargo --version"],     // probe; missing => offer install link, never auto-install
     "run":     "cargo run --release",

@@ -15,6 +15,7 @@
 // are increment 6 and layer on top of this project source.
 
 import type { FileNode } from "../gen";
+import { getExtensions } from "../gen";
 import { projectFileEx } from "./api";
 import type { ElementTemplate } from "./urbanComponents";
 
@@ -116,4 +117,40 @@ export async function loadProjectComponents(
     }),
   );
   return mergeComponentsById(byDir);
+}
+
+/**
+ * Loads the components contributed by installed packs (ADR 0033 §4, increment 6),
+ * flattened across every extension in the overview and deduped by template id.
+ * These sit at the **lowest** precedence: `combineComponents` layers a project's
+ * own components on top so a project can shadow/customise a pack's component.
+ * Best-effort — a failed overview fetch or a non-template entry yields nothing.
+ */
+export async function loadPackComponents(): Promise<ElementTemplate[]> {
+  let overview: Awaited<ReturnType<typeof getExtensions>>["data"];
+  try {
+    overview = (await getExtensions({ throwOnError: true })).data;
+  } catch {
+    return [];
+  }
+  const byId = new Map<string, ElementTemplate>();
+  for (const ext of overview?.extensions ?? []) {
+    for (const raw of ext.components ?? []) {
+      if (isElementTemplate(raw)) byId.set(raw.id, raw);
+    }
+  }
+  return [...byId.values()];
+}
+
+/**
+ * Merges the pack-contributed and project-local component sets into the final
+ * installed set for the modeler (ADR 0033 §4). Pack components are the base
+ * layer; project components override them on an id collision — the local project
+ * always wins, mirroring how project files shadow installed defaults.
+ */
+export function combineComponents(
+  pack: ElementTemplate[],
+  project: ElementTemplate[],
+): ElementTemplate[] {
+  return mergeComponentsById([pack, project]);
 }

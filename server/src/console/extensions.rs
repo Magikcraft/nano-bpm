@@ -294,6 +294,14 @@ pub struct ExtManifest {
     /// console which registers providers per language.
     #[serde(default)]
     pub intellisense: Vec<LangIntellisense>,
+    /// Component element templates this pack contributes (ADR 0033 §4): a list
+    /// of pack-relative paths to Zeebe element-template JSON files (each holding
+    /// a single template or an array). The host reads + parses them and forwards
+    /// the resolved templates to the console, which merges them **under** the
+    /// project's own components (project wins on an id collision) to drive the
+    /// BPMN palette — the installable-component-library / Delphi-VCL axis.
+    #[serde(default)]
+    pub components: Vec<String>,
 }
 
 /// Built-in language-pack icons: theme-robust lettermark tiles (a brand-coloured
@@ -339,6 +347,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             }],
             themes: vec![],
             intellisense: vec![],
+            components: vec![],
         },
         ExtManifest {
             id: "deno-gui".into(),
@@ -358,6 +367,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             config_fields: vec![],
             themes: vec![],
             intellisense: vec![],
+            components: vec![],
         },
     ]
 }
@@ -433,6 +443,77 @@ pub fn pack_version(ext_id: &str) -> Option<String> {
             .map(String::from);
     }
     None
+}
+
+/// Reads the element templates contributed by the installed pack `ext_id` (ADR
+/// 0033 §4): resolves each of its manifest `components` paths against the pack
+/// dir, parses the JSON (a single template or an array), and returns every
+/// element-template-looking entry (a string `id` + a non-empty `appliesTo`).
+/// Path-escaping paths, missing files, and malformed JSON are skipped so a bad
+/// pack never blanks the palette. Built-in packs (no on-disk dir) yield nothing.
+pub fn pack_component_templates(ext_id: &str) -> Vec<serde_json::Value> {
+    let Ok(rd) = std::fs::read_dir(extensions_root()) else {
+        return vec![];
+    };
+    for entry in rd.flatten() {
+        let base = entry.path();
+        let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<ExtManifest>(&txt) else {
+            continue;
+        };
+        if m.id != ext_id {
+            continue;
+        }
+        let mut out = Vec::new();
+        for rel in &m.components {
+            let Some(path) = safe_pack_path(&base, rel) else {
+                continue;
+            };
+            let Ok(body) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) else {
+                continue;
+            };
+            match parsed {
+                serde_json::Value::Array(items) => {
+                    out.extend(items.into_iter().filter(is_element_template));
+                }
+                v if is_element_template(&v) => out.push(v),
+                _ => {}
+            }
+        }
+        return out;
+    }
+    vec![]
+}
+
+/// Whether a JSON value looks like a Zeebe element template: a string `id` and a
+/// non-empty `appliesTo` array. Loose on purpose — the console's
+/// `elementTemplates.set()` runs the authoritative schema validation; this only
+/// screens obviously-unrelated JSON so one stray file can't poison the set.
+fn is_element_template(v: &serde_json::Value) -> bool {
+    v.get("id").and_then(|x| x.as_str()).is_some()
+        && v.get("appliesTo")
+            .and_then(|x| x.as_array())
+            .is_some_and(|a| !a.is_empty())
+}
+
+/// Joins a pack-relative path to the pack `base`, rejecting absolute paths and
+/// any `..`/root/prefix component so a manifest can't read files outside its own
+/// dir (the same containment rule the project file API enforces).
+fn safe_pack_path(base: &std::path::Path, rel: &str) -> Option<PathBuf> {
+    let candidate = std::path::Path::new(rel);
+    if candidate
+        .components()
+        .all(|c| matches!(c, std::path::Component::Normal(_)))
+    {
+        Some(base.join(candidate))
+    } else {
+        None
+    }
 }
 
 /// Locate the on-disk source dir for a scaffold template contributed by an
@@ -856,6 +937,75 @@ mod tests {
         let p = safe_pkg_dir("@nanobpm/nano-ide-lang-rust").unwrap();
         assert!(p.ends_with("nanobpm__nano-ide-lang-rust"));
         assert!(safe_pkg_dir("../evil").is_none());
+    }
+
+    #[test]
+    fn pack_component_templates_reads_declared_files() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-comp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pack = root.join("nanobpm__nano-ide-components-hvac");
+        std::fs::create_dir_all(pack.join("components")).unwrap();
+        // A manifest declaring component files: one a single template, one an
+        // array of templates. A third declared path escapes the pack dir and one
+        // more is missing — both must be skipped, not abort the read.
+        std::fs::write(
+            pack.join(manifest_name()),
+            r#"{
+              "id": "components-hvac",
+              "kind": "app",
+              "displayName": "HVAC Components",
+              "components": [
+                "components/read.json",
+                "components/pair.json",
+                "../escape.json",
+                "components/missing.json"
+              ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("components/read.json"),
+            r#"{ "id": "hvac.read", "name": "Read", "appliesTo": ["bpmn:Task"] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("components/pair.json"),
+            r#"[
+              { "id": "hvac.a", "appliesTo": ["bpmn:Task"] },
+              { "id": "hvac.b", "appliesTo": ["bpmn:Task"] },
+              { "id": "not-a-template" }
+            ]"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("escape.json"),
+            r#"{"id":"evil","appliesTo":["x"]}"#,
+        )
+        .unwrap();
+
+        // SAFETY: test-local env set, serialized on ENV_LOCK; no other test in
+        // this module depends on the extensions-root value.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        let comps = pack_component_templates("components-hvac");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+
+        let ids: BTreeSet<_> = comps
+            .iter()
+            .filter_map(|c| c.get("id").and_then(|x| x.as_str()).map(String::from))
+            .collect();
+        // The single template + both valid array entries — but not the id-less
+        // array entry, the path-escaping file, or the missing file.
+        assert_eq!(
+            ids,
+            ["hvac.a", "hvac.b", "hvac.read"]
+                .into_iter()
+                .map(String::from)
+                .collect()
+        );
+        // Built-in packs (no on-disk dir) contribute nothing.
+        assert!(pack_component_templates("deno").is_empty());
     }
 
     #[test]
