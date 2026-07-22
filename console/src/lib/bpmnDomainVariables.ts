@@ -6,8 +6,10 @@
 // package (tested); this only translates its neutral scope tree and keeps the
 // BpmnModeler wiring thin.
 
-import { processScope } from "@nanobpm/nano-app-schema";
+import { processScope, componentOutputScope, type ComponentOutput } from "@nanobpm/nano-app-schema";
 import { toFeelVariables, type FeelVariable } from "./feelVariables";
+
+export type { ComponentOutput };
 
 /**
  * The FEEL variables in scope for a process's expressions, derived from its
@@ -17,4 +19,15 @@ import { toFeelVariables, type FeelVariable } from "./feelVariables";
 export function processFeelVariables(manifest: unknown, processId: string | undefined): FeelVariable[] {
   const scope = processScope(manifest, processId);
   return scope ? toFeelVariables(scope) : [];
+}
+
+/**
+ * The FEEL variables contributed by the diagram's component outputs (ADR 0033
+ * §3): each output-mapped process variable typed by the domain type its worker
+ * declares (`workers[].outputType`). `outputs` are the `{ taskType, target }`
+ * pairs the BpmnModeler extracts from service-task output mappings. Empty when no
+ * output maps to a worker with a declared `outputType`.
+ */
+export function componentOutputFeelVariables(manifest: unknown, outputs: readonly ComponentOutput[]): FeelVariable[] {
+  return toFeelVariables(componentOutputScope(manifest, outputs));
 }

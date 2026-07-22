@@ -35,7 +35,7 @@ import {
 } from "../lib/api";
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
-import { processFeelVariables } from "../lib/bpmnDomainVariables";
+import { processFeelVariables, componentOutputFeelVariables, type ComponentOutput } from "../lib/bpmnDomainVariables";
 import {
   subscribe as subscribeDebug,
   snapshot as debugSnapshot,
@@ -672,7 +672,10 @@ function EditorPane({
     [manifest],
   );
   const bpmnGetVariables = useCallback(
-    () => processFeelVariables(manifest, primaryProcessId ?? undefined),
+    ({ taskOutputs }: { taskOutputs: ComponentOutput[] }) => [
+      ...processFeelVariables(manifest, primaryProcessId ?? undefined),
+      ...componentOutputFeelVariables(manifest, taskOutputs),
+    ],
     [manifest, primaryProcessId],
   );
 

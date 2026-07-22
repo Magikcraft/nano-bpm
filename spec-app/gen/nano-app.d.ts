@@ -86,6 +86,10 @@ export type Worker = {
    * Name of an llm[] binding used as the worker (LLM-as-worker).
    */
   llm?: string;
+  /**
+   * Lowercase kebab-case slug.
+   */
+  outputType?: string;
 } & Worker1;
 export type Worker1 = {
   [k: string]: unknown;

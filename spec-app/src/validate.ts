@@ -122,11 +122,14 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     push("/surfaces/chat/agent", `chat agent "${agent}" is not declared in llm`, "unknown-llm");
   }
 
-  // workers[].llm names a declared llm.
+  // workers[].llm names a declared llm; workers[].outputType names a declared type.
   const workers: any[] = manifest.workers ?? [];
   workers.forEach((w, i) => {
     if (w.llm != null && !llmNames.has(w.llm)) {
       push(`/workers/${i}/llm`, `worker llm "${w.llm}" is not declared in llm`, "unknown-llm");
+    }
+    if (w.outputType != null && !typeIds.has(w.outputType)) {
+      push(`/workers/${i}/outputType`, `outputType "${w.outputType}" is not a declared domain type`, "unknown-type");
     }
   });
 
