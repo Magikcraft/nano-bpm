@@ -6,9 +6,10 @@
 // input/output properties are FEEL fields that will be scoped to the bound
 // domain type (ADR 0029, generalising the DMN injection shipped in #197).
 //
-// SPIKE SCOPE: this is a small bundled sample set proving the load → palette →
-// properties-panel → apply loop end to end. In the shipped design these come
-// from installed component packs (ADR 0007) and the project, not this constant.
+// SAMPLE SET: these reference components document the element-template shape and
+// seed a project's `components/` dir for the demo. The modeler no longer imports
+// this constant — it loads the installed set from the open project (ADR 0033
+// increment 2, `projectComponents.ts`); packs (ADR 0007) layer on in increment 6.
 
 /** The Zeebe (Camunda 8 / "Cloud") element-template JSON shape. Typed loosely —
  *  the authoritative schema is `@camunda/zeebe-element-templates-json-schema`,

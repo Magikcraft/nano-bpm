@@ -125,8 +125,13 @@ input scoping (§3), and the pack axis (§4) are the increments below.
 
 ## Open questions
 
-1. **Where components live** — a project `components/` dir indexed by the symbol index, vs. pack-only,
-   vs. both. Bearing on how the manifest references a component instance.
+1. ~~**Where components live**~~ — **resolved (increment 2).** Both, merged by template id: the project's
+   `.camunda/element-templates/` (the Camunda-standard location, so a Marketplace/connector catalog drops
+   in as-is per §4) **and** an Urban-native `components/` dir; `components/` wins on an id collision. The
+   modeler loads this installed set (`console/src/lib/projectComponents.ts`) instead of a bundled constant,
+   so the palette *is* the project's component tray. No manifest `components[]` list is added (OQ2): a
+   component instance is just the stamped service task, joined to its worker by `taskDefinition:type` ↔
+   `workers[].taskType`. Packs layer another source on top (increment 6, §4).
 2. ~~**Template ↔ worker binding surface**~~ — **resolved (PR #199).** The manifest does *not* gain a
    `components[]` list. Instead `bindings[]` binds a domain type to a **process** (ADR 0030's duality:
    a process is the motion of a typed domain object), which scopes *all* FEEL in that process —
@@ -145,7 +150,11 @@ input scoping (§3), and the pack axis (§4) are the increments below.
 ## Increments
 
 1. **spike** — element-templates wired into the modeler + palette + sample components (this PR). ✅
-2. **component source** — load templates from the project/packs (OQ1) instead of the bundled constant.
+2. **component source** — the modeler loads the installed component set from the project instead of a
+   bundled constant: `loadProjectComponents` scans `.camunda/element-templates/` + `components/` and merges
+   by id (OQ1); `BpmnModeler` takes them as a live `components` prop feeding both `elementTemplates.set()`
+   and the palette; the `urban-starter` scaffold seeds `components/` so a fresh Urban App ships a palette —
+   PR (this). ✅
 3. **the binding** — `bindings[].process` binds a domain type to a process (ADR 0030); schema +
    fail-closed `unknown-process` validation + completion (`process-ref`) — PR #199. ✅
 4. **FEEL scoping** — `processScope` injects the bound type's fields into bpmn-js component-input FEEL
