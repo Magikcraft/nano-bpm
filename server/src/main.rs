@@ -2118,6 +2118,15 @@ fn replication_mode_from_env() -> ReplicationMode {
     }
 }
 
+/// Bootstrap leader-settle budget: after `initialize`, the leader-durable
+/// bootstrap waits up to this many 50 ms polls (≈30 s) for this node to become
+/// the established leader of a freshly formed group before registering its
+/// learners, so `add_learner` is only attempted once it can actually commit.
+/// Generous because on a CPU-starved boot the (quorum = 1) election can be
+/// delayed; if it is still not the leader after this budget, learner
+/// registration is left to the recovery tick rather than blocking boot further.
+const RAFT_BOOTSTRAP_LEADER_POLL_ITERS: u32 = 600;
+
 /// Consecutive leaderless supervisor passes (≈500 ms each) before leader-durable
 /// auto-recovery promotes a partition. Default 3 (~1.5 s) so a brief
 /// heartbeat/election flutter never triggers a needless promotion; env-tunable via
@@ -9196,24 +9205,50 @@ impl ServerImpl {
                 }
                 // Leader-durable: register the remaining replicas as non-voting
                 // learners so they tail the log without gating the write quorum.
-                // `add_learner` is a membership-change write that requires this node
-                // to be an established leader that has committed a blank entry in its
-                // current term; immediately after `initialize` that may not have
-                // happened yet, so an early call can transiently fail
-                // (`ForwardToLeader`/`ChangeMembershipError`). It must therefore be
-                // RETRIED until it lands (mirroring the `initialize` loop above) —
-                // a fire-and-forget call silently drops the learner, breaking the
-                // leader-durable contract that every replica tails the log (the
-                // learner would never receive shipped entries). Bounded so a
-                // genuinely bad peer address can't wedge bootstrap forever.
+                //
+                // `add_learner` is a membership-change write that only succeeds once
+                // this node is an ESTABLISHED leader — it has won its (quorum = 1)
+                // election AND committed its term's blank entry. `initialize` returns
+                // BEFORE that settles, so an add_learner issued right away fails with
+                // `ForwardToLeader`/`ChangeMembershipError`. Rather than burn a bounded
+                // retry against a node that isn't the leader yet (on a CPU-starved boot
+                // the election can be delayed long enough to EXHAUST the budget, which
+                // silently drops the learner — the bootstrap path has no recovery of
+                // its own, so that replica would never tail the log), FIRST wait for
+                // leadership to settle, then add each learner. The leader-durable
+                // recovery tick reconciles any learner still missing afterwards
+                // (`reconcile_leader_durable_learners`), so this is best-effort: if
+                // leadership never settles here we log and move on rather than wedge.
                 if leader_durable {
+                    let mut established = false;
+                    for _ in 0..RAFT_BOOTSTRAP_LEADER_POLL_ITERS {
+                        if part.raft.metrics().borrow().current_leader
+                            == Some(topology.node_id as u64)
+                        {
+                            established = true;
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    if !established {
+                        tracing::error!(
+                            "raft: node {} is not the established leader of partition {p} \
+                             after initialize; deferring learner registration to the \
+                             recovery tick",
+                            topology.node_id,
+                        );
+                    }
                     for n in all_replicas.iter().copied() {
                         if n == topology.node_id {
                             continue;
                         }
                         let addr = topology.peer_addr(n).unwrap_or("").to_string();
+                        // A short retry still absorbs the narrow window between
+                        // `current_leader == me` and the leader being ready to commit
+                        // a membership change; a persistent failure is left to the
+                        // recovery tick.
                         let mut added = false;
-                        for attempt in 0..100u32 {
+                        for attempt in 0..20u32 {
                             match part
                                 .add_learner(n as u64, openraft::BasicNode::new(addr.clone()))
                                 .await
@@ -9237,9 +9272,9 @@ impl ServerImpl {
                         }
                         if !added {
                             tracing::error!(
-                                "raft: node {} gave up adding node {n} as a learner for \
-                                 partition {p} after retries; the leader-durable replica set \
-                                 is incomplete",
+                                "raft: node {} could not add node {n} as a learner for \
+                                 partition {p} at bootstrap; the recovery tick will \
+                                 reconcile it",
                                 topology.node_id,
                             );
                         }
@@ -9551,6 +9586,47 @@ impl ServerImpl {
         out
     }
 
+    /// Best-effort reconciliation of the learner set for a leader-durable partition
+    /// this node currently leads: any co-replica that is neither a voter nor a
+    /// learner of the group is (re)added as a learner. Idempotent and cheap — it
+    /// reads the membership from the metrics watch and only issues a membership
+    /// write when a replica is genuinely missing. This is the recovery path for a
+    /// bootstrap `add_learner` that could not land (unlike the failover
+    /// self-promote, the initial bootstrap has no re-announce), so a starved boot
+    /// cannot permanently strand a replica off the log.
+    async fn reconcile_leader_durable_learners(&self, p: u64, topology: &cluster::Topology) {
+        let Some(part) = self.raft.get(p) else {
+            return;
+        };
+        let present: std::collections::BTreeSet<u64> = {
+            let metrics = part.raft.metrics();
+            let m = metrics.borrow();
+            let membership = m.membership_config.membership();
+            membership
+                .voter_ids()
+                .chain(membership.learner_ids())
+                .collect()
+        };
+        for n in topology.replicas_of(p) {
+            if n == topology.node_id || present.contains(&(n as u64)) {
+                continue;
+            }
+            let addr = topology.peer_addr(n).unwrap_or("").to_string();
+            match part
+                .add_learner(n as u64, openraft::BasicNode::new(addr))
+                .await
+            {
+                Ok(()) => tracing::info!(
+                    "raft: node {} recovery-reconciled node {n} as a learner for partition {p}",
+                    topology.node_id,
+                ),
+                Err(e) => tracing::warn!(
+                    "raft: recovery add_learner node {n} for partition {p} failed: {e}"
+                ),
+            }
+        }
+    }
+
     /// One pass of the leader-durable recovery supervisor. For every partition this
     /// node replicates: if the group is leaderless (no current leader, and the
     /// original leader's peer link is down) for `grace_ticks` consecutive passes,
@@ -9580,6 +9656,21 @@ impl ServerImpl {
             // once -> this partition is established and thus a failover candidate.
             if leader.is_some() {
                 state.established.insert(p);
+            }
+            // Leader-durable self-heal: while we are the steady leader of a
+            // partition we own, make sure every co-replica is still registered as a
+            // learner. A bootstrap `add_learner` that could not land (e.g. a
+            // starved boot whose election settled after the bootstrap budget) or a
+            // learner otherwise dropped is silently re-added here — closing the gap
+            // the bootstrap path cannot recover from on its own, so every replica
+            // resumes tailing the log without operator intervention. Cheap in the
+            // common case: it only issues a membership write when a learner is
+            // actually absent.
+            if self.replication_mode == ReplicationMode::LeaderDurable
+                && topology.is_local(p)
+                && leader == Some(me)
+            {
+                self.reconcile_leader_durable_learners(p, &topology).await;
             }
             // Post-promote hold-down (Option C): after we self-promote `p`, damp the
             // reclaim epoch-climb. If leadership now reads as ours the promote took —
@@ -20460,6 +20551,117 @@ mod clustered_startup_tests {
         assert!(
             converged,
             "the retirement watermark reaps the follower backlog with zero per-key frames"
+        );
+
+        for node in [&node0, &node1, &node2] {
+            for p in 0..3u64 {
+                if let Some(part) = node.raft_registry().get(p) {
+                    part.raft.shutdown().await.ok();
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn leader_durable_recovery_tick_reconciles_a_dropped_learner() {
+        // Leader-durable's contract is that every replica tails the leader's log as
+        // a learner. The initial `raft_bootstrap` `add_learner` is best-effort (on a
+        // CPU-starved boot the group's election can settle after the bootstrap
+        // budget, so a learner may never get registered — and unlike the failover
+        // self-promote, bootstrap has no re-announce of its own). The recovery tick
+        // closes that gap: while node 0 leads partition 0 it re-adds any co-replica
+        // missing from the membership. Here we simulate the dropped learner by
+        // removing node 1 from the group, then prove one recovery pass restores it
+        // AND that the group resumes shipping to it — no operator intervention.
+        let (node0, node1, node2) = boot_rf3_leader_durable_cluster().await;
+
+        let part0 = node0
+            .raft_registry()
+            .get(0)
+            .expect("node 0 hosts partition 0");
+
+        // Precondition: both peers are learners of partition 0.
+        let learners_of = || -> Vec<u64> {
+            let mut l: Vec<u64> = part0
+                .raft
+                .metrics()
+                .borrow()
+                .membership_config
+                .membership()
+                .learner_ids()
+                .collect();
+            l.sort_unstable();
+            l
+        };
+        let mut ready = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if learners_of() == vec![1, 2] {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(ready, "boot registers nodes 1 and 2 as learners");
+
+        // Simulate the dropped learner: remove node 1 from the membership.
+        part0
+            .raft
+            .change_membership(
+                openraft::ChangeMembers::RemoveNodes(std::collections::BTreeSet::from([1u64])),
+                false,
+            )
+            .await
+            .expect("remove node 1 as a learner");
+        assert_eq!(learners_of(), vec![2], "node 1 is no longer a learner");
+
+        // One recovery pass on node 0 (the partition-0 leader) must re-add node 1.
+        // Poll: the reconciling `add_learner` is non-blocking, so the membership
+        // change may settle a beat after the tick returns under load.
+        let mut healed = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            let mut state = RecoveryState::default();
+            node0.leader_durable_recovery_tick(1, &mut state).await;
+            if learners_of() == vec![1, 2] {
+                healed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            healed,
+            "the recovery tick reconciles the dropped learner back into the group"
+        );
+
+        // The re-added learner resumes tailing the log: a fresh create on the sole
+        // voter ships to node 1's replica engine.
+        let (instance_key, _c) = node0
+            .create_for_stream(Some("intake".into()), None, Default::default())
+            .await
+            .expect("leader-durable create acks on the sole voter");
+        assert_eq!(nanobpmn_engine_core::partition_of(instance_key), 0);
+        let node1_p0 = node1
+            .engine_handle_for(0)
+            .expect("node 1 materializes a replica engine for partition 0");
+        let mut shipped = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if node1_p0
+                .with(move |journal| {
+                    journal
+                        .engine()
+                        .state()
+                        .instances
+                        .contains_key(&instance_key)
+                })
+                .await
+            {
+                shipped = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            shipped,
+            "the create ships to the reconciled learner, proving it tails the log again"
         );
 
         for node in [&node0, &node1, &node2] {
