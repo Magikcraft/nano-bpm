@@ -1866,6 +1866,40 @@ impl RaftPartition {
         Ok(())
     }
 
+    /// Awaits this node becoming the *established leader* of the group — its
+    /// `current_leader` metric reads self — bounded by `timeout`. Returns whether
+    /// leadership was observed within the budget.
+    ///
+    /// A freshly initialized single-voter group elects itself almost immediately,
+    /// but under CPU starvation the openraft leader transition can lag well past a
+    /// caller's short retry window. The leader-durable self-promote waits here so
+    /// it does not return before leadership is real: otherwise the recovery tick's
+    /// post-promote hold-down (a fixed tick budget) can expire while the metric
+    /// still lags and re-promote the SAME partition at the next epoch — an
+    /// unbounded epoch climb under load. Tying the barrier to the leadership event
+    /// (not wall-clock ticks) makes the reclaim epoch deterministic.
+    pub async fn wait_for_self_leadership(&self, timeout: std::time::Duration) -> bool {
+        let mut metrics = self.raft.metrics();
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if metrics.borrow().current_leader == Some(self.node_id) {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            // Wake on the next metrics change or when the budget lapses, whichever
+            // comes first — no busy-poll.
+            if tokio::time::timeout(remaining, metrics.changed())
+                .await
+                .is_err()
+            {
+                return metrics.borrow().current_leader == Some(self.node_id);
+            }
+        }
+    }
+
     /// Adds `node` as a **learner** (non-voting replica) of this group — the
     /// leader-durable path (ADR 0003). A learner receives the replicated log in the
     /// background but does NOT count toward the write quorum, so the leader (sole
