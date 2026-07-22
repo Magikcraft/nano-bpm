@@ -16,6 +16,17 @@ const port = Number(process.env.CONSOLE_PORT ?? 5173);
 export default defineConfig({
   base: "/console/",
   plugins: [react(), tailwindcss()],
+  // `@bpmn-io/form-js-editor` pins its own nested `preact` (10.15.x) while the
+  // form *viewer* it renders through — plus `@bpmn-io/properties-panel` and
+  // diagram-js — resolve the hoisted `preact` (10.29.x). Two preact copies means
+  // two independent "current component" globals, so the editor's `useService`
+  // hooks read an undefined render context and the whole form editor crashes
+  // ("Cannot read properties of undefined (reading 'context')"), rendering no
+  // palette or properties panel. Collapsing preact to a single instance fixes it
+  // in both dev (optimizeDeps) and the production build (Rollup).
+  resolve: {
+    dedupe: ["preact"],
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
