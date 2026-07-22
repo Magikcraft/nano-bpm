@@ -31,6 +31,8 @@ tags:
     description: Extension packs and marketplace
   - name: config
     description: Server and IDE configuration
+  - name: server
+    description: Nano server version and self-update
 
 paths:
   /topology:
@@ -727,6 +729,26 @@ paths:
               schema: { $ref: '#/components/schemas/ActiveRunConfigResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /server/update:
+    get:
+      operationId: getServerUpdate
+      tags: [server]
+      summary: Nano server version and self-update availability
+      description: >
+        Reports the running server version, the latest available version for
+        the channel this binary was launched from, and whether the launcher can
+        self-update. Self-managed / dev binaries (a configured binary path, a
+        --binary flag, or a repo build) report canSelfUpdate=false and suppress
+        the update nag (updateAvailable=false) even when a newer version exists.
+        Best-effort and offline-soft: version resolution failures degrade to a
+        null latest rather than an error.
+      responses:
+        '200':
+          description: Server update status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ServerUpdateStatus' }
 
   /extensions:
     get:
@@ -1688,6 +1710,53 @@ components:
         entries:
           type: array
           items: { $ref: '#/components/schemas/MarketEntry' }
+    ServerUpdateStatus:
+      type: object
+      required: [current, updateAvailable, canSelfUpdate, installMethod]
+      properties:
+        current:
+          type: string
+          description: >
+            Installed version in the update channel's version space — the basis
+            for the update comparison and shown next to latest. For the npm
+            channel this is the launcher/plugin version; otherwise the running
+            server build.
+        serverVersion:
+          type: string
+          description: >
+            The actual running server binary build (NANOBPM_VERSION). Present
+            (and distinct from current) when the update unit versions in a
+            different space than the server build, e.g. an npm-managed install.
+        latest:
+          type: string
+          description: >
+            Latest available version for the launch channel, or absent if it
+            could not be resolved (offline, unknown channel, self-managed).
+        updateAvailable:
+          type: boolean
+          description: >
+            True only when a self-updatable install has a newer latest than
+            current. Always false for self-managed / dev binaries.
+        canSelfUpdate:
+          type: boolean
+          description: >
+            True when the launcher manages this binary (managed npm platform
+            package or managed download) and can perform an in-place update.
+        installMethod:
+          type: string
+          description: >
+            How the running binary was provisioned, as reported by the
+            launcher.
+          enum: [managed-npm, managed-download, configured, flag, repo-release, repo-debug, unknown]
+        channel:
+          type: string
+          description: Update channel the launcher resolves latest from (npm or download).
+        launcher:
+          type: string
+          description: Identifier of the launcher that started the server (e.g. c8ctl-plugin-nano).
+        updateHint:
+          type: string
+          description: Human-readable guidance for updating (method-specific).
     ExtPkgRequest:
       type: object
       required: [pkg]

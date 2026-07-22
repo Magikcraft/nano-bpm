@@ -182,6 +182,22 @@ impl apis::config::Config for ServerImpl {
 // --- extensions -----------------------------------------------------------
 
 #[async_trait]
+impl apis::server::Server for ServerImpl {
+    async fn get_server_update(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+    ) -> Result<apis::server::GetServerUpdateResponse, ()> {
+        // Only 200 is declared; the handler is offline-soft and never errors.
+        let v = super::server_update()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({}));
+        Ok(apis::server::GetServerUpdateResponse::Status200_ServerUpdateStatus(from_val(v)))
+    }
+}
+
+#[async_trait]
 impl apis::extensions::Extensions for ServerImpl {
     async fn get_extensions(
         &self,
