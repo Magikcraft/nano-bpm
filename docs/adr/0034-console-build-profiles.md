@@ -117,8 +117,14 @@ verified locally / in the release matrix rather than in the default CI leg.
 - **Feature-gate the authoring API.** The `console` feature still compiles the project create/run/save
   endpoints even in an observe binary. They are tiny (Rust) and harmless, but a hardened observe build
   should not expose maker mutation endpoints — split them behind the studio side of the feature.
-- **Build-time precompression + brotli.** `serve_embedded` gzips per request. Precompressing embedded
-  assets (and adding brotli, ~20% smaller than gzip) would cut both CPU and bytes on the wire.
+- **Build-time precompression + brotli.** ✅ Done (follow-up PR). `console/scripts/precompress.mjs`
+  writes a Brotli-11 `.br` and a gzip-9 `.gz` sibling next to every compressible built asset;
+  `serve_embedded` streams the sibling matching the client's `Accept-Encoding` (brotli preferred), so
+  there is no per-request compression CPU on the hot path and ~15-20% fewer bytes on the wire than the
+  old runtime gzip. Runtime gzip is kept as a fallback for the CI stub bundle and any hand-built `dist`
+  without siblings. Tradeoff: the binary now embeds raw + `.br` + `.gz` (studio: ~21MB raw, +4MB br,
+  +5MB gz). Reclaiming that by embedding only the compressed variants — decompressing for the rare
+  client that accepts no encoding — is a future lever.
 - **Observe UX polish.** The Workers view hides its editor tab in observe; a couple of other maker
   affordances (e.g. "new project" entry points) could be softened for the operator surface.
 - **Distribution.** Decide how the two profiles surface to users — a `--profile` on the launcher, two
