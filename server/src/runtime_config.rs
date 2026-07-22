@@ -21,9 +21,26 @@
 //! ```yaml
 //! observability:
 //!   metrics: "off"      # on (default) | off — the Prometheus /metrics endpoint
+//!   console: "observe"  # studio (default) | observe (read-only) | off (headless)
 //!   consolePeers:       # non-empty => run as a standalone off-cluster console
 //!     - "http://10.0.0.11:8080"
 //! ```
+
+/// How the embedded web console is served at runtime (ADR 0035 §C). Independent
+/// of the ADR 0034 *build* profile: this is a thin runtime gate over whatever
+/// console bundle was compiled in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConsoleProfile {
+    /// Headless: the console router is not mounted at all (SPA + `/console/api/*`
+    /// and the marketing/docs pages all 404).
+    Off,
+    /// Operator subset: the observability views are served, but authoring
+    /// (mutating) API requests are refused — a runtime read-only gate.
+    Observe,
+    /// Full behaviour: the complete studio IDE + authoring API (the default).
+    #[default]
+    Studio,
+}
 
 /// The resolved observability configuration for this process.
 #[derive(Debug, Clone)]
@@ -32,6 +49,10 @@ pub struct ObservabilityConfig {
     /// `false` the route is not registered at all (it 404s), removing the
     /// endpoint from the attack surface.
     pub metrics: bool,
+    /// How the embedded web console is served (off | observe | studio). Default
+    /// `studio`.
+    #[cfg_attr(not(feature = "console"), allow(dead_code))]
+    pub console: ConsoleProfile,
     /// Peer base URLs for the standalone off-cluster console (ADR 0035 §B). When
     /// non-empty, the process runs as an engine-less console that scrapes these
     /// peers instead of serving the engine. Empty = normal (engine) mode.
@@ -45,13 +66,28 @@ impl ObservabilityConfig {
     pub fn is_standalone_console(&self) -> bool {
         !self.standalone_console_peers.is_empty()
     }
+
+    /// Whether the console router should be mounted at all (`off` => headless).
+    #[cfg_attr(not(feature = "console"), allow(dead_code))]
+    pub fn console_enabled(&self) -> bool {
+        self.console != ConsoleProfile::Off
+    }
+
+    /// Whether the console is in the read-only `observe` gate (authoring API
+    /// requests must be refused).
+    #[cfg_attr(not(feature = "console"), allow(dead_code))]
+    pub fn console_read_only(&self) -> bool {
+        self.console == ConsoleProfile::Observe
+    }
 }
 
 impl ObservabilityConfig {
-    /// The default: metrics on, engine (non-standalone) mode.
+    /// The default: metrics on, console in full studio mode, engine
+    /// (non-standalone) mode.
     fn defaults() -> Self {
         Self {
             metrics: true,
+            console: ConsoleProfile::default(),
             standalone_console_peers: Vec::new(),
         }
     }
@@ -71,6 +107,7 @@ impl ObservabilityConfig {
         let config_path = config_path(&args);
         Self::resolve_from(
             std::env::var("NANOBPMN_METRICS").ok().as_deref(),
+            std::env::var("NANOBPMN_CONSOLE").ok().as_deref(),
             std::env::var("NANOBPMN_CONSOLE_STANDALONE").ok().as_deref(),
             config_path.as_deref().and_then(read_file_warn),
             &args,
@@ -78,11 +115,13 @@ impl ObservabilityConfig {
     }
 
     /// Pure resolver, factored out for unit testing. `env_metrics` /
-    /// `env_peers` are the raw `NANOBPMN_METRICS` / `NANOBPMN_CONSOLE_STANDALONE`
-    /// values (if set); `file` is the config file's contents (if a readable file
-    /// was configured); `args` are the CLI args after the program name.
+    /// `env_console` / `env_peers` are the raw `NANOBPMN_METRICS` /
+    /// `NANOBPMN_CONSOLE` / `NANOBPMN_CONSOLE_STANDALONE` values (if set); `file`
+    /// is the config file's contents (if a readable file was configured); `args`
+    /// are the CLI args after the program name.
     fn resolve_from(
         env_metrics: Option<&str>,
+        env_console: Option<&str>,
         env_peers: Option<&str>,
         file: Option<String>,
         args: &[String],
@@ -101,6 +140,19 @@ impl ObservabilityConfig {
         // Accepts both `--metrics <on|off>` and the convenience `--no-metrics`.
         if let Some(v) = metrics_flag(args) {
             cfg.metrics = v;
+        }
+
+        // --- console profile (flag > file > env > default) ------------------
+        if let Some(p) = env_console.and_then(parse_console_profile) {
+            cfg.console = p;
+        }
+        if let Some(text) = file.as_deref()
+            && let Some(p) = console_from_yaml(text)
+        {
+            cfg.console = p;
+        }
+        if let Some(p) = console_flag(args) {
+            cfg.console = p;
         }
 
         // --- standalone console peers (flag > file > env > default) ---------
@@ -206,6 +258,52 @@ fn metrics_from_yaml(text: &str) -> Option<bool> {
     }
 }
 
+/// Parses a console profile: `off` (aliases `none`, `headless`, `disabled`),
+/// `observe` (aliases `observer`, `operator`, `readonly`, `read-only`), or
+/// `studio` (aliases `full`, `ide`, `on`). Case/whitespace-insensitive. Returns
+/// `None` for anything else.
+fn parse_console_profile(v: &str) -> Option<ConsoleProfile> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "headless" | "disabled" | "false" | "no" => Some(ConsoleProfile::Off),
+        "observe" | "observer" | "operator" | "readonly" | "read-only" => {
+            Some(ConsoleProfile::Observe)
+        }
+        "studio" | "full" | "ide" | "on" | "true" | "yes" => Some(ConsoleProfile::Studio),
+        _ => None,
+    }
+}
+
+/// Resolves the console profile from CLI flags: `--console <off|observe|studio>`
+/// (also glued with `=`). An unrecognized value warns and is ignored. Returns
+/// `None` if the flag is absent.
+fn console_flag(args: &[String]) -> Option<ConsoleProfile> {
+    let mut result = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let raw = match a.as_str() {
+            "--console" => it.next().map(String::as_str),
+            other => other.strip_prefix("--console="),
+        };
+        if let Some(v) = raw {
+            match parse_console_profile(v) {
+                Some(p) => result = Some(p),
+                None => eprintln!(
+                    "warning: unrecognized --console value '{v}' (expected off|observe|studio)"
+                ),
+            }
+        }
+    }
+    result
+}
+
+/// Reads `observability.console` (a string) from a YAML config document. Returns
+/// `None` when the key is absent or the document doesn't parse.
+fn console_from_yaml(text: &str) -> Option<ConsoleProfile> {
+    let doc: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+    let node = doc.get("observability")?.get("console")?;
+    node.as_str().and_then(parse_console_profile)
+}
+
 /// Parses a permissive on/off toggle: `on/off`, `true/false`, `yes/no`, `1/0`
 /// (case/whitespace-insensitive). Returns `None` for anything else.
 fn parse_onoff(v: &str) -> Option<bool> {
@@ -277,21 +375,24 @@ mod tests {
 
     #[test]
     fn default_is_metrics_on() {
-        let cfg = ObservabilityConfig::resolve_from(None, None, None, &[]);
+        let cfg = ObservabilityConfig::resolve_from(None, None, None, None, &[]);
         assert!(cfg.metrics);
         assert!(!cfg.is_standalone_console());
+        assert_eq!(cfg.console, ConsoleProfile::Studio);
+        assert!(cfg.console_enabled());
+        assert!(!cfg.console_read_only());
     }
 
     #[test]
     fn env_can_disable_metrics() {
-        let cfg = ObservabilityConfig::resolve_from(Some("off"), None, None, &[]);
+        let cfg = ObservabilityConfig::resolve_from(Some("off"), None, None, None, &[]);
         assert!(!cfg.metrics);
     }
 
     #[test]
     fn file_overrides_env() {
         let file = "observability:\n  metrics: \"on\"\n".to_string();
-        let cfg = ObservabilityConfig::resolve_from(Some("off"), None, Some(file), &[]);
+        let cfg = ObservabilityConfig::resolve_from(Some("off"), None, None, Some(file), &[]);
         assert!(cfg.metrics, "file (on) must override env (off)");
     }
 
@@ -301,6 +402,7 @@ mod tests {
         let cfg = ObservabilityConfig::resolve_from(
             Some("on"),
             None,
+            None,
             Some(file),
             &args(&["--metrics", "off"]),
         );
@@ -309,13 +411,15 @@ mod tests {
 
     #[test]
     fn no_metrics_flag_disables() {
-        let cfg = ObservabilityConfig::resolve_from(None, None, None, &args(&["--no-metrics"]));
+        let cfg =
+            ObservabilityConfig::resolve_from(None, None, None, None, &args(&["--no-metrics"]));
         assert!(!cfg.metrics);
     }
 
     #[test]
     fn glued_flag_value() {
-        let cfg = ObservabilityConfig::resolve_from(None, None, None, &args(&["--metrics=off"]));
+        let cfg =
+            ObservabilityConfig::resolve_from(None, None, None, None, &args(&["--metrics=off"]));
         assert!(!cfg.metrics);
     }
 
@@ -343,11 +447,12 @@ mod tests {
     #[test]
     fn unrecognized_values_ignored() {
         // A bad env value falls through to the default (on).
-        let cfg = ObservabilityConfig::resolve_from(Some("maybe"), None, None, &[]);
+        let cfg = ObservabilityConfig::resolve_from(Some("maybe"), None, None, None, &[]);
         assert!(cfg.metrics);
         // A bad flag value leaves the resolved layer unchanged (file wins).
         let file = "observability:\n  metrics: off\n".to_string();
         let cfg = ObservabilityConfig::resolve_from(
+            None,
             None,
             None,
             Some(file),
@@ -368,9 +473,85 @@ mod tests {
         );
     }
 
+    // --- console profile ----------------------------------------------------
+
+    #[test]
+    fn console_profile_parses_aliases() {
+        assert_eq!(parse_console_profile("off"), Some(ConsoleProfile::Off));
+        assert_eq!(parse_console_profile("HEADLESS"), Some(ConsoleProfile::Off));
+        assert_eq!(
+            parse_console_profile(" observe "),
+            Some(ConsoleProfile::Observe)
+        );
+        assert_eq!(
+            parse_console_profile("read-only"),
+            Some(ConsoleProfile::Observe)
+        );
+        assert_eq!(
+            parse_console_profile("studio"),
+            Some(ConsoleProfile::Studio)
+        );
+        assert_eq!(parse_console_profile("banana"), None);
+    }
+
+    #[test]
+    fn console_profile_env() {
+        let cfg = ObservabilityConfig::resolve_from(None, Some("observe"), None, None, &[]);
+        assert_eq!(cfg.console, ConsoleProfile::Observe);
+        assert!(cfg.console_enabled());
+        assert!(cfg.console_read_only());
+    }
+
+    #[test]
+    fn console_profile_off_disables() {
+        let cfg = ObservabilityConfig::resolve_from(None, Some("off"), None, None, &[]);
+        assert_eq!(cfg.console, ConsoleProfile::Off);
+        assert!(!cfg.console_enabled());
+    }
+
+    #[test]
+    fn console_profile_precedence() {
+        let file = "observability:\n  console: observe\n".to_string();
+        // env only.
+        let env_only = ObservabilityConfig::resolve_from(None, Some("off"), None, None, &[]);
+        assert_eq!(env_only.console, ConsoleProfile::Off);
+        // file overrides env.
+        let file_over =
+            ObservabilityConfig::resolve_from(None, Some("off"), None, Some(file.clone()), &[]);
+        assert_eq!(file_over.console, ConsoleProfile::Observe);
+        // flag overrides file + env.
+        let flag_over = ObservabilityConfig::resolve_from(
+            None,
+            Some("off"),
+            None,
+            Some(file),
+            &args(&["--console", "studio"]),
+        );
+        assert_eq!(flag_over.console, ConsoleProfile::Studio);
+    }
+
+    #[test]
+    fn console_flag_glued_and_bad_value() {
+        let cfg =
+            ObservabilityConfig::resolve_from(None, None, None, None, &args(&["--console=off"]));
+        assert_eq!(cfg.console, ConsoleProfile::Off);
+        // Bad flag value is ignored -> default studio.
+        let cfg = ObservabilityConfig::resolve_from(
+            None,
+            None,
+            None,
+            None,
+            &args(&["--console", "banana"]),
+        );
+        assert_eq!(cfg.console, ConsoleProfile::Studio);
+    }
+
+    // --- standalone console peers -------------------------------------------
+
     #[test]
     fn standalone_peers_from_env_csv() {
         let cfg = ObservabilityConfig::resolve_from(
+            None,
             None,
             Some("http://a:8080, http://b:8080/"),
             None,
@@ -388,19 +569,20 @@ mod tests {
     fn standalone_peers_from_yaml_sequence() {
         let file = "observability:\n  consolePeers:\n    - http://a:8080\n    - http://b:8080\n"
             .to_string();
-        let cfg = ObservabilityConfig::resolve_from(None, None, Some(file), &[]);
+        let cfg = ObservabilityConfig::resolve_from(None, None, None, Some(file), &[]);
         assert_eq!(cfg.standalone_console_peers.len(), 2);
     }
 
     #[test]
     fn standalone_peers_precedence() {
-        // env_metrics=None, env_peers=env, file=file-yaml, args=flags.
         let file = "observability:\n  consolePeers:\n    - http://file:8080\n".to_string();
         // env only.
-        let env_only = ObservabilityConfig::resolve_from(None, Some("http://env:8080"), None, &[]);
+        let env_only =
+            ObservabilityConfig::resolve_from(None, None, Some("http://env:8080"), None, &[]);
         assert_eq!(env_only.standalone_console_peers, vec!["http://env:8080"]);
         // file overrides env.
         let file_over = ObservabilityConfig::resolve_from(
+            None,
             None,
             Some("http://env:8080"),
             Some(file.clone()),
@@ -409,6 +591,7 @@ mod tests {
         assert_eq!(file_over.standalone_console_peers, vec!["http://file:8080"]);
         // flag overrides file + env.
         let flag_over = ObservabilityConfig::resolve_from(
+            None,
             None,
             Some("http://env:8080"),
             Some(file),

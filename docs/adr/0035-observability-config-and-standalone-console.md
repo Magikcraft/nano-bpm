@@ -1,8 +1,8 @@
 # ADR 0035 — Full-fidelity Prometheus, a standalone console, and runtime observability config
 
-Status: **Accepted.** §A (full-fidelity gauges) and the `metrics` half of §C shipped in PR 1 (#216);
-§B (standalone off-cluster console) is **implemented**. §C's `console` off/observe/studio runtime setting
-remains the follow-up (Option 3).
+Status: **Accepted & implemented.** §A (full-fidelity gauges) and the `metrics` half of §C shipped in
+PR 1 (#216); §B (standalone off-cluster console) shipped in PR 2 (#218); §C's `console` off/observe/studio
+runtime profile shipped in PR 3.
 Date: 2026-07-23.
 Relates to:
 ADR 0034 (`0034-console-build-profiles.md`, the build-time studio/observe split — this ADR adds the
@@ -83,15 +83,17 @@ profile, sourced from remote scrapes instead of a local engine.
 ### C. Runtime observability config (flag / file / env)
 
 Introduce a small typed runtime-config layer resolved once at startup, covering the observability
-surface (and extensible later). It defines two settings; the `metrics` toggle ships first (PR 1), and
-the `console` toggle lands with the Option 3 runtime-profile work (PR 3), reusing the same layer:
+surface (and extensible later). It defines two settings; the `metrics` toggle shipped in PR 1, and the
+`console` profile is now **implemented** (PR 3), reusing the same layer:
 
 - **`metrics`** — `on` (default) | `off`. When `off`, the `/metrics` route is **not registered** (so it
   404s, no handler compiled out — it's a runtime gate).
 - **`console`** — `studio` | `observe` | `off`. `off` doesn't mount the console router at all; `observe`
-  serves the operator subset and refuses the authoring routes; `studio` is today's full behaviour. (The
-  runtime `observe`↔`studio` distinction over a studio *build* is a thin gate; the byte-savings version
-  remains the ADR 0034 build profile. `off` is the headless runtime.)
+  serves the operator subset and **refuses authoring (mutating) API requests with `403`** via a thin
+  middleware gate (any method other than GET/HEAD/OPTIONS on `/console/api/*`); `studio` is the default
+  full behaviour. (The runtime `observe`↔`studio` distinction over a studio *build* is a thin gate; the
+  byte-savings version remains the ADR 0034 build profile. `off` is the headless runtime.) Configured via
+  `--console <off|observe|studio>`, env `NANOBPMN_CONSOLE`, or YAML `observability.console`.
 
 Resolution precedence, highest wins:
 
@@ -146,8 +148,10 @@ Unknown flags/keys warn and are ignored (forward-compatible), matching today's l
 2. **PR 2 — standalone off-cluster console (§B).** ✅ The `RemoteCluster` remote aggregator and the
    console-standalone run mode (`server/src/console/standalone.rs`), configured via the same layered
    config from PR 1.
-3. **Then** the ADR 0034 runtime-profile polish (Option 3) lands §C's `console` off/observe/studio
-   setting on the same config layer.
+3. **PR 3 — the runtime console profile (§C's `console` setting).** ✅ `off | observe | studio` on the
+   same config layer: `off` skips mounting the console router, `observe` applies a middleware gate that
+   refuses mutating `/console/api/*` requests with `403`, `studio` is the default. (Feature-gating the
+   authoring API off the base/observe *build* remains an ADR 0034 follow-up.)
 
 ## Follow-ups
 

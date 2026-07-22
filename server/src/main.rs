@@ -14591,6 +14591,34 @@ async fn log_rest(req: axum::extract::Request, next: axum::middleware::Next) -> 
     Response::from_parts(parts, Body::from(bytes))
 }
 
+/// Console `observe`-profile guard (ADR 0035 §C): a thin runtime read-only gate
+/// over a studio build. Mutating requests (any method other than GET/HEAD/
+/// OPTIONS) to the console API surface are refused with `403`, so the operator
+/// subset is served but authoring is disabled. Non-`/console/api/*` requests
+/// (SPA assets, marketing/docs pages) pass through untouched.
+#[cfg(feature = "console")]
+async fn console_observe_guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    use axum::http::Method;
+    use axum::response::IntoResponse;
+    let is_api = req.uri().path().starts_with("/console/api");
+    let read_only = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if is_api && !read_only {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "console is in observe (read-only) mode",
+                "detail": "Authoring is disabled on this node (NANOBPMN_CONSOLE=observe). \
+                           Only the observability views are available.",
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
 /// An [`axum::serve::Listener`] wrapper that disables Nagle (`TCP_NODELAY`) on
 /// every accepted connection. The gateway's WebSocket surfaces — the SDK command
 /// stream and the inter-node peer/Raft lane — exchange small, latency-sensitive
@@ -14665,10 +14693,13 @@ fn gateway_usage() -> String {
          --no-metrics     Disable the Prometheus /metrics endpoint\n  \
          --console-peer <url>  Run as a standalone off-cluster console scraping this\n                        \
          gateway peer (repeatable). Engine-less; observability views only (ADR 0035)\n  \
-         --console-standalone <csv>  Same, as a comma-separated peer URL list\n\n\
+         --console-standalone <csv>  Same, as a comma-separated peer URL list\n  \
+         --console <off|observe|studio>  Console run mode: headless | read-only\n                        \
+         observability | full studio IDE (default studio; ADR 0035 §C)\n\n\
          COMMON ENVIRONMENT VARIABLES:\n  \
          PORT                  TCP port to listen on (default 8080)\n  \
          NANOBPMN_METRICS      on (default) | off — serve the /metrics endpoint\n  \
+         NANOBPMN_CONSOLE      off | observe | studio (default) — console run mode\n  \
          NANOBPMN_CONSOLE_STANDALONE  Comma-separated peer URLs — run as a standalone\n                        \
          off-cluster console instead of an engine (ADR 0035 §B)\n  \
          NANOBPMN_CONFIG       Path to a YAML config file (see docs/adr/0035)\n  \
@@ -15525,14 +15556,33 @@ async fn main() {
 
     #[cfg(feature = "console")]
     {
-        // The spec-first typed `/console/api/*` routes are served by the
-        // generated rust-axum router; the reduced hand-written `console_router`
-        // keeps only the streaming/binary/proxy/static routes excluded from the
-        // spec. axum merges the two: they only share the
-        // `/console/api/projects/{name}/file` path, on disjoint methods (GET is
-        // hand-wired; PUT/POST/DELETE are generated), so there is no collision.
-        app = app.merge(console_router).merge(gen_console_router);
-        tracing::info!("console enabled: web UI at /console, API under /console/api");
+        if !obs_config.console_enabled() {
+            // Headless: don't mount the console router at all. `server` was still
+            // cloned into `gen_console_router` above; both are dropped here
+            // unused, which is intentional (no runtime cost mounted).
+            tracing::info!("console disabled by configuration (headless)");
+        } else {
+            // The spec-first typed `/console/api/*` routes are served by the
+            // generated rust-axum router; the reduced hand-written
+            // `console_router` keeps only the streaming/binary/proxy/static
+            // routes excluded from the spec. axum merges the two: they only
+            // share the `/console/api/projects/{name}/file` path, on disjoint
+            // methods (GET is hand-wired; PUT/POST/DELETE are generated), so
+            // there is no collision.
+            let mut console = console_router.merge(gen_console_router);
+            if obs_config.console_read_only() {
+                // Runtime read-only gate: refuse authoring (mutating) API
+                // requests while still serving the observability views.
+                console = console.layer(axum::middleware::from_fn(console_observe_guard));
+                tracing::info!(
+                    "console enabled in observe mode: read-only web UI at /console \
+                     (authoring API refused)"
+                );
+            } else {
+                tracing::info!("console enabled: web UI at /console, API under /console/api");
+            }
+            app = app.merge(console);
+        }
     }
 
     if debug_rest_enabled() {
