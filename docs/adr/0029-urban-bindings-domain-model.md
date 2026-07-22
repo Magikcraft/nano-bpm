@@ -141,10 +141,17 @@ scope is declared in a top-level `bindings[]` list: each entry binds one model �
 `{ decision: <id> }` — to a `type` (a declared domain type id). The bound model's id resolves against
 the project symbol index (`unknown-form` / `unknown-decision`) and the type against the registry
 (`unknown-type`); the manifest editor autocompletes all three. This is the same typed-reference move,
-and it is the type-in-scope prerequisite for the in-editor step below. The FEEL *inside* the form's
-default-value fields and the decision's input expressions — edited in the form-js / dmn-js editors,
-which carry their own FEEL engines — is fed the bound type's fields as variable suggestions in a
-follow-up increment; that in-editor scope reuses the same resolved domain-type view (`domain-types.ts`).
+and it is the type-in-scope prerequisite for the in-editor step below.
+
+**DMN input-expression variables (implemented).** The FEEL *inside* a decision's input expressions —
+edited in dmn-js, which carries its own FEEL engine — is fed the bound type's fields as variable
+suggestions. `feel.ts` exposes `scopeVarsForType` / `decisionScope` (an editor-agnostic scope tree that
+recurses declared types, cycle-guarded); the console maps that tree into dmn-js's `variableResolver`
+via a registered provider (per-view `additionalModules`), scoped to the decision shown in the active
+view. The bound scope reuses the same resolved domain-type view as validation, so autocomplete and
+diagnostics can't disagree. Form-js default-value FEEL is **deferred**: form-js self-supplies its own
+component keys as FEEL variables (`getSchemaVariables`) with no external-injection seam and no
+plain-defaultValue-as-FEEL concept, so domain-scope injection there is low-value and fragile.
 
 ### 6. Codegen — the domain types flow into TypeScript
 

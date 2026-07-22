@@ -1,5 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 import Modeler from "dmn-js/lib/Modeler";
+import type { FeelVariable } from "../lib/dmnDomainVariables";
 import "dmn-js/dist/assets/diagram-js.css";
 import "dmn-js/dist/assets/dmn-js-shared.css";
 import "dmn-js/dist/assets/dmn-js-drd.css";
@@ -17,6 +18,18 @@ interface Viewer {
   get<T = unknown>(service: string): T;
 }
 
+/** dmn-js/didi injector — used to reach the optional `variableResolver`. */
+interface Injector {
+  get<T = unknown>(name: string, strict: false): T | null;
+}
+
+/** The subset of `@bpmn-io/dmn-variable-resolver`'s VariableResolver we use. */
+interface VariableResolver {
+  registerProvider(provider: {
+    getVariables(variables: FeelVariable[], element: unknown): FeelVariable[];
+  }): void;
+}
+
 /// Imperative handle the DMN editor view drives. Keeps the live DMN document
 /// inside this component and exposes just the operations the toolbar needs.
 export interface DmnModelerHandle {
@@ -32,6 +45,10 @@ interface DmnModelerProps {
   /// Called whenever the document changes (after the first import). The initial
   /// blank model does not mark dirty.
   onChange?: () => void;
+  /// FEEL variables in scope for a decision's input expressions, from the App
+  /// manifest's domain-type binding (ADR 0029 §5). Called with the active
+  /// decision id; returns the variables to add to dmn-js's own inferred set.
+  getVariables?: (decisionId: string | undefined) => FeelVariable[];
 }
 
 const EMPTY_DMN = `<?xml version="1.0" encoding="UTF-8"?>
@@ -56,7 +73,7 @@ const EMPTY_DMN = `<?xml version="1.0" encoding="UTF-8"?>
 </definitions>`;
 
 const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
-  function DmnModeler({ onChange }, ref) {
+  function DmnModeler({ onChange, getVariables }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
     // Set once the modeler has been destroyed, so async work already in flight
@@ -69,6 +86,11 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
     const suppressTimerRef = useRef<number | null>(null);
     const onChangeRef = useRef(onChange);
     onChangeRef.current = onChange;
+    // The bound-type FEEL variable source and the id of the decision currently
+    // shown, read live by the variable-resolver provider (ADR 0029 §5).
+    const getVariablesRef = useRef(getVariables);
+    getVariablesRef.current = getVariables;
+    const activeDecisionIdRef = useRef<string | undefined>(undefined);
     const activeEventBusRef = useRef<EventBus | null>(null);
     const activeHandlerRef = useRef<((...args: unknown[]) => void) | null>(null);
 
@@ -105,7 +127,38 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
     useEffect(() => {
       if (!containerRef.current) return;
       disposedRef.current = false;
-      const modeler = new Modeler({ container: containerRef.current });
+
+      // A didi module that registers a variable provider on any viewer carrying a
+      // `variableResolver` (the decision-table / expression editors). The provider
+      // appends the bound domain type's fields (ADR 0029 §5) to dmn-js's own
+      // inferred variables, reading the live source + active decision each call.
+      function DomainVariableProvider(injector: Injector) {
+        const variableResolver = injector.get<VariableResolver>("variableResolver", false);
+        if (!variableResolver) return;
+        variableResolver.registerProvider({
+          getVariables(variables) {
+            const extra = getVariablesRef.current?.(activeDecisionIdRef.current) ?? [];
+            return extra.length > 0 ? [...variables, ...extra] : variables;
+          },
+        });
+      }
+      DomainVariableProvider.$inject = ["injector"];
+      const domainModule = {
+        __init__: ["nanoDomainVariables"],
+        nanoDomainVariables: ["type", DomainVariableProvider],
+      };
+      const viewerModules = { additionalModules: [domainModule] };
+
+      // dmn-js merges per-viewer `additionalModules` (dmn-js-shared Manager
+      // `_createViewer`), but its bundled types don't declare the viewer keys —
+      // pass a variable so structural typing admits the extra properties.
+      const modelerOptions = {
+        container: containerRef.current,
+        decisionTable: viewerModules,
+        literalExpression: viewerModules,
+        boxedExpression: viewerModules,
+      };
+      const modeler = new Modeler(modelerOptions);
       modelerRef.current = modeler;
 
       const handleChanged = () => {
@@ -133,6 +186,15 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
       };
 
       const handleViewsChanged = () => {
+        // Track the decision shown in the active view so the variable provider
+        // scopes to its binding. A DRD view exposes the DRG id (not a decision),
+        // which simply resolves to no bound type — no wrong variables.
+        const view = (
+          modeler as unknown as {
+            getActiveView?: () => { element?: { id?: string } } | undefined;
+          }
+        ).getActiveView?.();
+        activeDecisionIdRef.current = view?.element?.id;
         attachActiveViewerChangeListener();
         handleChanged();
       };
