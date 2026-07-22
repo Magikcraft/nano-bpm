@@ -25,10 +25,16 @@
 //! cached. The jemalloc `thread.allocatedp` pointer is `!Send`, so it is obtained
 //! lazily on — and only ever used from — the engine thread via a thread-local.
 
+#[cfg(not(target_env = "msvc"))]
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
+// jemalloc's per-thread `thread.allocated` counter is only available where
+// jemalloc is the global allocator — i.e. everywhere except MSVC/Windows, which
+// falls back to the system allocator (see `memory.rs`). On MSVC the alloc-byte
+// side of the measurement degrades to 0; the wall-time side is unaffected.
+#[cfg(not(target_env = "msvc"))]
 use tikv_jemalloc_ctl::thread::{ThreadLocal, allocatedp};
 
 /// Tri-state cache of the `NANOBPM_CMD_PROFILE` gate: 0 = unresolved, 1 = on,
@@ -51,6 +57,7 @@ pub fn enabled() -> bool {
     }
 }
 
+#[cfg(not(target_env = "msvc"))]
 thread_local! {
     /// The engine thread's cached jemalloc thread-allocated counter pointer.
     /// `ThreadLocal<u64>` is `!Send`; obtaining it here (inside the apply closure,
@@ -62,6 +69,7 @@ thread_local! {
 
 /// Reads this thread's cumulative jemalloc-allocated byte counter, caching the
 /// pointer on first use. Returns `0` if jemalloc's thread stats are unavailable.
+#[cfg(not(target_env = "msvc"))]
 #[inline]
 fn thread_allocated() -> u64 {
     ALLOCATED.with(|cell| {
@@ -71,6 +79,15 @@ fn thread_allocated() -> u64 {
         }
         slot.as_ref().map(|tl| tl.get()).unwrap_or(0)
     })
+}
+
+/// MSVC/Windows fallback: the system allocator has no per-thread allocated-byte
+/// counter, so the alloc side of the measurement is always 0 (wall time still
+/// measures). Keeps the diagnostic buildable on every target.
+#[cfg(target_env = "msvc")]
+#[inline]
+fn thread_allocated() -> u64 {
+    0
 }
 
 /// An in-flight per-command measurement. `None` when profiling is disabled, so
