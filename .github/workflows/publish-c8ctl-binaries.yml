@@ -167,6 +167,16 @@ jobs:
             asset: nanobpm-gateway-rest-server-linux-arm64
             apt: gcc-aarch64-linux-gnu
             linker: aarch64-linux-gnu-gcc
+          - target: armv7-unknown-linux-gnueabihf
+            os: ubuntu-24.04
+            asset: nanobpm-gateway-rest-server-linux-armv7
+            apt: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-24.04
+            asset: nanobpm-gateway-rest-server-linux-armv6
+            apt: gcc-arm-linux-gnueabihf
+            linker: arm-linux-gnueabihf-gcc
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             asset: nanobpm-gateway-rest-server-win32-x64.exe
@@ -192,7 +202,7 @@ jobs:
           key: ${{ matrix.target }}
           workspaces: server
 
-      - name: Install cross linker (linux arm64)
+      - name: Install cross linker (linux arm cross targets)
         if: matrix.apt != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
 
@@ -204,10 +214,15 @@ jobs:
         shell: bash
         working-directory: server
         env:
-          # Linker for the linux arm64 cross target (ignored when unset). The
-          # `cc` crate auto-selects the matching `aarch64-linux-gnu-gcc` for the
-          # bundled C deps (rusqlite, jemalloc-sys) from the target triple.
+          # Linker for each linux cross target (cargo consults only the var whose
+          # name matches the active `--target`, so setting them all to the matrix
+          # linker is safe — the non-matching ones are ignored). The `cc` crate
+          # auto-selects the matching cross gcc (`aarch64-linux-gnu-gcc` /
+          # `arm-linux-gnueabihf-gcc`) for the bundled C deps (rusqlite,
+          # jemalloc-sys) from the target triple.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
+          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
+          CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
           # Stamp the binary's reported version from the tag (build.rs strips the
           # leading `v`). Empty on manual runs -> build.rs falls back to git/Cargo.
           NANOBPM_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
