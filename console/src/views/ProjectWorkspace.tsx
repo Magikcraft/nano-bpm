@@ -328,6 +328,7 @@ export default function ProjectWorkspace() {
         {/* File tree */}
         <FileBrowser
           name={name}
+          config={detail.config}
           files={detail.files}
           selected={selected}
           onSelect={setSelected}
@@ -428,27 +429,26 @@ function ToolbarButton({
 
 function FileBrowser({
   name,
+  config,
   files,
   selected,
   onSelect,
   onChanged,
 }: {
   name: string;
+  config: ProjectConfig;
   files: FileNode[];
   selected: string | null;
   onSelect: (path: string) => void;
   onChanged: () => void;
 }) {
-  const newFile = async (dir: boolean) => {
-    const base = prompt(
-      dir ? "New folder path (project-relative):" : "New file path (project-relative):",
-      dir ? "resources/processes/" : "resources/processes/new.bpmn",
-    );
+  const [newFileOpen, setNewFileOpen] = useState(false);
+  const newFolder = async () => {
+    const base = prompt("New folder path (project-relative):", "resources/");
     if (!base) return;
     try {
-      await createProjectPath({ path: { name }, body: { path: base, dir }, throwOnError: true });
+      await createProjectPath({ path: { name }, body: { path: base, dir: true }, throwOnError: true });
       onChanged();
-      if (!dir) onSelect(base);
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
     }
@@ -468,10 +468,10 @@ function FileBrowser({
       <div className="flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-fg-faint">
         <span>Files</span>
         <div className="flex gap-1">
-          <button title="New file" onClick={() => void newFile(false)} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg">
+          <button title="New file" onClick={() => setNewFileOpen(true)} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg">
             ＋
           </button>
-          <button title="New folder" onClick={() => void newFile(true)} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg">
+          <button title="New folder" onClick={() => void newFolder()} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg">
             ⊞
           </button>
         </div>
@@ -479,7 +479,234 @@ function FileBrowser({
       <div className="min-h-0 flex-1 overflow-auto px-1 pb-2">
         <FileTree nodes={files} depth={0} selected={selected} onSelect={onSelect} onDelete={del} />
       </div>
+      {newFileOpen && (
+        <NewFileModal
+          name={name}
+          config={config}
+          files={files}
+          onClose={() => setNewFileOpen(false)}
+          onCreated={(path) => {
+            onChanged();
+            onSelect(path);
+            setNewFileOpen(false);
+          }}
+        />
+      )}
     </aside>
+  );
+}
+
+// Fixed file kinds every project understands. The `source` kind is derived from
+// the project language at render time (extension + default dir), so it isn't
+// listed here.
+const NEW_FILE_KINDS = [
+  {
+    id: "model" as const,
+    label: "Model",
+    hint: "BPMN process diagram",
+    dir: "resources/processes",
+    ext: ".bpmn",
+  },
+  {
+    id: "decision" as const,
+    label: "Decision",
+    hint: "DMN decision table",
+    dir: "resources/decisions",
+    ext: ".dmn",
+  },
+  {
+    id: "form" as const,
+    label: "Form",
+    hint: "User task form",
+    dir: "resources/forms",
+    ext: ".form",
+  },
+];
+
+type NewFileKindId = "model" | "decision" | "form" | "source";
+
+const extnameOf = (p: string): string => {
+  const base = p.split("/").pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  return dot > 0 ? base.slice(dot) : "";
+};
+
+const dirnameOf = (p: string): string => {
+  const slash = p.lastIndexOf("/");
+  return slash >= 0 ? p.slice(0, slash) : "";
+};
+
+const hasTopLevelDir = (files: FileNode[], dir: string): boolean =>
+  files.some((f) => f.kind === "dir" && f.name === dir);
+
+/// Language-aware "New file" dialog. Offers the fixed BPMN/DMN/Form kinds plus a
+/// project-language "Source" kind, each pre-filling the conventional directory
+/// (`resources/processes|decisions|forms`) and extension so files land where the
+/// Urban manifest and editors expect them. The location stays editable for the
+/// escape-hatch cases.
+function NewFileModal({
+  name,
+  config,
+  files,
+  onClose,
+  onCreated,
+}: {
+  name: string;
+  config: ProjectConfig;
+  files: FileNode[];
+  onClose: () => void;
+  onCreated: (path: string) => void;
+}) {
+  // Derive the "Source" kind from the project entrypoint: its extension mirrors
+  // the language (main.ts -> .ts, main.rs -> .rs) and its directory is the most
+  // natural home for new source (the entrypoint's own dir, else a top-level
+  // `lib`/`src`, else the project root).
+  const sourceExt = extnameOf(config.main) || ".txt";
+  const sourceDir = useMemo(() => {
+    const d = dirnameOf(config.main);
+    if (d) return d;
+    for (const cand of ["lib", "src"]) {
+      if (hasTopLevelDir(files, cand)) return cand;
+    }
+    return "";
+  }, [config.main, files]);
+
+  const kindOf = useCallback(
+    (id: NewFileKindId) =>
+      id === "source"
+        ? { id, label: "Source", hint: `${config.lang} source (${sourceExt})`, dir: sourceDir, ext: sourceExt }
+        : NEW_FILE_KINDS.find((k) => k.id === id)!,
+    [config.lang, sourceDir, sourceExt],
+  );
+
+  const kinds = useMemo(
+    () => [...NEW_FILE_KINDS, kindOf("source")],
+    [kindOf],
+  );
+
+  const [kindId, setKindId] = useState<NewFileKindId>("model");
+  const [baseName, setBaseName] = useState("new");
+  const [dir, setDir] = useState(NEW_FILE_KINDS[0].dir);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const active = kindOf(kindId);
+
+  const selectKind = (id: NewFileKindId) => {
+    setKindId(id);
+    setDir(kindOf(id).dir);
+    setError(null);
+  };
+
+  const finalPath = useMemo(() => {
+    let bn = baseName.trim().replace(/^\/+|\/+$/g, "");
+    if (bn.endsWith(active.ext)) bn = bn.slice(0, -active.ext.length);
+    const cleanDir = dir.trim().replace(/^\/+|\/+$/g, "");
+    const file = `${bn}${active.ext}`;
+    return cleanDir ? `${cleanDir}/${file}` : file;
+  }, [baseName, dir, active.ext]);
+
+  const create = async () => {
+    if (!baseName.trim()) {
+      setError("Enter a file name.");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await createProjectPath({
+        path: { name },
+        body: { path: finalPath, dir: false },
+        throwOnError: true,
+      });
+      onCreated(finalPath);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="New file" onClose={onClose}>
+      <div className="space-y-4">
+        <div>
+          <label className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-fg-faint">
+            Type
+          </label>
+          <div className="grid grid-cols-2 gap-2">
+            {kinds.map((k) => (
+              <label
+                key={k.id}
+                className={`flex cursor-pointer items-start gap-2 rounded-md border p-2.5 text-sm transition-colors ${
+                  kindId === k.id
+                    ? "border-accent bg-accent/10"
+                    : "border-edge hover:bg-hover"
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="new-file-kind"
+                  checked={kindId === k.id}
+                  onChange={() => selectKind(k.id)}
+                  className="mt-0.5 accent-accent"
+                />
+                <span className="min-w-0">
+                  <span className="block font-medium text-fg">{k.label}</span>
+                  <span className="block truncate text-xs text-fg-faint">{k.hint}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+        <div className="grid grid-cols-[1fr_auto] items-end gap-2">
+          <label className="block">
+            <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-fg-faint">
+              Name
+            </span>
+            <input
+              autoFocus
+              value={baseName}
+              onChange={(e) => setBaseName(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void create();
+              }}
+              className={`${inputClass} w-full`}
+              placeholder="new"
+            />
+          </label>
+          <div className="rounded-md border border-edge bg-inset px-3 py-2 font-mono text-sm text-fg-muted">
+            {active.ext}
+          </div>
+        </div>
+        <label className="block">
+          <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-fg-faint">
+            Location
+          </span>
+          <input
+            value={dir}
+            onChange={(e) => setDir(e.target.value)}
+            className={`${inputClass} w-full`}
+            placeholder="resources/processes"
+          />
+        </label>
+        <p className="text-xs text-fg-muted">
+          Creates <code className="text-fg">{finalPath}</code>
+        </p>
+        {error && <p className="text-sm text-danger">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => void create()}
+            disabled={busy || !baseName.trim()}
+          >
+            {busy ? "Creating…" : "Create"}
+          </Button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
