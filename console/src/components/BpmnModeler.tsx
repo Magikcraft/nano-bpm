@@ -12,7 +12,9 @@ import {
   type ElementTemplatesService,
 } from "bpmn-js-element-templates";
 import CloudBehaviorsModule from "camunda-bpmn-js-behaviors/lib/camunda-cloud";
+import { getVariablesForElement as extractZeebeVariables } from "@bpmn-io/extract-process-variables/zeebe";
 import { urbanComponents } from "../lib/urbanComponents";
+import type { FeelVariable } from "../lib/feelVariables";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
@@ -100,10 +102,15 @@ interface BpmnModelerProps {
   /// Called once after the initial blank diagram has loaded, so the parent can
   /// read the starting process id.
   onReady?: () => void;
+  /// Supplies the domain variables in scope for the open diagram's process
+  /// (ADR 0030) so component-input / gateway FEEL autocomplete offers the bound
+  /// domain type's fields. Empty/absent → only bpmn-js's extracted process
+  /// variables are offered. Read live, so binding edits reflect without a remount.
+  getVariables?: () => FeelVariable[];
 }
 
 const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
-  function BpmnModeler({ onChange, onReady }, ref) {
+  function BpmnModeler({ onChange, onReady, getVariables }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const panelRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
@@ -122,6 +129,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     onChangeRef.current = onChange;
     const onReadyRef = useRef(onReady);
     onReadyRef.current = onReady;
+    const getVariablesRef = useRef(getVariables);
+    getVariablesRef.current = getVariables;
 
     // Queues a load on a single chain so imports can't race each other or the
     // initial blank diagram. Each op captures the modeler instance it was
@@ -156,6 +165,28 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     useEffect(() => {
       if (!containerRef.current || !panelRef.current) return;
       disposedRef.current = false;
+      // A `variableResolver` service the bpmn-js FEEL fields consult
+      // (`useServiceIfAvailable('variableResolver', …)` in properties-panel and
+      // element-templates). We keep bpmn-js's own extracted process variables
+      // (output mappings written upstream) and append the domain type bound to
+      // this diagram's process (ADR 0030), so component-input / gateway FEEL
+      // autocomplete offers `body.<field>` for the bound record. Read live via
+      // the ref so binding edits reflect without recreating the modeler.
+      class DomainVariableResolver {
+        getVariablesForElement(bo: unknown): FeelVariable[] {
+          let base: FeelVariable[] = [];
+          try {
+            base = (extractZeebeVariables(bo) as FeelVariable[]) ?? [];
+          } catch {
+            base = [];
+          }
+          const domain = getVariablesRef.current?.() ?? [];
+          return [...base, ...domain];
+        }
+      }
+      const domainVariableResolverModule = {
+        variableResolver: ["type", DomainVariableResolver],
+      };
       const modeler = new Modeler({
         container: containerRef.current,
         propertiesPanel: { parent: panelRef.current },
@@ -171,6 +202,7 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           CloudElementTemplatesPropertiesProviderModule,
           CloudBehaviorsModule,
           urbanComponentsPaletteModule,
+          domainVariableResolverModule,
         ],
         moddleExtensions: { zeebe: ZeebeModdle },
       });

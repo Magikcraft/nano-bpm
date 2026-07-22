@@ -2,7 +2,7 @@
 // and `resolveBodyPath` type-walking. `node --test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope } from "../src/feel.ts";
+import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope, processScope } from "../src/feel.ts";
 
 const manifest = {
   types: {
@@ -113,4 +113,18 @@ test("decisionScope resolves the type bound to a decision, else undefined", () =
   const m2 = { types: manifest.types, bindings: [{ decision: "d", type: "ghost" }] };
   assert.equal(decisionScope(m2, "d"), undefined);
   assert.equal(decisionScope(m, undefined), undefined);
+});
+
+test("processScope resolves the type bound to a process, else undefined (ADR 0030)", () => {
+  const m = {
+    types: manifest.types,
+    bindings: [{ process: "order-cycle", type: "reading" }, { decision: "d", type: "reading" }],
+  };
+  const vars = processScope(m, "order-cycle");
+  assert.deepEqual(vars.map((v) => v.name).sort(), ["meta", "readings", "room", "sensor", "temp"]);
+  // a process id with no binding, an undeclared type, and a missing id → undefined
+  assert.equal(processScope(m, "other"), undefined);
+  const m2 = { types: manifest.types, bindings: [{ process: "p", type: "ghost" }] };
+  assert.equal(processScope(m2, "p"), undefined);
+  assert.equal(processScope(m, undefined), undefined);
 });

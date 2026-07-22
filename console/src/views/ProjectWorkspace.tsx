@@ -35,6 +35,7 @@ import {
 } from "../lib/api";
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
+import { processFeelVariables } from "../lib/bpmnDomainVariables";
 import {
   subscribe as subscribeDebug,
   snapshot as debugSnapshot,
@@ -640,12 +641,13 @@ function EditorPane({
     lastDeployedXml != null && lastDeployedXml === content && !dirty;
 
   // The App manifest supplies the domain type bound to each decision (ADR 0029
-  // §5), which scopes the DMN input-expression FEEL autocomplete. Load it (root
-  // nano.app.json) while a decision is open; reload on file switch so recent
-  // binding edits are reflected. Absent/invalid manifest → no bound variables.
+  // §5) and each process (ADR 0030), which scopes the DMN input-expression and
+  // BPMN component-input FEEL autocomplete. Load it (root nano.app.json) while a
+  // decision or process model is open; reload on file switch so recent binding
+  // edits are reflected. Absent/invalid manifest → no bound variables.
   const [manifestText, setManifestText] = useState<string | null>(null);
   useEffect(() => {
-    if (kind !== "dmn") {
+    if (kind !== "dmn" && kind !== "bpmn") {
       setManifestText(null);
       return;
     }
@@ -668,6 +670,10 @@ function EditorPane({
   const dmnGetVariables = useCallback(
     (decisionId: string | undefined) => decisionFeelVariables(manifest, decisionId),
     [manifest],
+  );
+  const bpmnGetVariables = useCallback(
+    () => processFeelVariables(manifest, primaryProcessId ?? undefined),
+    [manifest, primaryProcessId],
   );
 
   useEffect(() => {
@@ -1051,7 +1057,7 @@ function EditorPane({
               The XML editor is layered above via absolute positioning.
             */}
             <div className={bpmnView === "visual" ? "h-full" : "h-full invisible"}>
-              <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} />
+              <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} getVariables={bpmnGetVariables} />
             </div>
             {bpmnView === "xml" && (
               <div className="absolute inset-0 bg-app">

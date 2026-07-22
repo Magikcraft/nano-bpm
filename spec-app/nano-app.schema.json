@@ -264,8 +264,8 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["type"],
-      "oneOf": [{ "required": ["form"] }, { "required": ["decision"] }],
-      "description": "Binds one model — a form OR a decision — to the domain type in scope for its FEEL (ADR 0029 §5). Exactly one of form/decision.",
+      "oneOf": [{ "required": ["form"] }, { "required": ["decision"] }, { "required": ["process"] }],
+      "description": "Binds one model — a form, a decision, OR a process — to the domain type in scope for its FEEL (ADR 0029 §5, ADR 0030). Exactly one of form/decision/process.",
       "properties": {
         "form": {
           "type": "string",
@@ -274,6 +274,10 @@
         "decision": {
           "type": "string",
           "description": "DMN decision id whose input-expression FEEL is scoped to `type`."
+        },
+        "process": {
+          "type": "string",
+          "description": "BPMN process id whose FEEL (component/service-task inputs, conditions) is scoped to `type` — the process as the motion of a typed domain object (ADR 0030)."
         },
         "type": {
           "$ref": "#/$defs/slug",

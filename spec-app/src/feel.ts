@@ -136,11 +136,34 @@ export function scopeVarsForType(manifest: unknown, typeId: string | undefined):
  * declared type — callers then contribute no domain variables (never a wrong scope).
  */
 export function decisionScope(manifest: unknown, decisionId: string | undefined): ScopeVar[] | undefined {
-  if (!decisionId) return undefined;
+  return bindingScope(manifest, "decision", decisionId);
+}
+
+/**
+ * The variable scope for a process's FEEL (component/service-task inputs, gateway
+ * conditions): the fields of the domain type bound to `processId` in `bindings[]`
+ * — the process as the motion of a typed domain object (ADR 0030). Returns
+ * `undefined` when the process has no binding or the bound type is not declared.
+ */
+export function processScope(manifest: unknown, processId: string | undefined): ScopeVar[] | undefined {
+  return bindingScope(manifest, "process", processId);
+}
+
+/**
+ * The domain-type scope bound to a model id in `bindings[]` (ADR 0029 §5). `key`
+ * is the binding discriminator (`decision` / `process` / `form`); shared so every
+ * scope entry point resolves bindings identically.
+ */
+function bindingScope(
+  manifest: unknown,
+  key: "decision" | "process" | "form",
+  id: string | undefined,
+): ScopeVar[] | undefined {
+  if (!id) return undefined;
   const bindings = (manifest as { bindings?: unknown })?.bindings;
   if (!Array.isArray(bindings)) return undefined;
   const binding = bindings.find(
-    (b) => b && typeof b === "object" && (b as { decision?: unknown }).decision === decisionId,
+    (b) => b && typeof b === "object" && (b as Record<string, unknown>)[key] === id,
   ) as { type?: unknown } | undefined;
   const typeId = typeof binding?.type === "string" ? binding.type : undefined;
   if (!isDeclaredType(manifest, typeId)) return undefined;

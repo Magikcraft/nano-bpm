@@ -74,10 +74,10 @@ a maker starts: from components, not from a blank service task they must configu
 ### 3. Component input/output FEEL is scoped to the domain model
 
 A template's `zeebe:input` properties are FEEL expressions over process variables. They get the **same
-variable injection** shipped for DMN in #197: the domain type in scope (from `bindings[]` / a trigger's
-`bodyType`) feeds the input-property autocomplete. This generalises `feel.ts`'s `decisionScope` into a
-`scopeForElement` resolver reused across DMN inputs, form defaults, and now component inputs — one
-tested scope model, many editors. Symmetrically, a component that declares its **output** domain type
+variable injection** shipped for DMN in #197: the domain type bound to the process (via `bindings[]`,
+ADR 0030) feeds the input-property autocomplete. `feel.ts` shares one `bindingScope` resolver behind
+`decisionScope` (DMN inputs) and `processScope` (component inputs, gateway conditions) — one tested
+scope model, many editors. Symmetrically, a component that declares its **output** domain type
 lets downstream tasks/forms/DMN autocomplete on its results: Delphi-grade continuity, component output →
 process variable → next component input, all typed, feeding the PRM registry (ADR 0029 §6 / 0031).
 
@@ -126,8 +126,12 @@ input scoping (§3), and the pack axis (§4) are the increments below.
 
 1. **Where components live** — a project `components/` dir indexed by the symbol index, vs. pack-only,
    vs. both. Bearing on how the manifest references a component instance.
-2. **Template ↔ worker binding surface** — does the manifest gain a `components[]` list (like
-   `bindings[]`), or is the link inferred from `taskDefinition:type` ↔ `workers[].taskType`?
+2. ~~**Template ↔ worker binding surface**~~ — **resolved (PR #199).** The manifest does *not* gain a
+   `components[]` list. Instead `bindings[]` binds a domain type to a **process** (ADR 0030's duality:
+   a process is the motion of a typed domain object), which scopes *all* FEEL in that process —
+   component `zeebe:input`, gateway conditions, output mappings — uniformly. The template↔worker link
+   stays inferred from `taskDefinition:type` ↔ `workers[].taskType`; no per-instance manifest entry is
+   needed, and connectors (which declare no `taskType`) raise no false "missing worker" diagnostics.
 3. **Output-type declaration** — how a component template declares the domain type of its outputs so
    §3's downstream typing works (a `zeebe:property`/metadata convention, or an Urban extension field).
 4. **Chooser vs. palette** — adopt `bpmn-js-create-append-anything` for the append-anything popup, or
@@ -135,10 +139,11 @@ input scoping (§3), and the pack axis (§4) are the increments below.
 
 ## Increments
 
-1. **spike** — element-templates wired into the modeler + palette + sample components (this PR).
+1. **spike** — element-templates wired into the modeler + palette + sample components (this PR). ✅
 2. **component source** — load templates from the project/packs (OQ1) instead of the bundled constant.
-3. **the binding** — manifest link + typed-reference validation of `taskDefinition:type` ↔ worker (§1,
-   OQ2).
-4. **FEEL scoping** — `scopeForElement` over component `zeebe:input` properties, reusing #197 (§3).
+3. **the binding** — `bindings[].process` binds a domain type to a process (ADR 0030); schema +
+   fail-closed `unknown-process` validation + completion (`process-ref`) — PR #199. ✅
+4. **FEEL scoping** — `processScope` injects the bound type's fields into bpmn-js component-input FEEL
+   autocomplete via a `variableResolver` service, mirroring #197's DMN injection — PR #199. ✅
 5. **output typing** — declare + consume a component's output domain type (§3, OQ3).
 6. **pack axis** — components as an ADR 0007 pack contribution (§4).

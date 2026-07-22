@@ -50,7 +50,7 @@ export type TriggerAction1 = {
   [k: string]: unknown;
 };
 /**
- * Binds one model — a form OR a decision — to the domain type in scope for its FEEL (ADR 0029 §5). Exactly one of form/decision.
+ * Binds one model — a form, a decision, OR a process — to the domain type in scope for its FEEL (ADR 0029 §5, ADR 0030). Exactly one of form/decision/process.
  */
 export type Binding = {
   /**
@@ -61,6 +61,10 @@ export type Binding = {
    * DMN decision id whose input-expression FEEL is scoped to `type`.
    */
   decision?: string;
+  /**
+   * BPMN process id whose FEEL (component/service-task inputs, conditions) is scoped to `type` — the process as the motion of a typed domain object (ADR 0030).
+   */
+  process?: string;
   /**
    * Lowercase kebab-case slug.
    */

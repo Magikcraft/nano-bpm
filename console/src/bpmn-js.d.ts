@@ -71,3 +71,8 @@ declare module "camunda-bpmn-js-behaviors/lib/camunda-cloud" {
   const mod: unknown;
   export default mod;
 }
+
+declare module "@bpmn-io/extract-process-variables/zeebe" {
+  /** Variables written into scope up to `element` (moddle business object). */
+  export function getVariablesForElement(element: unknown): { name: string }[];
+}
