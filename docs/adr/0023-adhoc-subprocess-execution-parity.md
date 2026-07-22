@@ -1,6 +1,12 @@
 # ADR 0023 — Ad-hoc sub-process execution parity (agentic Tier-1)
 
-Status: **Proposed.**
+Status: **Accepted; implementing.** Seams 1–3 (fixtures, model catalog, result
+plumbing) and seam 2 (runtime activate/loop/complete) shipped in PRs #142/#146;
+seam 5 (read model + metrics) is implemented — each tool activation is a
+read-model element instance and the loop is metered via
+`nanobpm_adhoc_events_total{kind=…}` (see `PERFORMANCE.md`). Remaining: seam 4
+(FEEL `completionCondition` + activated-element `ioMapping` + `BPMN_TASK`
+`activeElementsCollection`) and the seam 6 E2E parity test.
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md` §E.1 — the parity strategy this ADR makes
 concrete; **Tier-1** of that tier ladder), ADR 0005 (`0005-embedded-u-nano.md`, Bernd — the
@@ -126,7 +132,11 @@ Ship in this order; state each boundary in `PERFORMANCE.md`/feature matrix:
 6. **E2E parity test**: run a golden agentic BPMN on embedded Bernd driven by the **unmodified**
    Camunda AI Agent connector; assert per-tool instances appear in the read model and the run
    matches Camunda's outcome.
-7. **Read model + metrics** (seam 5); update the feature matrix + `PERFORMANCE.md` subset note.
+7. **Read model + metrics** (seam 5) ✅: each tool activation is a read-model
+   element instance (standard `ElementActivated`/`ElementCompleted`, so tools
+   appear in the console trace scoped to their container); the loop is metered on
+   `/metrics` via `nanobpm_adhoc_events_total{kind=tool_activation|agent_iteration|completion|cancellation}`.
+   Feature matrix + `PERFORMANCE.md` subset note updated.
 
 ## Consequences
 

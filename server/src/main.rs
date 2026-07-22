@@ -4271,6 +4271,7 @@ impl ServerImpl {
                 // message catch: route the resulting subscription open/correlate.
                 self.spawn_routing_if_needed(&events);
                 self.observe_job_sojourn(&events, now_millis());
+                self.record_adhoc_events(&events);
                 // Completing a job may advance the token onto a following service
                 // task, creating a new activatable job: wake any long-pollers.
                 self.signal_jobs_available();
@@ -12455,6 +12456,7 @@ impl ServerImpl {
         }
         self.spawn_routing_if_needed(&response.events);
         self.observe_job_sojourn(&response.events, now_millis());
+        self.record_adhoc_events(&response.events);
         Ok(Commit::ready())
     }
 
@@ -12495,6 +12497,7 @@ impl ServerImpl {
         if let Ok((events, _)) = &result {
             self.spawn_routing_if_needed(events);
             self.observe_job_sojourn(events, now_millis());
+            self.record_adhoc_events(events);
         }
         Self::map_job_outcome(result)
     }
@@ -12627,6 +12630,23 @@ impl ServerImpl {
     /// `now` injected into the engine at create and complete), in seconds. This is
     /// the user-facing SLA/SLI reporting surface, **not** a control input — sojourn
     /// is dominated by external/worker service time, so it must never throttle
+    /// Increments the ad-hoc lifecycle counters (`nanobpm_adhoc_events_total`)
+    /// for any agentic-orchestration events in `events`: each tool activation,
+    /// each agent re-iteration, and each container completion (split into a
+    /// normal `completion` vs a `cancellation`). Called at the same completion
+    /// sites as [`observe_job_sojourn`](Self::observe_job_sojourn) — the agent
+    /// job's `CompleteJob` (and the tool-drain that re-emits it or finishes the
+    /// container) always flows through one of them, so every ad-hoc event is
+    /// counted exactly once. Hot-path cheap: a slice scan + counter `inc`.
+    #[inline]
+    pub(crate) fn record_adhoc_events(&self, events: &[Event]) {
+        for ev in events {
+            if let Some(kind) = adhoc_event_kind(ev) {
+                crate::metrics::record_adhoc_event(kind);
+            }
+        }
+    }
+
     /// admission (that is the internal-command-latency compressor's job). Per job
     /// type so an operator can localize a slow downstream to a specific process/job
     /// type (its sojourn stretches while the engine's internal command latency stays
@@ -14757,6 +14777,91 @@ mod console_observe_guard_tests {
         assert!(is_console_authoring_path("/console/api/config/ide"));
     }
 }
+
+/// Classifies an engine event into an ad-hoc lifecycle metric label
+/// (`nanobpm_adhoc_events_total{kind}`), or `None` for non-ad-hoc events. Pure,
+/// so the event→counter mapping (including the completion-vs-cancellation split)
+/// is unit-testable without an [`App`]. See [`App::record_adhoc_events`].
+fn adhoc_event_kind(ev: &Event) -> Option<&'static str> {
+    match ev {
+        Event::AdHocToolActivated { .. } => Some("tool_activation"),
+        Event::AdHocIterated { .. } => Some("agent_iteration"),
+        Event::AdHocCompleted {
+            cancelled: false, ..
+        } => Some("completion"),
+        Event::AdHocCompleted {
+            cancelled: true, ..
+        } => Some("cancellation"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod adhoc_metrics_tests {
+    use super::Event;
+    use super::adhoc_event_kind;
+
+    #[test]
+    fn classifies_adhoc_lifecycle_events() {
+        assert_eq!(
+            adhoc_event_kind(&Event::AdHocToolActivated {
+                instance_key: 1,
+                container_key: 2,
+                child_key: 3,
+                local_variables: Default::default(),
+            }),
+            Some("tool_activation")
+        );
+        assert_eq!(
+            adhoc_event_kind(&Event::AdHocIterated {
+                instance_key: 1,
+                container_key: 2,
+            }),
+            Some("agent_iteration")
+        );
+        assert_eq!(
+            adhoc_event_kind(&Event::AdHocCompleted {
+                instance_key: 1,
+                container_key: 2,
+                cancelled: false,
+            }),
+            Some("completion")
+        );
+        assert_eq!(
+            adhoc_event_kind(&Event::AdHocCompleted {
+                instance_key: 1,
+                container_key: 2,
+                cancelled: true,
+            }),
+            Some("cancellation")
+        );
+    }
+
+    #[test]
+    fn ignores_non_adhoc_events() {
+        assert_eq!(
+            adhoc_event_kind(&Event::AdHocToolCompleted {
+                instance_key: 1,
+                container_key: 2,
+                child_key: 3,
+                output: None,
+            }),
+            None,
+            "tool completion is captured by ElementCompleted, not a counter"
+        );
+        assert_eq!(
+            adhoc_event_kind(&Event::JobCompleted {
+                job_key: 1,
+                instance_key: 2,
+                created_at: 0,
+                job_type: String::new(),
+            }),
+            None
+        );
+    }
+}
+
+/// An [`axum::serve::Listener`] wrapper that disables Nagle (`TCP_NODELAY`) on
 /// every accepted connection. The gateway's WebSocket surfaces — the SDK command
 /// stream and the inter-node peer/Raft lane — exchange small, latency-sensitive
 /// request/response frames; with Nagle + delayed-ACK each round-trip can stall
