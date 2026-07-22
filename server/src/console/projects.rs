@@ -142,6 +142,30 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Terminate a spawned child **and its descendants**.
+///
+/// Run targets are launched as their own process-group leaders (see the
+/// `process_group(0)` calls in the run paths), so on Unix we SIGKILL the whole
+/// group via `kill(-pid)`. This is essential for wrappers that fork a real
+/// worker child — e.g. `uv run worker.py` execs `uv`, which spawns `python`;
+/// killing only `uv` (`child.start_kill()`) would orphan the python worker,
+/// which keeps polling the gateway after the user hits **Stop**. Off Unix (or
+/// if the pid is already gone) we fall back to killing just the direct child.
+fn kill_process_group(child: &mut tokio::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Some(pid) = child.id() {
+            // SAFETY: a negative pid signals the process group led by `pid`.
+            // The group leader was set with `process_group(0)` at spawn time.
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            return;
+        }
+    }
+    let _ = child.start_kill();
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem model
 // ---------------------------------------------------------------------------
@@ -2227,6 +2251,10 @@ impl ProjectSupervisor {
             cmd.env(k, v);
         }
 
+        // Own process group so Stop can reap the whole tree (see
+        // `kill_process_group`). No-op / unsupported off Unix.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -2286,7 +2314,7 @@ impl ProjectSupervisor {
         tokio::spawn(async move {
             let status = tokio::select! {
                 _ = inner.stop.notified() => {
-                    let _ = child.start_kill();
+                    kill_process_group(&mut child);
                     inner.push_log("sys", "stop requested; terminating".into()).await;
                     child.wait().await.ok()
                 }
@@ -2360,6 +2388,10 @@ impl ProjectSupervisor {
         for (k, v) in resolve_run_env(cfg) {
             cmd.env(k, v);
         }
+        // Own process group so Stop can reap the whole tree — e.g. `uv run`
+        // forks a `python` worker child that must die with it.
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -2400,7 +2432,7 @@ impl ProjectSupervisor {
         let inner = inner.clone();
         tokio::spawn(async move {
             let status = tokio::select! {
-                _ = inner.stop.notified() => { let _ = child.start_kill(); child.wait().await.ok() }
+                _ = inner.stop.notified() => { kill_process_group(&mut child); child.wait().await.ok() }
                 st = child.wait() => st.ok(),
             };
             inner.pid.store(0, Ordering::Relaxed);

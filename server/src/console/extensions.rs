@@ -868,8 +868,15 @@ fn refresh_installed_latest(npm: &std::path::Path, entries: &mut [MarketEntry]) 
     }
 }
 
-/// Find a program on PATH (and the Cargo bin dir for Rust). Mirrors
+/// Find a program on PATH (plus the usual per-user tool bin dirs). Mirrors
 /// [`super::workers::find_deno`]'s resolution order.
+///
+/// A detached server (e.g. spawned by systemd / at boot) often inherits a
+/// minimal PATH like `/usr/local/sbin:…:/bin` that omits the per-user bin dirs
+/// where tool installers drop binaries — notably `~/.local/bin` (the astral
+/// `uv` installer) and `~/.cargo/bin` (rustup). We fall back to those so a
+/// pack's toolchain (`uv`, `cargo`, …) is found for both detection and
+/// execution without the operator having to symlink or patch PATH.
 pub fn find_program(name: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PATH") {
         for d in std::env::split_paths(&path) {
@@ -880,9 +887,14 @@ pub fn find_program(name: &str) -> Option<PathBuf> {
         }
     }
     if let Some(home) = std::env::var_os("HOME") {
-        let c = PathBuf::from(home).join(".cargo").join("bin").join(name);
-        if c.is_file() {
-            return Some(c);
+        let home = PathBuf::from(home);
+        for sub in [
+            home.join(".local").join("bin").join(name),
+            home.join(".cargo").join("bin").join(name),
+        ] {
+            if sub.is_file() {
+                return Some(sub);
+            }
         }
     }
     None
@@ -1006,6 +1018,42 @@ mod tests {
         );
         // Built-in packs (no on-disk dir) contribute nothing.
         assert!(pack_component_templates("deno").is_empty());
+    }
+
+    #[test]
+    fn find_program_falls_back_to_local_bin() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = std::env::temp_dir().join(format!("nano-fp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // A tool an installer dropped in ~/.local/bin, absent from PATH — mirrors
+        // uv installed by the astral script under a detached server's minimal PATH.
+        let local_bin = home.join(".local").join("bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let tool = format!("nano-fake-uv-{}", std::process::id());
+        std::fs::write(local_bin.join(&tool), b"#!/bin/sh\n").unwrap();
+
+        // SAFETY: test-local env, serialized on ENV_LOCK; restored below.
+        let saved_home = std::env::var_os("HOME");
+        let saved_path = std::env::var_os("PATH");
+        unsafe {
+            std::env::set_var("HOME", &home);
+            // A PATH that does *not* contain the tool.
+            std::env::set_var("PATH", home.join("nowhere"));
+        }
+        let found = find_program(&tool);
+        unsafe {
+            match saved_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match saved_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(found.as_deref(), Some(local_bin.join(&tool).as_path()));
     }
 
     #[test]
