@@ -1,0 +1,118 @@
+// Deno unit tests for the Urban datasource SDK (ADR 0024 phase-1 core).
+//
+// CI cannot run Deno, so these are run locally with:
+//   deno test --allow-read --allow-write --allow-env server/src/console/data_sdk_test.ts
+//
+// They cover the env-template alias flip, url→path resolution, and a full SQLite
+// roundtrip (exec/query/tx/schema) against a temp manifest+db.
+
+import { assertEquals, assertRejects } from "jsr:@std/assert@1";
+import {
+  openDataSource,
+  resolveEnvTemplate,
+  resolveSource,
+  sqlitePath,
+} from "./data_sdk.ts";
+
+Deno.test("resolveEnvTemplate expands vars and :- defaults", () => {
+  const env = (k: string) => ({ SET: "pg", EMPTY: "" }[k]);
+  assertEquals(resolveEnvTemplate("${SET}", env), "pg");
+  assertEquals(resolveEnvTemplate("${MISSING:-sqlite}", env), "sqlite");
+  assertEquals(resolveEnvTemplate("${EMPTY:-fallback}", env), "fallback");
+  assertEquals(resolveEnvTemplate("${MISSING}", env), "");
+  assertEquals(
+    resolveEnvTemplate("postgres://${DB_HOST:-localhost}:${DB_PORT:-5432}/app", env),
+    "postgres://localhost:5432/app",
+  );
+});
+
+Deno.test("resolveSource flips driver+url from env", () => {
+  const env = (k: string) => ({ NANO_APP_DB_DRIVER: "postgres" }[k]);
+  const r = resolveSource(
+    "app",
+    { driver: "${NANO_APP_DB_DRIVER:-sqlite}", url: "${NANO_APP_DB_URL:-file:./app.db}" },
+    env,
+  );
+  assertEquals(r.driver, "postgres");
+  assertEquals(r.url, "file:./app.db");
+});
+
+Deno.test("sqlitePath resolves file: urls against project root", () => {
+  assertEquals(sqlitePath("file:./app.db", "/proj"), "/proj/app.db");
+  assertEquals(sqlitePath("file:app.db", "/proj"), "/proj/app.db");
+  assertEquals(sqlitePath("file:/abs/app.db", "/proj"), "/abs/app.db");
+  assertEquals(sqlitePath("app.db", "/proj"), "/proj/app.db");
+  assertEquals(sqlitePath(":memory:", "/proj"), ":memory:");
+});
+
+Deno.test("openDataSource: SQLite roundtrip, tx, and schema", async () => {
+  const root = await Deno.makeTempDir();
+  await Deno.writeTextFile(
+    `${root}/nano.app.json`,
+    JSON.stringify({
+      data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
+    }),
+  );
+  // A worker runs from a nested cwd; the SDK must walk up to the manifest.
+  const cwd = `${root}/workers/save`;
+  await Deno.mkdir(cwd, { recursive: true });
+
+  const db = await openDataSource("app", { cwd });
+  await db.exec(
+    "CREATE TABLE orders(id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER)",
+  );
+  await db.exec("CREATE INDEX idx_orders_name ON orders(name)");
+
+  const ins = await db.exec("INSERT INTO orders(name, qty) VALUES (?, ?)", ["widget", 3]);
+  assertEquals(ins.changed, 1);
+  assertEquals(Number(ins.lastInsertId), 1);
+
+  // tx commits on success
+  await db.tx(async (t) => {
+    await t.exec("INSERT INTO orders(name, qty) VALUES (?, ?)", ["gadget", 7]);
+  });
+  // tx rolls back on throw
+  await assertRejects(() =>
+    db.tx(async (t) => {
+      await t.exec("INSERT INTO orders(name, qty) VALUES (?, ?)", ["ghost", 1]);
+      throw new Error("boom");
+    })
+  );
+
+  const rows = await db.query("SELECT name, qty FROM orders ORDER BY id");
+  assertEquals(rows, [
+    { name: "widget", qty: 3 },
+    { name: "gadget", qty: 7 },
+  ]);
+
+  const schema = await db.schema();
+  assertEquals(schema.length, 1);
+  assertEquals(schema[0].name, "orders");
+  assertEquals(schema[0].columns.map((c) => c.name), ["id", "name", "qty"]);
+  assertEquals(schema[0].columns[0].primaryKey, true);
+  assertEquals(schema[0].columns[1].notNull, true);
+  assertEquals(schema[0].indexes.includes("idx_orders_name"), true);
+
+  db.close();
+
+  // The default source is picked when no name is given, and re-opens are cached.
+  const dflt = await openDataSource(undefined, { cwd });
+  assertEquals((await dflt.query("SELECT COUNT(*) c FROM orders"))[0].c, 2);
+  dflt.close();
+
+  await Deno.remove(root, { recursive: true });
+});
+
+Deno.test("openDataSource: unknown driver hints at a pack", async () => {
+  const root = await Deno.makeTempDir();
+  await Deno.writeTextFile(
+    `${root}/nano.app.json`,
+    JSON.stringify({ data: { default: "app", sources: { app: { driver: "mysql", url: "x" } } } }),
+  );
+  await assertRejects(
+    () => openDataSource("app", { cwd: root }),
+    Error,
+    "nano-ide-data-mysql",
+  );
+  await Deno.remove(root, { recursive: true });
+});

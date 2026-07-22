@@ -38,6 +38,7 @@ use tokio::sync::{Mutex, Notify, broadcast};
 use super::{worker_export, workers, workspace};
 
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
+const DATA_SDK_TS: &str = include_str!("data_sdk.ts");
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
 const LOG_RING_CAP: usize = 1000;
@@ -499,6 +500,7 @@ pub fn write_config(name: &str, cfg: &ProjectConfig) -> std::io::Result<()> {
 const PROJECT_DENO_JSON: &str = r#"{
   "imports": {
     "@nanobpm/worker": "./.nanobpm/worker-sdk.ts",
+    "@nanobpm/data": "./.nanobpm/data-sdk.ts",
     "@lib/": "./lib/"
   },
   "tasks": {
@@ -668,6 +670,7 @@ defineWorker({
 const WORKER_DENO_JSON: &str = r#"{
   "imports": {
     "@nanobpm/worker": "../../.nanobpm/worker-sdk.ts",
+    "@nanobpm/data": "../../.nanobpm/data-sdk.ts",
     "@lib/": "../../lib/"
   }
 }
@@ -1060,7 +1063,7 @@ for a self-contained engine+UI binary.\n"
 // for the sqlite datasource + `public/` for static assets.
 
 const URBAN_DENO_JSON: &str = r#"{
-  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@lib/": "./lib/" },
+  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/data": "./.nanobpm/data-sdk.ts", "@lib/": "./lib/" },
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-write --allow-env main.ts"
   }
@@ -1184,7 +1187,19 @@ A Nano RAD application (ADR 0022). `nano.app.json` is the source of truth: it \
 declares the app's **models** (`resources/processes|decisions|forms`), \
 **data** (a sqlite datasource with migrations under `db/`), **triggers** and \
 **surfaces**. Design them in the Console's App panels, then **Run** the Deno \
-binary or **Compile** it (`deno compile --include nano.app.json --include public`).\n"
+binary or **Compile** it (`deno compile --include nano.app.json --include public`).\n\n\
+## Data\n\n\
+Open a declared datasource by name (the swappable BDE alias, ADR 0024):\n\n\
+```ts\n\
+import {{ openDataSource }} from \"@nanobpm/data\";\n\
+const db = await openDataSource();          // the manifest's `default` source\n\
+await db.exec(\"CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY, body TEXT)\");\n\
+await db.exec(\"INSERT INTO notes(body) VALUES (?)\", [\"hello\"]);\n\
+console.log(await db.query(\"SELECT * FROM notes\"));\n\
+```\n\n\
+Inside a worker handler the same source is on `ctx.data(name?)`. Bind by *name*, \
+never by driver: flip `${{NANO_APP_DB_*}}` env to run the same app on a server \
+database in production with no source change.\n"
     )
 }
 
@@ -1216,6 +1231,7 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     })?;
     let nano = dir.join(".nanobpm");
     std::fs::create_dir_all(&nano)?;
+    std::fs::write(nano.join("data-sdk.ts"), DATA_SDK_TS)?;
     std::fs::write(nano.join("worker-sdk.ts"), WORKER_SDK_TS)
 }
 
@@ -1308,6 +1324,7 @@ pub fn create_project(
     let w =
         |p: PathBuf, body: &str| std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"));
     w(dir.join("deno.json"), PROJECT_DENO_JSON)?;
+    w(dir.join(".nanobpm").join("data-sdk.ts"), DATA_SDK_TS)?;
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
@@ -2173,8 +2190,8 @@ impl ProjectSupervisor {
             *inner.phase.lock().await = Phase::Stopped;
             return Err(format!("entrypoint {} not found", cfg.main));
         }
-        // Canonicalize so the --allow-read scope matches the path Deno resolves
-        // (e.g. macOS /tmp -> /private/tmp), otherwise reads are denied.
+        // Canonicalize so the --allow-read/-write scope matches the path Deno
+        // resolves (e.g. macOS /tmp -> /private/tmp), otherwise access is denied.
         let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
         let cache = dir.join(".deno-cache");
         let _ = std::fs::create_dir_all(&cache);
@@ -2188,7 +2205,10 @@ impl ProjectSupervisor {
             .arg("--no-prompt")
             .arg("--allow-net")
             .arg(format!("--allow-read={}", dir.display()))
-            .arg(format!("--allow-write={}", cache.display()))
+            // The whole project root (which includes .deno-cache) so an Urban App
+            // datasource can create/write its embedded SQLite file, e.g.
+            // `file:./app.db` (ADR 0024). App code is the maker's own trusted code.
+            .arg(format!("--allow-write={}", dir.display()))
             .arg("--allow-env")
             .arg(&cfg.main)
             .env("DENO_DIR", &cache)
@@ -2837,6 +2857,20 @@ mod tests {
         assert_eq!(manifest["name"], "Home_Heating");
         assert_eq!(manifest["data"]["sources"]["app"]["driver"], "sqlite");
         assert_eq!(manifest["surfaces"]["taskInbox"]["enabled"], true);
+        // ADR 0024 phase-1 core: the embedded datasource SDK is materialised and
+        // its `@nanobpm/data` alias is wired into the project + worker import maps
+        // so `openDataSource()` / `ctx.data()` resolve at runtime.
+        assert!(
+            dir.join(".nanobpm/data-sdk.ts").is_file(),
+            ".nanobpm/data-sdk.ts must be materialised"
+        );
+        let deno_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("deno.json")).unwrap())
+                .expect("deno.json parses");
+        assert_eq!(
+            deno_json["imports"]["@nanobpm/data"], "./.nanobpm/data-sdk.ts",
+            "@nanobpm/data must be import-mapped"
+        );
         // Components (element templates) seed the BPMN palette (ADR 0033
         // increment 2): the modeler loads them from the project's `components/`
         // dir, so a fresh Urban App ships with a valid, parseable component set.
@@ -3454,6 +3488,17 @@ mod tests {
         assert!(dir.join("deno.json").is_file());
         assert!(dir.join(CONFIG_FILE).is_file());
         assert!(dir.join(".nanobpm/worker-sdk.ts").is_file());
+        assert!(dir.join(".nanobpm/data-sdk.ts").is_file());
+        // Worker import map carries the datasource alias so handlers can
+        // `import { openDataSource } from "@nanobpm/data"` (ADR 0024).
+        let wdj: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("workers/do-work/deno.json")).unwrap(),
+        )
+        .expect("worker deno.json parses");
+        assert_eq!(
+            wdj["imports"]["@nanobpm/data"],
+            "../../.nanobpm/data-sdk.ts"
+        );
         assert!(dir.join("resources/processes/demo.bpmn").is_file());
         assert!(dir.join("workers/do-work/worker.ts").is_file());
         // Idempotency guard.
