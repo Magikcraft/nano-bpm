@@ -36,6 +36,7 @@ import {
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import { processFeelVariables, componentOutputFeelVariables, type ComponentOutput } from "../lib/bpmnDomainVariables";
+import { loadProjectComponents, type ElementTemplate } from "../lib/projectComponents";
 import {
   subscribe as subscribeDebug,
   snapshot as debugSnapshot,
@@ -667,6 +668,25 @@ function EditorPane({
       return undefined;
     }
   }, [manifestText]);
+  // The components (element templates) installed for this project drive the BPMN
+  // palette + template chooser (ADR 0033 increment 2). Load them from the
+  // project's component dirs while a BPMN model is open; reload when the file
+  // tree changes so a newly-added component file appears. Absent → empty palette.
+  const [components, setComponents] = useState<ElementTemplate[]>([]);
+  useEffect(() => {
+    if (kind !== "bpmn") {
+      setComponents([]);
+      return;
+    }
+    let alive = true;
+    listProjectFiles({ path: { name }, throwOnError: true })
+      .then((res) => (alive ? loadProjectComponents(name, res.data.files) : []))
+      .then((c) => alive && setComponents(c))
+      .catch(() => alive && setComponents([]));
+    return () => {
+      alive = false;
+    };
+  }, [name, kind, path]);
   const dmnGetVariables = useCallback(
     (decisionId: string | undefined) => decisionFeelVariables(manifest, decisionId),
     [manifest],
@@ -1060,7 +1080,7 @@ function EditorPane({
               The XML editor is layered above via absolute positioning.
             */}
             <div className={bpmnView === "visual" ? "h-full" : "h-full invisible"}>
-              <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} getVariables={bpmnGetVariables} />
+              <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} getVariables={bpmnGetVariables} components={components} />
             </div>
             {bpmnView === "xml" && (
               <div className="absolute inset-0 bg-app">

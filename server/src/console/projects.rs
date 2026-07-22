@@ -1106,6 +1106,44 @@ triggers and surfaces in the Console, then run or compile it to a binary.</p>
 </body></html>
 "#;
 
+// Sample components (Zeebe element templates) the scaffold drops into the
+// project's `components/` dir (ADR 0033 increment 2). The Console's BPMN modeler
+// loads the installed component set from here (`console/src/lib/projectComponents.ts`),
+// so a fresh Urban App shows these on the palette — the Delphi component tray,
+// installed per-project rather than hard-coded. Each template's
+// `zeebe:taskDefinition:type` is the seam to a matching `workers[].taskType`
+// (ADR 0022). Mirrors the reference set in `console/src/lib/urbanComponents.ts`.
+const URBAN_COMPONENT_READ_THERMOSTAT: &str = r#"{
+  "$schema": "https://unpkg.com/@camunda/zeebe-element-templates-json-schema@0.44.0/resources/schema.json",
+  "id": "io.nanobpm.urban.read-thermostat",
+  "name": "Read Thermostat",
+  "description": "Read a room's current temperature (Urban component).",
+  "appliesTo": ["bpmn:Task"],
+  "elementType": { "value": "bpmn:ServiceTask" },
+  "properties": [
+    { "type": "Hidden", "value": "read-thermostat", "binding": { "type": "zeebe:taskDefinition:type" } },
+    { "label": "Room", "type": "String", "feel": "optional", "binding": { "type": "zeebe:input", "name": "room" } },
+    { "label": "Result variable", "type": "String", "value": "temperature", "binding": { "type": "zeebe:output", "source": "= temperature" } }
+  ]
+}
+"#;
+
+const URBAN_COMPONENT_CLASSIFY_LLM: &str = r#"{
+  "$schema": "https://unpkg.com/@camunda/zeebe-element-templates-json-schema@0.44.0/resources/schema.json",
+  "id": "io.nanobpm.urban.classify-llm",
+  "name": "Classify (LLM)",
+  "description": "Classify text with an LLM job worker (Urban component).",
+  "appliesTo": ["bpmn:Task"],
+  "elementType": { "value": "bpmn:ServiceTask" },
+  "properties": [
+    { "type": "Hidden", "value": "classify", "binding": { "type": "zeebe:taskDefinition:type" } },
+    { "label": "Text", "type": "String", "feel": "required", "binding": { "type": "zeebe:input", "name": "text" } },
+    { "label": "Categories (comma separated)", "type": "String", "binding": { "type": "zeebe:input", "name": "categories" } },
+    { "label": "Result variable", "type": "String", "value": "category", "binding": { "type": "zeebe:output", "source": "= category" } }
+  ]
+}
+"#;
+
 /// The scaffolded Urban manifest. Models point at the `resources/` dirs the
 /// Console model editors use; a single sqlite datasource with a `db/migrations`
 /// dir; the task inbox surface enabled. Valid against `spec-app/nano-app.schema.json`.
@@ -1329,6 +1367,15 @@ pub fn create_project(
                 .join("processes")
                 .join(format!("{name}.bpmn")),
             &starter_process(name),
+        )?;
+        mk(dir.join("components"))?;
+        w(
+            dir.join("components").join("read-thermostat.json"),
+            URBAN_COMPONENT_READ_THERMOSTAT,
+        )?;
+        w(
+            dir.join("components").join("classify-llm.json"),
+            URBAN_COMPONENT_CLASSIFY_LLM,
         )?;
         cfg_app = "urban";
     } else {
@@ -2790,6 +2837,20 @@ mod tests {
         assert_eq!(manifest["name"], "Home_Heating");
         assert_eq!(manifest["data"]["sources"]["app"]["driver"], "sqlite");
         assert_eq!(manifest["surfaces"]["taskInbox"]["enabled"], true);
+        // Components (element templates) seed the BPMN palette (ADR 0033
+        // increment 2): the modeler loads them from the project's `components/`
+        // dir, so a fresh Urban App ships with a valid, parseable component set.
+        let comp_path = dir.join("components/read-thermostat.json");
+        assert!(
+            comp_path.is_file(),
+            "components/read-thermostat.json must exist"
+        );
+        assert!(dir.join("components/classify-llm.json").is_file());
+        let comp: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&comp_path).unwrap())
+                .expect("component template parses");
+        assert_eq!(comp["id"], "io.nanobpm.urban.read-thermostat");
+        assert_eq!(comp["appliesTo"][0], "bpmn:Task");
     }
 
     #[test]

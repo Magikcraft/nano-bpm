@@ -13,7 +13,7 @@ import {
 } from "bpmn-js-element-templates";
 import CloudBehaviorsModule from "camunda-bpmn-js-behaviors/lib/camunda-cloud";
 import { getVariablesForElement as extractZeebeVariables } from "@bpmn-io/extract-process-variables/zeebe";
-import { urbanComponents } from "../lib/urbanComponents";
+import type { ElementTemplate } from "../lib/urbanComponents";
 import type { FeelVariable } from "../lib/feelVariables";
 import type { ComponentOutput } from "../lib/bpmnDomainVariables";
 import "bpmn-js/dist/assets/diagram-js.css";
@@ -84,47 +84,20 @@ function collectComponentOutputs(registry: ElementRegistry): ComponentOutput[] {
 // pre-bound to the template's task type + input/output mappings — the "drag a
 // Delphi component off the palette" loop. Runtime behaviour is the matching
 // `workers[].taskType` (ADR 0022); the properties panel is the Object Inspector.
+// The component set comes from the open project (ADR 0033 increment 2,
+// `loadProjectComponents`), read live through a ref so a newly-added component
+// file surfaces without recreating the modeler; the provider class is defined
+// inside the mount effect so it can close over that ref.
 interface PaletteService {
   registerProvider(provider: unknown): void;
+  /** diagram-js internal palette re-render; re-invokes every provider's
+   *  `getPaletteEntries`. Used to refresh entries when the component set loads
+   *  after mount. Optional/guarded — absence just means no live refresh. */
+  _update?(): void;
 }
 interface CreateService {
   start(event: Event, shape: unknown): void;
 }
-
-class UrbanComponentsPaletteProvider {
-  // Explicit annotation so didi injection survives Vite minification.
-  static $inject = ["palette", "create", "elementTemplates"];
-  private readonly create: CreateService;
-  private readonly elementTemplates: ElementTemplatesService;
-
-  constructor(palette: PaletteService, create: CreateService, elementTemplates: ElementTemplatesService) {
-    this.create = create;
-    this.elementTemplates = elementTemplates;
-    palette.registerProvider(this);
-  }
-
-  getPaletteEntries(): Record<string, unknown> {
-    const entries: Record<string, unknown> = {};
-    for (const tpl of urbanComponents) {
-      const start = (event: Event) => {
-        const shape = this.elementTemplates.createElement(tpl);
-        this.create.start(event, shape);
-      };
-      entries[`create.urban-${tpl.id}`] = {
-        group: "urban-components",
-        className: "bpmn-icon-service-task",
-        title: tpl.name,
-        action: { dragstart: start, click: start },
-      };
-    }
-    return entries;
-  }
-}
-
-const urbanComponentsPaletteModule = {
-  __init__: ["urbanComponentsPaletteProvider"],
-  urbanComponentsPaletteProvider: ["type", UrbanComponentsPaletteProvider],
-};
 
 /// Imperative handle the Modeler view drives. Keeps the live bpmn document inside
 /// this component and exposes just the operations the toolbar needs.
@@ -156,10 +129,16 @@ interface BpmnModelerProps {
   /// only bpmn-js's extracted process variables are offered. Read live, so
   /// binding/output edits reflect without a remount.
   getVariables?: (ctx: { taskOutputs: ComponentOutput[] }) => FeelVariable[];
+  /// The component element templates installed for the open project (ADR 0033
+  /// increment 2, loaded by `loadProjectComponents`). Feeds both the palette
+  /// (one draggable entry per component) and the template chooser. Read live, so
+  /// adding a component file refreshes the palette without a remount. Empty/absent
+  /// → an empty component palette (nothing installed).
+  components?: ElementTemplate[];
 }
 
 const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
-  function BpmnModeler({ onChange, onReady, getVariables }, ref) {
+  function BpmnModeler({ onChange, onReady, getVariables, components }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const panelRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
@@ -180,6 +159,11 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     onReadyRef.current = onReady;
     const getVariablesRef = useRef(getVariables);
     getVariablesRef.current = getVariables;
+    // The installed component set, read live by the palette provider and the
+    // template-sync effect so a newly-loaded/edited component surfaces without
+    // recreating the modeler.
+    const componentsRef = useRef<ElementTemplate[]>(components ?? []);
+    componentsRef.current = components ?? [];
 
     // Queues a load on a single chain so imports can't race each other or the
     // initial blank diagram. Each op captures the modeler instance it was
@@ -254,6 +238,40 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       const domainVariableResolverModule = {
         variableResolver: ["type", DomainVariableResolver],
       };
+      // Palette provider: one draggable entry per installed component. Defined
+      // here so it can read the live `componentsRef` — the set loads from the
+      // project after mount and can change as component files are added.
+      class UrbanComponentsPaletteProvider {
+        // Explicit annotation so didi injection survives Vite minification.
+        static $inject = ["palette", "create", "elementTemplates"];
+        private readonly create: CreateService;
+        private readonly elementTemplates: ElementTemplatesService;
+        constructor(palette: PaletteService, create: CreateService, elementTemplates: ElementTemplatesService) {
+          this.create = create;
+          this.elementTemplates = elementTemplates;
+          palette.registerProvider(this);
+        }
+        getPaletteEntries(): Record<string, unknown> {
+          const entries: Record<string, unknown> = {};
+          for (const tpl of componentsRef.current) {
+            const start = (event: Event) => {
+              const shape = this.elementTemplates.createElement(tpl);
+              this.create.start(event, shape);
+            };
+            entries[`create.urban-${tpl.id}`] = {
+              group: "urban-components",
+              className: "bpmn-icon-service-task",
+              title: tpl.name,
+              action: { dragstart: start, click: start },
+            };
+          }
+          return entries;
+        }
+      }
+      const urbanComponentsPaletteModule = {
+        __init__: ["urbanComponentsPaletteProvider"],
+        urbanComponentsPaletteProvider: ["type", UrbanComponentsPaletteProvider],
+      };
       const modeler = new Modeler({
         container: containerRef.current,
         propertiesPanel: { parent: panelRef.current },
@@ -274,11 +292,12 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         moddleExtensions: { zeebe: ZeebeModdle },
       });
       modelerRef.current = modeler;
-      // Install the bundled Urban components so the palette + template chooser
-      // surface them. In the shipped design these come from installed component
-      // packs (ADR 0007) and the project; the spike bundles a sample set.
+      // Install the project's components so the palette + template chooser
+      // surface them (ADR 0033 increment 2). The set may still be loading at
+      // mount; the `[components]` effect below re-installs + refreshes the
+      // palette once it arrives or changes.
       try {
-        modeler.get<ElementTemplatesService>("elementTemplates").set(urbanComponents);
+        modeler.get<ElementTemplatesService>("elementTemplates").set(componentsRef.current);
       } catch {
         // Non-fatal: without the core module the palette simply shows nothing.
       }
@@ -300,6 +319,21 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         modelerRef.current = null;
       };
     }, []);
+
+    // Re-install the component set + refresh the palette when it changes. The
+    // project loads components asynchronously (and can add more), so the mount
+    // effect's `set()` may have run against an empty/stale set. Reads live via
+    // `componentsRef`; the palette re-render re-invokes `getPaletteEntries`.
+    useEffect(() => {
+      const modeler = modelerRef.current;
+      if (!modeler || disposedRef.current) return;
+      try {
+        modeler.get<ElementTemplatesService>("elementTemplates").set(componentsRef.current);
+        modeler.get<PaletteService>("palette")._update?.();
+      } catch {
+        // Non-fatal: core/palette absent, or modeler torn down mid-flight.
+      }
+    }, [components]);
 
     useImperativeHandle(ref, () => ({
       async getXml() {
