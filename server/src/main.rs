@@ -9864,7 +9864,22 @@ impl ServerImpl {
     fn next_promotion_epoch(&self, p: u64) -> u64 {
         let me = self.engine.topology().node_id as u64;
         let mut map = self.promotion_epoch.lock().unwrap();
-        let next = map.get(&p).map(|(e, _)| *e).unwrap_or(0) + 1;
+        let (cur_epoch, cur_leader) = map.get(&p).copied().unwrap_or((0, u64::MAX));
+        // Idempotent for the incumbent-self: only step strictly PAST a *different*
+        // leader's epoch (the fence overtake). If WE already hold `p` at
+        // `cur_epoch`, re-assert the SAME epoch instead of climbing. The reclaim
+        // path can legitimately re-enter (a fresh single-voter group whose
+        // self-election has not yet surfaced in the metrics the recovery tick reads,
+        // so its post-promote hold-down lapses and it re-promotes) — an
+        // unconditional `+1` turned that benign re-entry into an unbounded epoch
+        // climb, the load-sensitive `leader_reject` storm. Tying the increment to
+        // "overtake a peer", not "promote again", makes the reclaim epoch
+        // deterministic (`incumbent + 1`) regardless of scheduling jitter.
+        let next = if cur_leader == me {
+            cur_epoch
+        } else {
+            cur_epoch + 1
+        };
         map.insert(p, (next, me));
         next
     }
@@ -21093,6 +21108,22 @@ mod clustered_startup_tests {
             node0.next_promotion_epoch(0),
             2,
             "the owner reclaims at incumbent_epoch + 1 after soliciting, not epoch 1"
+        );
+        // Idempotent for the incumbent-self (deterministic, timing-free): re-entering
+        // the reclaim path — which happens under load when a fresh group's election
+        // has not yet surfaced and the post-promote hold-down lapses — must RE-ASSERT
+        // the same epoch, never climb. Before the fix an unconditional `+1` returned
+        // 3 here (then 4, 5, ...), the epoch storm that flaked
+        // `rejoined_owner_reclaims_a_partition_a_peer_leads` on CI with `Some((3,0))`.
+        assert_eq!(
+            node0.next_promotion_epoch(0),
+            2,
+            "a repeated self-promote re-asserts the same epoch (2), it does not climb to 3"
+        );
+        assert_eq!(
+            node0.next_promotion_epoch(0),
+            2,
+            "the epoch stays fenced at 2 no matter how many times the owner re-promotes"
         );
 
         for node in [&node0, &node1, &node2] {
