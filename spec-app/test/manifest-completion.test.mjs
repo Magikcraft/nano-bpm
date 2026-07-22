@@ -148,6 +148,15 @@ test("completes a declared type id under bindings[].type", () => {
   assert.equal(r.candidates[0].kind, "type");
 });
 
+test("completes a declared type id under workers[].outputType (ADR 0033 §3)", () => {
+  const { text, offset } = at('{ "workers": [ { "taskType": "read-thermostat", "outputType": "‸" } ] }');
+  const r = manifestCompletionAt(text, offset, manifest, bindIndex);
+  assert.ok(r);
+  assert.equal(r.site, "output-type");
+  assert.deepEqual(r.candidates.map((c) => c.value).sort(), ["reading", "schedule"]);
+  assert.equal(r.candidates[0].kind, "type");
+});
+
 test("completes a process id under bindings[].process", () => {
   const { text, offset } = at('{ "bindings": [ { "process": "‸" } ] }');
   const r = manifestCompletionAt(text, offset, manifest, bindIndex);

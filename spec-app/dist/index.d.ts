@@ -187,8 +187,34 @@ export declare function decisionScope(manifest: unknown, decisionId: string | un
  * `undefined` when the process has no binding or the bound type is not declared.
  */
 export declare function processScope(manifest: unknown, processId: string | undefined): ScopeVar[] | undefined;
+/**
+ * A component output mapping: a service task's `taskType` (the worker seam,
+ * ADR 0022) and the process variable one of its output mappings writes into.
+ * The console extracts these from the diagram; `componentOutputScope` types them.
+ */
+export interface ComponentOutput {
+	taskType: string;
+	target: string;
+}
+/**
+ * The declared domain type a worker writes as its result (ADR 0033 §3), resolved
+ * by a component's `taskType`. Returns `undefined` when no worker matches, the
+ * worker declares no `outputType`, or that type is not declared — callers then
+ * leave the output variable untyped (never a wrong scope).
+ */
+export declare function outputTypeForTaskType(manifest: unknown, taskType: string | undefined): string | undefined;
+/**
+ * The variable scope contributed by a process's component outputs (ADR 0033 §3):
+ * each output-mapped process variable typed by the domain type its worker
+ * declares (`workers[].outputType`). This is the "component output → typed
+ * process variable → next component input" continuity — a task placed after a
+ * component autocompletes on the result's fields. Outputs whose worker declares
+ * no (declared) `outputType` are skipped; a variable written by more than one
+ * component keeps the first typed occurrence.
+ */
+export declare function componentOutputScope(manifest: unknown, outputs: readonly ComponentOutput[]): ScopeVar[];
 /** The kinds of reference a manifest string value can be. */
-export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "form-ref" | "process-ref" | "datasource" | "agent";
+export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "output-type" | "form-ref" | "process-ref" | "datasource" | "agent";
 export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "form" | "datasource" | "agent" | "variable";
 export interface CompletionCandidate {
 	/** The literal id/name to insert (unquoted). */
@@ -289,6 +315,10 @@ type Worker = {
 	 * Name of an llm[] binding used as the worker (LLM-as-worker).
 	 */
 	llm?: string;
+	/**
+	 * Lowercase kebab-case slug.
+	 */
+	outputType?: string;
 } & Worker1;
 type Worker1 = {
 	[k: string]: unknown;

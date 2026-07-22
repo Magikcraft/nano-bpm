@@ -150,6 +150,58 @@ export function processScope(manifest: unknown, processId: string | undefined): 
 }
 
 /**
+ * A component output mapping: a service task's `taskType` (the worker seam,
+ * ADR 0022) and the process variable one of its output mappings writes into.
+ * The console extracts these from the diagram; `componentOutputScope` types them.
+ */
+export interface ComponentOutput {
+  taskType: string;
+  target: string;
+}
+
+/**
+ * The declared domain type a worker writes as its result (ADR 0033 §3), resolved
+ * by a component's `taskType`. Returns `undefined` when no worker matches, the
+ * worker declares no `outputType`, or that type is not declared — callers then
+ * leave the output variable untyped (never a wrong scope).
+ */
+export function outputTypeForTaskType(manifest: unknown, taskType: string | undefined): string | undefined {
+  if (!taskType) return undefined;
+  const workers = (manifest as { workers?: unknown })?.workers;
+  if (!Array.isArray(workers)) return undefined;
+  const worker = workers.find(
+    (w) => w && typeof w === "object" && (w as { taskType?: unknown }).taskType === taskType,
+  ) as { outputType?: unknown } | undefined;
+  const typeId = typeof worker?.outputType === "string" ? worker.outputType : undefined;
+  return isDeclaredType(manifest, typeId) ? typeId : undefined;
+}
+
+/**
+ * The variable scope contributed by a process's component outputs (ADR 0033 §3):
+ * each output-mapped process variable typed by the domain type its worker
+ * declares (`workers[].outputType`). This is the "component output → typed
+ * process variable → next component input" continuity — a task placed after a
+ * component autocompletes on the result's fields. Outputs whose worker declares
+ * no (declared) `outputType` are skipped; a variable written by more than one
+ * component keeps the first typed occurrence.
+ */
+export function componentOutputScope(manifest: unknown, outputs: readonly ComponentOutput[]): ScopeVar[] {
+  const out: ScopeVar[] = [];
+  const seen = new Set<string>();
+  for (const o of outputs) {
+    if (!o || !o.target || seen.has(o.target)) continue;
+    const typeId = outputTypeForTaskType(manifest, o.taskType);
+    if (!typeId) continue;
+    seen.add(o.target);
+    const v: ScopeVar = { name: o.target, type: typeId };
+    const entries = scopeVarsForType(manifest, typeId);
+    if (entries.length > 0) v.entries = entries;
+    out.push(v);
+  }
+  return out;
+}
+
+/**
  * The domain-type scope bound to a model id in `bindings[]` (ADR 0029 §5). `key`
  * is the binding discriminator (`decision` / `process` / `form`); shared so every
  * scope entry point resolves bindings identically.

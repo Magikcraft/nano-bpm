@@ -183,3 +183,15 @@ test("a binding to an unknown form/decision/type is rejected with pointers", asy
   assert.deepEqual(codesFor(result, "/bindings/0/type"), ["unknown-type"]);
   assert.deepEqual(codesFor(result, "/bindings/1/type"), ["unknown-type"]);
 });
+
+test("a worker outputType must name a declared domain type (ADR 0033 §3)", async () => {
+  const index = await buildSymbolIndex(models);
+  const m = manifest();
+  m.types = { ...(m.types ?? {}), reading: { fields: { room: { type: "string" } } } };
+  // fixture workers[0]=read-thermostat (handler), [1]=classify (llm)
+  m.workers[0].outputType = "reading"; // declared → valid
+  m.workers[1].outputType = "ghost"; // undeclared → unknown-type
+  const result = validateManifest(m, index);
+  assert.deepEqual(codesFor(result, "/workers/0/outputType"), []);
+  assert.deepEqual(codesFor(result, "/workers/1/outputType"), ["unknown-type"]);
+});
