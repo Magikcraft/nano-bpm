@@ -14591,21 +14591,66 @@ async fn log_rest(req: axum::extract::Request, next: axum::middleware::Next) -> 
     Response::from_parts(parts, Body::from(bytes))
 }
 
-/// Console `observe`-profile guard (ADR 0035 §C): a thin runtime read-only gate
-/// over a studio build. Mutating requests (any method other than GET/HEAD/
-/// OPTIONS) to the console API surface are refused with `403`, so the operator
-/// subset is served but authoring is disabled. Non-`/console/api/*` requests
-/// (SPA assets, marketing/docs pages) pass through untouched.
+/// Console-API path prefixes that are pure authoring/IDE surface, with no
+/// operator/observability role: the `observe` profile disables them entirely
+/// (all methods, including `GET`). This is the runtime realization of "author­
+/// ing API off" (ADR 0034 follow-up) without a separate build feature or an
+/// exploded build matrix — the same subset a future lean `observe` build would
+/// omit. Observability endpoints (`topology`, `cluster/*`, `metrics`,
+/// `instances`, `traces`, `workers` status/logs, `config/server`,
+/// `server/update`, `stream`) are deliberately absent from this list.
+#[cfg(feature = "console")]
+const CONSOLE_AUTHORING_PREFIXES: &[&str] = &[
+    "/console/api/models",
+    "/console/api/projects",
+    "/console/api/lib",
+    "/console/api/extensions",
+    "/console/api/worker-sdk",
+    "/console/api/deno-types",
+    "/console/api/config/ide",
+];
+
+/// True when `path` is (or is nested under) an authoring prefix. Matches on a
+/// segment boundary so e.g. `/console/api/models` and `/console/api/models/x`
+/// hit but a hypothetical `/console/api/models-report` would not.
+#[cfg(feature = "console")]
+fn is_console_authoring_path(path: &str) -> bool {
+    CONSOLE_AUTHORING_PREFIXES.iter().any(|p| {
+        path == *p
+            || path
+                .strip_prefix(p)
+                .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// Decides whether the `observe` profile should refuse a request. Refuses when
+/// the request targets `/console/api/*` and is either mutating (any method
+/// other than `GET`/`HEAD`/`OPTIONS`) or an authoring endpoint (see
+/// [`is_console_authoring_path`]). Everything else — observability reads, SPA
+/// assets, marketing/docs pages — is allowed. Pure so it can be unit-tested.
+#[cfg(feature = "console")]
+fn observe_should_block(path: &str, method: &axum::http::Method) -> bool {
+    use axum::http::Method;
+    if !path.starts_with("/console/api") {
+        return false;
+    }
+    let mutating = !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS);
+    mutating || is_console_authoring_path(path)
+}
+
+/// Console `observe`-profile guard (ADR 0035 §C, ADR 0034 follow-up): a thin
+/// runtime observability-only gate over a studio build. Requests that
+/// [`observe_should_block`] rejects — all mutations plus the authoring/IDE API
+/// surface — are refused with `403`; the operator (observability) subset is
+/// served. Non-`/console/api/*` requests (SPA assets, marketing/docs pages)
+/// pass through untouched.
 #[cfg(feature = "console")]
 async fn console_observe_guard(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    use axum::http::Method;
     use axum::response::IntoResponse;
-    let is_api = req.uri().path().starts_with("/console/api");
-    let read_only = matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
-    if is_api && !read_only {
+    if observe_should_block(req.uri().path(), req.method()) {
         return (
             axum::http::StatusCode::FORBIDDEN,
             axum::Json(serde_json::json!({
@@ -14619,7 +14664,99 @@ async fn console_observe_guard(
     next.run(req).await
 }
 
-/// An [`axum::serve::Listener`] wrapper that disables Nagle (`TCP_NODELAY`) on
+#[cfg(all(test, feature = "console"))]
+mod console_observe_guard_tests {
+    use axum::http::Method;
+
+    use super::{is_console_authoring_path, observe_should_block};
+
+    #[test]
+    fn observability_reads_pass() {
+        for path in [
+            "/console/api/topology",
+            "/console/api/cluster/health",
+            "/console/api/cluster/metrics",
+            "/console/api/metrics",
+            "/console/api/instances",
+            "/console/api/instances/42",
+            "/console/api/traces",
+            "/console/api/traces/7/otel",
+            "/console/api/workers",
+            "/console/api/workers/pay/logs",
+            "/console/api/config/server",
+            "/console/api/server/update",
+            "/console/api/stream",
+        ] {
+            assert!(
+                !observe_should_block(path, &Method::GET),
+                "GET {path} must be allowed in observe"
+            );
+        }
+    }
+
+    #[test]
+    fn authoring_reads_are_blocked() {
+        for path in [
+            "/console/api/models",
+            "/console/api/models/order.bpmn",
+            "/console/api/projects",
+            "/console/api/projects/acme",
+            "/console/api/projects/acme/files",
+            "/console/api/lib",
+            "/console/api/lib/file",
+            "/console/api/extensions",
+            "/console/api/extensions/marketplace",
+            "/console/api/worker-sdk",
+            "/console/api/deno-types",
+            "/console/api/config/ide",
+        ] {
+            assert!(
+                observe_should_block(path, &Method::GET),
+                "GET {path} must be blocked (authoring) in observe"
+            );
+        }
+    }
+
+    #[test]
+    fn mutations_are_blocked_everywhere_under_api() {
+        for method in [Method::POST, Method::PUT, Method::DELETE, Method::PATCH] {
+            assert!(observe_should_block(
+                "/console/api/workers/pay/start",
+                &method
+            ));
+            assert!(observe_should_block(
+                "/console/api/config/server/sla",
+                &method
+            ));
+            // even an otherwise-observability path is frozen against writes
+            assert!(observe_should_block("/console/api/topology", &method));
+        }
+    }
+
+    #[test]
+    fn non_api_paths_always_pass() {
+        for path in [
+            "/console",
+            "/console/index.html",
+            "/console/assets/app.js",
+            "/",
+        ] {
+            assert!(!observe_should_block(path, &Method::GET));
+            assert!(!observe_should_block(path, &Method::POST));
+        }
+    }
+
+    #[test]
+    fn authoring_prefix_respects_segment_boundary() {
+        assert!(is_console_authoring_path("/console/api/models"));
+        assert!(is_console_authoring_path("/console/api/models/x"));
+        // a sibling resource that merely shares a textual prefix must not match
+        assert!(!is_console_authoring_path("/console/api/models-report"));
+        // config/server is observability; config/ide is authoring
+        assert!(!is_console_authoring_path("/console/api/config/server"));
+        assert!(is_console_authoring_path("/console/api/config/ide"));
+    }
+}
 /// every accepted connection. The gateway's WebSocket surfaces — the SDK command
 /// stream and the inter-node peer/Raft lane — exchange small, latency-sensitive
 /// request/response frames; with Nagle + delayed-ACK each round-trip can stall
