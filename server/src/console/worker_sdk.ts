@@ -22,6 +22,29 @@
 // them) or call one of job.complete/job.fail/job.error explicitly. Throwing
 // fails the job. npm libraries are available via `npm:` specifiers.
 
+/** A row from a datasource query. */
+export type WorkerRow = Record<string, unknown>;
+
+/** The datasource handle returned by `ctx.data()`. Mirrors the DataSource
+ * contract in the `@nanobpm/data` SDK (ADR 0024); typed structurally here so the
+ * worker SDK stays a single self-contained file. */
+export interface WorkerDataSource {
+  query(sql: string, params?: unknown[]): Promise<WorkerRow[]>;
+  exec(
+    sql: string,
+    params?: unknown[],
+  ): Promise<{ changed: number; lastInsertId?: number | bigint }>;
+  tx<T>(fn: (t: WorkerDataSource) => Promise<T>): Promise<T>;
+  schema(): Promise<unknown[]>;
+  close(): void;
+}
+
+/** The App runtime handed to a worker handler as its 2nd argument. */
+export interface WorkerContext {
+  /** Open a declared datasource by name (default when omitted), per ADR 0024. */
+  data(name?: string): Promise<WorkerDataSource>;
+}
+
 export interface WorkerJob {
   readonly jobKey: string;
   readonly type: string;
@@ -43,8 +66,13 @@ export interface WorkerJob {
 export interface WorkerOptions {
   /** BPMN job type to work on. */
   type: string;
-  /** Handler invoked per job. Return output vars, or call a job action. */
-  handle: (job: WorkerJob) => Promise<void | Record<string, unknown>> | void | Record<string, unknown>;
+  /** Handler invoked per job. Return output vars, or call a job action. The
+   * optional 2nd arg exposes the App runtime: `ctx.data(name?)` opens a
+   * declared datasource (ADR 0024). Single-arg handlers keep working. */
+  handle: (
+    job: WorkerJob,
+    ctx: WorkerContext,
+  ) => Promise<void | Record<string, unknown>> | void | Record<string, unknown>;
   /** Max jobs in flight (also the streaming credit window). Default 10. */
   maxParallelJobs?: number;
   /** Job activation lock timeout in ms. Default 60000. */
@@ -165,11 +193,21 @@ export function defineWorker(opts: WorkerOptions): void {
     };
   }
 
+  // The App runtime handed to handlers. `ctx.data()` lazily loads the sibling
+  // datasource SDK (materialised next to this file as ./data-sdk.ts) so a worker
+  // that never touches data pays nothing and needs no import-map entry.
+  const ctx: WorkerContext = {
+    data: (name?: string) =>
+      import("./data-sdk.ts").then((m) =>
+        (m as { openDataSource(n?: string): Promise<WorkerDataSource> }).openDataSource(name)
+      ),
+  };
+
   async function dispatch(raw: Record<string, unknown>): Promise<void> {
     const job = enrich(raw);
     inFlight += 1;
     try {
-      const out = await opts.handle(job);
+      const out = await opts.handle(job, ctx);
       if (!acted.has(job.jobKey)) {
         // Handler returned without acting: complete with any returned vars.
         job.complete(out && typeof out === "object" ? (out as Record<string, unknown>) : undefined);

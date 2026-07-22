@@ -1,6 +1,6 @@
 # ADR 0024 — Urban data layer & datasource abstraction (the BDE alias, for Nano Apps)
 
-Status: **Proposed.**
+Status: **Accepted** (phase 1, *datasource-core*, implemented — the runtime seam; phases 2–4 remain Proposed).
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md`, **Urban** — the RAD App bundle; this ADR
 expands its §D "Data layer" from a single SQLite file into a named-datasource seam),
@@ -173,9 +173,13 @@ tenant **row-level scoping** (Postgres RLS vs. app-level filters) is a shared op
 
 ## Phased plan
 
-1. **datasource-core** — the §2 `DataSource` interface + the SQLite driver + manifest §1 parsing
-   (named sources, env-resolvable driver/URL, `default`). Wire `ctx.data(name)` into the worker
-   host. Ships the swap seam even before the GUI.
+1. **datasource-core** — *implemented.* The §2 `DataSource` interface + the SQLite driver
+   (Deno `node:sqlite`, embedded) + manifest §1 parsing (named sources, env-resolvable
+   driver/URL via `${VAR:-default}`, `default`). Ships as the `@nanobpm/data` SDK
+   (`server/src/console/data_sdk.ts`, materialised to `<project>/.nanobpm/data-sdk.ts`) with
+   `openDataSource(name?)`; `ctx.data(name?)` is wired into the worker host (`worker_sdk.ts`),
+   and the App-run sandbox now grants project-root write so a `file:./app.db` source is
+   creatable. Ships the swap seam even before the GUI.
 2. **db-manager-panel** — the §4 Data tab (Tables / SQL / Migrations) over a named datasource,
    reusing the Monaco/panel pattern.
 3. **datasource-bindings** — §5 form field binding + FEEL `data.query` builtin + the chat
