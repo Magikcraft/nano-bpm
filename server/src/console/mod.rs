@@ -40,6 +40,7 @@ pub mod extensions;
 mod generated_api;
 pub mod projects;
 pub mod server_update;
+pub(crate) mod standalone;
 pub mod trace;
 pub mod worker_export;
 pub mod workers;

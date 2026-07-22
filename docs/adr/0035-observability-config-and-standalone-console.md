@@ -1,6 +1,8 @@
 # ADR 0035 — Full-fidelity Prometheus, a standalone console, and runtime observability config
 
-Status: **Proposed.**
+Status: **Accepted.** §A (full-fidelity gauges) and the `metrics` half of §C shipped in PR 1 (#216);
+§B (standalone off-cluster console) is **implemented**. §C's `console` off/observe/studio runtime setting
+remains the follow-up (Option 3).
 Date: 2026-07-23.
 Relates to:
 ADR 0034 (`0034-console-build-profiles.md`, the build-time studio/observe split — this ADR adds the
@@ -62,17 +64,21 @@ the counts by the parser.
 ### B. Standalone off-cluster console (a run mode, not a new binary)
 
 Add a **console-standalone run mode** to the existing gateway binary: it starts the console router and a
-remote-scrape aggregator **without** starting the engine / raft. It is configured with either a static
-peer list or a seed address it discovers peers from via `/v2/topology`, scrapes each peer's `/metrics`
-on the dashboard's refresh cadence, and serves the existing observability dashboard APIs
-(cluster topology + metrics + per-node health).
+remote-scrape aggregator **without** starting the engine / raft. It is configured with a peer list
+(`--console-peer <url>` repeatable, `--console-standalone <csv>`, env `NANOBPMN_CONSOLE_STANDALONE`, or
+YAML `observability.consolePeers` / `consoleStandalone`). **Every configured peer doubles as a seed:** the
+aggregator queries peers' always-on `/v2/topology` until one answers, expands that into the full cluster
+membership (substituting the reached URL for the peer's self-advertised `0.0.0.0` entry), then scrapes
+each member's `/metrics` on the dashboard's refresh cadence. It serves the existing observability
+dashboard APIs (cluster topology + metrics + per-node health); engine-only endpoints answer `503`.
 
-The console's dashboard data-source is abstracted behind a small trait with two implementors: the
-**embedded** source (reads the local `ServerImpl`) and the **remote** source (aggregates peer scrapes).
-Because a pure Prometheus consumer can only serve what Prometheus carries, standalone mode serves the
-**observe** subset (topology / metrics / node health); engine-only detail views (instance/trace/worker
-drill-down, project authoring) are not offered off-cluster. This makes "standalone console" the runtime
-sibling of the build-time **observe** profile, sourced from remote scrapes instead of a local engine.
+_Implemented_ in `server/src/console/standalone.rs`: a `RemoteCluster` aggregator + an axum router that
+reuses the console SPA handlers and the existing peer-probe/DTO machinery, branched into early in `main()`
+(before any engine/journal/raft setup) when a peer list is configured. Because a pure Prometheus consumer
+can only serve what Prometheus carries, standalone mode serves the **observe** subset (topology / metrics
+/ node health); engine-only detail views (instance/trace/worker drill-down, project authoring) are not
+offered off-cluster. This makes "standalone console" the runtime sibling of the build-time **observe**
+profile, sourced from remote scrapes instead of a local engine.
 
 ### C. Runtime observability config (flag / file / env)
 
@@ -104,12 +110,12 @@ CLI flag  >  config file  >  environment variable  >  built-in default
   observability:
     metrics: "off"
     console: "observe"
-    # standalone console:
+    # standalone console (each peer doubles as a seed):
     # consolePeers:
     #   - "http://10.0.0.11:8080"
     #   - "http://10.0.0.12:8080"
-    # or discover from a seed:
-    # consoleSeed: "http://10.0.0.11:8080"
+    # or as a CSV scalar:
+    # consoleStandalone: "http://10.0.0.11:8080,http://10.0.0.12:8080"
   ```
 
 - **Env vars:** `NANOBPMN_METRICS=off`, `NANOBPMN_CONSOLE=observe|off`, mirroring the file keys — the
@@ -137,8 +143,9 @@ Unknown flags/keys warn and are ignored (forward-compatible), matching today's l
    Scrape-computed `active_instances` + recovery gauges; console parser reads them with fallback;
    `metrics` on/off via flag/file/env, with the config-file + flag plumbing that §C's `console` setting
    will later reuse. Independently valuable and low-risk.
-2. **PR 2 — standalone off-cluster console (§B).** The data-source trait, the remote aggregator, and the
-   console-standalone run mode.
+2. **PR 2 — standalone off-cluster console (§B).** ✅ The `RemoteCluster` remote aggregator and the
+   console-standalone run mode (`server/src/console/standalone.rs`), configured via the same layered
+   config from PR 1.
 3. **Then** the ADR 0034 runtime-profile polish (Option 3) lands §C's `console` off/observe/studio
    setting on the same config layer.
 
