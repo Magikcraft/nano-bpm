@@ -53,3 +53,21 @@ declare module "zeebe-bpmn-moddle/resources/zeebe.json" {
   const value: Record<string, unknown>;
   export default value;
 }
+
+declare module "bpmn-js-element-templates" {
+  /** ElementTemplates service (didi id `elementTemplates`). */
+  export interface ElementTemplatesService {
+    set(templates: unknown[]): void;
+    get(): unknown[];
+    createElement(template: unknown, options?: Record<string, unknown>): unknown;
+    applyTemplate(element: unknown, template: unknown, options?: Record<string, unknown>): unknown;
+  }
+  const CloudElementTemplatesCoreModule: unknown;
+  const CloudElementTemplatesPropertiesProviderModule: unknown;
+  export { CloudElementTemplatesCoreModule, CloudElementTemplatesPropertiesProviderModule };
+}
+
+declare module "camunda-bpmn-js-behaviors/lib/camunda-cloud" {
+  const mod: unknown;
+  export default mod;
+}
