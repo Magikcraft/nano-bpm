@@ -180,8 +180,15 @@ export declare function scopeVarsForType(manifest: unknown, typeId: string | und
  * declared type — callers then contribute no domain variables (never a wrong scope).
  */
 export declare function decisionScope(manifest: unknown, decisionId: string | undefined): ScopeVar[] | undefined;
+/**
+ * The variable scope for a process's FEEL (component/service-task inputs, gateway
+ * conditions): the fields of the domain type bound to `processId` in `bindings[]`
+ * — the process as the motion of a typed domain object (ADR 0030). Returns
+ * `undefined` when the process has no binding or the bound type is not declared.
+ */
+export declare function processScope(manifest: unknown, processId: string | undefined): ScopeVar[] | undefined;
 /** The kinds of reference a manifest string value can be. */
-export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "form-ref" | "datasource" | "agent";
+export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "form-ref" | "process-ref" | "datasource" | "agent";
 export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "form" | "datasource" | "agent" | "variable";
 export interface CompletionCandidate {
 	/** The literal id/name to insert (unquoted). */
@@ -260,6 +267,10 @@ type Binding = {
 	 * DMN decision id whose input-expression FEEL is scoped to `type`.
 	 */
 	decision?: string;
+	/**
+	 * BPMN process id whose FEEL (component/service-task inputs, conditions) is scoped to `type` — the process as the motion of a typed domain object (ADR 0030).
+	 */
+	process?: string;
 	/**
 	 * Lowercase kebab-case slug.
 	 */

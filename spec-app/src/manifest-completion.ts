@@ -25,6 +25,7 @@ export type ReferenceSite =
   | "body-type" // triggers[].bodyType — a declared domain type id (FEEL scope)
   | "binding-type" // bindings[].type — a declared domain type id (model FEEL scope)
   | "form-ref" // bindings[].form — a form-js form id
+  | "process-ref" // bindings[].process — a BPMN process id (process FEEL scope)
   | "datasource" // data.default — a declared datasource id
   | "agent"; // surfaces.<name>.agent / workers[].llm — a declared llm agent id
 
@@ -224,6 +225,10 @@ function classify(path: string[]): ReferenceSite | null {
       // bindings[].form
       if (at(2) === "bindings") return "form-ref";
       return null;
+    case "process":
+      // bindings[].process
+      if (at(2) === "bindings") return "process-ref";
+      return null;
     case "bodyType":
       // triggers[].bodyType
       if (at(2) === "triggers") return "body-type";
@@ -297,6 +302,12 @@ function candidatesFor(
       return (index?.forms ?? []).map((f) => ({
         value: f.id,
         kind: "form" as const,
+      }));
+    case "process-ref":
+      return (index?.processes ?? []).map((p) => ({
+        value: p.id,
+        kind: "process" as const,
+        detail: p.name,
       }));
     case "datasource":
       return Object.keys(record(record(manifest, "data"), "sources") ?? {}).map((id) => ({

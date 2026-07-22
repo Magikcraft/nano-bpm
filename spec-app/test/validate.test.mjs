@@ -157,10 +157,12 @@ test("bindings to a resolvable form/decision + declared type are valid (ADR 0029
   m.bindings = [
     { form: "confirm-heating", type: "reading" },
     { decision: "email-triage", type: "reading" },
+    { process: "heating-cycle", type: "reading" },
   ];
   const result = validateManifest(m, index);
   assert.deepEqual(codesFor(result, "/bindings/0/form"), []);
   assert.deepEqual(codesFor(result, "/bindings/1/decision"), []);
+  assert.deepEqual(codesFor(result, "/bindings/2/process"), []);
   assert.deepEqual(codesFor(result, "/bindings/0/type"), []);
 });
 
@@ -170,12 +172,14 @@ test("a binding to an unknown form/decision/type is rejected with pointers", asy
   m.bindings = [
     { form: "no-such-form", type: "reading" },
     { decision: "no-such-decision", type: "reading" },
+    { process: "no-such-process", type: "reading" },
   ];
   const result = validateManifest(m, index);
   assert.equal(result.ok, false);
   assert.deepEqual(codesFor(result, "/bindings/0/form"), ["unknown-form"]);
   assert.deepEqual(codesFor(result, "/bindings/1/decision"), ["unknown-decision"]);
-  // "reading" is not declared here → both bindings flag the type.
+  assert.deepEqual(codesFor(result, "/bindings/2/process"), ["unknown-process"]);
+  // "reading" is not declared here → all bindings flag the type.
   assert.deepEqual(codesFor(result, "/bindings/0/type"), ["unknown-type"]);
   assert.deepEqual(codesFor(result, "/bindings/1/type"), ["unknown-type"]);
 });

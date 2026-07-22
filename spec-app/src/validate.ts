@@ -168,6 +168,9 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     if (b.decision != null && decisionIds && !decisionIds.has(b.decision)) {
       push(`/bindings/${i}/decision`, `no model declares a decision with id "${b.decision}"`, "unknown-decision");
     }
+    if (b.process != null && processIds && !processIds.has(b.process)) {
+      push(`/bindings/${i}/process`, `no deployed process has id "${b.process}"`, "unknown-process");
+    }
     if (b.type != null && !typeIds.has(b.type)) {
       push(`/bindings/${i}/type`, `type "${b.type}" is not a declared domain type`, "unknown-type");
     }

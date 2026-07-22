@@ -148,6 +148,15 @@ test("completes a declared type id under bindings[].type", () => {
   assert.equal(r.candidates[0].kind, "type");
 });
 
+test("completes a process id under bindings[].process", () => {
+  const { text, offset } = at('{ "bindings": [ { "process": "‸" } ] }');
+  const r = manifestCompletionAt(text, offset, manifest, bindIndex);
+  assert.ok(r);
+  assert.equal(r.site, "process-ref");
+  assert.deepEqual(r.candidates.map((c) => c.value).sort(), ["heating-cycle", "triage-email"]);
+  assert.equal(r.candidates[0].kind, "process");
+});
+
 test("bindings[].form in the second element resolves via navPath index", () => {
   const { text, offset } = at(
     '{ "bindings": [ { "decision": "email-triage" }, { "form": "tri‸" } ] }',
