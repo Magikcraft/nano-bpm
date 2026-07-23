@@ -1060,6 +1060,8 @@ mod tests {
             timer,
             io,
             multi_instance: mi,
+            start_listeners: Vec::new(),
+            end_listeners: Vec::new(),
         };
         let mut emitted = Vec::new();
         render_element_attrs_for_test(&el, &mut emitted);
