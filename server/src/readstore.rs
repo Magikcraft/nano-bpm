@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
-    Event, IncidentKind, IncidentState, JobState, Key, ProcessInstanceState, UserTaskState, Value,
-    partition_of,
+    Event, IncidentKind, IncidentState, JobKind, JobState, Key, ListenerEventType,
+    ProcessInstanceState, UserTaskState, Value, partition_of,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -63,7 +63,9 @@ CREATE TABLE jobs (
     worker                 TEXT,
     deadline_ms            INTEGER,
     process_definition_id  TEXT NOT NULL,
-    process_definition_key TEXT NOT NULL
+    process_definition_key TEXT NOT NULL,
+    job_kind               INTEGER NOT NULL DEFAULT 0,
+    listener_event_type    INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE incidents (
     key                    INTEGER PRIMARY KEY,
@@ -187,6 +189,41 @@ fn job_state_from(code: i64) -> JobState {
     }
 }
 
+/// Encodes a [`JobKind`] into the `(job_kind, listener_event_type)` column pair
+/// stored on the jobs read-model row (ADR 0037). Ordinary element jobs store
+/// `(0, 0)`; execution-listener jobs store `(1, start=0/end=1)`. The listener
+/// index/scope are not projected.
+fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
+    match kind {
+        JobKind::BpmnElement => (0, 0),
+        JobKind::ExecutionListener { event_type, .. } => (
+            1,
+            match event_type {
+                ListenerEventType::Start => 0,
+                ListenerEventType::End => 1,
+            },
+        ),
+    }
+}
+
+/// Reconstructs the display-relevant [`JobKind`] from the stored column pair.
+/// The listener index/scope are not persisted, so they default to `0`.
+fn job_kind_from(job_kind: i64, listener_event_type: i64) -> JobKind {
+    if job_kind == 1 {
+        JobKind::ExecutionListener {
+            event_type: if listener_event_type == 1 {
+                ListenerEventType::End
+            } else {
+                ListenerEventType::Start
+            },
+            index: 0,
+            scope: 0,
+        }
+    } else {
+        JobKind::BpmnElement
+    }
+}
+
 fn user_task_state_code(s: UserTaskState) -> i64 {
     match s {
         UserTaskState::Created => 0,
@@ -261,6 +298,10 @@ pub struct JobRow {
     pub deadline_ms: Option<u64>,
     pub process_definition_id: String,
     pub process_definition_key: String,
+    /// Ordinary BPMN-element job or an execution-listener job (ADR 0037). Only
+    /// the display-relevant discriminant (kind + listener event type) is
+    /// preserved in the read model; the listener index/scope are not projected.
+    pub kind: JobKind,
 }
 
 pub struct UserTaskRow {
@@ -1149,7 +1190,8 @@ impl ReadStore {
         let mut stmt = conn
             .prepare(
                 "SELECT key, instance_key, element_instance_key, element_id, job_type, state, \
-                 retries, worker, deadline_ms, process_definition_id, process_definition_key \
+                 retries, worker, deadline_ms, process_definition_id, process_definition_key, \
+                 job_kind, listener_event_type \
                  FROM jobs",
             )
             .expect("prepare jobs");
@@ -1735,6 +1777,7 @@ fn map_job(r: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         deadline_ms: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
         process_definition_id: r.get(9)?,
         process_definition_key: r.get(10)?,
+        kind: job_kind_from(r.get(11)?, r.get(12)?),
     })
 }
 
@@ -2108,6 +2151,45 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
                     *retries,
                     def_id,
                     def_key,
+                ],
+            )?;
+        }
+
+        Event::ExecutionListenerJobCreated {
+            job_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            job_type,
+            event_type,
+            retries,
+            ..
+        } => {
+            let (def_id, def_key) = instance_def(tx, *instance_key);
+            let (kind_code, event_code) = job_kind_codes(&JobKind::ExecutionListener {
+                event_type: *event_type,
+                index: 0,
+                scope: 0,
+            });
+            tx.cexecute(
+                "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                 state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
+                 job_kind, listener_event_type) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
+                 worker = NULL, deadline_ms = NULL",
+                params![
+                    *job_key as i64,
+                    *instance_key as i64,
+                    *element_instance_key as i64,
+                    element_id,
+                    job_type,
+                    job_state_code(JobState::Created),
+                    *retries,
+                    def_id,
+                    def_key,
+                    kind_code,
+                    event_code,
                 ],
             )?;
         }

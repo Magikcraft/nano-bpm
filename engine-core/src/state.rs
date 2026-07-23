@@ -117,6 +117,27 @@ pub enum JobState {
     Completed,
 }
 
+/// What a job represents. Ordinary service-task jobs are [`JobKind::BpmnElement`]
+/// (the default, so records serialized before this field existed load as such);
+/// [`JobKind::ExecutionListener`] jobs are the sequential execution-listener
+/// chain that runs on an element's activation/completion transition (ADR 0037).
+/// A listener job carries the transition it fires on, its 0-based position in
+/// the element's listener list, and the element's enclosing scope (so the next
+/// listener or the resumed lifecycle transition can be driven on completion).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum JobKind {
+    /// An ordinary job that backs a service task (or ad-hoc agent).
+    #[default]
+    BpmnElement,
+    /// A job for one execution listener in an element's sequential chain.
+    ExecutionListener {
+        event_type: crate::model::ListenerEventType,
+        index: usize,
+        scope: Key,
+    },
+}
+
 /// A job created for a service task, awaiting activation and completion.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -155,6 +176,11 @@ pub struct Job {
     /// age. `0` for jobs created before the engine carried this field.
     #[cfg_attr(feature = "serde", serde(default))]
     pub created_at: u64,
+    /// What this job represents (ordinary element job vs execution-listener job).
+    /// Defaults to [`JobKind::BpmnElement`] for records serialized before
+    /// execution listeners existed, so ordinary jobs are unaffected.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub kind: JobKind,
 }
 
 /// Default job-activation priority when no `zeebe:priorityDefinition` is declared.
@@ -1248,6 +1274,49 @@ pub fn apply(state: &mut State, event: &Event) {
                     retries: *retries,
                     priority: *priority,
                     created_at: *created_at,
+                    kind: JobKind::BpmnElement,
+                },
+            );
+            resync_job_index(state, *job_key);
+            state
+                .jobs_by_instance
+                .entry(*instance_key)
+                .or_default()
+                .insert(*job_key);
+        }
+
+        Event::ExecutionListenerJobCreated {
+            job_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            job_type,
+            event_type,
+            listener_index,
+            scope,
+            created_at,
+            retries,
+        } => {
+            state.jobs.insert(
+                *job_key,
+                Job {
+                    key: *job_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    job_type: job_type.clone(),
+                    state: JobState::Created,
+                    worker: None,
+                    deadline: None,
+                    activated: false,
+                    retries: *retries,
+                    priority: DEFAULT_JOB_PRIORITY,
+                    created_at: *created_at,
+                    kind: JobKind::ExecutionListener {
+                        event_type: *event_type,
+                        index: *listener_index,
+                        scope: *scope,
+                    },
                 },
             );
             resync_job_index(state, *job_key);

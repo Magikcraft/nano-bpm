@@ -225,6 +225,31 @@ pub enum Event {
         )]
         retries: i32,
     },
+    /// A job was created for one execution listener in an element's sequential
+    /// listener chain (ADR 0037). Distinct from [`Event::JobCreated`] so that
+    /// listener-free models never produce it and their log stays byte-identical.
+    /// `event_type` is the transition it fires on, `listener_index` its 0-based
+    /// position in the element's listener list for that transition, and `scope`
+    /// the element's enclosing scope (carried so completing the job can drive the
+    /// next listener or resume the lifecycle transition). The token rests until
+    /// the job completes.
+    ExecutionListenerJobCreated {
+        job_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        job_type: String,
+        event_type: crate::model::ListenerEventType,
+        listener_index: usize,
+        scope: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        created_at: u64,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default = "crate::state::default_job_retries")
+        )]
+        retries: i32,
+    },
     /// A job was activated by a worker and locked until `deadline` (a logical
     /// instant supplied by the caller). Another worker cannot activate it until
     /// the lock expires, but any holder of the key may complete it.
@@ -764,6 +789,7 @@ impl Event {
             | Event::ParallelJoinTokenArrived { instance_key, .. }
             | Event::ParallelJoinReset { instance_key, .. }
             | Event::JobCreated { instance_key, .. }
+            | Event::ExecutionListenerJobCreated { instance_key, .. }
             | Event::JobActivated { instance_key, .. }
             | Event::JobLockExpired { instance_key, .. }
             | Event::JobFailed { instance_key, .. }
@@ -886,6 +912,12 @@ impl Event {
                 element_instance_key,
                 ..
             } => m = m.max(*job_key).max(*element_instance_key),
+            Event::ExecutionListenerJobCreated {
+                job_key,
+                element_instance_key,
+                scope,
+                ..
+            } => m = m.max(*job_key).max(*element_instance_key).max(*scope),
             Event::JobActivated { job_key, .. }
             | Event::JobLockExpired { job_key, .. }
             | Event::JobFailed { job_key, .. }

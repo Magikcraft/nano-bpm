@@ -7953,3 +7953,292 @@ fn adhoc_agent_completion_flag_completes_without_activating_and_cancels() {
     );
     let _ = container;
 }
+
+// --- Execution listeners (ADR 0037) -----------------------------------------
+
+use crate::model::{ExecutionListener, ListenerEventType};
+
+fn el(event_type: ListenerEventType, job_type: &str) -> ExecutionListener {
+    ExecutionListener {
+        event_type,
+        job_type: job_type.to_string(),
+        retries: None,
+    }
+}
+
+/// A linear process whose single service task `charge` (job `payment`) carries
+/// the given start/end execution listeners.
+fn task_with_listeners(
+    start: Vec<ExecutionListener>,
+    end: Vec<ExecutionListener>,
+) -> ProcessDefinition {
+    ProcessBuilder::new("order")
+        .start_event("start")
+        .service_task("charge", "payment")
+        .end_event("end")
+        .connect("start", "charge")
+        .connect("charge", "end")
+        .with_listeners("charge", start, end)
+        .build()
+        .unwrap()
+}
+
+fn kinds(events: &[Event]) -> Vec<&'static str> {
+    events
+        .iter()
+        .map(|e| match e {
+            Event::ElementActivating { .. } => "Activating",
+            Event::ElementActivated { .. } => "Activated",
+            Event::ElementCompleting { .. } => "Completing",
+            Event::ElementCompleted { .. } => "Completed",
+            Event::JobCreated { .. } => "JobCreated",
+            Event::ExecutionListenerJobCreated { .. } => "ListenerJobCreated",
+            Event::JobCompleted { .. } => "JobCompleted",
+            Event::JobActivated { .. } => "JobActivated",
+            Event::SequenceFlowTaken { .. } => "FlowTaken",
+            Event::ProcessInstanceCompleted { .. } => "InstanceCompleted",
+            _ => "_",
+        })
+        .collect()
+}
+
+#[test]
+fn start_listener_runs_before_the_service_job_is_created() {
+    // A `start` execution listener defers the element's own behaviour (job
+    // creation): the listener job is minted at ACTIVATED time; the service job
+    // only appears once the listener chain drains.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![el(ListenerEventType::Start, "audit")],
+            Vec::new(),
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+
+    // No service `payment` job yet — the element rests in ACTIVATING.
+    assert!(
+        engine
+            .activate_jobs("payment", "W", 10, 1_000, 0)
+            .is_empty(),
+        "service job must not exist until the start listener completes"
+    );
+    // The start-listener job is activatable.
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "one start-listener job");
+
+    // Completing it drains the chain → the service job is created.
+    engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    let payment = engine.activate_jobs("payment", "W", 10, 1_000, 0);
+    assert_eq!(payment.len(), 1, "service job created after start listener");
+}
+
+#[test]
+fn end_listener_runs_before_the_element_completes() {
+    // An `end` execution listener defers ElementCompleted + the outgoing flow:
+    // the element rests in COMPLETING while the listener runs, so the instance
+    // is not yet finished.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            Vec::new(),
+            vec![el(ListenerEventType::End, "audit")],
+        )))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let payment = engine.activate_jobs("payment", "W", 10, 1_000, 0);
+    let completing = engine
+        .apply_command(Command::complete_job(payment[0].key))
+        .unwrap();
+    // Completing the service job emits Completing + the end-listener job, but
+    // NOT ElementCompleted, and the instance is still running.
+    assert!(kinds(&completing).contains(&"Completing"));
+    assert!(!kinds(&completing).contains(&"Completed"));
+    assert!(kinds(&completing).contains(&"ListenerJobCreated"));
+    assert!(
+        !engine.is_completed(inst),
+        "instance parked on end listener"
+    );
+
+    // Completing the end listener finalises completion → instance done.
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    assert_eq!(listener.len(), 1, "one end-listener job");
+    let done = engine
+        .apply_command(Command::complete_job(listener[0].key))
+        .unwrap();
+    assert!(kinds(&done).contains(&"Completed"));
+    assert!(
+        engine.is_completed(inst),
+        "instance finished after end listener"
+    );
+}
+
+#[test]
+fn multiple_start_listeners_run_sequentially_in_declaration_order() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![
+                el(ListenerEventType::Start, "first"),
+                el(ListenerEventType::Start, "second"),
+            ],
+            Vec::new(),
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+
+    // Only the first listener is activatable; the second does not exist yet.
+    assert!(engine.activate_jobs("second", "W", 10, 1_000, 0).is_empty());
+    let first = engine.activate_jobs("first", "W", 10, 1_000, 0);
+    assert_eq!(first.len(), 1);
+    engine
+        .apply_command(Command::complete_job(first[0].key))
+        .unwrap();
+
+    // Now the second listener exists; the service job still does not.
+    assert!(engine
+        .activate_jobs("payment", "W", 10, 1_000, 0)
+        .is_empty());
+    let second = engine.activate_jobs("second", "W", 10, 1_000, 0);
+    assert_eq!(second.len(), 1);
+    engine
+        .apply_command(Command::complete_job(second[0].key))
+        .unwrap();
+
+    // Chain drained → service job created.
+    assert_eq!(engine.activate_jobs("payment", "W", 10, 1_000, 0).len(), 1);
+}
+
+#[test]
+fn listener_variables_merge_into_the_element_scope() {
+    // A start listener that returns a variable makes it visible to the service
+    // job that follows (Zeebe parity: listener completions merge forward).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![el(ListenerEventType::Start, "audit")],
+            Vec::new(),
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let listener = engine.activate_jobs("audit", "W", 10, 1_000, 0);
+    let mut vars = HashMap::new();
+    vars.insert("approved".to_string(), Value::Bool(true));
+    engine
+        .apply_command(Command::complete_job_with(listener[0].key, vars))
+        .unwrap();
+    let payment = engine.activate_jobs("payment", "W", 10, 1_000, 0);
+    assert_eq!(
+        payment[0].variables.get("approved"),
+        Some(&Value::Bool(true)),
+        "start-listener variable is visible to the service job"
+    );
+}
+
+#[test]
+fn listener_free_model_journal_is_byte_identical() {
+    // The critical invariant: a model with NO listeners must emit exactly the
+    // same events as before execution-listener support existed. We assert the
+    // full lifecycle event shape of a plain service task.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            Vec::new(),
+            Vec::new(),
+        )))
+        .unwrap();
+    let create = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    // Activation of the service task: Activating, Activated, JobCreated — no
+    // listener events interleaved.
+    assert_eq!(
+        kinds(&create),
+        vec![
+            "_",
+            "Activating",
+            "Activated",
+            "Completing",
+            "Completed",
+            "FlowTaken",
+            "Activating",
+            "Activated",
+            "JobCreated"
+        ],
+        "listener-free activation journal unchanged"
+    );
+    let payment = engine.activate_jobs("payment", "W", 10, 1_000, 0);
+    let done = engine
+        .apply_command(Command::complete_job(payment[0].key))
+        .unwrap();
+    assert_eq!(
+        kinds(&done),
+        vec![
+            "JobCompleted",
+            "Completing",
+            "Completed",
+            "FlowTaken",
+            "Activating",
+            "Activated",
+            "Completing",
+            "Completed",
+            "InstanceCompleted"
+        ],
+        "listener-free completion journal unchanged"
+    );
+}
+
+#[test]
+fn start_and_end_listeners_bracket_the_service_task() {
+    // Full lifecycle: start listener → service job → end listener.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(task_with_listeners(
+            vec![el(ListenerEventType::Start, "before")],
+            vec![el(ListenerEventType::End, "after")],
+        )))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let before = engine.activate_jobs("before", "W", 10, 1_000, 0);
+    assert_eq!(before.len(), 1, "start listener first");
+    engine
+        .apply_command(Command::complete_job(before[0].key))
+        .unwrap();
+
+    let payment = engine.activate_jobs("payment", "W", 10, 1_000, 0);
+    assert_eq!(payment.len(), 1, "then the service job");
+    engine
+        .apply_command(Command::complete_job(payment[0].key))
+        .unwrap();
+    assert!(!engine.is_completed(inst));
+
+    let after = engine.activate_jobs("after", "W", 10, 1_000, 0);
+    assert_eq!(after.len(), 1, "then the end listener");
+    engine
+        .apply_command(Command::complete_job(after[0].key))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "instance finished after end listener"
+    );
+}

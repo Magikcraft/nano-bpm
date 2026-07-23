@@ -180,6 +180,21 @@ enum Step {
         container_key: Key,
         cancel: bool,
     },
+    /// Advance an element's execution-listener chain after one listener job
+    /// completed (ADR 0037): create the next listener job, or — when the chain
+    /// is drained — run the deferred lifecycle transition (a `Start` chain runs
+    /// the element's normal activation behaviour; an `End` chain emits
+    /// `ElementCompleted` and takes the outgoing flows).
+    AdvanceListener {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        event_type: crate::model::ListenerEventType,
+        /// The 0-based index of the listener that just completed.
+        index: usize,
+        /// The element's enclosing flow scope.
+        scope: Key,
+    },
 }
 
 impl Engine {
@@ -862,6 +877,7 @@ impl Engine {
                 let element_id = job.element_id.clone();
                 let created_at = job.created_at;
                 let job_type = job.job_type.clone();
+                let job_kind = job.kind;
 
                 self.emit(
                     &mut log,
@@ -884,12 +900,30 @@ impl Engine {
                         self.emit(&mut log, event);
                     }
                 }
-                // An ad-hoc container's agent job: instead of resuming the
-                // container token, drive the activate-element loop (ADR 0023
-                // seam 2). The container element id is in the definition's ad-hoc
-                // catalog; ordinary jobs (including the tools' own jobs) are not,
-                // so they fall through to the normal token resume below.
-                if self.adhoc_def_of(instance_key, &element_id).is_some() {
+                // An execution-listener job (ADR 0037): its completion advances the
+                // element's listener chain rather than resuming the token. The
+                // JobCompleted + variable merge above still apply (a listener may
+                // contribute variables that later listeners and the element see).
+                if let state::JobKind::ExecutionListener {
+                    event_type,
+                    index,
+                    scope,
+                } = job_kind
+                {
+                    queue.push_back(Step::AdvanceListener {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        event_type,
+                        index,
+                        scope,
+                    });
+                } else if self.adhoc_def_of(instance_key, &element_id).is_some() {
+                    // An ad-hoc container's agent job: instead of resuming the
+                    // container token, drive the activate-element loop (ADR 0023
+                    // seam 2). The container element id is in the definition's
+                    // ad-hoc catalog; ordinary jobs (including the tools' own jobs)
+                    // are not, so they fall through to the normal token resume.
                     let container_key = element_instance_key;
                     let result = adhoc_result.unwrap_or_default();
                     if result.cancel_remaining_instances {
@@ -2556,6 +2590,21 @@ impl Engine {
                 container_key,
                 cancel,
             } => self.complete_adhoc_container(instance_key, container_key, cancel),
+            Step::AdvanceListener {
+                instance_key,
+                element_instance_key,
+                element_id,
+                event_type,
+                index,
+                scope,
+            } => self.advance_listener(
+                instance_key,
+                element_instance_key,
+                element_id,
+                event_type,
+                index,
+                scope,
+            ),
         }
     }
 
@@ -2666,6 +2715,70 @@ impl Engine {
                 });
             }
         }
+
+        // Start execution listeners (ADR 0037): before the element enacts its
+        // own behaviour (creating a job, routing a gateway, opening a
+        // sub-process) it runs a sequential chain of `start` listener jobs. The
+        // element rests in ACTIVATING — `ElementActivated` was already emitted
+        // above (nano's early-marker choice), but the *behaviour* is deferred
+        // until the chain drains (see `advance_listener`). Listener-free
+        // elements skip this entirely and fall straight through to
+        // `run_activation_body`, so their journal is byte-identical.
+        let start_listeners = self.listeners_of(
+            instance_key,
+            &element_id,
+            crate::model::ListenerEventType::Start,
+        );
+        if let Some(first) = start_listeners.first() {
+            let mut listener_vars = (*element_vars).clone();
+            if !inputs.is_empty() {
+                let updates = self.eval_io_mappings_in(&element_vars, &inputs);
+                listener_vars.extend(updates);
+            }
+            let job_key = self.mint_key();
+            let job_type = self.resolve_job_type(&listener_vars, &first.job_type);
+            let retries = self.resolve_retries(&listener_vars, first.retries.as_deref());
+            events.push(Event::ExecutionListenerJobCreated {
+                job_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+                job_type,
+                event_type: crate::model::ListenerEventType::Start,
+                listener_index: 0,
+                scope,
+                created_at: self.now,
+                retries,
+            });
+            return (events, followups);
+        }
+
+        let (kind_events, kind_followups) =
+            self.run_activation_body(instance_key, element_id, element_instance_key, scope);
+        events.extend(kind_events);
+        followups.extend(kind_followups);
+        (events, followups)
+    }
+
+    /// Runs an element's own activation behaviour — everything after
+    /// `ElementActivated`: create the service/agent/user-task job, route the
+    /// gateway, open the sub-process/ad-hoc scope, arm boundary events, or
+    /// schedule an immediate `Complete`. Split out of [`activate`] so it can be
+    /// deferred until the element's `start` execution-listener chain drains
+    /// (ADR 0037). Listener-free elements call it inline with the same key/event
+    /// ordering, so their journal is unchanged.
+    fn run_activation_body(
+        &mut self,
+        instance_key: Key,
+        element_id: String,
+        element_instance_key: Key,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let kind = self.element_kind(instance_key, &element_id);
+        let adhoc_def = self.adhoc_def_of(instance_key, &element_id);
+        let element_vars = self.variables_for_element(instance_key, scope);
+        let mut events: Vec<Event> = Vec::new();
+        let mut followups: Vec<Step> = Vec::new();
 
         match kind {
             // A service task creates a job and parks the token.
@@ -3896,18 +4009,32 @@ impl Engine {
 
         // Default behaviour: complete and take every outgoing flow (a single flow
         // for ordinary elements; all flows for a parallel split).
-        let mut events = vec![
-            Event::ElementCompleting {
+        //
+        // End execution listeners (ADR 0037): when the element declares `end`
+        // listeners, defer `ElementCompleted` and the outgoing flows. The element
+        // rests in COMPLETING while a sequential chain of end-listener jobs runs;
+        // the deferred completion is emitted by `finalize_completion` once the
+        // chain drains (see `advance_listener`). The parked listener job keeps the
+        // element active, so `complete_finished_instances` won't finish the
+        // instance mid-chain. A listener-free element pushes `ElementCompleted`
+        // immediately, keeping its journal byte-identical.
+        let end_listeners = self.listeners_of(
+            instance_key,
+            &element_id,
+            crate::model::ListenerEventType::End,
+        );
+        let mut events = vec![Event::ElementCompleting {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        if end_listeners.is_empty() {
+            events.push(Event::ElementCompleted {
                 instance_key,
                 element_instance_key,
                 element_id: element_id.clone(),
-            },
-            Event::ElementCompleted {
-                instance_key,
-                element_instance_key,
-                element_id: element_id.clone(),
-            },
-        ];
+            });
+        }
         // Emit the decision-evaluation audit record (after ElementCompleted, before
         // the variables it produced are merged).
         if let Some(event) = decision_event {
@@ -3958,8 +4085,38 @@ impl Engine {
                 events.extend(self.propagated_updates(instance_key, flow_scope, updates, false));
             }
         }
-        let mut followups = Vec::new();
         let scope = self.scope_of(instance_key, element_instance_key);
+
+        // End-listener gate: the element rests in COMPLETING. Mint the first
+        // end-listener job (its type/retries resolved against the element's
+        // completion-time variable view, including any script/DMN result and
+        // output mappings staged above), and defer `ElementCompleted` + the
+        // outgoing flows to `finalize_completion` when the chain drains.
+        if let Some(first) = end_listeners.first() {
+            let mut listener_vars =
+                (*self.variables_for_element(instance_key, element_instance_key)).clone();
+            if let Some(update) = &script_update {
+                listener_vars.extend(update.clone());
+            }
+            let job_key = self.mint_key();
+            let job_type = self.resolve_job_type(&listener_vars, &first.job_type);
+            let retries = self.resolve_retries(&listener_vars, first.retries.as_deref());
+            events.push(Event::ExecutionListenerJobCreated {
+                job_key,
+                instance_key,
+                element_instance_key,
+                element_id: element_id.clone(),
+                job_type,
+                event_type: crate::model::ListenerEventType::End,
+                listener_index: 0,
+                scope,
+                created_at: self.now,
+                retries,
+            });
+            return (events, Vec::new());
+        }
+
+        let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
                 instance_key,
@@ -3973,6 +4130,93 @@ impl Engine {
             });
         }
         (events, followups)
+    }
+
+    /// Emits the deferred completion of an element whose `end` execution-listener
+    /// chain has drained (ADR 0037): `ElementCompleted` followed by taking every
+    /// outgoing flow. The completing-time work (boundary disarm, result merge,
+    /// output mappings) already ran in [`complete`]; this is only the tail that
+    /// was parked behind the listener chain.
+    fn finalize_completion(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = vec![Event::ElementCompleted {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        let mut followups = Vec::new();
+        for flow in self.outgoing(instance_key, &element_id) {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: element_id.clone(),
+                to: flow.to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow.to,
+                scope,
+            });
+        }
+        (events, followups)
+    }
+
+    /// Advances an element's execution-listener chain after one listener job
+    /// completed (ADR 0037). If another listener remains in the chain, its job is
+    /// created; otherwise the chain has drained and the deferred lifecycle
+    /// transition runs — a `Start` chain enacts the element's activation
+    /// behaviour ([`run_activation_body`]), an `End` chain emits the deferred
+    /// completion ([`finalize_completion`]).
+    fn advance_listener(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        event_type: crate::model::ListenerEventType,
+        index: usize,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let listeners = self.listeners_of(instance_key, &element_id, event_type);
+        let next_index = index + 1;
+        if let Some(next) = listeners.get(next_index) {
+            // The element's applied scope view (input mappings for a start chain,
+            // completion-time state for an end chain, plus any variables merged by
+            // preceding listener completions) is what the next listener's FEEL
+            // attributes resolve against.
+            let listener_vars = self.variables_for_element(instance_key, element_instance_key);
+            let job_key = self.mint_key();
+            let job_type = self.resolve_job_type(&listener_vars, &next.job_type);
+            let retries = self.resolve_retries(&listener_vars, next.retries.as_deref());
+            return (
+                vec![Event::ExecutionListenerJobCreated {
+                    job_key,
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    job_type,
+                    event_type,
+                    listener_index: next_index,
+                    scope,
+                    created_at: self.now,
+                    retries,
+                }],
+                Vec::new(),
+            );
+        }
+
+        // Chain drained — run the deferred transition.
+        match event_type {
+            crate::model::ListenerEventType::Start => {
+                self.run_activation_body(instance_key, element_id, element_instance_key, scope)
+            }
+            crate::model::ListenerEventType::End => {
+                self.finalize_completion(instance_key, element_instance_key, element_id, scope)
+            }
+        }
     }
 
     /// Mints a fresh job for an already-active service-task element instance.
@@ -4453,6 +4697,10 @@ pub struct ActivatedJob {
     /// the (up to 50 KB) value tree on the single command thread; the response
     /// mapper encodes it to JSON off-thread by borrowing.
     pub variables: Arc<HashMap<String, Value>>,
+    /// Whether this is an ordinary BPMN-element job or an execution-listener job
+    /// (ADR 0037), surfaced so the worker/transport can report `jobKind` and
+    /// `listenerEventType` (Camunda parity).
+    pub kind: state::JobKind,
 }
 
 /// The outcome of a standalone [`Engine::evaluate_deployed_decision`] call: the
