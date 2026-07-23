@@ -2460,6 +2460,10 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
             .map(|p| extensions::toolchain_available(&p))
             .unwrap_or(false)
     };
+    // When not runnable, tell the user exactly what we probed for (which binary,
+    // on PATH) plus the pack's install hint — a bare "toolchain missing" leaves
+    // them guessing which tool to install.
+    let missing_toolchain = missing_toolchain_json(&cfg.lang, runnable);
     Ok(serde_json::json!({
         "config": cfg,
         "files": tree,
@@ -2467,8 +2471,73 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
         "denoAvailable": sup.deno_available(),
         "nodeAvailable": sup.node_available(),
         "runnable": runnable,
+        "missingToolchain": missing_toolchain,
         "platforms": projects::PLATFORMS,
     }))
+}
+
+/// Describe the missing run/compile toolchain for a project's `lang` so the
+/// Console banner can name the exact executable the probe looked for (and the
+/// pack's install hint), instead of a generic "toolchain missing". Returns
+/// `None` when the project is runnable. Pure: given `lang` + `runnable` it only
+/// reads the (already-probed) lang pack manifest, so it's unit-testable without
+/// a supervisor or an on-disk project.
+fn missing_toolchain_json(lang: &str, runnable: bool) -> Option<serde_json::Value> {
+    if runnable {
+        return None;
+    }
+    if lang == "deno" {
+        return Some(serde_json::json!({
+            "displayName": "Deno / Node",
+            "probes": ["deno", "node"],
+            "installHint": "Install the Deno runtime, or Node \u{2265} 22.6 (used as a fallback where Deno has no build, e.g. 32-bit ARM).",
+            "installUrl": "https://deno.com/",
+        }));
+    }
+    extensions::lang_pack(lang).map(|p| {
+        let probes: Vec<&str> = p
+            .toolchain
+            .detect
+            .first()
+            .map(|b| vec![b.as_str()])
+            .unwrap_or_default();
+        serde_json::json!({
+            "displayName": p.display_name,
+            "probes": probes,
+            "installHint": p.toolchain.install_hint,
+            "installUrl": p.toolchain.install_url,
+        })
+    })
+}
+
+#[cfg(test)]
+mod missing_toolchain_tests {
+    use super::*;
+
+    #[test]
+    fn runnable_project_reports_no_missing_toolchain() {
+        assert!(missing_toolchain_json("deno", true).is_none());
+        assert!(missing_toolchain_json("rust", true).is_none());
+    }
+
+    #[test]
+    fn missing_deno_names_both_runtimes() {
+        let v = missing_toolchain_json("deno", false).expect("deno payload");
+        let probes: Vec<_> = v["probes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p.as_str().unwrap())
+            .collect();
+        assert_eq!(probes, ["deno", "node"]);
+        assert!(v["installUrl"].as_str().unwrap().contains("deno.com"));
+    }
+
+    #[test]
+    fn unknown_lang_pack_yields_no_payload() {
+        // No pack installed for this id, so there is nothing specific to name.
+        assert!(missing_toolchain_json("no-such-lang", false).is_none());
+    }
 }
 
 /// `DELETE /console/api/projects/{name}` — remove a project (must be stopped).
