@@ -15,7 +15,7 @@ import Ajv2020 from "ajv/dist/2020.js";
 import schema from "../nano-app.schema.json" with { type: "json" };
 import type { SymbolIndex } from "./symbol-index.ts";
 import { DOMAIN_PRIMITIVES } from "./symbol-index.ts";
-import { bodyPaths, isDeclaredType, resolveBodyPath } from "./feel.ts";
+import { bodyPaths, dataQueryCalls, isDeclaredType, resolveBodyPath } from "./feel.ts";
 
 export interface Diagnostic {
   severity: "error";
@@ -114,9 +114,25 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
         }
       }
     }
+    // `data.query("alias", …)` in an action's App-tier FEEL must name a declared
+    // datasource (ADR 0024 §5) — the same bind-to-the-alias rule as a form's
+    // dataSource. Intra-manifest (no index), and independent of bodyType: the
+    // read is App-tier, so it is sound here (unlike engine FEEL). The default
+    // form `data.query(sql)` names no alias and is covered by `data.default`.
+    for (const field of ["variables", "correlationKey"] as const) {
+      const expr = t.action?.[field];
+      if (typeof expr !== "string") continue;
+      for (const call of dataQueryCalls(expr)) {
+        if (call.source != null && !sourceNames.has(call.source)) {
+          push(
+            `/triggers/${i}/action/${field}`,
+            `data.query datasource "${call.source}" is not declared in data.sources`,
+            "unknown-datasource",
+          );
+        }
+      }
+    }
   });
-
-  // surfaces.chat.agent names a declared llm.
   const agent = manifest.surfaces?.chat?.agent;
   if (agent != null && !llmNames.has(agent)) {
     push("/surfaces/chat/agent", `chat agent "${agent}" is not declared in llm`, "unknown-llm");
