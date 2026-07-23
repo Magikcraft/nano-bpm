@@ -7,6 +7,7 @@ import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
 import AppManifestEditor, { isAppManifestPath } from "../components/AppManifestEditor";
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
+const DataPanel = lazy(() => import("../components/DataPanel"));
 import {
   compileProject,
   createProjectPath,
@@ -69,6 +70,7 @@ export default function ProjectWorkspace() {
   const [logs, setLogs] = useState<ProjectLogLine[]>([]);
   const [showConfig, setShowConfig] = useState(false);
   const [showCompile, setShowCompile] = useState(false);
+  const [showData, setShowData] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const [consoleHeight, setConsoleHeight] = useState(() => {
     const saved = Number(localStorage.getItem("nano.consoleHeight"));
@@ -255,6 +257,12 @@ export default function ProjectWorkspace() {
     return <div className="p-8 text-sm text-fg-faint">Loading…</div>;
   }
 
+  // Urban App projects carry a root `nano.app.json`; only those have
+  // datasources, so the DB Manager (Data) toolbar entry is shown for them.
+  const isUrbanApp = detail.files.some(
+    (f) => f.kind === "file" && f.name === "nano.app.json",
+  );
+
   return (
     <div className="flex h-full flex-col">
       {/* Toolbar */}
@@ -312,6 +320,11 @@ export default function ProjectWorkspace() {
         >
           Compile
         </ToolbarButton>
+        {isUrbanApp && (
+          <ToolbarButton onClick={() => setShowData((v) => !v)} kind={showData ? "primary" : undefined}>
+            Data
+          </ToolbarButton>
+        )}
         <ToolbarButton onClick={() => setShowConfig(true)}>Configure</ToolbarButton>
         <ToolbarButton onClick={() => void exportProject(name, false)}>Export</ToolbarButton>
       </div>
@@ -335,38 +348,48 @@ export default function ProjectWorkspace() {
           onChanged={reloadFiles}
         />
 
-        {/* Editor + console */}
-        <div className="flex min-w-0 flex-1 flex-col">
-          <div className="min-h-0 flex-1 overflow-hidden border-b border-edge">
-            {selected ? (
-              isAppManifestPath(selected) ? (
-                <AppManifestEditor
-                  key={selected}
-                  name={name}
-                  path={selected}
-                  files={detail.files}
-                />
-              ) : (
-                <EditorPane
-                  key={selected}
-                  name={name}
-                  path={selected}
-                  deployTarget={detail.config.deployTarget}
-                />
-              )
-            ) : (
-              <div className="flex h-full items-center justify-center text-sm text-fg-faint">
-                Select a file to edit
-              </div>
-            )}
+        {/* Editor + console — or the DB Manager (Data) panel when toggled */}
+        {showData ? (
+          <div className="flex min-w-0 flex-1 flex-col">
+            <Suspense
+              fallback={<div className="p-8 text-sm text-fg-faint">Loading Data panel…</div>}
+            >
+              <DataPanel name={name} />
+            </Suspense>
           </div>
-          <div
-            onMouseDown={startDrag}
-            className="h-1.5 shrink-0 cursor-row-resize bg-hover transition-colors hover:bg-accent"
-            title="Drag to resize console"
-          />
-          <RunConsole logs={logs} forwardRef={logRef} onClear={() => setLogs([])} height={consoleHeight} />
-        </div>
+        ) : (
+          <div className="flex min-w-0 flex-1 flex-col">
+            <div className="min-h-0 flex-1 overflow-hidden border-b border-edge">
+              {selected ? (
+                isAppManifestPath(selected) ? (
+                  <AppManifestEditor
+                    key={selected}
+                    name={name}
+                    path={selected}
+                    files={detail.files}
+                  />
+                ) : (
+                  <EditorPane
+                    key={selected}
+                    name={name}
+                    path={selected}
+                    deployTarget={detail.config.deployTarget}
+                  />
+                )
+              ) : (
+                <div className="flex h-full items-center justify-center text-sm text-fg-faint">
+                  Select a file to edit
+                </div>
+              )}
+            </div>
+            <div
+              onMouseDown={startDrag}
+              className="h-1.5 shrink-0 cursor-row-resize bg-hover transition-colors hover:bg-accent"
+              title="Drag to resize console"
+            />
+            <RunConsole logs={logs} forwardRef={logRef} onClear={() => setLogs([])} height={consoleHeight} />
+          </div>
+        )}
       </div>
 
       {showConfig && (

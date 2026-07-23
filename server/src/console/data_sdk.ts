@@ -122,6 +122,20 @@ export function resolveSource(
   };
 }
 
+/// List every datasource the manifest declares (resolved against the
+/// environment), plus the `default` source name. Powers the DB Manager's
+/// datasource picker — it enumerates the aliases without opening a connection.
+export async function listSources(
+  cwd?: string,
+): Promise<{ default?: string; sources: ResolvedSource[] }> {
+  const { data } = await findManifest(cwd ?? Deno.cwd());
+  const env = (k: string) => Deno.env.get(k);
+  const sources = Object.entries(data.sources).map(([name, raw]) =>
+    resolveSource(name, raw, env)
+  );
+  return { default: data.default, sources };
+}
+
 // --- manifest discovery ----------------------------------------------------
 
 interface ManifestLocation {

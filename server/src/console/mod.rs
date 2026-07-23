@@ -2693,6 +2693,96 @@ pub(super) fn project_path_create(name: &str, rel: &str, dir: bool) -> ApiResult
     }
 }
 
+/// Maps a datasource gateway error to an HTTP status + message.
+fn data_error(e: projects::DataError) -> (StatusCode, String) {
+    use projects::DataError::*;
+    match e {
+        NoProject => (StatusCode::NOT_FOUND, "no such project".to_string()),
+        NoDeno => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Deno runtime not found. Install Deno (https://deno.com) or set \
+             NANOBPMN_DENO_BIN to use the Data panel."
+                .to_string(),
+        ),
+        // A bad SQL statement / unknown source / missing manifest is the
+        // maker's input, not a server fault.
+        Op(m) => (StatusCode::BAD_REQUEST, m),
+        Gateway(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+    }
+}
+
+/// Run one datasource op and surface it as an `ApiResult`.
+async fn project_data_op(name: &str, request: serde_json::Value) -> ApiResult {
+    projects::run_data_op(name, request)
+        .await
+        .map_err(data_error)
+}
+
+/// `GET /console/api/projects/{name}/data/sources` — the datasources the App
+/// manifest declares (resolved driver/url) plus the default source name.
+pub(super) async fn project_data_sources(name: &str) -> ApiResult {
+    project_data_op(name, serde_json::json!({ "op": "sources" })).await
+}
+
+/// `GET /console/api/projects/{name}/data/{source}/schema` — tables/columns/indexes.
+pub(super) async fn project_data_schema(name: &str, source: &str) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({ "op": "schema", "source": source }),
+    )
+    .await
+}
+
+/// `POST /console/api/projects/{name}/data/{source}/query` — run a row-returning
+/// statement, returning `{ columns, rows }`.
+pub(super) async fn project_data_query(
+    name: &str,
+    source: &str,
+    sql: &str,
+    params: Vec<serde_json::Value>,
+) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({ "op": "query", "source": source, "sql": sql, "params": params }),
+    )
+    .await
+}
+
+/// `POST /console/api/projects/{name}/data/{source}/exec` — run a non-row
+/// statement (INSERT/UPDATE/DELETE/DDL), returning `{ changed, lastInsertId? }`.
+pub(super) async fn project_data_exec(
+    name: &str,
+    source: &str,
+    sql: &str,
+    params: Vec<serde_json::Value>,
+) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({ "op": "exec", "source": source, "sql": sql, "params": params }),
+    )
+    .await
+}
+
+/// `GET /console/api/projects/{name}/data/{source}/migrations` — the ordered
+/// migration files with applied status.
+pub(super) async fn project_data_migrations(name: &str, source: &str) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({ "op": "migrations", "source": source }),
+    )
+    .await
+}
+
+/// `POST /console/api/projects/{name}/data/{source}/migrate` — apply pending
+/// migrations, returning the names applied.
+pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({ "op": "migrate", "source": source }),
+    )
+    .await
+}
+
 /// `DELETE /console/api/projects/{name}/file?path=...` — remove a file or folder.
 pub(super) fn project_path_delete(name: &str, rel: &str) -> ApiResult {
     let Some(path) = projects::safe_project_path(name, rel) else {

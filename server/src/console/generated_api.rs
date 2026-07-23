@@ -1038,3 +1038,131 @@ impl apis::projects::Projects for ServerImpl {
         }
     }
 }
+
+// --- data (datasources / DB Manager, ADR 0024) ----------------------------
+
+/// Map a datasource `ApiResult` error to a data response's collapsed status set
+/// (only 400/404 exist on these operations): `NOT_FOUND` → 404, everything else
+/// (bad SQL/unknown source → 400; no-Deno → 503; gateway → 500) → 400.
+macro_rules! data_ok_or {
+    ($res:expr, $ok:path, $bad:path, $nf:path) => {
+        match $res {
+            Ok(v) => Ok($ok(from_val(v))),
+            Err((code, msg)) if code == http::StatusCode::NOT_FOUND => Ok($nf(msg)),
+            Err((_, msg)) => Ok($bad(msg)),
+        }
+    };
+}
+
+#[async_trait]
+impl apis::data::Data for ServerImpl {
+    async fn get_data_sources(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::GetDataSourcesPathParams,
+    ) -> Result<apis::data::GetDataSourcesResponse, ()> {
+        use apis::data::GetDataSourcesResponse as R;
+        data_ok_or!(
+            super::project_data_sources(&path_params.name).await,
+            R::Status200_DatasourcesPlusTheDefaultSourceName,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
+    async fn get_data_schema(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::GetDataSchemaPathParams,
+    ) -> Result<apis::data::GetDataSchemaResponse, ()> {
+        use apis::data::GetDataSchemaResponse as R;
+        data_ok_or!(
+            super::project_data_schema(&path_params.name, &path_params.source).await,
+            R::Status200_DatasourceSchema,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
+    async fn query_data(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::QueryDataPathParams,
+        body: &models::DataQueryRequest,
+    ) -> Result<apis::data::QueryDataResponse, ()> {
+        use apis::data::QueryDataResponse as R;
+        let params = body
+            .params
+            .as_ref()
+            .map(|ps| ps.iter().map(|o| o.0.clone()).collect())
+            .unwrap_or_default();
+        data_ok_or!(
+            super::project_data_query(&path_params.name, &path_params.source, &body.sql, params)
+                .await,
+            R::Status200_QueryResult,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
+    async fn exec_data(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::ExecDataPathParams,
+        body: &models::DataQueryRequest,
+    ) -> Result<apis::data::ExecDataResponse, ()> {
+        use apis::data::ExecDataResponse as R;
+        let params = body
+            .params
+            .as_ref()
+            .map(|ps| ps.iter().map(|o| o.0.clone()).collect())
+            .unwrap_or_default();
+        data_ok_or!(
+            super::project_data_exec(&path_params.name, &path_params.source, &body.sql, params)
+                .await,
+            R::Status200_ExecResult,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
+    async fn get_data_migrations(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::GetDataMigrationsPathParams,
+    ) -> Result<apis::data::GetDataMigrationsResponse, ()> {
+        use apis::data::GetDataMigrationsResponse as R;
+        data_ok_or!(
+            super::project_data_migrations(&path_params.name, &path_params.source).await,
+            R::Status200_MigrationStatus,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
+    async fn migrate_data(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::MigrateDataPathParams,
+    ) -> Result<apis::data::MigrateDataResponse, ()> {
+        use apis::data::MigrateDataResponse as R;
+        data_ok_or!(
+            super::project_data_migrate(&path_params.name, &path_params.source).await,
+            R::Status200_MigrationsApplied,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+}
