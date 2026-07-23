@@ -2179,6 +2179,18 @@ const LEADER_DURABLE_PROMOTE_HOLDDOWN_TICKS: u32 = 2;
 /// default 1000ms) with margin for a starved runtime.
 const LEADER_DURABLE_PROMOTE_LEADERSHIP_WAIT_MS: u64 = 3000;
 
+/// How long a self-promote waits for a surviving replica to acknowledge the
+/// promotion (adopt the epoch + rebuild as our receiver) before we ship it the
+/// fresh lineage via `add_learner` (issue #228). The `Promote` announcement and
+/// the `add_learner` AppendEntries travel on independent lanes (control vs. raft)
+/// with no ordering, so without this barrier the append can reach the survivor's
+/// still-live prior-epoch group and collide two committed `idx-1` entries. If a
+/// survivor cannot confirm within this budget we DEFER its learner add — the
+/// recovery tick's learner reconcile re-adds it later, by when it is a settled
+/// receiver. Sized to comfortably cover a starved receiver rebuild (a raft
+/// shutdown + fresh in-memory group), matching the leadership-wait budget above.
+const LEADER_DURABLE_STEPDOWN_ACK_TIMEOUT_MS: u64 = 3000;
+
 /// Requester-side state for an in-flight leadership hand-off (see
 /// [`ServerImpl::handoff_pending`]). Tracks how long to keep suppressing the
 /// legacy self-promote while waiting for the incumbent to complete the openraft
@@ -9968,14 +9980,41 @@ impl ServerImpl {
         );
 
         // Announce so peers rejoin as learners and any stale leader steps down,
-        // then (best-effort) add the reachable survivors as learners.
+        // then ship the fresh lineage to the surviving replicas — but through a
+        // STEP-DOWN BARRIER (issue #228). `broadcast_promotion` and `add_learner`
+        // travel on independent lanes (control vs. raft socket) with no ordering,
+        // so a naive "announce then add_learner" lets our fresh committed `idx-1`
+        // reach a survivor's still-live prior-epoch group and collide two committed
+        // lineages (openraft's `has_log_id` invariant). For each surviving replica
+        // we therefore send a SYNCHRONOUS promote and wait for it to rebuild as our
+        // receiver before add_learner. The synchronous ack is handled inline on the
+        // same control lane as the broadcast Promote, so by the time it returns the
+        // survivor's prior-epoch group is already torn down and our AppendEntries
+        // land in a clean receiver. If a survivor cannot confirm in time (slow or
+        // unreachable) we DEFER its learner add — `reconcile_leader_durable_learners`
+        // re-adds it on a later recovery tick, by when it is a settled receiver.
         self.broadcast_promotion(p, epoch).await;
-        for n in topology.replicas_of(p) {
+        let replicas = topology.replicas_of(p);
+        let my_addr = topology.peer_addr(me as u32).unwrap_or("").to_string();
+        for &n in &replicas {
             if n as u64 == me {
                 continue;
             }
-            if self.peer_reachable(n).await {
-                let addr = topology.peer_addr(n).unwrap_or("").to_string();
+            let addr = topology.peer_addr(n).unwrap_or("").to_string();
+            let stepped_down = match self.peers.link(n).await {
+                Ok(link) => link
+                    .promote_sync(
+                        p,
+                        epoch,
+                        me,
+                        my_addr.clone(),
+                        std::time::Duration::from_millis(LEADER_DURABLE_STEPDOWN_ACK_TIMEOUT_MS),
+                    )
+                    .await
+                    .is_ok(),
+                Err(_) => false,
+            };
+            if stepped_down {
                 part.add_learner(n as u64, openraft::BasicNode::new(addr))
                     .await
                     .ok();
@@ -21728,7 +21767,18 @@ mod clustered_startup_tests {
         // openraft leadership hand-off, NOT self-promote a competing group (the
         // two-lineage election war). This proves the recovery tick reclaims a
         // boot-deferred partition end-to-end via hand-off, with no fresh self-promote.
-        let (node0, node1, node2, mut handles) = boot_rf3_intake_cluster_cfg2(false, true).await;
+        let (mut node0, node1, node2, mut handles) =
+            boot_rf3_intake_cluster_cfg2(false, true).await;
+
+        // Exercise the intended reclaim-via-handoff path this test documents (issue
+        // #228): without this the tick silently ran the legacy self-promote (a
+        // competing lineage), so the map-derived hand-off (Phase E) had no coverage
+        // and the racy add_learner-after-broadcast intermittently panicked the
+        // incumbent's rt-worker on the openraft `has_log_id` invariant in CI. The
+        // flag is a plain per-clone bool but only the requester (this handle, which
+        // drives the tick directly) reads it, and raft state is Arc-shared, so
+        // setting it here suffices.
+        node0.reclaim_via_handoff = true;
 
         // node 1 is the failover incumbent: it genuinely raft-leads partition 0 at
         // epoch 1 (node 0, the static owner, treated as having been down).

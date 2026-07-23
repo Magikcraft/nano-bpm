@@ -364,6 +364,33 @@ impl PeerLink {
         .await
     }
 
+    /// Request/response variant of [`send_promote`](Self::send_promote) (issue
+    /// #228): tell this peer we promoted ourselves leader of `partition` at `epoch`
+    /// and WAIT until it has adopted the epoch and rebuilt as our receiver before
+    /// returning. The promoting leader gates its `add_learner` on this ack so it
+    /// never ships the fresh lineage into the peer's still-live prior-epoch group
+    /// (where two committed `idx-1` entries would collide). `Ok` iff the peer
+    /// confirmed the step-down within `timeout`; on timeout/link failure the caller
+    /// defers the learner add to the recovery tick's reconcile.
+    pub async fn promote_sync(
+        &self,
+        partition: u64,
+        epoch: u64,
+        leader_node: u64,
+        leader_addr: String,
+        timeout: Duration,
+    ) -> Result<(), PeerError> {
+        self.request_within(timeout, |corr| ClientFrame::PromoteSync {
+            corr,
+            partition,
+            epoch,
+            leader_node,
+            leader_addr,
+        })
+        .await
+        .map(|_| ())
+    }
+
     /// Fire-and-forget the runtime SLA-mode switch to this peer, so the cluster
     /// applies a single uniform admission policy. `mode` is the
     /// [`crate::backpressure::SlaMode`] string. See [`ClientFrame::SetSlaMode`].
