@@ -4,9 +4,14 @@ Status: **Accepted; implementing.** Seams 1–3 (fixtures, model catalog, result
 plumbing) and seam 2 (runtime activate/loop/complete) shipped in PRs #142/#146;
 seam 5 (read model + metrics) is implemented — each tool activation is a
 read-model element instance and the loop is metered via
-`nanobpm_adhoc_events_total{kind=…}` (see `PERFORMANCE.md`). Remaining: seam 4
-(FEEL `completionCondition` + activated-element `ioMapping` + `BPMN_TASK`
-`activeElementsCollection`) and the seam 6 E2E parity test.
+`nanobpm_adhoc_events_total{kind=…}` (see `PERFORMANCE.md`). Seam 4 is
+implemented for v1: the engine evaluates a declared `<completionCondition>` after
+each tool completes (and honors the agent's `isCompletionConditionFulfilled`
+flag), and applies each activated tool's `zeebe:ioMapping` (inputs on activation,
+outputs projected into the container scope) — the pruned tool's mappings are
+carried on the container catalog. Deferred to v1.1: the declarative `BPMN_TASK`
+`activeElementsCollection` variant (small — see §Subset). Remaining: the seam 6
+E2E parity test.
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md` §E.1 — the parity strategy this ADR makes
 concrete; **Tier-1** of that tier ladder), ADR 0005 (`0005-embedded-u-nano.md`, Bernd — the
@@ -97,13 +102,22 @@ shape byte-for-byte so the existing connector is unmodified. Scope is bounded an
   into it) and the Falcon complete-job frame (ADR 0016). No new endpoint; existing complete-job
   gains optional fields (absent ⇒ today's behavior).
 
-### 4. FEEL + IO (`engine-core` FEEL)
+### 4. FEEL + IO (`engine-core` FEEL) ✅ (v1: completionCondition + ioMapping)
 
 - Evaluate `<completionCondition>` in the scope's variable context on each tool completion.
+  **Done:** the parser attaches the container's `<completionCondition>` to the catalog, and the
+  runtime evaluates it (via `eval_bool`) against the container scope after every tool completes —
+  overlaid with that tool's just-projected output mappings. When true the container completes at
+  once, cancelling any tools still running (like a multi-instance body's early completion). The
+  agent's `isCompletionConditionFulfilled` flag is honored the same way (it supersedes any
+  activate-element instructions in the same result).
 - Apply each activated element's `ioMapping` on activation (input) and completion (output→
-  `outputCollection`). Support `activeElementsCollection` (declarative `BPMN_TASK` variant) as a
-  FEEL list evaluated at container activation — cheap to add alongside and completes ad-hoc
-  coverage.
+  container scope). **Done:** each tool's `zeebe:ioMapping` is retained on the container catalog
+  (the tool element is pruned from the executable graph, so it can't be read back by element id);
+  inputs are evaluated on activation into the tool's local scope, outputs are projected into the
+  container scope on completion.
+- **Deferred to v1.1:** `activeElementsCollection` (declarative `BPMN_TASK` variant) as a FEEL list
+  evaluated at container activation — small, but a distinct (agent-less) execution mode.
 
 ### 5. Read model + metrics
 
@@ -128,7 +142,8 @@ Ship in this order; state each boundary in `PERFORMANCE.md`/feature matrix:
 2. **Model** (seam 1): parse + retain-as-catalog; unit tests over the fixtures.
 3. **Result plumbing** (seam 3): fields on REST + Falcon complete-job (no behavior yet).
 4. **Runtime** (seam 2): activate-element command, scope, loop, completion/cancel; engine tests.
-5. **FEEL/IO** (seam 4): completion condition + output collection + declarative variant.
+5. **FEEL/IO** (seam 4) ✅ (v1): completion condition + tool ioMapping; `BPMN_TASK` declarative
+   variant deferred to v1.1.
 6. **E2E parity test**: run a golden agentic BPMN on embedded Bernd driven by the **unmodified**
    Camunda AI Agent connector; assert per-tool instances appear in the read model and the run
    matches Camunda's outcome.

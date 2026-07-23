@@ -643,6 +643,12 @@ pub enum AdHocToolKind {
 pub struct AdHocTool {
     pub element_id: ElementId,
     pub kind: AdHocToolKind,
+    /// The tool's own `zeebe:ioMapping` (empty if none). Retained on the catalog
+    /// because the tool element is pruned from the executable graph, so the
+    /// runtime cannot read it back via `element(id)` (ADR 0023 seam 4): input
+    /// mappings apply on activation, output mappings on completion.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub io: IoMapping,
 }
 
 /// The retained metadata + tool catalog of one `adHocSubProcess`.

@@ -599,8 +599,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             // The standard BPMN `<completionCondition>` FEEL text
-                            // nested in `multiInstanceLoopCharacteristics`.
-                            "completionCondition" if cur_multi_instance.is_some() => {
+                            // nested in `multiInstanceLoopCharacteristics`, or a
+                            // direct child of an ad-hoc container (ADR 0023 seam 4).
+                            "completionCondition" => {
                                 completion_condition_text = Some(String::new());
                             }
                             // zeebe:ioMapping and its nested zeebe:input/output.
@@ -749,14 +750,22 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 "intermediateCatchEvent" => cur_intermediate = None,
                 "multiInstanceLoopCharacteristics" => cur_multi_instance = None,
                 "completionCondition" => {
-                    if let (Some(idx), Some(text)) =
-                        (cur_multi_instance, completion_condition_text.take())
-                    {
+                    if let Some(text) = completion_condition_text.take() {
                         let trimmed = text.trim();
                         if !trimmed.is_empty() {
                             if let Some(acc) = current.as_mut() {
-                                if let Some(mi) = acc.nodes[idx].multi_instance.as_mut() {
-                                    mi.completion_condition = Some(trimmed.to_string());
+                                if let Some(idx) = cur_multi_instance {
+                                    if let Some(mi) = acc.nodes[idx].multi_instance.as_mut() {
+                                        mi.completion_condition = Some(trimmed.to_string());
+                                    }
+                                } else if let Some(id) = acc.scope_stack.last().cloned() {
+                                    // A direct child of an ad-hoc container: attach
+                                    // to the open container node (ADR 0023 seam 4).
+                                    if let Some(node) =
+                                        acc.nodes.iter_mut().find(|n| n.id == id && n.is_adhoc)
+                                    {
+                                        node.adhoc_completion_condition = Some(trimmed.to_string());
+                                    }
                                 }
                             }
                         }
@@ -1174,6 +1183,7 @@ impl ProcessAcc {
                     adhoc_catalog[pos].tools.push(crate::model::AdHocTool {
                         element_id: n.id.clone(),
                         kind,
+                        io: n.io.clone(),
                     });
                 }
             }
