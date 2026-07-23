@@ -1,3 +1,58 @@
+/** The datasource binding attached to a choice field's `dataSource` property. */
+export interface FormFieldDataBinding {
+	/** Datasource alias (a key of manifest `data.sources`). */
+	source: string;
+	/** A read query (SELECT …) whose rows become the field's options. */
+	query: string;
+	/** Row column mapped to each option's `value` (default `"value"`). */
+	value?: string;
+	/** Row column mapped to each option's `label` (default `"label"`). */
+	label?: string;
+}
+/** A binding located within a form schema, with the field it belongs to. */
+export interface CollectedFormBinding {
+	/** The bound field's `key` (its data path), when it has one. */
+	fieldKey?: string;
+	/** The field component's `id` (form-js always assigns one). */
+	fieldId?: string;
+	/** JSON-pointer-ish path to the field within the schema, for diagnostics. */
+	path: string;
+	binding: FormFieldDataBinding;
+}
+/** A single resolved option, matching form-js's static `values` entry shape. */
+export interface FormOption {
+	value: string;
+	label: string;
+}
+/** The form-js component `type`s that render an option list. */
+export declare const CHOICE_FIELD_TYPES: ReadonlySet<string>;
+/**
+ * Reads a well-formed `dataSource` binding off a component, or `undefined`.
+ * Deliberately strict: `source` and `query` must be non-empty strings, so a
+ * half-typed or malformed binding is simply ignored (and separately flagged by
+ * the validator) rather than throwing at render time.
+ */
+export declare function readFieldDataBinding(component: unknown): FormFieldDataBinding | undefined;
+/**
+ * Walks a form-js schema (recursing into layout components: groups, dynamic
+ * lists) and returns every field carrying a datasource binding. Order is
+ * document order so diagnostics are stable.
+ */
+export declare function collectFormDataBindings(schema: unknown): CollectedFormBinding[];
+/**
+ * Maps datasource query rows to form-js static options. Uses the binding's
+ * `value`/`label` columns, defaulting to `"value"`/`"label"`; when only one
+ * mapping resolves, it doubles as the other so a `SELECT name` still renders.
+ */
+export declare function rowsToOptions(rows: ReadonlyArray<Record<string, unknown>>, binding: FormFieldDataBinding): FormOption[];
+/**
+ * Returns a deep clone of `schema` with each bound field's options replaced by
+ * the resolved list (keyed by the field's `id`, falling back to `key`). The
+ * field is switched to form-js's static source (`values` set, `valuesKey`
+ * cleared) so a plain viewer renders the live options with no extra wiring. The
+ * input schema is never mutated.
+ */
+export declare function applyDataSourceOptions(schema: unknown, resolved: ReadonlyMap<string, ReadonlyArray<FormOption>>): unknown;
 /** A model file to index. `kind` selects the parser; `text` is the file body. */
 export interface ModelFile {
 	path: string;
@@ -27,6 +82,8 @@ export interface DecisionSymbol {
 export interface FormFieldSymbol {
 	key: string;
 	type: string;
+	/** Datasource binding (ADR 0024 §5), when the field declares one. */
+	dataSource?: FormFieldDataBinding;
 }
 export interface FormSymbol {
 	id: string;

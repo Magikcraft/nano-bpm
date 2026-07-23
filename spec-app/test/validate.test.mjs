@@ -195,3 +195,37 @@ test("a worker outputType must name a declared domain type (ADR 0033 §3)", asyn
   assert.deepEqual(codesFor(result, "/workers/0/outputType"), []);
   assert.deepEqual(codesFor(result, "/workers/1/outputType"), ["unknown-type"]);
 });
+
+test("a form field's datasource binding must name a declared source (ADR 0024 §5)", async () => {
+  const boundForm = JSON.stringify({
+    id: "orders",
+    schemaVersion: 18,
+    type: "default",
+    components: [
+      {
+        type: "select",
+        key: "customerId",
+        id: "Field_1",
+        dataSource: { source: "app", query: "SELECT id AS value, name AS label FROM customers" },
+      },
+      {
+        type: "checklist",
+        key: "regionIds",
+        id: "Field_2",
+        dataSource: { source: "warehouse", query: "SELECT id, name FROM regions" },
+      },
+    ],
+  });
+  const index = await buildSymbolIndex([
+    ...models,
+    { path: "orders.form", kind: "form", text: boundForm },
+  ]);
+  const result = validateManifest(manifest(), index);
+  // "app" is declared in data.sources → no diagnostic; "warehouse" is not.
+  assert.deepEqual(codesFor(result, "/forms/orders/fields/customerId/dataSource/source"), []);
+  assert.deepEqual(
+    codesFor(result, "/forms/orders/fields/regionIds/dataSource/source"),
+    ["unknown-datasource"],
+  );
+  assert.equal(result.ok, false);
+});

@@ -1,6 +1,6 @@
 # ADR 0024 — Urban data layer & datasource abstraction (the BDE alias, for Nano Apps)
 
-Status: **Accepted** (phase 1, *datasource-core*, implemented — the runtime seam; phases 2–4 remain Proposed).
+Status: **Accepted** (phases 1–2 *datasource-core* + *db-manager-panel* implemented; phase 3 *datasource-bindings* partially implemented — the §5 form field binding; the FEEL `data.query` builtin and chat `query-data` tool remain Proposed, as does phase 4).
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md`, **Urban** — the RAD App bundle; this ADR
 expands its §D "Data layer" from a single SQLite file into a named-datasource seam),
@@ -180,10 +180,13 @@ tenant **row-level scoping** (Postgres RLS vs. app-level filters) is a shared op
    `openDataSource(name?)`; `ctx.data(name?)` is wired into the worker host (`worker_sdk.ts`),
    and the App-run sandbox now grants project-root write so a `file:./app.db` source is
    creatable. Ships the swap seam even before the GUI.
-2. **db-manager-panel** — the §4 Data tab (Tables / SQL / Migrations) over a named datasource,
+2. **db-manager-panel** — *implemented.* The §4 Data tab (Tables / SQL / Migrations) over a named datasource,
    reusing the Monaco/panel pattern.
-3. **datasource-bindings** — §5 form field binding + FEEL `data.query` builtin + the chat
-   `query-data` tool (read-only default).
+3. **datasource-bindings** — §5 form field binding (*implemented* — a form-js choice field declares a
+   `dataSource` binding `{ source, query, value?, label? }`; the console Form **Preview** resolves it
+   live through the phase-2 gateway into a data-aware control, and `validate.ts` cross-checks the
+   `source` against declared `data.sources`) + FEEL `data.query` builtin (*Proposed*) + the chat
+   `query-data` tool (read-only default, *Proposed*).
 4. **datasource-postgres-pack** — the first `nano-ide-data-*` pack (Postgres), proving the axis and
    the SQLite→Postgres alias flip end-to-end.
 

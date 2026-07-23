@@ -12,6 +12,7 @@
 import BpmnModdle from "bpmn-moddle";
 import DmnModdle from "dmn-moddle";
 import zeebe from "zeebe-bpmn-moddle/resources/zeebe.json" with { type: "json" };
+import { readFieldDataBinding, type FormFieldDataBinding } from "./form-data-binding.ts";
 
 /** A model file to index. `kind` selects the parser; `text` is the file body. */
 export interface ModelFile {
@@ -46,6 +47,8 @@ export interface DecisionSymbol {
 export interface FormFieldSymbol {
   key: string;
   type: string;
+  /** Datasource binding (ADR 0024 §5), when the field declares one. */
+  dataSource?: FormFieldDataBinding;
 }
 
 export interface FormSymbol {
@@ -187,7 +190,10 @@ async function indexDmn(model: ModelFile, index: SymbolIndex): Promise<void> {
 function collectFormFields(components: MEl[], out: FormFieldSymbol[]): void {
   for (const c of components || []) {
     if (typeof c.key === "string" && typeof c.type === "string") {
-      out.push({ key: c.key, type: c.type });
+      const field: FormFieldSymbol = { key: c.key, type: c.type };
+      const binding = readFieldDataBinding(c);
+      if (binding) field.dataSource = binding;
+      out.push(field);
     }
     // Layout components (groups, dynamic lists) nest their own components.
     if (Array.isArray(c.components)) collectFormFields(c.components as MEl[], out);
