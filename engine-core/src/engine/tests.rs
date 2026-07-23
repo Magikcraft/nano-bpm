@@ -8242,3 +8242,415 @@ fn start_and_end_listeners_bracket_the_service_task() {
         "instance finished after end listener"
     );
 }
+
+#[test]
+fn end_listener_fires_on_an_exclusive_gateway() {
+    // An `end` execution listener on an exclusive gateway defers the routing
+    // decision: the gateway rests in COMPLETING while the listener runs, and the
+    // outgoing flow is only taken once the chain drains (ADR 0037). This closes a
+    // real gap — the gateway previously short-circuited before the end gate.
+    let process = ProcessBuilder::new("route")
+        .start_event("s")
+        .exclusive_gateway("g")
+        .end_event("yes")
+        .end_event("no")
+        .connect("s", "g")
+        .connect_when("g", "yes", "=go")
+        .connect_default("g", "no")
+        .with_listeners(
+            "g",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "gate-audit")],
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process))
+        .unwrap();
+    let create = engine
+        .apply_command(Command::create_instance_with(
+            "route",
+            vars(&[("go", Value::Bool(true))]),
+        ))
+        .unwrap();
+    let inst = create.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The gateway parked on its end listener: no routing flow taken yet.
+    assert!(
+        !create.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "yes" || to == "no"
+        )),
+        "gateway must not route until its end listener completes"
+    );
+    assert!(kinds(&create).contains(&"ListenerJobCreated"));
+    assert!(
+        !engine.is_completed(inst),
+        "instance parked on gateway end listener"
+    );
+
+    // Completing the listener drains the chain → the conditional flow is taken.
+    let audit = engine.activate_jobs("gate-audit", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one gateway end-listener job");
+    let done = engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "yes"
+        )),
+        "conditional flow taken after the end listener"
+    );
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn end_listener_fires_on_an_embedded_subprocess() {
+    // An `end` execution listener on an embedded sub-process defers the
+    // sub-process's completion (and its outgoing flow) until the listener runs.
+    let process = ProcessBuilder::new("wrap")
+        .start_event("s")
+        .sub_process("sub", "inner-start")
+        .start_event("inner-start")
+        .service_task("work", "job")
+        .end_event("inner-end")
+        .end_event("e")
+        .contained_in("inner-start", "sub")
+        .contained_in("work", "sub")
+        .contained_in("inner-end", "sub")
+        .connect("s", "sub")
+        .connect("inner-start", "work")
+        .connect("work", "inner-end")
+        .connect("sub", "e")
+        .with_listeners(
+            "sub",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "sub-audit")],
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("wrap"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let work = engine.activate_jobs("job", "W", 10, 1_000, 0);
+    assert_eq!(work.len(), 1);
+    engine
+        .apply_command(Command::complete_job(work[0].key))
+        .unwrap();
+
+    // Inner flow drained; the sub-process parks on its end listener.
+    assert!(
+        !engine.is_completed(inst),
+        "sub-process parked on end listener"
+    );
+    let audit = engine.activate_jobs("sub-audit", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one sub-process end-listener job");
+    engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "instance done after the sub-process end listener"
+    );
+}
+
+/// A parallel multi-instance service task `each` (job `handle`) over `items`,
+/// carrying the given start/end execution listeners on the multi-instance body.
+fn mi_body_with_listeners(
+    start: Vec<ExecutionListener>,
+    end: Vec<ExecutionListener>,
+) -> ProcessDefinition {
+    ProcessBuilder::new("mi")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .with_listeners("each", start, end)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn start_listener_fires_once_on_a_multi_instance_body_before_children() {
+    // A `start` execution listener on a multi-instance activity fires ONCE on the
+    // body, before ANY child is instantiated (ADR 0037). It does not double-fire
+    // per child.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(mi_body_with_listeners(
+            vec![el(ListenerEventType::Start, "mi-start")],
+            Vec::new(),
+        )))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+
+    // No child jobs until the body's start listener drains.
+    assert!(
+        engine.activate_jobs("handle", "W", 10, 1_000, 0).is_empty(),
+        "children must not spawn until the body start listener completes"
+    );
+    let start = engine.activate_jobs("mi-start", "W", 10, 1_000, 0);
+    assert_eq!(start.len(), 1, "exactly one body start-listener job");
+    engine
+        .apply_command(Command::complete_job(start[0].key))
+        .unwrap();
+
+    // Now all three children spawn, and the start listener does NOT re-fire.
+    assert_eq!(
+        engine.activate_jobs("handle", "W", 10, 1_000, 0).len(),
+        3,
+        "all children spawn after the body start listener"
+    );
+    assert!(
+        engine
+            .activate_jobs("mi-start", "W", 10, 1_000, 0)
+            .is_empty(),
+        "start listener must not re-fire per child"
+    );
+}
+
+#[test]
+fn end_listener_fires_once_on_a_multi_instance_body_after_all_children() {
+    // An `end` execution listener on a multi-instance activity fires ONCE on the
+    // body, only after every child has completed, before the body itself
+    // completes.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(mi_body_with_listeners(
+            Vec::new(),
+            vec![el(ListenerEventType::End, "mi-end")],
+        )))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    let handle = engine.activate_jobs("handle", "W", 10, 1_000, 0);
+    assert_eq!(handle.len(), 3);
+    // Completing the first two children does NOT yet mint the body end listener.
+    for j in &handle[..2] {
+        engine.apply_command(Command::complete_job(j.key)).unwrap();
+    }
+    assert!(
+        engine.activate_jobs("mi-end", "W", 10, 1_000, 0).is_empty(),
+        "body end listener must wait for all children"
+    );
+    // Completing the last child parks the body on its single end listener.
+    engine
+        .apply_command(Command::complete_job(handle[2].key))
+        .unwrap();
+    assert!(
+        !engine.is_completed(inst),
+        "body parked on its end listener"
+    );
+    let end = engine.activate_jobs("mi-end", "W", 10, 1_000, 0);
+    assert_eq!(end.len(), 1, "exactly one body end-listener job");
+    engine
+        .apply_command(Command::complete_job(end[0].key))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "instance done after the body end listener"
+    );
+}
+
+#[test]
+fn end_listener_fires_on_an_adhoc_container() {
+    // An `end` execution listener on an ad-hoc sub-process container defers the
+    // container's completion until the listener runs (natural, non-cancel path).
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc />
+              <zeebe:executionListeners>
+                <zeebe:executionListener eventType="end" type="agent-audit" />
+              </zeebe:executionListeners>
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let process = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("p"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Drive the ad-hoc worker: activate one tool, then complete with no further
+    // activations so the container drains naturally.
+    let agent = engine.activate_jobs("agent-worker", "W", 10, 1_000, 0);
+    assert_eq!(agent.len(), 1, "ad-hoc container job");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent[0].key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let tool = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool.len(), 1, "activated tool job");
+    engine
+        .apply_command(Command::complete_job(tool[0].key))
+        .unwrap();
+
+    // The tool drained; the agent re-emits for a final turn. Returning NO further
+    // activations drives the container down its natural (non-cancel) completion
+    // path, where it parks on its end listener before completing.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted");
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult::default(),
+        ))
+        .unwrap();
+
+    // The ad-hoc container parks on its end listener before completing.
+    assert!(
+        !engine.is_completed(inst),
+        "container parked on end listener"
+    );
+    let audit = engine.activate_jobs("agent-audit", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1, "one ad-hoc container end-listener job");
+    engine
+        .apply_command(Command::complete_job(audit[0].key))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "instance done after the ad-hoc container end listener"
+    );
+}
+
+#[test]
+fn exclusive_gateway_end_listener_reselects_and_raises_incident_if_nothing_matches() {
+    // A gateway's `end` listener runs BEFORE the routing decision is finalised, so
+    // a listener that rewrites a condition variable is observed by the
+    // re-selection. If the rewrite makes NOTHING match (and there is no default),
+    // the gateway must raise a no-matching-flow incident and keep its token — not
+    // silently complete and drop the token (which would falsely finish the
+    // instance).
+    let process = ProcessBuilder::new("route")
+        .start_event("s")
+        .exclusive_gateway("g")
+        .end_event("yes")
+        .connect("s", "g")
+        .connect_when("g", "yes", "=go")
+        .with_listeners(
+            "g",
+            Vec::new(),
+            vec![el(ListenerEventType::End, "gate-audit")],
+        )
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process))
+        .unwrap();
+    // `go=true` at creation → the flow to "yes" is selectable, so the gateway
+    // parks on its end listener.
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "route",
+            vars(&[("go", Value::Bool(true))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let audit = engine.activate_jobs("gate-audit", "W", 10, 1_000, 0);
+    assert_eq!(audit.len(), 1);
+
+    // The listener completes, flipping `go` to false — now nothing matches on
+    // re-selection.
+    let done = engine
+        .apply_command(Command::complete_job_with(
+            audit[0].key,
+            vars(&[("go", Value::Bool(false))]),
+        ))
+        .unwrap();
+    assert!(
+        done.iter().any(|e| matches!(
+            e,
+            Event::IncidentRaised {
+                kind: state::IncidentKind::NoMatchingSequenceFlow,
+                ..
+            }
+        )),
+        "re-selection matched nothing → no-matching-flow incident"
+    );
+    assert!(
+        !done.iter().any(|e| matches!(
+            e,
+            Event::SequenceFlowTaken { to, .. } if to == "yes"
+        )),
+        "no flow taken when re-selection fails"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "instance parked on the gateway incident, not falsely completed"
+    );
+}

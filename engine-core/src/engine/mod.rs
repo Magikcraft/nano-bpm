@@ -2473,7 +2473,14 @@ impl Engine {
                     continue;
                 }
                 let has_child = instance.scopes.values().any(|parent| parent == eik);
-                if !has_child {
+                if !has_child && self.active_job_on(*eik).is_none() {
+                    // A sub-process resting in COMPLETING while its `end`
+                    // execution-listener chain runs (ADR 0037) has also drained its
+                    // children, but carries a parked listener job on its own
+                    // instance — the only kind of job a sub-process instance can
+                    // host, since it creates none of its own. Skip it so the sweep
+                    // does not re-fire its completion; `finalize_subprocess` emits
+                    // the deferred `ElementCompleted` when the chain drains.
                     drained.push((instance.key, *eik, element_id.clone()));
                 }
             }
@@ -2505,6 +2512,63 @@ impl Engine {
                     element_id: element_id.clone(),
                 },
             );
+
+            // End-listener gate (ADR 0037): the sub-process rests in COMPLETING
+            // while its `end` chain runs. Its boundary events disarm and its
+            // output mappings project at completing-time (Zeebe: before the
+            // listeners); `finalize_subprocess` emits the deferred
+            // `ElementCompleted` + outgoing flows once the chain drains. The
+            // parked listener job keeps the sub-process instance active, and the
+            // sweep guard above skips it so it is not re-detected as drained.
+            // Only build the (cloned) listener variable view when the sub-process
+            // actually declares `end` listeners — the listener-free path stays
+            // allocation-free, matching the pre-listener engine operationally.
+            let has_end_listeners = !self
+                .listeners_of(
+                    instance_key,
+                    &element_id,
+                    crate::model::ListenerEventType::End,
+                )
+                .is_empty();
+            if has_end_listeners {
+                let mut listener_vars = (*self.variables_for_element(instance_key, eik)).clone();
+                // Zeebe runs `end` listeners after output mappings, so the first
+                // listener resolves its own FEEL (job type / retries) against the
+                // mapped values — the same post-output view every subsequent
+                // listener sees (they re-read the scope after the propagation
+                // below is applied).
+                listener_vars.extend(output_updates.clone());
+                if let Some(job) = self.begin_end_listener_chain(
+                    instance_key,
+                    eik,
+                    &element_id,
+                    scope,
+                    &listener_vars,
+                ) {
+                    for event in self.cancel_boundary_timers_on(eik) {
+                        self.emit(log, event);
+                    }
+                    for event in self.cancel_boundary_message_subscriptions_on(eik) {
+                        self.emit(log, event);
+                    }
+                    for event in self.cancel_boundary_signal_subscriptions_on(eik) {
+                        self.emit(log, event);
+                    }
+                    for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
+                        self.emit(log, event);
+                    }
+                    if !output_updates.is_empty() {
+                        for event in
+                            self.propagated_updates(instance_key, scope, output_updates, false)
+                        {
+                            self.emit(log, event);
+                        }
+                    }
+                    self.emit(log, job);
+                    continue;
+                }
+            }
+
             self.emit(
                 log,
                 Event::ElementCompleted {
@@ -3078,11 +3142,12 @@ impl Engine {
             _ => Vec::new(),
         };
         let total = items.len();
+        let sequential = mi.sequential;
         events.push(Event::MultiInstanceActivated {
             instance_key,
             body_key,
             element_id: element_id.clone(),
-            sequential: mi.sequential,
+            sequential,
             items,
             input_element: mi.input_element.clone(),
             output_collection: mi.output_collection.clone(),
@@ -3090,13 +3155,44 @@ impl Engine {
             completion_condition: mi.completion_condition.clone(),
         });
 
+        // Start-listener gate (ADR 0037): the body rests in ACTIVATING while its
+        // `start` chain runs. Zeebe fires the activity's start listeners at the
+        // body boundary, before any child is instantiated, so child spawning is
+        // deferred to `advance_listener` (Start), which re-derives it via
+        // `spawn_multi_instance_children` once the chain drains (by which point
+        // the `MultiInstanceActivated` event above has been applied). Listener-free
+        // bodies fan out inline, byte-identical to before.
+        let start_listeners = self.listeners_of(
+            instance_key,
+            &element_id,
+            crate::model::ListenerEventType::Start,
+        );
+        if let Some(first) = start_listeners.first() {
+            let job_key = self.mint_key();
+            let job_type = self.resolve_job_type(&vars, &first.job_type);
+            let retries = self.resolve_retries(&vars, first.retries.as_deref());
+            events.push(Event::ExecutionListenerJobCreated {
+                job_key,
+                instance_key,
+                element_instance_key: body_key,
+                element_id: element_id.clone(),
+                job_type,
+                event_type: crate::model::ListenerEventType::Start,
+                listener_index: 0,
+                scope,
+                created_at: self.now,
+                retries,
+            });
+            return (events, Vec::new());
+        }
+
         let mut followups = Vec::new();
         if total == 0 {
             followups.push(Step::CompleteMiBody {
                 instance_key,
                 body_key,
             });
-        } else if mi.sequential {
+        } else if sequential {
             followups.push(Step::ActivateMiChild {
                 instance_key,
                 element_id,
@@ -3114,6 +3210,48 @@ impl Engine {
             }
         }
         (events, followups)
+    }
+
+    /// Fans out a multi-instance body's children (or completes an empty body),
+    /// re-derived from the body record: an empty loop completes the body, a
+    /// sequential loop starts its first child, a parallel loop starts one child
+    /// per item. Split out of [`activate_multi_instance_body`] so the fan-out can
+    /// be deferred behind the body's `start` execution-listener chain (ADR 0037)
+    /// and resumed from [`advance_listener`] once it drains.
+    fn spawn_multi_instance_children(&self, instance_key: Key, body_key: Key) -> Vec<Step> {
+        let (element_id, sequential, total) = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.multi_instances.get(&body_key))
+        {
+            Some(mi) => (mi.element_id.clone(), mi.sequential, mi.items.len()),
+            None => return Vec::new(),
+        };
+        let mut followups = Vec::new();
+        if total == 0 {
+            followups.push(Step::CompleteMiBody {
+                instance_key,
+                body_key,
+            });
+        } else if sequential {
+            followups.push(Step::ActivateMiChild {
+                instance_key,
+                element_id,
+                body_key,
+                index: 0,
+            });
+        } else {
+            for index in 0..total {
+                followups.push(Step::ActivateMiChild {
+                    instance_key,
+                    element_id: element_id.clone(),
+                    body_key,
+                    index,
+                });
+            }
+        }
+        followups
     }
 
     /// Activates one child of a multi-instance body: instantiates the activity
@@ -3383,14 +3521,57 @@ impl Engine {
         // The output collection propagates OUT of the body to its enclosing (flow)
         // scope — for a top-level loop that is the root, collapsing to the flat
         // `VariablesUpdated`, byte-identical to the pre-scoping engine.
-        if let Some(map) = collection_map {
-            events.extend(self.propagated_updates(instance_key, scope, map, false));
+        if let Some(map) = &collection_map {
+            events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
         }
         events.push(Event::ElementCompleting {
             instance_key,
             element_instance_key: body_key,
             element_id: element_id.clone(),
         });
+
+        // End-listener gate (ADR 0037): the multi-instance body rests in COMPLETING
+        // once every child has finished (Zeebe fires the activity's `end` listeners
+        // at the body boundary, not per child). Its output mappings run first
+        // (Zeebe ordering: mappings before listeners); `finalize_multi_instance_body`
+        // emits the deferred `ElementCompleted` + `MultiInstanceCompleted` + outgoing
+        // flows once the chain drains.
+        if !self
+            .listeners_of(
+                instance_key,
+                &element_id,
+                crate::model::ListenerEventType::End,
+            )
+            .is_empty()
+        {
+            let mut listener_vars = (*self.variables_for_element(instance_key, body_key)).clone();
+            if let Some(map) = &collection_map {
+                listener_vars.extend(map.clone());
+            }
+            // Zeebe runs `end` listeners after output mappings, so the first
+            // listener sees the mapped values — consistent with subsequent
+            // listeners, which re-read the scope after the propagation below.
+            listener_vars.extend(output_updates.clone());
+            if let Some(job) = self.begin_end_listener_chain(
+                instance_key,
+                body_key,
+                &element_id,
+                scope,
+                &listener_vars,
+            ) {
+                if !output_updates.is_empty() {
+                    events.extend(self.propagated_updates(
+                        instance_key,
+                        scope,
+                        output_updates,
+                        false,
+                    ));
+                }
+                events.push(job);
+                return (events, Vec::new());
+            }
+        }
+
         events.push(Event::ElementCompleted {
             instance_key,
             element_instance_key: body_key,
@@ -3405,6 +3586,53 @@ impl Engine {
         if !output_updates.is_empty() {
             events.extend(self.propagated_updates(instance_key, scope, output_updates, false));
         }
+        let mut followups = Vec::new();
+        for flow in self.outgoing(instance_key, &element_id) {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: element_id.clone(),
+                to: flow.to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow.to,
+                scope,
+            });
+        }
+        (events, followups)
+    }
+
+    /// Deferred completion of a multi-instance body whose `end` execution-listener
+    /// chain has drained (ADR 0037). Its output collection + mappings already
+    /// propagated when the body parked; this emits the parked `ElementCompleted` +
+    /// `MultiInstanceCompleted` and takes the activity's outgoing flow, re-derived
+    /// from the still-resident body record.
+    fn finalize_multi_instance_body(
+        &mut self,
+        instance_key: Key,
+        body_key: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let element_id = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.multi_instances.get(&body_key))
+        {
+            Some(mi) => mi.element_id.clone(),
+            None => return (Vec::new(), Vec::new()),
+        };
+        let scope = self.scope_of(instance_key, body_key);
+        let mut events = vec![
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key: body_key,
+                element_id: element_id.clone(),
+            },
+            Event::MultiInstanceCompleted {
+                instance_key,
+                body_key,
+            },
+        ];
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
@@ -3790,15 +4018,57 @@ impl Engine {
         // The output collection propagates OUT of the container to its enclosing
         // (flow) scope — for a top-level container that is the root, collapsing to
         // the flat `VariablesUpdated`.
-        if let Some(name) = output_collection {
-            let map = HashMap::from([(name, Value::List(output_values))]);
-            events.extend(self.propagated_updates(instance_key, scope, map, false));
+        let collection_map =
+            output_collection.map(|name| HashMap::from([(name, Value::List(output_values))]));
+        if let Some(map) = &collection_map {
+            events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
         }
         events.push(Event::ElementCompleting {
             instance_key,
             element_instance_key: container_key,
             element_id: element_id.clone(),
         });
+
+        // End-listener gate (ADR 0037): fires the container's `end` listeners at
+        // the container boundary once its tools have drained.
+        // `finalize_adhoc_container` emits the parked `ElementCompleted` +
+        // `AdHocCompleted` + outgoing flows. Only the natural completion is gated;
+        // a cancel-remaining-instances completion (`cancel`) stays inline — its
+        // `cancelled` flag cannot be re-derived at drain time, and running end
+        // listeners on an aborted container is not meaningful.
+        if !cancel
+            && !self
+                .listeners_of(
+                    instance_key,
+                    &element_id,
+                    crate::model::ListenerEventType::End,
+                )
+                .is_empty()
+        {
+            let mut listener_vars =
+                (*self.variables_for_element(instance_key, container_key)).clone();
+            if let Some(map) = &collection_map {
+                listener_vars.extend(map.clone());
+            }
+            if let Some(job) = self.begin_end_listener_chain(
+                instance_key,
+                container_key,
+                &element_id,
+                scope,
+                &listener_vars,
+            ) {
+                // Disarm any boundary events so none can fire during the
+                // COMPLETING window the end chain opens (defensive/symmetric with
+                // the sub-process path; a no-op when the container carries none).
+                events.extend(self.cancel_boundary_timers_on(container_key));
+                events.extend(self.cancel_boundary_message_subscriptions_on(container_key));
+                events.extend(self.cancel_boundary_signal_subscriptions_on(container_key));
+                events.extend(self.cancel_boundary_conditional_subscriptions_on(container_key));
+                events.push(job);
+                return (events, Vec::new());
+            }
+        }
+
         events.push(Event::ElementCompleted {
             instance_key,
             element_instance_key: container_key,
@@ -3809,6 +4079,54 @@ impl Engine {
             container_key,
             cancelled: cancel,
         });
+        let mut followups = Vec::new();
+        for flow in self.outgoing(instance_key, &element_id) {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: element_id.clone(),
+                to: flow.to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow.to,
+                scope,
+            });
+        }
+        (events, followups)
+    }
+
+    /// Deferred completion of an ad-hoc sub-process container whose `end`
+    /// execution-listener chain has drained (ADR 0037). Its output collection
+    /// already propagated when the container parked; this emits the parked
+    /// `ElementCompleted` + `AdHocCompleted` and takes the outgoing flow.
+    fn finalize_adhoc_container(
+        &mut self,
+        instance_key: Key,
+        container_key: Key,
+        cancelled: bool,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let element_id = match self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+        {
+            Some(a) => a.element_id.clone(),
+            None => return (Vec::new(), Vec::new()),
+        };
+        let scope = self.scope_of(instance_key, container_key);
+        let mut events = vec![
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key: container_key,
+                element_id: element_id.clone(),
+            },
+            Event::AdHocCompleted {
+                instance_key,
+                container_key,
+                cancelled,
+            },
+        ];
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
             events.push(Event::SequenceFlowTaken {
@@ -4132,12 +4450,140 @@ impl Engine {
         (events, followups)
     }
 
+    /// Mints the first `end` execution-listener job for an element that has just
+    /// entered COMPLETING (ADR 0037), if it declares any. Returns the
+    /// `ExecutionListenerJobCreated` event when there is an end chain to run — the
+    /// caller appends it, having already emitted `ElementCompleting` and its
+    /// completing-time work (output mappings, result merge, boundary disarm), and
+    /// then defers `ElementCompleted` + its structural downstream to the matching
+    /// `finalize_*` (dispatched by [`finalize_end_transition`] once the chain
+    /// drains). Returns `None` when the element has no end listeners, so the
+    /// caller completes inline and its journal stays byte-identical.
+    ///
+    /// `vars` is the element's completion-time variable view (its own scope,
+    /// including any input-mapped locals and merged job/script/DMN result), which
+    /// the listener job's own FEEL attributes (`type`, `retries`) resolve against.
+    fn begin_end_listener_chain(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        scope: Key,
+        vars: &HashMap<String, Value>,
+    ) -> Option<Event> {
+        let end_listeners = self.listeners_of(
+            instance_key,
+            element_id,
+            crate::model::ListenerEventType::End,
+        );
+        let first = end_listeners.first()?;
+        let job_key = self.mint_key();
+        let job_type = self.resolve_job_type(vars, &first.job_type);
+        let retries = self.resolve_retries(vars, first.retries.as_deref());
+        Some(Event::ExecutionListenerJobCreated {
+            job_key,
+            instance_key,
+            element_instance_key,
+            element_id: element_id.to_string(),
+            job_type,
+            event_type: crate::model::ListenerEventType::End,
+            listener_index: 0,
+            scope,
+            created_at: self.now,
+            retries,
+        })
+    }
+
+    /// Dispatches the deferred completion of an element whose `end`
+    /// execution-listener chain has drained (ADR 0037) to the finalizer matching
+    /// the completion site that parked it. The parked element still rests in
+    /// COMPLETING with its scope resident, so each finalizer re-derives its
+    /// structural tail (`ElementCompleted` + the site's own downstream) from the
+    /// current state — no captured context, replay-safe, exactly like the `start`
+    /// side re-derives [`run_activation_body`]. Ordinary elements (service/user/
+    /// script/business-rule tasks, pass-through events) fall through to
+    /// [`finalize_completion`].
+    fn finalize_end_transition(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        // A multi-instance body (its own instance key is the body scope key).
+        if self
+            .state
+            .instances
+            .get(&instance_key)
+            .map(|i| i.multi_instances.contains_key(&element_instance_key))
+            .unwrap_or(false)
+        {
+            return self.finalize_multi_instance_body(instance_key, element_instance_key);
+        }
+        // An ad-hoc sub-process container (keyed by its own instance key).
+        if self
+            .state
+            .instances
+            .get(&instance_key)
+            .map(|i| i.adhoc_instances.contains_key(&element_instance_key))
+            .unwrap_or(false)
+        {
+            return self.finalize_adhoc_container(instance_key, element_instance_key, false);
+        }
+        match self.element_kind(instance_key, &element_id) {
+            Some(ElementKind::ExclusiveGateway) => self.finalize_exclusive_gateway(
+                instance_key,
+                element_instance_key,
+                element_id,
+                scope,
+            ),
+            Some(ElementKind::SubProcess { .. }) => {
+                self.finalize_subprocess(instance_key, element_instance_key, element_id, scope)
+            }
+            _ => self.finalize_completion(instance_key, element_instance_key, element_id, scope),
+        }
+    }
+
     /// Emits the deferred completion of an element whose `end` execution-listener
     /// chain has drained (ADR 0037): `ElementCompleted` followed by taking every
     /// outgoing flow. The completing-time work (boundary disarm, result merge,
     /// output mappings) already ran in [`complete`]; this is only the tail that
     /// was parked behind the listener chain.
     fn finalize_completion(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let mut events = vec![Event::ElementCompleted {
+            instance_key,
+            element_instance_key,
+            element_id: element_id.clone(),
+        }];
+        let mut followups = Vec::new();
+        for flow in self.outgoing(instance_key, &element_id) {
+            events.push(Event::SequenceFlowTaken {
+                instance_key,
+                from: element_id.clone(),
+                to: flow.to.clone(),
+            });
+            followups.push(Step::Activate {
+                instance_key,
+                element_id: flow.to,
+                scope,
+            });
+        }
+        (events, followups)
+    }
+
+    /// Deferred completion of an embedded sub-process (or spliced call activity)
+    /// whose `end` execution-listener chain has drained (ADR 0037). Its boundary
+    /// events disarmed and its output mappings projected when it parked (in the
+    /// drained-sub-process sweep); this emits the parked `ElementCompleted` and
+    /// takes its outgoing flows. A newly-drained *enclosing* sub-process is picked
+    /// up by the end-of-command sweep, so nesting composes.
+    fn finalize_subprocess(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
@@ -4211,10 +4657,27 @@ impl Engine {
         // Chain drained — run the deferred transition.
         match event_type {
             crate::model::ListenerEventType::Start => {
-                self.run_activation_body(instance_key, element_id, element_instance_key, scope)
+                // A multi-instance body deferred its child fan-out (not
+                // `run_activation_body`): its activation already ran in
+                // `activate_multi_instance_body`; the start chain gated only the
+                // spawn, re-derived here from the body record.
+                if self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| i.multi_instances.contains_key(&element_instance_key))
+                    .unwrap_or(false)
+                {
+                    (
+                        Vec::new(),
+                        self.spawn_multi_instance_children(instance_key, element_instance_key),
+                    )
+                } else {
+                    self.run_activation_body(instance_key, element_id, element_instance_key, scope)
+                }
             }
             crate::model::ListenerEventType::End => {
-                self.finalize_completion(instance_key, element_instance_key, element_id, scope)
+                self.finalize_end_transition(instance_key, element_instance_key, element_id, scope)
             }
         }
     }
@@ -4264,91 +4727,113 @@ impl Engine {
     /// Exclusive gateway: take exactly one outgoing flow — the first whose
     /// condition holds (an unconditional flow is the default). If none qualifies,
     /// raise an incident and park the token.
+    /// Selects the outgoing flow an exclusive gateway takes, evaluating each
+    /// conditional flow in document order against the instance variables and
+    /// falling back to the explicit `default` flow when none matches. Returns the
+    /// chosen flow's target id (`Ok(Some)`), `Ok(None)` when nothing matches and
+    /// there is no default (the caller raises a no-matching-flow incident), or
+    /// `Err(reason)` when a condition failed to evaluate (an expression incident).
+    /// Pure over the current variables, so the end-listener gate can re-select at
+    /// [`finalize_exclusive_gateway`] time without captured state.
+    fn select_exclusive_flow(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+    ) -> Result<Option<String>, String> {
+        let variables = self.variables(instance_key);
+        let mut default_flow = None;
+        for flow in self.outgoing(instance_key, element_id) {
+            // The explicit `default` flow is a fallback only: it is never taken
+            // by document order, but kept aside in case no conditional flow
+            // matches.
+            if flow.is_default {
+                default_flow = Some(flow.to);
+                continue;
+            }
+            match &flow.condition {
+                None => return Ok(Some(flow.to)),
+                Some(condition) => match condition.eval(&variables) {
+                    Ok(true) => return Ok(Some(flow.to)),
+                    Ok(false) => continue,
+                    Err(err) => {
+                        return Err(format!(
+                            "failed to evaluate condition '{}' at exclusive gateway \
+                             '{element_id}': {}",
+                            condition.expression, err.0
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(default_flow)
+    }
+
     fn complete_exclusive_gateway(
         &mut self,
         instance_key: Key,
         element_instance_key: Key,
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
-        let variables = self.variables(instance_key);
-        let mut selected = None;
-        let mut default_flow = None;
-        let mut eval_error: Option<String> = None;
-        for flow in self.outgoing(instance_key, &element_id) {
-            // The explicit `default` flow is a fallback only: it is never taken
-            // by document order, but kept aside in case no conditional flow
-            // matches.
-            if flow.is_default {
-                default_flow = Some(flow);
-                continue;
+        let selected = match self.select_exclusive_flow(instance_key, &element_id) {
+            Ok(sel) => sel,
+            Err(reason) => {
+                let incident_key = self.mint_key();
+                return (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind: state::IncidentKind::ExpressionEvaluation,
+                        reason,
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                );
             }
-            match &flow.condition {
-                None => {
-                    selected = Some(flow);
-                    break;
-                }
-                Some(condition) => match condition.eval(&variables) {
-                    Ok(true) => {
-                        selected = Some(flow);
-                        break;
-                    }
-                    Ok(false) => continue,
-                    Err(err) => {
-                        eval_error = Some(format!(
-                            "failed to evaluate condition '{}' at exclusive gateway \
-                             '{element_id}': {}",
-                            condition.expression, err.0
-                        ));
-                        break;
-                    }
-                },
-            }
-        }
-        // Fall back to the explicit default flow when no conditional flow matched.
-        if selected.is_none() && eval_error.is_none() {
-            selected = default_flow;
-        }
-
-        if let Some(reason) = eval_error {
-            let incident_key = self.mint_key();
-            let events = vec![Event::IncidentRaised {
-                incident_key,
-                instance_key,
-                element_instance_key,
-                element_id,
-                kind: state::IncidentKind::ExpressionEvaluation,
-                reason,
-                job_key: None,
-                created_at: self.now,
-            }];
-            return (events, Vec::new());
-        }
+        };
 
         match selected {
-            Some(flow) => {
-                let events = vec![
-                    Event::ElementCompleting {
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                    },
-                    Event::ElementCompleted {
-                        instance_key,
-                        element_instance_key,
-                        element_id: element_id.clone(),
-                    },
-                    Event::SequenceFlowTaken {
-                        instance_key,
-                        from: element_id,
-                        to: flow.to.clone(),
-                    },
-                ];
-                let followups = vec![Step::Activate {
+            Some(flow_to) => {
+                let scope = self.scope_of(instance_key, element_instance_key);
+                let mut events = vec![Event::ElementCompleting {
                     instance_key,
-                    element_id: flow.to,
-                    scope: self.scope_of(instance_key, element_instance_key),
+                    element_instance_key,
+                    element_id: element_id.clone(),
                 }];
-                (events, followups)
+                // End-listener gate (ADR 0037): the gateway rests in COMPLETING
+                // while its end chain runs; `finalize_exclusive_gateway` re-selects
+                // the flow and emits the deferred completion once it drains.
+                let vars = self.variables(instance_key);
+                if let Some(job) = self.begin_end_listener_chain(
+                    instance_key,
+                    element_instance_key,
+                    &element_id,
+                    scope,
+                    &vars,
+                ) {
+                    events.push(job);
+                    return (events, Vec::new());
+                }
+                events.push(Event::ElementCompleted {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                });
+                events.push(Event::SequenceFlowTaken {
+                    instance_key,
+                    from: element_id,
+                    to: flow_to.clone(),
+                });
+                (
+                    events,
+                    vec![Step::Activate {
+                        instance_key,
+                        element_id: flow_to,
+                        scope,
+                    }],
+                )
             }
             None => {
                 // The token stays active (parked on the incident) so the instance
@@ -4367,6 +4852,80 @@ impl Engine {
                     created_at: self.now,
                 }];
                 (events, Vec::new())
+            }
+        }
+    }
+
+    /// Deferred completion of an exclusive gateway whose `end` execution-listener
+    /// chain has drained (ADR 0037). Re-selects the outgoing flow from the
+    /// resident scope (the gateway rested in COMPLETING). Selection is normally
+    /// deterministic, but a listener may have rewritten a condition variable; if
+    /// re-selection now matches nothing (or a condition fails to evaluate) the
+    /// gateway raises the same incident its non-listener path would and keeps the
+    /// token active, rather than emitting `ElementCompleted` with nowhere to go
+    /// (which would drop the token / falsely complete the instance).
+    fn finalize_exclusive_gateway(
+        &mut self,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+        scope: Key,
+    ) -> (Vec<Event>, Vec<Step>) {
+        match self.select_exclusive_flow(instance_key, &element_id) {
+            Ok(Some(flow_to)) => (
+                vec![
+                    Event::ElementCompleted {
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                    },
+                    Event::SequenceFlowTaken {
+                        instance_key,
+                        from: element_id,
+                        to: flow_to.clone(),
+                    },
+                ],
+                vec![Step::Activate {
+                    instance_key,
+                    element_id: flow_to,
+                    scope,
+                }],
+            ),
+            Ok(None) => {
+                // No flow matches now (and no default). Keep the token parked on
+                // an incident — do not complete — mirroring the non-listener path.
+                let incident_key = self.mint_key();
+                (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id: element_id.clone(),
+                        kind: state::IncidentKind::NoMatchingSequenceFlow,
+                        reason: format!(
+                            "no matching outgoing sequence flow at exclusive gateway '{element_id}'"
+                        ),
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                )
+            }
+            Err(reason) => {
+                let incident_key = self.mint_key();
+                (
+                    vec![Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                        kind: state::IncidentKind::ExpressionEvaluation,
+                        reason,
+                        job_key: None,
+                        created_at: self.now,
+                    }],
+                    Vec::new(),
+                )
             }
         }
     }

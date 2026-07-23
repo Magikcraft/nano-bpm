@@ -176,17 +176,39 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
   `JobKind`/`JobListenerEventType` in the read model and on the activated job.
   - **`start` listeners fire for every element reached through the common
     `activate()` path** (all of the above), before the element enacts its own
-    behaviour (job creation / routing / scope open).
-  - **`end` listeners fire for elements that complete through the shared
-    `complete()` path — service/script/business-rule tasks, the exclusive
-    gateway, and pass-through events.**
-- **Deferred:** `end` listeners on elements whose completion runs through a
-  *different* site than `complete()` — user tasks (`CompleteUserTask`),
-  sub-process/call-activity/ad-hoc containers, and multi-instance children. Their
-  `start` listeners still fire; their `end` listeners are a documented gap (the
-  parser accepts them, the runtime does not yet drain them). Also deferred: task
-  listeners (§6 — user-task `completing` denial + corrections); listener
-  behaviour under process-instance **migration** and **modification**;
+    behaviour (job creation / routing / scope open). The multi-instance **body**
+    is a special case: it early-returns from `activate()` before the shared start
+    gate, so it carries its **own** start gate — its `start` listeners fire once
+    on the body, before any child is instantiated, and child fan-out is deferred
+    to `advance_listener` (which re-derives it via `spawn_multi_instance_children`
+    once the chain drains). They do not double-fire per child.
+  - **`end` listeners fire for every element that completes**, across both the
+    shared `complete()` path (service/script/business-rule/user tasks,
+    pass-through events) and the previously-deferred structural completion sites,
+    each of which now parks in `COMPLETING` while its end chain runs and finalises
+    through a dedicated `finalize_*` tail dispatched from `advance_listener`:
+    the **exclusive gateway** (routing deferred until the chain drains, then
+    re-selected), the **embedded sub-process** (and, since a **call activity** is
+    spliced into a sub-process before deploy, call activities too), the
+    **multi-instance body** (fires once, after every child completes), and the
+    **ad-hoc sub-process container** (natural, no-further-activations completion).
+    Each `finalize_*` re-derives its structural tail from still-resident state
+    (the parked element stays active, its scope resident until `ElementCompleted`),
+    so a node restart between park and drain is replay-safe.
+- **Documented boundaries (not gaps in coverage, but noted nuances):**
+  - An exclusive gateway's `end` listener runs **before** the routing decision, so
+    a listener that mutates a condition variable is observed by the post-listener
+    re-selection. If re-selection then matches no flow (and there is no default),
+    the gateway raises a no-matching-flow incident and keeps its token, exactly as
+    its non-listener path does — it does not silently complete and drop the token.
+  - The ad-hoc container's `end` listeners fire on the **natural** completion path
+    (the agent returns no further activations and no tools remain). The
+    agent-signalled *cancel-remaining-instances* and *completion-condition-
+    fulfilled* completions cancel any still-running tools and stay inline (the
+    `cancelled` flag cannot be re-derived at drain), so they do not run end
+    listeners — treated as an aborted, not a clean, completion.
+- **Deferred:** task listeners (§6 — user-task `completing` denial + corrections);
+  listener behaviour under process-instance **migration** and **modification**;
   interaction subtleties with non-interrupting boundary events firing mid-chain.
 
 ## Phased plan
