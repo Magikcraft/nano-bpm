@@ -1,12 +1,10 @@
 # ADR 0025 — Urban trigger runtime (the Zapier primitive: sources → inbox → engine)
 
-Status: **Accepted; phases 1–2 (trigger-inbox + core sources) implemented** (durable inbox +
-dispatcher + FEEL action planning + gateway apply + `enqueue`/`inbox` console
-endpoints; the always-on dispatcher auto-starts for a running App that declares
-`triggers[]`; **phase 2** adds the `cron`/`webhook`/`file` core sources behind an
-**extensible source registry** — marketplace packs on the `nano-ide-trigger-*` axis
-declare new source kinds and emit over the universal webhook ingress). Phases 3–4
-(Triggers panel UI, pack-driver auto-launch) remain.
+Status: **Accepted; phases 1–3 implemented** (durable inbox + dispatcher + FEEL action planning +
+gateway apply; phase 2 `cron`/`webhook`/`file` core sources behind an extensible source registry;
+**phase 3** the console Triggers panel — declared-trigger + source-registry view, per-trigger "Run
+now", and the delivery inbox). Phase 4 (auto-launch pack source drivers as supervised processes +
+a first source pack) remains.
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md`, **Urban** — the RAD App bundle; this ADR
 expands its §B "Trigger runtime" from a sketch into the one genuinely-new runtime subsystem the
@@ -191,10 +189,22 @@ out-of-band and emits over the ingress.
 
 ### 7. Console — the Triggers panel
 
-A **Triggers** tab in the App project type (beside Data/Surfaces), editing *this manifest's*
-`triggers`/`connections` blocks and surfacing runtime status: per-trigger enabled/disabled, last
-fire, inbox depth, failed-row count, and a manual "run now" for `cron`/manual sources. Reuses the
-console panel pattern (as the Data panel does, ADR 0024 §4).
+A **Triggers** toolbar toggle in the App project workspace (beside Data), surfacing runtime status
+over the manifest's declared `triggers`. **(Implemented, phase 3.**
+`console/src/components/TriggersPanel.tsx`, wired into `ProjectWorkspace` mutually-exclusive with the
+Data panel and shown only for Urban App projects.) Two sub-surfaces:
+
+- **Triggers** — the declared triggers from `GET …/triggers`, each tagged against the source registry:
+  a `core` badge (builtin), a `pack` badge (recognized pack kind), or an `unrecognized` badge (a typo
+  or not-yet-installed pack). Surfaces the `errors[]` (e.g. a malformed cron spec) and a collapsible
+  view of the whole source registry (core kinds ∪ installed packs). A per-trigger **Run now** enqueues
+  a synthetic event (editable JSON body) through `POST …/triggers/enqueue` — the *same* inbox path a
+  real source uses, so testing a trigger exercises the production dispatch path.
+- **Inbox** — the delivery status from `GET …/triggers/inbox`: pending/done/failed counts and the most
+  recent rows (id, trigger, status badge, attempts, last error, created), with opt-in auto-refresh.
+
+Reuses the console panel pattern (as the Data panel does, ADR 0024 §4). Editing the `triggers` block
+itself stays in the App manifest editor; this panel is the *runtime* view. Node-first per ADR 0038.
 
 ## Phased plan
 
@@ -215,7 +225,12 @@ console panel pattern (as the Data panel does, ADR 0024 §4).
    `triggers_overview` (`GET …/triggers`, tagging builtin/recognized). `extensions.rs`:
    `ExtManifest.triggerSources[]` + `all_trigger_sources()` — the marketplace seam. `onMissed`/`config`
    added to the spec-app `trigger` schema. Node-first per ADR 0038.**)
-3. **triggers-panel** — the §7 console tab (edit + status), consuming `GET …/triggers` + the inbox.
+3. **triggers-panel** — the §7 console panel, consuming `GET …/triggers` + the inbox.
+   **(Implemented.** `console/src/components/TriggersPanel.tsx`: Triggers sub-tab (declared triggers
+   tagged core/pack/unrecognized against the registry, config-error banner, collapsible source
+   registry, per-trigger "Run now" enqueuing a synthetic event over `POST …/triggers/enqueue`) + Inbox
+   sub-tab (pending/done/failed counts + recent rows with auto-refresh). Wired into `ProjectWorkspace`
+   as a toolbar toggle for Urban App projects, mutually exclusive with the Data panel.**)
 4. **trigger-pack-axis** — auto-launching the §6 `nano-ide-trigger-*` pack drivers as supervised
    Node/Deno processes + a first pack (`imap` or `mqtt`), proving the axis end-to-end.
 

@@ -9,6 +9,7 @@ import FormPreview from "../components/FormPreview";
 import AppManifestEditor, { isAppManifestPath } from "../components/AppManifestEditor";
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 const DataPanel = lazy(() => import("../components/DataPanel"));
+const TriggersPanel = lazy(() => import("../components/TriggersPanel"));
 import {
   compileProject,
   createProjectPath,
@@ -72,6 +73,7 @@ export default function ProjectWorkspace() {
   const [showConfig, setShowConfig] = useState(false);
   const [showCompile, setShowCompile] = useState(false);
   const [showData, setShowData] = useState(false);
+  const [showTriggers, setShowTriggers] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const [consoleHeight, setConsoleHeight] = useState(() => {
     const saved = Number(localStorage.getItem("nano.consoleHeight"));
@@ -322,8 +324,25 @@ export default function ProjectWorkspace() {
           Compile
         </ToolbarButton>
         {isUrbanApp && (
-          <ToolbarButton onClick={() => setShowData((v) => !v)} kind={showData ? "primary" : undefined}>
+          <ToolbarButton
+            onClick={() => {
+              setShowData((v) => !v);
+              setShowTriggers(false);
+            }}
+            kind={showData ? "primary" : undefined}
+          >
             Data
+          </ToolbarButton>
+        )}
+        {isUrbanApp && (
+          <ToolbarButton
+            onClick={() => {
+              setShowTriggers((v) => !v);
+              setShowData(false);
+            }}
+            kind={showTriggers ? "primary" : undefined}
+          >
+            Triggers
           </ToolbarButton>
         )}
         <ToolbarButton onClick={() => setShowConfig(true)}>Configure</ToolbarButton>
@@ -378,13 +397,21 @@ export default function ProjectWorkspace() {
           onChanged={reloadFiles}
         />
 
-        {/* Editor + console — or the DB Manager (Data) panel when toggled */}
+        {/* Editor + console — or the DB Manager (Data) / Triggers panel when toggled */}
         {showData ? (
           <div className="flex min-w-0 flex-1 flex-col">
             <Suspense
               fallback={<div className="p-8 text-sm text-fg-faint">Loading Data panel…</div>}
             >
               <DataPanel name={name} />
+            </Suspense>
+          </div>
+        ) : showTriggers ? (
+          <div className="flex min-w-0 flex-1 flex-col">
+            <Suspense
+              fallback={<div className="p-8 text-sm text-fg-faint">Loading Triggers panel…</div>}
+            >
+              <TriggersPanel name={name} />
             </Suspense>
           </div>
         ) : (
