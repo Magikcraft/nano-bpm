@@ -332,9 +332,38 @@ export default function ProjectWorkspace() {
 
       {!runnable && (
         <div className="border-b border-warn/30 bg-warn/10 px-4 py-1.5 text-xs text-warn">
-          {lang === "deno"
-            ? "No Deno or Node runtime detected — Run and Compile for this project need Deno (deno.com) or Node ≥ 22.6. Authoring and Export still work."
-            : `No ${lang} toolchain detected — install it (and approve the extension) to enable Run and Compile. Authoring and Export still work.`}
+          {(() => {
+            const mt = detail.missingToolchain;
+            const probes = mt?.probes ?? [];
+            const looked =
+              probes.length > 0
+                ? ` Looked for ${probes
+                    .map((p) => `\u201C${p}\u201D`)
+                    .join(" or ")} on your PATH.`
+                : "";
+            const who = mt?.displayName ?? (lang === "deno" ? "Deno or Node" : lang);
+            return (
+              <>
+                No {who} toolchain detected — Run and Compile for this project need it.
+                {looked}
+                {mt?.installHint ? ` ${mt.installHint}` : ""} Authoring and Export
+                still work.
+                {mt?.installUrl && (
+                  <>
+                    {" "}
+                    <a
+                      href={mt.installUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="font-medium underline"
+                    >
+                      Install →
+                    </a>
+                  </>
+                )}
+              </>
+            );
+          })()}
         </div>
       )}
 

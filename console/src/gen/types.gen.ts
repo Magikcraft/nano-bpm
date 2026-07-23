@@ -479,7 +479,33 @@ export type ProjectDetail = {
     runState: RunState;
     denoAvailable: boolean;
     runnable: boolean;
+    /**
+     * Present only when `runnable` is false. Names exactly what the server probed for (and could not find) so the Console can tell the user which tool to install, instead of a generic "toolchain missing".
+     */
+    missingToolchain?: MissingToolchain | null;
     platforms: Array<string>;
+};
+
+/**
+ * What the run/compile toolchain probe looked for and did not find. Used by the project workspace banner to give an actionable install hint.
+ */
+export type MissingToolchain = {
+    /**
+     * Human name of the missing toolchain (e.g. "Rust", "Deno / Node").
+     */
+    displayName?: string | null;
+    /**
+     * Executable names searched for on PATH; finding ANY one satisfies the probe (e.g. ["cargo"] for a Rust pack, ["deno", "node"] for Deno).
+     */
+    probes: Array<string>;
+    /**
+     * One-line, actionable install hint for the missing toolchain.
+     */
+    installHint?: string | null;
+    /**
+     * Official install page for the missing toolchain.
+     */
+    installUrl?: string | null;
 };
 
 export type ProjectsResponse = {
