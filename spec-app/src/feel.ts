@@ -6,6 +6,7 @@
 // way and can never disagree.
 
 import { DOMAIN_PRIMITIVES } from "./symbol-index.ts";
+import { scanDataQueryCalls } from "./data-query.ts";
 
 const PRIMITIVES = new Set<string>(DOMAIN_PRIMITIVES);
 
@@ -285,29 +286,12 @@ export interface DataQueryCall {
   index: number;
 }
 
-// `data.query(` with tolerant whitespace around the dot and before the paren.
-const DATA_QUERY_CALL = /\bdata\s*\.\s*query\s*\(/g;
-// A FEEL double-quoted string literal (with escapes) at the current position.
-const STRING_LITERAL = /^\s*"((?:[^"\\]|\\.)*)"\s*([,)])/;
-
 /**
- * Extract the `data.query(...)` call sites in a FEEL expression. Conservative on
- * purpose: it reports the alias only for the two-argument form whose first
- * argument is a plain string literal; the single-argument (default-source) form
- * and any dynamic first argument yield `source: null` so validation never flags
- * a call it cannot verify.
+ * Extract the `data.query(...)` call sites in a FEEL expression, reporting the
+ * datasource alias of each (see {@link DataQueryCall}). Used by the validator to
+ * cross-check the alias against `data.sources`. Delegates to the shared scanner
+ * in `data-query.ts` so parsing and pre-resolution can never disagree.
  */
 export function dataQueryCalls(feel: string): DataQueryCall[] {
-  const out: DataQueryCall[] = [];
-  DATA_QUERY_CALL.lastIndex = 0;
-  let m: RegExpExecArray | null;
-  while ((m = DATA_QUERY_CALL.exec(feel)) !== null) {
-    const rest = feel.slice(m.index + m[0].length);
-    const lit = STRING_LITERAL.exec(rest);
-    // Two-argument form (`"alias" ,`) names the source; single-argument
-    // (`"sql" )`) uses the default; anything else is dynamic/unverifiable.
-    const source = lit && lit[2] === "," ? lit[1] : null;
-    out.push({ source, index: m.index });
-  }
-  return out;
+  return scanDataQueryCalls(feel).map((c) => ({ source: c.source, index: c.span[0] }));
 }

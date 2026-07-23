@@ -967,6 +967,12 @@ function EditorPane({
     return Object.keys(sources as Record<string, unknown>);
   }, [manifest]);
   const formGetDataSources = useCallback(() => dataSourceNames, [dataSourceNames]);
+  // The manifest's default datasource (`data.default`), used to resolve a
+  // `data.query(sql)` call's default-source form in the form preview (ADR 0024 §5).
+  const defaultDataSource = useMemo<string | undefined>(() => {
+    const d = (manifest as { data?: { default?: unknown } } | undefined)?.data?.default;
+    return typeof d === "string" ? d : undefined;
+  }, [manifest]);
 
   useEffect(() => {
     let alive = true;
@@ -1424,7 +1430,7 @@ function EditorPane({
             )}
             {formView === "preview" && (
               <div className="absolute inset-0 bg-app">
-                <FormPreview schema={formJson} name={name} />
+                <FormPreview schema={formJson} name={name} defaultSource={defaultDataSource} />
               </div>
             )}
           </div>

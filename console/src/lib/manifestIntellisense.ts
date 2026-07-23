@@ -38,6 +38,7 @@ const KIND_ICON: Record<CandidateKind, monaco.languages.CompletionItemKind> = {
   form: monaco.languages.CompletionItemKind.File,
   datasource: monaco.languages.CompletionItemKind.Module,
   agent: monaco.languages.CompletionItemKind.Value,
+  function: monaco.languages.CompletionItemKind.Function,
   variable: monaco.languages.CompletionItemKind.Field,
 };
 

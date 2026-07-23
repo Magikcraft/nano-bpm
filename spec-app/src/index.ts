@@ -9,4 +9,5 @@ export * from "./feel.ts";
 export * from "./manifest-completion.ts";
 export * from "./validate.ts";
 export * from "./form-data-binding.ts";
+export * from "./data-query.ts";
 export type { AppManifest } from "../gen/nano-app.d.ts";

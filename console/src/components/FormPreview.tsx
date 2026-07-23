@@ -4,7 +4,9 @@ import "@bpmn-io/form-js/dist/assets/form-js.css";
 import {
   applyDataSourceOptions,
   collectFormDataBindings,
+  preResolveFormSchema,
   rowsToOptions,
+  type DataQueryResolver,
   type FormOption,
 } from "@nanobpm/nano-app-schema";
 
@@ -73,7 +75,16 @@ async function resolveBindings(
   return { resolved, errors };
 }
 
-export default function FormPreview({ schema, name }: { schema: string; name: string }) {
+export default function FormPreview({
+  schema,
+  name,
+  defaultSource,
+}: {
+  schema: string;
+  name: string;
+  /** The App manifest's `data.default` alias — the source for a `data.query(sql)` call. */
+  defaultSource?: string;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
   const formRef = useRef<Form | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -98,8 +109,32 @@ export default function FormPreview({ schema, name }: { schema: string; name: st
     (async () => {
       const { resolved, errors } = await resolveBindings(parsed, name);
       if (disposed) return;
-      setBindingErrors(errors);
-      const finalSchema = applyDataSourceOptions(parsed, resolved);
+      const withOptions = applyDataSourceOptions(parsed, resolved);
+
+      // Pre-resolve `data.query(...)` FEEL calls (ADR 0024 §5): FEEL evaluates
+      // synchronously, so each static call is run read-only through the gateway
+      // now and its rows seeded as form data under a `__dq*` binding, which the
+      // rewritten expression references. A `data.query(sql)` (default form)
+      // resolves against the manifest's `data.default`.
+      const runDataQuery: DataQueryResolver = async (source, sql) => {
+        const src = source ?? defaultSource;
+        if (!src) {
+          throw new Error("data.query() names no source and the app declares no data.default");
+        }
+        const r = await queryData({
+          path: { name, source: src },
+          body: { sql },
+          throwOnError: true,
+        });
+        return r.data.rows ?? [];
+      };
+      const pre = await preResolveFormSchema(withOptions, runDataQuery);
+      if (disposed) return;
+      setBindingErrors([
+        ...errors,
+        ...pre.errors.map((e) => ({ field: e.path, message: e.message })),
+      ]);
+      const finalSchema = pre.schema;
 
       const container = containerRef.current;
       if (!container) return;
@@ -109,7 +144,7 @@ export default function FormPreview({ schema, name }: { schema: string; name: st
       const form = new Form({ container });
       formRef.current = form;
       try {
-        await form.importSchema(finalSchema as never, {});
+        await form.importSchema(finalSchema as never, pre.data as never);
       } catch (e) {
         if (!disposed) setError(`Could not render form: ${errMsg(e)}`);
       } finally {
@@ -122,7 +157,7 @@ export default function FormPreview({ schema, name }: { schema: string; name: st
       formRef.current?.destroy();
       formRef.current = null;
     };
-  }, [schema, name]);
+  }, [schema, name, defaultSource]);
 
   return (
     <div className="flex h-full flex-col bg-white">

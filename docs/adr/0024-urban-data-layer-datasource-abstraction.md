@@ -1,6 +1,6 @@
 # ADR 0024 — Urban data layer & datasource abstraction (the BDE alias, for Nano Apps)
 
-Status: **Accepted** (phases 1–2 *datasource-core* + *db-manager-panel* implemented; phase 3 *datasource-bindings* partially implemented — the §5 form field binding + the FEEL `data.query` builtin's spec-first contract (signature/autocomplete + `unknown-datasource` alias validation, App-tier decision recorded in §5); the `data.query` runtime pre-resolution and chat `query-data` tool remain Proposed, as does phase 4).
+Status: **Accepted** (phases 1–2 *datasource-core* + *db-manager-panel* implemented; phase 3 *datasource-bindings* partially implemented — the §5 form field binding + the FEEL `data.query` builtin (spec-first contract: signature/autocomplete + `unknown-datasource` alias validation; App-tier decision in §5; **runtime pre-resolution** implemented for the form preview); the trigger-runtime `data.query` and chat `query-data` tool remain Proposed, as does phase 4).
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md`, **Urban** — the RAD App bundle; this ADR
 expands its §D "Data layer" from a single SQLite file into a named-datasource seam),
@@ -166,7 +166,13 @@ This is what makes it *Urban* rather than a SQLite GUI bolted on:
 > expression synchronously (the same shape as the §5 form option binding). *Shipped first:* the
 > spec-first contract — the builtin signature (editor autocomplete/signature), a pure call extractor
 > (`dataQueryCalls`), and `unknown-datasource` validation of `data.query("alias", …)` against
-> `data.sources` in trigger-action FEEL. The runtime pre-resolution wiring follows.
+> `data.sources` in trigger-action FEEL. *Shipped next:* the **runtime pre-resolution** for the form
+> preview — `preResolveFormSchema` scans a form-js schema's `=`-prefixed FEEL for `data.query(...)`
+> calls, runs each distinct statically-resolvable call once through the gateway, binds the rows to a
+> fresh `__dq*` variable seeded as the form's initial data, and rewrites the call to reference it, so
+> form-js's synchronous `@bpmn-io/feelin` evaluation resolves the binding from context (a failing
+> query binds `[]` + surfaces an error; a dynamic-argument call is left for a follow-up). The
+> trigger-runtime pre-resolution reuses the same `preResolveDataQuery`.
 
 The datasource is also the **resting bank** of the motion↔rest bridge ADR 0030 §4 names. A domain
 type (ADR 0029) declared once is the *same* object in flight (process variables) and at rest (a row
@@ -207,10 +213,11 @@ tenant **row-level scoping** (Postgres RLS vs. app-level filters) is a shared op
    **"Data source (Urban)"** properties-panel inspector (pick an alias, write the query, name the
    value/label columns — no JSON hand-editing); the console Form **Preview** resolves it live through
    the phase-2 gateway into a data-aware control, and `validate.ts` cross-checks the `source` against
-   declared `data.sources`) + FEEL `data.query` builtin (*contract implemented* — App-tier read-only
-   builtin per §5; `data.query` autocomplete/signature in the FEEL editor and `unknown-datasource`
-   alias validation of `data.query("alias", …)` in trigger-action FEEL, with the pure `dataQueryCalls`
-   extractor; the runtime pre-resolution is *Proposed*) + the chat `query-data` tool
+   declared `data.sources`) + FEEL `data.query` builtin (*implemented* — App-tier read-only
+   builtin per §5; `data.query` autocomplete/signature in the FEEL editor, `unknown-datasource`
+   alias validation of `data.query("alias", …)` in trigger-action FEEL, and **runtime pre-resolution**
+   in the form preview (`preResolveFormSchema` → `__dq*` bindings seeded as form data; dynamic-argument
+   calls and the trigger runtime are the follow-up) + the chat `query-data` tool
    (read-only default, *Proposed*).
 4. **datasource-postgres-pack** — the first `nano-ide-data-*` pack (Postgres), proving the axis and
    the SQLite→Postgres alias flip end-to-end.
