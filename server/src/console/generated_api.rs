@@ -1166,3 +1166,47 @@ impl apis::data::Data for ServerImpl {
         )
     }
 }
+
+#[async_trait]
+impl apis::triggers::Triggers for ServerImpl {
+    async fn enqueue_trigger_event(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::EnqueueTriggerEventPathParams,
+        body: &models::TriggerEnqueueRequest,
+    ) -> Result<apis::triggers::EnqueueTriggerEventResponse, ()> {
+        use apis::triggers::EnqueueTriggerEventResponse as R;
+        let event_body = serde_json::Value::Object(
+            body.body
+                .iter()
+                .map(|(k, v)| (k.clone(), v.0.clone()))
+                .collect(),
+        );
+        let idem = flatten_nullable(&body.idempotency_key);
+        data_ok_or!(
+            super::project_trigger_enqueue(&path_params.name, &body.trigger_id, idem, event_body)
+                .await,
+            R::Status200_EnqueueOutcome,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
+    async fn get_trigger_inbox(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::GetTriggerInboxPathParams,
+    ) -> Result<apis::triggers::GetTriggerInboxResponse, ()> {
+        use apis::triggers::GetTriggerInboxResponse as R;
+        data_ok_or!(
+            super::project_trigger_inbox(&path_params.name).await,
+            R::Status200_InboxStatus,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+}
