@@ -1,6 +1,9 @@
 # ADR 0025 — Urban trigger runtime (the Zapier primitive: sources → inbox → engine)
 
-Status: **Proposed.**
+Status: **Accepted; phase 1 (trigger-inbox) implemented** (durable inbox +
+dispatcher + FEEL action planning + gateway apply + `enqueue`/`inbox` console
+endpoints; the always-on dispatcher auto-starts for a running App that declares
+`triggers[]`). Phases 2–4 (core sources, Triggers panel UI, pack axis) remain.
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md`, **Urban** — the RAD App bundle; this ADR
 expands its §B "Trigger runtime" from a sketch into the one genuinely-new runtime subsystem the
@@ -174,7 +177,12 @@ console panel pattern (as the Data panel does, ADR 0024 §4).
 
 1. **trigger-inbox** — the §2 inbox schema (on an ADR 0024 datasource) + the §4 dispatcher (persist
    → dispatch → settle, at-least-once, retry/backoff). Prove it with a **manual/synthetic** source
-   so the durability path lands before any real source.
+   so the durability path lands before any real source. **(Implemented.** `server/src/console/triggers.rs`:
+   inbox primitives + `drain_over_gateway` + a supervised drain loop auto-started from the project run
+   path; FEEL action planning via `engine-core` `feel::eval`; actions applied over the local gateway
+   (`POST /v2/process-instances`, `POST /v2/messages/publication`). The synthetic source is the
+   `POST /console/api/projects/{name}/triggers/enqueue` endpoint; `GET …/triggers/inbox` reports
+   status. Node-first per ADR 0038.**)
 2. **core-sources** — `cron` (in-process scheduler, deterministic keys, §3), `webhook` (on the
    `Deno.serve` backend, ack-after-persist, `auth`), `file` (watch + mtime keys).
 3. **triggers-panel** — the §7 console tab (edit + status).

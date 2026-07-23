@@ -35,7 +35,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Notify, broadcast};
 
-use super::{worker_export, workers, workspace};
+use super::{triggers, worker_export, workers, workspace};
 
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 const DATA_SDK_TS: &str = include_str!("data_sdk.ts");
@@ -2459,6 +2459,15 @@ impl ProjectSupervisor {
             return Err("no such project".into());
         }
         let cfg = read_config(name).ok_or("no such project")?;
+        // Start this project's trigger dispatcher (ADR 0025) if it declares
+        // triggers[]. Idempotent and no-op for projects without triggers, so it
+        // covers both the toolchain and built-in run paths below without paying
+        // a drain loop for ordinary Apps. The dispatcher applies actions over
+        // the same local gateway workers use (base_url), so embedded and remote
+        // are identical (ADR 0005).
+        triggers::dispatcher()
+            .ensure_started(name, Self::base_url(&cfg))
+            .await;
         // Toolchain dispatch (ADR 0007/0008/…): the project owns its Run/Compile
         // invocation via `cfg.toolchain` — snapshotted from the scaffolding pack
         // so pack updates or uninstalls don't break existing projects. A
@@ -2766,6 +2775,9 @@ impl ProjectSupervisor {
 
     /// Stops a running project. No-op if not running.
     pub async fn stop(&self, name: &str) -> Result<(), String> {
+        // Tear down the trigger dispatcher first (idempotent, no-op if never
+        // started) so a stopped App stops acting on its triggers.
+        triggers::dispatcher().stop(name).await;
         let inner = self.entry(name).await;
         if matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
             return Ok(());

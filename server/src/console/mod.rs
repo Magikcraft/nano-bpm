@@ -42,6 +42,7 @@ pub mod projects;
 pub mod server_update;
 pub(crate) mod standalone;
 pub mod trace;
+pub mod triggers;
 pub mod worker_export;
 pub mod workers;
 pub mod workspace;
@@ -2855,6 +2856,45 @@ pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult 
         serde_json::json!({ "op": "migrate", "source": source }),
     )
     .await
+}
+
+// --- triggers (ADR 0025) --------------------------------------------------
+
+fn trigger_error(e: triggers::TriggerError) -> (StatusCode, String) {
+    use triggers::TriggerError::*;
+    match e {
+        // A datasource failure carries its own HTTP mapping (no source, missing
+        // manifest, bad SQL → 400/404/503).
+        Data(d) => data_error(d),
+        // An unknown trigger / bad manifest is the maker's input.
+        Manifest(m) => (StatusCode::BAD_REQUEST, m),
+        Feel(m) => (StatusCode::BAD_REQUEST, m),
+        Apply(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+    }
+}
+
+/// `POST /console/api/projects/{name}/triggers/enqueue` — the manual/synthetic
+/// source (ADR 0025 phase 1): persist an event into the durable inbox, returning
+/// `{ enqueued, id? }`. A repeated idempotency key is a no-op (`enqueued=false`).
+pub(super) async fn project_trigger_enqueue(
+    name: &str,
+    trigger_id: &str,
+    idempotency_key: Option<String>,
+    body: serde_json::Value,
+) -> ApiResult {
+    triggers::enqueue(name, trigger_id, idempotency_key.as_deref(), &body)
+        .await
+        .map(|o| serde_json::to_value(o).unwrap_or_default())
+        .map_err(trigger_error)
+}
+
+/// `GET /console/api/projects/{name}/triggers/inbox` — inbox counts by state
+/// plus the most recently updated rows.
+pub(super) async fn project_trigger_inbox(name: &str) -> ApiResult {
+    triggers::inbox_status(name)
+        .await
+        .map(|s| serde_json::to_value(s).unwrap_or_default())
+        .map_err(trigger_error)
 }
 
 /// `DELETE /console/api/projects/{name}/file?path=...` — remove a file or folder.
