@@ -2678,7 +2678,11 @@ pub(super) fn project_path_create(name: &str, rel: &str, dir: bool) -> ApiResult
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(&path, "")
+        // Seed a valid minimal document for known resource kinds so the file is
+        // deployable/openable immediately; unknown kinds (source files) stay
+        // empty as before.
+        let content = projects::starter_file_content(rel).unwrap_or_default();
+        std::fs::write(&path, content)
     };
     match res {
         Ok(()) => Ok(serde_json::Value::Null),

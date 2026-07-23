@@ -634,6 +634,121 @@ A Nano BPM application created with the RAD environment.\n\n\
     )
 }
 
+/// A valid minimal document for a newly-created resource file, keyed by
+/// extension, so a file created from the console's "New file" dialog is
+/// deployable/openable immediately — even if never opened in an editor (the
+/// editors also seed a blank on an empty file, but that only reaches disk after
+/// a Save). Returns `None` for extensions with no meaningful skeleton (source
+/// files, etc.), which are created empty as before. The BPMN process / DMN
+/// decision / form id is derived from the file stem so ids are stable and
+/// human-readable.
+pub(super) fn starter_file_content(rel: &str) -> Option<String> {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    let (stem, ext) = match base.rsplit_once('.') {
+        Some((s, e)) => (s, e.to_ascii_lowercase()),
+        None => return None,
+    };
+    let id = sanitize_id(stem);
+    match ext.as_str() {
+        "bpmn" => Some(blank_bpmn(&id)),
+        "dmn" => Some(blank_dmn(&id)),
+        "form" => Some(blank_form(&id)),
+        _ => None,
+    }
+}
+
+/// Sanitizes a file stem into a valid XML/BPMN NCName (letters, digits, `_`,
+/// `-`), never starting with a digit. Falls back to a generic id when empty.
+fn sanitize_id(stem: &str) -> String {
+    let mut out: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push_str("resource");
+    }
+    if out
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// A blank-but-valid BPMN document: an executable process with a single start
+/// event and its diagram interchange, mirroring bpmn-js's "new diagram".
+fn blank_bpmn(id: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs-{id}" targetNamespace="http://nanobpm">
+  <bpmn:process id="{id}" isExecutable="true">
+    <bpmn:startEvent id="start" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="BPMNDiagram_{id}">
+    <bpmndi:BPMNPlane id="BPMNPlane_{id}" bpmnElement="{id}">
+      <bpmndi:BPMNShape id="start_di" bpmnElement="start">
+        <dc:Bounds x="180" y="100" width="36" height="36" />
+      </bpmndi:BPMNShape>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
+"#
+    )
+}
+
+/// A blank-but-valid DMN document: one decision with an empty single-column
+/// decision table plus its diagram interchange (matches the console
+/// `DmnModeler` `EMPTY_DMN` so a fresh file opens directly).
+fn blank_dmn(id: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" xmlns:dmndi="https://www.omg.org/spec/DMN/20191111/DMNDI/" xmlns:dc="http://www.omg.org/spec/DMN/20180521/DC/" id="defs-{id}" name="{id}" namespace="http://nanobpmn/dmn">
+  <decision id="{id}" name="{id}">
+    <decisionTable id="DecisionTable_{id}">
+      <input id="Input_1">
+        <inputExpression id="InputExpression_1" typeRef="string">
+          <text></text>
+        </inputExpression>
+      </input>
+      <output id="Output_1" typeRef="string" />
+    </decisionTable>
+  </decision>
+  <dmndi:DMNDI>
+    <dmndi:DMNDiagram id="DMNDiagram_{id}">
+      <dmndi:DMNShape id="DMNShape_{id}" dmnElementRef="{id}">
+        <dc:Bounds x="160" y="100" width="180" height="80" />
+      </dmndi:DMNShape>
+    </dmndi:DMNDiagram>
+  </dmndi:DMNDI>
+</definitions>
+"#
+    )
+}
+
+/// A blank-but-valid form-js schema (an empty default form). `schemaVersion` 18
+/// matches the form-js 1.x line the console bundles; a lower version always
+/// imports on a newer library.
+fn blank_form(id: &str) -> String {
+    format!(
+        r#"{{
+  "type": "default",
+  "id": "{id}",
+  "components": [],
+  "schemaVersion": 18
+}}
+"#
+    )
+}
+
 /// A starter BPMN process so a fresh project has something to deploy.
 fn starter_process(name: &str) -> String {
     let pid = format!("{name}-process");
@@ -3627,5 +3742,39 @@ mod tests {
         create_project("other", "", "starter").unwrap();
         assert!(rename_project("newname", "other").is_err());
         assert!(rename_project("ghost", "fresh").is_err());
+    }
+
+    #[test]
+    fn starter_file_content_seeds_valid_resource_skeletons() {
+        // A new BPMN is a valid, executable, deployable process (the engine
+        // parses it) with the file stem as the process id.
+        let bpmn =
+            starter_file_content("resources/processes/order-intake.bpmn").expect("bpmn skeleton");
+        let defs = nanobpmn_engine_core::bpmn::parse_bpmn(&bpmn).expect("bpmn parses");
+        assert_eq!(defs[0].id, "order-intake", "process id from the file stem");
+
+        // A new DMN mirrors the console's EMPTY_DMN (one empty decision table).
+        let dmn = starter_file_content("resources/decisions/triage.dmn").expect("dmn skeleton");
+        assert!(dmn.contains(r#"<decision id="triage""#));
+        assert!(dmn.contains("<decisionTable"));
+
+        // A new form is a valid empty default form schema.
+        let form = starter_file_content("resources/forms/intake.form").expect("form skeleton");
+        let parsed: serde_json::Value = serde_json::from_str(&form).expect("form is valid JSON");
+        assert_eq!(parsed["type"], "default");
+        assert_eq!(parsed["id"], "intake");
+        assert_eq!(parsed["components"], serde_json::json!([]));
+
+        // Source files (and unknown extensions / no extension) get no skeleton.
+        assert!(starter_file_content("lib/worker.ts").is_none());
+        assert!(starter_file_content("README").is_none());
+    }
+
+    #[test]
+    fn sanitize_id_produces_valid_ncnames() {
+        assert_eq!(sanitize_id("order intake"), "order_intake");
+        assert_eq!(sanitize_id("2024-report"), "_2024-report");
+        assert_eq!(sanitize_id(""), "resource");
+        assert_eq!(sanitize_id("my.thing"), "my_thing");
     }
 }
