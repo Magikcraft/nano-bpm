@@ -301,11 +301,10 @@ export interface DataQueryCall {
 	index: number;
 }
 /**
- * Extract the `data.query(...)` call sites in a FEEL expression. Conservative on
- * purpose: it reports the alias only for the two-argument form whose first
- * argument is a plain string literal; the single-argument (default-source) form
- * and any dynamic first argument yield `source: null` so validation never flags
- * a call it cannot verify.
+ * Extract the `data.query(...)` call sites in a FEEL expression, reporting the
+ * datasource alias of each (see {@link DataQueryCall}). Used by the validator to
+ * cross-check the alias against `data.sources`. Delegates to the shared scanner
+ * in `data-query.ts` so parsing and pre-resolution can never disagree.
  */
 export declare function dataQueryCalls(feel: string): DataQueryCall[];
 /** The kinds of reference a manifest string value can be. */
@@ -353,6 +352,88 @@ export interface ValidationResult {
  * diagnostics whenever anything fails.
  */
 export declare function validateManifest(manifest: unknown, index?: SymbolIndex): ValidationResult;
+/** The prefix for a generated binding variable a `data.query(...)` call becomes. */
+export declare const DATA_QUERY_BINDING_PREFIX = "__dq";
+/** A `data.query(...)` call site located in a FEEL expression. */
+export interface DataQueryCallSpan {
+	/** `[start, end)` offsets of the whole `data.query(...)` call in the source. */
+	span: [
+		number,
+		number
+	];
+	/**
+	 * The datasource alias — the first argument's string literal in the
+	 * two-argument form `data.query("alias", "SELECT …")`. `null` for the
+	 * single-argument (default-source) form or a dynamic first argument.
+	 */
+	source: string | null;
+	/**
+	 * The SQL — the last argument's string literal, when it is statically
+	 * resolvable. `null` when the SQL argument is dynamic (a non-literal FEEL
+	 * expression) and so cannot be pre-resolved.
+	 */
+	sql: string | null;
+	/** Whether the call can be pre-resolved up-front (`sql` is a literal). */
+	static: boolean;
+}
+/**
+ * Locate the `data.query(...)` call sites in a FEEL expression, with their full
+ * span and statically-resolvable arguments. Conservative: an argument that is
+ * not a plain string literal yields `null` for that slot (never a guess).
+ */
+export declare function scanDataQueryCalls(feel: string): DataQueryCallSpan[];
+/** A row set, as returned by the datasource gateway (ADR 0024 phase 2). */
+export type DataQueryRows = ReadonlyArray<Record<string, unknown>>;
+/**
+ * Runs one `data.query(...)` read against the datasource gateway. `source` is
+ * the named alias, or `null` for the default-source form (the caller maps it to
+ * `data.default`). Read-only by contract (ADR 0024 §5).
+ */
+export type DataQueryResolver = (source: string | null, sql: string) => Promise<DataQueryRows>;
+/** A pre-resolved expression: the rewritten FEEL plus the bound row sets. */
+export interface PreResolvedExpr {
+	/** The expression with each resolved `data.query(...)` call replaced by its binding. */
+	expr: string;
+	/** The binding variables (`__dq0`, …) → resolved rows to add to the FEEL context. */
+	context: Record<string, DataQueryRows>;
+}
+/**
+ * Pre-resolve the statically-resolvable `data.query(...)` calls in one FEEL
+ * expression: run each distinct `(source, sql)` once through `resolve`, bind the
+ * rows to a fresh `__dq<n>` variable, and rewrite the calls to reference it. The
+ * returned `expr` evaluates synchronously once `context` is merged into the FEEL
+ * data. `nextIndex` seeds the binding counter so a caller can keep names unique
+ * across many expressions (see `preResolveFormSchema`).
+ */
+export declare function preResolveDataQuery(feel: string, resolve: DataQueryResolver, nextIndex?: number): Promise<PreResolvedExpr & {
+	nextIndex: number;
+}>;
+/** A per-expression pre-resolution failure, located by a schema JSON path. */
+export interface DataQueryError {
+	/** Dotted/indexed path to the offending schema property (e.g. `components.0.conditional.hide`). */
+	path: string;
+	message: string;
+}
+/** The result of pre-resolving a whole form schema's `data.query(...)` calls. */
+export interface PreResolvedForm {
+	/** A deep copy of the schema with resolved calls rewritten to their bindings. */
+	schema: unknown;
+	/** The bound row sets to seed as the form's initial data (the FEEL context). */
+	data: Record<string, DataQueryRows>;
+	/** Per-expression resolution errors; the call is bound to `[]` so the form still renders. */
+	errors: DataQueryError[];
+}
+/**
+ * Pre-resolve every `=`-prefixed FEEL expression in a form-js schema that
+ * contains a `data.query(...)` call (ADR 0024 §5). Walks the schema, rewrites
+ * each such expression in place (a deep copy — the input is untouched), and
+ * returns the bound row sets to seed as the form's initial data so form-js's
+ * synchronous evaluation resolves the bindings from context. Distinct queries
+ * across the whole form share one binding and one gateway call. A failing query
+ * is bound to an empty list and reported in `errors`, so an unbound field never
+ * breaks the whole preview.
+ */
+export declare function preResolveFormSchema(schema: unknown, resolve: DataQueryResolver): Promise<PreResolvedForm>;
 type GlobList = string[];
 type GlobList1 = string[];
 type GlobList2 = string[];
