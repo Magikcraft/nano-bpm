@@ -34,6 +34,39 @@ cluster keeps up with the create rate (no growing backlog).
 
 ---
 
+## Feature subset — Ad-hoc sub-process (agentic Tier-1)
+
+Not a throughput run; a **feature-boundary note** (ADR 0023 asks each boundary be
+stated here). The ad-hoc sub-process runtime — Camunda-compatible agentic
+orchestration, where the ad-hoc container is an ordinary job worker and its
+"tools" are inner activities the agent activates per turn — ships as a bounded
+**v1**:
+
+- **Supported (v1):** single-level ad-hoc container (`JOB_WORKER` impl);
+  `activateElements` per agent turn; service/connector-task tools;
+  `cancelRemainingInstances`; `outputCollection`/`outputElement` aggregation;
+  agent re-iteration until completion.
+- **Deferred:** FEEL `completionCondition` and activated-element `ioMapping`
+  (seam 4); the `BPMN_TASK` `activeElementsCollection` declarative variant;
+  nested ad-hoc (agent-of-agents); boundary events on tools; compensation inside
+  ad-hoc; per-tool retries/priority (currently defaulted).
+
+**Observability.** Every tool activation is a first-class **read-model element
+instance** — the engine emits the standard `ElementActivated`/`ElementCompleted`
+lifecycle for each tool, so it appears in the console trace scoped to its
+container, drill-down identical to any other BPMN element. The agentic loop is
+metered on the Prometheus `/metrics` surface via
+`nanobpm_adhoc_events_total{kind=…}`:
+
+| `kind` | increments when |
+| --- | --- |
+| `tool_activation` | the agent activates a tool child (one per activate-element instruction) |
+| `agent_iteration` | the agent job is re-emitted for the next turn (active tools drained) |
+| `completion` | a container finishes normally (agent signalled done / no tools requested) |
+| `cancellation` | a container finishes via `cancelRemainingInstances` |
+
+---
+
 ## 2026-07-12 — Byte-bounded Raft-log hot-window cache (50KB-payload RAM) — clean A/B validated
 
 **Problem:** the compaction governor (below) bounds the log by *bytes*, but the

@@ -651,10 +651,15 @@ pub enum Event {
     /// remained and none were requested, or a cancel was requested). Its runtime
     /// state is dropped; the aggregated `output_collection` (when named) is
     /// written by a surrounding [`Event::VariablesUpdated`] and its outgoing flow
-    /// taken by the surrounding element-completion events.
+    /// taken by the surrounding element-completion events. `cancelled` records
+    /// whether completion was a `cancel_remaining_instances` request (which tears
+    /// down any still-active tools) versus a normal agent-signalled finish, so the
+    /// distinction is durable on the journal for the trace read model and metrics.
     AdHocCompleted {
         instance_key: Key,
         container_key: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        cancelled: bool,
     },
     /// The **instance** partition tore down a cross-partition parked
     /// subscription (state [`crate::state::MessageSubscriptionState::Opening`],

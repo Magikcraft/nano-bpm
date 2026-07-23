@@ -1463,6 +1463,86 @@ mod tests {
     }
 
     #[test]
+    fn adhoc_tool_activations_appear_as_read_model_element_instances() {
+        // ADR 0023 seam 2: an ad-hoc container's tools are real element
+        // instances in the engine event stream (ElementActivated /
+        // ElementCompleted), not opaque job internals. The trace read model must
+        // therefore surface each tool activation as a distinct element instance
+        // scoped to the container — the observability guarantee the agentic loop
+        // (and the AI-agent parity E2E) relies on.
+        let store = TraceStore::new(16);
+        store.ingest(&[&created(1, &[])], 1000);
+        // The ad-hoc container element activates (eik 2) and parks on its agent job.
+        store.ingest(
+            &[&Event::ElementActivated {
+                instance_key: 1,
+                element_instance_key: 2,
+                element_id: "AI_Agent".into(),
+                scope: 1,
+            }],
+            1010,
+        );
+        // The agent returns two tools; each is activated as a child element
+        // scoped to the container (eik 2).
+        store.ingest(
+            &[
+                &Event::ElementActivated {
+                    instance_key: 1,
+                    element_instance_key: 3,
+                    element_id: "search_recipe".into(),
+                    scope: 2,
+                },
+                &Event::ElementActivated {
+                    instance_key: 1,
+                    element_instance_key: 4,
+                    element_id: "book_table".into(),
+                    scope: 2,
+                },
+            ],
+            1020,
+        );
+        // Both tools complete, then the container completes.
+        store.ingest(
+            &[
+                &Event::ElementCompleted {
+                    instance_key: 1,
+                    element_instance_key: 3,
+                    element_id: "search_recipe".into(),
+                },
+                &Event::ElementCompleted {
+                    instance_key: 1,
+                    element_instance_key: 4,
+                    element_id: "book_table".into(),
+                },
+            ],
+            1030,
+        );
+
+        let dto = store.get(1).unwrap();
+        let tool_a = dto
+            .elements
+            .iter()
+            .find(|e| e.element_id == "search_recipe")
+            .expect("tool A is a read-model element instance");
+        let tool_b = dto
+            .elements
+            .iter()
+            .find(|e| e.element_id == "book_table")
+            .expect("tool B is a read-model element instance");
+        assert_eq!(tool_a.element_instance_key, "3");
+        assert_eq!(tool_a.scope, "2", "tool scoped to the ad-hoc container eik");
+        assert!(tool_a.exited_at.is_some(), "tool completion recorded");
+        assert_eq!(tool_b.element_instance_key, "4");
+        assert_eq!(tool_b.scope, "2");
+        assert!(tool_b.exited_at.is_some());
+        // The container itself is also an element instance in the trace.
+        assert!(
+            dto.elements.iter().any(|e| e.element_id == "AI_Agent"),
+            "the ad-hoc container is a read-model element instance"
+        );
+    }
+
+    #[test]
     fn stimulus_log_is_capped_per_instance() {
         let store = TraceStore::with_capture(8, 16 * 1024, 2);
         store.ingest(&[&created(1, &[])], 1000);

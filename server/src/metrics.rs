@@ -108,6 +108,12 @@ struct Metrics {
     creates_total: prometheus::IntCounterVec,
     /// Job completions, split by protocol (rest vs stream).
     job_completions_total: prometheus::IntCounterVec,
+    /// Ad-hoc sub-process (agentic orchestration) lifecycle events, by kind
+    /// (`tool_activation` | `agent_iteration` | `completion` | `cancellation`).
+    /// Lets an operator watch an agent loop's shape: tools activated per turn,
+    /// iterations taken, and whether containers finished normally or were
+    /// cancelled (`cancel_remaining_instances`). See ADR 0023.
+    adhoc_events_total: prometheus::IntCounterVec,
     /// Diagnostic: stream CompleteJob outcomes by decision point, to localize a
     /// load-induced completion freeze (route_forward|route_local|leader_reject|
     /// propose_err|apply_err|forward_ok|forward_err).
@@ -573,6 +579,16 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     )
     .expect("valid counter vec");
 
+    let adhoc_events_total = IntCounterVec::new(
+        Opts::new(
+            "nanobpm_adhoc_events_total",
+            "Ad-hoc sub-process lifecycle events by kind \
+             (tool_activation|agent_iteration|completion|cancellation).",
+        ),
+        &["kind"],
+    )
+    .expect("valid counter vec");
+
     let stream_complete_outcome_total = IntCounterVec::new(
         Opts::new(
             "nanobpm_stream_complete_outcome_total",
@@ -926,6 +942,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .and(registry.register(Box::new(peer_link_seconds.clone())))
         .and(registry.register(Box::new(creates_total.clone())))
         .and(registry.register(Box::new(job_completions_total.clone())))
+        .and(registry.register(Box::new(adhoc_events_total.clone())))
         .and(registry.register(Box::new(stream_complete_outcome_total.clone())))
         .and(registry.register(Box::new(raft_promote_total.clone())))
         .and(registry.register(Box::new(raft_log_bytes.clone())))
@@ -1000,6 +1017,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         peer_link_seconds,
         creates_total,
         job_completions_total,
+        adhoc_events_total,
         stream_complete_outcome_total,
         raft_promote_total,
         raft_log_bytes,
@@ -1560,6 +1578,14 @@ pub fn record_stream_frame_processing(elapsed: Duration) {
 /// Records a process instance create (by protocol: "rest" or "stream").
 pub fn record_create(protocol: &str) {
     METRICS.creates_total.with_label_values(&[protocol]).inc();
+}
+
+/// Records one ad-hoc sub-process lifecycle event. `kind` is one of
+/// `tool_activation`, `agent_iteration`, `completion`, `cancellation`. Called
+/// from the completion sites that have the engine's emitted events in scope
+/// (see `App::record_adhoc_events`).
+pub fn record_adhoc_event(kind: &'static str) {
+    METRICS.adhoc_events_total.with_label_values(&[kind]).inc();
 }
 
 /// Records one peer uplink dial (redial) attempt to `target`, tagged by outcome

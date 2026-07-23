@@ -1914,6 +1914,7 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::AdHocCompleted {
             instance_key,
             container_key,
+            ..
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.adhoc_instances.remove(container_key);

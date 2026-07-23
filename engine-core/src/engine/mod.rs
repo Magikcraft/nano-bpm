@@ -3594,6 +3594,7 @@ impl Engine {
         events.push(Event::AdHocCompleted {
             instance_key,
             container_key,
+            cancelled: cancel,
         });
         let mut followups = Vec::new();
         for flow in self.outgoing(instance_key, &element_id) {
