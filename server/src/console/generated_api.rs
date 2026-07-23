@@ -1209,4 +1209,20 @@ impl apis::triggers::Triggers for ServerImpl {
             R::Status404_NotFound
         )
     }
+
+    async fn get_triggers(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::GetTriggersPathParams,
+    ) -> Result<apis::triggers::GetTriggersResponse, ()> {
+        use apis::triggers::GetTriggersResponse as R;
+        data_ok_or!(
+            super::project_triggers(&path_params.name).await,
+            R::Status200_Triggers,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
 }

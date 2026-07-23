@@ -937,6 +937,30 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ExtensionsOverview' }
 
+  /projects/{name}/triggers:
+    get:
+      operationId: getTriggers
+      tags: [triggers]
+      summary: Configured triggers + resolved source registry (ADR 0025 phase 2)
+      description: >
+        Lists the App manifest's declared triggers, each resolved against the
+        source registry — the union of the compiled-in core kinds
+        (cron/webhook/file/manual) and every installed pack's declared source
+        kinds (`nano-ide-trigger-*`, ADR 0025 §6). `builtin` says whether the
+        kind runs in-process (core) or is driven by a pack/ingress. Also returns
+        the full registry so the console can offer a source picker, and any
+        config errors (e.g. a malformed cron spec). This is the data the phase-3
+        Triggers panel renders.
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Triggers + source registry
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TriggersResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /projects/{name}/triggers/enqueue:
     post:
       operationId: enqueueTriggerEvent
@@ -2134,3 +2158,56 @@ components:
           type: array
           description: The most recently updated inbox rows (newest first).
           items: { $ref: '#/components/schemas/TriggerInboxRow' }
+    TriggersResponse:
+      type: object
+      required: [triggers, sources, errors]
+      description: >
+        The App's configured triggers resolved against the source registry
+        (ADR 0025 phase 2).
+      properties:
+        triggers:
+          type: array
+          description: The manifest's declared triggers, resolved.
+          items: { $ref: '#/components/schemas/TriggerInfo' }
+        sources:
+          type: array
+          description: >
+            The full source registry — core kinds plus every installed pack's
+            declared kinds — for the console source picker.
+          items: { $ref: '#/components/schemas/SourceKindInfo' }
+        errors:
+          type: array
+          description: Per-trigger source config errors (e.g. a malformed cron spec).
+          items: { type: string }
+    TriggerInfo:
+      type: object
+      required: [id, type, builtin]
+      properties:
+        id: { type: string }
+        type:
+          type: string
+          description: The trigger's source kind (its manifest `type`).
+        builtin:
+          type: boolean
+          description: >
+            true if the kind is a compiled-in core source (cron/webhook/file/
+            manual); false if it is a pack/external source driven via the ingress.
+        recognized:
+          type: boolean
+          description: >
+            Whether the kind is in the source registry at all (a false value
+            flags a typo or a not-yet-installed pack).
+        action:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: The trigger's action block, verbatim from the manifest.
+    SourceKindInfo:
+      type: object
+      required: [kind, builtin]
+      properties:
+        kind: { type: string }
+        builtin:
+          type: boolean
+          description: true for a compiled-in core source; false for a pack source.
+        displayName: { type: string, nullable: true }

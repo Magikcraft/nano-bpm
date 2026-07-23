@@ -816,6 +816,59 @@ export type TriggerInboxResponse = {
     recent: Array<TriggerInboxRow>;
 };
 
+/**
+ * The App's configured triggers resolved against the source registry (ADR 0025 phase 2).
+ *
+ */
+export type TriggersResponse = {
+    /**
+     * The manifest's declared triggers, resolved.
+     */
+    triggers: Array<TriggerInfo>;
+    /**
+     * The full source registry — core kinds plus every installed pack's declared kinds — for the console source picker.
+     *
+     */
+    sources: Array<SourceKindInfo>;
+    /**
+     * Per-trigger source config errors (e.g. a malformed cron spec).
+     */
+    errors: Array<string>;
+};
+
+export type TriggerInfo = {
+    id: string;
+    /**
+     * The trigger's source kind (its manifest `type`).
+     */
+    type: string;
+    /**
+     * true if the kind is a compiled-in core source (cron/webhook/file/ manual); false if it is a pack/external source driven via the ingress.
+     *
+     */
+    builtin: boolean;
+    /**
+     * Whether the kind is in the source registry at all (a false value flags a typo or a not-yet-installed pack).
+     *
+     */
+    recognized?: boolean;
+    /**
+     * The trigger's action block, verbatim from the manifest.
+     */
+    action?: {
+        [key: string]: unknown;
+    } | null;
+};
+
+export type SourceKindInfo = {
+    kind: string;
+    /**
+     * true for a compiled-in core source; false for a pack source.
+     */
+    builtin: boolean;
+    displayName?: string | null;
+};
+
 export type NamePath = string;
 
 /**
@@ -2412,6 +2465,37 @@ export type TrustExtensionResponses = {
 };
 
 export type TrustExtensionResponse = TrustExtensionResponses[keyof TrustExtensionResponses];
+
+export type GetTriggersData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/projects/{name}/triggers';
+};
+
+export type GetTriggersErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type GetTriggersError = GetTriggersErrors[keyof GetTriggersErrors];
+
+export type GetTriggersResponses = {
+    /**
+     * Triggers + source registry
+     */
+    200: TriggersResponse;
+};
+
+export type GetTriggersResponse = GetTriggersResponses[keyof GetTriggersResponses];
 
 export type EnqueueTriggerEventData = {
     body: TriggerEnqueueRequest;

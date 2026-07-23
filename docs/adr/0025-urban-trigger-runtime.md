@@ -1,9 +1,12 @@
 # ADR 0025 — Urban trigger runtime (the Zapier primitive: sources → inbox → engine)
 
-Status: **Accepted; phase 1 (trigger-inbox) implemented** (durable inbox +
+Status: **Accepted; phases 1–2 (trigger-inbox + core sources) implemented** (durable inbox +
 dispatcher + FEEL action planning + gateway apply + `enqueue`/`inbox` console
 endpoints; the always-on dispatcher auto-starts for a running App that declares
-`triggers[]`). Phases 2–4 (core sources, Triggers panel UI, pack axis) remain.
+`triggers[]`; **phase 2** adds the `cron`/`webhook`/`file` core sources behind an
+**extensible source registry** — marketplace packs on the `nano-ide-trigger-*` axis
+declare new source kinds and emit over the universal webhook ingress). Phases 3–4
+(Triggers panel UI, pack-driver auto-launch) remain.
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md`, **Urban** — the RAD App bundle; this ADR
 expands its §B "Trigger runtime" from a sketch into the one genuinely-new runtime subsystem the
@@ -166,6 +169,26 @@ step-1 persist; the runtime owns the inbox, dispatch, retry, and lifecycle. Sour
 data** referenced by the manifest — no `eval`, per ADR 0007 — so a community source cannot run
 arbitrary host code beyond its packaged, reviewed driver.
 
+**The extensibility seam, concretely (phase 2).** Core and pack sources unify at the *emit-to-inbox
+boundary* (`triggers::enqueue`). The only difference is *where the source loop runs*:
+
+- **`cron`/`file`** are in-process Rust loops (`server/src/console/trigger_sources.rs`) spawned by the
+  supervisor alongside the drain loop, sharing one stop signal.
+- **`webhook`** is passive: a gateway ingress route (`POST /console/api/projects/{name}/hooks/{triggerId}`)
+  that persists-before-acks. This is the **universal external emit endpoint** — any out-of-process
+  producer uses it.
+- **A pack source** is declared data: its `nano-ide.ext.json` carries a `triggerSources[]` entry
+  (`kind`, `displayName`, `transport`, `configFields`). The installed pack's out-of-process driver
+  (a Node/Deno process, ADR 0036) emits over the same webhook ingress. Adding a `type` therefore needs
+  **no core change**.
+
+`known_kinds()` = the compiled-in `BUILTIN_KINDS` ∪ every installed pack's declared `triggerSources[].kind`.
+`GET …/triggers` (below) tags each manifest trigger `builtin`/`recognized` against this union, so the
+Triggers panel can show an unknown `type` as "needs a pack" rather than silently ignoring it. **Deferred
+to phase 4:** the runtime *auto-launching* a pack driver process as a supervised task — phase 2 lands
+the recognition + emit contract, which is the marketplace seam; a pack driver run today is started
+out-of-band and emits over the ingress.
+
 ### 7. Console — the Triggers panel
 
 A **Triggers** tab in the App project type (beside Data/Surfaces), editing *this manifest's*
@@ -183,11 +206,18 @@ console panel pattern (as the Data panel does, ADR 0024 §4).
    (`POST /v2/process-instances`, `POST /v2/messages/publication`). The synthetic source is the
    `POST /console/api/projects/{name}/triggers/enqueue` endpoint; `GET …/triggers/inbox` reports
    status. Node-first per ADR 0038.**)
-2. **core-sources** — `cron` (in-process scheduler, deterministic keys, §3), `webhook` (on the
-   `Deno.serve` backend, ack-after-persist, `auth`), `file` (watch + mtime keys).
-3. **triggers-panel** — the §7 console tab (edit + status).
-4. **trigger-pack-axis** — the §6 `nano-ide-trigger-*` contract + a first pack (`imap` or `mqtt`),
-   proving the axis end-to-end.
+2. **core-sources** — `cron` (in-process scheduler, deterministic keys, §3), `webhook` (gateway
+   ingress route, ack-after-persist, env-var shared-secret `auth`), `file` (mtime-poll watcher).
+   **(Implemented.** `server/src/console/trigger_sources.rs`: the extensible source registry
+   (`BUILTIN_KINDS`, `known_kinds()` = builtins ∪ pack-declared kinds), a dependency-free 5-field UTC
+   cron parser (`CronSpec`, Vixie dom/dow OR-rule), and the in-process cron/file drivers spawned by
+   the supervisor. `triggers.rs`: `webhook_ingest` (validate → auth → persist-before-ack),
+   `triggers_overview` (`GET …/triggers`, tagging builtin/recognized). `extensions.rs`:
+   `ExtManifest.triggerSources[]` + `all_trigger_sources()` — the marketplace seam. `onMissed`/`config`
+   added to the spec-app `trigger` schema. Node-first per ADR 0038.**)
+3. **triggers-panel** — the §7 console tab (edit + status), consuming `GET …/triggers` + the inbox.
+4. **trigger-pack-axis** — auto-launching the §6 `nano-ide-trigger-*` pack drivers as supervised
+   Node/Deno processes + a first pack (`imap` or `mqtt`), proving the axis end-to-end.
 
 ## Consequences
 
@@ -206,8 +236,9 @@ console panel pattern (as the Data panel does, ADR 0024 §4).
 
 ## Open questions
 
-- **Missed-fire policy** for `cron` across downtime: catch up every missed instant, fire once, or
-  skip to the next? Likely per-trigger config (`onMissed: skip|once|all`), default `skip`.
+- **Missed-fire policy** for `cron` across downtime: the per-trigger `onMissed: skip|once|all` field
+  (default `skip`) is now in the schema and parsed (`OnMissed`); a durable missed-fire *cursor* (so
+  `once`/`all` catch up precisely rather than from a boot-window heuristic) is still open.
 - **Retry/backoff shape** for `failed` rows: cap, backoff curve, and a dead-letter state — surfaced
   where in the Triggers panel?
 - **Inbox retention/GC**: how long are `done` rows kept (audit vs. table growth), and does GC ride
