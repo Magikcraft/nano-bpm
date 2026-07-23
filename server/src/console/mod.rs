@@ -2448,9 +2448,11 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
     let tree = projects::file_tree(name).unwrap_or_default();
     let sup = projects::supervisor();
     // Run/Compile readiness is language-aware: Deno projects need the Deno
-    // runtime; a polyglot lang pack (e.g. Rust) needs its own toolchain (cargo).
+    // runtime *or* the Node fallback (>= 22.6) on hosts with no Deno build,
+    // e.g. 32-bit ARM (ADR 0036); a polyglot lang pack (e.g. Rust) needs its
+    // own toolchain (cargo).
     let runnable = if cfg.lang == "deno" {
-        sup.deno_available()
+        sup.deno_available() || sup.node_available()
     } else {
         extensions::lang_pack(&cfg.lang)
             .map(|p| extensions::toolchain_available(&p))

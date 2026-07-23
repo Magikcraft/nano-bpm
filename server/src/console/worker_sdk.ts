@@ -1,9 +1,14 @@
-// nanobpmn embedded worker SDK (Deno).
+// nanobpmn embedded worker SDK (Deno-preferred, Node-capable).
 //
 // This file is written verbatim into <workspace>/.nanobpm/worker-sdk.ts by the
 // console worker supervisor and imported by each worker's `worker.ts`. It speaks
-// the nanobpmn Falcon protocol directly over Deno's native WebSocket
-// (no `ws`, no node:events) so a worker is a single self-contained Deno process.
+// the nanobpmn Falcon protocol directly over the platform's native WebSocket
+// (no `ws`, no node:events) so a worker is a single self-contained process.
+//
+// It runs under **Deno** (preferred) or, on hosts with no Deno build (e.g.
+// 32-bit ARM), under **Node** (>= 22.6, launched with type stripping + the
+// import-map loader). The only host calls that differ between the two runtimes
+// are isolated behind the `RT` adapter below; see ADR 0036.
 //
 // A worker file looks like:
 //
@@ -90,10 +95,52 @@ export interface WorkerOptions {
 const METRIC = "@@NBPM_METRIC@@";
 const STATUS = "@@NBPM_STATUS@@";
 
+// Runtime adapter: the handful of host calls that differ between Deno (native
+// `Deno.*`) and Node (`process`). Everything else the worker uses — WebSocket,
+// fetch, timers, TextEncoder — is standard on both. Detected once at load.
+interface Runtime {
+  env(key: string): string | undefined;
+  write(line: string): void;
+  onSigterm(handler: () => void): void;
+  exit(code: number): void;
+}
+const RT: Runtime = ((): Runtime => {
+  const g = globalThis as unknown as {
+    Deno?: {
+      env: { get(k: string): string | undefined };
+      stdout: { writeSync(b: Uint8Array): number };
+      addSignalListener(sig: string, h: () => void): void;
+      exit(code: number): void;
+    };
+    process?: {
+      env: Record<string, string | undefined>;
+      stdout: { write(s: string): boolean };
+      on(sig: string, h: () => void): void;
+      exit(code: number): void;
+    };
+  };
+  if (g.Deno) {
+    const d = g.Deno;
+    const enc = new TextEncoder();
+    return {
+      env: (k) => d.env.get(k),
+      write: (line) => void d.stdout.writeSync(enc.encode(line)),
+      onSigterm: (h) => d.addSignalListener("SIGTERM", h),
+      exit: (c) => d.exit(c),
+    };
+  }
+  const p = g.process!;
+  return {
+    env: (k) => p.env[k],
+    write: (line) => void p.stdout.write(line),
+    onSigterm: (h) => p.on("SIGTERM", h),
+    exit: (c) => p.exit(c),
+  };
+})();
+
 function emit(prefix: string, payload: unknown): void {
   // Write directly so it is one atomic line, independent of console.log.
-  const line = prefix + JSON.stringify(payload) + "\n";
-  Deno.stdout.writeSync(new TextEncoder().encode(line));
+  RT.write(prefix + JSON.stringify(payload) + "\n");
 }
 
 function falconUrl(baseUrl: string, worker?: string): string {
@@ -106,8 +153,8 @@ function falconUrl(baseUrl: string, worker?: string): string {
 }
 
 export function defineWorker(opts: WorkerOptions): void {
-  const baseUrl = opts.baseUrl ?? Deno.env.get("NANOBPMN_BASE_URL") ?? "http://127.0.0.1:8080";
-  const workerName = opts.worker ?? Deno.env.get("NANOBPMN_WORKER_NAME") ?? "embedded-worker";
+  const baseUrl = opts.baseUrl ?? RT.env("NANOBPMN_BASE_URL") ?? "http://127.0.0.1:8080";
+  const workerName = opts.worker ?? RT.env("NANOBPMN_WORKER_NAME") ?? "embedded-worker";
   const maxParallel = opts.maxParallelJobs ?? 10;
   const timeoutMs = opts.timeoutMs ?? 60_000;
   const url = falconUrl(baseUrl, workerName);
@@ -294,8 +341,8 @@ export function defineWorker(opts: WorkerOptions): void {
       ws?.close(1000, "shutdown");
     } catch { /* ignore */ }
   };
-  Deno.addSignalListener("SIGTERM", () => {
+  RT.onSigterm(() => {
     shutdown();
-    Deno.exit(0);
+    RT.exit(0);
   });
 }

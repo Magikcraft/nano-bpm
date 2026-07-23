@@ -40,6 +40,10 @@ use super::{worker_export, workers, workspace};
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 const DATA_SDK_TS: &str = include_str!("data_sdk.ts");
 const DATA_CLI_TS: &str = include_str!("data_cli.ts");
+/// Node fallback runtime loader + bootstrap (ADR 0036), materialised next to the
+/// SDK so `deno.json` import maps resolve under Node (no Deno build required).
+const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
+const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
 const LOG_RING_CAP: usize = 1000;
@@ -1373,6 +1377,8 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(&nano)?;
     std::fs::write(nano.join("data-sdk.ts"), DATA_SDK_TS)?;
     std::fs::write(nano.join("data-cli.ts"), DATA_CLI_TS)?;
+    std::fs::write(nano.join("node-loader.mjs"), NODE_LOADER_MJS)?;
+    std::fs::write(nano.join("node-register.mjs"), NODE_REGISTER_MJS)?;
     std::fs::write(nano.join("worker-sdk.ts"), WORKER_SDK_TS)
 }
 
@@ -1564,6 +1570,14 @@ pub fn create_project(
     w(dir.join("deno.json"), PROJECT_DENO_JSON)?;
     w(dir.join(".nanobpm").join("data-sdk.ts"), DATA_SDK_TS)?;
     w(dir.join(".nanobpm").join("data-cli.ts"), DATA_CLI_TS)?;
+    w(
+        dir.join(".nanobpm").join("node-loader.mjs"),
+        NODE_LOADER_MJS,
+    )?;
+    w(
+        dir.join(".nanobpm").join("node-register.mjs"),
+        NODE_REGISTER_MJS,
+    )?;
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
@@ -2168,6 +2182,13 @@ impl ProjectSupervisor {
         workers::find_deno().is_some()
     }
 
+    /// Whether a usable Node fallback runtime is available (Deno absent hosts,
+    /// e.g. 32-bit ARM). Node must be new enough to strip `.ts` types. See
+    /// ADR 0036.
+    pub fn node_available(&self) -> bool {
+        workers::usable_node().is_some()
+    }
+
     async fn entry(&self, name: &str) -> Arc<ProjectInner> {
         let mut map = self.projects.lock().await;
         map.entry(name.to_string())
@@ -2412,10 +2433,25 @@ impl ProjectSupervisor {
         if let Some((argv, trust_id)) = resolve_run_argv(&cfg) {
             return self.run_toolchain(name, &cfg, &dir, argv, trust_id).await;
         }
-        let deno = workers::find_deno().ok_or_else(|| {
-            "Deno runtime not found. Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN."
-                .to_string()
-        })?;
+        // Runtime for a plain (non-toolchain) project: prefer Deno; fall back to
+        // Node (>= 22.6) on hosts with no Deno build — e.g. 32-bit ARM. The npm
+        // launcher is itself Node, so the fallback is effectively always present.
+        // See ADR 0036.
+        enum RunRuntime {
+            Deno(PathBuf),
+            Node(PathBuf),
+        }
+        let runtime = if let Some(d) = workers::find_deno() {
+            RunRuntime::Deno(d)
+        } else if let Some(n) = workers::usable_node() {
+            RunRuntime::Node(n)
+        } else {
+            return Err(
+                "No JavaScript runtime found to run this project. Install Deno \
+                 (https://deno.com), or Node >= 22.6 (the npm launcher provides one)."
+                    .to_string(),
+            );
+        };
 
         let inner = self.entry(name).await;
         if matches!(*inner.phase.lock().await, Phase::Starting | Phase::Running) {
@@ -2438,20 +2474,41 @@ impl ProjectSupervisor {
 
         Self::auto_deploy_resources(&cfg, &dir, &base_url, &inner).await;
 
-        let mut cmd = Command::new(&deno);
-        cmd.current_dir(&dir)
-            .arg("run")
-            .arg("--no-prompt")
-            .arg("--allow-net")
-            .arg(format!("--allow-read={}", dir.display()))
-            // The whole project root (which includes .deno-cache) so an Urban App
-            // datasource can create/write its embedded SQLite file, e.g.
-            // `file:./app.db` (ADR 0024). App code is the maker's own trusted code.
-            .arg(format!("--allow-write={}", dir.display()))
-            .arg("--allow-env")
-            .arg(&cfg.main)
-            .env("DENO_DIR", &cache)
-            .env("NO_COLOR", "1")
+        let runtime_label;
+        let mut cmd;
+        match &runtime {
+            RunRuntime::Deno(deno) => {
+                runtime_label = "deno";
+                cmd = Command::new(deno);
+                cmd.current_dir(&dir)
+                    .arg("run")
+                    .arg("--no-prompt")
+                    .arg("--allow-net")
+                    .arg(format!("--allow-read={}", dir.display()))
+                    // The whole project root (which includes .deno-cache) so an Urban
+                    // App datasource can create/write its embedded SQLite file, e.g.
+                    // `file:./app.db` (ADR 0024). App code is the maker's own trusted code.
+                    .arg(format!("--allow-write={}", dir.display()))
+                    .arg("--allow-env")
+                    .arg(&cfg.main)
+                    .env("DENO_DIR", &cache);
+            }
+            RunRuntime::Node(node) => {
+                // Node fallback: strip TS types + register the import-map loader
+                // (materialised in .nanobpm/) so `deno.json`-mapped specifiers and
+                // `.ts` sources resolve. `node:sqlite`/WebSocket are built in. Node
+                // has no capability sandbox — App code is the maker's own trusted code.
+                runtime_label = "node";
+                cmd = Command::new(node);
+                cmd.current_dir(&dir)
+                    .arg("--experimental-strip-types")
+                    .arg("--no-warnings")
+                    .arg("--import")
+                    .arg(dir.join(".nanobpm").join("node-register.mjs"))
+                    .arg(&cfg.main);
+            }
+        }
+        cmd.env("NO_COLOR", "1")
             .env("NANOBPMN_BASE_URL", &base_url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -2474,7 +2531,7 @@ impl ProjectSupervisor {
             Ok(c) => c,
             Err(e) => {
                 *inner.phase.lock().await = Phase::Stopped;
-                return Err(format!("failed to spawn deno: {e}"));
+                return Err(format!("failed to spawn {runtime_label}: {e}"));
             }
         };
         let pid = child.id().unwrap_or(0);
@@ -2486,7 +2543,10 @@ impl ProjectSupervisor {
         inner
             .push_log(
                 "sys",
-                format!("running {} (pid {pid}) -> {base_url}", cfg.main),
+                format!(
+                    "running {} via {runtime_label} (pid {pid}) -> {base_url}",
+                    cfg.main
+                ),
             )
             .await;
 
@@ -2699,7 +2759,12 @@ impl ProjectSupervisor {
                 .await;
         }
         let deno = workers::find_deno().ok_or_else(|| {
-            "Deno runtime not found. Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN."
+            // Compile builds a standalone single-file binary via `deno compile`,
+            // which is Deno-specific — there is no Node equivalent. Run still works
+            // on the Node fallback (ADR 0036); only Compile requires Deno.
+            "Compile requires the Deno runtime (it builds a standalone binary). \
+             Install Deno (https://deno.com) or set NANOBPMN_DENO_BIN. Run works \
+             without Deno on Node >= 22.6."
                 .to_string()
         })?;
         let inner = self.entry(name).await;
