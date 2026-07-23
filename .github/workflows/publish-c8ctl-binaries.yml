@@ -159,24 +159,33 @@ jobs:
           - target: x86_64-apple-darwin
             os: macos-14
             asset: nanobpm-gateway-rest-server-darwin-x64
+          # Linux legs cross-compile with cargo-zigbuild, pinning a glibc floor
+          # (`.2.31` = Ubuntu 20.04) so the dynamically-linked `-gnu` binaries run
+          # on older distros. Building natively on ubuntu-24.04 (glibc 2.39) would
+          # bake in GLIBC_2.39 symbol refs that fail on anything older with
+          # "version `GLIBC_2.39' not found". zig also provides the cross C
+          # compiler/linker for the bundled C deps (rusqlite, jemalloc-sys), so no
+          # per-target gcc/mold plumbing is needed.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-24.04
             asset: nanobpm-gateway-rest-server-linux-x64
+            zig: true
+            glibc: '2.31'
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04
             asset: nanobpm-gateway-rest-server-linux-arm64
-            apt: gcc-aarch64-linux-gnu
-            linker: aarch64-linux-gnu-gcc
+            zig: true
+            glibc: '2.31'
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-24.04
             asset: nanobpm-gateway-rest-server-linux-armv7
-            apt: gcc-arm-linux-gnueabihf
-            linker: arm-linux-gnueabihf-gcc
+            zig: true
+            glibc: '2.31'
           - target: arm-unknown-linux-gnueabihf
             os: ubuntu-24.04
             asset: nanobpm-gateway-rest-server-linux-armv6
-            apt: gcc-arm-linux-gnueabihf
-            linker: arm-linux-gnueabihf-gcc
+            zig: true
+            glibc: '2.31'
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             asset: nanobpm-gateway-rest-server-win32-x64.exe
@@ -202,27 +211,38 @@ jobs:
           key: ${{ matrix.target }}
           workspaces: server
 
-      - name: Install cross linker (linux arm cross targets)
-        if: matrix.apt != ''
-        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.apt }}
+      - name: Install zig (cross C compiler/linker)
+        if: matrix.zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.13.0
 
-      - name: Install mold linker (linux x64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y mold
+      - name: Install cargo-zigbuild
+        if: matrix.zig
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
 
-      - name: Build gateway (release, cross-target)
+      - name: Build gateway (release, zig cross-compile, glibc floor)
+        if: matrix.zig
         shell: bash
         working-directory: server
         env:
-          # Linker for each linux cross target (cargo consults only the var whose
-          # name matches the active `--target`, so setting them all to the matrix
-          # linker is safe — the non-matching ones are ignored). The `cc` crate
-          # auto-selects the matching cross gcc (`aarch64-linux-gnu-gcc` /
-          # `arm-linux-gnueabihf-gcc`) for the bundled C deps (rusqlite,
-          # jemalloc-sys) from the target triple.
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
-          CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
-          CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
+          # Stamp the binary's reported version from the tag (build.rs strips the
+          # leading `v`). Empty on manual runs -> build.rs falls back to git/Cargo.
+          NANOBPM_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: |
+          set -euo pipefail
+          # The `.<glibc>` suffix pins the minimum glibc; zigbuild writes to the
+          # unsuffixed target dir (server/target/<triple>/release/).
+          cargo zigbuild --release --target "${{ matrix.target }}.${{ matrix.glibc }}" \
+            --features console --bin "$BIN_NAME"
+
+      - name: Build gateway (release, native)
+        if: ${{ !matrix.zig }}
+        shell: bash
+        working-directory: server
+        env:
           # Stamp the binary's reported version from the tag (build.rs strips the
           # leading `v`). Empty on manual runs -> build.rs falls back to git/Cargo.
           NANOBPM_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
