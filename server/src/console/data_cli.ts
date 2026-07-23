@@ -1,4 +1,5 @@
-// nanobpmn datasource CLI (Deno) — ADR 0024 phase-2 (DB Manager gateway).
+// nanobpmn datasource CLI (Deno-preferred, Node-capable) — ADR 0024 phase-2
+// (DB Manager gateway); dual-runtime per ADR 0036/0038.
 //
 // Materialised verbatim to <project>/.nanobpm/data-cli.ts next to data-sdk.ts.
 // The Rust console server invokes it as a one-shot subprocess to serve the
@@ -28,14 +29,24 @@ interface Request {
   params?: unknown[];
 }
 
-async function readStdin(): Promise<string> {
-  const chunks: Uint8Array[] = [];
-  const reader = Deno.stdin.readable.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) chunks.push(value);
-  }
+// Runtime adapter (ADR 0036/0038): the host calls that differ between Deno
+// (`Deno.*`) and Node (`process` / `node:fs`). The DB Manager gateway runs under
+// whichever runtime the console picked — Deno preferred, Node >= 22.6 fallback
+// (32-bit ARM ships no Deno build). `data-sdk.ts` already carries the same shim
+// for SQLite/`node:sqlite`; this closes the gateway's own host calls (stdin,
+// readDir, readTextFile, exit) so the Data panel works with no Deno present.
+interface DirEntry {
+  name: string;
+  isFile: boolean;
+}
+interface CliRuntime {
+  readStdin(): Promise<string>;
+  readDir(dir: string): Promise<DirEntry[]>;
+  readTextFile(path: string): Promise<string>;
+  exit(code: number): never;
+}
+
+function concatDecode(chunks: Uint8Array[]): string {
   let len = 0;
   for (const c of chunks) len += c.length;
   const buf = new Uint8Array(len);
@@ -46,6 +57,55 @@ async function readStdin(): Promise<string> {
   }
   return new TextDecoder().decode(buf);
 }
+
+const RT: CliRuntime = ((): CliRuntime => {
+  const g = globalThis as unknown as {
+    Deno?: {
+      stdin: { readable: ReadableStream<Uint8Array> };
+      readDir(dir: string): AsyncIterable<{ name: string; isFile: boolean }>;
+      readTextFile(p: string): Promise<string>;
+      exit(code: number): never;
+    };
+    process?: { stdin: AsyncIterable<Uint8Array>; exit(code: number): never };
+  };
+  if (g.Deno) {
+    const d = g.Deno;
+    return {
+      readStdin: async () => {
+        const chunks: Uint8Array[] = [];
+        const reader = d.stdin.readable.getReader();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) chunks.push(value);
+        }
+        return concatDecode(chunks);
+      },
+      readDir: async (dir) => {
+        const out: DirEntry[] = [];
+        for await (const e of d.readDir(dir)) out.push({ name: e.name, isFile: e.isFile });
+        return out;
+      },
+      readTextFile: (p) => d.readTextFile(p),
+      exit: (c) => d.exit(c),
+    };
+  }
+  const p = g.process!;
+  return {
+    readStdin: async () => {
+      const chunks: Uint8Array[] = [];
+      for await (const c of p.stdin) chunks.push(c as Uint8Array);
+      return concatDecode(chunks);
+    },
+    readDir: async (dir) => {
+      const { readdir } = await import("node:fs/promises");
+      const ents = await readdir(dir, { withFileTypes: true });
+      return ents.map((e) => ({ name: e.name, isFile: e.isFile() }));
+    },
+    readTextFile: async (path) => (await import("node:fs/promises")).readFile(path, "utf8"),
+    exit: (c) => p.exit(c),
+  };
+})();
 
 /// JSON can't carry a bigint (SQLite INTEGER/rowid may exceed 2^53). Coerce any
 /// bigint a driver returns to a Number when it is safe, else a decimal string,
@@ -108,11 +168,10 @@ async function migrationDir(source: string): Promise<string> {
 async function listMigrationFiles(dir: string): Promise<string[]> {
   const names: string[] = [];
   try {
-    for await (const e of Deno.readDir(dir)) {
+    for (const e of await RT.readDir(dir)) {
       if (e.isFile && e.name.endsWith(".sql")) names.push(e.name);
     }
-  } catch {
-    // no migrations directory — treat as an empty set
+  } catch {    // no migrations directory — treat as an empty set
   }
   names.sort();
   return names;
@@ -177,7 +236,7 @@ async function run(req: Request): Promise<unknown> {
       const applied: string[] = [];
       for (const name of files) {
         if (done.has(name)) continue;
-        const sql = await Deno.readTextFile(`${dir}/${name}`);
+        const sql = await RT.readTextFile(`${dir}/${name}`);
         await db.tx(async (t) => {
           for (const stmt of splitStatements(sql)) await t.exec(stmt);
           await t.exec(
@@ -197,10 +256,10 @@ async function run(req: Request): Promise<unknown> {
 async function main(): Promise<void> {
   let req: Request;
   try {
-    req = JSON.parse(await readStdin()) as Request;
+    req = JSON.parse(await RT.readStdin()) as Request;
   } catch (e) {
     console.log(JSON.stringify({ ok: false, error: `bad request: ${(e as Error).message}` }));
-    Deno.exit(1);
+    RT.exit(1);
   }
   try {
     const result = await run(req);

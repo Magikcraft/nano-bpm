@@ -50,6 +50,7 @@ export default function Projects() {
   const navigate = useNavigate();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [denoAvailable, setDenoAvailable] = useState(true);
+  const [nodeAvailable, setNodeAvailable] = useState(true);
   const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
   const [langMeta, setLangMeta] = useState<Record<string, LangMeta>>({});
   const [newTemplate, setNewTemplate] = useState("starter");
@@ -65,6 +66,7 @@ export default function Projects() {
       const res = (await listProjects({ throwOnError: true })).data;
       setProjects(res.projects);
       setDenoAvailable(res.denoAvailable);
+      setNodeAvailable(res.nodeAvailable);
       setTemplates(res.templates ?? []);
       const meta: Record<string, LangMeta> = {};
       for (const e of res.extensions?.extensions ?? []) {
@@ -138,10 +140,17 @@ export default function Projects() {
         }
       />
 
-      {!denoAvailable && (
+      {!nodeAvailable && !denoAvailable && (
         <div className="mb-4 rounded-md border border-warn/40 bg-warn/10 px-4 py-2 text-sm text-warn">
-          No Deno runtime detected — you can author projects, but Run and Compile
-          are disabled until Deno is installed.
+          No JavaScript runtime detected — you can author projects, but Run needs
+          Node ≥ 22.6 (the npm launcher provides one) or Deno. Compile to a standalone
+          binary additionally requires Deno.
+        </div>
+      )}
+      {nodeAvailable && !denoAvailable && (
+        <div className="mb-4 rounded-md border border-edge bg-subtle px-4 py-2 text-sm text-fg-muted">
+          Deno not detected — Run works on Node. Install Deno (deno.com) only to
+          Compile a project to a standalone single-file binary.
         </div>
       )}
 

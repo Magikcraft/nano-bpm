@@ -289,6 +289,7 @@ export type WorkerSummary = {
 export type WorkersResponse = {
     workers: Array<WorkerSummary>;
     denoAvailable: boolean;
+    nodeAvailable: boolean;
 };
 
 export type CreateWorkerRequest = {
@@ -478,6 +479,7 @@ export type ProjectDetail = {
     files: Array<FileNode>;
     runState: RunState;
     denoAvailable: boolean;
+    nodeAvailable: boolean;
     runnable: boolean;
     platforms: Array<string>;
 };
@@ -485,6 +487,7 @@ export type ProjectDetail = {
 export type ProjectsResponse = {
     projects: Array<ProjectSummary>;
     denoAvailable: boolean;
+    nodeAvailable: boolean;
     platforms: Array<string>;
     templates?: Array<ProjectTemplate>;
     extensions?: ExtensionsOverview;

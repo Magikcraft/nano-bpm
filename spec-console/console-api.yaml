@@ -1371,12 +1371,16 @@ components:
         runtime: { $ref: '#/components/schemas/WorkerRuntime' }
     WorkersResponse:
       type: object
-      required: [workers, denoAvailable]
+      required: [workers, denoAvailable, nodeAvailable]
       properties:
         workers:
           type: array
           items: { $ref: '#/components/schemas/WorkerSummary' }
+        # Deno present. Node-first (ADR 0038): Deno is optional, needed only to
+        # compile a project to a standalone binary; workers RUN on Node.
         denoAvailable: { type: boolean }
+        # Node >= 22.6 present — the primary runtime for running workers/projects.
+        nodeAvailable: { type: boolean }
     CreateWorkerRequest:
       type: object
       required: [name]
@@ -1632,26 +1636,32 @@ components:
         label: { type: string }
     ProjectDetail:
       type: object
-      required: [config, files, runState, denoAvailable, runnable, platforms]
+      required: [config, files, runState, denoAvailable, nodeAvailable, runnable, platforms]
       properties:
         config: { $ref: '#/components/schemas/ProjectConfig' }
         files:
           type: array
           items: { $ref: '#/components/schemas/FileNode' }
         runState: { $ref: '#/components/schemas/RunState' }
+        # Deno present (needed only for `deno compile`, ADR 0038).
         denoAvailable: { type: boolean }
+        # Node >= 22.6 present — the primary Run runtime.
+        nodeAvailable: { type: boolean }
         runnable: { type: boolean }
         platforms:
           type: array
           items: { type: string }
     ProjectsResponse:
       type: object
-      required: [projects, denoAvailable, platforms]
+      required: [projects, denoAvailable, nodeAvailable, platforms]
       properties:
         projects:
           type: array
           items: { $ref: '#/components/schemas/ProjectSummary' }
+        # Deno present (needed only for `deno compile`, ADR 0038).
         denoAvailable: { type: boolean }
+        # Node >= 22.6 present — the primary Run runtime.
+        nodeAvailable: { type: boolean }
         platforms:
           type: array
           items: { type: string }
