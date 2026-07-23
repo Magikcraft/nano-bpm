@@ -41,6 +41,44 @@ pub enum ExtKind {
     /// manifest as design-token values (`nano-ide-theme-*`). Pure data — no
     /// toolchain, no code.
     Theme,
+    /// A trigger-source pack: contributes one or more trigger source **kinds**
+    /// (`nano-ide-trigger-*`, ADR 0025 §6). Its driver runs out-of-process and
+    /// emits over the trigger ingress; the pack only *declares* the kinds it
+    /// provides in `triggerSources[]` (declared data — no `eval`).
+    Trigger,
+}
+
+/// One trigger source **kind** a pack contributes (ADR 0025 §6). This is the
+/// marketplace extensibility record: it declares that a `type` string exists,
+/// how the runtime is fed (`transport`), and the config fields the console
+/// should render. The runtime owns the inbox/dispatch; the pack's driver only
+/// produces events over the ingress.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TriggerSourceSpec {
+    /// The `type` string a manifest trigger uses (e.g. `imap`, `mqtt`).
+    pub kind: String,
+    /// Human label for the console source picker.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// How the runtime receives this source's events. Only `webhook` (the
+    /// universal ingress) is honoured in v1; the field is forward-declared so a
+    /// pack states its contract explicitly.
+    #[serde(default)]
+    pub transport: SourceTransport,
+    /// Config fields the console renders for a trigger of this kind.
+    #[serde(default)]
+    pub config_fields: Vec<ConfigField>,
+}
+
+/// How a pack source's events reach the runtime (ADR 0025 §6).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceTransport {
+    /// The pack driver POSTs each event to the trigger ingress (the universal
+    /// emit endpoint). The only transport wired in v1.
+    #[default]
+    Webhook,
 }
 
 /// One console colour theme a `kind: "theme"` pack contributes. `tokens` maps
@@ -302,6 +340,12 @@ pub struct ExtManifest {
     /// BPMN palette — the installable-component-library / Delphi-VCL axis.
     #[serde(default)]
     pub components: Vec<String>,
+    /// Trigger source **kinds** this pack contributes (ADR 0025 §6). Each entry
+    /// registers a `type` string so a manifest trigger can use it and the
+    /// console/validation recognise it; the pack's out-of-process driver emits
+    /// events over the trigger ingress. This is the `nano-ide-trigger-*` axis.
+    #[serde(default)]
+    pub trigger_sources: Vec<TriggerSourceSpec>,
 }
 
 /// Built-in language-pack icons: theme-robust lettermark tiles (a brand-coloured
@@ -348,6 +392,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             themes: vec![],
             intellisense: vec![],
             components: vec![],
+            trigger_sources: vec![],
         },
         ExtManifest {
             id: "deno-gui".into(),
@@ -368,6 +413,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             themes: vec![],
             intellisense: vec![],
             components: vec![],
+            trigger_sources: vec![],
         },
     ]
 }
@@ -408,6 +454,23 @@ pub fn lang_pack(id: &str) -> Option<ExtManifest> {
     all_extensions()
         .into_iter()
         .find(|e| e.kind == ExtKind::Lang && e.id == id)
+}
+
+/// Every trigger source **kind** any installed pack contributes (ADR 0025 §6) —
+/// the union the runtime registry ([`super::trigger_sources::known_kinds`])
+/// folds together with the compiled-in core kinds. Later duplicate declarations
+/// of the same `kind` are ignored (first pack wins).
+pub fn all_trigger_sources() -> Vec<TriggerSourceSpec> {
+    let mut out: Vec<TriggerSourceSpec> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    for ext in all_extensions() {
+        for spec in ext.trigger_sources {
+            if seen.insert(spec.kind.clone()) {
+                out.push(spec);
+            }
+        }
+    }
+    out
 }
 
 /// Resolve any installed extension (lang/app/example/theme) by manifest id.

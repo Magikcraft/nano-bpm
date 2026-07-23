@@ -75,6 +75,8 @@ pub enum TriggerError {
     /// The engine rejected the action (non-2xx from the gateway, or a transport
     /// error). Transient — the row is retried.
     Apply(String),
+    /// An inbound webhook presented an invalid or missing shared secret.
+    Unauthorized(String),
 }
 
 impl std::fmt::Display for TriggerError {
@@ -84,6 +86,7 @@ impl std::fmt::Display for TriggerError {
             TriggerError::Manifest(m) => write!(f, "manifest: {m}"),
             TriggerError::Feel(m) => write!(f, "feel: {m}"),
             TriggerError::Apply(m) => write!(f, "apply: {m}"),
+            TriggerError::Unauthorized(m) => write!(f, "unauthorized: {m}"),
         }
     }
 }
@@ -173,6 +176,83 @@ fn derive_idem_key(trigger_id: &str, body: &Json) -> String {
     trigger_id.hash(&mut h);
     serde_json::to_string(body).unwrap_or_default().hash(&mut h);
     format!("auto:{trigger_id}:{:016x}", h.finish())
+}
+
+// ---------------------------------------------------------------------------
+// Webhook ingress (ADR 0025 phase 2) — the universal external emit endpoint
+// ---------------------------------------------------------------------------
+
+/// Ingest an inbound webhook event for `trigger_id` (the gateway ingress route
+/// delegates here). Validates the trigger exists and is a `webhook`, enforces
+/// its optional shared-secret `auth`, then **persists before acking** (§2:
+/// sources acknowledge upstream after step-1 only, so "a webhook that arrived
+/// is not lost across a crash"). Any external producer — including a pack
+/// source driver (§6) — uses this same path, which is why it is the universal
+/// emit endpoint.
+pub(crate) async fn webhook_ingest(
+    project: &str,
+    trigger_id: &str,
+    provided_token: Option<&str>,
+    idem_key: Option<&str>,
+    body: &Json,
+) -> Result<EnqueueOutcome, TriggerError> {
+    let manifest = read_manifest(project)?;
+    let t = manifest
+        .get("triggers")
+        .and_then(Json::as_array)
+        .and_then(|ts| {
+            ts.iter()
+                .find(|t| t.get("id").and_then(Json::as_str) == Some(trigger_id))
+        })
+        .ok_or_else(|| TriggerError::Manifest(format!("no trigger '{trigger_id}' in manifest")))?;
+    if t.get("type").and_then(Json::as_str) != Some("webhook") {
+        return Err(TriggerError::Manifest(format!(
+            "trigger '{trigger_id}' is not a webhook source"
+        )));
+    }
+    if let Some(auth) = t
+        .get("auth")
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        check_webhook_secret(auth, provided_token)?;
+    }
+    enqueue(project, trigger_id, idem_key, body).await
+}
+
+/// Enforce a webhook's `auth` shared secret. `auth` names an environment
+/// variable (either `env:VARNAME` or a bare `VARNAME`) holding the expected
+/// secret — secrets are never inlined in the bundle (ADR 0025 §1 / 0024). An
+/// unset secret env **fails closed** (the hook is declared protected but the
+/// deployment hasn't supplied the secret). HMAC signatures / connection-backed
+/// secrets are a later refinement (§Open questions).
+fn check_webhook_secret(auth: &str, provided: Option<&str>) -> Result<(), TriggerError> {
+    let var = auth.strip_prefix("env:").unwrap_or(auth);
+    let expected = std::env::var(var).unwrap_or_default();
+    if expected.is_empty() {
+        return Err(TriggerError::Apply(format!(
+            "webhook secret env '{var}' is unset; refusing to accept unauthenticated event"
+        )));
+    }
+    match provided {
+        Some(tok) if constant_time_eq(tok.as_bytes(), expected.as_bytes()) => Ok(()),
+        _ => Err(TriggerError::Unauthorized(
+            "invalid or missing webhook token".to_string(),
+        )),
+    }
+}
+
+/// Length-independent-leaking constant-time byte comparison (avoids an
+/// early-return timing side channel on the shared secret).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// A `pending` inbox row that is due for dispatch.
@@ -620,12 +700,79 @@ pub(crate) async fn inbox_status(project: &str) -> Result<InboxStatus, TriggerEr
 }
 
 // ---------------------------------------------------------------------------
+// Triggers overview — declared triggers resolved against the source registry
+// ---------------------------------------------------------------------------
+
+/// The manifest's declared triggers plus the recognised source registry (ADR
+/// 0025 phase 2). Powers the Triggers panel and source picker: each trigger is
+/// tagged `builtin`/`recognized` against [`super::trigger_sources::known_kinds`]
+/// (core kinds ∪ installed-pack kinds), and any source-config error (e.g. a bad
+/// cron spec) is surfaced.
+pub(crate) async fn triggers_overview(project: &str) -> Result<Json, TriggerError> {
+    let manifest = read_manifest(project)?;
+    let known = super::trigger_sources::known_kinds();
+    let (_, errors) = super::trigger_sources::parse_sources(&manifest);
+
+    let triggers: Vec<Json> = manifest
+        .get("triggers")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|t| {
+            let id = t.get("id").and_then(Json::as_str)?.to_string();
+            let kind = t
+                .get("type")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_string();
+            Some(json!({
+                "id": id,
+                "type": kind,
+                "builtin": super::trigger_sources::is_builtin(&kind),
+                "recognized": known.contains(&kind),
+                "action": t.get("action").cloned(),
+            }))
+        })
+        .collect();
+
+    let sources: Vec<Json> = known
+        .iter()
+        .map(|k| {
+            json!({
+                "kind": k,
+                "builtin": super::trigger_sources::is_builtin(k),
+                "displayName": super::trigger_sources::display_name(k),
+            })
+        })
+        .collect();
+
+    Ok(json!({ "triggers": triggers, "sources": sources, "errors": errors }))
+}
+
+// ---------------------------------------------------------------------------
 // Supervision — one drain loop per running App that declares triggers
 // ---------------------------------------------------------------------------
 
-struct LoopHandle {
+/// Shared stop signal for a project's supervised tasks — the drain loop and
+/// every in-process source loop ([`super::trigger_sources`]) share one, so a
+/// single [`TriggerDispatcher::stop`] tears them all down together.
+pub(crate) struct LoopHandle {
     running: AtomicBool,
     stop: Notify,
+}
+
+impl LoopHandle {
+    /// Whether the supervised tasks should keep running.
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Resolves when [`TriggerDispatcher::stop`] fires, so a source loop can
+    /// `select!` on it to wake immediately rather than after its next poll.
+    pub(crate) async fn stopped(&self) {
+        self.stop.notified().await;
+    }
 }
 
 /// Owns a drain loop per project (ADR 0025 §4). Modeled on the worker/project
@@ -644,11 +791,20 @@ pub(crate) fn dispatcher() -> &'static TriggerDispatcher {
 }
 
 impl TriggerDispatcher {
-    /// Start the drain loop for `project` if it declares `triggers[]` and isn't
-    /// already running. Called from the project run path; idempotent.
+    /// Start the drain loop **and the in-process source loops** for `project`
+    /// if it declares `triggers[]` and isn't already running. Called from the
+    /// project run path; idempotent.
     pub(crate) async fn ensure_started(&self, project: &str, base_url: String) {
         // Only running Apps that actually declare triggers pay for a loop.
-        if !manifest_has_triggers(project) {
+        let Ok(manifest) = read_manifest(project) else {
+            return;
+        };
+        let has_triggers = manifest
+            .get("triggers")
+            .and_then(Json::as_array)
+            .map(|t| !t.is_empty())
+            .unwrap_or(false);
+        if !has_triggers {
             return;
         }
         let mut loops = self.loops.lock().await;
@@ -660,9 +816,13 @@ impl TriggerDispatcher {
             stop: Notify::new(),
         });
         loops.insert(project.to_string(), handle.clone());
+        // Spawn the in-process source drivers (cron/file); webhook + pack
+        // sources emit via the ingress and spawn no loop. They share `handle`,
+        // so `stop` tears them down with the drain loop below.
+        super::trigger_sources::spawn_sources(project, &manifest, handle.clone());
         let project = project.to_string();
         tokio::spawn(async move {
-            while handle.running.load(Ordering::Relaxed) {
+            while handle.is_running() {
                 let wait = match drain_over_gateway(&project, &base_url).await {
                     Ok(_) => Duration::from_millis(POLL_INTERVAL_MS),
                     // A drain error (no datasource yet, engine not up) backs off
@@ -671,7 +831,7 @@ impl TriggerDispatcher {
                 };
                 tokio::select! {
                     _ = tokio::time::sleep(wait) => {}
-                    _ = handle.stop.notified() => break,
+                    _ = handle.stopped() => break,
                 }
             }
         });
@@ -704,17 +864,6 @@ fn read_manifest(project: &str) -> Result<Json, TriggerError> {
         .map_err(|_| TriggerError::Manifest("nano.app.json not found".to_string()))?;
     serde_json::from_str(&text)
         .map_err(|e| TriggerError::Manifest(format!("nano.app.json is not valid JSON: {e}")))
-}
-
-fn manifest_has_triggers(project: &str) -> bool {
-    read_manifest(project)
-        .ok()
-        .and_then(|m| {
-            m.get("triggers")
-                .and_then(Json::as_array)
-                .map(|t| !t.is_empty())
-        })
-        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1072,5 +1221,179 @@ mod tests {
         // stop() is a harmless no-op when nothing is registered.
         dispatcher().stop(&name).await;
         assert!(!dispatcher().is_running(&name).await);
+    }
+
+    // --- webhook auth (pure; no runtime) ----------------------------------
+
+    #[test]
+    fn check_webhook_secret_accepts_matching_token() {
+        let _g = lock();
+        let var = "NANO_TEST_WH_SECRET_OK";
+        unsafe {
+            std::env::set_var(var, "s3cr3t");
+        }
+        assert!(check_webhook_secret("env:NANO_TEST_WH_SECRET_OK", Some("s3cr3t")).is_ok());
+        // bare VARNAME form resolves the same env var.
+        assert!(check_webhook_secret("NANO_TEST_WH_SECRET_OK", Some("s3cr3t")).is_ok());
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn check_webhook_secret_rejects_wrong_and_missing_token() {
+        let _g = lock();
+        let var = "NANO_TEST_WH_SECRET_BAD";
+        unsafe {
+            std::env::set_var(var, "expected");
+        }
+        assert!(matches!(
+            check_webhook_secret("env:NANO_TEST_WH_SECRET_BAD", Some("nope")),
+            Err(TriggerError::Unauthorized(_))
+        ));
+        assert!(matches!(
+            check_webhook_secret("env:NANO_TEST_WH_SECRET_BAD", None),
+            Err(TriggerError::Unauthorized(_))
+        ));
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn check_webhook_secret_fails_closed_when_env_unset() {
+        let _g = lock();
+        unsafe {
+            std::env::remove_var("NANO_TEST_WH_SECRET_UNSET");
+        }
+        // Declared protected but no secret supplied → refuse (not Unauthorized).
+        assert!(matches!(
+            check_webhook_secret("env:NANO_TEST_WH_SECRET_UNSET", Some("anything")),
+            Err(TriggerError::Apply(_))
+        ));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_bytewise() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+    }
+
+    // --- triggers_overview (manifest read; no runtime) --------------------
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn triggers_overview_tags_builtin_and_unknown_kinds() {
+        let _g = lock();
+        let name = setup_app(
+            r#", "triggers": [
+                { "id": "nightly", "type": "cron", "spec": "0 6 * * *", "action": { "start": "p" } },
+                { "id": "weird", "type": "quantum", "action": { "start": "p" } }
+            ]"#,
+        );
+        let ov = triggers_overview(&name).await.expect("overview");
+        let triggers = ov.get("triggers").and_then(Json::as_array).unwrap();
+        assert_eq!(triggers.len(), 2);
+        let cron = &triggers[0];
+        assert_eq!(cron.get("type").and_then(Json::as_str), Some("cron"));
+        assert_eq!(cron.get("builtin").and_then(Json::as_bool), Some(true));
+        assert_eq!(cron.get("recognized").and_then(Json::as_bool), Some(true));
+        let weird = &triggers[1];
+        assert_eq!(weird.get("builtin").and_then(Json::as_bool), Some(false));
+        assert_eq!(weird.get("recognized").and_then(Json::as_bool), Some(false));
+        // The source registry advertises the builtin kinds.
+        let sources = ov.get("sources").and_then(Json::as_array).unwrap();
+        assert!(
+            sources
+                .iter()
+                .any(|s| s.get("kind").and_then(Json::as_str) == Some("cron"))
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn triggers_overview_surfaces_bad_cron_error() {
+        let _g = lock();
+        let name = setup_app(
+            r#", "triggers": [
+                { "id": "broken", "type": "cron", "spec": "not a cron", "action": { "start": "p" } }
+            ]"#,
+        );
+        let ov = triggers_overview(&name).await.expect("overview");
+        let errors = ov.get("errors").and_then(Json::as_array).unwrap();
+        assert!(!errors.is_empty(), "a malformed cron spec is reported");
+    }
+
+    // --- webhook_ingest (needs a JS runtime for the sqlite inbox) ----------
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn webhook_ingest_enqueues_and_dedups() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app(
+            r#", "triggers": [
+                { "id": "hook", "type": "webhook", "action": { "start": "p" } }
+            ]"#,
+        );
+        let body = json!({ "n": 1 });
+        let first = webhook_ingest(&name, "hook", None, Some("idem-1"), &body)
+            .await
+            .expect("ingest");
+        assert!(first.enqueued, "new event is persisted");
+        let dup = webhook_ingest(&name, "hook", None, Some("idem-1"), &body)
+            .await
+            .expect("ingest");
+        assert!(!dup.enqueued, "same idempotency key is collapsed");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn webhook_ingest_rejects_non_webhook_trigger() {
+        let _g = lock();
+        let name = setup_app(
+            r#", "triggers": [
+                { "id": "nightly", "type": "cron", "spec": "0 6 * * *", "action": { "start": "p" } }
+            ]"#,
+        );
+        let err = webhook_ingest(&name, "nightly", None, None, &json!({})).await;
+        assert!(matches!(err, Err(TriggerError::Manifest(_))));
+        // Unknown trigger id is also a manifest error.
+        let missing = webhook_ingest(&name, "ghost", None, None, &json!({})).await;
+        assert!(matches!(missing, Err(TriggerError::Manifest(_))));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn webhook_ingest_enforces_auth() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let var = "NANO_TEST_WH_INGEST_SECRET";
+        unsafe {
+            std::env::set_var(var, "letmein");
+        }
+        let name = setup_app(
+            r#", "triggers": [
+                { "id": "hook", "type": "webhook", "auth": "env:NANO_TEST_WH_INGEST_SECRET", "action": { "start": "p" } }
+            ]"#,
+        );
+        // Wrong token → Unauthorized, nothing persisted.
+        let bad = webhook_ingest(&name, "hook", Some("wrong"), None, &json!({})).await;
+        assert!(matches!(bad, Err(TriggerError::Unauthorized(_))));
+        // Correct token → enqueued.
+        let ok = webhook_ingest(&name, "hook", Some("letmein"), Some("k"), &json!({}))
+            .await
+            .expect("ingest");
+        assert!(ok.enqueued);
+        unsafe {
+            std::env::remove_var(var);
+        }
     }
 }

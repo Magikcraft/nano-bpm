@@ -42,6 +42,7 @@ pub mod projects;
 pub mod server_update;
 pub(crate) mod standalone;
 pub mod trace;
+pub mod trigger_sources;
 pub mod triggers;
 pub mod worker_export;
 pub mod workers;
@@ -119,6 +120,16 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/projects/{name}/file", get(project_file_get))
         .route("/console/api/projects/{name}/logs", get(project_logs))
         .route("/console/api/projects/{name}/export", get(project_export))
+        // Trigger webhook ingress (ADR 0025 phase 2): the universal external
+        // emit endpoint. Hand-wired (not in the OpenAPI spec) because it accepts
+        // an arbitrary body + custom shared-secret auth and acks after persist.
+        // Any external producer — including a pack source driver (§6) — POSTs
+        // here. Under the observe profile the console guard refuses it (a
+        // mutation), keeping observe truly read-only.
+        .route(
+            "/console/api/projects/{name}/hooks/{triggerId}",
+            axum::routing::post(project_hook),
+        )
         .route(
             "/console/api/export-workers-app",
             axum::routing::post(workers_export),
@@ -2870,6 +2881,7 @@ fn trigger_error(e: triggers::TriggerError) -> (StatusCode, String) {
         Manifest(m) => (StatusCode::BAD_REQUEST, m),
         Feel(m) => (StatusCode::BAD_REQUEST, m),
         Apply(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+        Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
     }
 }
 
@@ -2888,12 +2900,82 @@ pub(super) async fn project_trigger_enqueue(
         .map_err(trigger_error)
 }
 
+/// `POST /console/api/projects/{name}/hooks/{triggerId}` — the webhook ingress
+/// (ADR 0025 phase 2). Persists the event into the durable inbox and acks after
+/// persist (§2): `202 Accepted` when a new row was enqueued, `200 OK` on a
+/// duplicate idempotency key. Auth (when the trigger declares it) comes from an
+/// `X-Webhook-Token` header or `Authorization: Bearer <token>`; the optional
+/// `Idempotency-Key` header supplies the dedup key.
+async fn project_hook(
+    Path((name, trigger_id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let token = headers
+        .get("x-webhook-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| {
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .map(str::to_string)
+        });
+    let idem = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    // Accept any body: parse JSON, else wrap the raw text so nothing is lost.
+    let event: serde_json::Value = if body.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_slice(&body)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": String::from_utf8_lossy(&body) }))
+    };
+    match triggers::webhook_ingest(
+        &name,
+        &trigger_id,
+        token.as_deref(),
+        idem.as_deref(),
+        &event,
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let code = if outcome.enqueued {
+                StatusCode::ACCEPTED
+            } else {
+                StatusCode::OK
+            };
+            (
+                code,
+                Json(serde_json::to_value(&outcome).unwrap_or_default()),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let (code, msg) = trigger_error(e);
+            (code, msg).into_response()
+        }
+    }
+}
+
 /// `GET /console/api/projects/{name}/triggers/inbox` — inbox counts by state
 /// plus the most recently updated rows.
 pub(super) async fn project_trigger_inbox(name: &str) -> ApiResult {
     triggers::inbox_status(name)
         .await
         .map(|s| serde_json::to_value(s).unwrap_or_default())
+        .map_err(trigger_error)
+}
+
+/// `GET /console/api/projects/{name}/triggers` — the manifest's declared
+/// triggers resolved against the source registry (ADR 0025 phase 2), for the
+/// Triggers panel + source picker.
+pub(super) async fn project_triggers(name: &str) -> ApiResult {
+    triggers::triggers_overview(name)
+        .await
         .map_err(trigger_error)
 }
 

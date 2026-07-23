@@ -212,7 +212,18 @@
         },
         "spec": {
           "type": "string",
-          "description": "cron: the crontab spec (e.g. '0 6 * * *')."
+          "description": "cron: the crontab spec (e.g. '0 6 * * *'). 5 fields, evaluated in UTC (ADR 0025 §2)."
+        },
+        "onMissed": {
+          "type": "string",
+          "enum": ["skip", "once", "all"],
+          "default": "skip",
+          "description": "cron catch-up policy for fires missed while the App was down (ADR 0025 §Open questions): skip them, fire once for the whole span, or enqueue every missed instant (dedup keys keep it idempotent)."
+        },
+        "config": {
+          "type": "object",
+          "description": "Source-kind-specific settings. Core: file may set { pollMs }. Pack sources (nano-ide-trigger-*, ADR 0025 §6) read their declared config fields from here.",
+          "additionalProperties": true
         },
         "path": {
           "type": "string",
