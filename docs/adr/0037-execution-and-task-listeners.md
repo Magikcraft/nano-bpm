@@ -1,0 +1,222 @@
+# ADR 0037 — Execution listeners (and task listeners): BPMN lifecycle-hook parity
+
+Status: **Proposed.**
+Date: 2026-07-23.
+
+Relates to: ADR 0023 (`0023-adhoc-subprocess-execution-parity.md` — the precedent
+for a bounded, honestly-scoped `engine-core` execution-parity feature that threads
+new job semantics through both completion transports), ADR 0016
+(`0016-falcon-protocol.md` — the complete-job transport that must carry the listener
+job kind/event-type), ADR 0022 (`0022-nano-rad-application.md` §E — the
+switch-over-parity discipline). Engine hot path:
+`engine-core/src/bpmn.rs` (extension-element parse), `engine-core/src/model.rs`
+(`ElementKind`, `Element`), `engine-core/src/{state,command,event}.rs`,
+`engine-core/src/engine/mod.rs` (the `ElementActivating→ElementActivated` and
+`ElementCompleting→ElementCompleted` transitions), `server/src/main.rs`
+(`JobKindEnum`/`JobListenerEventTypeEnum` on the jobs read model, complete-job REST),
+`server/src/falcon.rs`. Camunda reference (`~/workspace/camunda/zeebe`):
+`engine/.../deployment/model/element/ExecutionListener.java`,
+`engine/.../deployment/model/transformer/zeebe/ExecutionListenerTransformer.java`,
+`engine/.../bpmn/behavior/BpmnJobBehavior.java` (`createNewExecutionListenerJob`,
+`fromExecutionListenerEventType` → `START`/`END`),
+`qa/.../command/ExecutionListenerJobTest.java` (behavioural contract).
+
+## Context
+
+A BPMN **execution listener** (`zeebe:executionListeners` → `zeebe:executionListener
+eventType="start|end" type="…" retries="…"`) is a **job** that fires at a flow node's
+lifecycle boundary: `start` listeners run while the element is **activating** (before
+its own behaviour — before a service task creates its worker job, before a gateway
+routes), `end` listeners run while it is **completing** (before the token leaves). A
+**task listener** (`zeebe:taskListeners`, `eventType` incl. `completing`) is the
+user-task-only cousin that can additionally **deny** the transition and return
+corrections.
+
+### The Camunda contract we must satisfy (verified against source)
+
+- Each listener is a job with `jobWorkerProperties` (a `type`, optional `retries`) and
+  an `eventType`. `fromExecutionListenerEventType` maps `start → START`, `end → END`
+  (`BpmnJobBehavior.java:494`); the job is stamped `JobListenerEventType` +
+  `JobKind = EXECUTION_LISTENER` so a worker subscribed to that type/event receives it.
+- Listeners of a given event type run **sequentially in declared order**, one job at a
+  time: the engine creates listener *i*, waits for its completion, then creates
+  *i+1*. Only after the **last `start`** listener completes does the element run its
+  own behaviour; only after the **last `end`** listener completes does the element
+  reach `COMPLETED` and the token advance.
+- **Variables** a listener returns on completion merge into the element scope and are
+  visible to subsequent listeners and to the element.
+- Execution listeners **cannot deny** (that is a task-listener-only capability). A
+  listener job that **fails / exhausts retries raises an incident**, exactly like any
+  job; the transition stays parked until resolved.
+- Listeners are valid on **most flow nodes** (tasks, gateways, events, sub-processes,
+  the process itself, call/ad-hoc containers, multi-instance bodies).
+
+### Nano today (the gap)
+
+- **Parse:** `engine-core/src/bpmn.rs` handles a large set of `zeebe:` extension
+  elements (`taskDefinition`, `calledDecision`, `calledElement`, `subscription`,
+  `assignmentDefinition`, `taskSchedule`, `priorityDefinition`, `adHoc`, `ioMapping`,
+  `loopCharacteristics`, `script`) but **not** `executionListeners`/`taskListeners`.
+  A model that declares them **deploys and runs**, with the listeners **silently
+  never firing** — no jobs are created, so a subscribed worker is never activated.
+  `grep -i listener engine-core/src` → zero matches.
+- **Lifecycle:** the engine already emits the four lifecycle events
+  (`ElementActivating`, `ElementActivated`, `ElementCompleting`, `ElementCompleted`
+  — `event.rs:147-176`), **but atomically**: `activate_element` pushes
+  `ElementActivating` and `ElementActivated` back-to-back in one synchronous step
+  (`engine/mod.rs:2598-2609`); completion likewise. There is **no state in which an
+  element rests mid-transition** awaiting external work.
+- **Transport:** the jobs read model already carries `JobKindEnum` and
+  `JobListenerEventTypeEnum`, but every engine job is hardcoded
+  `JobKindEnum::BpmnElement` + `JobListenerEventTypeEnum::Unspecified`
+  (`server/src/main.rs:13774-13775, 13908-13909`). The REST spec surface
+  (`spec/jobs.yaml`, enum `EXECUTION_LISTENER`/`TASK_LISTENER`) is the copied C8 API
+  contract — schema only, no engine behaviour behind it.
+
+**The core engine change is therefore to break lifecycle atomicity**: let an element
+instance *rest* in `ACTIVATING` (resp. `COMPLETING`) while a chain of listener jobs
+runs, then finalise the transition when the chain drains.
+
+## Decision (proposed)
+
+Implement **execution listeners first** (they apply to every flow node and cannot
+deny, so they are the smaller, cleaner change); specify **task listeners** as a
+follow-on §6 (user-task-only, adds denial + corrections, reuses the same machinery).
+Match the Camunda job shape byte-for-byte so an **unmodified** listener worker runs.
+Everything is gated on the element actually declaring listeners, so models without
+them emit **byte-identical journals** (replay-safe; the hot path is unchanged).
+
+### 1. Model (`bpmn.rs`, `model.rs`) — parse and attach listeners
+
+- Parse `zeebe:executionListeners`/`zeebe:executionListener` into
+  `ExecutionListener { event_type: ListenerEvent::{Start,End}, job_type: String,
+  retries: Option<String> }` (retries a literal-or-FEEL raw expression, resolved at
+  job creation exactly like `taskDefinition` retries).
+- Add `start_listeners: Vec<ExecutionListener>` / `end_listeners: Vec<ExecutionListener>`
+  to `struct Element` (`model.rs:571`), preserving declaration order. Empty vecs
+  (the overwhelmingly common case) ⇒ no behaviour change. This is orthogonal to
+  `ElementKind`, so it applies uniformly to tasks, gateways, events, and containers.
+
+### 2. Runtime state (`state.rs`) — a rest point mid-transition
+
+- Add a per-element-instance **listener cursor**: `{ phase: Start|End, index: usize }`
+  recording which listener in the chain is currently outstanding. Present only while a
+  listener job is in flight; absent otherwise.
+- Add a job kind discriminator so a created job knows it is an execution listener
+  (carries `event_type` Start/End). Reuse the existing job store; the discriminator
+  drives (a) the read-model `JobKind`/`JobListenerEventType` mapping and (b) the
+  completion router in §3.
+
+### 3. Commands/events + transitions (`command.rs`, `event.rs`, `engine/mod.rs`)
+
+The heart of the change. Split the two atomic transitions:
+
+- **Activation.** In `activate_element`: emit `ElementActivating`. If the element has
+  `start_listeners`, **stop** — create listener job `#0` (type + resolved retries,
+  `event_type=Start`), set the listener cursor, and rest. Do **not** yet emit
+  `ElementActivated` or run the element behaviour. If there are none, proceed exactly
+  as today (emit `ElementActivated`, apply input mappings, create the service job /
+  route the gateway / …).
+- **Listener completion** (a `CompleteJob` whose job is an execution listener): merge
+  the returned variables into the element scope; advance the cursor. If another
+  same-phase listener remains, create it. If the `Start` chain is **drained**, emit
+  `ElementActivated` and run the element's **normal activation behaviour** (the code
+  path currently inlined right after `ElementActivated`). If the `End` chain is
+  drained, emit `ElementCompleted` and take the outgoing flow.
+- **Completion.** Wherever the engine emits `ElementCompleting`→`ElementCompleted`
+  today (service-job complete, gateway, pass-through events, sub-process end — many
+  sites, `engine/mod.rs`), interpose: emit `ElementCompleting`, and if the element has
+  `end_listeners`, create end-listener `#0` and rest instead of emitting
+  `ElementCompleted`. A shared helper (`begin_end_listeners_or_complete`) keeps the
+  many completion sites consistent.
+- **Failure/incident.** A listener job that exhausts retries raises an incident like
+  any job (existing machinery); the element stays parked in `ACTIVATING`/`COMPLETING`.
+- **Interruption.** If an interrupting boundary event / terminate fires while a
+  listener chain is outstanding, cancel the in-flight listener job and drop the cursor
+  as part of the element's termination (must be handled so a pending listener can't
+  resurrect a terminated element).
+
+### 4. Job kind plumbing (`server/src/main.rs`, generated models, `falcon.rs`)
+
+- Map the listener discriminator onto the jobs read model: replace the hardcoded
+  `JobKindEnum::BpmnElement` / `JobListenerEventTypeEnum::Unspecified` with
+  `ExecutionListener` + `Start`/`End` **for listener jobs only** (non-listener jobs
+  unchanged). Both the REST jobs projection and the activate-jobs path.
+- Activation and complete-job transports are otherwise **unchanged** — a listener job
+  activates and completes through the same REST/Falcon paths as any job (that is the
+  point: stock workers work). Completion just routes into the §3 advance instead of
+  the element's own complete.
+
+### 5. Read model + metrics
+
+- Listener jobs are real jobs ⇒ they appear in the jobs read model / trace with the
+  correct kind + event type (observability parity with Operate's listener jobs).
+- Add `nanobpm_execution_listener_jobs_total{event_type=start|end,outcome=created|completed|failed}`.
+
+### 6. Task listeners (follow-on, specified now for coherence)
+
+Task listeners apply **only to user tasks** and add two things execution listeners
+lack: the `completing` event can **deny** the completion (`denied=true` +
+`deniedReason`) and return **corrections** (assignee, candidate groups/users, due/
+follow-up date, priority). They reuse §2/§3 machinery, hooked at the **user-task
+lifecycle** (`assigning`, `completing`, `canceling`, `updating`) rather than the
+element lifecycle, and require threading the `denied`/`corrections` fields through the
+complete-job result (a strict superset of the ad-hoc result plumbing in ADR 0023 §3).
+Kept out of v1 to bound the first cut; no v1 decision precludes it.
+
+### Subset (honestly stated, per the whitepaper discipline)
+
+State each boundary in `PERFORMANCE.md` / the feature matrix:
+
+- **v1 (this ADR):** `zeebe:executionListeners` `start`/`end` on tasks, gateways,
+  events, (sub)processes, call/ad-hoc/multi-instance containers; sequential in-order
+  execution; literal/FEEL `retries`; incident on failure; forward variable merge;
+  correct `JobKind`/`JobListenerEventType` in the read model.
+- **Deferred:** task listeners (§6 — user-task `completing` denial + corrections);
+  listener behaviour under process-instance **migration** and **modification**;
+  interaction subtleties with non-interrupting boundary events firing mid-chain.
+
+## Phased plan
+
+1. **Contract fixtures.** Import a Camunda golden BPMN with start+end execution
+   listeners on a service task + a gateway; capture the exact create-listener-job and
+   complete-job REST bodies a stock worker exchanges (mirror `ExecutionListenerJobTest`).
+2. **Model** (seam 1): parse + attach `start/end_listeners`; unit tests over fixtures;
+   assert a listener-free model's parse is byte-unchanged.
+3. **Transport** (seam 4): `JobKind`/`JobListenerEventType` mapping (no runtime yet).
+4. **Runtime** (seams 2–3): the transition split + listener cursor + completion router;
+   engine tests for ordering, variable merge, retries→incident, and interruption
+   mid-chain. **Guard:** a listener-free run emits the identical journal.
+5. **Read model + metrics** (seam 5).
+6. **E2E parity test:** run the golden BPMN under an unmodified listener worker on
+   embedded Bernd; assert listener jobs appear in the read model in order and the run
+   matches Camunda's outcome. Update the feature matrix + `PERFORMANCE.md` subset note.
+7. **Task listeners** (seam 6) as a separate follow-up ADR increment.
+
+## Consequences
+
+- **First feature to break element-lifecycle atomicity.** Every existing completion
+  site must route through the shared "begin end-listeners or complete" helper; the
+  invariant "an element can now rest in `ACTIVATING`/`COMPLETING`" ripples into
+  interruption, boundary-event, and termination handling. This is the main risk and
+  the reason for the strict listener-free-is-byte-identical guard.
+- Unmodified Zeebe listener workers run on Nano — the ADR 0022 switch-over-parity
+  target for a widely-used authoring feature that today silently no-ops (a
+  correctness cliff: a model relying on an `end` listener to, e.g., write an audit
+  record simply skips it on Nano).
+- Listener jobs are first-class in the read model/trace, extending the same
+  audit-trail parity ADR 0023 established for ad-hoc tools.
+
+## Open questions
+
+- **Ordering vs. IO mappings:** pin against the fixture whether `start` listeners run
+  **before or after** `zeebe:input` mappings are applied (and `end` vs `zeebe:output`).
+  Zeebe's ACTIVATING ordering is exact and observable; Nano must match it.
+- **Container start/end semantics:** for a sub-process/multi-instance body, do
+  `start`/`end` listeners fire on the container boundary only, or also interleave with
+  child activation? Confirm against Camunda for the container processors.
+- **Retry/incident UX:** a parked element with a failed listener — surface it in the
+  console incidents view identically to a failed service job (it already is a job), or
+  distinguish listener incidents?
+- **Guarding runaway/expensive chains:** any engine cap on listener count or a
+  per-listener timeout, or leave it purely worker/incident-driven (as Zeebe does)?
