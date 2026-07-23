@@ -179,6 +179,28 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     }
   });
 
+  // Form-field datasource bindings (ADR 0024 §5): a choice field's `dataSource`
+  // must name a declared datasource — bind to the alias, never a driver — so the
+  // form survives the SQLite→Postgres flip. The field's `query` shape is the
+  // maker's; only the alias resolves here (columns are checked at run time by
+  // the datasource, ADR 0024 phase 2).
+  if (index) {
+    for (const form of index.forms) {
+      for (const field of form.fields) {
+        const ds = field.dataSource;
+        if (!ds) continue;
+        const at = `/forms/${form.id}/fields/${field.key}/dataSource`;
+        if (!sourceNames.has(ds.source)) {
+          push(
+            `${at}/source`,
+            `datasource "${ds.source}" is not declared in data.sources`,
+            "unknown-datasource",
+          );
+        }
+      }
+    }
+  }
+
   return diags;
 }
 

@@ -5,6 +5,7 @@ import MarkdownPreview from "../components/MarkdownPreview";
 import BpmnModeler, { type BpmnModelerHandle } from "../components/BpmnModeler";
 import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
+import FormPreview from "../components/FormPreview";
 import AppManifestEditor, { isAppManifestPath } from "../components/AppManifestEditor";
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 const DataPanel = lazy(() => import("../components/DataPanel"));
@@ -855,7 +856,7 @@ function EditorPane({
   // Form files open in the graphical form editor; the user can switch to a raw
   // JSON editor to inspect/tweak the underlying schema. The editor stays mounted
   // when the JSON tab is active so form state is preserved across toggles.
-  const [formView, setFormView] = useState<"visual" | "json">("visual");
+  const [formView, setFormView] = useState<"visual" | "json" | "preview">("visual");
   const [formJson, setFormJson] = useState<string>("");
   // Mirrors bpmnXmlDirtyRef for the form JSON tab.
   const formJsonDirtyRef = useRef(false);
@@ -1018,7 +1019,7 @@ function EditorPane({
       if (kind === "bpmn" && bpmnView === "xml") body = bpmnXml;
       else if (kind === "bpmn" && bpmnRef.current) body = await bpmnRef.current.getXml();
       else if (kind === "dmn" && dmnRef.current) body = await dmnRef.current.getXml();
-      else if (kind === "form" && formView === "json") body = formJson;
+      else if (kind === "form" && (formView === "json" || formView === "preview")) body = formJson;
       else if (kind === "form" && formRef.current) body = await formRef.current.getSchema();
       await saveProjectFile({ path: { name }, query: { path }, body, throwOnError: true });
       setContent(body);
@@ -1046,7 +1047,7 @@ function EditorPane({
         // Persisted body is now authoritative in both surfaces (mirrors bpmn).
         setFormJson(body);
         formJsonDirtyRef.current = false;
-        if (formView === "json" && formRef.current) {
+        if ((formView === "json" || formView === "preview") && formRef.current) {
           try {
             await formRef.current.importSchema(body);
           } catch {
@@ -1151,18 +1152,20 @@ function EditorPane({
     [bpmnView, bpmnXml],
   );
 
-  // Switches the form editor between the graphical canvas and the raw JSON tab
-  // (mirrors switchBpmnView). Visual → JSON: pull the current schema. JSON →
-  // Visual: if the JSON was edited, import it back (errors surface via alert).
+  // Switches the form editor between the graphical canvas, the raw JSON tab, and
+  // the live Preview (form-js viewer with datasource-resolved options, ADR 0024
+  // §5). Leaving the canvas snapshots its schema into `formJson` so JSON and
+  // Preview reflect unsaved canvas edits; returning to the canvas re-imports any
+  // JSON edits (errors surface via alert).
   const switchFormView = useCallback(
-    async (next: "visual" | "json") => {
+    async (next: "visual" | "json" | "preview") => {
       if (next === formView) return;
-      if (next === "json") {
+      if (formView === "visual") {
         const json = (await formRef.current?.getSchema()) ?? "";
         setFormJson(json);
         formJsonDirtyRef.current = false;
-        setFormView("json");
-      } else {
+      }
+      if (next === "visual") {
         if (formJsonDirtyRef.current && formRef.current) {
           try {
             await formRef.current.importSchema(formJson);
@@ -1172,8 +1175,8 @@ function EditorPane({
             return;
           }
         }
-        setFormView("visual");
       }
+      setFormView(next);
     },
     [formView, formJson],
   );
@@ -1258,7 +1261,7 @@ function EditorPane({
         )}
         {kind === "form" && (
           <div className="flex overflow-hidden rounded-md border border-edge-strong">
-            {(["visual", "json"] as const).map((mode) => (
+            {(["visual", "json", "preview"] as const).map((mode) => (
               <button
                 key={mode}
                 onClick={() => void switchFormView(mode)}
@@ -1404,6 +1407,11 @@ function EditorPane({
                   }}
                   onSave={() => void save()}
                 />
+              </div>
+            )}
+            {formView === "preview" && (
+              <div className="absolute inset-0 bg-app">
+                <FormPreview schema={formJson} name={name} />
               </div>
             )}
           </div>
