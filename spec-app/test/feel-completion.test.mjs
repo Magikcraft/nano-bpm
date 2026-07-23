@@ -43,15 +43,29 @@ const manifest = {
 
 const values = (r) => r.candidates.map((c) => c.value).sort();
 
-test("root FEEL position offers the `body` binding", () => {
+test("root FEEL position offers `body` and the `data.query` builtin", () => {
   const { text, offset } = at(
     '{ "triggers": [ { "bodyType": "reading", "action": { "variables": "= ‸" } } ] }',
   );
   const r = manifestCompletionAt(text, offset, manifest);
   assert.ok(r);
   assert.equal(r.site, "feel");
-  assert.deepEqual(values(r), ["body"]);
-  assert.equal(r.candidates[0].kind, "variable");
+  assert.deepEqual(values(r), ["body", "data.query"]);
+  const body = r.candidates.find((c) => c.value === "body");
+  const dq = r.candidates.find((c) => c.value === "data.query");
+  assert.equal(body.kind, "variable");
+  assert.equal(dq.kind, "function");
+});
+
+test("`data.` completes the `query` datasource builtin (ADR 0024 §5)", () => {
+  const { text, offset } = at(
+    '{ "triggers": [ { "action": { "variables": "= data.‸" } } ] }',
+  );
+  const r = manifestCompletionAt(text, offset, manifest);
+  assert.ok(r);
+  assert.equal(r.site, "feel");
+  assert.deepEqual(values(r), ["query"]);
+  assert.equal(r.candidates[0].kind, "function");
 });
 
 test("`body.` completes the bodyType's fields", () => {

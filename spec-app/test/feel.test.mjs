@@ -2,7 +2,7 @@
 // and `resolveBodyPath` type-walking. `node --test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope, processScope, outputTypeForTaskType, componentOutputScope } from "../src/feel.ts";
+import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope, processScope, outputTypeForTaskType, componentOutputScope, dataQueryCalls, DATA_QUERY } from "../src/feel.ts";
 
 const manifest = {
   types: {
@@ -164,4 +164,38 @@ test("componentOutputScope types each output-mapped variable by its worker (ADR 
   assert.deepEqual(scope[0].entries.map((e) => e.name).sort(), ["meta", "readings", "room", "sensor", "temp"]);
   // no outputs, or all untyped → empty scope
   assert.deepEqual(componentOutputScope(m, []), []);
+});
+
+// --- data.query builtin (ADR 0024 §5) --------------------------------------
+
+test("dataQueryCalls extracts the alias from the two-argument form", () => {
+  const calls = dataQueryCalls('= data.query("app", "SELECT * FROM t")');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].source, "app");
+});
+
+test("dataQueryCalls returns null source for the default-source form", () => {
+  const calls = dataQueryCalls('= data.query("SELECT 1")');
+  assert.deepEqual(calls.map((c) => c.source), [null]);
+});
+
+test("dataQueryCalls is conservative: dynamic first arg is unverifiable (null)", () => {
+  assert.deepEqual(dataQueryCalls("= data.query(src, sql)").map((c) => c.source), [null]);
+  assert.deepEqual(dataQueryCalls("= data.query(body.alias, \"x\")").map((c) => c.source), [null]);
+});
+
+test("dataQueryCalls finds multiple calls and tolerates whitespace", () => {
+  const calls = dataQueryCalls('= { a: data . query ( "app" , "x" ), b: data.query("warehouse","y") }');
+  assert.deepEqual(calls.map((c) => c.source), ["app", "warehouse"]);
+  assert.ok(calls[0].index < calls[1].index);
+});
+
+test("dataQueryCalls ignores lookalikes (data.queryFoo, other.query)", () => {
+  assert.deepEqual(dataQueryCalls('= data.queryFoo("app","x")'), []);
+  assert.deepEqual(dataQueryCalls('= other.query("app","x")'), []);
+});
+
+test("DATA_QUERY exposes the read-only App-tier contract", () => {
+  assert.equal(DATA_QUERY.name, "data.query");
+  assert.deepEqual(DATA_QUERY.forms, ["data.query(source, sql)", "data.query(sql)"]);
 });

@@ -270,9 +270,47 @@ export declare function outputTypeForTaskType(manifest: unknown, taskType: strin
  * component keeps the first typed occurrence.
  */
 export declare function componentOutputScope(manifest: unknown, outputs: readonly ComponentOutput[]): ScopeVar[];
+/** The `data.query` builtin's editor-facing signature descriptor. */
+export interface FeelFunctionSignature {
+	/** The callable name as written in FEEL. */
+	name: string;
+	/** One-line human hint for autocomplete/detail. */
+	detail: string;
+	/** The accepted call forms, most-specific first. */
+	forms: string[];
+	/** A longer description for signature/documentation surfaces. */
+	doc: string;
+}
+/**
+ * The `data.query` builtin contract (ADR 0024 §5). Read-only: it reads from a
+ * datasource, never writes. Two forms — an explicit alias, or the default
+ * source (`data.default`) when the alias is omitted.
+ */
+export declare const DATA_QUERY: FeelFunctionSignature;
+/** A `data.query(...)` call site found in a FEEL expression. */
+export interface DataQueryCall {
+	/**
+	 * The datasource alias named as the first argument in the two-argument form
+	 * `data.query("alias", "SELECT …")`. `null` for the single-argument form
+	 * `data.query("SELECT …")` (which uses `data.default`) or when the first
+	 * argument is not a plain string literal (dynamic — unverifiable, never a
+	 * false error), mirroring the conservative stance of `bodyPaths`.
+	 */
+	source: string | null;
+	/** Offset of the `data.query` occurrence in the expression. */
+	index: number;
+}
+/**
+ * Extract the `data.query(...)` call sites in a FEEL expression. Conservative on
+ * purpose: it reports the alias only for the two-argument form whose first
+ * argument is a plain string literal; the single-argument (default-source) form
+ * and any dynamic first argument yield `source: null` so validation never flags
+ * a call it cannot verify.
+ */
+export declare function dataQueryCalls(feel: string): DataQueryCall[];
 /** The kinds of reference a manifest string value can be. */
 export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "output-type" | "form-ref" | "process-ref" | "datasource" | "agent";
-export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "form" | "datasource" | "agent" | "variable";
+export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "form" | "datasource" | "agent" | "function" | "variable";
 export interface CompletionCandidate {
 	/** The literal id/name to insert (unquoted). */
 	value: string;

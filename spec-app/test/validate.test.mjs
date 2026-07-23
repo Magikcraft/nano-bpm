@@ -229,3 +229,23 @@ test("a form field's datasource binding must name a declared source (ADR 0024 §
   );
   assert.equal(result.ok, false);
 });
+
+test("data.query in a trigger action must name a declared datasource (ADR 0024 §5)", async () => {
+  const index = await buildSymbolIndex(models);
+  const m = manifest();
+  // Unknown alias → diagnostic; the default-source form and a declared alias are fine.
+  m.triggers[1].action.correlationKey = '= data.query("ghost", "SELECT room FROM t")';
+  m.triggers[0].action.variables = '= { seed: data.query("SELECT 1"), ok: data.query("app", "SELECT 1") }';
+  const result = validateManifest(m, index);
+  assert.equal(result.ok, false);
+  assert.deepEqual(codesFor(result, "/triggers/1/action/correlationKey"), ["unknown-datasource"]);
+  // default-source + declared "app" alias → no diagnostics on triggers[0].
+  assert.deepEqual(codesFor(result, "/triggers/0/action/variables"), []);
+});
+
+test("data.query alias validation is intra-manifest (runs without an index)", () => {
+  const m = manifest();
+  m.triggers[1].action.correlationKey = '= data.query("ghost", "SELECT 1")';
+  const result = validateManifest(m); // no index
+  assert.deepEqual(codesFor(result, "/triggers/1/action/correlationKey"), ["unknown-datasource"]);
+});

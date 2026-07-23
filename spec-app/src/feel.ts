@@ -221,3 +221,93 @@ function bindingScope(
   if (!isDeclaredType(manifest, typeId)) return undefined;
   return scopeVarsForType(manifest, typeId);
 }
+
+// ---------------------------------------------------------------------------
+// The `data.query` App-tier FEEL builtin (ADR 0024 §5).
+//
+// `data.query` reads an App datasource from *App-tier* FEEL — the expressions
+// the App runtime evaluates outside the engine's replayable path (I/O trigger
+// actions, forms, App-side decisions). It is deliberately NOT an engine FEEL
+// builtin: the engine's FEEL (conditions, I/O mappings, correlation-key
+// evaluation) must stay pure and deterministic so a journal replay never
+// diverges, and the engine must stay untyped/Zeebe-pure with the datasource as
+// App-owned state-at-rest. A trigger action computes its value App-side and
+// hands the engine a literal, so determinism is preserved.
+//
+// Because FEEL evaluation is synchronous and a datasource read is async, the
+// runtime resolves `data.query(...)` calls by pre-resolution (collect the
+// calls, run them read-only through the datasource gateway, substitute the
+// results, then evaluate the expression) — the same shape as the form option
+// binding (ADR 0024 §5). This module supplies the *contract* (signature for
+// editor surfacing) and a pure call extractor (for alias validation and, later,
+// that pre-resolution); the runtime wiring lands in a follow-up.
+// ---------------------------------------------------------------------------
+
+/** The `data.query` builtin's editor-facing signature descriptor. */
+export interface FeelFunctionSignature {
+  /** The callable name as written in FEEL. */
+  name: string;
+  /** One-line human hint for autocomplete/detail. */
+  detail: string;
+  /** The accepted call forms, most-specific first. */
+  forms: string[];
+  /** A longer description for signature/documentation surfaces. */
+  doc: string;
+}
+
+/**
+ * The `data.query` builtin contract (ADR 0024 §5). Read-only: it reads from a
+ * datasource, never writes. Two forms — an explicit alias, or the default
+ * source (`data.default`) when the alias is omitted.
+ */
+export const DATA_QUERY: FeelFunctionSignature = {
+  name: "data.query",
+  detail: "read a datasource (App-tier, read-only)",
+  forms: [`data.query(source, sql)`, `data.query(sql)`],
+  doc:
+    "Read rows from an App datasource. `source` names a declared `data.sources` " +
+    "alias; omit it to use `data.default`. Read-only, and available only in " +
+    "App-tier FEEL (trigger actions, forms) — never in engine FEEL, which stays " +
+    "deterministic (ADR 0024 §5).",
+};
+
+/** A `data.query(...)` call site found in a FEEL expression. */
+export interface DataQueryCall {
+  /**
+   * The datasource alias named as the first argument in the two-argument form
+   * `data.query("alias", "SELECT …")`. `null` for the single-argument form
+   * `data.query("SELECT …")` (which uses `data.default`) or when the first
+   * argument is not a plain string literal (dynamic — unverifiable, never a
+   * false error), mirroring the conservative stance of `bodyPaths`.
+   */
+  source: string | null;
+  /** Offset of the `data.query` occurrence in the expression. */
+  index: number;
+}
+
+// `data.query(` with tolerant whitespace around the dot and before the paren.
+const DATA_QUERY_CALL = /\bdata\s*\.\s*query\s*\(/g;
+// A FEEL double-quoted string literal (with escapes) at the current position.
+const STRING_LITERAL = /^\s*"((?:[^"\\]|\\.)*)"\s*([,)])/;
+
+/**
+ * Extract the `data.query(...)` call sites in a FEEL expression. Conservative on
+ * purpose: it reports the alias only for the two-argument form whose first
+ * argument is a plain string literal; the single-argument (default-source) form
+ * and any dynamic first argument yield `source: null` so validation never flags
+ * a call it cannot verify.
+ */
+export function dataQueryCalls(feel: string): DataQueryCall[] {
+  const out: DataQueryCall[] = [];
+  DATA_QUERY_CALL.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = DATA_QUERY_CALL.exec(feel)) !== null) {
+    const rest = feel.slice(m.index + m[0].length);
+    const lit = STRING_LITERAL.exec(rest);
+    // Two-argument form (`"alias" ,`) names the source; single-argument
+    // (`"sql" )`) uses the default; anything else is dynamic/unverifiable.
+    const source = lit && lit[2] === "," ? lit[1] : null;
+    out.push({ source, index: m.index });
+  }
+  return out;
+}
