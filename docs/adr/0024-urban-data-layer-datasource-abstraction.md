@@ -1,6 +1,6 @@
 # ADR 0024 — Urban data layer & datasource abstraction (the BDE alias, for Nano Apps)
 
-Status: **Accepted** (phases 1–2 *datasource-core* + *db-manager-panel* implemented; phase 3 *datasource-bindings* partially implemented — the §5 form field binding; the FEEL `data.query` builtin and chat `query-data` tool remain Proposed, as does phase 4).
+Status: **Accepted** (phases 1–2 *datasource-core* + *db-manager-panel* implemented; phase 3 *datasource-bindings* partially implemented — the §5 form field binding + the FEEL `data.query` builtin's spec-first contract (signature/autocomplete + `unknown-datasource` alias validation, App-tier decision recorded in §5); the `data.query` runtime pre-resolution and chat `query-data` tool remain Proposed, as does phase 4).
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md`, **Urban** — the RAD App bundle; this ADR
 expands its §D "Data layer" from a single SQLite file into a named-datasource seam),
@@ -141,12 +141,32 @@ This is what makes it *Urban* rather than a SQLite GUI bolted on:
   controls.
 - **Processes / workers** — a worker handler receives an injected `ctx.data("app")` handle; no
   per-handler connection boilerplate.
-- **FEEL** — expose a `data.query(...)` builtin (the read access ADR 0022 §D already promised) so
-  decisions and message correlation can read App state.
+- **FEEL** — expose a read-only `data.query(source, sql)` builtin (the read access ADR 0022 §D
+  already promised) so App-tier FEEL can read App state. **This is an App-tier builtin, not an engine
+  FEEL function** (see the engine-vs-App-tier decision below): the App evaluates it where reading
+  state-at-rest is sound — I/O trigger actions (ADR 0025), forms, App-side decisions — and hands the
+  engine a plain literal. The engine's FEEL stays pure.
 - **Chat agent (ADR 0022 §E)** — its `query-data` tool *is* `DataSource.query` against the default
   source, **read-only by default**; a source is writable to the agent only when the manifest opts
   it in. (This resolves the §E "which capabilities are safe as LLM tools" question for the data
   axis.)
+
+> **`data.query` — engine-vs-App-tier decision (2026-07-23).** `data.query` is an **App-tier FEEL
+> builtin, never an engine builtin.** The engine's FEEL (gateway conditions, I/O mappings,
+> correlation-key evaluation) runs in the replayable execution path and must stay pure and
+> deterministic — a datasource read there would (a) diverge on journal replay, since the DB is mutable
+> external state, and (b) couple the durable engine to App-owned state-at-rest, breaking the
+> engine-stays-Zeebe-pure invariant. So the earlier "message correlation can read App state" aspiration
+> is **rejected as unsound**; the correct pattern is a worker that queries App data and writes a
+> process variable, then correlates on that variable. `data.query` lives only in the FEEL the *App*
+> evaluates outside the engine (trigger actions, forms, App-side decisions), resolved **read-only**
+> through the datasource gateway (ADR 0024 phase 2). Because FEEL evaluates synchronously while a
+> datasource read is async, the runtime resolves calls by **pre-resolution** — collect the
+> `data.query(...)` calls, run them through the gateway, substitute the results, then evaluate the
+> expression synchronously (the same shape as the §5 form option binding). *Shipped first:* the
+> spec-first contract — the builtin signature (editor autocomplete/signature), a pure call extractor
+> (`dataQueryCalls`), and `unknown-datasource` validation of `data.query("alias", …)` against
+> `data.sources` in trigger-action FEEL. The runtime pre-resolution wiring follows.
 
 The datasource is also the **resting bank** of the motion↔rest bridge ADR 0030 §4 names. A domain
 type (ADR 0029) declared once is the *same* object in flight (process variables) and at rest (a row
@@ -187,7 +207,10 @@ tenant **row-level scoping** (Postgres RLS vs. app-level filters) is a shared op
    **"Data source (Urban)"** properties-panel inspector (pick an alias, write the query, name the
    value/label columns — no JSON hand-editing); the console Form **Preview** resolves it live through
    the phase-2 gateway into a data-aware control, and `validate.ts` cross-checks the `source` against
-   declared `data.sources`) + FEEL `data.query` builtin (*Proposed*) + the chat `query-data` tool
+   declared `data.sources`) + FEEL `data.query` builtin (*contract implemented* — App-tier read-only
+   builtin per §5; `data.query` autocomplete/signature in the FEEL editor and `unknown-datasource`
+   alias validation of `data.query("alias", …)` in trigger-action FEEL, with the pure `dataQueryCalls`
+   extractor; the runtime pre-resolution is *Proposed*) + the chat `query-data` tool
    (read-only default, *Proposed*).
 4. **datasource-postgres-pack** — the first `nano-ide-data-*` pack (Postgres), proving the axis and
    the SQLite→Postgres alias flip end-to-end.

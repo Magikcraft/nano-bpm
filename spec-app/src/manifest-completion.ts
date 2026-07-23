@@ -14,7 +14,7 @@
 
 import { DOMAIN_PRIMITIVES } from "./symbol-index.ts";
 import type { SymbolIndex } from "./symbol-index.ts";
-import { fieldsOf } from "./feel.ts";
+import { DATA_QUERY, fieldsOf } from "./feel.ts";
 
 /** The kinds of reference a manifest string value can be. */
 export type ReferenceSite =
@@ -39,6 +39,7 @@ export type CandidateKind =
   | "form"
   | "datasource"
   | "agent"
+  | "function" // a FEEL builtin call (e.g. data.query, ADR 0024 §5)
   | "variable"; // a FEEL variable-path segment (ADR 0029 §5)
 
 export interface CompletionCandidate {
@@ -379,10 +380,21 @@ function feelCandidates(
   const range = { start: offset - seg.length, end: e };
   const prefix = segs.slice(0, -1); // the resolved portion before the caret
 
-  // Root position (no dot yet): offer `body`, the event-body binding.
+  // Root position (no dot yet): offer `body`, the event-body binding, and the
+  // `data.query` App-tier datasource builtin (ADR 0024 §5).
   if (prefix.length === 0) {
     return {
-      candidates: [{ value: "body", kind: "variable", detail: bodyType ?? "event body" }],
+      candidates: [
+        { value: "body", kind: "variable", detail: bodyType ?? "event body" },
+        { value: DATA_QUERY.name, kind: "function", detail: DATA_QUERY.detail },
+      ],
+      range,
+    };
+  }
+  // `data.` — complete the `query` builtin member (ADR 0024 §5).
+  if (prefix.length === 1 && prefix[0] === "data") {
+    return {
+      candidates: [{ value: "query", kind: "function", detail: DATA_QUERY.detail }],
       range,
     };
   }
