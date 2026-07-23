@@ -899,7 +899,7 @@ function EditorPane({
   // edits are reflected. Absent/invalid manifest → no bound variables.
   const [manifestText, setManifestText] = useState<string | null>(null);
   useEffect(() => {
-    if (kind !== "dmn" && kind !== "bpmn") {
+    if (kind !== "dmn" && kind !== "bpmn" && kind !== "form") {
       setManifestText(null);
       return;
     }
@@ -958,6 +958,15 @@ function EditorPane({
     ],
     [manifest, primaryProcessId],
   );
+  // Datasource aliases declared in the App manifest (`data.sources`), for the
+  // form editor's "Data source" binding inspector (ADR 0024 §5). Recomputed when
+  // the manifest reloads; the FormEditor reads it lazily via getDataSources.
+  const dataSourceNames = useMemo<string[]>(() => {
+    const sources = (manifest as { data?: { sources?: unknown } } | undefined)?.data?.sources;
+    if (!sources || typeof sources !== "object") return [];
+    return Object.keys(sources as Record<string, unknown>);
+  }, [manifest]);
+  const formGetDataSources = useCallback(() => dataSourceNames, [dataSourceNames]);
 
   useEffect(() => {
     let alive = true;
@@ -1392,7 +1401,11 @@ function EditorPane({
               absolute positioning (mirrors the BPMN visual/xml split).
             */}
             <div className={formView === "visual" ? "h-full" : "h-full invisible"}>
-              <FormEditor ref={formRef} onChange={() => setDirty(true)} />
+              <FormEditor
+                ref={formRef}
+                onChange={() => setDirty(true)}
+                getDataSources={formGetDataSources}
+              />
             </div>
             {formView === "json" && (
               <div className="absolute inset-0 bg-app">
