@@ -156,8 +156,8 @@ export function resolveSource(
 export async function listSources(
   cwd?: string,
 ): Promise<{ default?: string; sources: ResolvedSource[] }> {
-  const { data } = await findManifest(cwd ?? Deno.cwd());
-  const env = (k: string) => Deno.env.get(k);
+  const { data } = await findManifest(cwd ?? RT.cwd());
+  const env = (k: string) => RT.env(k);
   const sources = Object.entries(data.sources).map(([name, raw]) =>
     resolveSource(name, raw, env)
   );
@@ -293,7 +293,7 @@ class SqliteDataSource implements DataSource {
 const CACHE = new Map<string, DataSource>();
 
 export interface OpenOptions {
-  /** Directory to begin the manifest search from. Defaults to `Deno.cwd()`. */
+  /** Directory to begin the manifest search from. Defaults to the runtime cwd. */
   cwd?: string;
 }
 

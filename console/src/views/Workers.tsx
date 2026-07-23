@@ -89,6 +89,7 @@ export default function Workers() {
   });
   const workers = data?.workers ?? [];
   const denoAvailable = data?.denoAvailable ?? true;
+  const nodeAvailable = data?.nodeAvailable ?? true;
   const current = workers.find((w) => w.name === selected);
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ["workers"] });
@@ -191,8 +192,8 @@ export default function Workers() {
           title="Embedded Workers"
           subtitle={
             IS_STUDIO
-              ? "Author TypeScript job workers and run them as sandboxed Deno processes over the Falcon."
-              : "Monitor job workers running as sandboxed Deno processes over the Falcon."
+              ? "Author TypeScript job workers and run them as isolated processes (Node, or sandboxed Deno) over the Falcon."
+              : "Monitor job workers running as isolated processes (Node, or sandboxed Deno) over the Falcon."
           }
           actions={
             <div className="flex gap-1 rounded-lg bg-inset p-1 text-sm">
@@ -217,10 +218,10 @@ export default function Workers() {
         />
       </div>
 
-      {!denoAvailable && (
+      {!nodeAvailable && !denoAvailable && (
         <div className="border-b border-warn/30 bg-warn/10 px-6 py-2 text-xs text-warn">
-          Deno runtime not found — you can author workers, but starting them requires Deno on PATH
-          (or set NANOBPMN_DENO_BIN). Install from https://deno.com.
+          No JavaScript runtime found — you can author workers, but starting them needs Node ≥ 22.6
+          (the npm launcher provides one) or Deno. Install Node from https://nodejs.org.
         </div>
       )}
       {message && (
