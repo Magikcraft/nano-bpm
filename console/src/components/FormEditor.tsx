@@ -5,6 +5,7 @@ import {
 } from "@bpmn-io/form-js-editor";
 import "@bpmn-io/form-js/dist/assets/form-js.css";
 import "@bpmn-io/form-js/dist/assets/form-js-editor.css";
+import { createFormDataBindingModule } from "../lib/formDataBindingProperties";
 
 type JsonPrimitive = string | number | boolean | null;
 type JsonValue = JsonPrimitive | { [key: string]: JsonValue } | JsonValue[];
@@ -31,6 +32,11 @@ interface FormEditorProps {
   /// Called whenever the schema changes (after the first import). The initial
   /// blank schema does not mark dirty.
   onChange?: () => void;
+  /// Returns the datasource aliases (`data.sources`) declared in the current
+  /// project's `nano.app.json`, driving the "Data source" binding inspector's
+  /// dropdown (ADR 0024 §5). Read lazily so a project switch reflects the right
+  /// list. Absent → no datasources (the inspector still shows, just empty).
+  getDataSources?: () => string[];
 }
 
 const createEmptySchema = (): FormSchema => ({
@@ -48,9 +54,13 @@ const parseSchema = (json: string): FormSchema => {
 };
 
 const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
-  function FormEditor({ onChange }, ref) {
+  function FormEditor({ onChange, getDataSources }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const editorRef = useRef<FormJsEditor | null>(null);
+    // Keep the datasource accessor in a ref so the editor (built once) always
+    // reads the current project's list without needing a remount.
+    const getDataSourcesRef = useRef(getDataSources);
+    getDataSourcesRef.current = getDataSources;
     // Set once the editor has been destroyed, so async work already in flight
     // doesn't touch a dead instance.
     const disposedRef = useRef(false);
@@ -97,7 +107,12 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
     useEffect(() => {
       if (!containerRef.current) return;
       disposedRef.current = false;
-      const editor = new FormJsEditor({ container: containerRef.current });
+      const editor = new FormJsEditor({
+        container: containerRef.current,
+        additionalModules: [
+          createFormDataBindingModule(() => getDataSourcesRef.current?.() ?? []),
+        ],
+      });
       editorRef.current = editor;
 
       const handleChanged = () => {
