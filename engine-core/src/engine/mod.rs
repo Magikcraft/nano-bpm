@@ -899,6 +899,19 @@ impl Engine {
                             container_key,
                             cancel: true,
                         });
+                    } else if result.completion_condition_fulfilled {
+                        // The agent asserts the container's completion condition is
+                        // met (Camunda `isCompletionConditionFulfilled`): complete
+                        // now, cancelling any tools still running so none is orphaned
+                        // (ADR 0023 seam 4). This is honoured independently of the
+                        // engine-side `<completionCondition>` FEEL (evaluated per
+                        // tool completion), so an agent can end the loop even when no
+                        // static condition is declared.
+                        queue.push_back(Step::CompleteAdHoc {
+                            instance_key,
+                            container_key,
+                            cancel: true,
+                        });
                     } else {
                         let already_active = self
                             .state
@@ -3341,6 +3354,26 @@ impl Engine {
             .cloned()
     }
 
+    /// The `zeebe:ioMapping` of one tool inside an ad-hoc container, read from the
+    /// container's catalog (the tool element is pruned from the executable graph,
+    /// so `io_inputs`/`io_outputs` — which look it up by element id — return
+    /// nothing for it). Empty when the tool declares no mappings (ADR 0023 seam 4).
+    fn adhoc_tool_io(
+        &self,
+        instance_key: Key,
+        container_element_id: &str,
+        tool_element_id: &str,
+    ) -> crate::model::IoMapping {
+        self.adhoc_def_of(instance_key, container_element_id)
+            .and_then(|def| {
+                def.tools
+                    .iter()
+                    .find(|t| t.element_id == tool_element_id)
+                    .map(|t| t.io.clone())
+            })
+            .unwrap_or_default()
+    }
+
     /// Activates one ad-hoc "tool" child (ADR 0023 seam 2): instantiates
     /// `element_id` inside the container scope, seeding the agent's
     /// activate-element `variables` as the child's local overlay, and marks it
@@ -3362,6 +3395,30 @@ impl Engine {
         let mut child_vars = (*self.variables_for_element(instance_key, container_key)).clone();
         child_vars.extend(variables.clone());
 
+        // The container element id anchors both the tool's catalog lookups (job
+        // type below, ioMapping here) and its scope.
+        let container_element_id = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+            .map(|a| a.element_id.clone());
+
+        // Tool input mappings (ADR 0023 seam 4): a tool's own `zeebe:ioMapping`
+        // inputs are evaluated against the activating view (container scope +
+        // agent seed variables) and folded into the child's local scope, exactly
+        // like a leaf activity's inputs — but sourced from the container catalog
+        // because the tool element is pruned from the executable graph.
+        let mut local_variables = variables;
+        if let Some(cid) = container_element_id.as_deref() {
+            let inputs = self.adhoc_tool_io(instance_key, cid, &element_id).inputs;
+            if !inputs.is_empty() {
+                let input_updates = self.eval_io_mappings_in(&child_vars, &inputs);
+                child_vars.extend(input_updates.clone());
+                local_variables.extend(input_updates);
+            }
+        }
+
         let mut events = vec![
             Event::ElementActivating {
                 instance_key,
@@ -3378,7 +3435,7 @@ impl Engine {
                 instance_key,
                 container_key,
                 child_key,
-                local_variables: variables,
+                local_variables,
             },
         ];
         let mut followups = Vec::new();
@@ -3391,12 +3448,6 @@ impl Engine {
         // other kind passes straight through to completion (feeding the loop).
         // v1 targets single-activity tools; the catalog does not carry per-tool
         // retries/priority, so those default (a later refinement).
-        let container_element_id = self
-            .state
-            .instances
-            .get(&instance_key)
-            .and_then(|i| i.adhoc_instances.get(&container_key))
-            .map(|a| a.element_id.clone());
         let tool_job_type = container_element_id
             .as_deref()
             .and_then(|cid| self.adhoc_def_of(instance_key, cid))
@@ -3450,6 +3501,7 @@ impl Engine {
         element_id: String,
         container_key: Key,
     ) -> (Vec<Event>, Vec<Step>) {
+        let tool_element_id = element_id.clone();
         let mut events = vec![
             Event::ElementCompleting {
                 instance_key,
@@ -3487,6 +3539,54 @@ impl Engine {
             child_key: child_eik,
             output,
         });
+        // Tool output mappings (ADR 0023 seam 4): project the tool's result into
+        // the container scope, sourced from the container catalog (the pruned tool
+        // has no element entry, so `io_outputs` cannot see it). Evaluated in the
+        // child's local scope while it is still resident — its `ElementCompleted`
+        // above tears the scope down only when the caller applies the events.
+        let output_updates = {
+            let outputs = self
+                .adhoc_tool_io(instance_key, &container_element_id, &tool_element_id)
+                .outputs;
+            if outputs.is_empty() {
+                HashMap::new()
+            } else {
+                let vars = self.variables_for_element(instance_key, child_eik);
+                self.eval_io_mappings_in(&vars, &outputs)
+            }
+        };
+        if !output_updates.is_empty() {
+            events.extend(self.propagated_updates(
+                instance_key,
+                container_key,
+                output_updates.clone(),
+                false,
+            ));
+        }
+        // Completion condition (ADR 0023 seam 4): a declared `<completionCondition>`
+        // is evaluated after each tool completes, against the container scope
+        // overlaid with the output mappings just projected into it. When true, the
+        // container completes now, cancelling any tools still running this turn —
+        // exactly like a multi-instance body's early completion.
+        let completion_now = self
+            .adhoc_def_of(instance_key, &container_element_id)
+            .and_then(|def| def.completion_condition)
+            .map(|cond| {
+                let mut ctx = (*self.variables_for_element(instance_key, container_key)).clone();
+                ctx.extend(output_updates);
+                matches!(crate::feel::eval_bool(&cond, &ctx), Ok(true))
+            })
+            .unwrap_or(false);
+        if completion_now {
+            return (
+                events,
+                vec![Step::CompleteAdHoc {
+                    instance_key,
+                    container_key,
+                    cancel: true,
+                }],
+            );
+        }
         // `active_now` still counts this child (its removal above is not yet
         // applied), so the last tool of the turn is the one leaving one active.
         let others = active_now.saturating_sub(1);

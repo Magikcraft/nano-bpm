@@ -7661,3 +7661,295 @@ fn plain_job_completion_ignores_absent_adhoc_result() {
         .map(|i| i.adhoc_instances.is_empty())
         .unwrap_or(true));
 }
+
+// --- ADR 0023 seam 4: completion condition + tool ioMapping ---------------
+
+fn adhoc_completion_condition_process() -> ProcessDefinition {
+    // An ad-hoc container whose `<completionCondition>` ends the loop once a tool
+    // sets `done = true`. Two tools are activatable so the condition firing after
+    // the first completes must cancel the second.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:completionCondition>=done = true</bpmn:completionCondition>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn adhoc_completion_condition_ends_the_loop_and_cancels_remaining_tools() {
+    // The declared `<completionCondition>` is evaluated after each tool completes:
+    // the first tool sets `done = true`, so the container completes at once —
+    // without another agent turn — and cancels the still-running second tool.
+    assert_eq!(
+        adhoc_completion_condition_process().adhoc[0]
+            .completion_condition
+            .as_deref(),
+        Some("=done = true"),
+        "the ad-hoc container's completionCondition is parsed onto the catalog"
+    );
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_completion_condition_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+
+    // Turn 1: activate both tools.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        2,
+        "both tools active"
+    );
+
+    // Complete only toolA, returning `done = true`; the completion condition then
+    // fires and the container completes, cancelling toolB.
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    let job_a = tool_jobs
+        .iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job");
+    let mut vars = HashMap::new();
+    vars.insert("done".to_string(), Value::Bool(true));
+    vars.insert("result".to_string(), Value::Str("A".to_string()));
+    let final_events = engine
+        .apply_command(Command::complete_job_with(job_a.key, vars))
+        .unwrap();
+
+    assert!(
+        engine.is_completed(inst),
+        "completion condition ends the container after the first tool"
+    );
+    assert!(
+        engine
+            .instance(inst)
+            .map(|i| i.adhoc_instances.is_empty())
+            .unwrap_or(true),
+        "ad-hoc runtime state torn down"
+    );
+    let results = final_events.iter().find_map(|e| match e {
+        Event::VariablesUpdated { variables, .. } => variables.get("results").cloned(),
+        _ => None,
+    });
+    assert_eq!(
+        results,
+        Some(Value::List(vec![Value::Str("A".to_string())])),
+        "only the completed tool's output is collected; toolB was cancelled"
+    );
+}
+
+fn adhoc_tool_io_process() -> ProcessDefinition {
+    // A container whose tool declares a `zeebe:ioMapping`: an input mapping
+    // (`=base + 1` → `n`, local to the tool) and an output mapping
+    // (`=result` → `status`, projected into the container scope). The container's
+    // completionCondition reads that projected `status`.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:completionCondition>=status = "ok"</bpmn:completionCondition>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+                <zeebe:ioMapping>
+                  <zeebe:input source="=base + 1" target="n" />
+                  <zeebe:output source="=result" target="status" />
+                </zeebe:ioMapping>
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn adhoc_tool_io_mapping_applies_inputs_on_activation_and_outputs_on_completion() {
+    let proc = adhoc_tool_io_process();
+    let tool = proc.adhoc[0]
+        .tools
+        .iter()
+        .find(|t| t.element_id == "toolA")
+        .unwrap();
+    assert_eq!(
+        tool.io.inputs.len(),
+        1,
+        "tool input mapping retained on catalog"
+    );
+    assert_eq!(
+        tool.io.outputs.len(),
+        1,
+        "tool output mapping retained on catalog"
+    );
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(proc)).unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            HashMap::from([("base".to_string(), Value::Int(1))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+
+    // Turn 1: activate toolA. Its input mapping `=base + 1` should resolve `n = 2`
+    // local to the tool's own scope.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let child = *engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap()
+        .active
+        .iter()
+        .next()
+        .expect("toolA active");
+    let local = engine
+        .instance(inst)
+        .unwrap()
+        .scope_variables
+        .get(&child)
+        .cloned()
+        .unwrap_or_default();
+    assert_eq!(
+        local.get("n"),
+        Some(&Value::Int(2)),
+        "input mapping evaluated into the tool's local scope"
+    );
+
+    // Complete toolA returning `result = "ok"`; the output mapping projects
+    // `status = "ok"` into the container scope, which satisfies the completion
+    // condition and ends the container.
+    let job = engine
+        .activate_jobs("tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "toolA")
+        .unwrap();
+    engine
+        .apply_command(Command::complete_job_with(
+            job.key,
+            HashMap::from([("result".to_string(), Value::Str("ok".to_string()))]),
+        ))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "output-mapped `status` satisfies the completion condition"
+    );
+}
+
+#[test]
+fn adhoc_agent_completion_flag_completes_without_activating_and_cancels() {
+    // The agent's `isCompletionConditionFulfilled` flag ends the loop even when it
+    // also returns activate-element instructions: the container completes at once
+    // and no tool is activated.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "completion flag ends the container"
+    );
+    assert!(
+        engine
+            .instance(inst)
+            .map(|i| i.adhoc_instances.is_empty())
+            .unwrap_or(true),
+        "runtime state torn down; no tool left active"
+    );
+    // No `tool` job was ever created — the activate instruction was superseded.
+    assert!(
+        engine.activate_jobs("tool", "W", 10, 1_000, 0).is_empty(),
+        "the completion flag supersedes the activate-element instruction"
+    );
+    let _ = container;
+}

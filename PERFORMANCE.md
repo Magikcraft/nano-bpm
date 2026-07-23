@@ -45,11 +45,13 @@ orchestration, where the ad-hoc container is an ordinary job worker and its
 - **Supported (v1):** single-level ad-hoc container (`JOB_WORKER` impl);
   `activateElements` per agent turn; service/connector-task tools;
   `cancelRemainingInstances`; `outputCollection`/`outputElement` aggregation;
-  agent re-iteration until completion.
-- **Deferred:** FEEL `completionCondition` and activated-element `ioMapping`
-  (seam 4); the `BPMN_TASK` `activeElementsCollection` declarative variant;
-  nested ad-hoc (agent-of-agents); boundary events on tools; compensation inside
-  ad-hoc; per-tool retries/priority (currently defaulted).
+  FEEL `<completionCondition>` (evaluated after each tool completes, and the
+  agent's `isCompletionConditionFulfilled` flag); activated-tool `zeebe:ioMapping`
+  (inputs on activation, outputs into the container scope); agent re-iteration
+  until completion.
+- **Deferred:** the `BPMN_TASK` `activeElementsCollection` declarative variant
+  (v1.1); nested ad-hoc (agent-of-agents); boundary events on tools; compensation
+  inside ad-hoc; per-tool retries/priority (currently defaulted).
 
 **Observability.** Every tool activation is a first-class **read-model element
 instance** — the engine emits the standard `ElementActivated`/`ElementCompleted`
