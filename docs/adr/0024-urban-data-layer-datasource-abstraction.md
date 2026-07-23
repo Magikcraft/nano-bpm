@@ -183,10 +183,12 @@ tenant **row-level scoping** (Postgres RLS vs. app-level filters) is a shared op
 2. **db-manager-panel** — *implemented.* The §4 Data tab (Tables / SQL / Migrations) over a named datasource,
    reusing the Monaco/panel pattern.
 3. **datasource-bindings** — §5 form field binding (*implemented* — a form-js choice field declares a
-   `dataSource` binding `{ source, query, value?, label? }`; the console Form **Preview** resolves it
-   live through the phase-2 gateway into a data-aware control, and `validate.ts` cross-checks the
-   `source` against declared `data.sources`) + FEEL `data.query` builtin (*Proposed*) + the chat
-   `query-data` tool (read-only default, *Proposed*).
+   `dataSource` binding `{ source, query, value?, label? }`, authored visually via the form editor's
+   **"Data source (Urban)"** properties-panel inspector (pick an alias, write the query, name the
+   value/label columns — no JSON hand-editing); the console Form **Preview** resolves it live through
+   the phase-2 gateway into a data-aware control, and `validate.ts` cross-checks the `source` against
+   declared `data.sources`) + FEEL `data.query` builtin (*Proposed*) + the chat `query-data` tool
+   (read-only default, *Proposed*).
 4. **datasource-postgres-pack** — the first `nano-ide-data-*` pack (Postgres), proving the axis and
    the SQLite→Postgres alias flip end-to-end.
 
