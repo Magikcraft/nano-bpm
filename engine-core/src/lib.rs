@@ -92,13 +92,13 @@ pub use event::Event;
 pub use feel::FeelError;
 pub use model::{
     AdHocActivateElement, AdHocImplementationType, AdHocJobResult, AdHocSubProcessDef, AdHocTool,
-    AdHocToolKind, BuildError, Condition, Element, ElementId, ElementKind, IoMapping, Mapping,
-    MultiInstance, ProcessBuilder, ProcessDefinition, SequenceFlow, TimerDef, TimerDefKind,
-    UserTaskProps, Value,
+    AdHocToolKind, BuildError, Condition, Element, ElementId, ElementKind, ExecutionListener,
+    IoMapping, ListenerEventType, Mapping, MultiInstance, ProcessBuilder, ProcessDefinition,
+    SequenceFlow, TimerDef, TimerDefKind, UserTaskProps, Value,
 };
 pub use state::{
     compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,
-    Incident, IncidentKind, IncidentState, InstanceSnapshot, Job, JobState, Key,
+    Incident, IncidentKind, IncidentState, InstanceSnapshot, Job, JobKind, JobState, Key,
     MessageStartSubscription, MessageSubscription, MessageSubscriptionKind,
     MessageSubscriptionState, ProcessInstance, ProcessInstanceState, SignalSubscription,
     StartTimer, State, Timer, TimerKind, TimerState, UserTask, UserTaskState, DEFAULT_JOB_PRIORITY,

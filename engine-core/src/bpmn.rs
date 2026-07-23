@@ -173,6 +173,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // activity. `in_io_mapping` gates input/output reads to a real ioMapping.
     let mut io_stack: Vec<usize> = Vec::new();
     let mut in_io_mapping = false;
+    // Gates `zeebe:executionListener` reads to a real `zeebe:executionListeners`
+    // container; each listener attaches to the innermost open activity on the
+    // io_stack (ADR 0037). Listeners on non-activity nodes (gateways, events)
+    // are a deferred subset — they are not on the io_stack.
+    let mut in_execution_listeners = false;
 
     for token in &tokens {
         match token {
@@ -628,6 +633,38 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     }
                                 }
                             }
+                            // zeebe:executionListeners and its nested
+                            // zeebe:executionListener entries (ADR 0037). Each
+                            // listener attaches to the innermost open activity.
+                            "executionListeners" => {
+                                in_execution_listeners = true;
+                            }
+                            "executionListener" if in_execution_listeners => {
+                                if let (Some(&idx), Some(job_type)) =
+                                    (io_stack.last(), attr(attrs, "type"))
+                                {
+                                    // `eventType` defaults to "start" in Zeebe when
+                                    // omitted.
+                                    let event_type = match attr(attrs, "eventType") {
+                                        Some("end") => crate::model::ListenerEventType::End,
+                                        _ => crate::model::ListenerEventType::Start,
+                                    };
+                                    let retries = attr(attrs, "retries").map(str::to_string);
+                                    let listener = crate::model::ExecutionListener {
+                                        event_type,
+                                        job_type: job_type.to_string(),
+                                        retries,
+                                    };
+                                    match event_type {
+                                        crate::model::ListenerEventType::Start => {
+                                            acc.nodes[idx].start_listeners.push(listener)
+                                        }
+                                        crate::model::ListenerEventType::End => {
+                                            acc.nodes[idx].end_listeners.push(listener)
+                                        }
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -674,6 +711,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_multi_instance = None;
                     io_stack.clear();
                     in_io_mapping = false;
+                    in_execution_listeners = false;
                 }
                 "serviceTask" => {
                     cur_service_task = None;
@@ -705,6 +743,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     io_stack.pop();
                 }
                 "ioMapping" => in_io_mapping = false,
+                "executionListeners" => in_execution_listeners = false,
                 "startEvent" => cur_start = None,
                 "message" => cur_message = None,
                 "boundaryEvent" => {
@@ -959,6 +998,11 @@ struct NodeAcc {
     /// `multiInstanceLoopCharacteristics` child plus its
     /// `zeebe:loopCharacteristics` extension; `None` for a single-instance node.
     multi_instance: Option<crate::model::MultiInstance>,
+    /// Execution listeners (`zeebe:executionListener`) declared on this node,
+    /// split by `eventType` into start (fire on activation) and end (fire on
+    /// completion) lists, in declaration order (ADR 0037).
+    start_listeners: Vec<crate::model::ExecutionListener>,
+    end_listeners: Vec<crate::model::ExecutionListener>,
 }
 
 #[derive(Clone, Copy)]
@@ -1067,6 +1111,8 @@ impl ProcessAcc {
             decision_result_variable: None,
             event_condition: None,
             multi_instance: None,
+            start_listeners: Vec::new(),
+            end_listeners: Vec::new(),
         });
         Some(self.nodes.len() - 1)
     }
@@ -1277,6 +1323,9 @@ impl ProcessAcc {
             let retries_id = node.id.clone();
             let node_retries = node.retries.clone();
             let mi_id = node.id.clone();
+            let listeners_id = node.id.clone();
+            let node_start_listeners = node.start_listeners.clone();
+            let node_end_listeners = node.end_listeners.clone();
             // Only treat as multi-instance when an input collection was actually
             // declared; a bare `multiInstanceLoopCharacteristics` with no
             // `zeebe:loopCharacteristics inputCollection` degenerates to an
@@ -1425,6 +1474,10 @@ impl ProcessAcc {
             }
             if let Some(mi) = node_mi {
                 builder = builder.with_multi_instance(mi_id, mi);
+            }
+            if !node_start_listeners.is_empty() || !node_end_listeners.is_empty() {
+                builder =
+                    builder.with_listeners(listeners_id, node_start_listeners, node_end_listeners);
             }
         }
         for boundary in self.boundaries {
@@ -3068,6 +3121,68 @@ mod io_mapping_tests {
         let io2 = &def.element("t2").unwrap().io;
         assert!(io2.inputs.is_empty());
         assert_eq!(io2.outputs.len(), 1);
+    }
+
+    #[test]
+    fn parses_zeebe_execution_listeners() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="t">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+        <zeebe:executionListeners>
+          <zeebe:executionListener eventType="start" type="start-1" />
+          <zeebe:executionListener eventType="start" type="start-2" retries="5" />
+          <zeebe:executionListener eventType="end" type="end-1" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let el = def.element("t").unwrap();
+        assert_eq!(el.start_listeners.len(), 2);
+        assert_eq!(el.start_listeners[0].job_type, "start-1");
+        assert_eq!(el.start_listeners[0].retries, None);
+        assert_eq!(el.start_listeners[1].job_type, "start-2");
+        assert_eq!(el.start_listeners[1].retries.as_deref(), Some("5"));
+        assert_eq!(el.end_listeners.len(), 1);
+        assert_eq!(el.end_listeners[0].job_type, "end-1");
+        // A listener-free element carries empty lists.
+        assert!(def.element("s").unwrap().start_listeners.is_empty());
+        assert!(def.element("s").unwrap().end_listeners.is_empty());
+    }
+
+    #[test]
+    fn execution_listener_event_type_defaults_to_start() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="t">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="work" />
+        <zeebe:executionListeners>
+          <zeebe:executionListener type="only" />
+        </zeebe:executionListeners>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+        let def = &parse_bpmn(xml).unwrap()[0];
+        let el = def.element("t").unwrap();
+        assert_eq!(el.start_listeners.len(), 1);
+        assert!(el.end_listeners.is_empty());
     }
 }
 

@@ -75,6 +75,25 @@ impl Engine {
             .and_then(|e| e.retries.clone())
     }
 
+    /// The execution listeners declared on `element_id` for a given transition
+    /// (start = activation, end = completion), in declaration order (ADR 0037).
+    /// Empty for listener-free elements — the common case — so callers can gate
+    /// the listener machinery on a cheap `is_empty` check.
+    pub(crate) fn listeners_of(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+        event_type: crate::model::ListenerEventType,
+    ) -> Vec<crate::model::ExecutionListener> {
+        self.process_of_instance(instance_key)
+            .and_then(|p| p.element(element_id))
+            .map(|e| match event_type {
+                crate::model::ListenerEventType::Start => e.start_listeners.clone(),
+                crate::model::ListenerEventType::End => e.end_listeners.clone(),
+            })
+            .unwrap_or_default()
+    }
+
     /// Evaluates the given io mappings against an explicit variable context
     /// `vars` (rather than the instance's persisted variables), returning the
     /// merged projection. Used when an as-yet-unapplied result (e.g. a script
