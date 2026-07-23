@@ -376,7 +376,7 @@ fn check_deno() -> Dependency {
         id: "deno".into(),
         name: "Deno".into(),
         purpose:
-            "Running Nano's embedded job workers — each enabled worker runs as a sandboxed Deno subprocess."
+            "Preferred runtime for Nano's embedded job workers (each runs as a sandboxed Deno subprocess). Optional: on hosts without a Deno build (e.g. 32-bit ARM), workers fall back to Node >= 22.6."
                 .into(),
         bin,
         present,
