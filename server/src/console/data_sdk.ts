@@ -1,4 +1,4 @@
-// nanobpmn embedded datasource SDK (Deno) — ADR 0024.
+// nanobpmn embedded datasource SDK (Deno-preferred, Node-capable) — ADR 0024.
 //
 // Materialised verbatim to <workspace>/<project>/.nanobpm/data-sdk.ts and
 // imported as `@nanobpm/data` (or `./data-sdk.ts` from the sibling worker SDK).
@@ -20,9 +20,37 @@
 //     await db.exec("INSERT INTO orders(id) VALUES (?)", [job.variables.id]);
 //   }});
 //
-// Core ships SQLite only (Deno's `node:sqlite`, embedded, single-file, compiled
-// into the `deno compile` binary). Other drivers arrive as ADR 0007 packs on the
-// `nano-ide-data-*` axis; an unknown driver throws a pack-install hint.
+// Core ships SQLite only (the `node:sqlite` built-in — embedded, single-file —
+// present in both Deno and Node >= 22.5). Other drivers arrive as ADR 0007 packs
+// on the `nano-ide-data-*` axis; an unknown driver throws a pack-install hint.
+
+// Runtime adapter: the few host calls that differ between Deno (native `Deno.*`)
+// and Node (`process` / `node:fs`). Detected once at load; see ADR 0036.
+interface DataRuntime {
+  cwd(): string;
+  env(key: string): string | undefined;
+  readTextFile(path: string): Promise<string>;
+}
+const RT: DataRuntime = ((): DataRuntime => {
+  const g = globalThis as unknown as {
+    Deno?: {
+      cwd(): string;
+      env: { get(k: string): string | undefined };
+      readTextFile(p: string): Promise<string>;
+    };
+    process?: { cwd(): string; env: Record<string, string | undefined> };
+  };
+  if (g.Deno) {
+    const d = g.Deno;
+    return { cwd: () => d.cwd(), env: (k) => d.env.get(k), readTextFile: (p) => d.readTextFile(p) };
+  }
+  const p = g.process!;
+  return {
+    cwd: () => p.cwd(),
+    env: (k) => p.env[k],
+    readTextFile: async (path) => (await import("node:fs/promises")).readFile(path, "utf8"),
+  };
+})();
 
 /** One column of a table, from the datasource's introspected schema. */
 export interface ColumnMeta {
@@ -150,7 +178,7 @@ async function findManifest(startDir: string): Promise<ManifestLocation> {
   let dir = startDir.replace(/\/+$/, "");
   for (let i = 0; i < 12; i++) {
     try {
-      const text = await Deno.readTextFile(`${dir}/nano.app.json`);
+      const text = await RT.readTextFile(`${dir}/nano.app.json`);
       const json = JSON.parse(text) as { data?: ManifestData };
       const data = json.data ?? { sources: {} };
       return { root: dir, data: { default: data.default, sources: data.sources ?? {} } };
@@ -276,7 +304,7 @@ export async function openDataSource(
   name?: string,
   opts?: OpenOptions,
 ): Promise<DataSource> {
-  const cwd = opts?.cwd ?? Deno.cwd();
+  const cwd = opts?.cwd ?? RT.cwd();
   const { root, data } = await findManifest(cwd);
   const srcName = name ?? data.default ?? Object.keys(data.sources)[0];
   if (!srcName) {
@@ -288,7 +316,7 @@ export async function openDataSource(
       `datasource "${srcName}" is not declared in nano.app.json data.sources`,
     );
   }
-  const resolved = resolveSource(srcName, raw, (k) => Deno.env.get(k));
+  const resolved = resolveSource(srcName, raw, (k) => RT.env(k));
   const key = `${resolved.driver}::${resolved.url}`;
   const hit = CACHE.get(key);
   if (hit) return hit;

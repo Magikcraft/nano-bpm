@@ -333,7 +333,7 @@ export default function ProjectWorkspace() {
       {!runnable && (
         <div className="border-b border-warn/30 bg-warn/10 px-4 py-1.5 text-xs text-warn">
           {lang === "deno"
-            ? "No Deno runtime detected — Run and Compile are disabled. Authoring and Export still work."
+            ? "No Deno or Node runtime detected — Run and Compile for this project need Deno (deno.com) or Node ≥ 22.6. Authoring and Export still work."
             : `No ${lang} toolchain detected — install it (and approve the extension) to enable Run and Compile. Authoring and Export still work.`}
         </div>
       )}

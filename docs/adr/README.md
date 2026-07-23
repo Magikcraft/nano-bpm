@@ -46,6 +46,9 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0031](0031-process-relational-mapper.md) | The Process-Relational Mapper (an ORM whose third bank is the engine) | Proposed | 2026-07-21 |
 | [0032](0032-domain-resource-api.md) | The domain-resource API (the Kogito seam: process instances as first-class REST resources) | Proposed | 2026-07-22 |
 | [0033](0033-urban-element-templates-first-class-components.md) | Element templates as first-class Urban components (the Delphi palette for the process canvas) | Proposed | 2026-07-22 |
+| [0034](0034-console-build-profiles.md) | Console build profiles: a lean "observe" surface vs the full "studio" IDE | Accepted | 2026-07-23 |
+| [0035](0035-observability-config-and-standalone-console.md) | Full-fidelity Prometheus, a standalone console, and runtime observability config | Accepted | 2026-07-23 |
+| [0036](0036-dual-runtime-workers-deno-node-fallback.md) | Dual-runtime workers: Deno-preferred, Node fallback (32-bit ARM support) | Accepted | 2026-07-24 |
 
 ## Reading paths
 
