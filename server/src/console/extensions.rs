@@ -340,7 +340,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
                 key: "denoBin".into(),
                 label: "Deno binary".into(),
                 description: Some(
-                    "Path to the Deno runtime used to run embedded job workers. Auto-resolved from PATH / ~/.deno/bin when unset.".into(),
+                    "Path to the Deno runtime, used only to compile a project to a standalone binary (`deno compile`). Auto-resolved from PATH / ~/.deno/bin when unset.".into(),
                 ),
                 env: Some("NANOBPMN_DENO_BIN".into()),
                 default: Some("deno (on PATH)".into()),

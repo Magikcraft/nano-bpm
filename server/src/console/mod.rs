@@ -1925,6 +1925,7 @@ pub(super) async fn workers_list() -> ApiResult {
     Ok(serde_json::json!({
         "workers": out,
         "denoAvailable": workers::supervisor().deno_available(),
+        "nodeAvailable": workers::supervisor().node_available(),
     }))
 }
 
@@ -2288,6 +2289,7 @@ pub(super) async fn projects_list() -> ApiResult {
     Ok(serde_json::json!({
         "projects": out,
         "denoAvailable": sup.deno_available(),
+        "nodeAvailable": sup.node_available(),
         "platforms": projects::PLATFORMS,
         "templates": projects::project_templates(),
         "extensions": extensions_overview(),
@@ -2463,6 +2465,7 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
         "files": tree,
         "runState": sup.run_state(name).await,
         "denoAvailable": sup.deno_available(),
+        "nodeAvailable": sup.node_available(),
         "runnable": runnable,
         "platforms": projects::PLATFORMS,
     }))
@@ -2700,10 +2703,10 @@ fn data_error(e: projects::DataError) -> (StatusCode, String) {
     use projects::DataError::*;
     match e {
         NoProject => (StatusCode::NOT_FOUND, "no such project".to_string()),
-        NoDeno => (
+        NoRuntime => (
             StatusCode::SERVICE_UNAVAILABLE,
-            "Deno runtime not found. Install Deno (https://deno.com) or set \
-             NANOBPMN_DENO_BIN to use the Data panel."
+            "No JavaScript runtime found for the Data panel. Install Node >= 22.6 \
+             (the npm launcher provides one), or Deno (https://deno.com)."
                 .to_string(),
         ),
         // A bad SQL statement / unknown source / missing manifest is the

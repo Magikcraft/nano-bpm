@@ -1387,8 +1387,9 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
 pub enum DataError {
     /// The project name doesn't resolve to a directory.
     NoProject,
-    /// Deno isn't installed — the datasource seam is Deno-hosted.
-    NoDeno,
+    /// No JavaScript runtime (Node >= 22.6 or Deno) is available to host the
+    /// datasource seam.
+    NoRuntime,
     /// The subprocess failed to spawn or produced unparseable output.
     Gateway(String),
     /// The datasource operation itself returned `{ ok: false, error }`
@@ -1397,7 +1398,8 @@ pub enum DataError {
 }
 
 /// Run one datasource operation for `project` by invoking the materialised
-/// `.nanobpm/data-cli.ts` under Deno (ADR 0024 §4). The panel's every read/write
+/// `.nanobpm/data-cli.ts` under Deno (or the Node >= 22.6 fallback, ADR 0036/
+/// 0037; ADR 0024 §4). The panel's every read/write
 /// goes through this one seam so it targets whatever the named datasource
 /// resolves to — SQLite today, a server driver once a `nano-ide-data-*` pack is
 /// installed — never a parallel SQLite-only path. `request` is the CLI's JSON
@@ -1413,7 +1415,21 @@ pub async fn run_data_op(
     if !dir.is_dir() {
         return Err(DataError::NoProject);
     }
-    let deno = workers::find_deno().ok_or(DataError::NoDeno)?;
+    // The gateway runs the data CLI Node-first: Node (>= 22.6) is always present
+    // (the npm launcher is Node), so it is the primary path; Deno is an equal
+    // alternative. Both the CLI and the `@nanobpm/data` SDK carry the runtime
+    // shim, so the Data panel works with only Node installed. See ADR 0038/0036.
+    enum CliRuntime {
+        Deno(std::path::PathBuf),
+        Node(std::path::PathBuf),
+    }
+    let runtime = if let Some(n) = workers::usable_node() {
+        CliRuntime::Node(n)
+    } else if let Some(d) = workers::find_deno() {
+        CliRuntime::Deno(d)
+    } else {
+        return Err(DataError::NoRuntime);
+    };
     ensure_project_sdk(project).map_err(|e| DataError::Gateway(format!("materialise SDK: {e}")))?;
 
     // Canonicalize so the --allow-read/-write scope matches the path Deno
@@ -1424,16 +1440,35 @@ pub async fn run_data_op(
     let _ = std::fs::create_dir_all(&cache);
     let cli = dir.join(".nanobpm").join("data-cli.ts");
 
-    let mut cmd = Command::new(&deno);
-    cmd.current_dir(&dir)
-        .arg("run")
-        .arg("--no-prompt")
-        .arg(format!("--allow-read={}", dir.display()))
-        .arg(format!("--allow-write={}", dir.display()))
-        .arg("--allow-env")
-        .arg(&cli)
-        .env("DENO_DIR", &cache)
-        .env("NO_COLOR", "1")
+    let mut cmd = match &runtime {
+        CliRuntime::Deno(deno) => {
+            let mut c = Command::new(deno);
+            c.current_dir(&dir)
+                .arg("run")
+                .arg("--no-prompt")
+                .arg(format!("--allow-read={}", dir.display()))
+                .arg(format!("--allow-write={}", dir.display()))
+                .arg("--allow-env")
+                .arg(&cli)
+                .env("DENO_DIR", &cache);
+            c
+        }
+        CliRuntime::Node(node) => {
+            // Node fallback: strip TS types + register the import-map loader
+            // (materialised in .nanobpm/ by ensure_project_sdk) so the CLI's
+            // `./data-sdk.ts` and `node:sqlite` specifiers resolve. Node has no
+            // capability sandbox; the gateway only touches the project dir.
+            let mut c = Command::new(node);
+            c.current_dir(&dir)
+                .arg("--experimental-strip-types")
+                .arg("--no-warnings")
+                .arg("--import")
+                .arg(dir.join(".nanobpm").join("node-register.mjs"))
+                .arg(&cli);
+            c
+        }
+    };
+    cmd.env("NO_COLOR", "1")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1441,7 +1476,7 @@ pub async fn run_data_op(
 
     let mut child = cmd
         .spawn()
-        .map_err(|e| DataError::Gateway(format!("spawn deno: {e}")))?;
+        .map_err(|e| DataError::Gateway(format!("spawn data gateway: {e}")))?;
     let body = serde_json::to_vec(&request).unwrap_or_default();
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -2433,22 +2468,22 @@ impl ProjectSupervisor {
         if let Some((argv, trust_id)) = resolve_run_argv(&cfg) {
             return self.run_toolchain(name, &cfg, &dir, argv, trust_id).await;
         }
-        // Runtime for a plain (non-toolchain) project: prefer Deno; fall back to
-        // Node (>= 22.6) on hosts with no Deno build — e.g. 32-bit ARM. The npm
-        // launcher is itself Node, so the fallback is effectively always present.
-        // See ADR 0036.
+        // Runtime for a plain (non-toolchain) project: Node-first. Node (>= 22.6)
+        // is always present (the npm launcher is Node), so it is the primary run
+        // path on every host including 32-bit ARM. Deno is an equal alternative
+        // for Run and is required only for Compile (`deno compile`). See ADR 0038.
         enum RunRuntime {
             Deno(PathBuf),
             Node(PathBuf),
         }
-        let runtime = if let Some(d) = workers::find_deno() {
-            RunRuntime::Deno(d)
-        } else if let Some(n) = workers::usable_node() {
+        let runtime = if let Some(n) = workers::usable_node() {
             RunRuntime::Node(n)
+        } else if let Some(d) = workers::find_deno() {
+            RunRuntime::Deno(d)
         } else {
             return Err(
-                "No JavaScript runtime found to run this project. Install Deno \
-                 (https://deno.com), or Node >= 22.6 (the npm launcher provides one)."
+                "No JavaScript runtime found to run this project. Install Node \
+                 >= 22.6 (the npm launcher provides one), or Deno (https://deno.com)."
                     .to_string(),
             );
         };
@@ -3944,15 +3979,16 @@ mod tests {
     }
 
     /// End-to-end datasource gateway: materialise a project, run migrations,
-    /// then schema/query/exec through the real Deno `data-cli.ts` against an
-    /// embedded SQLite file (ADR 0024 §4). Skipped when Deno is absent (CI);
-    /// the SDK internals are covered locally by `data_sdk_test.ts`.
+    /// then schema/query/exec through the real `data-cli.ts` against an embedded
+    /// SQLite file (ADR 0024 §4). Runtime-agnostic (ADR 0038): runs under Node
+    /// (preferred) or Deno; skipped only when neither is present (CI). The SDK
+    /// internals are covered locally by `data_sdk_test.ts`.
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op awaits
-    async fn run_data_op_roundtrips_through_the_deno_gateway() {
+    async fn run_data_op_roundtrips_through_the_data_gateway() {
         let _g = lock();
-        if workers::find_deno().is_none() {
-            eprintln!("skipping: Deno not installed");
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
             return;
         }
         let root = temp_root();

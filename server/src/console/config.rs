@@ -271,7 +271,7 @@ const PARAMS: &[(&str, &str, &str, &str, &str)] = &[
         "Paths & runtime",
         "Deno binary",
         "deno (on PATH)",
-        "Deno runtime used to run embedded job workers. Auto-resolved when unset.",
+        "Deno runtime, used only to compile a project to a standalone binary (`deno compile`). Auto-resolved when unset.",
     ),
 ];
 
@@ -364,8 +364,10 @@ fn probe(bin: &str) -> Option<String> {
     Some(line)
 }
 
-/// The Deno runtime dependency — the one a user most often lacks. Mirrors the
-/// engine's resolution order (`NANOBPMN_DENO_BIN`, PATH, `~/.deno/bin/deno`).
+/// The Deno runtime dependency. Node-first (ADR 0038): Deno is now **optional**
+/// — needed only to compile a project to a single-file binary (`deno compile`),
+/// which Node has no equivalent for. Run uses Node. Mirrors the engine's
+/// resolution order (`NANOBPMN_DENO_BIN`, PATH, `~/.deno/bin/deno`).
 fn check_deno() -> Dependency {
     let bin = super::workers::find_deno()
         .map(|p| p.display().to_string())
@@ -376,7 +378,7 @@ fn check_deno() -> Dependency {
         id: "deno".into(),
         name: "Deno".into(),
         purpose:
-            "Preferred runtime for Nano's embedded job workers (each runs as a sandboxed Deno subprocess). Optional: on hosts without a Deno build (e.g. 32-bit ARM), workers fall back to Node >= 22.6."
+            "Optional runtime. Nano runs projects and workers on Node (>= 22.6); Deno is needed only to compile a project to a standalone single-file binary (`deno compile`), which has no Node equivalent."
                 .into(),
         bin,
         present,
@@ -385,7 +387,7 @@ fn check_deno() -> Dependency {
         hint: if present {
             String::new()
         } else {
-            "Deno was not found. Install it (see the link) so `deno` is on PATH, or set NANOBPMN_DENO_BIN to its path. Until then, embedded Nano workers cannot run."
+            "Deno was not found. It is optional — install it (see the link) only if you want to compile a project to a standalone binary; everything else runs on Node."
                 .into()
         },
     }

@@ -310,9 +310,16 @@ pub(crate) fn usable_node() -> Option<PathBuf> {
 }
 
 impl WorkerSupervisor {
-    /// Whether a Deno runtime is available to run workers.
+    /// Whether a Deno runtime is available. Node-first (ADR 0038): Deno is
+    /// needed only for `deno compile`; workers run on Node.
     pub fn deno_available(&self) -> bool {
         find_deno().is_some()
+    }
+
+    /// Whether a usable Node (>= 22.6) runtime is available — the primary
+    /// runtime for running workers. See ADR 0038.
+    pub fn node_available(&self) -> bool {
+        usable_node().is_some()
     }
 
     async fn entry(&self, name: &str) -> Arc<WorkerInner> {
@@ -347,19 +354,21 @@ impl WorkerSupervisor {
         if !dir.is_dir() {
             return Err("no such worker".into());
         }
-        // Prefer Deno; fall back to Node (>= 22.6) on hosts with no Deno build
-        // (e.g. 32-bit ARM). See ADR 0036.
+        // Node-first: Node (>= 22.6) is the runtime the npm launcher always
+        // provides, so it is the primary path. Deno is preferred only when a
+        // project needs `deno compile`; for Run it is an equal alternative and
+        // no longer required. See ADR 0038 (Node-first) / 0036.
         enum WorkerRuntime {
             Deno(PathBuf),
             Node(PathBuf),
         }
-        let runtime = if let Some(d) = find_deno() {
-            WorkerRuntime::Deno(d)
-        } else if let Some(n) = usable_node() {
+        let runtime = if let Some(n) = usable_node() {
             WorkerRuntime::Node(n)
+        } else if let Some(d) = find_deno() {
+            WorkerRuntime::Deno(d)
         } else {
-            return Err("No JavaScript runtime found to run workers. Install Deno \
-                 (https://deno.com), or Node >= 22.6 (the npm launcher provides one)."
+            return Err("No JavaScript runtime found to run workers. Install Node \
+                 >= 22.6 (the npm launcher provides one), or Deno (https://deno.com)."
                 .to_string());
         };
 

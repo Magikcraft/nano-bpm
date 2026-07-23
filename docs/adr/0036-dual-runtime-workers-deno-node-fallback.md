@@ -1,6 +1,7 @@
 # ADR 0036 — Dual-runtime workers: Deno-preferred, Node fallback
 
-Status: **Accepted.**
+Status: **Accepted** (preference inverted by ADR 0038 — the dual-runtime mechanism stands, but the
+default is now **Node-first**, with Deno required only for `deno compile`).
 Date: 2026-07-24.
 Relates to:
 ADR 0022 (`0022-nano-rad-application.md`, **Urban** — §E's embedded job workers are the runtime this
