@@ -3239,6 +3239,8 @@ fn apply_edit_op(
                     timer: None,
                     retries: None,
                     multi_instance: None,
+                    start_listeners: Vec::new(),
+                    end_listeners: Vec::new(),
                 },
             );
             if let Some(label) = &op_name_label {
@@ -3293,6 +3295,8 @@ fn apply_edit_op(
                     timer: None,
                     retries: None,
                     multi_instance: None,
+                    start_listeners: Vec::new(),
+                    end_listeners: Vec::new(),
                 },
             );
             if let Some(label) = &op_name_label {
@@ -3454,6 +3458,8 @@ fn apply_edit_op(
                     timer: None,
                     retries: None,
                     multi_instance: None,
+                    start_listeners: Vec::new(),
+                    end_listeners: Vec::new(),
                 },
             );
             Ok(format!(

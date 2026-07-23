@@ -132,6 +132,7 @@ impl Engine {
                     retries: job.retries,
                     variables: self
                         .variables_for_element(job.instance_key, job.element_instance_key),
+                    kind: job.kind,
                 }),
                 _ => None,
             })
@@ -155,6 +156,7 @@ impl Engine {
             deadline: job.deadline.unwrap_or(0),
             retries: job.retries,
             variables: self.variables_for_element(job.instance_key, job.element_instance_key),
+            kind: job.kind,
         })
     }
     /// making it activatable again. Like [`Engine::trigger_timers`], the host

@@ -168,12 +168,25 @@ Kept out of v1 to bound the first cut; no v1 decision precludes it.
 
 State each boundary in `PERFORMANCE.md` / the feature matrix:
 
-- **v1 (this ADR):** `zeebe:executionListeners` `start`/`end` on tasks, gateways,
-  events, (sub)processes, call/ad-hoc/multi-instance containers; sequential in-order
-  execution; literal/FEEL `retries`; incident on failure; forward variable merge;
-  correct `JobKind`/`JobListenerEventType` in the read model.
-- **Deferred:** task listeners (§6 — user-task `completing` denial + corrections);
-  listener behaviour under process-instance **migration** and **modification**;
+- **v1 (this ADR, as implemented):** `zeebe:executionListeners`
+  parsed on any task/container that carries a `zeebe:ioMapping` attach point
+  (service/script/business-rule/user tasks, call activity, (sub)process,
+  ad-hoc/multi-instance). Sequential in-order execution; literal/FEEL `retries`;
+  incident on failure; forward variable merge; correct
+  `JobKind`/`JobListenerEventType` in the read model and on the activated job.
+  - **`start` listeners fire for every element reached through the common
+    `activate()` path** (all of the above), before the element enacts its own
+    behaviour (job creation / routing / scope open).
+  - **`end` listeners fire for elements that complete through the shared
+    `complete()` path — service/script/business-rule tasks, the exclusive
+    gateway, and pass-through events.**
+- **Deferred:** `end` listeners on elements whose completion runs through a
+  *different* site than `complete()` — user tasks (`CompleteUserTask`),
+  sub-process/call-activity/ad-hoc containers, and multi-instance children. Their
+  `start` listeners still fire; their `end` listeners are a documented gap (the
+  parser accepts them, the runtime does not yet drain them). Also deferred: task
+  listeners (§6 — user-task `completing` denial + corrections); listener
+  behaviour under process-instance **migration** and **modification**;
   interaction subtleties with non-interrupting boundary events firing mid-chain.
 
 ## Phased plan
@@ -209,9 +222,15 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
 
 ## Open questions
 
-- **Ordering vs. IO mappings:** pin against the fixture whether `start` listeners run
-  **before or after** `zeebe:input` mappings are applied (and `end` vs `zeebe:output`).
-  Zeebe's ACTIVATING ordering is exact and observable; Nano must match it.
+- **Ordering vs. IO mappings — RESOLVED (pinned against Zeebe
+  `BpmnStreamProcessor`).** `start` listeners run **after** `zeebe:input`
+  mappings are applied and **before** the element's job/behaviour + `ACTIVATED`;
+  `end` listeners run **after** `zeebe:output` mappings (and any script/DMN
+  result merge) and **before** `COMPLETED` + the outgoing flows. Nano matches
+  this: the listener job's own FEEL attributes resolve against the
+  input-/output-mapped variable view. (Nano still emits its `ElementActivated`
+  early-marker at `ACTIVATING` time, ahead of Zeebe, but the *behaviour* is
+  deferred behind the `start` chain, so the observable ordering matches.)
 - **Container start/end semantics:** for a sub-process/multi-instance body, do
   `start`/`end` listeners fire on the container boundary only, or also interleave with
   child activation? Confirm against Camunda for the container processors.

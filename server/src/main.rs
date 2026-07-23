@@ -13746,6 +13746,29 @@ fn job_state_enum(state: nanobpmn_engine_core::JobState) -> models::JobStateEnum
     }
 }
 
+/// Maps an engine [`nanobpmn_engine_core::JobKind`] to the REST `jobKind` +
+/// `listenerEventType` pair. Ordinary element jobs report `BpmnElement` /
+/// `Unspecified`; an execution-listener job (ADR 0037) reports
+/// `ExecutionListener` and its start/end event type.
+fn job_kind_enums(
+    kind: &nanobpmn_engine_core::JobKind,
+) -> (models::JobKindEnum, models::JobListenerEventTypeEnum) {
+    use nanobpmn_engine_core::{JobKind, ListenerEventType};
+    match kind {
+        JobKind::BpmnElement => (
+            models::JobKindEnum::BpmnElement,
+            models::JobListenerEventTypeEnum::Unspecified,
+        ),
+        JobKind::ExecutionListener { event_type, .. } => (
+            models::JobKindEnum::ExecutionListener,
+            match event_type {
+                ListenerEventType::Start => models::JobListenerEventTypeEnum::Start,
+                ListenerEventType::End => models::JobListenerEventTypeEnum::End,
+            },
+        ),
+    }
+}
+
 /// Projects a [`JobRow`] into the generated `JobSearchResult`. The
 /// process-definition identity is denormalized onto the row at projection time.
 fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
@@ -13759,6 +13782,8 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         None => types::Nullable::Null,
     };
 
+    let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
+
     models::JobSearchResult::new(
         std::collections::HashMap::new(),
         deadline,
@@ -13771,8 +13796,8 @@ fn job_search_result(job: &readstore::JobRow) -> models::JobSearchResult {
         false,
         types::Nullable::Null,
         models::JobKey(job.key.to_string()),
-        models::JobKindEnum::BpmnElement,
-        models::JobListenerEventTypeEnum::Unspecified,
+        job_kind_enum,
+        job_listener_event_type_enum,
         process_definition_id,
         models::ProcessDefinitionKey(process_definition_key),
         models::ProcessInstanceKey(job.instance_key.to_string()),
@@ -13890,6 +13915,8 @@ fn activated_job_result(
         None => to_object_map(&job.variables),
     };
 
+    let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
+
     models::ActivatedJobResult::new(
         job.job_type,
         process_id,
@@ -13905,8 +13932,8 @@ fn activated_job_result(
         models::ProcessInstanceKey(job.instance_key.to_string()),
         models::ProcessDefinitionKey(process_definition_key),
         models::ElementInstanceKey(job.element_instance_key.to_string()),
-        models::JobKindEnum::BpmnElement,
-        models::JobListenerEventTypeEnum::Unspecified,
+        job_kind_enum,
+        job_listener_event_type_enum,
         nanobpm_gateway_rest::types::Nullable::Null,
         Vec::new(),
         nanobpm_gateway_rest::types::Nullable::Null,

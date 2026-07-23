@@ -196,6 +196,42 @@ impl IoMapping {
     }
 }
 
+/// The lifecycle transition an execution listener fires on (Zeebe
+/// `zeebe:executionListener eventType`). `Start` listeners run between an
+/// element's `ACTIVATING` and `ACTIVATED` events; `End` listeners run between
+/// its `COMPLETING` and `COMPLETED` events (ADR 0037).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum ListenerEventType {
+    /// Runs on the `ACTIVATING -> ACTIVATED` transition, before the element's
+    /// own behaviour (input mappings, job creation, flow routing).
+    Start,
+    /// Runs on the `COMPLETING -> COMPLETED` transition, before output mappings
+    /// and outgoing flows are taken.
+    End,
+}
+
+/// A single BPMN execution listener declared on a flow node
+/// (`zeebe:executionListener`). Each listener is realised as a job of
+/// `job_type` that must be completed by a worker before the element's lifecycle
+/// transition proceeds; listeners of the same event type run sequentially in
+/// declaration order and their returned variables merge into the element's
+/// scope (Zeebe parity, ADR 0037). Execution listeners cannot deny the
+/// transition (that is a task-listener capability, deferred).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ExecutionListener {
+    /// Which transition this listener fires on.
+    pub event_type: ListenerEventType,
+    /// The job type workers subscribe to for this listener.
+    pub job_type: String,
+    /// The raw `retries` expression (literal or FEEL), evaluated at listener-job
+    /// creation. `None` (the default) starts the job with
+    /// [`crate::state::DEFAULT_JOB_RETRIES`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub retries: Option<String>,
+}
+
 /// The flavour of a FEEL timer expression, mirroring the BPMN
 /// `timerEventDefinition` children.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -603,6 +639,17 @@ pub struct Element {
     /// serialized before multi-instance support existed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub multi_instance: Option<MultiInstance>,
+    /// Execution listeners that fire on this element's `ACTIVATING -> ACTIVATED`
+    /// transition, in declaration order. Empty (the default) for elements
+    /// without listeners and for definitions serialized before listeners
+    /// existed, so listener-free models run on the unchanged hot path (ADR 0037).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub start_listeners: Vec<ExecutionListener>,
+    /// Execution listeners that fire on this element's `COMPLETING -> COMPLETED`
+    /// transition, in declaration order. Empty (the default) for elements
+    /// without listeners.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub end_listeners: Vec<ExecutionListener>,
 }
 
 /// The BPMN ad-hoc sub-process implementation type (Camunda `zeebe:adHoc`).
@@ -864,6 +911,8 @@ fn splice_call_activities(
                     timer: el.timer.clone(),
                     retries: el.retries.clone(),
                     multi_instance: el.multi_instance.clone(),
+                    start_listeners: el.start_listeners.clone(),
+                    end_listeners: el.end_listeners.clone(),
                 },
             );
             stack.push(called_process_id.clone());
@@ -888,6 +937,8 @@ fn splice_call_activities(
                     timer: el.timer.clone(),
                     retries: el.retries.clone(),
                     multi_instance: el.multi_instance.clone(),
+                    start_listeners: el.start_listeners.clone(),
+                    end_listeners: el.end_listeners.clone(),
                 },
             );
         }
@@ -990,6 +1041,11 @@ pub struct ProcessBuilder {
     ///
     /// [`build`]: ProcessBuilder::build
     multi_instances: Vec<(ElementId, MultiInstance)>,
+    /// Recorded `(element id, start listeners, end listeners)` declarations,
+    /// applied in [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    listeners: Vec<(ElementId, Vec<ExecutionListener>, Vec<ExecutionListener>)>,
 }
 
 impl ProcessBuilder {
@@ -1004,6 +1060,7 @@ impl ProcessBuilder {
             timers: Vec::new(),
             retries: Vec::new(),
             multi_instances: Vec::new(),
+            listeners: Vec::new(),
         }
     }
 
@@ -1017,6 +1074,8 @@ impl ProcessBuilder {
             timer: None,
             retries: None,
             multi_instance: None,
+            start_listeners: Vec::new(),
+            end_listeners: Vec::new(),
         });
         self
     }
@@ -1233,6 +1292,20 @@ impl ProcessBuilder {
     /// activity. Applied in [`build`](ProcessBuilder::build).
     pub fn with_multi_instance(mut self, id: impl Into<String>, mi: MultiInstance) -> Self {
         self.multi_instances.push((id.into(), mi));
+        self
+    }
+
+    /// Declares execution listeners (see [`ExecutionListener`]) on an element,
+    /// split into start (fire on activation) and end (fire on completion) lists.
+    /// Applied in [`build`](ProcessBuilder::build).
+    pub fn with_listeners(
+        mut self,
+        id: impl Into<String>,
+        start_listeners: Vec<ExecutionListener>,
+        end_listeners: Vec<ExecutionListener>,
+    ) -> Self {
+        self.listeners
+            .push((id.into(), start_listeners, end_listeners));
         self
     }
 
@@ -1654,6 +1727,17 @@ impl ProcessBuilder {
             }
         }
 
+        // Attach execution listeners to their elements.
+        for (id, start_listeners, end_listeners) in &self.listeners {
+            match elements.get_mut(id) {
+                Some(element) => {
+                    element.start_listeners = start_listeners.clone();
+                    element.end_listeners = end_listeners.clone();
+                }
+                None => return Err(BuildError::UnknownListenerElement(id.clone())),
+            }
+        }
+
         // The process-level start event is the unique start event that is not
         // contained in any sub-process (sub-process inner start events have a
         // parent and start their own scope, not the instance).
@@ -1711,6 +1795,8 @@ pub enum BuildError {
     UnknownRetriesElement(ElementId),
     /// A `with_multi_instance` referenced an element that does not exist.
     UnknownMultiInstanceElement(ElementId),
+    /// A `with_listeners` referenced an element that does not exist.
+    UnknownListenerElement(ElementId),
 }
 
 impl std::fmt::Display for BuildError {
@@ -1757,6 +1843,9 @@ impl std::fmt::Display for BuildError {
                     f,
                     "multi-instance characteristics declared on unknown element {id}"
                 )
+            }
+            BuildError::UnknownListenerElement(id) => {
+                write!(f, "execution listeners declared on unknown element {id}")
             }
         }
     }
