@@ -33,6 +33,8 @@ tags:
     description: Server and IDE configuration
   - name: server
     description: Nano server version and self-update
+  - name: data
+    description: Urban App datasources (DB Manager) — ADR 0024
 
 paths:
   /topology:
@@ -730,6 +732,116 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /projects/{name}/data/sources:
+    get:
+      operationId: getDataSources
+      tags: [data]
+      summary: List an App project's declared datasources
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Datasources plus the default source name
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataSourcesResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/data/{source}/schema:
+    get:
+      operationId: getDataSchema
+      tags: [data]
+      summary: Introspect a datasource's tables/columns/indexes
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/SourcePath' }
+      responses:
+        '200':
+          description: Datasource schema
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataSchemaResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/data/{source}/query:
+    post:
+      operationId: queryData
+      tags: [data]
+      summary: Run a row-returning statement against a datasource
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/SourcePath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DataQueryRequest' }
+      responses:
+        '200':
+          description: Query result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataQueryResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/data/{source}/exec:
+    post:
+      operationId: execData
+      tags: [data]
+      summary: Run a non-row statement (INSERT/UPDATE/DELETE/DDL)
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/SourcePath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DataQueryRequest' }
+      responses:
+        '200':
+          description: Exec result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataExecResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/data/{source}/migrations:
+    get:
+      operationId: getDataMigrations
+      tags: [data]
+      summary: List a datasource's migrations with applied status
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/SourcePath' }
+      responses:
+        '200':
+          description: Migration status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataMigrationsResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/data/{source}/migrate:
+    post:
+      operationId: migrateData
+      tags: [data]
+      summary: Apply a datasource's pending migrations
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/SourcePath' }
+      responses:
+        '200':
+          description: Migrations applied
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataMigrateResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /server/update:
     get:
       operationId: getServerUpdate
@@ -835,6 +947,12 @@ components:
       in: query
       required: true
       description: Project/worker-relative, forward-slash separated file path.
+      schema: { type: string }
+    SourcePath:
+      name: source
+      in: path
+      required: true
+      description: The datasource name from the App manifest's `data.sources`.
       schema: { type: string }
 
   responses:
@@ -1779,3 +1897,97 @@ components:
         yolo: { type: boolean, nullable: true }
         approve: { type: string, nullable: true }
         revoke: { type: string, nullable: true }
+
+    # ---- Data / datasources (ADR 0024, camelCase wire fields) -------------
+    DataSourceInfo:
+      type: object
+      required: [name, driver, url]
+      properties:
+        name: { type: string }
+        driver: { type: string }
+        url: { type: string }
+        migrations: { type: string, nullable: true }
+    DataSourcesResponse:
+      type: object
+      required: [sources]
+      properties:
+        default: { type: string, nullable: true }
+        sources:
+          type: array
+          items: { $ref: '#/components/schemas/DataSourceInfo' }
+    DataColumnMeta:
+      type: object
+      required: [name, type, notNull, primaryKey]
+      properties:
+        name: { type: string }
+        type: { type: string }
+        notNull: { type: boolean }
+        primaryKey: { type: boolean }
+    DataTableMeta:
+      type: object
+      required: [name, columns, indexes]
+      properties:
+        name: { type: string }
+        columns:
+          type: array
+          items: { $ref: '#/components/schemas/DataColumnMeta' }
+        indexes:
+          type: array
+          items: { type: string }
+    DataSchemaResponse:
+      type: object
+      required: [tables]
+      properties:
+        tables:
+          type: array
+          items: { $ref: '#/components/schemas/DataTableMeta' }
+    DataQueryRequest:
+      type: object
+      required: [sql]
+      properties:
+        sql: { type: string }
+        params:
+          type: array
+          description: Positional bind values for the statement's `?` placeholders.
+          items: {}
+    DataQueryResult:
+      type: object
+      required: [columns, rows]
+      properties:
+        columns:
+          type: array
+          items: { type: string }
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    DataExecResult:
+      type: object
+      required: [changed]
+      properties:
+        changed: { type: integer, format: int64 }
+        lastInsertId: { type: integer, format: int64, nullable: true }
+    DataMigrationEntry:
+      type: object
+      required: [name, applied]
+      properties:
+        name: { type: string }
+        applied: { type: boolean }
+        appliedAt: { type: string, nullable: true }
+    DataMigrationsResponse:
+      type: object
+      required: [dir, entries]
+      properties:
+        dir: { type: string }
+        entries:
+          type: array
+          items: { $ref: '#/components/schemas/DataMigrationEntry' }
+    DataMigrateResult:
+      type: object
+      required: [applied, pending]
+      properties:
+        applied:
+          type: array
+          items: { type: string }
+        pending: { type: integer, format: int64 }

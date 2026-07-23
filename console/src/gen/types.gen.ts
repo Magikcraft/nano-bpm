@@ -669,12 +669,82 @@ export type TrustRequest = {
     revoke?: string | null;
 };
 
+export type DataSourceInfo = {
+    name: string;
+    driver: string;
+    url: string;
+    migrations?: string | null;
+};
+
+export type DataSourcesResponse = {
+    default?: string | null;
+    sources: Array<DataSourceInfo>;
+};
+
+export type DataColumnMeta = {
+    name: string;
+    type: string;
+    notNull: boolean;
+    primaryKey: boolean;
+};
+
+export type DataTableMeta = {
+    name: string;
+    columns: Array<DataColumnMeta>;
+    indexes: Array<string>;
+};
+
+export type DataSchemaResponse = {
+    tables: Array<DataTableMeta>;
+};
+
+export type DataQueryRequest = {
+    sql: string;
+    /**
+     * Positional bind values for the statement's `?` placeholders.
+     */
+    params?: Array<unknown>;
+};
+
+export type DataQueryResult = {
+    columns: Array<string>;
+    rows: Array<{
+        [key: string]: unknown;
+    }>;
+};
+
+export type DataExecResult = {
+    changed: number;
+    lastInsertId?: number | null;
+};
+
+export type DataMigrationEntry = {
+    name: string;
+    applied: boolean;
+    appliedAt?: string | null;
+};
+
+export type DataMigrationsResponse = {
+    dir: string;
+    entries: Array<DataMigrationEntry>;
+};
+
+export type DataMigrateResult = {
+    applied: Array<string>;
+    pending: number;
+};
+
 export type NamePath = string;
 
 /**
  * Project/worker-relative, forward-slash separated file path.
  */
 export type PathQuery = string;
+
+/**
+ * The datasource name from the App manifest's `data.sources`.
+ */
+export type SourcePath = string;
 
 export type GetTopologyData = {
     body?: never;
@@ -1940,6 +2010,212 @@ export type SetActiveRunConfigResponses = {
 };
 
 export type SetActiveRunConfigResponse = SetActiveRunConfigResponses[keyof SetActiveRunConfigResponses];
+
+export type GetDataSourcesData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/sources';
+};
+
+export type GetDataSourcesErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type GetDataSourcesError = GetDataSourcesErrors[keyof GetDataSourcesErrors];
+
+export type GetDataSourcesResponses = {
+    /**
+     * Datasources plus the default source name
+     */
+    200: DataSourcesResponse;
+};
+
+export type GetDataSourcesResponse = GetDataSourcesResponses[keyof GetDataSourcesResponses];
+
+export type GetDataSchemaData = {
+    body?: never;
+    path: {
+        name: string;
+        /**
+         * The datasource name from the App manifest's `data.sources`.
+         */
+        source: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/{source}/schema';
+};
+
+export type GetDataSchemaErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type GetDataSchemaError = GetDataSchemaErrors[keyof GetDataSchemaErrors];
+
+export type GetDataSchemaResponses = {
+    /**
+     * Datasource schema
+     */
+    200: DataSchemaResponse;
+};
+
+export type GetDataSchemaResponse = GetDataSchemaResponses[keyof GetDataSchemaResponses];
+
+export type QueryDataData = {
+    body: DataQueryRequest;
+    path: {
+        name: string;
+        /**
+         * The datasource name from the App manifest's `data.sources`.
+         */
+        source: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/{source}/query';
+};
+
+export type QueryDataErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type QueryDataError = QueryDataErrors[keyof QueryDataErrors];
+
+export type QueryDataResponses = {
+    /**
+     * Query result
+     */
+    200: DataQueryResult;
+};
+
+export type QueryDataResponse = QueryDataResponses[keyof QueryDataResponses];
+
+export type ExecDataData = {
+    body: DataQueryRequest;
+    path: {
+        name: string;
+        /**
+         * The datasource name from the App manifest's `data.sources`.
+         */
+        source: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/{source}/exec';
+};
+
+export type ExecDataErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type ExecDataError = ExecDataErrors[keyof ExecDataErrors];
+
+export type ExecDataResponses = {
+    /**
+     * Exec result
+     */
+    200: DataExecResult;
+};
+
+export type ExecDataResponse = ExecDataResponses[keyof ExecDataResponses];
+
+export type GetDataMigrationsData = {
+    body?: never;
+    path: {
+        name: string;
+        /**
+         * The datasource name from the App manifest's `data.sources`.
+         */
+        source: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/{source}/migrations';
+};
+
+export type GetDataMigrationsErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type GetDataMigrationsError = GetDataMigrationsErrors[keyof GetDataMigrationsErrors];
+
+export type GetDataMigrationsResponses = {
+    /**
+     * Migration status
+     */
+    200: DataMigrationsResponse;
+};
+
+export type GetDataMigrationsResponse = GetDataMigrationsResponses[keyof GetDataMigrationsResponses];
+
+export type MigrateDataData = {
+    body?: never;
+    path: {
+        name: string;
+        /**
+         * The datasource name from the App manifest's `data.sources`.
+         */
+        source: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/{source}/migrate';
+};
+
+export type MigrateDataErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type MigrateDataError = MigrateDataErrors[keyof MigrateDataErrors];
+
+export type MigrateDataResponses = {
+    /**
+     * Migrations applied
+     */
+    200: DataMigrateResult;
+};
+
+export type MigrateDataResponse = MigrateDataResponses[keyof MigrateDataResponses];
 
 export type GetServerUpdateData = {
     body?: never;

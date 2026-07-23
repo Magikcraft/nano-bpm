@@ -2,7 +2,7 @@
 
 import type { Client, ClientMeta, Options as Options2, RequestResult, TDataShape } from './client';
 import { client } from './client.gen';
-import type { CompileProjectData, CompileProjectErrors, CompileProjectResponses, CreateLibFileData, CreateLibFileErrors, CreateLibFileResponses, CreateModelData, CreateModelErrors, CreateModelResponses, CreateProjectData, CreateProjectErrors, CreateProjectPathData, CreateProjectPathErrors, CreateProjectPathResponses, CreateProjectResponses, CreateWorkerData, CreateWorkerErrors, CreateWorkerFileData, CreateWorkerFileErrors, CreateWorkerFileResponses, CreateWorkerResponses, DeleteLibFileData, DeleteLibFileErrors, DeleteLibFileResponses, DeleteModelData, DeleteModelErrors, DeleteModelResponses, DeleteProjectData, DeleteProjectErrors, DeleteProjectPathData, DeleteProjectPathErrors, DeleteProjectPathResponses, DeleteProjectResponses, DeleteWorkerData, DeleteWorkerErrors, DeleteWorkerFileData, DeleteWorkerFileErrors, DeleteWorkerFileResponses, DeleteWorkerResponses, GetClusterHealthData, GetClusterHealthResponses, GetClusterMetricsData, GetClusterMetricsResponses, GetDenoTypesData, GetDenoTypesResponses, GetExtensionsData, GetExtensionsResponses, GetIdeConfigData, GetIdeConfigResponses, GetInstanceData, GetInstanceErrors, GetInstanceResponses, GetLibFileData, GetLibFileErrors, GetLibFileResponses, GetMarketplaceData, GetMarketplaceResponses, GetMetricsData, GetMetricsResponses, GetModelData, GetModelErrors, GetModelResponses, GetProjectConfigData, GetProjectConfigErrors, GetProjectConfigResponses, GetProjectData, GetProjectErrors, GetProjectResponses, GetRunConfigsData, GetRunConfigsErrors, GetRunConfigsResponses, GetServerConfigData, GetServerConfigResponses, GetServerUpdateData, GetServerUpdateResponses, GetTopologyData, GetTopologyResponses, GetTraceData, GetTraceErrors, GetTraceOtelData, GetTraceOtelErrors, GetTraceOtelResponses, GetTraceResponses, GetWorkerData, GetWorkerErrors, GetWorkerFileData, GetWorkerFileErrors, GetWorkerFileResponses, GetWorkerResponses, GetWorkerSdkData, GetWorkerSdkResponses, InstallExtensionData, InstallExtensionErrors, InstallExtensionResponses, ListInstancesData, ListInstancesResponses, ListLibFilesData, ListLibFilesResponses, ListModelsData, ListModelsResponses, ListProjectFilesData, ListProjectFilesErrors, ListProjectFilesResponses, ListProjectsData, ListProjectsResponses, ListTracesData, ListTracesResponses, ListWorkersData, ListWorkersResponses, RemoveExtensionData, RemoveExtensionErrors, RemoveExtensionResponses, RenameProjectData, RenameProjectErrors, RenameProjectResponses, RunProjectData, RunProjectErrors, RunProjectResponses, SaveLibFileData, SaveLibFileErrors, SaveLibFileResponses, SaveModelData, SaveModelErrors, SaveModelResponses, SaveProjectConfigData, SaveProjectConfigErrors, SaveProjectConfigResponses, SaveProjectFileData, SaveProjectFileErrors, SaveProjectFileResponses, SaveWorkerFileData, SaveWorkerFileErrors, SaveWorkerFileResponses, SetActiveRunConfigData, SetActiveRunConfigErrors, SetActiveRunConfigResponses, SetSlaModeData, SetSlaModeErrors, SetSlaModeResponses, StartWorkerData, StartWorkerErrors, StartWorkerResponses, StopProjectData, StopProjectErrors, StopProjectResponses, StopWorkerData, StopWorkerErrors, StopWorkerResponses, TrustExtensionData, TrustExtensionResponses } from './types.gen';
+import type { CompileProjectData, CompileProjectErrors, CompileProjectResponses, CreateLibFileData, CreateLibFileErrors, CreateLibFileResponses, CreateModelData, CreateModelErrors, CreateModelResponses, CreateProjectData, CreateProjectErrors, CreateProjectPathData, CreateProjectPathErrors, CreateProjectPathResponses, CreateProjectResponses, CreateWorkerData, CreateWorkerErrors, CreateWorkerFileData, CreateWorkerFileErrors, CreateWorkerFileResponses, CreateWorkerResponses, DeleteLibFileData, DeleteLibFileErrors, DeleteLibFileResponses, DeleteModelData, DeleteModelErrors, DeleteModelResponses, DeleteProjectData, DeleteProjectErrors, DeleteProjectPathData, DeleteProjectPathErrors, DeleteProjectPathResponses, DeleteProjectResponses, DeleteWorkerData, DeleteWorkerErrors, DeleteWorkerFileData, DeleteWorkerFileErrors, DeleteWorkerFileResponses, DeleteWorkerResponses, ExecDataData, ExecDataErrors, ExecDataResponses, GetClusterHealthData, GetClusterHealthResponses, GetClusterMetricsData, GetClusterMetricsResponses, GetDataMigrationsData, GetDataMigrationsErrors, GetDataMigrationsResponses, GetDataSchemaData, GetDataSchemaErrors, GetDataSchemaResponses, GetDataSourcesData, GetDataSourcesErrors, GetDataSourcesResponses, GetDenoTypesData, GetDenoTypesResponses, GetExtensionsData, GetExtensionsResponses, GetIdeConfigData, GetIdeConfigResponses, GetInstanceData, GetInstanceErrors, GetInstanceResponses, GetLibFileData, GetLibFileErrors, GetLibFileResponses, GetMarketplaceData, GetMarketplaceResponses, GetMetricsData, GetMetricsResponses, GetModelData, GetModelErrors, GetModelResponses, GetProjectConfigData, GetProjectConfigErrors, GetProjectConfigResponses, GetProjectData, GetProjectErrors, GetProjectResponses, GetRunConfigsData, GetRunConfigsErrors, GetRunConfigsResponses, GetServerConfigData, GetServerConfigResponses, GetServerUpdateData, GetServerUpdateResponses, GetTopologyData, GetTopologyResponses, GetTraceData, GetTraceErrors, GetTraceOtelData, GetTraceOtelErrors, GetTraceOtelResponses, GetTraceResponses, GetWorkerData, GetWorkerErrors, GetWorkerFileData, GetWorkerFileErrors, GetWorkerFileResponses, GetWorkerResponses, GetWorkerSdkData, GetWorkerSdkResponses, InstallExtensionData, InstallExtensionErrors, InstallExtensionResponses, ListInstancesData, ListInstancesResponses, ListLibFilesData, ListLibFilesResponses, ListModelsData, ListModelsResponses, ListProjectFilesData, ListProjectFilesErrors, ListProjectFilesResponses, ListProjectsData, ListProjectsResponses, ListTracesData, ListTracesResponses, ListWorkersData, ListWorkersResponses, MigrateDataData, MigrateDataErrors, MigrateDataResponses, QueryDataData, QueryDataErrors, QueryDataResponses, RemoveExtensionData, RemoveExtensionErrors, RemoveExtensionResponses, RenameProjectData, RenameProjectErrors, RenameProjectResponses, RunProjectData, RunProjectErrors, RunProjectResponses, SaveLibFileData, SaveLibFileErrors, SaveLibFileResponses, SaveModelData, SaveModelErrors, SaveModelResponses, SaveProjectConfigData, SaveProjectConfigErrors, SaveProjectConfigResponses, SaveProjectFileData, SaveProjectFileErrors, SaveProjectFileResponses, SaveWorkerFileData, SaveWorkerFileErrors, SaveWorkerFileResponses, SetActiveRunConfigData, SetActiveRunConfigErrors, SetActiveRunConfigResponses, SetSlaModeData, SetSlaModeErrors, SetSlaModeResponses, StartWorkerData, StartWorkerErrors, StartWorkerResponses, StopProjectData, StopProjectErrors, StopProjectResponses, StopWorkerData, StopWorkerErrors, StopWorkerResponses, TrustExtensionData, TrustExtensionResponses } from './types.gen';
 
 export type Options<TData extends TDataShape = TDataShape, ThrowOnError extends boolean = boolean, TResponse = unknown> = Options2<TData, ThrowOnError, TResponse> & {
     /**
@@ -376,6 +376,50 @@ export const setActiveRunConfig = <ThrowOnError extends boolean = false>(options
         ...options.headers
     }
 });
+
+/**
+ * List an App project's declared datasources
+ */
+export const getDataSources = <ThrowOnError extends boolean = false>(options: Options<GetDataSourcesData, ThrowOnError>): RequestResult<GetDataSourcesResponses, GetDataSourcesErrors, ThrowOnError> => (options.client ?? client).get<GetDataSourcesResponses, GetDataSourcesErrors, ThrowOnError>({ url: '/projects/{name}/data/sources', ...options });
+
+/**
+ * Introspect a datasource's tables/columns/indexes
+ */
+export const getDataSchema = <ThrowOnError extends boolean = false>(options: Options<GetDataSchemaData, ThrowOnError>): RequestResult<GetDataSchemaResponses, GetDataSchemaErrors, ThrowOnError> => (options.client ?? client).get<GetDataSchemaResponses, GetDataSchemaErrors, ThrowOnError>({ url: '/projects/{name}/data/{source}/schema', ...options });
+
+/**
+ * Run a row-returning statement against a datasource
+ */
+export const queryData = <ThrowOnError extends boolean = false>(options: Options<QueryDataData, ThrowOnError>): RequestResult<QueryDataResponses, QueryDataErrors, ThrowOnError> => (options.client ?? client).post<QueryDataResponses, QueryDataErrors, ThrowOnError>({
+    url: '/projects/{name}/data/{source}/query',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * Run a non-row statement (INSERT/UPDATE/DELETE/DDL)
+ */
+export const execData = <ThrowOnError extends boolean = false>(options: Options<ExecDataData, ThrowOnError>): RequestResult<ExecDataResponses, ExecDataErrors, ThrowOnError> => (options.client ?? client).post<ExecDataResponses, ExecDataErrors, ThrowOnError>({
+    url: '/projects/{name}/data/{source}/exec',
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
+});
+
+/**
+ * List a datasource's migrations with applied status
+ */
+export const getDataMigrations = <ThrowOnError extends boolean = false>(options: Options<GetDataMigrationsData, ThrowOnError>): RequestResult<GetDataMigrationsResponses, GetDataMigrationsErrors, ThrowOnError> => (options.client ?? client).get<GetDataMigrationsResponses, GetDataMigrationsErrors, ThrowOnError>({ url: '/projects/{name}/data/{source}/migrations', ...options });
+
+/**
+ * Apply a datasource's pending migrations
+ */
+export const migrateData = <ThrowOnError extends boolean = false>(options: Options<MigrateDataData, ThrowOnError>): RequestResult<MigrateDataResponses, MigrateDataErrors, ThrowOnError> => (options.client ?? client).post<MigrateDataResponses, MigrateDataErrors, ThrowOnError>({ url: '/projects/{name}/data/{source}/migrate', ...options });
 
 /**
  * Nano server version and self-update availability

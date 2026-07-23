@@ -39,6 +39,7 @@ use super::{worker_export, workers, workspace};
 
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 const DATA_SDK_TS: &str = include_str!("data_sdk.ts");
+const DATA_CLI_TS: &str = include_str!("data_cli.ts");
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
 const LOG_RING_CAP: usize = 1000;
@@ -1371,10 +1372,108 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     let nano = dir.join(".nanobpm");
     std::fs::create_dir_all(&nano)?;
     std::fs::write(nano.join("data-sdk.ts"), DATA_SDK_TS)?;
+    std::fs::write(nano.join("data-cli.ts"), DATA_CLI_TS)?;
     std::fs::write(nano.join("worker-sdk.ts"), WORKER_SDK_TS)
 }
 
-/// Scaffolds a brand-new project directory. Fails if it already exists.
+/// Errors from the datasource gateway, mapped to HTTP status by the caller.
+#[derive(Debug)]
+pub enum DataError {
+    /// The project name doesn't resolve to a directory.
+    NoProject,
+    /// Deno isn't installed — the datasource seam is Deno-hosted.
+    NoDeno,
+    /// The subprocess failed to spawn or produced unparseable output.
+    Gateway(String),
+    /// The datasource operation itself returned `{ ok: false, error }`
+    /// (bad SQL, unknown source, missing manifest, …).
+    Op(String),
+}
+
+/// Run one datasource operation for `project` by invoking the materialised
+/// `.nanobpm/data-cli.ts` under Deno (ADR 0024 §4). The panel's every read/write
+/// goes through this one seam so it targets whatever the named datasource
+/// resolves to — SQLite today, a server driver once a `nano-ide-data-*` pack is
+/// installed — never a parallel SQLite-only path. `request` is the CLI's JSON
+/// protocol object (`{ op, source?, sql?, params? }`); the resolved result
+/// object is returned on success.
+pub async fn run_data_op(
+    project: &str,
+    request: serde_json::Value,
+) -> Result<serde_json::Value, DataError> {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = project_dir(project).ok_or(DataError::NoProject)?;
+    if !dir.is_dir() {
+        return Err(DataError::NoProject);
+    }
+    let deno = workers::find_deno().ok_or(DataError::NoDeno)?;
+    ensure_project_sdk(project).map_err(|e| DataError::Gateway(format!("materialise SDK: {e}")))?;
+
+    // Canonicalize so the --allow-read/-write scope matches the path Deno
+    // resolves (e.g. macOS /tmp -> /private/tmp); otherwise findManifest can't
+    // read nano.app.json and every op fails with "manifest not found".
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let cache = dir.join(".deno-cache");
+    let _ = std::fs::create_dir_all(&cache);
+    let cli = dir.join(".nanobpm").join("data-cli.ts");
+
+    let mut cmd = Command::new(&deno);
+    cmd.current_dir(&dir)
+        .arg("run")
+        .arg("--no-prompt")
+        .arg(format!("--allow-read={}", dir.display()))
+        .arg(format!("--allow-write={}", dir.display()))
+        .arg("--allow-env")
+        .arg(&cli)
+        .env("DENO_DIR", &cache)
+        .env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| DataError::Gateway(format!("spawn deno: {e}")))?;
+    let body = serde_json::to_vec(&request).unwrap_or_default();
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(&body)
+            .await
+            .map_err(|e| DataError::Gateway(format!("write request: {e}")))?;
+        // Drop stdin (via scope) so the CLI's stdin reader sees EOF.
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| DataError::Gateway(format!("await deno: {e}")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(DataError::Gateway(format!(
+            "deno exited {}: {}",
+            out.status,
+            err.trim()
+        )));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut val: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|e| DataError::Gateway(format!("bad gateway output: {e}: {}", text.trim())))?;
+    let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !ok {
+        let msg = val
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("datasource operation failed")
+            .to_string();
+        return Err(DataError::Op(msg));
+    }
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("ok");
+    }
+    Ok(val)
+}
+
 /// `template` selects which starter content to stamp out ("starter" default, or
 /// "throughput" for the benchmark demo). Unknown templates fall back to starter.
 pub fn create_project(
@@ -1464,6 +1563,7 @@ pub fn create_project(
         |p: PathBuf, body: &str| std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"));
     w(dir.join("deno.json"), PROJECT_DENO_JSON)?;
     w(dir.join(".nanobpm").join("data-sdk.ts"), DATA_SDK_TS)?;
+    w(dir.join(".nanobpm").join("data-cli.ts"), DATA_CLI_TS)?;
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
@@ -3776,5 +3876,95 @@ mod tests {
         assert_eq!(sanitize_id("2024-report"), "_2024-report");
         assert_eq!(sanitize_id(""), "resource");
         assert_eq!(sanitize_id("my.thing"), "my_thing");
+    }
+
+    /// End-to-end datasource gateway: materialise a project, run migrations,
+    /// then schema/query/exec through the real Deno `data-cli.ts` against an
+    /// embedded SQLite file (ADR 0024 §4). Skipped when Deno is absent (CI);
+    /// the SDK internals are covered locally by `data_sdk_test.ts`.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op awaits
+    async fn run_data_op_roundtrips_through_the_deno_gateway() {
+        let _g = lock();
+        if workers::find_deno().is_none() {
+            eprintln!("skipping: Deno not installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "dsapp";
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("db/migrations")).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                "app": { "driver": "sqlite", "url": "file:./app.db", "migrations": "db/migrations" }
+            } } }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("db/migrations/001_init.sql"),
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n\
+             INSERT INTO orders (name) VALUES ('first');",
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        // sources: the declared alias, resolved.
+        let src = run_data_op(name, serde_json::json!({ "op": "sources" }))
+            .await
+            .expect("sources");
+        assert_eq!(src["default"], "app");
+        assert_eq!(src["sources"][0]["driver"], "sqlite");
+
+        // migrate: applies the one pending file.
+        let mig = run_data_op(name, serde_json::json!({ "op": "migrate" }))
+            .await
+            .expect("migrate");
+        assert_eq!(mig["applied"], serde_json::json!(["001_init.sql"]));
+
+        // migrations status now reports it applied.
+        let ms = run_data_op(name, serde_json::json!({ "op": "migrations" }))
+            .await
+            .expect("migrations");
+        assert_eq!(ms["entries"][0]["applied"], true);
+
+        // schema sees the user table.
+        let sc = run_data_op(name, serde_json::json!({ "op": "schema" }))
+            .await
+            .expect("schema");
+        let tables: Vec<String> = sc["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(tables.contains(&"orders".to_string()));
+
+        // exec + query roundtrip a parameterised insert.
+        let ex = run_data_op(
+            name,
+            serde_json::json!({ "op": "exec", "sql": "INSERT INTO orders (name) VALUES (?)", "params": ["second"] }),
+        )
+        .await
+        .expect("exec");
+        assert_eq!(ex["changed"], 1);
+
+        let q = run_data_op(
+            name,
+            serde_json::json!({ "op": "query", "sql": "SELECT name FROM orders ORDER BY id" }),
+        )
+        .await
+        .expect("query");
+        assert_eq!(q["columns"], serde_json::json!(["name"]));
+        assert_eq!(q["rows"][0]["name"], "first");
+        assert_eq!(q["rows"][1]["name"], "second");
+
+        // A bad statement surfaces as an Op error (→ 400), not a gateway crash.
+        let err = run_data_op(
+            name,
+            serde_json::json!({ "op": "query", "sql": "SELECT * FROM nope" }),
+        )
+        .await;
+        assert!(matches!(err, Err(DataError::Op(_))));
     }
 }
