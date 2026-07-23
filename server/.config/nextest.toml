@@ -1,5 +1,5 @@
 # The heavy server integration tests each spin up a multi-node Raft cluster on a
-# `worker_threads = 4` runtime (`clustered_startup_tests`) or drive snapshot+tail
+# `worker_threads = 4` runtime (the `cluster_e2e` binary) or drive snapshot+tail
 # journal recovery (`seglog::tests`). They are timing sensitive: their fixed
 # replication/failover readiness budgets (e.g. "the create ships to node 1"
 # within 8s) assume the tokio runtime makes steady progress, which only holds if
@@ -19,10 +19,16 @@
 # AGENTS.md, "No Test Retries"); a retry only masks a real defect. The whole
 # suite stays strict (zero retries) and, apart from these serial-heavy tests,
 # fully parallel.
+#
+# The filter must name the ACTUAL heavy binaries: `binary(cluster_e2e)` covers
+# every multi-node cluster test (they all boot a 2-node cluster), not a stale
+# test name. A filter that matches nothing silently leaves those tests running
+# under ambient parallel load — the exact starvation flake this override exists
+# to prevent.
 [test-groups]
 serial-heavy = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'test(clustered_startup_tests) or test(seglog::tests)'
+filter = 'binary(cluster_e2e) or test(seglog::tests)'
 test-group = 'serial-heavy'
 threads-required = 'num-test-threads'
