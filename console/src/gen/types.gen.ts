@@ -763,6 +763,59 @@ export type DataMigrateResult = {
     pending: number;
 };
 
+export type TriggerEnqueueRequest = {
+    /**
+     * Id of a `triggers[]` entry in the App manifest whose `action` this event drives.
+     *
+     */
+    triggerId: string;
+    /**
+     * Deterministic dedup key (ADR 0025 §3). Omit to have the server derive a content hash of the body — repeat submissions of the same body then collapse to one inbox row.
+     *
+     */
+    idempotencyKey?: string | null;
+    /**
+     * The event body; the action's FEEL evaluates over `body`.
+     */
+    body: {
+        [key: string]: unknown;
+    };
+};
+
+export type TriggerEnqueueResult = {
+    /**
+     * true if a new inbox row was persisted; false if the idempotency key already existed (a no-op — the §3 dedup boundary).
+     *
+     */
+    enqueued: boolean;
+    /**
+     * Inbox row id when a new row was persisted.
+     */
+    id?: number | null;
+};
+
+export type TriggerInboxRow = {
+    id: number;
+    triggerId: string;
+    /**
+     * pending | done | failed (failed = dead-lettered after max attempts).
+     */
+    status: string;
+    attempts: number;
+    lastError?: string | null;
+    createdAt: number;
+};
+
+export type TriggerInboxResponse = {
+    pending: number;
+    done: number;
+    failed: number;
+    /**
+     * The most recently updated inbox rows (newest first).
+     */
+    recent: Array<TriggerInboxRow>;
+};
+
 export type NamePath = string;
 
 /**
@@ -2359,3 +2412,65 @@ export type TrustExtensionResponses = {
 };
 
 export type TrustExtensionResponse = TrustExtensionResponses[keyof TrustExtensionResponses];
+
+export type EnqueueTriggerEventData = {
+    body: TriggerEnqueueRequest;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/projects/{name}/triggers/enqueue';
+};
+
+export type EnqueueTriggerEventErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type EnqueueTriggerEventError = EnqueueTriggerEventErrors[keyof EnqueueTriggerEventErrors];
+
+export type EnqueueTriggerEventResponses = {
+    /**
+     * Enqueue outcome
+     */
+    200: TriggerEnqueueResult;
+};
+
+export type EnqueueTriggerEventResponse = EnqueueTriggerEventResponses[keyof EnqueueTriggerEventResponses];
+
+export type GetTriggerInboxData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/projects/{name}/triggers/inbox';
+};
+
+export type GetTriggerInboxErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type GetTriggerInboxError = GetTriggerInboxErrors[keyof GetTriggerInboxErrors];
+
+export type GetTriggerInboxResponses = {
+    /**
+     * Inbox status
+     */
+    200: TriggerInboxResponse;
+};
+
+export type GetTriggerInboxResponse = GetTriggerInboxResponses[keyof GetTriggerInboxResponses];

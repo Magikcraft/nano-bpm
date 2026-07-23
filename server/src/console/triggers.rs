@@ -1,0 +1,1076 @@
+//! Trigger runtime — the durable inbox + dispatcher (ADR 0025, phase 1).
+//!
+//! An installed Urban App is inert until something makes it *act*. A **trigger**
+//! maps a source event to an engine call — start a process, or publish a
+//! `CorrelateMessage`. This module is the "one genuinely-new runtime subsystem"
+//! ADR 0022 §B said to build first: a **durable inbox** (a table on the App's
+//! ADR 0024 datasource) that is the crash-consistency boundary between "event
+//! received" and "action applied", plus a **dispatcher** that drains it.
+//!
+//! ## Delivery semantics (ADR 0025 §2) — at-least-once
+//! Each event flows through three durable steps:
+//! 1. **persist** to the inbox (status `pending`) under a unique **idempotency
+//!    key** — the dedup point (§3);
+//! 2. **dispatch** — apply the trigger's `action` to the engine exactly like an
+//!    SDK client would, over the local gateway (`http://127.0.0.1:<port>`), so
+//!    embedded and remote are identical (ADR 0005);
+//! 3. **settle** — mark the row `done`, or bump `attempts` with capped backoff
+//!    and dead-letter (`failed`) past [`MAX_ATTEMPTS`].
+//!
+//! A crash between step 2 and step 3 re-delivers on the next drain (the row is
+//! still `pending`); this is why the contract is honestly *at-least-once*, not
+//! exactly-once, and why makers should design idempotent processes.
+//!
+//! ## Runtime portability (ADR 0038)
+//! The inbox is reached through [`super::projects::run_data_op`], which is
+//! Node-first (Deno optional). The dispatcher itself is pure in-process Rust; it
+//! carries no Deno dependency.
+
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::Serialize;
+use serde_json::{Value as Json, json};
+use tokio::sync::{Mutex, Notify};
+
+use super::projects::{self, DataError};
+
+/// Rows are dead-lettered (`status = 'failed'`) once `attempts` reaches this.
+const MAX_ATTEMPTS: i64 = 5;
+/// First retry waits this long; each subsequent retry doubles, capped at
+/// [`BACKOFF_CAP_MS`].
+const BACKOFF_BASE_MS: u64 = 1_000;
+const BACKOFF_CAP_MS: u64 = 60_000;
+/// Rows pulled per drain pass.
+const DRAIN_BATCH: i64 = 32;
+/// How often the always-on dispatcher polls the inbox for a running App.
+const POLL_INTERVAL_MS: u64 = 2_000;
+/// Back-off after a drain error (e.g. the App has no datasource yet).
+const ERROR_BACKOFF_MS: u64 = 5_000;
+/// Inbox rows surfaced by [`inbox_status`].
+const RECENT_LIMIT: i64 = 20;
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub enum TriggerError {
+    /// A datasource op failed (see [`DataError`]).
+    Data(DataError),
+    /// The App manifest is missing/unreadable, or references an unknown trigger.
+    Manifest(String),
+    /// A trigger action's FEEL (`variables`/`correlationKey`) failed to evaluate.
+    Feel(String),
+    /// The engine rejected the action (non-2xx from the gateway, or a transport
+    /// error). Transient — the row is retried.
+    Apply(String),
+}
+
+impl std::fmt::Display for TriggerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TriggerError::Data(e) => write!(f, "datasource: {e:?}"),
+            TriggerError::Manifest(m) => write!(f, "manifest: {m}"),
+            TriggerError::Feel(m) => write!(f, "feel: {m}"),
+            TriggerError::Apply(m) => write!(f, "apply: {m}"),
+        }
+    }
+}
+
+impl From<DataError> for TriggerError {
+    fn from(e: DataError) -> Self {
+        TriggerError::Data(e)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inbox schema + primitives
+// ---------------------------------------------------------------------------
+
+const CREATE_INBOX_SQL: &str = "CREATE TABLE IF NOT EXISTS trigger_inbox (\
+    id INTEGER PRIMARY KEY AUTOINCREMENT, \
+    trigger_id TEXT NOT NULL, \
+    idem_key TEXT NOT NULL UNIQUE, \
+    body TEXT NOT NULL, \
+    status TEXT NOT NULL DEFAULT 'pending', \
+    attempts INTEGER NOT NULL DEFAULT 0, \
+    next_at INTEGER NOT NULL DEFAULT 0, \
+    last_error TEXT, \
+    created_at INTEGER NOT NULL, \
+    updated_at INTEGER NOT NULL)";
+
+/// Create the inbox table on the App's default datasource if absent. Idempotent.
+pub(crate) async fn ensure_inbox(project: &str) -> Result<(), TriggerError> {
+    projects::run_data_op(project, json!({ "op": "exec", "sql": CREATE_INBOX_SQL })).await?;
+    Ok(())
+}
+
+/// The outcome of [`enqueue`]: `enqueued` is false when the idempotency key was
+/// already present — a no-op that proves the §3 dedup boundary.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct EnqueueOutcome {
+    pub enqueued: bool,
+    pub id: Option<i64>,
+}
+
+/// Persist an event for `trigger_id` into the inbox (step 1). A repeated
+/// `idem_key` is suppressed by the table's UNIQUE constraint. When `idem_key`
+/// is `None`, a deterministic content hash of `(trigger_id, body)` is used so
+/// identical submissions collapse to one row.
+pub(crate) async fn enqueue(
+    project: &str,
+    trigger_id: &str,
+    idem_key: Option<&str>,
+    body: &Json,
+) -> Result<EnqueueOutcome, TriggerError> {
+    ensure_inbox(project).await?;
+    let key = match idem_key {
+        Some(k) if !k.is_empty() => k.to_string(),
+        _ => derive_idem_key(trigger_id, body),
+    };
+    let body_str = serde_json::to_string(body).unwrap_or_else(|_| "{}".to_string());
+    let now = now_ms() as i64;
+    let res = projects::run_data_op(
+        project,
+        json!({
+            "op": "exec",
+            "sql": "INSERT INTO trigger_inbox \
+                    (trigger_id, idem_key, body, status, attempts, next_at, created_at, updated_at) \
+                    VALUES (?, ?, ?, 'pending', 0, 0, ?, ?) \
+                    ON CONFLICT(idem_key) DO NOTHING",
+            "params": [trigger_id, key, body_str, now, now],
+        }),
+    )
+    .await?;
+    let changed = res.get("changed").and_then(Json::as_i64).unwrap_or(0);
+    if changed >= 1 {
+        let id = res.get("lastInsertId").and_then(Json::as_i64);
+        Ok(EnqueueOutcome { enqueued: true, id })
+    } else {
+        Ok(EnqueueOutcome {
+            enqueued: false,
+            id: None,
+        })
+    }
+}
+
+/// A deterministic, non-cryptographic content key. `DefaultHasher::new()` uses
+/// fixed SipHash keys, so this is stable across process restarts — enough to
+/// collapse re-submitted identical events within the runtime (§3).
+fn derive_idem_key(trigger_id: &str, body: &Json) -> String {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    trigger_id.hash(&mut h);
+    serde_json::to_string(body).unwrap_or_default().hash(&mut h);
+    format!("auto:{trigger_id}:{:016x}", h.finish())
+}
+
+/// A `pending` inbox row that is due for dispatch.
+#[derive(Debug, Clone)]
+pub(crate) struct InboxRow {
+    pub id: i64,
+    pub trigger_id: String,
+    pub body: Json,
+    pub attempts: i64,
+}
+
+/// Read the FIFO-ordered `pending` rows whose `next_at` has arrived (step 2
+/// input). Ordering is by insert order (`id`); there is no cross-source order
+/// guarantee (triggers are independent Zapier-style automations).
+pub(crate) async fn claim_due(
+    project: &str,
+    now: i64,
+    limit: i64,
+) -> Result<Vec<InboxRow>, TriggerError> {
+    let res = projects::run_data_op(
+        project,
+        json!({
+            "op": "query",
+            "sql": "SELECT id, trigger_id, body, attempts FROM trigger_inbox \
+                    WHERE status = 'pending' AND next_at <= ? ORDER BY id ASC LIMIT ?",
+            "params": [now, limit],
+        }),
+    )
+    .await?;
+    let rows = res
+        .get("rows")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            Some(InboxRow {
+                id: r.get("id")?.as_i64()?,
+                trigger_id: r.get("trigger_id")?.as_str()?.to_string(),
+                body: r
+                    .get("body")
+                    .and_then(Json::as_str)
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(Json::Null),
+                attempts: r.get("attempts").and_then(Json::as_i64).unwrap_or(0),
+            })
+        })
+        .collect())
+}
+
+/// Settle a row as applied (step 3, success path).
+pub(crate) async fn mark_done(project: &str, id: i64) -> Result<(), TriggerError> {
+    projects::run_data_op(
+        project,
+        json!({
+            "op": "exec",
+            "sql": "UPDATE trigger_inbox SET status = 'done', updated_at = ? WHERE id = ?",
+            "params": [now_ms() as i64, id],
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The result of settling a failed dispatch: whether the row was dead-lettered
+/// and when it becomes eligible again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Settlement {
+    pub terminal: bool,
+    pub attempts: i64,
+    pub next_at: i64,
+}
+
+/// Settle a row after a failed dispatch (step 3, failure path): increment
+/// `attempts`; keep it `pending` with an exponential-backoff `next_at` until it
+/// reaches [`MAX_ATTEMPTS`], then dead-letter it (`failed`, terminal).
+pub(crate) async fn settle_failure(
+    project: &str,
+    id: i64,
+    current_attempts: i64,
+    err: &str,
+    now: i64,
+) -> Result<Settlement, TriggerError> {
+    let attempts = current_attempts + 1;
+    let terminal = attempts >= MAX_ATTEMPTS;
+    let (status, next_at) = if terminal {
+        ("failed", now)
+    } else {
+        ("pending", now + backoff_ms(attempts) as i64)
+    };
+    // Keep dead-letter errors readable and the column bounded.
+    let err = err.chars().take(500).collect::<String>();
+    projects::run_data_op(
+        project,
+        json!({
+            "op": "exec",
+            "sql": "UPDATE trigger_inbox \
+                    SET status = ?, attempts = ?, next_at = ?, last_error = ?, updated_at = ? \
+                    WHERE id = ?",
+            "params": [status, attempts, next_at, err, now, id],
+        }),
+    )
+    .await?;
+    Ok(Settlement {
+        terminal,
+        attempts,
+        next_at,
+    })
+}
+
+fn backoff_ms(attempt: i64) -> u64 {
+    let shift = (attempt.max(1) - 1).min(20) as u32;
+    BACKOFF_BASE_MS
+        .saturating_mul(1u64 << shift)
+        .min(BACKOFF_CAP_MS)
+}
+
+// ---------------------------------------------------------------------------
+// Actions — resolve from the manifest, plan the engine call via FEEL
+// ---------------------------------------------------------------------------
+
+/// A trigger's engine mapping (ADR 0025 §1), parsed from the manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Action {
+    /// Start a process; `variables` is FEEL over the event body.
+    Start {
+        process: String,
+        variables: Option<String>,
+    },
+    /// Publish a `CorrelateMessage`; `correlation_key`/`variables` are FEEL.
+    Message {
+        name: String,
+        correlation_key: Option<String>,
+        variables: Option<String>,
+    },
+}
+
+/// The concrete engine call after FEEL evaluation — what the gateway receives.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum EngineCall {
+    Start {
+        process: String,
+        variables: Json,
+    },
+    Message {
+        name: String,
+        correlation_key: String,
+        variables: Json,
+    },
+}
+
+/// Resolve the `action` for `trigger_id` from the App manifest's `triggers[]`.
+/// `Ok(None)` when the manifest declares no such trigger.
+pub(crate) fn resolve_action(
+    project: &str,
+    trigger_id: &str,
+) -> Result<Option<Action>, TriggerError> {
+    let manifest = read_manifest(project)?;
+    let triggers = match manifest.get("triggers").and_then(Json::as_array) {
+        Some(t) => t,
+        None => return Ok(None),
+    };
+    let Some(t) = triggers
+        .iter()
+        .find(|t| t.get("id").and_then(Json::as_str) == Some(trigger_id))
+    else {
+        return Ok(None);
+    };
+    let action = t
+        .get("action")
+        .ok_or_else(|| TriggerError::Manifest(format!("trigger '{trigger_id}' has no action")))?;
+    parse_action(action, trigger_id).map(Some)
+}
+
+fn parse_action(action: &Json, trigger_id: &str) -> Result<Action, TriggerError> {
+    let variables = action
+        .get("variables")
+        .and_then(Json::as_str)
+        .map(str::to_string);
+    if let Some(process) = action.get("start").and_then(Json::as_str) {
+        return Ok(Action::Start {
+            process: process.to_string(),
+            variables,
+        });
+    }
+    if let Some(name) = action.get("message").and_then(Json::as_str) {
+        return Ok(Action::Message {
+            name: name.to_string(),
+            correlation_key: action
+                .get("correlationKey")
+                .and_then(Json::as_str)
+                .map(str::to_string),
+            variables,
+        });
+    }
+    Err(TriggerError::Manifest(format!(
+        "trigger '{trigger_id}' action has neither start nor message"
+    )))
+}
+
+/// Evaluate a trigger `action`'s FEEL over `body` to produce the engine call.
+/// The FEEL scope is `{ body: <event body> }` (ADR 0029 §5 / 0025 §1).
+pub(crate) fn plan_call(action: &Action, body: &Json) -> Result<EngineCall, TriggerError> {
+    let mut ctx: HashMap<String, nanobpmn_engine_core::Value> = HashMap::new();
+    ctx.insert("body".to_string(), crate::json_to_value(body));
+    match action {
+        Action::Start { process, variables } => Ok(EngineCall::Start {
+            process: process.clone(),
+            variables: eval_variables(variables.as_deref(), &ctx)?,
+        }),
+        Action::Message {
+            name,
+            correlation_key,
+            variables,
+        } => {
+            let correlation_key = match correlation_key.as_deref() {
+                Some(expr) => nanobpmn_engine_core::feel::eval_string(expr, &ctx)
+                    .map_err(|e| TriggerError::Feel(e.to_string()))?,
+                None => String::new(),
+            };
+            Ok(EngineCall::Message {
+                name: name.clone(),
+                correlation_key,
+                variables: eval_variables(variables.as_deref(), &ctx)?,
+            })
+        }
+    }
+}
+
+/// Evaluate the optional `variables` FEEL to a JSON object. A `null` result (or
+/// no expression) yields `{}`; a non-object result is a FEEL error — the started
+/// instance / published message needs a variable context, not a scalar.
+fn eval_variables(
+    expr: Option<&str>,
+    ctx: &HashMap<String, nanobpmn_engine_core::Value>,
+) -> Result<Json, TriggerError> {
+    let Some(expr) = expr else {
+        return Ok(json!({}));
+    };
+    let v = nanobpmn_engine_core::feel::eval(expr, ctx)
+        .map_err(|e| TriggerError::Feel(e.to_string()))?;
+    match crate::value_to_json(&v) {
+        Json::Null => Ok(json!({})),
+        obj @ Json::Object(_) => Ok(obj),
+        other => Err(TriggerError::Feel(format!(
+            "variables expression must yield a context/object, got {other}"
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Applying the call over the local gateway (SDK-style)
+// ---------------------------------------------------------------------------
+
+/// Perform the engine call against the gateway at `base_url` exactly like an SDK
+/// client would (ADR 0025 §4). `start` → `POST /v2/process-instances`;
+/// `message` → `POST /v2/messages/publication` (Nano's unbuffered
+/// `CorrelateMessage`). A non-2xx or transport error is a transient
+/// [`TriggerError::Apply`], so the row is retried.
+async fn perform_over_gateway(base_url: &str, call: &EngineCall) -> Result<(), TriggerError> {
+    let client = reqwest::Client::new();
+    let (url, payload) = match call {
+        EngineCall::Start { process, variables } => (
+            format!("{base_url}/v2/process-instances"),
+            json!({ "processDefinitionId": process, "variables": variables }),
+        ),
+        EngineCall::Message {
+            name,
+            correlation_key,
+            variables,
+        } => (
+            format!("{base_url}/v2/messages/publication"),
+            json!({ "name": name, "correlationKey": correlation_key, "variables": variables }),
+        ),
+    };
+    let resp = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(serde_json::to_vec(&payload).unwrap_or_default())
+        .send()
+        .await
+        .map_err(|e| TriggerError::Apply(format!("gateway request failed: {e}")))?;
+    let status = resp.status();
+    if status.is_success() {
+        Ok(())
+    } else {
+        let body = resp.text().await.unwrap_or_default();
+        let body = body.chars().take(200).collect::<String>();
+        Err(TriggerError::Apply(format!("gateway {status}: {body}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The dispatcher — one drain pass, and the always-on supervised loop
+// ---------------------------------------------------------------------------
+
+/// The outcome of one [`drain_over_gateway`] pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct DrainStats {
+    pub claimed: usize,
+    pub done: usize,
+    pub retried: usize,
+    pub dead_lettered: usize,
+}
+
+/// One full drain pass over `project`'s inbox: claim due rows, apply each row's
+/// action over the gateway, and settle. This is the dispatcher's unit of work
+/// (ADR 0025 §4). Restart-safe: rows left `pending` by a crash are simply
+/// re-claimed on the next pass (at-least-once, §2).
+pub(crate) async fn drain_over_gateway(
+    project: &str,
+    base_url: &str,
+) -> Result<DrainStats, TriggerError> {
+    ensure_inbox(project).await?;
+    let now = now_ms() as i64;
+    let rows = claim_due(project, now, DRAIN_BATCH).await?;
+    let mut stats = DrainStats {
+        claimed: rows.len(),
+        ..Default::default()
+    };
+    for row in rows {
+        match dispatch_row(project, &row, base_url).await {
+            Ok(()) => {
+                mark_done(project, row.id).await?;
+                stats.done += 1;
+            }
+            Err(e) => {
+                let s = settle_failure(
+                    project,
+                    row.id,
+                    row.attempts,
+                    &e.to_string(),
+                    now_ms() as i64,
+                )
+                .await?;
+                if s.terminal {
+                    stats.dead_lettered += 1;
+                } else {
+                    stats.retried += 1;
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
+/// Resolve + plan + apply one row's action (dispatch, step 2). Any error leaves
+/// the row for [`settle_failure`] to retry/dead-letter.
+async fn dispatch_row(project: &str, row: &InboxRow, base_url: &str) -> Result<(), TriggerError> {
+    let action = resolve_action(project, &row.trigger_id)?.ok_or_else(|| {
+        TriggerError::Manifest(format!("no trigger '{}' in manifest", row.trigger_id))
+    })?;
+    let call = plan_call(&action, &row.body)?;
+    perform_over_gateway(base_url, &call).await
+}
+
+/// Inbox status for the Triggers panel: row counts by state + the most recently
+/// updated rows.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InboxStatus {
+    pub pending: i64,
+    pub done: i64,
+    pub failed: i64,
+    pub recent: Vec<InboxStatusRow>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct InboxStatusRow {
+    pub id: i64,
+    #[serde(rename = "triggerId")]
+    pub trigger_id: String,
+    pub status: String,
+    pub attempts: i64,
+    #[serde(rename = "lastError")]
+    pub last_error: Option<String>,
+    #[serde(rename = "createdAt")]
+    pub created_at: i64,
+}
+
+/// Read the inbox counts + recent rows.
+pub(crate) async fn inbox_status(project: &str) -> Result<InboxStatus, TriggerError> {
+    ensure_inbox(project).await?;
+    let counts = projects::run_data_op(
+        project,
+        json!({
+            "op": "query",
+            "sql": "SELECT status, COUNT(*) AS n FROM trigger_inbox GROUP BY status",
+        }),
+    )
+    .await?;
+    let mut pending = 0;
+    let mut done = 0;
+    let mut failed = 0;
+    for r in counts
+        .get("rows")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let n = r.get("n").and_then(Json::as_i64).unwrap_or(0);
+        match r.get("status").and_then(Json::as_str) {
+            Some("pending") => pending = n,
+            Some("done") => done = n,
+            Some("failed") => failed = n,
+            _ => {}
+        }
+    }
+    let recent = projects::run_data_op(
+        project,
+        json!({
+            "op": "query",
+            "sql": "SELECT id, trigger_id, status, attempts, last_error, created_at \
+                    FROM trigger_inbox ORDER BY updated_at DESC, id DESC LIMIT ?",
+            "params": [RECENT_LIMIT],
+        }),
+    )
+    .await?;
+    let recent = recent
+        .get("rows")
+        .and_then(Json::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|r| {
+            Some(InboxStatusRow {
+                id: r.get("id")?.as_i64()?,
+                trigger_id: r.get("trigger_id")?.as_str()?.to_string(),
+                status: r.get("status")?.as_str()?.to_string(),
+                attempts: r.get("attempts").and_then(Json::as_i64).unwrap_or(0),
+                last_error: r
+                    .get("last_error")
+                    .and_then(Json::as_str)
+                    .map(str::to_string),
+                created_at: r.get("created_at").and_then(Json::as_i64).unwrap_or(0),
+            })
+        })
+        .collect();
+    Ok(InboxStatus {
+        pending,
+        done,
+        failed,
+        recent,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Supervision — one drain loop per running App that declares triggers
+// ---------------------------------------------------------------------------
+
+struct LoopHandle {
+    running: AtomicBool,
+    stop: Notify,
+}
+
+/// Owns a drain loop per project (ADR 0025 §4). Modeled on the worker/project
+/// supervisors: [`ensure_started`](TriggerDispatcher::ensure_started) is
+/// idempotent, and [`stop`](TriggerDispatcher::stop) tears the loop down.
+pub(crate) struct TriggerDispatcher {
+    loops: Mutex<HashMap<String, Arc<LoopHandle>>>,
+}
+
+/// The process-wide dispatcher.
+pub(crate) fn dispatcher() -> &'static TriggerDispatcher {
+    static D: OnceLock<TriggerDispatcher> = OnceLock::new();
+    D.get_or_init(|| TriggerDispatcher {
+        loops: Mutex::new(HashMap::new()),
+    })
+}
+
+impl TriggerDispatcher {
+    /// Start the drain loop for `project` if it declares `triggers[]` and isn't
+    /// already running. Called from the project run path; idempotent.
+    pub(crate) async fn ensure_started(&self, project: &str, base_url: String) {
+        // Only running Apps that actually declare triggers pay for a loop.
+        if !manifest_has_triggers(project) {
+            return;
+        }
+        let mut loops = self.loops.lock().await;
+        if loops.contains_key(project) {
+            return;
+        }
+        let handle = Arc::new(LoopHandle {
+            running: AtomicBool::new(true),
+            stop: Notify::new(),
+        });
+        loops.insert(project.to_string(), handle.clone());
+        let project = project.to_string();
+        tokio::spawn(async move {
+            while handle.running.load(Ordering::Relaxed) {
+                let wait = match drain_over_gateway(&project, &base_url).await {
+                    Ok(_) => Duration::from_millis(POLL_INTERVAL_MS),
+                    // A drain error (no datasource yet, engine not up) backs off
+                    // quietly rather than spinning.
+                    Err(_) => Duration::from_millis(ERROR_BACKOFF_MS),
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {}
+                    _ = handle.stop.notified() => break,
+                }
+            }
+        });
+    }
+
+    /// Stop and forget `project`'s drain loop. Idempotent.
+    pub(crate) async fn stop(&self, project: &str) {
+        if let Some(h) = self.loops.lock().await.remove(project) {
+            h.running.store(false, Ordering::Relaxed);
+            h.stop.notify_waiters();
+        }
+    }
+
+    /// Whether a drain loop is registered for `project` (tests/introspection).
+    #[cfg(test)]
+    pub(crate) async fn is_running(&self, project: &str) -> bool {
+        self.loops.lock().await.contains_key(project)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Manifest access
+// ---------------------------------------------------------------------------
+
+fn read_manifest(project: &str) -> Result<Json, TriggerError> {
+    let dir = projects::project_dir(project)
+        .ok_or_else(|| TriggerError::Manifest("invalid project name".to_string()))?;
+    let path = dir.join("nano.app.json");
+    let text = std::fs::read_to_string(&path)
+        .map_err(|_| TriggerError::Manifest("nano.app.json not found".to_string()))?;
+    serde_json::from_str(&text)
+        .map_err(|e| TriggerError::Manifest(format!("nano.app.json is not valid JSON: {e}")))
+}
+
+fn manifest_has_triggers(project: &str) -> bool {
+    read_manifest(project)
+        .ok()
+        .and_then(|m| {
+            m.get("triggers")
+                .and_then(Json::as_array)
+                .map(|t| !t.is_empty())
+        })
+        .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU64;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    use super::super::workers;
+    use super::*;
+
+    /// Serializes tests that mutate the process-global `NANOBPMN_PROJECTS_DIR`.
+    fn lock() -> MutexGuard<'static, ()> {
+        static L: OnceLock<Mutex<()>> = OnceLock::new();
+        L.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn runtime_available() -> bool {
+        workers::usable_node().is_some() || workers::find_deno().is_some()
+    }
+
+    /// Materialise a fresh Urban App project (sqlite datasource + optional
+    /// `triggers[]`) under a unique projects root, and return its name.
+    fn setup_app(triggers_json: &str) -> String {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nano-trig-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        unsafe {
+            std::env::set_var("NANOBPMN_PROJECTS_DIR", &root);
+        }
+        let name = "trigapp";
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("db/migrations")).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            format!(
+                r#"{{ "data": {{ "default": "app", "sources": {{
+                    "app": {{ "driver": "sqlite", "url": "file:./app.db", "migrations": "db/migrations" }}
+                }} }}{triggers_json} }}"#
+            ),
+        )
+        .unwrap();
+        projects::ensure_project_sdk(name).unwrap();
+        name.to_string()
+    }
+
+    // --- pure FEEL planning (no datasource; always runs) ------------------
+
+    #[test]
+    fn plan_call_start_evaluates_variables_feel() {
+        let action = Action::Start {
+            process: "heating".to_string(),
+            variables: Some("= {room: body.room, target: body.target}".to_string()),
+        };
+        let body = json!({ "room": "kitchen", "target": 21 });
+        let call = plan_call(&action, &body).expect("plan");
+        assert_eq!(
+            call,
+            EngineCall::Start {
+                process: "heating".to_string(),
+                variables: json!({ "room": "kitchen", "target": 21 }),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_call_start_without_variables_defaults_to_empty_object() {
+        let action = Action::Start {
+            process: "p".to_string(),
+            variables: None,
+        };
+        let call = plan_call(&action, &json!({ "x": 1 })).expect("plan");
+        assert_eq!(
+            call,
+            EngineCall::Start {
+                process: "p".to_string(),
+                variables: json!({}),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_call_message_evaluates_correlation_key_feel() {
+        let action = Action::Message {
+            name: "temp-reading".to_string(),
+            correlation_key: Some("= body.room".to_string()),
+            variables: Some("= {celsius: body.celsius}".to_string()),
+        };
+        let body = json!({ "room": "kitchen", "celsius": 19.5 });
+        let call = plan_call(&action, &body).expect("plan");
+        assert_eq!(
+            call,
+            EngineCall::Message {
+                name: "temp-reading".to_string(),
+                correlation_key: "kitchen".to_string(),
+                variables: json!({ "celsius": 19.5 }),
+            }
+        );
+    }
+
+    #[test]
+    fn plan_call_rejects_non_object_variables() {
+        let action = Action::Start {
+            process: "p".to_string(),
+            variables: Some("= body.room".to_string()),
+        };
+        let err = plan_call(&action, &json!({ "room": "kitchen" }));
+        assert!(matches!(err, Err(TriggerError::Feel(_))));
+    }
+
+    #[test]
+    fn parse_action_reads_start_and_message() {
+        let start = parse_action(&json!({ "start": "p", "variables": "= body" }), "t").unwrap();
+        assert_eq!(
+            start,
+            Action::Start {
+                process: "p".to_string(),
+                variables: Some("= body".to_string())
+            }
+        );
+        let msg = parse_action(
+            &json!({ "message": "m", "correlationKey": "= body.k" }),
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            msg,
+            Action::Message {
+                name: "m".to_string(),
+                correlation_key: Some("= body.k".to_string()),
+                variables: None
+            }
+        );
+        assert!(parse_action(&json!({ "nope": true }), "t").is_err());
+    }
+
+    #[test]
+    fn resolve_action_finds_declared_trigger() {
+        let _g = lock();
+        let name = setup_app(
+            r#", "triggers": [
+                { "id": "morning", "type": "cron", "spec": "0 6 * * *",
+                  "action": { "start": "heating", "variables": "= {room: body.room}" } }
+            ]"#,
+        );
+        let action = resolve_action(&name, "morning")
+            .expect("resolve")
+            .expect("some");
+        assert_eq!(
+            action,
+            Action::Start {
+                process: "heating".to_string(),
+                variables: Some("= {room: body.room}".to_string()),
+            }
+        );
+        // Unknown trigger id resolves to None (not an error).
+        assert!(resolve_action(&name, "nope").expect("resolve").is_none());
+    }
+
+    // --- durable inbox (datasource; runtime-gated) ------------------------
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env across awaits
+    async fn enqueue_dedups_on_idempotency_key() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        let body = json!({ "room": "kitchen" });
+        let first = enqueue(&name, "t", Some("k1"), &body)
+            .await
+            .expect("enqueue");
+        assert!(first.enqueued, "first enqueue persists");
+        let second = enqueue(&name, "t", Some("k1"), &body)
+            .await
+            .expect("enqueue");
+        assert!(!second.enqueued, "repeat key is a no-op (dedup)");
+        let due = claim_due(&name, now_ms() as i64, 10).await.expect("claim");
+        assert_eq!(due.len(), 1, "only one row despite two enqueues");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn derived_key_dedups_identical_bodies() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        let body = json!({ "a": 1 });
+        assert!(enqueue(&name, "t", None, &body).await.unwrap().enqueued);
+        assert!(!enqueue(&name, "t", None, &body).await.unwrap().enqueued);
+        // A different body is a distinct event.
+        assert!(
+            enqueue(&name, "t", None, &json!({ "a": 2 }))
+                .await
+                .unwrap()
+                .enqueued
+        );
+        let due = claim_due(&name, now_ms() as i64, 10).await.expect("claim");
+        assert_eq!(due.len(), 2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claim_is_fifo_and_mark_done_removes_from_due() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        enqueue(&name, "t", Some("a"), &json!({ "n": 1 }))
+            .await
+            .unwrap();
+        enqueue(&name, "t", Some("b"), &json!({ "n": 2 }))
+            .await
+            .unwrap();
+        let due = claim_due(&name, now_ms() as i64, 10).await.expect("claim");
+        assert_eq!(due.len(), 2);
+        assert_eq!(due[0].body, json!({ "n": 1 }), "FIFO by insert order");
+        mark_done(&name, due[0].id).await.expect("done");
+        let due2 = claim_due(&name, now_ms() as i64, 10).await.expect("claim");
+        assert_eq!(due2.len(), 1);
+        assert_eq!(due2[0].body, json!({ "n": 2 }));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn at_least_once_redelivers_unsettled_row() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        enqueue(&name, "t", Some("k"), &json!({ "n": 1 }))
+            .await
+            .unwrap();
+        // First drain: claim + "apply" but crash before settling (no mark_done).
+        let due = claim_due(&name, now_ms() as i64, 10).await.expect("claim");
+        assert_eq!(due.len(), 1);
+        // Second drain (after restart): the unsettled row is still pending.
+        let redue = claim_due(&name, now_ms() as i64, 10).await.expect("claim");
+        assert_eq!(
+            redue.len(),
+            1,
+            "unsettled row is re-delivered (at-least-once)"
+        );
+        assert_eq!(redue[0].id, due[0].id);
+        // Now settle it.
+        mark_done(&name, redue[0].id).await.expect("done");
+        let after = claim_due(&name, now_ms() as i64, 10).await.expect("claim");
+        assert!(after.is_empty(), "settled row is no longer due");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn retry_backoff_then_dead_letter() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        enqueue(&name, "t", Some("k"), &json!({ "n": 1 }))
+            .await
+            .unwrap();
+        let now = now_ms() as i64;
+        let row = claim_due(&name, now, 10).await.expect("claim")[0].clone();
+
+        // First failure: stays pending but with a future next_at (backoff).
+        let s1 = settle_failure(&name, row.id, row.attempts, "boom", now)
+            .await
+            .expect("settle");
+        assert!(!s1.terminal);
+        assert_eq!(s1.attempts, 1);
+        assert!(s1.next_at > now, "backoff schedules a future retry");
+        assert!(
+            claim_due(&name, now, 10).await.unwrap().is_empty(),
+            "not due yet"
+        );
+        let far = s1.next_at + 1;
+        let due = claim_due(&name, far, 10).await.expect("claim");
+        assert_eq!(due.len(), 1, "due again after backoff elapses");
+        assert_eq!(due[0].attempts, 1);
+
+        // Exhaust attempts → dead-letter (terminal 'failed', never re-claimed).
+        let mut attempts = 1;
+        let mut terminal = false;
+        for _ in 0..MAX_ATTEMPTS {
+            let s = settle_failure(&name, row.id, attempts, "boom", now_ms() as i64)
+                .await
+                .expect("settle");
+            attempts = s.attempts;
+            terminal = s.terminal;
+            if terminal {
+                break;
+            }
+        }
+        assert!(terminal, "row is dead-lettered after MAX_ATTEMPTS");
+        let far_future = now_ms() as i64 + 10_000_000;
+        assert!(
+            claim_due(&name, far_future, 10).await.unwrap().is_empty(),
+            "dead-lettered rows are never re-claimed"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn inbox_status_counts_by_state() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let name = setup_app("");
+        enqueue(&name, "t", Some("a"), &json!({})).await.unwrap();
+        enqueue(&name, "t", Some("b"), &json!({})).await.unwrap();
+        let due = claim_due(&name, now_ms() as i64, 10).await.unwrap();
+        mark_done(&name, due[0].id).await.unwrap();
+        let st = inbox_status(&name).await.expect("status");
+        assert_eq!(st.done, 1);
+        assert_eq!(st.pending, 1);
+        assert_eq!(st.failed, 0);
+        assert_eq!(st.recent.len(), 2);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn dispatcher_skips_apps_without_triggers() {
+        let _g = lock();
+        // A manifest with no triggers[] must not spawn a drain loop.
+        let name = setup_app("");
+        dispatcher()
+            .ensure_started(&name, "http://127.0.0.1:1".to_string())
+            .await;
+        assert!(
+            !dispatcher().is_running(&name).await,
+            "no loop for an App without triggers"
+        );
+        // stop() is a harmless no-op when nothing is registered.
+        dispatcher().stop(&name).await;
+        assert!(!dispatcher().is_running(&name).await);
+    }
+}
