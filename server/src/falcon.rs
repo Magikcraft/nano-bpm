@@ -440,6 +440,25 @@ pub enum ClientFrame {
         leader_node: u64,
         leader_addr: String,
     },
+    /// **Leadership reclaim — synchronous step-down request (new leader → survivor).**
+    /// Request/response variant of [`Promote`](ClientFrame::Promote): the promoting
+    /// leader waits for the recipient to adopt the epoch and rebuild as a receiver
+    /// (tearing down any prior-epoch group it still leads) BEFORE the leader ships it
+    /// the fresh lineage via `add_learner`. `Promote` (control lane) and the
+    /// `add_learner` AppendEntries (raft lane) travel on independent sockets with no
+    /// ordering, so a naive "announce then add_learner" lets the leader's fresh
+    /// committed `idx-1` reach the survivor's still-live prior-epoch group and collide
+    /// two committed lineages (the openraft `has_log_id` invariant, issue #228). The
+    /// recipient replies with a `CommandResult` (200) once its rebuild has completed;
+    /// the `corr` matches the reply back to the awaiting promoter.
+    #[serde(rename_all = "camelCase")]
+    PromoteSync {
+        corr: u64,
+        partition: u64,
+        epoch: u64,
+        leader_node: u64,
+        leader_addr: String,
+    },
     /// **Intra-cluster only.** An operator switched the runtime SLA mode on one
     /// node (via the console SLA knob); that node fans the new mode out to every
     /// peer so the whole cluster applies a single, uniform admission policy (a
@@ -1102,6 +1121,7 @@ async fn handle_client_frame(
         ClientFrame::RetirementDigest { .. } => "retirement_digest",
         ClientFrame::RetirementWatermark { .. } => "retirement_watermark",
         ClientFrame::Promote { .. } => "promote",
+        ClientFrame::PromoteSync { .. } => "promote_sync",
         ClientFrame::SetSlaMode { .. } => "set_sla_mode",
         ClientFrame::PressureReport { .. } => "pressure_report",
         ClientFrame::SolicitPromotions { .. } => "solicit_promotions",
@@ -1857,6 +1877,27 @@ async fn handle_client_frame(
             // leader of `partition`. Adopt the epoch and rejoin as a learner (or
             // step down if we were a stale leader). Fire-and-forget: no reply.
             server.handle_promotion(partition, epoch, leader_node).await;
+        }
+        ClientFrame::PromoteSync {
+            corr,
+            partition,
+            epoch,
+            leader_node,
+            leader_addr: _,
+        } => {
+            // Synchronous reclaim barrier (issue #228): adopt the promotion and
+            // rebuild as a receiver (tearing down any prior-epoch group we lead)
+            // BEFORE replying, so the promoting leader only ships us the fresh
+            // lineage once our old group is gone. Its `add_learner` AppendEntries
+            // then land in the clean receiver instead of colliding with our
+            // still-live prior-epoch committed log. Handled inline on this lane, so
+            // the ack is sent only after the rebuild has completed.
+            server.handle_promotion(partition, epoch, leader_node).await;
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status: 200,
+                body: None,
+            });
         }
         ClientFrame::SetSlaMode { mode } => {
             // A peer's operator switched the runtime SLA mode; apply it locally so
