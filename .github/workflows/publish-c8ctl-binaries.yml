@@ -296,9 +296,18 @@ jobs:
           gh release upload binaries dist/* --repo "$PLUGIN_REPO" --clobber
 
       # Bump the bundled-binary marker in the plugin repo. Because the plugin's
-      # npm version is decoupled from the nanobpmn version, this `fix:` commit on
-      # main is what makes semantic-release cut a patch release that ships the
-      # binaries just uploaded above. No-ops (skips the push) if unchanged.
+      # npm version is decoupled from the nanobpmn version, this commit on main
+      # is what makes semantic-release cut a release that ships the binaries just
+      # uploaded above. The conventional-commit TYPE is chosen from the server
+      # SemVer delta so the plugin's bump magnitude reflects how much the bundled
+      # server changed (issue #1):
+      #   * server minor-or-higher bump -> feat(binary):  -> plugin MINOR
+      #   * server patch bump (or commit-only)-> fix(binary): -> plugin PATCH
+      # A server MAJOR is deliberately NOT mapped to a plugin major (that would
+      # imply the plugin's own CLI surface broke); it maps to feat like a minor.
+      # No `!`/`BREAKING CHANGE:` is ever emitted. No-ops (skips push) if
+      # unchanged. semantic-release still takes the MAX bump across all commits,
+      # so a bigger plugin-own change in the same window wins.
       - name: Bump bundled-binary marker (triggers npm release)
         env:
           GH_TOKEN: ${{ secrets.C8CTL_PLUGIN_REPO_TOKEN }}
@@ -314,6 +323,30 @@ jobs:
           tmp="$(mktemp -d)"
           git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/${PLUGIN_REPO}.git" "$tmp"
+
+          # Previous bundled server version, read BEFORE we overwrite the marker.
+          prev="$(jq -r '.version // empty' "$tmp/nanobpmn-binary.json" 2>/dev/null || true)"
+
+          # Pick the conventional-commit type from the server SemVer delta.
+          # "feat" when the significant field (pre-1.0: minor; else major/minor)
+          # changed, otherwise "fix". Unparseable/absent prev -> fix (safe).
+          commit_type() {
+            local p="${1%%-*}" n="${2%%-*}"
+            p="${p%%+*}"; n="${n%%+*}"
+            [ -z "$p" ] && { echo fix; return; }
+            local pa pb pc na nb nc
+            IFS=. read -r pa pb pc <<<"$p"
+            IFS=. read -r na nb nc <<<"$n"
+            pa=${pa:-0}; pb=${pb:-0}; na=${na:-0}; nb=${nb:-0}
+            if [ "$pa" = 0 ] && [ "$na" = 0 ]; then
+              # pre-1.0: the minor field carries "new capability" significance.
+              [ "$nb" != "$pb" ] && echo feat || echo fix
+            else
+              { [ "$na" != "$pa" ] || [ "$nb" != "$pb" ]; } && echo feat || echo fix
+            fi
+          }
+          type="$(commit_type "$prev" "$ver")"
+
           cat > "$tmp/nanobpmn-binary.json" <<JSON
           {
             "version": "${ver}",
@@ -329,5 +362,7 @@ jobs:
           git config user.name "nanobpmn-ci"
           git config user.email "nanobpmn-ci@users.noreply.github.com"
           git add nanobpmn-binary.json
-          git commit -m "fix(binary): bundle nanobpmn ${ver} (${sha})"
+          git commit \
+            -m "${type}(binary): bundle nanobpmn ${ver} (${sha})" \
+            -m "Bundled nano server ${prev:-unknown} -> ${ver}."
           git push origin HEAD:main
