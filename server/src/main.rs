@@ -20165,6 +20165,36 @@ mod clustered_startup_tests {
         } else {
             &node1
         };
+
+        // `other` (the follower we did NOT elect) may momentarily lag the election:
+        // `wait_new_leader` confirms only that the NEW leader sees itself as leader,
+        // not that `other` has learned of it yet (leadership reaches a follower via
+        // the leader's first AppendEntries heartbeat, a beat or two later). In that
+        // window `other`'s partition-0 `current_leader` still reads `None`, so
+        // `route_by_leader` deliberately falls back to `remote_owner_of` — the dead
+        // static owner (node 0) — and `read_route` snapshots `Some(0)`, tripping the
+        // assertions below. Under starved CI this window stretches and the snapshot
+        // catches the follower mid-convergence. Poll until `other` agrees on the new
+        // leader (matching `rest_mutations_follow_leadership_across_a_failover`), so
+        // the assertions observe the settled follow-the-leader route this test means
+        // to prove rather than the transient in-flight-election fallback.
+        let mut other_converged = false;
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if other
+                .raft_registry()
+                .get(0)
+                .and_then(|part| part.raft.metrics().borrow().current_leader)
+                == Some(new_leader_id as u64)
+            {
+                other_converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            other_converged,
+            "the surviving follower converges on the new leader before its read is routed"
+        );
         assert_eq!(
             other.read_route(instance_key),
             Some(new_leader_id),
