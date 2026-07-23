@@ -636,9 +636,19 @@ interface Trigger {
 	 */
 	type: string;
 	/**
-	 * cron: the crontab spec (e.g. '0 6 * * *').
+	 * cron: the crontab spec (e.g. '0 6 * * *'). 5 fields, evaluated in UTC (ADR 0025 §2).
 	 */
 	spec?: string;
+	/**
+	 * cron catch-up policy for fires missed while the App was down (ADR 0025 §Open questions): skip them, fire once for the whole span, or enqueue every missed instant (dedup keys keep it idempotent).
+	 */
+	onMissed?: "skip" | "once" | "all";
+	/**
+	 * Source-kind-specific settings. Core: file may set { pollMs }. Pack sources (nano-ide-trigger-*, ADR 0025 §6) read their declared config fields from here.
+	 */
+	config?: {
+		[k: string]: unknown;
+	};
 	/**
 	 * webhook: the HTTP path served on the App backend (e.g. /hooks/temp).
 	 */
