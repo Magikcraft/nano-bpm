@@ -22,6 +22,14 @@ info:
     it is not part of code generation. It mirrors the Rust `ClientFrame` /
     `ServerFrame` enums in `server/src/falcon.rs` and the design notes in
     `docs/falcon-design.md`.
+
+
+    **This document describes only the public client channel served at
+    `/falcon`.** The nodes speak a superset of intra-cluster control/data-plane
+    frames to each other over a separate, authenticated `/cluster` channel
+    (shared-secret gated, optionally on a dedicated internal listener). Those
+    frames are internal RPC and are intentionally undocumented here; a public
+    `/falcon` connection may send only the client frames below (see ADR 0039).
   contact:
     name: nanobpmn
   license:
