@@ -2406,6 +2406,23 @@ pub(super) async fn extensions_marketplace() -> ApiResult {
     }
 }
 
+/// `GET /console/api/extensions/readme?pkg=<name>` — a pack's README (markdown).
+/// Reads an installed pack's bundled README, else fetches it from npm. Returns
+/// 404 when no README can be found. `npm view` shells out, so run it off the
+/// async runtime's worker threads.
+pub(super) async fn extensions_readme(pkg: String) -> ApiResult {
+    let name = pkg.clone();
+    match tokio::task::spawn_blocking(move || extensions::pack_readme(&name)).await {
+        Ok(Some(r)) => Ok(serde_json::json!({
+            "pkg": pkg,
+            "readme": r.readme,
+            "installed": r.installed,
+        })),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "no README for that pack".to_string())),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
 /// `GET /console/api/server/update` — server version + self-update status.
 pub(super) async fn server_update() -> ApiResult {
     Ok(

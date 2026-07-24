@@ -888,6 +888,29 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Marketplace' }
 
+  /extensions/readme:
+    get:
+      operationId: getExtensionReadme
+      tags: [extensions]
+      summary: README (markdown) for an extension pack
+      description: >
+        Returns the pack's README as raw markdown. For an installed pack this is
+        read from the bundled `README.md`; otherwise it is fetched from npm
+        (`npm view <pkg> readme`). Used by the marketplace to show pack detail.
+      parameters:
+        - name: pkg
+          in: query
+          required: true
+          description: The npm package name (e.g. `@nanobpm/nano-ide-trigger-mqtt`).
+          schema: { type: string }
+      responses:
+        '200':
+          description: Pack README
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtensionReadme' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /extensions/install:
     post:
       operationId: installExtension
@@ -1938,7 +1961,7 @@ components:
         description: { type: string }
         category:
           type: string
-          enum: [lang, app, example, theme, other]
+          enum: [lang, app, example, theme, trigger, other]
         installed: { type: boolean }
         installedVersion: { type: string }
         updateAvailable: { type: boolean }
@@ -1949,6 +1972,17 @@ components:
         entries:
           type: array
           items: { $ref: '#/components/schemas/MarketEntry' }
+    ExtensionReadme:
+      type: object
+      required: [pkg, readme, installed]
+      properties:
+        pkg: { type: string }
+        readme:
+          type: string
+          description: The pack's README as raw markdown.
+        installed:
+          type: boolean
+          description: True when the README came from an installed pack (vs npm).
     ServerUpdateStatus:
       type: object
       required: [current, updateAvailable, canSelfUpdate, installMethod]

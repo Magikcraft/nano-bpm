@@ -901,6 +901,8 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                 "example"
             } else if kws.iter().any(|k| k == "nano-ide-theme") {
                 "theme"
+            } else if kws.iter().any(|k| k == "nano-ide-trigger") {
+                "trigger"
             } else {
                 "other"
             };
@@ -979,6 +981,53 @@ fn refresh_installed_latest(npm: &std::path::Path, entries: &mut [MarketEntry]) 
             .map(|iv| !iv.is_empty() && !e.version.is_empty() && iv != e.version)
             .unwrap_or(false);
     }
+}
+
+/// A pack's README and where it came from — surfaced in the marketplace UI so a
+/// user can read the pack's docs before (or after) installing.
+pub struct PackReadme {
+    pub readme: String,
+    /// True when the README was read from an installed pack (vs fetched from npm).
+    pub installed: bool,
+}
+
+/// The README (markdown) for an extension pack. For an installed pack this reads
+/// the bundled `README.md`; otherwise it shells `npm view <pkg> readme` to pull
+/// the published README from the registry. `None` when neither yields text
+/// (unknown pack, no README, or npm unavailable/offline).
+pub fn pack_readme(pkg: &str) -> Option<PackReadme> {
+    // Prefer the installed copy: it matches exactly what's running, works
+    // offline, and needs no network round-trip.
+    if let Some(dir) = safe_pkg_dir(pkg).filter(|d| d.is_dir()) {
+        for name in ["README.md", "readme.md", "README", "Readme.md"] {
+            if let Ok(txt) = std::fs::read_to_string(dir.join(name))
+                && !txt.trim().is_empty()
+            {
+                return Some(PackReadme {
+                    readme: txt,
+                    installed: true,
+                });
+            }
+        }
+    }
+    // Not installed (or no bundled README): fall back to the registry. npm's
+    // `readme` field carries the full published README markdown.
+    let npm = find_program("npm")?;
+    let out = std::process::Command::new(&npm)
+        .args(["view", pkg, "readme", "--silent"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let txt = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if txt.is_empty() || txt == "undefined" {
+        return None;
+    }
+    Some(PackReadme {
+        readme: txt,
+        installed: false,
+    })
 }
 
 /// Find a program on PATH (plus the usual per-user tool bin dirs). Mirrors
@@ -1197,6 +1246,31 @@ mod tests {
         assert_eq!(installed_version("@nanobpm/not-installed"), None);
         // The update-available rule: installed version differs from latest.
         assert_ne!(installed_version(pkg).as_deref(), Some("1.1.0"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    #[test]
+    fn pack_readme_reads_installed_readme() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // An installed pack's bundled README.md is returned verbatim, flagged
+        // as installed (so the UI shows it without a network round-trip).
+        let root = std::env::temp_dir().join(format!("nano-ext-readme-{}", std::process::id()));
+        let pkg = "@nanobpm/nano-ide-trigger-mqtt";
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        let dir = safe_pkg_dir(pkg).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("README.md"), "# MQTT trigger\n\nHello.").unwrap();
+
+        let r = pack_readme(pkg).expect("readme present");
+        assert!(r.installed);
+        assert!(r.readme.contains("# MQTT trigger"));
+
+        // A pack dir with no README yields None from the installed branch (and
+        // this pkg name won't resolve on npm in the hermetic test env).
+        let bare = "@nanobpm/nano-ide-trigger-bare-xyz";
+        std::fs::create_dir_all(safe_pkg_dir(bare).unwrap()).unwrap();
 
         let _ = std::fs::remove_dir_all(&root);
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };

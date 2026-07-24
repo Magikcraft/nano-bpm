@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  getExtensionReadme,
   getExtensions,
   getMarketplace,
   installExtension,
@@ -8,6 +9,7 @@ import {
   type ExtensionsOverview,
   type MarketEntry,
 } from "../gen";
+import MarkdownPreview from "../components/MarkdownPreview";
 import { registerFileTypesFromOverview } from "../lib/editorLang";
 import { setIntellisenseFromOverview } from "../lib/langIntellisense";
 import { useTheme } from "../theme/ThemeProvider";
@@ -18,6 +20,7 @@ const CATEGORIES = [
   { id: "lang", label: "Languages" },
   { id: "app", label: "App templates" },
   { id: "example", label: "Example apps" },
+  { id: "trigger", label: "Triggers" },
   { id: "theme", label: "Themes" },
 ] as const;
 
@@ -31,6 +34,10 @@ export default function Extensions() {
   const [q, setQ] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // README pack-detail drawer: the pack being viewed + its fetched markdown.
+  const [readmePkg, setReadmePkg] = useState<MarketEntry | null>(null);
+  const [readmeMd, setReadmeMd] = useState<string | null>(null);
+  const [readmeErr, setReadmeErr] = useState<string | null>(null);
   const { selection, select } = useTheme();
 
   const load = async () => {
@@ -97,6 +104,19 @@ export default function Extensions() {
     return (market ?? []).filter((m) => !t || `${m.name} ${m.description}`.toLowerCase().includes(t));
   }, [market, q]);
 
+  // Open the pack-detail drawer and lazily fetch its README markdown (from the
+  // installed copy, else npm). Re-fetches each open so an update's new docs show.
+  const openReadme = async (m: MarketEntry) => {
+    setReadmePkg(m);
+    setReadmeMd(null);
+    setReadmeErr(null);
+    try {
+      setReadmeMd((await getExtensionReadme({ query: { pkg: m.name }, throwOnError: true })).data.readme);
+    } catch {
+      setReadmeErr("No README available for this pack.");
+    }
+  };
+
   return (
     <div className="mx-auto max-w-4xl p-6">
       <PageHeader
@@ -134,7 +154,14 @@ export default function Extensions() {
                 <Card key={m.name} className="group flex items-start justify-between gap-3 p-3">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-baseline gap-x-2">
-                      <span className="break-all font-medium text-fg">{m.name}</span>
+                      <button
+                        type="button"
+                        onClick={() => void openReadme(m)}
+                        className="break-all text-left font-medium text-fg hover:text-accent hover:underline"
+                        title="View README"
+                      >
+                        {m.name}
+                      </button>
                       <span className="text-xs text-fg-faint">
                         {m.installed && m.installedVersion && m.installedVersion !== m.version
                           ? `${m.installedVersion} → ${m.version}`
@@ -246,6 +273,56 @@ export default function Extensions() {
           </Card>
         ))}
       </div>
+
+      {readmePkg && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          onClick={() => setReadmePkg(null)}
+        >
+          <div
+            className="flex max-h-[85vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-edge-strong bg-panel shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-3">
+              <div className="min-w-0">
+                <h2 className="break-all text-sm font-semibold text-fg">{readmePkg.name}</h2>
+                <p className="mt-0.5 text-xs text-fg-faint">
+                  {readmePkg.version}
+                  {readmePkg.installed ? " · installed" : ""}
+                </p>
+              </div>
+              <div className="flex shrink-0 items-center gap-3">
+                {!readmePkg.installed && (
+                  <Button
+                    variant="primary"
+                    size="sm"
+                    onClick={() => void install(readmePkg.name)}
+                    disabled={busy === readmePkg.name}
+                  >
+                    {busy === readmePkg.name ? "Installing…" : "Install"}
+                  </Button>
+                )}
+                <button
+                  onClick={() => setReadmePkg(null)}
+                  className="text-fg-faint hover:text-fg"
+                  aria-label="Close"
+                >
+                  ✕
+                </button>
+              </div>
+            </div>
+            <div className="min-h-0 flex-1 overflow-auto">
+              {readmeErr ? (
+                <div className="px-6 py-5 text-sm text-fg-faint">{readmeErr}</div>
+              ) : readmeMd === null ? (
+                <div className="px-6 py-5 text-sm text-fg-faint">Loading README…</div>
+              ) : (
+                <MarkdownPreview source={readmeMd} />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
