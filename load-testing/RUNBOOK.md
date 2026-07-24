@@ -100,7 +100,7 @@ Each node is started by a small systemd launcher, `~/node-launch-verify.sh`, tha
 base64-encoded in the `LB64="..."` variable inside `deploy.sh`** (so the whole
 deploy is a single self-contained script with no side files to copy). `deploy.sh`
 does `echo "$LB64" | base64 -d > ~/node-launch-verify.sh` on each node, then runs
-it via `nohup ... $MAXBKLOG $CAP $LIVENESS "$EXP_MODE" "$EXP_ENDPOINT"`.
+it via `nohup ... $MAXBKLOG $CAP $LIVENESS "$EXP_MODE" "$EXP_ENDPOINT" "$CLUSTER_SECRET"`.
 
 A **decoded, human-readable copy is committed** at
 [`scripts/node-launch-verify.reference.sh`](scripts/node-launch-verify.reference.sh).
@@ -121,10 +121,47 @@ rails on (`VAR_SPILL`/`COLD_SPILL`=700 MB, `HISTORY_RETENTION`=6000 MB,
 | `$3` | `LIVENESS` | `NANOBPMN_STREAM_LIVENESS_MS` (default 600000) |
 | `$4` | `EXP_MODE` | read-model exporter: `sqlite` (default) \| `tee` \| `remote` → `NANOBPMN_READ_EXPORTER` |
 | `$5` | `EXP_ENDPOINT` | central exporter batch URL → `NANOBPMN_EXPORTER_ENDPOINT` |
+| `$6` | `CLUSTER_SECRET` | Falcon `/cluster` handshake secret → `NANOBPMN_CLUSTER_SECRET` (omit → `/cluster` open, ADR 0039) |
 
-`deploy.sh` forwards `$4`/`$5` from its own env `NANO_EXP_MODE` /
-`NANO_EXP_ENDPOINT`, so the remote-exporter A/B (see below) needs **no
-re-encoding** — just `NANO_EXP_MODE=remote NANO_EXP_ENDPOINT=... deploy.sh`.
+`deploy.sh` forwards `$4`/`$5`/`$6` from its own env `NANO_EXP_MODE` /
+`NANO_EXP_ENDPOINT` / `NANO_CLUSTER_SECRET`, so the remote-exporter A/B (see below)
+and the cluster-secret posture need **no re-encoding** — just
+`NANO_EXP_MODE=remote NANO_EXP_ENDPOINT=... deploy.sh` or
+`NANO_CLUSTER_SECRET=<shared> deploy.sh`.
+
+### Intra-cluster channel: `/cluster` + `NANOBPMN_CLUSTER_SECRET` (ADR 0039)
+
+**As of [ADR 0039](../../docs/adr/0039-falcon-client-cluster-channel-split.md)
+(PR #264, merged 2026-07-24) the Falcon transport is split into two WebSocket
+routes and this changes how a cluster is deployed:**
+
+- **Public clients** (SDKs, job workers, the loadgen) still use `GET /falcon`,
+  which now accepts only the 8 documented public frames and **403s any
+  intra-cluster frame**. No change for load drivers.
+- **Peers dial `GET /cluster`** (raft socket `/cluster?raft=1`) for the full
+  33-frame control/data plane, attaching an `x-nano-cluster-secret` header **only
+  when `NANOBPMN_CLUSTER_SECRET` is set**. When the env is set, `/cluster` refuses
+  the handshake (`401`) without the matching secret (constant-time compared).
+
+**Deployment implications for a soak:**
+
+- **Coordinated upgrade, always.** All nodes must move to the `/cluster` binary
+  together — a node still dialing `/falcon` for peer traffic would be 403'd.
+  `deploy.sh` already wipe-restarts **all 3 nodes** with the same staged binary,
+  so this is satisfied by construction. **Never** roll one node at a time across
+  the 0039 boundary (e.g. mixing a pre-0039 and post-0039 binary) — the cluster
+  will not form.
+- **Secret is optional on the load-test VPC.** With `NANO_CLUSTER_SECRET` **unset**
+  (the default) `/cluster` is open and the launcher does not set the env — this is
+  **byte-identical to the pre-0039 launcher**, so it does not perturb a
+  baseline comparison. A multi-node cluster with no secret logs a one-time startup
+  warning (harmless in the isolated soak VPC). To exercise the authenticated
+  posture, set the **same** `NANO_CLUSTER_SECRET=<shared>` for every node (deploy.sh
+  forwards it to all three).
+- **`NANOBPMN_INTERNAL_ADDR` is not used here.** The launcher leaves it unset, so
+  `/cluster` is merged into the main app on port 8080 (same socket as before 0039).
+  Binding `/cluster` on a dedicated internal socket is a separate, unused-in-soak
+  option.
 
 ### Editing the launcher (decode → edit → re-encode)
 

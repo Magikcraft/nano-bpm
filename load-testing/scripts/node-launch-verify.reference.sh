@@ -21,6 +21,11 @@ CAP="${2:-100000}"
 LIVENESS="${3:-600000}"
 EXP_MODE="${4:-}"
 EXP_ENDPOINT="${5:-}"
+# Falcon cluster-channel secret (ADR 0039). Peers dial /cluster; when this is set the
+# handshake requires x-nano-cluster-secret. Forwarded by deploy.sh as $6 from
+# NANO_CLUSTER_SECRET. Omitted (default) => /cluster is open (single-VPC load test;
+# a multi-node deployment then logs a startup warning). All nodes must share the value.
+CLUSTER_SECRET="${6:-}"
 NID="${HOSTNAME##*-}"
 NODES="http://10.128.0.19:8080,http://10.128.0.20:8080,http://10.128.0.18:8080"
 cp -f "$HOME/nano-gw-new" "$HOME/nano-gw"
@@ -35,6 +40,10 @@ if [ -n "$EXP_MODE" ] && [ "$EXP_MODE" != "sqlite" ]; then
   EXP_ARG+=(--setenv=NANOBPMN_READ_EXPORTER="$EXP_MODE")
   [ -n "$EXP_ENDPOINT" ] && EXP_ARG+=(--setenv=NANOBPMN_EXPORTER_ENDPOINT="$EXP_ENDPOINT")
 fi
+# Falcon cluster-channel secret (ADR 0039). Omitted => launcher does not set the env
+# (byte-identical to the pre-0039 launcher: /cluster stays open on the load-test VPC).
+SEC_ARG=()
+[ -n "$CLUSTER_SECRET" ] && SEC_ARG+=(--setenv=NANOBPMN_CLUSTER_SECRET="$CLUSTER_SECRET")
 sudo systemd-run --unit=nano --collect \
   --uid=$(id -u) --gid=$(id -g) \
   --setenv=HOME=$HOME --setenv=PORT=8080 \
@@ -51,8 +60,9 @@ sudo systemd-run --unit=nano --collect \
   --setenv=NANOBPMN_SLA_MODE=latency \
   "${BKLOG_ARG[@]}" \
   "${EXP_ARG[@]}" \
+  "${SEC_ARG[@]}" \
   --setenv=NANOBPMN_ADMISSION_MAX_CREATE_QUEUE="$CAP" \
   --setenv=NANOBPMN_STREAM_LIVENESS_MS="$LIVENESS" \
   $HOME/nano-gw
 sleep 3
-systemctl is-active nano.service && echo "LAUNCHED-VERIFY node-$NID replicate_activation=DEFAULT maxBacklog=$MAXBKLOG liveness=$LIVENESS exporter=${EXP_MODE:-sqlite} sha $(sha256sum ~/nano-gw|cut -c1-16)"
+systemctl is-active nano.service && echo "LAUNCHED-VERIFY node-$NID replicate_activation=DEFAULT maxBacklog=$MAXBKLOG liveness=$LIVENESS exporter=${EXP_MODE:-sqlite} cluster_secret=$([ -n "$CLUSTER_SECRET" ] && echo set || echo unset) sha $(sha256sum ~/nano-gw|cut -c1-16)"
