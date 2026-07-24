@@ -14,6 +14,19 @@
 //! eviction logic. `synchronous=NORMAL` is safe here because the spill store is a
 //! *derived* cache: the variables are already durable in the journal (and the
 //! read model), so a lost spill page is reconstructable, never authoritative.
+//!
+//! ## Returning freed space to the OS
+//!
+//! Destructive reads ([`VarSpillStore::take`]) and terminal eviction
+//! ([`VarSpillStore::forget`]) keep the *live* row set bounded to the still-cold
+//! backlog — but SQLite never returns freed pages to the OS on its own, so the
+//! *file* would otherwise plateau at the high-water mark of the largest backlog
+//! ever seen (a single spike parks ~payload × peak-backlog on disk for the life of
+//! the process — e.g. 100+ GB after one bad soak). The store therefore runs in
+//! `INCREMENTAL` auto-vacuum mode and, on the batched eviction path, hands freed
+//! pages back to the OS once enough have accumulated to be worth a copy-back (see
+//! [`crate::sqlite_space`]). The file then tracks the *live* backlog rather than the
+//! historical peak. `NANOBPMN_VARSPILL_RECLAIM_MB` tunes the gate (0 disables).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -22,15 +35,43 @@ use std::sync::Mutex;
 use nanobpmn_engine_core::{InstanceSnapshot, Key, Value};
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::sqlite_space::{enable_incremental_auto_vacuum, page_stats, reclaim_freelist};
+
+/// Freelist bytes that must accumulate before [`VarSpillStore::forget`] spends an
+/// `incremental_vacuum` + `wal_checkpoint(TRUNCATE)` to return them to the OS.
+/// Default 64 MiB — high enough that steady-state churn (bounded live backlog)
+/// rarely triggers a reclaim, low enough to cap the file near `live + 64 MiB`
+/// rather than the historical peak. `NANOBPMN_VARSPILL_RECLAIM_MB` overrides;
+/// 0 disables reclaim entirely (pre-fix high-water behaviour, for A/B).
+fn reclaim_threshold_bytes() -> u64 {
+    std::env::var("NANOBPMN_VARSPILL_RECLAIM_MB")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(64)
+        * 1024
+        * 1024
+}
+
 /// A SQLite-backed key → variables map for spilled instance payloads.
 pub struct VarSpillStore {
     conn: Mutex<Connection>,
+    /// Freelist byte gate for on-eviction reclaim; 0 disables it.
+    reclaim_threshold_bytes: u64,
 }
 
 impl VarSpillStore {
     /// Opens (creating if absent) the spill store at `path`, or an in-memory
     /// store when `path` is `None` (tests / ephemeral runs).
     pub fn open(path: Option<&Path>) -> rusqlite::Result<Self> {
+        Self::open_with_reclaim_threshold(path, reclaim_threshold_bytes())
+    }
+
+    /// [`open`](Self::open) with an explicit freelist reclaim gate, so tests can
+    /// force reclaim without racing the process-global `NANOBPMN_VARSPILL_RECLAIM_MB`.
+    fn open_with_reclaim_threshold(
+        path: Option<&Path>,
+        reclaim_threshold_bytes: u64,
+    ) -> rusqlite::Result<Self> {
         let conn = match path {
             Some(p) => Connection::open(p)?,
             None => Connection::open_in_memory()?,
@@ -43,8 +84,13 @@ impl VarSpillStore {
              DELETE FROM spill;
              DELETE FROM cold;",
         )?;
+        // Convert to INCREMENTAL auto-vacuum now that the tables are empty (the
+        // wipe above), so the VACUUM is near-free and later evictions can hand
+        // freed pages back to the OS instead of plateauing at the high-water mark.
+        enable_incremental_auto_vacuum(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            reclaim_threshold_bytes,
         })
     }
 
@@ -140,6 +186,24 @@ impl VarSpillStore {
             }
         }
         let _ = tx.commit();
+        // Terminal eviction is the natural, batched moment to return freed pages
+        // to the OS: `take` deletions (rehydration) also land on the freelist and
+        // are reclaimed here. Gated so this runs only when enough space has piled
+        // up to be worth the copy-back — keeping the file near the live backlog
+        // instead of the historical high-water mark.
+        if self.reclaim_threshold_bytes > 0 {
+            let _ = reclaim_freelist(&conn, self.reclaim_threshold_bytes);
+        }
+    }
+
+    /// The store's on-disk size as `(file_bytes, live_bytes)` (see
+    /// [`crate::sqlite_space::page_stats`]): `file_bytes` is the whole allocated
+    /// file (freelist included), `live_bytes` the pages holding actual data. With
+    /// incremental auto-vacuum + on-eviction reclaim, `file_bytes` tracks the live
+    /// cold backlog rather than plateauing at the peak-backlog high-water.
+    pub fn db_page_stats(&self) -> (u64, u64) {
+        let conn = self.conn.lock().expect("spill store poisoned");
+        page_stats(&conn)
     }
 }
 
@@ -234,5 +298,41 @@ mod tests {
 
         // Empty slice is a cheap no-op.
         store.forget(&[]);
+    }
+
+    #[test]
+    fn forget_reclaims_file_space_to_the_os() {
+        // A file-backed store so we can observe the on-disk high-water shrink;
+        // the reclaim gate is set to 1 byte so any freelist triggers it.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("varspill-reclaim-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let store = VarSpillStore::open_with_reclaim_threshold(Some(&path), 1).unwrap();
+
+        // Spill a batch large enough to grow the file well past its empty size.
+        let big = "x".repeat(8 * 1024);
+        let keys: Vec<Key> = (0..4000).collect();
+        for &k in &keys {
+            store.put(k, &vars(&big)).unwrap();
+        }
+        let (file_peak, live_peak) = store.db_page_stats();
+        assert!(live_peak > 0 && file_peak > 0);
+
+        // Terminal eviction of the whole batch must hand the freed pages back.
+        store.forget(&keys);
+        let (file_after, live_after) = store.db_page_stats();
+
+        assert!(
+            live_after < live_peak / 4,
+            "live bytes should collapse after forgetting the batch (peak={live_peak}, after={live_after})"
+        );
+        assert!(
+            file_after < file_peak / 2,
+            "file should shrink back toward the live set, not hold the high-water (peak={file_peak}, after={file_after})"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
     }
 }

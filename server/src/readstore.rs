@@ -478,26 +478,10 @@ fn read_wal_truncate_bytes() -> u64 {
         * 1024
 }
 
-/// Reads a SQLite database's size as `(file_bytes, live_bytes)` from its header:
-/// `file_bytes = page_count × page_size` (the whole allocated file, freelist
-/// included) and `live_bytes = (page_count − freelist_count) × page_size` (the
-/// pages holding actual data). All three PRAGMAs are O(1) header reads, so this
-/// is cheap enough for the pruner's hot loop.
-fn page_stats(conn: &Connection) -> (u64, u64) {
-    let page_count: i64 = conn
-        .query_row("PRAGMA page_count", [], |r| r.get(0))
-        .unwrap_or(0);
-    let freelist: i64 = conn
-        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
-        .unwrap_or(0);
-    let page_size: i64 = conn
-        .query_row("PRAGMA page_size", [], |r| r.get(0))
-        .unwrap_or(4096);
-    let ps = page_size.max(0) as u64;
-    let file = page_count.max(0) as u64 * ps;
-    let live = (page_count - freelist).max(0) as u64 * ps;
-    (file, live)
-}
+/// Read-model store space accounting reuses the shared SQLite helper so the
+/// `(file_bytes, live_bytes)` derivation lives in one place (see
+/// [`crate::sqlite_space::page_stats`]).
+use crate::sqlite_space::page_stats;
 
 /// Evicts up to `batch` of the **oldest** terminal instances (and their child
 /// rows) in a single small transaction, returning how many were deleted.
