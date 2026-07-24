@@ -92,6 +92,7 @@ Deno.test("openDataSource: SQLite roundtrip, tx, and schema", async () => {
   assertEquals(schema[0].columns[0].primaryKey, true);
   assertEquals(schema[0].columns[1].notNull, true);
   assertEquals(schema[0].indexes.includes("idx_orders_name"), true);
+  assertEquals(schema[0].foreignKeys, []);
 
   db.close();
 
@@ -100,6 +101,51 @@ Deno.test("openDataSource: SQLite roundtrip, tx, and schema", async () => {
   assertEquals((await dflt.query("SELECT COUNT(*) c FROM orders"))[0].c, 2);
   dflt.close();
 
+  await Deno.remove(root, { recursive: true });
+});
+
+Deno.test("schema() introspects foreign keys", async () => {
+  const root = await Deno.makeTempDir();
+  await Deno.writeTextFile(
+    `${root}/nano.app.json`,
+    JSON.stringify({
+      data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
+    }),
+  );
+  const db = await openDataSource("app", { cwd: root });
+  await db.exec("CREATE TABLE customer(id INTEGER PRIMARY KEY, name TEXT)");
+  await db.exec(
+    "CREATE TABLE ord(" +
+      "id INTEGER PRIMARY KEY, " +
+      "customer_id INTEGER REFERENCES customer(id) ON DELETE CASCADE, " +
+      "parent_id INTEGER REFERENCES ord)",
+  );
+
+  const schema = await db.schema();
+  const customer = schema.find((t) => t.name === "customer")!;
+  const ord = schema.find((t) => t.name === "ord")!;
+
+  // The parent table has no outgoing FKs.
+  assertEquals(customer.foreignKeys, []);
+
+  // FKs are keyed by their local column; a named target keeps its column, an
+  // unnamed self-reference resolves to the parent PK (empty refColumn), and
+  // "NO ACTION" normalises to an empty onDelete.
+  const byCol = Object.fromEntries(ord.foreignKeys.map((f) => [f.column, f]));
+  assertEquals(byCol["customer_id"], {
+    column: "customer_id",
+    refTable: "customer",
+    refColumn: "id",
+    onDelete: "CASCADE",
+  });
+  assertEquals(byCol["parent_id"], {
+    column: "parent_id",
+    refTable: "ord",
+    refColumn: "",
+    onDelete: "",
+  });
+
+  db.close();
   await Deno.remove(root, { recursive: true });
 });
 

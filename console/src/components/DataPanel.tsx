@@ -13,6 +13,7 @@ import {
   regenerateDomainTypes,
   saveProjectFile,
   type DataColumnMeta,
+  type DataForeignKey,
   type DataMigrationEntry,
   type DataQueryResult,
   type DataSourceInfo,
@@ -105,15 +106,26 @@ function buildCreateTable(table: string, cols: NewColumn[]): string {
   // after all column defs). `PRAGMA foreign_keys = ON` is set by the datasource,
   // so these are enforced, not merely declarative.
   for (const c of cols) {
-    const r = c.references;
-    if (!c.name.trim() || !r || !r.table.trim() || !r.column.trim()) continue;
-    let s = `  FOREIGN KEY (${quoteIdent(c.name.trim())}) REFERENCES ${quoteIdent(
-      r.table.trim(),
-    )} (${quoteIdent(r.column.trim())})`;
-    if (r.onDelete) s += ` ON DELETE ${r.onDelete}`;
-    defs.push(s);
+    const clause = fkClause(c.name, c.references);
+    if (clause) defs.push(clause);
   }
   return `CREATE TABLE ${quoteIdent(table.trim() || "new_table")} (\n${defs.join(",\n")}\n);`;
+}
+
+/** A column's foreign-key clause for a `CREATE TABLE` (inline table constraint).
+ * Returns null when the reference is incomplete. An empty `refColumn` targets
+ * the parent's primary key (SQLite allows omitting the column list). */
+function fkClause(colName: string, r: ColumnRef | null): string | null {
+  if (!r || !colName.trim() || !r.table.trim()) return null;
+  let s = `  FOREIGN KEY (${quoteIdent(colName.trim())}) REFERENCES ${quoteIdent(r.table.trim())}`;
+  if (r.column.trim()) s += ` (${quoteIdent(r.column.trim())})`;
+  if (r.onDelete) s += ` ON DELETE ${r.onDelete}`;
+  return s;
+}
+
+/** A stable key for a column reference, so two FKs can be compared for equality. */
+function refKey(r: ColumnRef | null): string {
+  return r ? `${r.table}\u0000${r.column}\u0000${r.onDelete}` : "";
 }
 
 // --- Structure-editor DDL model --------------------------------------------
@@ -122,6 +134,7 @@ function buildCreateTable(table: string, cols: NewColumn[]): string {
  * A column as seen by the structure editor. `originalName` is the column's name
  * in the live table (null for a freshly-added column) and is the stable key used
  * to copy data during a rebuild; the other fields are the edited target shape.
+ * `references` is the column's foreign key (null when it has none).
  */
 interface EditColumn {
   originalName: string | null;
@@ -130,20 +143,28 @@ interface EditColumn {
   primaryKey: boolean;
   notNull: boolean;
   default: string;
+  references: ColumnRef | null;
   drop: boolean;
 }
 
-/** Seed the structure editor from a live table's column metadata. */
-function editColumnsFrom(columns: DataColumnMeta[]): EditColumn[] {
-  return columns.map((c) => ({
-    originalName: c.name,
-    name: c.name,
-    type: c.type || "TEXT",
-    primaryKey: c.primaryKey,
-    notNull: c.notNull,
-    default: "",
-    drop: false,
-  }));
+/** Seed the structure editor from a live table's columns + foreign keys. */
+function editColumnsFrom(columns: DataColumnMeta[], foreignKeys: DataForeignKey[]): EditColumn[] {
+  const fkByColumn = new Map(foreignKeys.map((f) => [f.column, f]));
+  return columns.map((c) => {
+    const fk = fkByColumn.get(c.name);
+    return {
+      originalName: c.name,
+      name: c.name,
+      type: c.type || "TEXT",
+      primaryKey: c.primaryKey,
+      notNull: c.notNull,
+      default: "",
+      references: fk
+        ? { table: fk.refTable, column: fk.refColumn, onDelete: fk.onDelete }
+        : null,
+      drop: false,
+    };
+  });
 }
 
 function blankEditColumn(): EditColumn {
@@ -154,6 +175,7 @@ function blankEditColumn(): EditColumn {
     primaryKey: false,
     notNull: false,
     default: "",
+    references: null,
     drop: false,
   };
 }
@@ -185,18 +207,32 @@ function needsRebuild(orig: DataColumnMeta, edit: EditColumn): boolean {
 /**
  * Compute the DDL to reshape `oldName` into `newName` with `cols`. Returns the
  * ordered statement list plus whether a rebuild was chosen, so the caller can
- * warn about the rebuild's caveats (indexes and table-level constraints such as
- * foreign keys are not carried over — use a migration for those).
+ * warn about the rebuild's caveats. Foreign keys *are* carried through the
+ * rebuild (they are re-emitted from each kept column's `references`); a
+ * foreign-key add/change/remove itself forces the rebuild, since SQLite cannot
+ * add or drop an FK on an existing column via `ALTER TABLE`.
  */
 function buildStructureStatements(
   oldName: string,
   newName: string,
   original: DataColumnMeta[],
+  originalFks: DataForeignKey[],
   cols: EditColumn[],
 ): { statements: string[]; rebuild: boolean } {
   const kept = cols.filter((c) => !c.drop && c.name.trim());
   const byOriginal = new Map(original.map((c) => [c.name, c]));
-  const rebuild = kept.some((c) => {
+  // The original FK per column, so an edited reference can be compared for change.
+  const origRefByColumn = new Map(
+    originalFks.map((f): [string, ColumnRef] => [
+      f.column,
+      { table: f.refTable, column: f.refColumn, onDelete: f.onDelete },
+    ]),
+  );
+  const fkChanged = kept.some((c) => {
+    const before = c.originalName ? origRefByColumn.get(c.originalName) ?? null : null;
+    return refKey(before) !== refKey(c.references);
+  });
+  const rebuild = fkChanged || kept.some((c) => {
     const o = c.originalName ? byOriginal.get(c.originalName) : undefined;
     return o ? needsRebuild(o, c) : false;
   });
@@ -205,12 +241,22 @@ function buildStructureStatements(
     // SQLite 12-step rebuild: create a new table, copy data by (old→new) column
     // mapping, drop the old, rename the new into place. New columns get their
     // declared DEFAULT / NULL. Runs atomically via the `script` endpoint.
+    const tmp = `${newName.trim()}__rebuild`;
     const pkCount = kept.filter((c) => c.primaryKey).length;
     const defs = kept.map((c) => `  ${columnDef(c, pkCount === 1)}`);
     if (pkCount > 1) {
       defs.push(`  PRIMARY KEY (${kept.filter((c) => c.primaryKey).map((c) => quoteIdent(c.name.trim())).join(", ")})`);
     }
-    const tmp = `${newName.trim()}__rebuild`;
+    // Re-emit each kept column's foreign key as a table-level constraint so the
+    // rebuild preserves (and applies newly added) FKs. A self-reference targets
+    // the temp table so it resolves during CREATE/INSERT; the final RENAME TABLE
+    // rewrites the reference to the new table name automatically.
+    for (const c of kept) {
+      let ref = c.references;
+      if (ref && ref.table === oldName) ref = { ...ref, table: tmp };
+      const clause = fkClause(c.name, ref);
+      if (clause) defs.push(clause);
+    }
     const copyCols = kept.filter((c) => c.originalName);
     const create = `CREATE TABLE ${quoteIdent(tmp)} (\n${defs.join(",\n")}\n)`;
     const insert =
@@ -553,7 +599,13 @@ function TablesTab({ name, source }: { name: string; source: string }) {
             </button>
           </div>
         )}
-        {meta && <ColumnStrip columns={meta.columns} indexes={meta.indexes} />}
+        {meta && (
+          <ColumnStrip
+            columns={meta.columns}
+            indexes={meta.indexes}
+            foreignKeys={meta.foreignKeys}
+          />
+        )}
         {error && <div className="px-4 py-2 text-sm text-danger">{error}</div>}
         <div className="min-h-0 flex-1 overflow-auto">
           {loadingRows ? (
@@ -622,6 +674,8 @@ function TablesTab({ name, source }: { name: string; source: string }) {
           source={source}
           table={meta.name}
           columns={meta.columns}
+          foreignKeys={meta.foreignKeys}
+          tables={tables}
           onClose={() => setShowStructure(false)}
           onSaved={(newName) => {
             setShowStructure(false);
@@ -637,17 +691,39 @@ function TablesTab({ name, source }: { name: string; source: string }) {
   );
 }
 
-function ColumnStrip({ columns, indexes }: { columns: DataColumnMeta[]; indexes: string[] }) {
+function ColumnStrip({
+  columns,
+  indexes,
+  foreignKeys,
+}: {
+  columns: DataColumnMeta[];
+  indexes: string[];
+  foreignKeys: DataForeignKey[];
+}) {
+  const fkByCol = new Map(foreignKeys.map((fk) => [fk.column, fk]));
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-edge bg-bg-subtle px-4 py-1.5 text-xs">
-      {columns.map((c) => (
-        <span key={c.name} className="text-fg-muted">
-          <span className="font-medium text-fg">{c.name}</span>
-          <span className="text-fg-faint"> {c.type || "?"}</span>
-          {c.primaryKey && <span className="ml-0.5 text-accent" title="primary key">🔑</span>}
-          {c.notNull && !c.primaryKey && <span className="ml-0.5 text-fg-faint" title="NOT NULL">*</span>}
-        </span>
-      ))}
+      {columns.map((c) => {
+        const fk = fkByCol.get(c.name);
+        return (
+          <span key={c.name} className="text-fg-muted">
+            <span className="font-medium text-fg">{c.name}</span>
+            <span className="text-fg-faint"> {c.type || "?"}</span>
+            {c.primaryKey && <span className="ml-0.5 text-accent" title="primary key">🔑</span>}
+            {c.notNull && !c.primaryKey && <span className="ml-0.5 text-fg-faint" title="NOT NULL">*</span>}
+            {fk && (
+              <span
+                className="ml-0.5 text-accent"
+                title={`foreign key → ${fk.refTable}${fk.refColumn ? `.${fk.refColumn}` : ""}${
+                  fk.onDelete ? ` (on delete ${fk.onDelete})` : ""
+                }`}
+              >
+                ↗{fk.refTable}
+              </span>
+            )}
+          </span>
+        );
+      })}
       {indexes.length > 0 && (
         <span className="text-fg-faint" title={indexes.join(", ")}>
           · {indexes.length} index{indexes.length === 1 ? "" : "es"}
@@ -1118,6 +1194,8 @@ function EditStructureDialog({
   source,
   table,
   columns,
+  foreignKeys,
+  tables,
   onClose,
   onSaved,
 }: {
@@ -1125,11 +1203,13 @@ function EditStructureDialog({
   source: string;
   table: string;
   columns: DataColumnMeta[];
+  foreignKeys: DataForeignKey[];
+  tables: DataTableMeta[];
   onClose: () => void;
   onSaved: (newName: string) => void;
 }) {
   const [newName, setNewName] = useState(table);
-  const [cols, setCols] = useState<EditColumn[]>(() => editColumnsFrom(columns));
+  const [cols, setCols] = useState<EditColumn[]>(() => editColumnsFrom(columns, foreignKeys));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1137,9 +1217,28 @@ function EditStructureDialog({
     setCols((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
   const addCol = () => setCols((cs) => [...cs, blankEditColumn()]);
 
+  // FK targets: every table in this datasource, including this one (a table may
+  // reference itself). Columns come from the picked table's live schema; when the
+  // picked table is the one being edited, offer its edited column names.
+  const fkTables = tables.map((t) => t.name);
+  const columnsOf = (t: string): string[] =>
+    t === table
+      ? cols.filter((c) => !c.drop && c.name.trim()).map((c) => c.name.trim())
+      : tables.find((x) => x.name === t)?.columns.map((c) => c.name) ?? [];
+  const toggleFk = (i: number, on: boolean) =>
+    setCol(i, {
+      references: on ? { table: fkTables[0] ?? "", column: "", onDelete: "" } : null,
+    });
+  const setRef = (i: number, patch: Partial<ColumnRef>) =>
+    setCols((cs) =>
+      cs.map((c, j) =>
+        j === i && c.references ? { ...c, references: { ...c.references, ...patch } } : c,
+      ),
+    );
+
   const { statements, rebuild } = useMemo(
-    () => buildStructureStatements(table, newName, columns, cols),
-    [table, newName, columns, cols],
+    () => buildStructureStatements(table, newName, columns, foreignKeys, cols),
+    [table, newName, columns, foreignKeys, cols],
   );
   const kept = cols.filter((c) => !c.drop && c.name.trim());
   const valid = newName.trim().length > 0 && kept.length > 0 && statements.length > 0;
@@ -1192,68 +1291,123 @@ function EditStructureDialog({
           <span className="w-24">Default</span>
           <span className="w-8 text-center" title="Primary key">PK</span>
           <span className="w-10 text-center" title="NOT NULL">Req</span>
+          <span className="w-8 text-center" title="Foreign key">FK</span>
           <span className="w-8 text-center" title="Drop column">Del</span>
         </div>
         {cols.map((c, i) => (
-          <div
-            key={i}
-            className={`flex items-center gap-2 ${c.drop ? "opacity-40 line-through" : ""}`}
-          >
-            <Input
-              className="flex-1"
-              value={c.name}
-              onChange={(e) => setCol(i, { name: e.target.value })}
-              placeholder="column"
-            />
-            <select
-              className={`${inputClass} w-28`}
-              value={c.type}
-              onChange={(e) => setCol(i, { type: e.target.value })}
+          <div key={i} className="flex flex-col gap-1.5">
+            <div
+              className={`flex items-center gap-2 ${c.drop ? "opacity-40 line-through" : ""}`}
             >
-              {COLUMN_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t}
-                </option>
-              ))}
-            </select>
-            <Input
-              className="w-24"
-              value={c.default}
-              onChange={(e) => setCol(i, { default: e.target.value })}
-              placeholder="—"
-              title="Raw SQL default, e.g. 0, 'active', CURRENT_TIMESTAMP"
-            />
-            <input
-              type="checkbox"
-              className="w-8"
-              checked={c.primaryKey}
-              onChange={(e) => setCol(i, { primaryKey: e.target.checked })}
-              title="Primary key"
-            />
-            <input
-              type="checkbox"
-              className="w-10"
-              checked={c.notNull}
-              disabled={c.primaryKey}
-              onChange={(e) => setCol(i, { notNull: e.target.checked })}
-              title="NOT NULL"
-            />
-            <input
-              type="checkbox"
-              className="w-8"
-              checked={c.drop}
-              onChange={(e) => setCol(i, { drop: e.target.checked })}
-              title="Drop this column"
-            />
+              <Input
+                className="flex-1"
+                value={c.name}
+                onChange={(e) => setCol(i, { name: e.target.value })}
+                placeholder="column"
+              />
+              <select
+                className={`${inputClass} w-28`}
+                value={c.type}
+                onChange={(e) => setCol(i, { type: e.target.value })}
+              >
+                {COLUMN_TYPES.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
+              <Input
+                className="w-24"
+                value={c.default}
+                onChange={(e) => setCol(i, { default: e.target.value })}
+                placeholder="—"
+                title="Raw SQL default, e.g. 0, 'active', CURRENT_TIMESTAMP"
+              />
+              <input
+                type="checkbox"
+                className="w-8"
+                checked={c.primaryKey}
+                onChange={(e) => setCol(i, { primaryKey: e.target.checked })}
+                title="Primary key"
+              />
+              <input
+                type="checkbox"
+                className="w-10"
+                checked={c.notNull}
+                disabled={c.primaryKey}
+                onChange={(e) => setCol(i, { notNull: e.target.checked })}
+                title="NOT NULL"
+              />
+              <input
+                type="checkbox"
+                className="w-8"
+                checked={c.references !== null}
+                disabled={c.drop || fkTables.length === 0}
+                onChange={(e) => toggleFk(i, e.target.checked)}
+                title={
+                  fkTables.length === 0
+                    ? "No tables to reference"
+                    : "Foreign key to another table"
+                }
+              />
+              <input
+                type="checkbox"
+                className="w-8"
+                checked={c.drop}
+                onChange={(e) => setCol(i, { drop: e.target.checked })}
+                title="Drop this column"
+              />
+            </div>
+            {c.references && !c.drop && (
+              <div className="flex items-center gap-2 pl-3 text-xs text-fg-faint">
+                <span className="text-fg-faint">↳ references</span>
+                <select
+                  className={`${inputClass} w-40`}
+                  value={c.references.table}
+                  onChange={(e) => setRef(i, { table: e.target.value, column: "" })}
+                >
+                  {fkTables.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+                <span>.</span>
+                <select
+                  className={`${inputClass} w-40`}
+                  value={c.references.column}
+                  onChange={(e) => setRef(i, { column: e.target.value })}
+                >
+                  <option value="">primary key</option>
+                  {columnsOf(c.references.table).map((col) => (
+                    <option key={col} value={col}>
+                      {col}
+                    </option>
+                  ))}
+                </select>
+                <span className="ml-1">on delete</span>
+                <select
+                  className={`${inputClass} w-28`}
+                  value={c.references.onDelete}
+                  onChange={(e) => setRef(i, { onDelete: e.target.value })}
+                >
+                  {ON_DELETE_ACTIONS.map((a) => (
+                    <option key={a} value={a}>
+                      {a || "—"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
         ))}
       </div>
 
       {rebuild && (
         <p className="mt-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
-          A type or constraint change requires rebuilding the table. Indexes and
-          table-level constraints (foreign keys, CHECK) are not carried over — add
-          those back via a migration if needed.
+          A type, constraint or foreign-key change requires rebuilding the table.
+          Foreign keys are re-created, but indexes and CHECK constraints are not
+          carried over — add those back via a migration if needed.
         </p>
       )}
 

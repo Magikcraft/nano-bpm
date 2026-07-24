@@ -60,12 +60,25 @@ export interface ColumnMeta {
   primaryKey: boolean;
 }
 
-/** One table: its columns and the names of its indexes. Powers the DB Manager,
- * form data-binding, and the ADR 0029 domain-type ↔ table projection. */
+/** One foreign-key constraint: `column` in this table references
+ * `refTable(refColumn)`. `refColumn` is empty when the FK targets the parent's
+ * primary key without naming a column. `onDelete` is the referential action
+ * (e.g. `CASCADE`), empty when none was declared. */
+export interface ForeignKeyMeta {
+  column: string;
+  refTable: string;
+  refColumn: string;
+  onDelete: string;
+}
+
+/** One table: its columns, the names of its indexes, and its foreign keys.
+ * Powers the DB Manager, form data-binding, and the ADR 0029 domain-type ↔ table
+ * projection. */
 export interface TableMeta {
   name: string;
   columns: ColumnMeta[];
   indexes: string[];
+  foreignKeys: ForeignKeyMeta[];
 }
 
 export type Row = Record<string, unknown>;
@@ -284,6 +297,11 @@ class SqliteDataSource implements DataSource {
       const idx = this.#db
         .prepare(`PRAGMA index_list(${quoteIdent(t.name)})`)
         .all() as Array<{ name: string }>;
+      const fks = this.#db
+        .prepare(`PRAGMA foreign_key_list(${quoteIdent(t.name)})`)
+        .all() as Array<
+          { from: string; table: string; to: string | null; on_delete?: string }
+        >;
       out.push({
         name: t.name,
         columns: cols.map((c) => ({
@@ -293,6 +311,14 @@ class SqliteDataSource implements DataSource {
           primaryKey: !!c.pk,
         })),
         indexes: idx.map((i) => String(i.name)),
+        foreignKeys: fks.map((f) => ({
+          column: f.from,
+          refTable: f.table,
+          refColumn: f.to ?? "",
+          onDelete: f.on_delete && f.on_delete.toUpperCase() !== "NO ACTION"
+            ? f.on_delete.toUpperCase()
+            : "",
+        })),
       });
     }
     return Promise.resolve(out);

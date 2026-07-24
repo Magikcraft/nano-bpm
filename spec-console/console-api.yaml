@@ -2152,9 +2152,22 @@ components:
         type: { type: string }
         notNull: { type: boolean }
         primaryKey: { type: boolean }
+    DataForeignKey:
+      type: object
+      required: [column, refTable, refColumn, onDelete]
+      description: >-
+        A foreign-key constraint: `column` in this table references
+        `refTable(refColumn)`. `refColumn` is empty when the FK targets the
+        parent's primary key. `onDelete` is the referential action (e.g.
+        `CASCADE`), empty when none was declared.
+      properties:
+        column: { type: string }
+        refTable: { type: string }
+        refColumn: { type: string }
+        onDelete: { type: string }
     DataTableMeta:
       type: object
-      required: [name, columns, indexes]
+      required: [name, columns, indexes, foreignKeys]
       properties:
         name: { type: string }
         columns:
@@ -2163,6 +2176,9 @@ components:
         indexes:
           type: array
           items: { type: string }
+        foreignKeys:
+          type: array
+          items: { $ref: '#/components/schemas/DataForeignKey' }
     DataSchemaResponse:
       type: object
       required: [tables]
