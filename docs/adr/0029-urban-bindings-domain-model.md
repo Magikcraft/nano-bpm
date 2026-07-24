@@ -190,10 +190,9 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > are type-agnostic (`enrich`/`dispatch` unchanged) — `defineWorker` casts to the base options — so
 > types add zero runtime cost and are fully erased at `deno compile`.
 >
-> **Follow-ups (not in this spike):** regenerate as part of the App **export/`deno compile`**
-> packaging in addition to boot. A maker-facing "Regenerate domain types" affordance now exists: the
+> **Follow-ups (all now implemented).** A maker-facing "Regenerate domain types" affordance exists: the
 > `POST /projects/{name}/data/{source}/domaintypes` route (operationId `regenerateDomainTypes`)
-> and a "⟳ Types" button in the Data panel's Tables sidebar both drive the same op. The op now
+> and a "⟳ Types" button in the Data panel's Tables sidebar both drive the same op. The op
 > **unions every declared datasource** into one `domain.d.ts`: `emitDomainDtsForSources` emits
 > source-prefixed interfaces (e.g. `AppCustomers`) under a `DomainSources` map keyed by alias then
 > table, with `DomainTables` aliased to the default source so the single-source
@@ -201,7 +200,10 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > **manifest `types` registry (§4.2) is folded in** too: `emitDomainTypeRegistry` emits a `DomainTypes`
 > map keyed by type id (`DomainTypes["taxSubmission"]`), mapping primitives + nominal references
 > (`DomainTypes["taxLine"]`), with `optional` widening the key and `list` wrapping in `[]` —
-> `emitDomainModel` composes the table spine + registry into the single file.
+> `emitDomainModel` composes the table spine + registry into the single file. Regeneration runs at
+> **App boot, on schema change, on the explicit button, and at export/`deno compile`** (the compile
+> and export handlers refresh the file before packaging, so a shipped App carries current types —
+> best-effort and type-erased at compile).
 
 ## Consequences
 

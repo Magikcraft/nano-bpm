@@ -3159,6 +3159,10 @@ struct ExportQuery {
 /// as a zip. Source-only by default; pass `dist=true` to bundle compiled
 /// binaries from `dist/`.
 async fn project_export(Path(name): Path<String>, Query(q): Query<ExportQuery>) -> Response {
+    // Export hook: refresh the generated domain types so the downloaded zip
+    // ships source that types against the current schema + manifest `types`
+    // registry (ADR 0029 §6). Best-effort — a failure never blocks the export.
+    regenerate_domain_types(&name).await;
     match projects::export_zip(&name, q.dist) {
         Ok(zip) => (
             StatusCode::OK,
