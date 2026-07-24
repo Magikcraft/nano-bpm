@@ -1586,6 +1586,15 @@ impl Journal {
         if let Some(store) = self.spill_store() {
             store.forget(keys);
         }
+        // Drop any cold-index entries for these keys too: the digest path forgets
+        // the disk rows above, but a cold-spilled replica instance named in the
+        // digest would otherwise leave its in-RAM ColdIndex entry behind (a slow
+        // leak, and a stale routing entry for a row that no longer exists).
+        if let Some(cold) = self.cold.as_mut() {
+            for &key in keys {
+                cold.index.remove(key);
+            }
+        }
         self.engine.retire_instances(keys)
     }
 
@@ -1615,8 +1624,17 @@ impl Journal {
     /// below the owner's `low_water` (and forgets their spilled rows), bounded to
     /// `max_remove` per call. Mirrors [`Engine::retire_below`]; the loss-tolerant
     /// convergence backstop for the best-effort per-key retirement digest.
+    ///
+    /// Sweeps **both tiers**: [`Engine::retire_below`] reaps hot replica shells,
+    /// and [`ColdIndex::retire_below`] reaps cold-spilled replica instances the
+    /// engine can no longer see. Without the cold sweep, a cold instance whose
+    /// per-key digest frame was dropped is never reaped by either path and leaks
+    /// its `cold` row forever (the observed unbounded var-spill file growth).
     pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> usize {
-        let reaped = self.engine.retire_below(low_water, max_remove);
+        let mut reaped = self.engine.retire_below(low_water, max_remove);
+        if let Some(cold) = self.cold.as_mut() {
+            reaped.extend(cold.index.retire_below(low_water, max_remove));
+        }
         if !reaped.is_empty()
             && let Some(store) = self.spill_store()
         {
@@ -2345,6 +2363,51 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, Event::ProcessInstanceTerminated { instance_key } if *instance_key == key)));
+    }
+
+    #[test]
+    fn retire_below_forgets_cold_rows_of_instances_under_the_mark() {
+        // Regression for unbounded var-spill growth: a follower cold-spills a
+        // dormant replica instance, then the leader's per-key retirement digest for
+        // it is DROPPED (best-effort). The low-water backstop must still reclaim it
+        // — from BOTH the cold index and the disk store — or its `cold` row leaks
+        // forever (the file plateaus at the high-water mark, never reclaims).
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        let mut journal = Journal::in_memory();
+        journal.set_cold_spill(Arc::clone(&store), 1, 0);
+        let key = deploy_and_create(&mut journal);
+
+        // The instance is dormant on its job: spill it to the cold tier.
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert_eq!(journal.cold_count(), 1);
+        assert!(journal.instance(key).is_none());
+
+        // The digest never arrives; only the low-water mark (above `key`) does.
+        // The backstop reaps it: index cleared AND the disk row forgotten.
+        let reaped = journal.retire_below(key + 1, 100);
+        assert_eq!(reaped, 1, "the cold instance below the mark is reaped");
+        assert_eq!(journal.cold_count(), 0, "cold index entry dropped");
+        assert!(
+            store.take_cold(key).is_none(),
+            "cold disk row forgotten (no leak)"
+        );
+    }
+
+    #[test]
+    fn retire_instances_forgets_cold_index_entry_on_the_digest_path() {
+        // The digest path forgets the disk row; it must also drop the in-RAM cold
+        // index entry, or a cold-spilled replica instance named in a digest leaves
+        // a stale routing entry (a slow RAM leak) behind.
+        let store = Arc::new(crate::varspill::VarSpillStore::open(None).expect("in-memory store"));
+        let mut journal = Journal::in_memory();
+        journal.set_cold_spill(Arc::clone(&store), 1, 0);
+        let key = deploy_and_create(&mut journal);
+        assert_eq!(journal.force_cold_spill_all(), 1);
+        assert_eq!(journal.cold_count(), 1);
+
+        journal.retire_instances(&[key]);
+        assert_eq!(journal.cold_count(), 0, "cold index entry dropped");
+        assert!(store.take_cold(key).is_none(), "cold disk row forgotten");
     }
 
     #[test]
