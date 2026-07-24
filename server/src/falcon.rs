@@ -159,6 +159,12 @@ pub enum ClientFrame {
         /// completions so the frame is byte-unchanged on the hot path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adhoc_result: Option<nanobpmn_engine_core::AdHocJobResult>,
+        /// Optional task-listener result (ADR 0037 §6): a denial and/or
+        /// corrections to the deferred user-task transition, forwarded to the
+        /// owning peer. `None`/skipped for ordinary completions so the frame is
+        /// byte-unchanged on the hot path.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_listener_result: Option<nanobpmn_engine_core::TaskListenerJobResult>,
     },
     /// Fail an activated job (unmetered drain).
     #[serde(rename_all = "camelCase")]
@@ -1419,6 +1425,7 @@ async fn handle_client_frame(
             job_key,
             variables,
             adhoc_result,
+            task_listener_result,
         } => {
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
@@ -1431,7 +1438,13 @@ async fn handle_client_frame(
                 let server = server.clone();
                 spawn_forward_stream_reply(conn, corr, async move {
                     let outcome = server
-                        .forward_complete_job_stream(node, key, variables, adhoc_result)
+                        .forward_complete_job_stream(
+                            node,
+                            key,
+                            variables,
+                            adhoc_result,
+                            task_listener_result,
+                        )
                         .await;
                     crate::metrics::record_complete_outcome(if outcome.0 < 300 {
                         "forward_ok"
@@ -1449,7 +1462,7 @@ async fn handle_client_frame(
                         conn,
                         corr,
                         server
-                            .complete_job_for_stream(key, vars, adhoc_result)
+                            .complete_job_for_stream(key, vars, adhoc_result, task_listener_result)
                             .await,
                     );
                 } else {
@@ -1460,7 +1473,7 @@ async fn handle_client_frame(
                     let conn = conn.clone();
                     tokio::spawn(async move {
                         let outcome = server
-                            .complete_job_for_stream(key, vars, adhoc_result)
+                            .complete_job_for_stream(key, vars, adhoc_result, task_listener_result)
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });

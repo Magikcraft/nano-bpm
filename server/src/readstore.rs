@@ -158,12 +158,15 @@ fn instance_state_code(s: ProcessInstanceState) -> i64 {
         ProcessInstanceState::Active => 0,
         ProcessInstanceState::Completed => 1,
         ProcessInstanceState::Terminated => 2,
+        // Transient state while canceling task listeners run (ADR 0037 §6).
+        ProcessInstanceState::Terminating => 3,
     }
 }
 fn instance_state_from(code: i64) -> ProcessInstanceState {
     match code {
         1 => ProcessInstanceState::Completed,
         2 => ProcessInstanceState::Terminated,
+        3 => ProcessInstanceState::Terminating,
         _ => ProcessInstanceState::Active,
     }
 }
@@ -191,9 +194,11 @@ fn job_state_from(code: i64) -> JobState {
 
 /// Encodes a [`JobKind`] into the `(job_kind, listener_event_type)` column pair
 /// stored on the jobs read-model row (ADR 0037). Ordinary element jobs store
-/// `(0, 0)`; execution-listener jobs store `(1, start=0/end=1)`. The listener
-/// index/scope are not projected.
+/// `(0, 0)`; execution-listener jobs store `(1, start=0/end=1)`; task-listener
+/// jobs store `(2, creating=0/assigning=1/updating=2/completing=3/canceling=4)`.
+/// The listener index/scope and the owning user-task key are not projected.
 fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
+    use nanobpmn_engine_core::TaskListenerEventType;
     match kind {
         JobKind::BpmnElement => (0, 0),
         JobKind::ExecutionListener { event_type, .. } => (
@@ -203,14 +208,26 @@ fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
                 ListenerEventType::End => 1,
             },
         ),
+        JobKind::TaskListener { event_type, .. } => (
+            2,
+            match event_type {
+                TaskListenerEventType::Creating => 0,
+                TaskListenerEventType::Assigning => 1,
+                TaskListenerEventType::Updating => 2,
+                TaskListenerEventType::Completing => 3,
+                TaskListenerEventType::Canceling => 4,
+            },
+        ),
     }
 }
 
 /// Reconstructs the display-relevant [`JobKind`] from the stored column pair.
-/// The listener index/scope are not persisted, so they default to `0`.
+/// The listener index/scope and owning user-task key are not persisted, so they
+/// default to `0`.
 fn job_kind_from(job_kind: i64, listener_event_type: i64) -> JobKind {
-    if job_kind == 1 {
-        JobKind::ExecutionListener {
+    use nanobpmn_engine_core::TaskListenerEventType;
+    match job_kind {
+        1 => JobKind::ExecutionListener {
             event_type: if listener_event_type == 1 {
                 ListenerEventType::End
             } else {
@@ -218,9 +235,19 @@ fn job_kind_from(job_kind: i64, listener_event_type: i64) -> JobKind {
             },
             index: 0,
             scope: 0,
-        }
-    } else {
-        JobKind::BpmnElement
+        },
+        2 => JobKind::TaskListener {
+            event_type: match listener_event_type {
+                1 => TaskListenerEventType::Assigning,
+                2 => TaskListenerEventType::Updating,
+                3 => TaskListenerEventType::Completing,
+                4 => TaskListenerEventType::Canceling,
+                _ => TaskListenerEventType::Creating,
+            },
+            index: 0,
+            user_task_key: 0,
+        },
+        _ => JobKind::BpmnElement,
     }
 }
 
@@ -2194,6 +2221,45 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
             )?;
         }
 
+        Event::TaskListenerJobCreated {
+            job_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            job_type,
+            event_type,
+            retries,
+            ..
+        } => {
+            let (def_id, def_key) = instance_def(tx, *instance_key);
+            let (kind_code, event_code) = job_kind_codes(&JobKind::TaskListener {
+                event_type: *event_type,
+                index: 0,
+                user_task_key: 0,
+            });
+            tx.cexecute(
+                "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+                 state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
+                 job_kind, listener_event_type) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL, ?8, ?9, ?10, ?11) \
+                 ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
+                 worker = NULL, deadline_ms = NULL",
+                params![
+                    *job_key as i64,
+                    *instance_key as i64,
+                    *element_instance_key as i64,
+                    element_id,
+                    job_type,
+                    job_state_code(JobState::Created),
+                    *retries,
+                    def_id,
+                    def_key,
+                    kind_code,
+                    event_code,
+                ],
+            )?;
+        }
+
         Event::JobActivated {
             job_key,
             worker,
@@ -2679,6 +2745,22 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
                 params![*decision_evaluation_key as i64],
             )?;
         }
+
+        // Task-listener transition bookkeeping (ADR 0037 §6) has no direct
+        // read-model projection: `UserTaskTransitionDeferred`/`Resolved` track the
+        // engine's pending-transition state, and `UserTaskCorrectionsApplied` only
+        // merges into that pending transition. The corrected user-task attributes
+        // reach the read model when the transition commits, via the accompanying
+        // lifecycle events (`UserTaskAssigned`/`UserTaskUpdated`/`UserTaskCompleted`)
+        // that ARE projected above. `ProcessInstanceTerminating` is a transient
+        // internal state that presents as `ACTIVE` on the wire, so the instance row
+        // stays `Active` (state 0) until the final `ProcessInstanceTerminated`
+        // decrements the active gauge; projecting it would break that transition's
+        // `WHERE state = 0` guard.
+        Event::UserTaskTransitionDeferred { .. }
+        | Event::UserTaskCorrectionsApplied { .. }
+        | Event::UserTaskTransitionResolved { .. }
+        | Event::ProcessInstanceTerminating { .. } => {}
 
         // Events with no queryable read-model projection.
         _ => {}

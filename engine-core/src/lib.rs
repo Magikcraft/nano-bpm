@@ -94,7 +94,8 @@ pub use model::{
     AdHocActivateElement, AdHocImplementationType, AdHocJobResult, AdHocSubProcessDef, AdHocTool,
     AdHocToolKind, BuildError, Condition, Element, ElementId, ElementKind, ExecutionListener,
     IoMapping, ListenerEventType, Mapping, MultiInstance, ProcessBuilder, ProcessDefinition,
-    SequenceFlow, TimerDef, TimerDefKind, UserTaskProps, Value,
+    SequenceFlow, TaskListener, TaskListenerEventType, TaskListenerJobResult, TimerDef,
+    TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
 };
 pub use state::{
     compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,

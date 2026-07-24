@@ -57,7 +57,7 @@ use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
     ActivatedJob, AdHocActivateElement, AdHocJobResult, Command, EngineError, Event, IncidentKind,
     IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
-    Value, partition_of,
+    TaskListenerJobResult, UserTaskCorrections, Value, partition_of,
 };
 
 use crate::backpressure::{
@@ -3615,6 +3615,113 @@ mod successor_balance_tests {
     }
 }
 
+/// Wire→engine mapping of the task-listener completion result (ADR 0037 §6).
+/// Exercises the pure parser so the `Option<Nullable<T>>` handling, deny
+/// extraction, date/priority conversion and adhoc-variant fall-through stay
+/// correct independently of the engine.
+#[cfg(test)]
+mod task_listener_completion_tests {
+    use super::{models, task_listener_result_from_completion, types};
+
+    fn body_with_user_task(u: models::JobResultUserTask) -> Option<models::JobCompletionRequest> {
+        let mut req = models::JobCompletionRequest::new();
+        req.result = Some(models::JobResult::JobResultUserTask(u));
+        Some(req)
+    }
+
+    #[test]
+    fn ordinary_completion_has_no_task_listener_result() {
+        assert!(task_listener_result_from_completion(&None).is_none());
+        let req = models::JobCompletionRequest::new();
+        assert!(task_listener_result_from_completion(&Some(req)).is_none());
+    }
+
+    #[test]
+    fn adhoc_result_is_not_a_task_listener_result() {
+        let mut req = models::JobCompletionRequest::new();
+        req.result = Some(models::JobResult::JobResultAdHocSubProcess(
+            models::JobResultAdHocSubProcess::new(),
+        ));
+        assert!(task_listener_result_from_completion(&Some(req)).is_none());
+    }
+
+    #[test]
+    fn empty_user_task_result_is_none() {
+        // A user-task result with no denial and no corrections routes as an
+        // ordinary completion (byte-unchanged path).
+        let u = models::JobResultUserTask::new();
+        assert!(task_listener_result_from_completion(&body_with_user_task(u)).is_none());
+    }
+
+    #[test]
+    fn deny_and_reason_are_extracted() {
+        let mut u = models::JobResultUserTask::new();
+        u.denied = Some(types::Nullable::Present(true));
+        u.denied_reason = Some(types::Nullable::Present("policy failed".to_string()));
+        let result = task_listener_result_from_completion(&body_with_user_task(u))
+            .expect("a denial yields a result");
+        assert!(result.denied);
+        assert_eq!(result.denied_reason.as_deref(), Some("policy failed"));
+        assert!(result.corrections.is_empty());
+    }
+
+    #[test]
+    fn null_denied_is_not_a_denial() {
+        let mut u = models::JobResultUserTask::new();
+        u.denied = Some(types::Nullable::Null);
+        assert!(task_listener_result_from_completion(&body_with_user_task(u)).is_none());
+    }
+
+    #[test]
+    fn corrections_are_mapped_with_date_and_priority_conversion() {
+        let due: chrono::DateTime<chrono::Utc> = "2026-01-02T03:04:05Z".parse().unwrap();
+        let mut c = models::JobResultCorrections::new();
+        c.assignee = Some(types::Nullable::Present("alice".to_string()));
+        c.candidate_groups = Some(types::Nullable::Present(vec!["ops".to_string()]));
+        c.due_date = Some(types::Nullable::Present(due));
+        c.priority = Some(types::Nullable::Present(50u8));
+        let mut u = models::JobResultUserTask::new();
+        u.corrections = Some(types::Nullable::Present(c));
+
+        let result = task_listener_result_from_completion(&body_with_user_task(u))
+            .expect("corrections yield a result");
+        assert!(!result.denied);
+        let corr = &result.corrections;
+        assert_eq!(corr.assignee.as_deref(), Some("alice"));
+        assert_eq!(
+            corr.candidate_groups.as_deref(),
+            Some(&["ops".to_string()][..])
+        );
+        assert_eq!(corr.due_date.as_deref(), Some("2026-01-02T03:04:05+00:00"));
+        assert_eq!(corr.priority, Some(50));
+        // Untouched fields preserve (None), not clear.
+        assert!(corr.candidate_users.is_none());
+        assert!(corr.follow_up_date.is_none());
+    }
+
+    #[test]
+    fn null_correction_fields_preserve() {
+        let mut c = models::JobResultCorrections::new();
+        c.assignee = Some(types::Nullable::Null);
+        c.priority = Some(types::Nullable::Null);
+        let mut u = models::JobResultUserTask::new();
+        u.corrections = Some(types::Nullable::Present(c));
+        // Every field is Null (preserve) → no effective correction → None.
+        assert!(task_listener_result_from_completion(&body_with_user_task(u)).is_none());
+    }
+
+    #[test]
+    fn empty_string_assignee_clears() {
+        let mut c = models::JobResultCorrections::new();
+        c.assignee = Some(types::Nullable::Present(String::new()));
+        let mut u = models::JobResultUserTask::new();
+        u.corrections = Some(types::Nullable::Present(c));
+        let result = task_listener_result_from_completion(&body_with_user_task(u))
+            .expect("an explicit empty assignee is a (clearing) correction");
+        assert_eq!(result.corrections.assignee.as_deref(), Some(""));
+    }
+}
+
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
@@ -4111,7 +4218,9 @@ impl ServerImpl {
                         // Terminated/canceled instances never complete; stop
                         // waiting and report not-completed.
                         ProcessInstanceState::Terminated => return false,
-                        ProcessInstanceState::Active => {}
+                        // Active, or terminating (canceling listeners running):
+                        // keep waiting for a terminal state.
+                        ProcessInstanceState::Active | ProcessInstanceState::Terminating => {}
                     }
                 }
                 notified.await;
@@ -4247,6 +4356,11 @@ impl ServerImpl {
         // `None` for ordinary completions, keeping that path byte-unchanged.
         let adhoc_result = adhoc_result_from_completion(body);
 
+        // Optional task-listener result (ADR 0037 §6): a denial and/or
+        // corrections to the deferred user-task transition. `None` for ordinary
+        // completions, keeping that path byte-unchanged.
+        let task_listener_result = task_listener_result_from_completion(body);
+
         // Cluster: if a peer owns the job's partition, forward over the command
         // stream and map its answer back (single-node always owns every key).
         if let Some(node) = self.route_by_leader(job_key) {
@@ -4258,13 +4372,15 @@ impl ServerImpl {
                     types::Nullable::Null => None,
                 });
             return Ok(self
-                .forward_complete_job(node, job_key, wire, adhoc_result)
+                .forward_complete_job(node, job_key, wire, adhoc_result, task_listener_result)
                 .await);
         }
 
-        let command = match adhoc_result {
-            Some(result) => Command::complete_job_with_result(job_key, variables, result),
-            None => Command::complete_job_with(job_key, variables),
+        let command = Command::CompleteJob {
+            job_key,
+            variables,
+            adhoc_result,
+            task_listener_result,
         };
         let result = self
             .engine
@@ -4310,6 +4426,16 @@ impl ServerImpl {
                     format!("Job {job_key} has not been activated and cannot be completed."),
                 )),
             ),
+            Err(
+                e @ (EngineError::TaskListenerJobWithVariables { .. }
+                | EngineError::TaskListenerDenyWithCorrections { .. }
+                | EngineError::TaskListenerDenyNotSupported { .. }
+                | EngineError::TaskListenerAssigneeCorrectionOnCreating { .. }),
+            ) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid task-listener result",
+                400,
+                e.to_string(),
+            ))),
             Err(e) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -5703,13 +5829,19 @@ impl ServerImpl {
         job_key: u64,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         adhoc_result: Option<AdHocJobResult>,
+        task_listener_result: Option<TaskListenerJobResult>,
     ) -> apis::job::CompleteJobResponse {
         use apis::job::CompleteJobResponse as Resp;
         let res =
             match self.peer_link(node).await {
                 Ok(link) => {
-                    link.complete_job(job_key.to_string(), variables, adhoc_result)
-                        .await
+                    link.complete_job(
+                        job_key.to_string(),
+                        variables,
+                        adhoc_result,
+                        task_listener_result,
+                    )
+                    .await
                 }
                 Err((s, m)) => {
                     return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
@@ -5719,6 +5851,11 @@ impl ServerImpl {
             };
         match res {
             Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobWasCompletedSuccessfully,
+            Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid task-listener result",
+                400,
+                peer_detail(&r),
+            )),
             Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheGivenKeyWasNotFound(problem(
                 "Job not found",
                 404,
@@ -5847,10 +5984,16 @@ impl ServerImpl {
         job_key: u64,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         adhoc_result: Option<AdHocJobResult>,
+        task_listener_result: Option<TaskListenerJobResult>,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
             Ok(link) => match link
-                .complete_job(job_key.to_string(), variables, adhoc_result)
+                .complete_job(
+                    job_key.to_string(),
+                    variables,
+                    adhoc_result,
+                    task_listener_result,
+                )
                 .await
             {
                 Ok(r) => (r.status, r.body),
@@ -11689,6 +11832,12 @@ impl ServerImpl {
             Err(EngineError::JobNotActivated { job_key }) => {
                 Err((409, format!("Job {job_key} has not been activated.")))
             }
+            Err(
+                e @ (EngineError::TaskListenerJobWithVariables { .. }
+                | EngineError::TaskListenerDenyWithCorrections { .. }
+                | EngineError::TaskListenerDenyNotSupported { .. }
+                | EngineError::TaskListenerAssigneeCorrectionOnCreating { .. }),
+            ) => Err((400, e.to_string())),
             Err(e) => Err((500, e.to_string())),
         }
     }
@@ -12520,10 +12669,13 @@ impl ServerImpl {
         job_key: u64,
         variables: std::collections::HashMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
+        task_listener_result: Option<TaskListenerJobResult>,
     ) -> Result<Commit, (u16, String)> {
-        let command = match adhoc_result {
-            Some(result) => Command::complete_job_with_result(job_key, variables, result),
-            None => Command::complete_job_with(job_key, variables),
+        let command = Command::CompleteJob {
+            job_key,
+            variables,
+            adhoc_result,
+            task_listener_result,
         };
         if !self.raft.is_empty() {
             return self.propose_job_for_stream(job_key, command).await;
@@ -13729,6 +13881,11 @@ fn process_instance_state_enum(state: ProcessInstanceState) -> models::ProcessIn
         ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
         ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
         ProcessInstanceState::Terminated => models::ProcessInstanceStateEnum::Terminated,
+        // `Terminating` is a transient internal state while canceling task
+        // listeners run (ADR 0037 §6); the Camunda wire enum has no equivalent,
+        // so it presents as ACTIVE (the instance is still running) until it
+        // reaches `Terminated`.
+        ProcessInstanceState::Terminating => models::ProcessInstanceStateEnum::Active,
     }
 }
 
@@ -13753,7 +13910,7 @@ fn job_state_enum(state: nanobpmn_engine_core::JobState) -> models::JobStateEnum
 fn job_kind_enums(
     kind: &nanobpmn_engine_core::JobKind,
 ) -> (models::JobKindEnum, models::JobListenerEventTypeEnum) {
-    use nanobpmn_engine_core::{JobKind, ListenerEventType};
+    use nanobpmn_engine_core::{JobKind, ListenerEventType, TaskListenerEventType};
     match kind {
         JobKind::BpmnElement => (
             models::JobKindEnum::BpmnElement,
@@ -13764,6 +13921,16 @@ fn job_kind_enums(
             match event_type {
                 ListenerEventType::Start => models::JobListenerEventTypeEnum::Start,
                 ListenerEventType::End => models::JobListenerEventTypeEnum::End,
+            },
+        ),
+        JobKind::TaskListener { event_type, .. } => (
+            models::JobKindEnum::TaskListener,
+            match event_type {
+                TaskListenerEventType::Creating => models::JobListenerEventTypeEnum::Creating,
+                TaskListenerEventType::Assigning => models::JobListenerEventTypeEnum::Assigning,
+                TaskListenerEventType::Updating => models::JobListenerEventTypeEnum::Updating,
+                TaskListenerEventType::Completing => models::JobListenerEventTypeEnum::Completing,
+                TaskListenerEventType::Canceling => models::JobListenerEventTypeEnum::Canceling,
             },
         ),
     }
@@ -13917,6 +14084,29 @@ fn activated_job_result(
 
     let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
 
+    // Task-listener jobs surface the `userTask` object so the worker sees which
+    // deferred user-task transition it is gating (Camunda parity, ADR 0037 §6).
+    // Only the user-task key is available on the activated job today; the richer
+    // attribute snapshot (assignee, candidates, dates, priority) is left at
+    // defaults until the engine threads it onto the activation.
+    let user_task = match &job.kind {
+        nanobpmn_engine_core::JobKind::TaskListener { user_task_key, .. } => {
+            types::Nullable::Present(models::UserTaskProperties::new(
+                String::new(),
+                types::Nullable::Null,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                types::Nullable::Null,
+                types::Nullable::Null,
+                types::Nullable::Null,
+                types::Nullable::Null,
+                types::Nullable::Present(models::UserTaskKey(user_task_key.to_string())),
+            ))
+        }
+        _ => types::Nullable::Null,
+    };
+
     models::ActivatedJobResult::new(
         job.job_type,
         process_id,
@@ -13934,7 +14124,7 @@ fn activated_job_result(
         models::ElementInstanceKey(job.element_instance_key.to_string()),
         job_kind_enum,
         job_listener_event_type_enum,
-        nanobpm_gateway_rest::types::Nullable::Null,
+        user_task,
         Vec::new(),
         nanobpm_gateway_rest::types::Nullable::Null,
         0,
@@ -13987,6 +14177,67 @@ fn adhoc_result_from_completion(
         completion_condition_fulfilled: adhoc.is_completion_condition_fulfilled.unwrap_or(false),
         cancel_remaining_instances: adhoc.is_cancel_remaining_instances.unwrap_or(false),
     })
+}
+
+/// Extracts a task-listener result (ADR 0037 §6) from a REST completion body.
+///
+/// Returns `None` for ordinary completions and for ad-hoc sub-process results (a
+/// job is either ad-hoc or task-listener, never both), keeping the plain
+/// completion path byte-unchanged. A denial and/or corrections yield `Some`. The
+/// engine only acts on the result when the target job is a task-listener job; it
+/// is inert for ordinary jobs, so passing it through unconditionally is safe.
+fn task_listener_result_from_completion(
+    body: &Option<models::JobCompletionRequest>,
+) -> Option<TaskListenerJobResult> {
+    let result = body.as_ref()?.result.as_ref()?;
+    let user_task = match result {
+        models::JobResult::JobResultUserTask(u) => u,
+        models::JobResult::JobResultAdHocSubProcess(_) => return None,
+    };
+    let denied = matches!(&user_task.denied, Some(types::Nullable::Present(true)));
+    let denied_reason = match &user_task.denied_reason {
+        Some(types::Nullable::Present(reason)) => Some(reason.clone()),
+        _ => None,
+    };
+    let corrections = match &user_task.corrections {
+        Some(types::Nullable::Present(c)) => corrections_from_wire(c),
+        _ => UserTaskCorrections::default(),
+    };
+    let result = TaskListenerJobResult {
+        denied,
+        denied_reason,
+        corrections,
+    };
+    // Byte-unchanged plain path: an empty result routes as an ordinary
+    // completion (the engine still advances the deferred transition by job kind).
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
+}
+
+/// Maps a wire [`models::JobResultCorrections`] to the engine
+/// [`UserTaskCorrections`]. The wire uses `Option<Nullable<T>>`: an absent field
+/// or an explicit `null` preserves the persisted value (`None`), while a present
+/// value corrects it (an empty string/list clears it, per Camunda semantics).
+/// Dates are ISO-8601 (RFC 3339) strings for the engine; priority narrows
+/// `u8` → `i32`.
+fn corrections_from_wire(c: &models::JobResultCorrections) -> UserTaskCorrections {
+    fn present<T: Clone>(field: &Option<types::Nullable<T>>) -> Option<T> {
+        match field {
+            Some(types::Nullable::Present(v)) => Some(v.clone()),
+            _ => None,
+        }
+    }
+    UserTaskCorrections {
+        assignee: present(&c.assignee),
+        candidate_groups: present(&c.candidate_groups),
+        candidate_users: present(&c.candidate_users),
+        due_date: present(&c.due_date).map(|d| d.to_rfc3339()),
+        follow_up_date: present(&c.follow_up_date).map(|d| d.to_rfc3339()),
+        priority: present(&c.priority).map(|p| p as i32),
+    }
 }
 
 fn from_object_map(
@@ -14296,6 +14547,7 @@ async fn instances_debug_body(server: &ServerImpl) -> Response {
                         ProcessInstanceState::Active => "Active",
                         ProcessInstanceState::Completed => "Completed",
                         ProcessInstanceState::Terminated => "Terminated",
+                        ProcessInstanceState::Terminating => "Terminating",
                     };
                     *inst_states.entry(label).or_default() += 1;
                     if !matches!(inst.state, ProcessInstanceState::Active) {
@@ -18390,7 +18642,9 @@ mod clustered_startup_tests {
 
         // Forward the completion to node 0 over the wire and map its answer back.
         use apis::job::CompleteJobResponse as R;
-        let resp = node1.forward_complete_job(owner, job_key, None, None).await;
+        let resp = node1
+            .forward_complete_job(owner, job_key, None, None, None)
+            .await;
         assert!(
             matches!(resp, R::Status204_TheJobWasCompletedSuccessfully),
             "the forwarded completion should succeed (204)"
@@ -18398,7 +18652,9 @@ mod clustered_startup_tests {
 
         // The completion really mutated node 0's state: completing the same job
         // again is rejected (it is no longer an activated job).
-        let again = node1.forward_complete_job(owner, job_key, None, None).await;
+        let again = node1
+            .forward_complete_job(owner, job_key, None, None, None)
+            .await;
         assert!(
             !matches!(again, R::Status204_TheJobWasCompletedSuccessfully),
             "re-completing an already-completed job must not return 204, got a success"
@@ -18945,7 +19201,7 @@ mod clustered_startup_tests {
             .expect("the job's partition is owned by node 0");
         assert_eq!(owner, 0);
         let (status, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None)
+            .forward_complete_job_stream(owner, job_key, None, None, None)
             .await;
         assert!(
             is_ok_status(status),
@@ -18954,7 +19210,7 @@ mod clustered_startup_tests {
 
         // Re-completing the same job is rejected — proof it mutated node 0's state.
         let (again, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None)
+            .forward_complete_job_stream(owner, job_key, None, None, None)
             .await;
         assert!(
             !is_ok_status(again),
@@ -19436,7 +19692,7 @@ mod clustered_startup_tests {
         let job_key = job_key.expect("the parked job activates on the leader");
 
         let commit = node0
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("raft-routed complete commits via quorum");
         commit.wait().await;
@@ -19444,7 +19700,7 @@ mod clustered_startup_tests {
         // Re-completing the same job is rejected THROUGH the Raft log, proving the
         // first completion mutated the leader's durable state via propose().
         let err = match node0
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
         {
             Ok(_) => panic!("re-complete of a completed job must be rejected"),
@@ -19600,7 +19856,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the parked job activates on the leader");
         node0
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("raft-routed complete commits via quorum")
             .wait()
@@ -19824,7 +20080,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the parked job activates on the new leader after failover");
         new_leader
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("complete commits via the new quorum")
             .wait()
@@ -20128,7 +20384,7 @@ mod clustered_startup_tests {
             for j in jobs {
                 let job_key = j.job_key.0.parse::<u64>().expect("numeric job key");
                 new_leader
-                    .complete_job_for_stream(job_key, Default::default(), None)
+                    .complete_job_for_stream(job_key, Default::default(), None, None)
                     .await
                     .expect("complete commits via the new quorum")
                     .wait()
@@ -20723,7 +20979,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the leased-but-uncompleted job re-activates after failover");
         new_leader
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("complete commits via the new quorum")
             .wait()
@@ -21377,7 +21633,7 @@ mod clustered_startup_tests {
         let job_key =
             job_key.expect("the auto-promoted leader serves activateJobs for partition 0");
         node1
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("the auto-promoted leader commits the completion")
             .wait()
@@ -23055,7 +23311,7 @@ mod subscription_placement_tests {
             .find(|k| nanobpmn_engine_core::partition_of(*k) == p_inst)
             .expect("our instance's job is activatable");
         server
-            .complete_job_for_stream(job_key, std::collections::HashMap::new(), None)
+            .complete_job_for_stream(job_key, std::collections::HashMap::new(), None, None)
             .await
             .expect("complete succeeds")
             .wait()

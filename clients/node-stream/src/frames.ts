@@ -65,12 +65,38 @@ export interface CreateInstanceFrame {
   requestTimeout?: number | null;
 }
 
+/** Corrections a task listener returns for a deferred user-task transition
+ * (ADR 0037 §6). Field names are snake_case to match the engine's on-wire
+ * serialization. An absent field preserves the value; a present value corrects
+ * it (an empty string/list clears it). */
+export interface UserTaskCorrections {
+  assignee?: string | null;
+  candidate_groups?: string[] | null;
+  candidate_users?: string[] | null;
+  due_date?: string | null;
+  follow_up_date?: string | null;
+  priority?: number | null;
+}
+
+/** Result a worker returns when completing a task-listener job (ADR 0037 §6).
+ * `denied` is honoured only for the assigning/updating/completing events and is
+ * mutually exclusive with `corrections`. Field names are snake_case to match the
+ * engine's on-wire serialization. */
+export interface TaskListenerJobResult {
+  denied?: boolean;
+  denied_reason?: string | null;
+  corrections?: UserTaskCorrections;
+}
+
 /** Complete an activated job (unmetered drain). */
 export interface CompleteJobFrame {
   type: 'completeJob';
   corr: Corr;
   jobKey: Key;
   variables?: Record<string, unknown> | null;
+  /** Optional task-listener result (ADR 0037 §6): a denial and/or corrections
+   * to a deferred user-task transition. Omitted for ordinary completions. */
+  taskListenerResult?: TaskListenerJobResult | null;
 }
 
 /** Fail an activated job (unmetered drain). */

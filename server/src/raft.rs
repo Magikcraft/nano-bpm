@@ -285,6 +285,10 @@ fn engine_error_status(e: &nanobpmn_engine_core::EngineError) -> (u16, String) {
         E::JobNotFound { job_key } => (404, format!("No job with key {job_key}.")),
         E::JobNotActive { job_key } => (409, format!("Job {job_key} is not active.")),
         E::JobNotActivated { job_key } => (409, format!("Job {job_key} has not been activated.")),
+        E::TaskListenerJobWithVariables { .. }
+        | E::TaskListenerDenyWithCorrections { .. }
+        | E::TaskListenerDenyNotSupported { .. }
+        | E::TaskListenerAssigneeCorrectionOnCreating { .. } => (400, e.to_string()),
         other => (500, other.to_string()),
     }
 }

@@ -8,6 +8,7 @@ import {
   type JobFrame,
   type PressureFrame,
   type ServerFrame,
+  type TaskListenerJobResult,
   type WelcomeFrame,
   encodeClientFrame,
   parseServerFrame,
@@ -454,10 +455,22 @@ export class FalconClient extends EventEmitter {
     return completion;
   }
 
-  /** Completes an activated job (unmetered). */
-  async completeJob(jobKey: string, variables?: Record<string, unknown>): Promise<void> {
+  /** Completes an activated job (unmetered). Pass `taskListenerResult` to deny a
+   * deferred user-task transition or return corrections when completing a
+   * task-listener job (ADR 0037 §6). */
+  async completeJob(
+    jobKey: string,
+    variables?: Record<string, unknown>,
+    taskListenerResult?: TaskListenerJobResult,
+  ): Promise<void> {
     const corr = this.nextCorr();
-    await this.sendCommand(corr, { type: 'completeJob', corr, jobKey, variables: variables ?? null });
+    await this.sendCommand(corr, {
+      type: 'completeJob',
+      corr,
+      jobKey,
+      variables: variables ?? null,
+      taskListenerResult: taskListenerResult ?? null,
+    });
   }
 
   /** Fails an activated job (unmetered). */
@@ -491,9 +504,19 @@ export class FalconClient extends EventEmitter {
    * than rejecting a caller. Lets a single connection keep its whole credit
    * window in flight instead of stalling one round-trip per job.
    */
-  completeJobNoWait(jobKey: string, variables?: Record<string, unknown>): void {
+  completeJobNoWait(
+    jobKey: string,
+    variables?: Record<string, unknown>,
+    taskListenerResult?: TaskListenerJobResult,
+  ): void {
     const corr = this.nextCorr();
-    this.sendCommandFireAndForget(corr, { type: 'completeJob', corr, jobKey, variables: variables ?? null });
+    this.sendCommandFireAndForget(corr, {
+      type: 'completeJob',
+      corr,
+      jobKey,
+      variables: variables ?? null,
+      taskListenerResult: taskListenerResult ?? null,
+    });
   }
 
   /** Fails an activated job without awaiting the ack. See {@link completeJobNoWait}. */

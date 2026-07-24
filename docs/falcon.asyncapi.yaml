@@ -364,6 +364,63 @@ components:
           type: object
           additionalProperties: true
           nullable: true
+        adhocResult:
+          # Optional agentic ad-hoc sub-process result (Camunda `JobResult`),
+          # forwarded to the owning peer. Omitted for ordinary completions so
+          # the frame is byte-unchanged on the hot path.
+          $ref: '#/components/schemas/AdHocJobResult'
+        taskListenerResult:
+          # Optional task-listener result (ADR 0037 §6), forwarded to the owning
+          # peer. Omitted for ordinary completions so the frame is byte-unchanged
+          # on the hot path.
+          $ref: '#/components/schemas/TaskListenerJobResult'
+
+    AdHocJobResult:
+      # Agentic ad-hoc sub-process result (Camunda `JobResult`). Fields are
+      # serialized in snake_case (the nested struct keeps its own serde config).
+      type: object
+      additionalProperties: true
+
+    TaskListenerJobResult:
+      # Result a worker returns when completing a task-listener job (ADR 0037 §6).
+      # Fields are serialized in snake_case (the nested struct keeps its own serde
+      # config). `denied` is honoured only for the assigning/updating/completing
+      # events and is mutually exclusive with corrections.
+      type: object
+      additionalProperties: false
+      properties:
+        denied:
+          type: boolean
+        denied_reason:
+          type: string
+          nullable: true
+        corrections:
+          type: object
+          additionalProperties: false
+          properties:
+            assignee:
+              type: string
+              nullable: true
+            candidate_groups:
+              type: array
+              items:
+                type: string
+              nullable: true
+            candidate_users:
+              type: array
+              items:
+                type: string
+              nullable: true
+            due_date:
+              type: string
+              nullable: true
+            follow_up_date:
+              type: string
+              nullable: true
+            priority:
+              type: integer
+              format: int32
+              nullable: true
 
     FailJob:
       type: object
