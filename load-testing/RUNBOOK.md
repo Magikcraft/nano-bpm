@@ -297,6 +297,55 @@ Mitigations, both in place:
 Keep the build host (node0) tidy: `cargo clean` in `~/build-console` and remove
 stale `~/nano-gw-*` / old `~/nano-data` between build cycles.
 
+### `var-spill.sqlite` growth (the 100 GB "disk explosion")
+
+The single biggest consumer under a 50 KB soak is **`var-spill.sqlite`** — the
+cold-instance variable/snapshot cache (`server/src/varspill.rs`). Watch it fill:
+a 50 KB / 30 min soak drove it to **60–116 GB/node**, enough to hit ENOSPC even
+on a node with **no** build overhead. Two things to know:
+
+- **It is bounded by the *peak concurrent cold backlog*, not total throughput.**
+  Destructive reads (rehydration) and terminal eviction delete rows, so the
+  *live* set stays small; but a single backlog spike (e.g. one node's disk
+  stalling) parks `payload × peak-backlog` on disk. Keep the peak cold backlog
+  bounded (tighter admission caps / lower loadgen `MI`) to bound the file.
+- **The file now returns space to the OS.** `varspill` runs in `INCREMENTAL`
+  auto-vacuum mode and reclaims freed pages on the eviction path once a
+  freelist threshold is crossed, so the file tracks the *live* backlog instead
+  of plateauing at the historical high-water mark. Tune with
+  **`NANOBPMN_VARSPILL_RECLAIM_MB`** (default 64; `0` disables reclaim to restore
+  the old high-water behaviour for an A/B). This does **not** remove the need for
+  headroom — it caps the file near `live + threshold`, but the live cold backlog
+  during a large soak is still tens of GB.
+
+### Build on the loadbox, keep nano-data on its own disk
+
+`node0` (`10.128.0.19`) doubles as the **build host** — its `cargo target/` +
+`~/builds` + rustup add **~40 GB** the other nodes don't carry, so it fills first
+and throttles the whole leader-durable cluster (looks like a throughput
+regression; it isn't). Two rules for clean regression runs:
+
+1. **Build on the loadbox, not node0** (see "Getting source onto the build host"
+   above, or build on the loadbox and fan out with `stage-binary.sh`), so no node
+   carries build overhead into a soak.
+2. **Give `nano-data` a dedicated, large data disk** sized for the run, not the
+   root/boot disk. Size it for `peak_cold_backlog × payload × safety` (a 50 KB /
+   30 min soak wants **≥ 250 GB**); attach and mount it, then point the launcher's
+   `DATA_DIR` at it:
+   ```
+   gcloud compute disks create nano-data-N --size=300 --type=pd-ssd --zone=us-central1-a
+   gcloud compute instances attach-disk nano-node-N --disk=nano-data-N --zone=us-central1-a
+   ssh <node> 'sudo mkfs.ext4 -F /dev/sdb && sudo mkdir -p /mnt/nano-data \
+       && sudo mount /dev/sdb /mnt/nano-data && sudo chown $USER /mnt/nano-data'
+   # then launch with DATA_DIR=/mnt/nano-data
+   ```
+
+**Raise the preflight floor for 50 KB runs.** The 40 GB `DISK_MIN_FREE_GB` floor
+is far too low for a 50 KB soak (which needs ~140 GB+ of headroom). Set
+`DISK_MIN_FREE_GB` to the expected `var-spill` peak plus raft/read-model overhead
+before starting a large-payload run.
+
+
 ---
 
 ## Disk Attribution Probe (raft-log vs read-model)
