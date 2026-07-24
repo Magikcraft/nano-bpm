@@ -22,6 +22,14 @@ info:
     it is not part of code generation. It mirrors the Rust `ClientFrame` /
     `ServerFrame` enums in `server/src/falcon.rs` and the design notes in
     `docs/falcon-design.md`.
+
+
+    **This document describes only the public client channel served at
+    `/falcon`.** The nodes speak a superset of intra-cluster control/data-plane
+    frames to each other over a separate, authenticated `/cluster` channel
+    (shared-secret gated, optionally on a dedicated internal listener). Those
+    frames are internal RPC and are intentionally undocumented here; a public
+    `/falcon` connection may send only the client frames below (see ADR 0039).
   contact:
     name: nanobpmn
   license:
@@ -77,6 +85,8 @@ channels:
         $ref: '#/components/messages/SubmissionCredits'
       pressure:
         $ref: '#/components/messages/Pressure'
+      workerAdvice:
+        $ref: '#/components/messages/WorkerAdvice'
       serverHeartbeat:
         $ref: '#/components/messages/ServerHeartbeat'
 
@@ -112,7 +122,9 @@ operations:
       `job` pushes are gated by job-delivery credits; `commandResult` acks a
       `corr`-tagged command; `instanceCompleted` delivers an awaited terminal
       outcome; `submissionCredits` replenishes create capacity; `pressure`
-      signals coarse fleet backpressure.
+      signals coarse fleet backpressure; `workerAdvice` broadcasts the
+      governor's recommended per-worker concurrency so cooperating clients can
+      self-size their subscriber pools.
     messages:
       - $ref: '#/channels/falcon/messages/welcome'
       - $ref: '#/channels/falcon/messages/job'
@@ -120,6 +132,7 @@ operations:
       - $ref: '#/channels/falcon/messages/instanceCompleted'
       - $ref: '#/channels/falcon/messages/submissionCredits'
       - $ref: '#/channels/falcon/messages/pressure'
+      - $ref: '#/channels/falcon/messages/workerAdvice'
       - $ref: '#/channels/falcon/messages/serverHeartbeat'
 
 components:
@@ -245,6 +258,16 @@ components:
       summary: Coarse fleet pressure signal.
       payload:
         $ref: '#/components/schemas/Pressure'
+    WorkerAdvice:
+      name: workerAdvice
+      title: Worker concurrency advice
+      summary: >
+        Advisory per-worker concurrency target from the server's
+        worker-concurrency governor. Edge-triggered: broadcast once each time the
+        target changes. Purely advisory — the server also enforces the cap by
+        truncating each job type's per-pass fan-out.
+      payload:
+        $ref: '#/components/schemas/WorkerAdvice'
     ServerHeartbeat:
       name: heartbeat
       title: Server heartbeat
@@ -523,6 +546,22 @@ components:
           format: int64
           nullable: true
           description: Suggested backoff before resubmitting, if applicable.
+
+    WorkerAdvice:
+      type: object
+      required: [type, recommendedConcurrency]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          const: workerAdvice
+        recommendedConcurrency:
+          type: integer
+          format: int64
+          description: >
+            Recommended active dispatch width per worker. A cooperating SDK can
+            park subscribers down toward this target. `0` = no advice (governor
+            disabled) and is never broadcast.
 
     Heartbeat:
       type: object

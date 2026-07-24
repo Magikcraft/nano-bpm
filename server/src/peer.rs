@@ -113,14 +113,24 @@ impl PeerLink {
         let connected = Arc::new(AtomicBool::new(true));
         let pending_app: Pending = Arc::new(Mutex::new(HashMap::new()));
         let pending_raft: Pending = Arc::new(Mutex::new(HashMap::new()));
+        // Present the shared cluster secret (ADR 0039) on the intra-cluster
+        // handshake so the peer's authenticated `/cluster` channel admits us.
+        let secret = crate::falcon::cluster_secret_from_env();
         // App-forwarding traffic and Raft RPCs ride separate sockets so a backlog
         // of forwarded creates/jobs can never delay an AppendEntries/Vote past its
         // election deadline (head-of-line isolation for the replication transport).
-        let out_app = Self::dial(&ws_url(base_url), pending_app.clone(), connected.clone()).await?;
+        let out_app = Self::dial(
+            &ws_url(base_url),
+            pending_app.clone(),
+            connected.clone(),
+            secret.as_deref(),
+        )
+        .await?;
         let out_raft = Self::dial(
             &raft_ws_url(base_url),
             pending_raft.clone(),
             connected.clone(),
+            secret.as_deref(),
         )
         .await?;
 
@@ -142,19 +152,36 @@ impl PeerLink {
         ws_url: &str,
         pending: Pending,
         connected: Arc<AtomicBool>,
+        secret: Option<&str>,
     ) -> Result<mpsc::Sender<Message>, PeerError> {
-        let (ws, _resp) =
-            match tokio::time::timeout(connect_timeout(), tokio_tungstenite::connect_async(ws_url))
-                .await
-            {
-                Ok(res) => res.map_err(|e| PeerError::Connect(e.to_string()))?,
-                Err(_) => {
-                    return Err(PeerError::Connect(format!(
-                        "connect timed out after {:?}",
-                        connect_timeout()
-                    )));
-                }
-            };
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = ws_url
+            .into_client_request()
+            .map_err(|e| PeerError::Connect(e.to_string()))?;
+        if let Some(secret) = secret {
+            let value = tokio_tungstenite::tungstenite::http::HeaderValue::from_str(secret)
+                .map_err(|e| PeerError::Connect(format!("invalid cluster secret: {e}")))?;
+            request.headers_mut().insert(
+                tokio_tungstenite::tungstenite::http::HeaderName::from_static(
+                    crate::falcon::CLUSTER_SECRET_HEADER,
+                ),
+                value,
+            );
+        }
+        let (ws, _resp) = match tokio::time::timeout(
+            connect_timeout(),
+            tokio_tungstenite::connect_async(request),
+        )
+        .await
+        {
+            Ok(res) => res.map_err(|e| PeerError::Connect(e.to_string()))?,
+            Err(_) => {
+                return Err(PeerError::Connect(format!(
+                    "connect timed out after {:?}",
+                    connect_timeout()
+                )));
+            }
+        };
         // Disable Nagle on the peer socket: the Falcon protocol carries small,
         // latency-sensitive request/response frames (notably Raft AppendEntries),
         // and Nagle + delayed-ACK adds ~40ms per round-trip, collapsing Raft
@@ -1052,8 +1079,12 @@ impl PeerSet {
     }
 }
 
-/// Maps a peer's HTTP base URL to its falcon WebSocket URL.
-/// `http://h:p` → `ws://h:p/falcon`, `https://…` → `wss://…`.
+/// Maps a peer's HTTP base URL to its intra-cluster falcon WebSocket URL.
+/// `http://h:p` → `ws://h:p/cluster`, `https://…` → `wss://…`.
+///
+/// Targets the authenticated `/cluster` channel (ADR 0039), not the public
+/// `/falcon` client channel: peer traffic carries the full intra-cluster
+/// protocol, which the public channel deliberately refuses.
 fn ws_url(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     let ws_base = if let Some(rest) = trimmed.strip_prefix("https://") {
@@ -1064,7 +1095,7 @@ fn ws_url(base_url: &str) -> String {
         // Assume a bare host:port is plaintext.
         format!("ws://{trimmed}")
     };
-    format!("{ws_base}/falcon")
+    format!("{ws_base}/cluster")
 }
 
 /// The dedicated Raft-lane socket URL: the falcon WS tagged `?raft=1`.
@@ -1129,20 +1160,23 @@ mod tests {
 
     #[test]
     fn ws_url_maps_scheme_and_appends_path() {
-        assert_eq!(ws_url("http://10.0.0.2:8080"), "ws://10.0.0.2:8080/falcon");
-        assert_eq!(ws_url("http://10.0.0.2:8080/"), "ws://10.0.0.2:8080/falcon");
-        assert_eq!(ws_url("https://node:443"), "wss://node:443/falcon");
-        assert_eq!(ws_url("host:9000"), "ws://host:9000/falcon");
+        assert_eq!(ws_url("http://10.0.0.2:8080"), "ws://10.0.0.2:8080/cluster");
+        assert_eq!(
+            ws_url("http://10.0.0.2:8080/"),
+            "ws://10.0.0.2:8080/cluster"
+        );
+        assert_eq!(ws_url("https://node:443"), "wss://node:443/cluster");
+        assert_eq!(ws_url("host:9000"), "ws://host:9000/cluster");
     }
 
-    /// Serves a real falcon endpoint on an ephemeral port and returns its
-    /// HTTP base URL. Models a peer node: a `PeerLink` connects to it exactly as
-    /// a forwarding gateway would in a cluster.
+    /// Serves a real intra-cluster falcon endpoint on an ephemeral port and
+    /// returns its HTTP base URL. Models a peer node: a `PeerLink` connects to
+    /// its `/cluster` channel exactly as a forwarding gateway would in a cluster.
     async fn serve_peer() -> String {
         let server = crate::ServerImpl::default();
         let registry = crate::falcon::Registry::new();
         crate::falcon::spawn_dispatcher(server.clone(), registry.clone());
-        let app = crate::falcon::router(server, registry);
+        let app = crate::falcon::cluster_router(server, registry, None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
