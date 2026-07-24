@@ -2843,6 +2843,24 @@ async fn project_data_op(name: &str, request: serde_json::Value) -> ApiResult {
         .map_err(data_error)
 }
 
+/// True if `sql` is a schema-changing (DDL) statement, so the domain types must
+/// be regenerated. A cheap leading-keyword sniff — enough to avoid regenerating
+/// on every row INSERT/UPDATE/DELETE while catching CREATE/ALTER/DROP TABLE.
+fn sql_is_ddl(sql: &str) -> bool {
+    let s = sql.trim_start().to_ascii_uppercase();
+    s.starts_with("CREATE ") || s.starts_with("ALTER ") || s.starts_with("DROP ")
+}
+
+/// Best-effort regeneration of `.nanobpm/domain.d.ts` from the default
+/// datasource's live schema (ADR 0029 §4.1/§6), so typed workers track the DB
+/// after a structural change. Failure is logged, never surfaced — the maker's
+/// operation already succeeded and the types are an authoring-time contract only.
+async fn regenerate_domain_types(name: &str) {
+    if let Err((_, msg)) = project_data_op(name, serde_json::json!({ "op": "domaintypes" })).await {
+        tracing::debug!(project = name, "domain.d.ts regen skipped: {msg}");
+    }
+}
+
 /// `GET /console/api/projects/{name}/data/sources` — the datasources the App
 /// manifest declares (resolved driver/url) plus the default source name.
 pub(super) async fn project_data_sources(name: &str) -> ApiResult {
@@ -2881,11 +2899,17 @@ pub(super) async fn project_data_exec(
     sql: &str,
     params: Vec<serde_json::Value>,
 ) -> ApiResult {
-    project_data_op(
+    let res = project_data_op(
         name,
         serde_json::json!({ "op": "exec", "source": source, "sql": sql, "params": params }),
     )
-    .await
+    .await;
+    // A bare `CREATE/ALTER/DROP TABLE` can arrive through exec; refresh the
+    // domain types so workers track the new shape (ADR 0029 §4.1/§6).
+    if res.is_ok() && sql_is_ddl(sql) {
+        regenerate_domain_types(name).await;
+    }
+    res
 }
 
 /// `POST /console/api/projects/{name}/data/{source}/script` — run several
@@ -2896,11 +2920,17 @@ pub(super) async fn project_data_script(
     source: &str,
     statements: Vec<String>,
 ) -> ApiResult {
-    project_data_op(
+    let res = project_data_op(
         name,
         serde_json::json!({ "op": "script", "source": source, "statements": statements }),
     )
-    .await
+    .await;
+    // The structure editor's table rebuild runs through `script`, so this is the
+    // primary schema-change trigger — refresh the domain types (ADR 0029 §4.1/§6).
+    if res.is_ok() {
+        regenerate_domain_types(name).await;
+    }
+    res
 }
 
 /// `GET /console/api/projects/{name}/data/{source}/migrations` — the ordered
@@ -2916,11 +2946,16 @@ pub(super) async fn project_data_migrations(name: &str, source: &str) -> ApiResu
 /// `POST /console/api/projects/{name}/data/{source}/migrate` — apply pending
 /// migrations, returning the names applied.
 pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult {
-    project_data_op(
+    let res = project_data_op(
         name,
         serde_json::json!({ "op": "migrate", "source": source }),
     )
-    .await
+    .await;
+    // Migrations are DDL by nature — refresh the domain types (ADR 0029 §4.1/§6).
+    if res.is_ok() {
+        regenerate_domain_types(name).await;
+    }
+    res
 }
 
 // --- triggers (ADR 0025) --------------------------------------------------

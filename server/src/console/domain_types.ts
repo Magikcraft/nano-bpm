@@ -9,7 +9,7 @@
 // at `deno compile`, and the shipped App is still untyped JSON on the wire
 // (ADR 0029 §3) — the engine stays Zeebe-pure.
 //
-//   import { openDataSource } from "@nanobpm/data";
+//   import { emitDomainDts } from "./domain-types.ts";
 //   const tables = await (await openDataSource("app")).schema();
 //   await Deno.writeTextFile(".nanobpm/domain.d.ts", emitDomainDts(tables));
 //
@@ -22,40 +22,15 @@
 // The manifest `types` registry (ADR 0029 §4.2, transient/non-persisted shapes)
 // is the *other* source; merging it in is the documented follow-up (see the ADR
 // delta) — this spike reifies the table spine.
+//
+// This module is a **pure emitter**: it imports only the `TableMeta`/`ColumnMeta`
+// *types* from the data SDK (a type-only import, erased at runtime), so it is
+// materialised verbatim next to `data-cli.ts` as `.nanobpm/domain-types.ts` and
+// the data CLI's `domaintypes` op imports `emitDomainDts` from it. Opening the
+// datasource, running `schema()`, and writing the file are the CLI op's job
+// (`data_cli.ts`), which already owns the datasource seam and the file writer.
 
 import type { ColumnMeta, TableMeta } from "./data_sdk.ts";
-import { openDataSource } from "./data_sdk.ts";
-
-// Runtime adapter: the host calls that differ between Deno (native `Deno.*`) and
-// Node (`node:fs`). Mirrors data_sdk.ts so this file degrades to Node >= 22.6
-// (ADR 0036); only the file writer needs it — the emitter is pure.
-interface DomainRuntime {
-  mkdir(path: string): Promise<void>;
-  writeTextFile(path: string, data: string): Promise<void>;
-}
-const RT: DomainRuntime = ((): DomainRuntime => {
-  const g = globalThis as unknown as {
-    Deno?: {
-      mkdir(p: string, o: { recursive: boolean }): Promise<void>;
-      writeTextFile(p: string, d: string): Promise<void>;
-    };
-  };
-  if (g.Deno) {
-    const d = g.Deno;
-    return {
-      mkdir: (p) => d.mkdir(p, { recursive: true }),
-      writeTextFile: (p, data) => d.writeTextFile(p, data),
-    };
-  }
-  return {
-    mkdir: async (p) => {
-      await (await import("node:fs/promises")).mkdir(p, { recursive: true });
-    },
-    writeTextFile: async (p, data) => {
-      await (await import("node:fs/promises")).writeFile(p, data, "utf8");
-    },
-  };
-})();
 
 /** The generated file's basename, written under a project's `.nanobpm/`. */
 export const DOMAIN_DTS = "domain.d.ts";
@@ -134,25 +109,4 @@ export function emitDomainDts(tables: TableMeta[]): string {
     .map((t) => `  ${JSON.stringify(t.name)}: ${interfaceName(t.name)};`)
     .join("\n");
   return `${header}\n${interfaces}\n\n/** Every table keyed by its wire name — index it for a row type. */\nexport interface DomainTables {\n${map}\n}\n`;
-}
-
-/**
- * Generate a project's `domain.d.ts` from a live datasource: introspect the
- * schema, emit the types, and write `<outDir>/domain.d.ts`. Returns the emitted
- * text. `source` is the datasource alias (default when omitted, per ADR 0024).
- */
-export async function generateDomainDts(
-  opts: { source?: string; outDir: string; cwd?: string },
-): Promise<{ path: string; text: string; tables: number }> {
-  const db = await openDataSource(opts.source, opts.cwd ? { cwd: opts.cwd } : undefined);
-  try {
-    const tables = await db.schema();
-    const text = emitDomainDts(tables);
-    await RT.mkdir(opts.outDir);
-    const path = `${opts.outDir.replace(/\/+$/, "")}/${DOMAIN_DTS}`;
-    await RT.writeTextFile(path, text);
-    return { path, text, tables: tables.length };
-  } finally {
-    db.close();
-  }
 }
