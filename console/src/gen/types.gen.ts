@@ -787,6 +787,22 @@ export type DataMigrateResult = {
     pending: number;
 };
 
+export type DomainTypesResult = {
+    /**
+     * The file written (relative to the project root), or null when the op only returned the text without writing.
+     *
+     */
+    path?: string | null;
+    /**
+     * The emitted `domain.d.ts` contents.
+     */
+    text: string;
+    /**
+     * Number of tables reified into interfaces.
+     */
+    tables: number;
+};
+
 export type TriggerEnqueueRequest = {
     /**
      * Id of a `triggers[]` entry in the App manifest whose `action` this event drives.
@@ -2458,6 +2474,41 @@ export type MigrateDataResponses = {
 };
 
 export type MigrateDataResponse = MigrateDataResponses[keyof MigrateDataResponses];
+
+export type RegenerateDomainTypesData = {
+    body?: never;
+    path: {
+        name: string;
+        /**
+         * The datasource name from the App manifest's `data.sources`.
+         */
+        source: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/{source}/domaintypes';
+};
+
+export type RegenerateDomainTypesErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type RegenerateDomainTypesError = RegenerateDomainTypesErrors[keyof RegenerateDomainTypesErrors];
+
+export type RegenerateDomainTypesResponses = {
+    /**
+     * The emitted domain types (and where they were written)
+     */
+    200: DomainTypesResult;
+};
+
+export type RegenerateDomainTypesResponse = RegenerateDomainTypesResponses[keyof RegenerateDomainTypesResponses];
 
 export type GetServerUpdateData = {
     body?: never;
