@@ -12,7 +12,6 @@ import type { TableMeta } from "./data_sdk.ts";
 import {
   DOMAIN_DTS,
   emitDomainDts,
-  generateDomainDts,
   interfaceName,
   sqliteAffinityToTs,
 } from "./domain_types.ts";
@@ -77,7 +76,7 @@ Deno.test("emitDomainDts handles an empty schema", () => {
   assertStringIncludes(emitDomainDts([]), "export interface DomainTables {}");
 });
 
-Deno.test("generateDomainDts: schema() → emit → write roundtrip", async () => {
+Deno.test("schema() → emit → write roundtrip (the CLI op's path)", async () => {
   const root = await Deno.makeTempDir();
   await Deno.writeTextFile(
     `${root}/nano.app.json`,
@@ -93,15 +92,19 @@ Deno.test("generateDomainDts: schema() → emit → write roundtrip", async () =
   await db.exec(
     "CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT NOT NULL, tier TEXT, credit REAL)",
   );
+  const tables = await db.schema();
   db.close();
 
+  // Mirror the data-cli `domaintypes` op: emit from schema() and write.
+  const text = emitDomainDts(tables);
   const outDir = `${root}/.nanobpm`;
-  const res = await generateDomainDts({ source: "app", outDir, cwd });
-  assertEquals(res.tables, 1);
-  assertEquals(res.path, `${outDir}/${DOMAIN_DTS}`);
+  await Deno.mkdir(outDir, { recursive: true });
+  const path = `${outDir}/${DOMAIN_DTS}`;
+  await Deno.writeTextFile(path, text);
 
-  const written = await Deno.readTextFile(res.path);
-  assertEquals(written, res.text);
+  assertEquals(tables.length, 1);
+  const written = await Deno.readTextFile(path);
+  assertEquals(written, text);
   assertStringIncludes(written, "export interface Customers {");
   assertStringIncludes(written, "id: number;");
   assertStringIncludes(written, "tier: string | null;");

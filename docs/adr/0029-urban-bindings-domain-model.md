@@ -102,11 +102,13 @@ Types come from two sources, in priority order:
 
    > **Reifier — implemented (spike).** `server/src/console/domain_types.ts` is the concrete §4.1
    > reifier: `emitDomainDts(tables)` turns `schema()`'s `TableMeta[]` into a `domain.d.ts` — one
-   > `export interface` per table plus a `DomainTables` lookup keyed by the raw table name — and
-   > `generateDomainDts({source, outDir})` runs `schema()` → emit → write. `sqliteAffinityToTs`
+   > `export interface` per table plus a `DomainTables` lookup keyed by the raw table name. The
+   > datasource CLI's `domaintypes` op (`data_cli.ts`) runs `schema()` → emit → write.
+   > `sqliteAffinityToTs`
    > applies SQLite's type-affinity rules with two maker-facing overrides the DB Manager's type list
    > implies (`BOOLEAN → boolean`, date/time → ISO `string`); a nullable column widens with `| null`,
-   > a `NOT NULL`/primary-key column does not. It is Node+Deno-portable (ADR 0036) and unit- +
+   > a `NOT NULL`/primary-key column does not. It is a pure emitter (type-only SDK import),
+   > Node+Deno-portable (ADR 0036) and unit- +
    > roundtrip-tested (`domain_types_test.ts`, run under Deno). *This is the "generate a models
    > directory" answer — but generated, never hand-edited, so it cannot drift from the DB.*
 2. **A manifest type registry** — a small `types` block for **transient, non-persisted** shapes
@@ -172,7 +174,14 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > **Codegen + typed SDK — implemented (spike).** The reifier (§4.1) emits a **gitignored**
 > `.nanobpm/domain.d.ts` under the maker's project — same materialize-and-ignore pattern as the
 > generated `data-cli.ts`/`data-sdk.ts`, so there is never a committed, hand-editable `models/` dir
-> to drift. The worker SDK (`worker_sdk.ts`) now carries authoring-only generics that consume it:
+> to drift. Generation is wired to two real triggers: a `domaintypes` datasource op
+> (`data_cli.ts`, exposed through the same `run_data_op` gateway) that emits + writes the file, fired
+> automatically after any **schema change** through the Data panel (a `script` rebuild, a DDL
+> `exec`, or a `migrate`); and an **App-boot hook** (`projects.rs` run path) that refreshes the
+> types before the App starts. Both are best-effort and type-erased — a failure never blocks the
+> maker's DDL or the App. The emitter itself is a pure module (`domain_types.ts`, type-only import)
+> so it materialises next to `data-cli.ts` as `.nanobpm/domain-types.ts`. The worker SDK
+> (`worker_sdk.ts`) carries authoring-only generics that consume it:
 > `defineWorker<In, Out>({ handle(job) })` types `job.variables` as `In` and `job.complete(out)` as
 > `Out`, and `ctx.data().query<T>()` returns `T[]` — e.g.
 > `query<DomainTables["customers"]>(...)`. Generics default to the prior untyped shapes, so existing
@@ -182,8 +191,10 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > types add zero runtime cost and are fully erased at `deno compile`.
 >
 > **Follow-ups (not in this spike):** merge the §4.2 manifest `types` registry into the emitter (the
-> spike does the *table spine* only); wire `generateDomainDts` into a real trigger (a console
-> datasource op and/or a `generate-app-manifest.sh` / build hook that regenerates on schema change).
+> spike does the *table spine* only); union multiple datasources into one `domain.d.ts` (today the
+> op reifies the default source); regenerate as part of the App **export/`deno compile`** packaging
+> in addition to boot; and expose a maker-facing "Regenerate domain types" REST endpoint + Data-panel
+> button (the op is reachable server-side today, not yet as a dedicated route).
 
 ## Consequences
 

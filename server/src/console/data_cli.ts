@@ -18,9 +18,11 @@
 // there and file-backed sources resolve against it.
 //
 //   Request:  { op, source?, sql?, params?, statements? }
-//   op = "sources" | "schema" | "query" | "exec" | "script" | "migrations" | "migrate"
+//   op = "sources" | "schema" | "query" | "exec" | "script" | "migrations"
+//      | "migrate" | "domaintypes"
 
 import { listSources, openDataSource } from "./data-sdk.ts";
+import { DOMAIN_DTS, emitDomainDts } from "./domain-types.ts";
 
 interface Request {
   op: string;
@@ -28,6 +30,8 @@ interface Request {
   sql?: string;
   params?: unknown[];
   statements?: string[];
+  /** `domaintypes`: also write `.nanobpm/domain.d.ts` (default true). */
+  write?: boolean;
 }
 
 // Runtime adapter (ADR 0036/0038): the host calls that differ between Deno
@@ -44,6 +48,8 @@ interface CliRuntime {
   readStdin(): Promise<string>;
   readDir(dir: string): Promise<DirEntry[]>;
   readTextFile(path: string): Promise<string>;
+  mkdir(path: string): Promise<void>;
+  writeTextFile(path: string, data: string): Promise<void>;
   exit(code: number): never;
 }
 
@@ -70,7 +76,10 @@ const RT: CliRuntime = ((): CliRuntime => {
     process?: { stdin: AsyncIterable<Uint8Array>; exit(code: number): never };
   };
   if (g.Deno) {
-    const d = g.Deno;
+    const d = g.Deno as typeof g.Deno & {
+      mkdir(p: string, o: { recursive: boolean }): Promise<void>;
+      writeTextFile(p: string, data: string): Promise<void>;
+    };
     return {
       readStdin: async () => {
         const chunks: Uint8Array[] = [];
@@ -88,6 +97,8 @@ const RT: CliRuntime = ((): CliRuntime => {
         return out;
       },
       readTextFile: (p) => d.readTextFile(p),
+      mkdir: (p) => d.mkdir(p, { recursive: true }),
+      writeTextFile: (p, data) => d.writeTextFile(p, data),
       exit: (c) => d.exit(c),
     };
   }
@@ -104,6 +115,12 @@ const RT: CliRuntime = ((): CliRuntime => {
       return ents.map((e) => ({ name: e.name, isFile: e.isFile() }));
     },
     readTextFile: async (path) => (await import("node:fs/promises")).readFile(path, "utf8"),
+    mkdir: async (path) => {
+      await (await import("node:fs/promises")).mkdir(path, { recursive: true });
+    },
+    writeTextFile: async (path, data) => {
+      await (await import("node:fs/promises")).writeFile(path, data, "utf8");
+    },
     exit: (c) => p.exit(c),
   };
 })();
@@ -266,6 +283,27 @@ async function run(req: Request): Promise<unknown> {
         applied.push(name);
       }
       return { applied, pending: 0 };
+    }
+    case "domaintypes": {
+      // ADR 0029 §4.1/§6: reify the datasource schema into TypeScript. Introspect
+      // the tables, emit `domain.d.ts`, and (unless `write:false`) materialise it
+      // to `.nanobpm/domain.d.ts` next to the SDK so workers type against the live
+      // DB. cwd is the project root, so the relative path lands in the project.
+      const db = await openDataSource(req.source);
+      let tables;
+      try {
+        tables = await db.schema();
+      } finally {
+        db.close();
+      }
+      const text = emitDomainDts(tables);
+      let path: string | null = null;
+      if (req.write !== false) {
+        await RT.mkdir(".nanobpm");
+        path = `.nanobpm/${DOMAIN_DTS}`;
+        await RT.writeTextFile(path, text);
+      }
+      return { path, text, tables: tables.length };
     }
     default:
       throw new Error(`unknown op "${req.op}"`);

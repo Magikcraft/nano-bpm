@@ -40,6 +40,7 @@ use super::{triggers, worker_export, workers, workspace};
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 const DATA_SDK_TS: &str = include_str!("data_sdk.ts");
 const DATA_CLI_TS: &str = include_str!("data_cli.ts");
+const DOMAIN_TYPES_TS: &str = include_str!("domain_types.ts");
 /// Node fallback runtime loader + bootstrap (ADR 0036), materialised next to the
 /// SDK so `deno.json` import maps resolve under Node (no Deno build required).
 const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
@@ -1377,6 +1378,7 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(&nano)?;
     std::fs::write(nano.join("data-sdk.ts"), DATA_SDK_TS)?;
     std::fs::write(nano.join("data-cli.ts"), DATA_CLI_TS)?;
+    std::fs::write(nano.join("domain-types.ts"), DOMAIN_TYPES_TS)?;
     std::fs::write(nano.join("node-loader.mjs"), NODE_LOADER_MJS)?;
     std::fs::write(nano.join("node-register.mjs"), NODE_REGISTER_MJS)?;
     std::fs::write(nano.join("worker-sdk.ts"), WORKER_SDK_TS)
@@ -1605,6 +1607,10 @@ pub fn create_project(
     w(dir.join("deno.json"), PROJECT_DENO_JSON)?;
     w(dir.join(".nanobpm").join("data-sdk.ts"), DATA_SDK_TS)?;
     w(dir.join(".nanobpm").join("data-cli.ts"), DATA_CLI_TS)?;
+    w(
+        dir.join(".nanobpm").join("domain-types.ts"),
+        DOMAIN_TYPES_TS,
+    )?;
     w(
         dir.join(".nanobpm").join("node-loader.mjs"),
         NODE_LOADER_MJS,
@@ -2503,6 +2509,11 @@ impl ProjectSupervisor {
         }
         *inner.phase.lock().await = Phase::Starting;
         let _ = ensure_project_sdk(name);
+        // Boot hook: refresh the generated domain types from the live schema so
+        // workers type against the current DB (ADR 0029 §4.1/§6). Best-effort and
+        // type-erased — a failure (no JS runtime yet, empty DB) never blocks the
+        // App from starting.
+        let _ = run_data_op(name, serde_json::json!({ "op": "domaintypes" })).await;
 
         let entry = dir.join(&cfg.main);
         if !entry.is_file() {
@@ -4122,5 +4133,85 @@ mod tests {
         .await
         .expect("probe query");
         assert!(gone["rows"].as_array().unwrap().is_empty());
+    }
+
+    /// The `domaintypes` op (ADR 0029 §4.1/§6) reifies the live schema into
+    /// `.nanobpm/domain.d.ts`: one interface per table + a `DomainTables` map,
+    /// written next to the SDK and returned as text. Runs through the same
+    /// gateway; skipped when no JS runtime is present (CI).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn domaintypes_op_reifies_the_schema_to_a_dts() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "dtapp";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                "app": { "driver": "sqlite", "url": "file:./app.db" }
+            } } }"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        // An empty schema still emits a valid (empty) DomainTables.
+        let empty = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes (empty)");
+        assert_eq!(empty["tables"], 0);
+        assert!(
+            empty["text"]
+                .as_str()
+                .unwrap()
+                .contains("export interface DomainTables {}")
+        );
+
+        // Create a table, then regenerate: the interface + map now reflect it.
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL, tier TEXT)" }),
+        )
+        .await
+        .expect("create table");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        assert_eq!(dt["tables"], 1);
+        assert_eq!(dt["path"], ".nanobpm/domain.d.ts");
+        let text = dt["text"].as_str().unwrap();
+        assert!(text.contains("export interface Customers {"));
+        assert!(text.contains("id: number;")); // PK ⇒ not null
+        assert!(text.contains("name: string;")); // NOT NULL ⇒ not null
+        assert!(text.contains("tier: string | null;")); // nullable widens
+        assert!(text.contains("\"customers\": Customers;"));
+
+        // The file was materialised on disk and matches the returned text.
+        let on_disk = std::fs::read_to_string(dir.join(".nanobpm/domain.d.ts")).unwrap();
+        assert_eq!(on_disk, text);
+
+        // write:false returns the text without touching disk.
+        std::fs::remove_file(dir.join(".nanobpm/domain.d.ts")).unwrap();
+        let dry = run_data_op(
+            name,
+            serde_json::json!({ "op": "domaintypes", "write": false }),
+        )
+        .await
+        .expect("domaintypes dry");
+        assert_eq!(dry["path"], serde_json::Value::Null);
+        assert!(
+            dry["text"]
+                .as_str()
+                .unwrap()
+                .contains("export interface Customers {")
+        );
+        assert!(!dir.join(".nanobpm/domain.d.ts").exists());
     }
 }
