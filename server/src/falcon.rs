@@ -559,6 +559,49 @@ pub enum ClientFrame {
     },
 }
 
+impl ClientFrame {
+    /// Whether this frame belongs to the **public client protocol** (the surface
+    /// documented in `docs/falcon.asyncapi.yaml`) and is therefore permitted on
+    /// the client-facing `/falcon` channel.
+    ///
+    /// Every other variant is an **intra-cluster** frame — the peer-to-peer
+    /// control/data plane a forwarding gateway uses to drive the owning node
+    /// (deploy install, raft RPCs, promotion/handoff, direct variable/incident
+    /// mutation, …). Those must only ever arrive on the authenticated cluster
+    /// channel (`/cluster`); accepting them from an unauthenticated public
+    /// client socket would expose the entire cluster control plane. See
+    /// ADR 0039.
+    ///
+    /// Note the cluster channel is a **superset**: a forwarding gateway also
+    /// sends genuine client frames (`CreateInstance`, `CompleteJob`, `FailJob`,
+    /// `ThrowError`) to the owning peer, so `/cluster` accepts everything while
+    /// `/falcon` is gated to exactly this public subset.
+    pub fn is_public(&self) -> bool {
+        matches!(
+            self,
+            ClientFrame::Subscribe { .. }
+                | ClientFrame::JobCredits { .. }
+                | ClientFrame::CreateInstance { .. }
+                | ClientFrame::CompleteJob { .. }
+                | ClientFrame::FailJob { .. }
+                | ClientFrame::ThrowError { .. }
+                | ClientFrame::AwaitInstance { .. }
+                | ClientFrame::Heartbeat
+        )
+    }
+}
+
+/// Which Falcon channel a connection arrived on. The public `/falcon` channel is
+/// restricted to the client protocol ([`ClientFrame::is_public`]); the
+/// authenticated `/cluster` channel carries the full intra-cluster protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    /// Public, client-facing endpoint (`/falcon`). Peer/control frames rejected.
+    Client,
+    /// Authenticated intra-cluster endpoint (`/cluster`). Accepts every frame.
+    Cluster,
+}
+
 /// The kind of entity a [`ClientFrame::GetByKey`] read targets, selecting which
 /// read-model lookup the owning peer runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -860,7 +903,18 @@ struct CsState {
     server: ServerImpl,
     registry: Arc<Registry>,
     submission_window: i64,
+    /// Which channel this state serves. `/falcon` is [`Channel::Client`] (public,
+    /// gated to [`ClientFrame::is_public`]); `/cluster` is [`Channel::Cluster`].
+    channel: Channel,
+    /// Expected shared secret for the intra-cluster channel. `Some` only on the
+    /// cluster router; when set, a connecting peer must present it in the
+    /// `x-nano-cluster-secret` header or the upgrade is refused with `401`.
+    /// `None` disables the check (single-node/dev). See ADR 0039.
+    cluster_secret: Option<Arc<str>>,
 }
+
+/// HTTP header a peer presents on the `/cluster` handshake to authenticate.
+pub const CLUSTER_SECRET_HEADER: &str = "x-nano-cluster-secret";
 
 #[derive(Debug, Deserialize)]
 struct ConnectParams {
@@ -869,17 +923,73 @@ struct ConnectParams {
     worker: Option<String>,
 }
 
-/// Builds the router carrying the `/falcon` WebSocket endpoint, sharing
-/// the engine-backed [`ServerImpl`] and the [`Registry`].
+/// Builds the router carrying the public **client** `/falcon` WebSocket
+/// endpoint, sharing the engine-backed [`ServerImpl`] and the [`Registry`].
+///
+/// This channel is gated to the public client protocol
+/// ([`ClientFrame::is_public`]): intra-cluster frames are rejected. Peers use
+/// [`cluster_router`] instead.
 pub fn router(server: ServerImpl, registry: Arc<Registry>) -> Router {
     let state = CsState {
         server,
         registry,
         submission_window: submission_window_from_env(),
+        channel: Channel::Client,
+        cluster_secret: None,
     };
     Router::new()
         .route("/falcon", get(ws_handler))
         .with_state(state)
+}
+
+/// Builds the router carrying the intra-cluster **peer** `/cluster` WebSocket
+/// endpoint. Accepts the full Falcon protocol (client frames a forwarding
+/// gateway relays *and* the peer control/data plane), so it MUST be reachable
+/// only by trusted cluster members.
+///
+/// When `secret` is `Some`, a connecting peer must present it in the
+/// [`CLUSTER_SECRET_HEADER`] header or the upgrade is refused with `401`. When
+/// `None`, no authentication is enforced (single-node/dev). For real network
+/// isolation this router can be served on a dedicated internal listener instead
+/// of merged into the public app — see the gateway's `NANOBPMN_INTERNAL_ADDR`
+/// wiring. See ADR 0039.
+pub fn cluster_router(
+    server: ServerImpl,
+    registry: Arc<Registry>,
+    secret: Option<String>,
+) -> Router {
+    let state = CsState {
+        server,
+        registry,
+        submission_window: submission_window_from_env(),
+        channel: Channel::Cluster,
+        cluster_secret: secret.map(Arc::from),
+    };
+    Router::new()
+        .route("/cluster", get(cluster_ws_handler))
+        .with_state(state)
+}
+
+/// Reads the expected intra-cluster shared secret from the environment
+/// (`NANOBPMN_CLUSTER_SECRET`). An empty/absent value disables authentication.
+pub fn cluster_secret_from_env() -> Option<String> {
+    std::env::var("NANOBPMN_CLUSTER_SECRET")
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Reads the optional dedicated internal listen address for the intra-cluster
+/// `/cluster` channel from `NANOBPMN_INTERNAL_ADDR` (e.g. `10.0.0.2:9090` or
+/// `0.0.0.0:9090`). When set, the gateway serves `/cluster` **only** on this
+/// listener and omits it from the public app, so operators can bind it to a
+/// private interface and firewall the public port. When unset, `/cluster` is
+/// served on the main gateway listener (path + shared-secret isolation only).
+/// See ADR 0039.
+pub fn internal_addr_from_env() -> Option<std::net::SocketAddr> {
+    std::env::var("NANOBPMN_INTERNAL_ADDR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| s.parse().ok())
 }
 
 fn submission_window_from_env() -> i64 {
@@ -918,6 +1028,48 @@ async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state, worker))
 }
 
+/// Upgrade handler for the authenticated intra-cluster `/cluster` channel. When
+/// the router carries an expected secret, the peer must present a matching
+/// [`CLUSTER_SECRET_HEADER`] header (constant-time compared) or the upgrade is
+/// refused with `401` before any frame is read. See ADR 0039.
+async fn cluster_ws_handler(
+    State(state): State<CsState>,
+    Query(params): Query<ConnectParams>,
+    headers: axum::http::HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    if let Some(expected) = state.cluster_secret.as_deref() {
+        let presented = headers
+            .get(CLUSTER_SECRET_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        if !constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            use axum::response::IntoResponse as _;
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "invalid or missing cluster secret",
+            )
+                .into_response();
+        }
+    }
+    let worker = params.worker.unwrap_or_default();
+    ws.on_upgrade(move |socket| handle_socket(socket, state, worker))
+}
+
+/// Length-independent byte comparison, so a peer secret mismatch cannot be
+/// timing-probed. Returns `false` immediately on a length difference (the
+/// length of the expected secret is not itself a useful oracle here).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Drives one connection: spawns the writer task, registers the connection, then
 /// reads client frames in arrival order (preserving per-connection ordering)
 /// until the socket closes.
@@ -926,6 +1078,8 @@ async fn handle_socket(socket: WebSocket, state: CsState, default_worker: String
         server,
         registry,
         submission_window,
+        channel,
+        cluster_secret: _,
     } = state;
 
     let id = registry.next_id.fetch_add(1, Ordering::Relaxed);
@@ -966,7 +1120,7 @@ async fn handle_socket(socket: WebSocket, state: CsState, default_worker: String
         n: submission_window,
     });
 
-    reader_loop(stream, &server, &registry, &conn, &default_worker).await;
+    reader_loop(stream, &server, &registry, &conn, &default_worker, channel).await;
 
     // Disconnect: drop the connection from the registry. Jobs already pushed but
     // not completed are reclaimed by lease-deadline expiry (the periodic tick),
@@ -1016,6 +1170,7 @@ async fn reader_loop(
     registry: &Arc<Registry>,
     conn: &Arc<Connection>,
     default_worker: &str,
+    channel: Channel,
 ) {
     loop {
         let message = tokio::select! {
@@ -1042,6 +1197,22 @@ async fn reader_loop(
                         continue;
                     }
                 };
+                // Trust boundary (ADR 0039): the public client channel may only
+                // carry the documented client protocol. Intra-cluster control/
+                // data-plane frames are refused here so a public socket cannot
+                // reach the cluster control plane; peers send them on the
+                // authenticated `/cluster` channel instead.
+                if channel == Channel::Client && !frame.is_public() {
+                    crate::metrics::record_stream_frame("rejected_peer_frame");
+                    conn.send(ServerFrame::CommandResult {
+                        corr: 0,
+                        status: 403,
+                        body: Some(Value::String(
+                            "frame type not permitted on the client channel".to_string(),
+                        )),
+                    });
+                    continue;
+                }
                 handle_client_frame(server, registry, conn, default_worker, frame).await;
             }
             Message::Binary(_) => {
@@ -3212,8 +3383,28 @@ mod asyncapi_spec_guard {
         "instanceCompleted",
         "submissionCredits",
         "pressure",
+        "workerAdvice",
         "heartbeat",
     ];
+
+    /// Compile-time tripwire: an exhaustive match (no `_` arm) over every
+    /// `ServerFrame` variant. Adding a variant breaks the build *here*, forcing
+    /// the author to (a) list it in `PUBLIC_SERVER`, (b) add an instance to the
+    /// `all` array in `server_frame_type_tags_match_the_spec`, and (c) document
+    /// it in `falcon.asyncapi.yaml`. This is the guard that `WorkerAdvice`
+    /// originally slipped past when the check was a hand-maintained array alone.
+    fn server_frame_is_exhaustively_guarded(f: &ServerFrame) {
+        match f {
+            ServerFrame::Welcome { .. }
+            | ServerFrame::Job { .. }
+            | ServerFrame::CommandResult { .. }
+            | ServerFrame::InstanceCompleted { .. }
+            | ServerFrame::SubmissionCredits { .. }
+            | ServerFrame::Pressure { .. }
+            | ServerFrame::WorkerAdvice { .. }
+            | ServerFrame::Heartbeat => {}
+        }
+    }
 
     /// Collect every message discriminator the spec documents, i.e. each
     /// `const: <x>` declared on a `type` property in the schemas section.
@@ -3268,10 +3459,14 @@ mod asyncapi_spec_guard {
                 level: "ok".into(),
                 retry_after_ms: None,
             },
+            ServerFrame::WorkerAdvice {
+                recommended_concurrency: 1,
+            },
             ServerFrame::Heartbeat,
         ];
         let tags: BTreeSet<String> = all
             .iter()
+            .inspect(|f| server_frame_is_exhaustively_guarded(f))
             .map(|f| {
                 serde_json::to_value(f).unwrap()["type"]
                     .as_str()
@@ -3344,6 +3539,74 @@ mod asyncapi_spec_guard {
                 origin_protocol, ..
             } => assert_eq!(origin_protocol, None),
             other => panic!("expected ForwardCreate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_public_accepts_exactly_the_documented_client_protocol() {
+        // Every documented public client frame must classify as public (allowed
+        // on `/falcon`). Reuses the same minimal fixtures as the spec drift guard
+        // so the trust boundary tracks the documented protocol automatically.
+        let minimal = |t: &str| match t {
+            "subscribe" => json!({"type":"subscribe","jobType":"x"}),
+            "jobCredits" => json!({"type":"jobCredits","jobType":"x","n":1}),
+            "createInstance" => json!({"type":"createInstance","corr":1}),
+            "completeJob" => json!({"type":"completeJob","corr":1,"jobKey":"1"}),
+            "failJob" => json!({"type":"failJob","corr":1,"jobKey":"1"}),
+            "throwError" => json!({"type":"throwError","corr":1,"jobKey":"1","errorCode":"E"}),
+            "awaitInstance" => json!({"type":"awaitInstance","corr":1,"processInstanceKey":"1"}),
+            "heartbeat" => json!({"type":"heartbeat"}),
+            other => panic!("no minimal frame for documented client type {other:?}"),
+        };
+        for &t in PUBLIC_CLIENT {
+            let frame: ClientFrame = serde_json::from_value(minimal(t)).unwrap();
+            assert!(
+                frame.is_public(),
+                "documented client frame {t:?} must be permitted on the client channel"
+            );
+        }
+    }
+
+    #[test]
+    fn is_public_rejects_intra_cluster_frames() {
+        // A representative spread of intra-cluster control/data-plane frames must
+        // NOT classify as public: on `/falcon` these are refused (ADR 0039) so a
+        // client cannot reach the cluster control plane. Peers send them on the
+        // authenticated `/cluster` channel instead.
+        let peer_frames = vec![
+            ClientFrame::Promote {
+                partition: 0,
+                epoch: 1,
+                leader_node: 2,
+                leader_addr: "http://n2".into(),
+            },
+            ClientFrame::SetVariables {
+                corr: 1,
+                scope_key: "1".into(),
+                variables: None,
+                local: false,
+            },
+            ClientFrame::CancelInstance {
+                corr: 1,
+                instance_key: "1".into(),
+            },
+            ClientFrame::Deploy {
+                corr: 1,
+                resources: vec![],
+                tenant_id: None,
+            },
+            ClientFrame::Raft {
+                corr: 1,
+                partition: 0,
+                rpc: String::new(),
+                zip: false,
+            },
+        ];
+        for frame in &peer_frames {
+            assert!(
+                !frame.is_public(),
+                "intra-cluster frame {frame:?} must be refused on the client channel"
+            );
         }
     }
 }

@@ -15709,7 +15709,29 @@ async fn main() {
     falcon::spawn_dispatcher(server.clone(), cs_registry.clone());
     let monitor_registry = cs_registry.clone();
     let monitor_server = server.clone();
-    let cs_router = falcon::router(server.clone(), cs_registry);
+    let cs_router = falcon::router(server.clone(), cs_registry.clone());
+
+    // Intra-cluster (`/cluster`) channel (ADR 0039): the authenticated peer
+    // transport, kept off the public client `/falcon` channel. Served either on
+    // a dedicated internal listener (`NANOBPMN_INTERNAL_ADDR`, for true network
+    // isolation) or merged into the public app behind the shared secret.
+    let cluster_secret = falcon::cluster_secret_from_env();
+    let internal_addr = falcon::internal_addr_from_env();
+    if cluster_secret.is_none() && !server.engine.topology().is_single_node() {
+        tracing::warn!(
+            "intra-cluster /cluster channel is UNAUTHENTICATED: set NANOBPMN_CLUSTER_SECRET \
+             (and ideally NANOBPMN_INTERNAL_ADDR) to gate peer traffic — see ADR 0039"
+        );
+    }
+    let cluster_router =
+        falcon::cluster_router(server.clone(), cs_registry, cluster_secret.clone());
+    // The cluster router lives in exactly one place: a dedicated internal
+    // listener when an internal address is configured, else merged into the
+    // public app.
+    let (public_cluster_router, internal_cluster_router) = match internal_addr {
+        Some(_) => (None, Some(cluster_router)),
+        None => (Some(cluster_router), None),
+    };
 
     // Clustered partition-0 owner: push the seeded/recovered deployment
     // definitions to every peer so the whole cluster can instantiate them,
@@ -15913,6 +15935,13 @@ async fn main() {
             }
             app = app.merge(console);
         }
+    }
+
+    // ADR 0039: when no dedicated internal listener is configured, the
+    // intra-cluster channel rides the public port, isolated by path + shared
+    // secret. Merge it here so `/cluster` is reachable alongside `/falcon`.
+    if let Some(cluster_router) = public_cluster_router {
+        app = app.merge(cluster_router);
     }
 
     if debug_rest_enabled() {
@@ -16671,6 +16700,30 @@ async fn main() {
     println!("LISTENING_PORT={local_port}");
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
+    // ADR 0039: when configured, serve the intra-cluster `/cluster` channel on a
+    // dedicated internal listener (bindable to a private interface and
+    // firewalled off from the public port). It is deliberately absent from the
+    // public `app`.
+    if let (Some(internal_addr), Some(internal_cluster_router)) =
+        (internal_addr, internal_cluster_router)
+    {
+        let internal_listener = tokio::net::TcpListener::bind(internal_addr)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("failed to bind internal cluster addr {internal_addr}: {e}")
+            });
+        let bound = internal_listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| internal_addr.to_string());
+        tracing::info!("intra-cluster /cluster channel on dedicated internal listener {bound}");
+        tokio::spawn(async move {
+            axum::serve(NoDelayListener(internal_listener), internal_cluster_router)
+                .await
+                .expect("internal cluster server error");
+        });
+    }
+
     // Tell the console worker supervisor which port to dial for the command
     // stream when it spawns Deno worker subprocesses.
     #[cfg(feature = "console")]
@@ -17300,7 +17353,7 @@ mod clustered_startup_tests {
         let node1 = clustered_node(1);
         let registry = falcon::Registry::new();
         falcon::spawn_dispatcher(node1.clone(), registry.clone());
-        let app = falcon::router(node1.clone(), registry);
+        let app = peer_facing_app(node1.clone(), registry);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -17631,12 +17684,24 @@ mod clustered_startup_tests {
         }
     }
 
+    /// Test harness router mirroring the production default (ADR 0039): a node
+    /// serves both the public client `/falcon` channel and the intra-cluster
+    /// `/cluster` channel (secret disabled) on one listener, so peer uplinks —
+    /// which now dial `/cluster` — reach it exactly as in a real cluster.
+    fn peer_facing_app(
+        server: ServerImpl,
+        registry: std::sync::Arc<falcon::Registry>,
+    ) -> axum::Router {
+        falcon::router(server.clone(), registry.clone())
+            .merge(falcon::cluster_router(server, registry, None))
+    }
+
     /// Serves a node's falcon endpoint on an ephemeral port and returns
     /// its HTTP base URL, so a peer can forward to it exactly as in a cluster.
     async fn serve_node(server: &ServerImpl) -> String {
         let registry = falcon::Registry::new();
         falcon::spawn_dispatcher(server.clone(), registry.clone());
-        let app = falcon::router(server.clone(), registry);
+        let app = peer_facing_app(server.clone(), registry);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind ephemeral port");
@@ -17645,6 +17710,144 @@ mod clustered_startup_tests {
             axum::serve(listener, app).await.ok();
         });
         format!("http://127.0.0.1:{port}")
+    }
+
+    /// Serves a router on an ephemeral port; returns `(base_url, port)`.
+    async fn serve_router(app: axum::Router) -> (String, u16) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let port = listener.local_addr().expect("local addr").port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://127.0.0.1:{port}"), port)
+    }
+
+    /// Reads text frames from a peer socket until a `commandResult` arrives,
+    /// returning its `status`. Skips the `welcome`/`submissionCredits` greeting.
+    async fn next_command_status(
+        ws: &mut tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    ) -> u64 {
+        use futures_util::StreamExt;
+        for _ in 0..10 {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .expect("frame within timeout")
+                .expect("stream open")
+                .expect("valid ws frame");
+            if let tokio_tungstenite::tungstenite::Message::Text(txt) = msg {
+                let v: serde_json::Value = serde_json::from_str(&txt).expect("json frame");
+                if v["type"] == "commandResult" {
+                    return v["status"].as_u64().expect("status");
+                }
+            }
+        }
+        panic!("no commandResult received");
+    }
+
+    /// ADR 0039: the public client `/falcon` channel must refuse intra-cluster
+    /// control frames (a client cannot reach the cluster control plane) while
+    /// still serving ordinary client commands.
+    #[tokio::test]
+    async fn client_channel_refuses_intra_cluster_frames() {
+        use futures_util::SinkExt;
+        let server =
+            build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+        let registry = falcon::Registry::new();
+        falcon::spawn_dispatcher(server.clone(), registry.clone());
+        let app = falcon::router(server.clone(), registry);
+        let (_, port) = serve_router(app).await;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/falcon"))
+            .await
+            .expect("client connects to /falcon");
+
+        // A peer/control frame must be refused with 403 and NOT dispatched.
+        let promote = serde_json::json!({
+            "type": "promote", "partition": 0, "epoch": 1,
+            "leaderNode": 2, "leaderAddr": "http://n2"
+        });
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            promote.to_string().into(),
+        ))
+        .await
+        .expect("send peer frame");
+        assert_eq!(
+            next_command_status(&mut ws).await,
+            403,
+            "an intra-cluster frame on /falcon must be refused with 403"
+        );
+
+        // An ordinary client command still works on the same channel.
+        let create = serde_json::json!({"type": "createInstance", "corr": 1, "processDefinitionId": "missing"});
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            create.to_string().into(),
+        ))
+        .await
+        .expect("send client frame");
+        // The definition is unknown, so the create is rejected — but with a
+        // command-level status (not 403), proving the frame was dispatched.
+        assert_ne!(
+            next_command_status(&mut ws).await,
+            403,
+            "a documented client frame must be dispatched on /falcon"
+        );
+    }
+
+    /// ADR 0039: the intra-cluster `/cluster` channel refuses a handshake that
+    /// omits or mismatches the shared secret, and admits one that matches.
+    #[tokio::test]
+    async fn cluster_channel_enforces_the_shared_secret() {
+        let server =
+            build_server_in_memory(vec![Journal::in_memory()], cluster::Topology::single(1));
+        let registry = falcon::Registry::new();
+        falcon::spawn_dispatcher(server.clone(), registry.clone());
+        let app = falcon::cluster_router(server.clone(), registry, Some("s3cr3t".to_string()));
+        let (_, port) = serve_router(app).await;
+        let url = format!("ws://127.0.0.1:{port}/cluster");
+
+        // No secret → 401, upgrade refused.
+        match tokio_tungstenite::connect_async(&url).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status().as_u16(), 401, "missing secret must be 401");
+            }
+            other => panic!("expected 401 Http error, got {other:?}"),
+        }
+
+        // Wrong secret → 401.
+        let bad = build_secret_request(&url, "wrong");
+        match tokio_tungstenite::connect_async(bad).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+                assert_eq!(resp.status().as_u16(), 401, "wrong secret must be 401");
+            }
+            other => panic!("expected 401 Http error, got {other:?}"),
+        }
+
+        // Correct secret → upgrade succeeds.
+        let good = build_secret_request(&url, "s3cr3t");
+        let (ws, _) = tokio_tungstenite::connect_async(good)
+            .await
+            .expect("correct secret admits the peer");
+        drop(ws);
+    }
+
+    /// Builds a WS handshake request carrying the cluster secret header.
+    fn build_secret_request(
+        url: &str,
+        secret: &str,
+    ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = url.into_client_request().expect("client request");
+        req.headers_mut().insert(
+            tokio_tungstenite::tungstenite::http::HeaderName::from_static(
+                falcon::CLUSTER_SECRET_HEADER,
+            ),
+            tokio_tungstenite::tungstenite::http::HeaderValue::from_str(secret).unwrap(),
+        );
+        req
     }
 
     #[tokio::test]
@@ -17770,7 +17973,7 @@ mod clustered_startup_tests {
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
             falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = falcon::router(server.clone(), registry);
+            let app = peer_facing_app(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -18324,7 +18527,7 @@ mod clustered_startup_tests {
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
             falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = falcon::router(server.clone(), registry);
+            let app = peer_facing_app(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -19105,7 +19308,7 @@ mod clustered_startup_tests {
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
             falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = falcon::router(server.clone(), registry);
+            let app = peer_facing_app(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -19260,7 +19463,7 @@ mod clustered_startup_tests {
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
             falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = falcon::router(server.clone(), registry);
+            let app = peer_facing_app(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -19380,7 +19583,7 @@ mod clustered_startup_tests {
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
             falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = falcon::router(server.clone(), registry);
+            let app = peer_facing_app(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -19550,7 +19753,7 @@ mod clustered_startup_tests {
         for (server, listener) in [(node0.clone(), l0), (node1.clone(), l1)] {
             let registry = falcon::Registry::new();
             falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = falcon::router(server.clone(), registry);
+            let app = peer_facing_app(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -19758,7 +19961,7 @@ mod clustered_startup_tests {
         for (server, listener) in served {
             let registry = falcon::Registry::new();
             falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = falcon::router(server.clone(), registry);
+            let app = peer_facing_app(server.clone(), registry);
             tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             });
@@ -20027,7 +20230,7 @@ mod clustered_startup_tests {
         for (server, listener) in served {
             let registry = falcon::Registry::new();
             falcon::spawn_dispatcher(server.clone(), registry.clone());
-            let app = falcon::router(server.clone(), registry);
+            let app = peer_facing_app(server.clone(), registry);
             serve_handles.push(tokio::spawn(async move {
                 axum::serve(listener, app).await.ok();
             }));

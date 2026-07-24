@@ -50,6 +50,8 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0035](0035-observability-config-and-standalone-console.md) | Full-fidelity Prometheus, a standalone console, and runtime observability config | Accepted | 2026-07-23 |
 | [0036](0036-dual-runtime-workers-deno-node-fallback.md) | Dual-runtime workers: Deno-preferred, Node fallback (32-bit ARM support) | Accepted | 2026-07-24 |
 | [0037](0037-execution-and-task-listeners.md) | Execution listeners (and task listeners): BPMN lifecycle-hook parity | Proposed | 2026-07-23 |
+| [0038](0038-node-first-runtime.md) | Node-first runtime: Deno optional, only for `deno compile` | Accepted | 2026-07-24 |
+| [0039](0039-falcon-client-cluster-channel-split.md) | Splitting Falcon: a public client channel vs an authenticated cluster channel | Proposed | 2026-07-24 |
 
 ## Reading paths
 
