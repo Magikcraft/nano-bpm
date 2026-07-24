@@ -2888,6 +2888,21 @@ pub(super) async fn project_data_exec(
     .await
 }
 
+/// `POST /console/api/projects/{name}/data/{source}/script` — run several
+/// statements atomically in one transaction (the structure editor's table
+/// rebuild). Returns `{ changed }`.
+pub(super) async fn project_data_script(
+    name: &str,
+    source: &str,
+    statements: Vec<String>,
+) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({ "op": "script", "source": source, "statements": statements }),
+    )
+    .await
+}
+
 /// `GET /console/api/projects/{name}/data/{source}/migrations` — the ordered
 /// migration files with applied status.
 pub(super) async fn project_data_migrations(name: &str, source: &str) -> ApiResult {

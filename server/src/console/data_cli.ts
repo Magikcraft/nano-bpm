@@ -17,8 +17,8 @@
 // project root, so `openDataSource`/`listSources` discover `nano.app.json`
 // there and file-backed sources resolve against it.
 //
-//   Request:  { op, source?, sql?, params? }
-//   op = "sources" | "schema" | "query" | "exec" | "migrations" | "migrate"
+//   Request:  { op, source?, sql?, params?, statements? }
+//   op = "sources" | "schema" | "query" | "exec" | "script" | "migrations" | "migrate"
 
 import { listSources, openDataSource } from "./data-sdk.ts";
 
@@ -27,6 +27,7 @@ interface Request {
   source?: string;
   sql?: string;
   params?: unknown[];
+  statements?: string[];
 }
 
 // Runtime adapter (ADR 0036/0038): the host calls that differ between Deno
@@ -199,6 +200,24 @@ async function run(req: Request): Promise<unknown> {
       const db = await openDataSource(req.source);
       const r = await db.exec(req.sql ?? "", req.params ?? []);
       return jsonSafe(r);
+    }
+    case "script": {
+      // Run several statements atomically in one transaction — the console's
+      // structure editor uses this for the SQLite 12-step table rebuild
+      // (create → copy → drop → rename), so a mid-rebuild failure rolls back
+      // and leaves the table untouched. Statements come pre-split from the
+      // caller; `?`-params are not threaded (DDL needs none).
+      const db = await openDataSource(req.source);
+      const statements = Array.isArray(req.statements)
+        ? req.statements
+        : splitStatements(req.sql ?? "");
+      let changed = 0;
+      await db.tx(async (t) => {
+        for (const stmt of statements) {
+          if (stmt.trim()) changed += (await t.exec(stmt)).changed;
+        }
+      });
+      return jsonSafe({ changed });
     }
     case "migrations": {
       const dir = await migrationDir(req.source ?? "");
