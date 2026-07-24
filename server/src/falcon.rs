@@ -3383,8 +3383,28 @@ mod asyncapi_spec_guard {
         "instanceCompleted",
         "submissionCredits",
         "pressure",
+        "workerAdvice",
         "heartbeat",
     ];
+
+    /// Compile-time tripwire: an exhaustive match (no `_` arm) over every
+    /// `ServerFrame` variant. Adding a variant breaks the build *here*, forcing
+    /// the author to (a) list it in `PUBLIC_SERVER`, (b) add an instance to the
+    /// `all` array in `server_frame_type_tags_match_the_spec`, and (c) document
+    /// it in `falcon.asyncapi.yaml`. This is the guard that `WorkerAdvice`
+    /// originally slipped past when the check was a hand-maintained array alone.
+    fn server_frame_is_exhaustively_guarded(f: &ServerFrame) {
+        match f {
+            ServerFrame::Welcome { .. }
+            | ServerFrame::Job { .. }
+            | ServerFrame::CommandResult { .. }
+            | ServerFrame::InstanceCompleted { .. }
+            | ServerFrame::SubmissionCredits { .. }
+            | ServerFrame::Pressure { .. }
+            | ServerFrame::WorkerAdvice { .. }
+            | ServerFrame::Heartbeat => {}
+        }
+    }
 
     /// Collect every message discriminator the spec documents, i.e. each
     /// `const: <x>` declared on a `type` property in the schemas section.
@@ -3439,10 +3459,14 @@ mod asyncapi_spec_guard {
                 level: "ok".into(),
                 retry_after_ms: None,
             },
+            ServerFrame::WorkerAdvice {
+                recommended_concurrency: 1,
+            },
             ServerFrame::Heartbeat,
         ];
         let tags: BTreeSet<String> = all
             .iter()
+            .inspect(|f| server_frame_is_exhaustively_guarded(f))
             .map(|f| {
                 serde_json::to_value(f).unwrap()["type"]
                     .as_str()
