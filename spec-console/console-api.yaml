@@ -810,6 +810,33 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /projects/{name}/data/{source}/script:
+    post:
+      operationId: execDataScript
+      tags: [data]
+      summary: Run several statements atomically in one transaction
+      description: >
+        Runs the supplied statements in a single transaction (the console
+        structure editor's SQLite 12-step table rebuild: create → copy → drop →
+        rename). A failure in any statement rolls the whole batch back, so the
+        table is never left half-migrated. DDL only — no bind parameters.
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/SourcePath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DataScriptRequest' }
+      responses:
+        '200':
+          description: Script result (rows changed across the batch)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DataExecResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /projects/{name}/data/{source}/migrations:
     get:
       operationId: getDataMigrations
@@ -2146,6 +2173,15 @@ components:
       properties:
         changed: { type: integer, format: int64 }
         lastInsertId: { type: integer, format: int64, nullable: true }
+    DataScriptRequest:
+      type: object
+      required: [statements]
+      properties:
+        statements:
+          type: array
+          description: >
+            DDL statements to run atomically in one transaction, in order.
+          items: { type: string }
     DataMigrationEntry:
       type: object
       required: [name, applied]

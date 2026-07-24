@@ -763,6 +763,14 @@ export type DataExecResult = {
     lastInsertId?: number | null;
 };
 
+export type DataScriptRequest = {
+    /**
+     * DDL statements to run atomically in one transaction, in order.
+     *
+     */
+    statements: Array<string>;
+};
+
 export type DataMigrationEntry = {
     name: string;
     applied: boolean;
@@ -2345,6 +2353,41 @@ export type ExecDataResponses = {
 };
 
 export type ExecDataResponse = ExecDataResponses[keyof ExecDataResponses];
+
+export type ExecDataScriptData = {
+    body: DataScriptRequest;
+    path: {
+        name: string;
+        /**
+         * The datasource name from the App manifest's `data.sources`.
+         */
+        source: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/{source}/script';
+};
+
+export type ExecDataScriptErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type ExecDataScriptError = ExecDataScriptErrors[keyof ExecDataScriptErrors];
+
+export type ExecDataScriptResponses = {
+    /**
+     * Script result (rows changed across the batch)
+     */
+    200: DataExecResult;
+};
+
+export type ExecDataScriptResponse = ExecDataScriptResponses[keyof ExecDataScriptResponses];
 
 export type GetDataMigrationsData = {
     body?: never;

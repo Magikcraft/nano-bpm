@@ -4079,5 +4079,48 @@ mod tests {
         )
         .await;
         assert!(matches!(err, Err(DataError::Op(_))));
+
+        // script: several statements run atomically (a SQLite-style table
+        // rebuild). Here we add a column via a rebuild and preserve the data.
+        let sc = run_data_op(
+            name,
+            serde_json::json!({ "op": "script", "statements": [
+                "CREATE TABLE orders__new (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER)",
+                "INSERT INTO orders__new (id, name) SELECT id, name FROM orders",
+                "DROP TABLE orders",
+                "ALTER TABLE orders__new RENAME TO orders",
+            ] }),
+        )
+        .await
+        .expect("script");
+        assert!(sc["changed"].as_i64().unwrap() >= 2); // at least the two rows copied
+
+        let q = run_data_op(
+            name,
+            serde_json::json!({ "op": "query", "sql": "SELECT name, qty FROM orders ORDER BY id" }),
+        )
+        .await
+        .expect("query after rebuild");
+        assert_eq!(q["rows"][0]["name"], "first");
+        assert_eq!(q["rows"][0]["qty"], serde_json::Value::Null);
+
+        // script rolls back on a mid-script failure: the first statement would
+        // succeed alone, but the second is invalid, so neither is committed.
+        let err = run_data_op(
+            name,
+            serde_json::json!({ "op": "script", "statements": [
+                "CREATE TABLE rollback_probe (id INTEGER PRIMARY KEY)",
+                "THIS IS NOT SQL",
+            ] }),
+        )
+        .await;
+        assert!(matches!(err, Err(DataError::Op(_))));
+        let gone = run_data_op(
+            name,
+            serde_json::json!({ "op": "query", "sql": "SELECT 1 FROM sqlite_master WHERE name='rollback_probe'" }),
+        )
+        .await
+        .expect("probe query");
+        assert!(gone["rows"].as_array().unwrap().is_empty());
     }
 }

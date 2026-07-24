@@ -148,6 +148,29 @@ does:
   datasource is flipped from SQLite to Postgres — the deployable path. The maker then applies it
   from the **Migrations** sub-surface.
 
+**Populating and editing data without hand-writing SQL.** The row browser is a live `TDBGrid`, so it
+is also where makers work with data:
+
+- **＋ Add row** opens a form with one field per column (NOT NULL and primary-key affinities are
+  surfaced; nullable columns get a **NULL** toggle; a blank untouched field is omitted so column
+  `DEFAULT`s and `INTEGER PRIMARY KEY` autoincrement still apply). It generates a parameterised
+  `INSERT` — values are always bound `?` params, never string-concatenated.
+- **Edit / delete a row.** The browser selects each row's implicit `rowid` (aliased `__rowid`, hidden
+  from the grid) so hovering a row reveals ✎ (edit — the same form, seeded from the row) and 🗑
+  (delete). Both target the exact row by `rowid` via bound-param `UPDATE` / `DELETE`. A `WITHOUT
+  ROWID` table has no rowid, so the grid transparently falls back to a read-only browse.
+
+**Editing a table's structure.** The **✎ Structure** button opens the full structure editor — rename
+the table, add / rename / drop columns, and change a column's type or constraints. It picks the least
+destructive DDL automatically: renames, adds and drops use native `ALTER TABLE` (indexes and
+constraints preserved), while a type or constraint change triggers the SQLite **12-step rebuild**
+(create a new table → copy the data by old→new column mapping → drop the old → rename the new into
+place). The rebuild runs atomically through a dedicated **`script`** datasource op
+(`POST …/data/{source}/script`, statements in one `tx()`), so a mid-rebuild failure rolls back and
+leaves the table untouched. The editor warns that a rebuild does not carry over indexes or
+table-level constraints (foreign keys, `CHECK`) — those are re-added via a migration, keeping the
+deployable path authoritative for anything beyond a table's own columns.
+
 ### 5. Binding — closing the loop with the other three designers
 
 This is what makes it *Urban* rather than a SQLite GUI bolted on:

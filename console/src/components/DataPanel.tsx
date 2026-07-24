@@ -4,6 +4,7 @@ import CodeEditor from "./CodeEditor";
 import { Button, Input, inputClass } from "./ui";
 import {
   execData,
+  execDataScript,
   getDataMigrations,
   getDataSchema,
   getDataSources,
@@ -25,6 +26,11 @@ import {
 
 type SubTab = "tables" | "sql" | "migrations";
 const ROW_LIMIT = 200;
+
+// Synthetic alias for a table's implicit `rowid`, selected alongside `*` so the
+// grid can target UPDATE/DELETE at an exact row. `WITHOUT ROWID` tables have no
+// rowid — the query then fails and the browser falls back to a read-only grid.
+const ROWID_COL = "__rowid";
 
 function errMsg(e: unknown): string {
   if (e instanceof Error) return e.message;
@@ -107,6 +113,144 @@ function buildCreateTable(table: string, cols: NewColumn[]): string {
     defs.push(s);
   }
   return `CREATE TABLE ${quoteIdent(table.trim() || "new_table")} (\n${defs.join(",\n")}\n);`;
+}
+
+// --- Structure-editor DDL model --------------------------------------------
+
+/**
+ * A column as seen by the structure editor. `originalName` is the column's name
+ * in the live table (null for a freshly-added column) and is the stable key used
+ * to copy data during a rebuild; the other fields are the edited target shape.
+ */
+interface EditColumn {
+  originalName: string | null;
+  name: string;
+  type: string;
+  primaryKey: boolean;
+  notNull: boolean;
+  default: string;
+  drop: boolean;
+}
+
+/** Seed the structure editor from a live table's column metadata. */
+function editColumnsFrom(columns: DataColumnMeta[]): EditColumn[] {
+  return columns.map((c) => ({
+    originalName: c.name,
+    name: c.name,
+    type: c.type || "TEXT",
+    primaryKey: c.primaryKey,
+    notNull: c.notNull,
+    default: "",
+    drop: false,
+  }));
+}
+
+function blankEditColumn(): EditColumn {
+  return {
+    originalName: null,
+    name: "",
+    type: "TEXT",
+    primaryKey: false,
+    notNull: false,
+    default: "",
+    drop: false,
+  };
+}
+
+/** A single column's `CREATE TABLE` definition (no table-level PK handling). */
+function columnDef(c: EditColumn, inlinePk: boolean): string {
+  let s = `${quoteIdent(c.name.trim())} ${c.type || "TEXT"}`;
+  if (inlinePk && c.primaryKey) s += " PRIMARY KEY";
+  if (c.notNull && !c.primaryKey) s += " NOT NULL";
+  if (c.default.trim()) s += ` DEFAULT ${c.default.trim()}`;
+  return s;
+}
+
+/**
+ * Does turning `orig` into `edit` need a full table rebuild? Native `ALTER
+ * TABLE` can rename the table, add, rename and drop columns, but cannot change
+ * an existing column's type or its NOT NULL / PRIMARY KEY / DEFAULT — those force
+ * the SQLite 12-step rebuild.
+ */
+function needsRebuild(orig: DataColumnMeta, edit: EditColumn): boolean {
+  return (
+    (edit.type || "TEXT") !== (orig.type || "TEXT") ||
+    edit.notNull !== orig.notNull ||
+    edit.primaryKey !== orig.primaryKey ||
+    edit.default.trim() !== ""
+  );
+}
+
+/**
+ * Compute the DDL to reshape `oldName` into `newName` with `cols`. Returns the
+ * ordered statement list plus whether a rebuild was chosen, so the caller can
+ * warn about the rebuild's caveats (indexes and table-level constraints such as
+ * foreign keys are not carried over — use a migration for those).
+ */
+function buildStructureStatements(
+  oldName: string,
+  newName: string,
+  original: DataColumnMeta[],
+  cols: EditColumn[],
+): { statements: string[]; rebuild: boolean } {
+  const kept = cols.filter((c) => !c.drop && c.name.trim());
+  const byOriginal = new Map(original.map((c) => [c.name, c]));
+  const rebuild = kept.some((c) => {
+    const o = c.originalName ? byOriginal.get(c.originalName) : undefined;
+    return o ? needsRebuild(o, c) : false;
+  });
+
+  if (rebuild) {
+    // SQLite 12-step rebuild: create a new table, copy data by (old→new) column
+    // mapping, drop the old, rename the new into place. New columns get their
+    // declared DEFAULT / NULL. Runs atomically via the `script` endpoint.
+    const pkCount = kept.filter((c) => c.primaryKey).length;
+    const defs = kept.map((c) => `  ${columnDef(c, pkCount === 1)}`);
+    if (pkCount > 1) {
+      defs.push(`  PRIMARY KEY (${kept.filter((c) => c.primaryKey).map((c) => quoteIdent(c.name.trim())).join(", ")})`);
+    }
+    const tmp = `${newName.trim()}__rebuild`;
+    const copyCols = kept.filter((c) => c.originalName);
+    const create = `CREATE TABLE ${quoteIdent(tmp)} (\n${defs.join(",\n")}\n)`;
+    const insert =
+      copyCols.length > 0
+        ? `INSERT INTO ${quoteIdent(tmp)} (${copyCols
+            .map((c) => quoteIdent(c.name.trim()))
+            .join(", ")}) SELECT ${copyCols
+            .map((c) => quoteIdent(c.originalName as string))
+            .join(", ")} FROM ${quoteIdent(oldName)}`
+        : null;
+    const statements = [create];
+    if (insert) statements.push(insert);
+    statements.push(`DROP TABLE ${quoteIdent(oldName)}`);
+    statements.push(`ALTER TABLE ${quoteIdent(tmp)} RENAME TO ${quoteIdent(newName.trim())}`);
+    return { statements, rebuild: true };
+  }
+
+  // Non-destructive path: individual ALTER TABLE statements. Drops and renames
+  // first (against the old name), adds next, then the table rename last.
+  const statements: string[] = [];
+  for (const c of cols) {
+    if (c.originalName && c.drop) {
+      statements.push(`ALTER TABLE ${quoteIdent(oldName)} DROP COLUMN ${quoteIdent(c.originalName)}`);
+    }
+  }
+  for (const c of cols) {
+    if (c.originalName && !c.drop && c.name.trim() && c.name.trim() !== c.originalName) {
+      statements.push(
+        `ALTER TABLE ${quoteIdent(oldName)} RENAME COLUMN ${quoteIdent(c.originalName)} TO ${quoteIdent(c.name.trim())}`,
+      );
+    }
+  }
+  for (const c of cols) {
+    if (!c.originalName && !c.drop && c.name.trim()) {
+      statements.push(`ALTER TABLE ${quoteIdent(oldName)} ADD COLUMN ${columnDef(c, false)}`);
+    }
+  }
+  if (newName.trim() && newName.trim() !== oldName) {
+    statements.push(`ALTER TABLE ${quoteIdent(oldName)} RENAME TO ${quoteIdent(newName.trim())}`);
+  }
+  return { statements, rebuild: false };
 }
 
 /** Next ordered migration filename, e.g. `003_create_orders.sql`. */
@@ -242,9 +386,13 @@ function TablesTab({ name, source }: { name: string; source: string }) {
   const [tables, setTables] = useState<DataTableMeta[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [rows, setRows] = useState<DataQueryResult | null>(null);
+  const [editable, setEditable] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [loadingRows, setLoadingRows] = useState(false);
   const [showNew, setShowNew] = useState(false);
+  const [showAddRow, setShowAddRow] = useState(false);
+  const [showStructure, setShowStructure] = useState(false);
+  const [editRow, setEditRow] = useState<Record<string, unknown> | null>(null);
 
   const loadSchema = useCallback(async () => {
     setError(null);
@@ -261,25 +409,61 @@ function TablesTab({ name, source }: { name: string; source: string }) {
     void loadSchema();
   }, [loadSchema]);
 
-  useEffect(() => {
+  const loadRows = useCallback(async () => {
     if (!selected) return;
-    let live = true;
     setLoadingRows(true);
     setError(null);
-    queryData({
-      path: { name, source },
-      body: { sql: `SELECT * FROM ${quoteIdent(selected)} LIMIT ${ROW_LIMIT}` },
-      throwOnError: true,
-    })
-      .then((r) => live && setRows(r.data))
-      .catch((e) => live && setError(errMsg(e)))
-      .finally(() => live && setLoadingRows(false));
-    return () => {
-      live = false;
-    };
+    const from = `${quoteIdent(selected)} LIMIT ${ROW_LIMIT}`;
+    try {
+      // Prefer selecting the rowid so the grid can edit/delete individual rows.
+      const r = await queryData({
+        path: { name, source },
+        body: { sql: `SELECT rowid AS ${ROWID_COL}, * FROM ${from}` },
+        throwOnError: true,
+      });
+      setRows(r.data);
+      setEditable(true);
+    } catch {
+      // WITHOUT ROWID tables (or an existing `rowid` column) — fall back to a
+      // plain read-only browse.
+      try {
+        const r = await queryData({
+          path: { name, source },
+          body: { sql: `SELECT * FROM ${from}` },
+          throwOnError: true,
+        });
+        setRows(r.data);
+        setEditable(false);
+      } catch (e) {
+        setError(errMsg(e));
+      }
+    } finally {
+      setLoadingRows(false);
+    }
   }, [name, source, selected]);
 
+  useEffect(() => {
+    void loadRows();
+  }, [loadRows]);
+
   const meta = tables.find((t) => t.name === selected);
+
+  const deleteRow = useCallback(
+    async (rowid: unknown) => {
+      if (!selected) return;
+      try {
+        await execData({
+          path: { name, source },
+          body: { sql: `DELETE FROM ${quoteIdent(selected)} WHERE rowid = ?`, params: [rowid] },
+          throwOnError: true,
+        });
+        await loadRows();
+      } catch (e) {
+        setError(errMsg(e));
+      }
+    },
+    [name, source, selected, loadRows],
+  );
 
   return (
     <div className="flex h-full min-h-0">
@@ -313,13 +497,39 @@ function TablesTab({ name, source }: { name: string; source: string }) {
         )}
       </aside>
       <div className="flex min-w-0 flex-1 flex-col">
+        {meta && (
+          <div className="flex items-center gap-2 border-b border-edge bg-panel px-4 py-1.5">
+            <span className="text-sm font-medium text-fg">{meta.name}</span>
+            <div className="flex-1" />
+            <button
+              onClick={() => setShowAddRow(true)}
+              disabled={!editable}
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
+              title={editable ? "Insert a row" : "This table has no rowid — add rows from the SQL tab"}
+            >
+              ＋ Add row
+            </button>
+            <button
+              onClick={() => setShowStructure(true)}
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover"
+              title="Edit table structure"
+            >
+              ✎ Structure
+            </button>
+          </div>
+        )}
         {meta && <ColumnStrip columns={meta.columns} indexes={meta.indexes} />}
         {error && <div className="px-4 py-2 text-sm text-danger">{error}</div>}
         <div className="min-h-0 flex-1 overflow-auto">
           {loadingRows ? (
             <div className="p-6 text-sm text-fg-faint">Loading rows…</div>
           ) : rows ? (
-            <ResultGrid result={rows} />
+            <ResultGrid
+              result={rows}
+              rowKey={editable ? ROWID_COL : undefined}
+              onEditRow={editable ? (row) => setEditRow(row) : undefined}
+              onDeleteRow={editable ? (rowid) => void deleteRow(rowid) : undefined}
+            />
           ) : (
             <div className="p-6 text-sm text-fg-faint">Select a table.</div>
           )}
@@ -328,6 +538,7 @@ function TablesTab({ name, source }: { name: string; source: string }) {
           <div className="border-t border-edge px-4 py-1 text-xs text-fg-faint">
             {rows.rows.length} row{rows.rows.length === 1 ? "" : "s"}
             {rows.rows.length >= ROW_LIMIT ? ` (first ${ROW_LIMIT})` : ""}
+            {!editable && rows.rows.length > 0 && " · read-only (no rowid)"}
           </div>
         )}
       </div>
@@ -340,6 +551,50 @@ function TablesTab({ name, source }: { name: string; source: string }) {
           onCreated={(table) => {
             setShowNew(false);
             void loadSchema().then(() => setSelected(table));
+          }}
+        />
+      )}
+      {showAddRow && meta && (
+        <RowDialog
+          name={name}
+          source={source}
+          table={meta.name}
+          columns={meta.columns}
+          onClose={() => setShowAddRow(false)}
+          onSaved={() => {
+            setShowAddRow(false);
+            void loadRows();
+          }}
+        />
+      )}
+      {editRow && meta && (
+        <RowDialog
+          name={name}
+          source={source}
+          table={meta.name}
+          columns={meta.columns}
+          existing={editRow}
+          onClose={() => setEditRow(null)}
+          onSaved={() => {
+            setEditRow(null);
+            void loadRows();
+          }}
+        />
+      )}
+      {showStructure && meta && (
+        <EditStructureDialog
+          name={name}
+          source={source}
+          table={meta.name}
+          columns={meta.columns}
+          onClose={() => setShowStructure(false)}
+          onSaved={(newName) => {
+            setShowStructure(false);
+            void loadSchema();
+            // A rename changes `selected` (which re-fires the row load); an
+            // in-place structure change keeps the same name, so reload directly.
+            if (newName === selected) void loadRows();
+            else setSelected(newName);
           }}
         />
       )}
@@ -672,9 +927,314 @@ function NewTableDialog({
   );
 }
 
-// --- SQL --------------------------------------------------------------------
+// --- Row add / edit dialog --------------------------------------------------
 
-/** A leading SELECT/WITH/PRAGMA/EXPLAIN reads rows; everything else mutates. */
+/** Per-field editing state: a raw string plus an explicit NULL flag. */
+interface FieldState {
+  raw: string;
+  isNull: boolean;
+}
+
+/** Render a live value into an editable field state (edit mode seed). */
+function seedField(v: unknown): FieldState {
+  if (v === null || v === undefined) return { raw: "", isNull: true };
+  if (typeof v === "object") return { raw: JSON.stringify(v), isNull: false };
+  return { raw: String(v), isNull: false };
+}
+
+/**
+ * The Delphi-style row form: one field per column, with a NULL toggle. In *add*
+ * mode a blank required field is omitted so column defaults / autoincrement
+ * apply; in *edit* mode every column is written and the row is targeted by its
+ * `__rowid`. All values go through bound `?` params — never string-concatenated.
+ */
+function RowDialog({
+  name,
+  source,
+  table,
+  columns,
+  existing,
+  onClose,
+  onSaved,
+}: {
+  name: string;
+  source: string;
+  table: string;
+  columns: DataColumnMeta[];
+  existing?: Record<string, unknown>;
+  onClose: () => void;
+  onSaved: () => void;
+}) {
+  const editing = existing != null;
+  const [fields, setFields] = useState<Record<string, FieldState>>(() => {
+    const out: Record<string, FieldState> = {};
+    for (const c of columns) {
+      out[c.name] = editing ? seedField(existing?.[c.name]) : { raw: "", isNull: false };
+    }
+    return out;
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const setField = (col: string, patch: Partial<FieldState>) =>
+    setFields((f) => ({ ...f, [col]: { ...f[col], ...patch } }));
+
+  const paramFor = (f: FieldState): unknown => (f.isNull ? null : f.raw);
+
+  const save = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      let sql: string;
+      let params: unknown[];
+      if (editing) {
+        const cols = columns;
+        sql = `UPDATE ${quoteIdent(table)} SET ${cols
+          .map((c) => `${quoteIdent(c.name)} = ?`)
+          .join(", ")} WHERE rowid = ?`;
+        params = [...cols.map((c) => paramFor(fields[c.name])), existing?.[ROWID_COL]];
+      } else {
+        // Include a column only if the user set NULL or typed a value; blank
+        // untouched fields are omitted so DEFAULT / autoincrement apply.
+        const provided = columns.filter((c) => fields[c.name].isNull || fields[c.name].raw !== "");
+        if (provided.length === 0) {
+          sql = `INSERT INTO ${quoteIdent(table)} DEFAULT VALUES`;
+          params = [];
+        } else {
+          sql = `INSERT INTO ${quoteIdent(table)} (${provided
+            .map((c) => quoteIdent(c.name))
+            .join(", ")}) VALUES (${provided.map(() => "?").join(", ")})`;
+          params = provided.map((c) => paramFor(fields[c.name]));
+        }
+      }
+      await execData({ path: { name, source }, body: { sql, params }, throwOnError: true });
+      onSaved();
+    } catch (e) {
+      setError(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [editing, columns, table, fields, existing, name, source, onSaved]);
+
+  return (
+    <Modal
+      title={editing ? `Edit row in ${table}` : `Add row to ${table}`}
+      onClose={onClose}
+      footer={
+        <>
+          {error && <span className="mr-auto truncate text-xs text-danger">{error}</span>}
+          <Button variant="secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={() => void save()} disabled={busy}>
+            {busy ? "Saving…" : editing ? "Save changes" : "Insert row"}
+          </Button>
+        </>
+      }
+    >
+      <div className="space-y-2.5">
+        {columns.map((c) => {
+          const f = fields[c.name];
+          return (
+            <label key={c.name} className="block">
+              <span className="mb-1 flex items-center gap-1.5 text-xs font-medium text-fg-muted">
+                {c.name}
+                <span className="text-fg-faint">{c.type || "?"}</span>
+                {c.primaryKey && <span className="text-accent" title="primary key">🔑</span>}
+                {c.notNull && !c.primaryKey && <span className="text-fg-faint" title="NOT NULL">*</span>}
+              </span>
+              <div className="flex items-center gap-2">
+                <Input
+                  className="flex-1"
+                  value={f.isNull ? "" : f.raw}
+                  disabled={f.isNull}
+                  placeholder={c.notNull ? "required" : "—"}
+                  onChange={(e) => setField(c.name, { raw: e.target.value })}
+                />
+                {!c.notNull && (
+                  <label className="flex items-center gap-1 text-xs text-fg-faint" title="Store NULL">
+                    <input
+                      type="checkbox"
+                      checked={f.isNull}
+                      onChange={(e) => setField(c.name, { isNull: e.target.checked })}
+                    />
+                    NULL
+                  </label>
+                )}
+              </div>
+            </label>
+          );
+        })}
+      </div>
+    </Modal>
+  );
+}
+
+// --- Structure editor -------------------------------------------------------
+
+/**
+ * The full structure editor: rename the table, add / rename / drop columns, and
+ * change a column's type or constraints. Non-destructive edits use native
+ * `ALTER TABLE`; a type/constraint change triggers the SQLite 12-step rebuild
+ * (create → copy → drop → rename), which the `script` endpoint runs atomically.
+ */
+function EditStructureDialog({
+  name,
+  source,
+  table,
+  columns,
+  onClose,
+  onSaved,
+}: {
+  name: string;
+  source: string;
+  table: string;
+  columns: DataColumnMeta[];
+  onClose: () => void;
+  onSaved: (newName: string) => void;
+}) {
+  const [newName, setNewName] = useState(table);
+  const [cols, setCols] = useState<EditColumn[]>(() => editColumnsFrom(columns));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const setCol = (i: number, patch: Partial<EditColumn>) =>
+    setCols((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+  const addCol = () => setCols((cs) => [...cs, blankEditColumn()]);
+
+  const { statements, rebuild } = useMemo(
+    () => buildStructureStatements(table, newName, columns, cols),
+    [table, newName, columns, cols],
+  );
+  const kept = cols.filter((c) => !c.drop && c.name.trim());
+  const valid = newName.trim().length > 0 && kept.length > 0 && statements.length > 0;
+
+  const apply = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await execDataScript({ path: { name, source }, body: { statements }, throwOnError: true });
+      onSaved(newName.trim());
+    } catch (e) {
+      setError(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [name, source, statements, newName, onSaved]);
+
+  return (
+    <Modal
+      title={`Edit structure — ${table}`}
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          {error && <span className="mr-auto truncate text-xs text-danger">{error}</span>}
+          <Button variant="secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={() => void apply()} disabled={!valid || busy}>
+            {busy ? "Applying…" : "Apply changes"}
+          </Button>
+        </>
+      }
+    >
+      <label className="mb-3 block">
+        <span className="mb-1 block text-xs font-medium text-fg-muted">Table name</span>
+        <Input value={newName} onChange={(e) => setNewName(e.target.value)} />
+      </label>
+
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-xs font-medium text-fg-muted">Columns</span>
+        <button onClick={addCol} className="text-xs font-medium text-accent hover:underline">
+          ＋ Add column
+        </button>
+      </div>
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 px-0.5 text-[10px] uppercase tracking-wide text-fg-faint">
+          <span className="flex-1">Name</span>
+          <span className="w-28">Type</span>
+          <span className="w-24">Default</span>
+          <span className="w-8 text-center" title="Primary key">PK</span>
+          <span className="w-10 text-center" title="NOT NULL">Req</span>
+          <span className="w-8 text-center" title="Drop column">Del</span>
+        </div>
+        {cols.map((c, i) => (
+          <div
+            key={i}
+            className={`flex items-center gap-2 ${c.drop ? "opacity-40 line-through" : ""}`}
+          >
+            <Input
+              className="flex-1"
+              value={c.name}
+              onChange={(e) => setCol(i, { name: e.target.value })}
+              placeholder="column"
+            />
+            <select
+              className={`${inputClass} w-28`}
+              value={c.type}
+              onChange={(e) => setCol(i, { type: e.target.value })}
+            >
+              {COLUMN_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+            <Input
+              className="w-24"
+              value={c.default}
+              onChange={(e) => setCol(i, { default: e.target.value })}
+              placeholder="—"
+              title="Raw SQL default, e.g. 0, 'active', CURRENT_TIMESTAMP"
+            />
+            <input
+              type="checkbox"
+              className="w-8"
+              checked={c.primaryKey}
+              onChange={(e) => setCol(i, { primaryKey: e.target.checked })}
+              title="Primary key"
+            />
+            <input
+              type="checkbox"
+              className="w-10"
+              checked={c.notNull}
+              disabled={c.primaryKey}
+              onChange={(e) => setCol(i, { notNull: e.target.checked })}
+              title="NOT NULL"
+            />
+            <input
+              type="checkbox"
+              className="w-8"
+              checked={c.drop}
+              onChange={(e) => setCol(i, { drop: e.target.checked })}
+              title="Drop this column"
+            />
+          </div>
+        ))}
+      </div>
+
+      {rebuild && (
+        <p className="mt-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
+          A type or constraint change requires rebuilding the table. Indexes and
+          table-level constraints (foreign keys, CHECK) are not carried over — add
+          those back via a migration if needed.
+        </p>
+      )}
+
+      <div className="mt-4">
+        <span className="mb-1 block text-[10px] uppercase tracking-wide text-fg-faint">
+          Generated SQL {rebuild ? "(rebuild)" : "(ALTER)"}
+        </span>
+        <pre className="max-h-40 overflow-auto rounded-md border border-edge bg-inset p-3 font-mono text-xs text-fg-muted">
+          {statements.length ? statements.map((s) => `${s};`).join("\n") : "— no changes —"}
+        </pre>
+      </div>
+    </Modal>
+  );
+}
+
+// --- SQL --------------------------------------------------------------------
 function isReadStatement(sql: string): boolean {
   return /^\s*(select|with|pragma|explain)\b/i.test(sql);
 }
@@ -846,15 +1406,28 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
 
 // --- Shared results grid ----------------------------------------------------
 
-function ResultGrid({ result }: { result: DataQueryResult }) {
+function ResultGrid({
+  result,
+  rowKey,
+  onEditRow,
+  onDeleteRow,
+}: {
+  result: DataQueryResult;
+  /** Column holding a per-row identity (e.g. `__rowid`); hidden and used for edit/delete. */
+  rowKey?: string;
+  onEditRow?: (row: Record<string, unknown>) => void;
+  onDeleteRow?: (rowid: unknown) => void;
+}) {
   if (result.columns.length === 0 && result.rows.length === 0) {
     return <div className="p-6 text-sm text-fg-faint">No rows.</div>;
   }
+  const cols = rowKey ? result.columns.filter((c) => c !== rowKey) : result.columns;
+  const actions = Boolean(rowKey && (onEditRow || onDeleteRow));
   return (
     <table className="min-w-full border-collapse text-sm">
       <thead className="sticky top-0 bg-bg-subtle">
         <tr>
-          {result.columns.map((c) => (
+          {cols.map((c) => (
             <th
               key={c}
               className="border-b border-edge px-3 py-1.5 text-left font-semibold text-fg-muted"
@@ -862,12 +1435,13 @@ function ResultGrid({ result }: { result: DataQueryResult }) {
               {c}
             </th>
           ))}
+          {actions && <th className="w-20 border-b border-edge px-3 py-1.5" />}
         </tr>
       </thead>
       <tbody>
         {result.rows.map((row, i) => (
-          <tr key={i} className="hover:bg-hover/50">
-            {result.columns.map((c) => {
+          <tr key={i} className="group hover:bg-hover/50">
+            {cols.map((c) => {
               const { text, muted } = cell(row[c]);
               return (
                 <td
@@ -880,6 +1454,32 @@ function ResultGrid({ result }: { result: DataQueryResult }) {
                 </td>
               );
             })}
+            {actions && (
+              <td className="border-b border-edge/40 px-3 py-1 text-right">
+                <span className="inline-flex gap-1.5 opacity-0 group-hover:opacity-100">
+                  {onEditRow && (
+                    <button
+                      onClick={() => onEditRow(row)}
+                      className="text-fg-faint hover:text-accent"
+                      title="Edit row"
+                    >
+                      ✎
+                    </button>
+                  )}
+                  {onDeleteRow && (
+                    <button
+                      onClick={() => {
+                        if (confirm("Delete this row?")) onDeleteRow(row[rowKey as string]);
+                      }}
+                      className="text-fg-faint hover:text-danger"
+                      title="Delete row"
+                    >
+                      🗑
+                    </button>
+                  )}
+                </span>
+              </td>
+            )}
           </tr>
         ))}
       </tbody>

@@ -1151,6 +1151,28 @@ impl apis::data::Data for ServerImpl {
         )
     }
 
+    async fn exec_data_script(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::ExecDataScriptPathParams,
+        body: &models::DataScriptRequest,
+    ) -> Result<apis::data::ExecDataScriptResponse, ()> {
+        use apis::data::ExecDataScriptResponse as R;
+        data_ok_or!(
+            super::project_data_script(
+                &path_params.name,
+                &path_params.source,
+                body.statements.clone(),
+            )
+            .await,
+            R::Status200_ScriptResult,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
     async fn get_data_migrations(
         &self,
         _method: &Method,
