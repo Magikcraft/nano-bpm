@@ -134,7 +134,10 @@ whatever `data.app` currently resolves to — SQLite in the IDE, Postgres in pro
 
 **Creating a table without hand-writing SQL.** The Tables sub-surface's **＋ New** button opens a
 dialog — the Delphi *Database Desktop → New Table* affordance — where the maker names the table and
-adds columns (name, type, primary key, NOT NULL, default). The dialog shows the generated
+adds columns (name, type, primary key, NOT NULL, default, and an optional **foreign key** to another
+table's column with an `ON DELETE` action). The FK picker is populated from the datasource's existing
+tables, and — because the datasource opens every connection with `PRAGMA foreign_keys = ON` — the
+generated constraints are enforced, not merely declarative. The dialog shows the generated
 `CREATE TABLE` DDL live and offers the two documented apply paths so the form never hides what it
 does:
 

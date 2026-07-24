@@ -47,16 +47,34 @@ function quoteIdent(id: string): string {
 /** Common SQLite column affinities offered in the New Table dialog. */
 const COLUMN_TYPES = ["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB", "BOOLEAN", "TIMESTAMP"];
 
+/** `ON DELETE` referential actions offered for a foreign key ("" = omit). */
+const ON_DELETE_ACTIONS = ["", "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"];
+
+/** A column's optional foreign-key reference to another table's column. */
+interface ColumnRef {
+  table: string;
+  column: string;
+  onDelete: string;
+}
+
 interface NewColumn {
   name: string;
   type: string;
   primaryKey: boolean;
   notNull: boolean;
   default: string;
+  references: ColumnRef | null;
 }
 
 function blankColumn(): NewColumn {
-  return { name: "", type: "TEXT", primaryKey: false, notNull: false, default: "" };
+  return {
+    name: "",
+    type: "TEXT",
+    primaryKey: false,
+    notNull: false,
+    default: "",
+    references: null,
+  };
 }
 
 /** Build a `CREATE TABLE` statement from the dialog's form model. */
@@ -75,6 +93,18 @@ function buildCreateTable(table: string, cols: NewColumn[]): string {
     });
   if (pkCols.length > 1) {
     defs.push(`  PRIMARY KEY (${pkCols.map((c) => quoteIdent(c.name.trim())).join(", ")})`);
+  }
+  // Foreign keys are emitted as table-level constraints (SQLite requires them
+  // after all column defs). `PRAGMA foreign_keys = ON` is set by the datasource,
+  // so these are enforced, not merely declarative.
+  for (const c of cols) {
+    const r = c.references;
+    if (!c.name.trim() || !r || !r.table.trim() || !r.column.trim()) continue;
+    let s = `  FOREIGN KEY (${quoteIdent(c.name.trim())}) REFERENCES ${quoteIdent(
+      r.table.trim(),
+    )} (${quoteIdent(r.column.trim())})`;
+    if (r.onDelete) s += ` ON DELETE ${r.onDelete}`;
+    defs.push(s);
   }
   return `CREATE TABLE ${quoteIdent(table.trim() || "new_table")} (\n${defs.join(",\n")}\n);`;
 }
@@ -305,6 +335,7 @@ function TablesTab({ name, source }: { name: string; source: string }) {
         <NewTableDialog
           name={name}
           source={source}
+          tables={tables}
           onClose={() => setShowNew(false)}
           onCreated={(table) => {
             setShowNew(false);
@@ -385,17 +416,26 @@ function Modal({
 function NewTableDialog({
   name,
   source,
+  tables,
   onClose,
   onCreated,
 }: {
   name: string;
   source: string;
+  tables: DataTableMeta[];
   onClose: () => void;
   onCreated: (table: string) => void;
 }) {
   const [table, setTable] = useState("");
   const [cols, setCols] = useState<NewColumn[]>([
-    { name: "id", type: "INTEGER", primaryKey: true, notNull: false, default: "" },
+    {
+      name: "id",
+      type: "INTEGER",
+      primaryKey: true,
+      notNull: false,
+      default: "",
+      references: null,
+    },
   ]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -409,6 +449,23 @@ function NewTableDialog({
     setCols((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
   const addCol = () => setCols((cs) => [...cs, blankColumn()]);
   const removeCol = (i: number) => setCols((cs) => cs.filter((_, j) => j !== i));
+
+  // FK targets: existing tables in this datasource (the new table can't yet
+  // reference itself since it doesn't exist). Columns come from the picked table.
+  const fkTables = tables.map((t) => t.name);
+  const columnsOf = (t: string) => tables.find((x) => x.name === t)?.columns.map((c) => c.name) ?? [];
+  const toggleFk = (i: number, on: boolean) =>
+    setCol(i, {
+      references: on
+        ? { table: fkTables[0] ?? "", column: "", onDelete: "" }
+        : null,
+    });
+  const setRef = (i: number, patch: Partial<ColumnRef>) =>
+    setCols((cs) =>
+      cs.map((c, j) =>
+        j === i && c.references ? { ...c, references: { ...c.references, ...patch } } : c,
+      ),
+    );
 
   const runNow = useCallback(async () => {
     setBusy(true);
@@ -490,57 +547,115 @@ function NewTableDialog({
           <span className="w-10 text-center" title="NOT NULL">
             Req
           </span>
+          <span className="w-8 text-center" title="Foreign key">
+            FK
+          </span>
           <span className="w-5" />
         </div>
         {cols.map((c, i) => (
-          <div key={i} className="flex items-center gap-2">
-            <Input
-              className="flex-1"
-              value={c.name}
-              onChange={(e) => setCol(i, { name: e.target.value })}
-              placeholder="column"
-            />
-            <select
-              className={`${inputClass} w-28`}
-              value={c.type}
-              onChange={(e) => setCol(i, { type: e.target.value })}
-            >
-              {COLUMN_TYPES.map((t) => (
-                <option key={t} value={t}>
-                  {t}
-                </option>
-              ))}
-            </select>
-            <Input
-              className="w-24"
-              value={c.default}
-              onChange={(e) => setCol(i, { default: e.target.value })}
-              placeholder="—"
-              title="Raw SQL default, e.g. 0, 'active', CURRENT_TIMESTAMP"
-            />
-            <input
-              type="checkbox"
-              className="w-8"
-              checked={c.primaryKey}
-              onChange={(e) => setCol(i, { primaryKey: e.target.checked })}
-              title="Primary key"
-            />
-            <input
-              type="checkbox"
-              className="w-10"
-              checked={c.notNull}
-              disabled={c.primaryKey}
-              onChange={(e) => setCol(i, { notNull: e.target.checked })}
-              title="NOT NULL"
-            />
-            <button
-              onClick={() => removeCol(i)}
-              disabled={cols.length === 1}
-              className="w-5 text-fg-faint hover:text-danger disabled:opacity-30"
-              title="Remove column"
-            >
-              ✕
-            </button>
+          <div key={i} className="flex flex-col gap-1.5">
+            <div className="flex items-center gap-2">
+              <Input
+                className="flex-1"
+                value={c.name}
+                onChange={(e) => setCol(i, { name: e.target.value })}
+                placeholder="column"
+              />
+              <select
+                className={`${inputClass} w-28`}
+                value={c.type}
+                onChange={(e) => setCol(i, { type: e.target.value })}
+              >
+                {COLUMN_TYPES.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
+              </select>
+              <Input
+                className="w-24"
+                value={c.default}
+                onChange={(e) => setCol(i, { default: e.target.value })}
+                placeholder="—"
+                title="Raw SQL default, e.g. 0, 'active', CURRENT_TIMESTAMP"
+              />
+              <input
+                type="checkbox"
+                className="w-8"
+                checked={c.primaryKey}
+                onChange={(e) => setCol(i, { primaryKey: e.target.checked })}
+                title="Primary key"
+              />
+              <input
+                type="checkbox"
+                className="w-10"
+                checked={c.notNull}
+                disabled={c.primaryKey}
+                onChange={(e) => setCol(i, { notNull: e.target.checked })}
+                title="NOT NULL"
+              />
+              <input
+                type="checkbox"
+                className="w-8"
+                checked={c.references !== null}
+                disabled={fkTables.length === 0}
+                onChange={(e) => toggleFk(i, e.target.checked)}
+                title={
+                  fkTables.length === 0
+                    ? "No other tables to reference yet"
+                    : "Foreign key to another table"
+                }
+              />
+              <button
+                onClick={() => removeCol(i)}
+                disabled={cols.length === 1}
+                className="w-5 text-fg-faint hover:text-danger disabled:opacity-30"
+                title="Remove column"
+              >
+                ✕
+              </button>
+            </div>
+            {c.references && (
+              <div className="flex items-center gap-2 pl-3 text-xs text-fg-faint">
+                <span className="text-fg-faint">↳ references</span>
+                <select
+                  className={`${inputClass} w-40`}
+                  value={c.references.table}
+                  onChange={(e) => setRef(i, { table: e.target.value, column: "" })}
+                >
+                  {fkTables.map((t) => (
+                    <option key={t} value={t}>
+                      {t}
+                    </option>
+                  ))}
+                </select>
+                <span>.</span>
+                <select
+                  className={`${inputClass} w-40`}
+                  value={c.references.column}
+                  onChange={(e) => setRef(i, { column: e.target.value })}
+                >
+                  <option value="">column…</option>
+                  {columnsOf(c.references.table).map((col) => (
+                    <option key={col} value={col}>
+                      {col}
+                    </option>
+                  ))}
+                </select>
+                <span className="ml-1">on delete</span>
+                <select
+                  className={`${inputClass} w-28`}
+                  value={c.references.onDelete}
+                  onChange={(e) => setRef(i, { onDelete: e.target.value })}
+                >
+                  {ON_DELETE_ACTIONS.map((a) => (
+                    <option key={a} value={a}>
+                      {a || "—"}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
         ))}
       </div>
