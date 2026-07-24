@@ -195,6 +195,16 @@ enum Step {
         /// The element's enclosing flow scope.
         scope: Key,
     },
+    /// Advance a user task's task-listener chain after a listener job completed
+    /// (ADR 0037 §6): mint the next listener's job, or — when the chain drains —
+    /// commit the deferred transition (assign/update/complete/create/cancel).
+    AdvanceTaskListener {
+        user_task_key: Key,
+        event_type: crate::model::TaskListenerEventType,
+        /// The 0-based index (within this event type's listener list) of the
+        /// listener that just completed.
+        index: usize,
+    },
 }
 
 impl Engine {
@@ -847,6 +857,7 @@ impl Engine {
                 job_key,
                 variables,
                 adhoc_result,
+                task_listener_result,
             } => {
                 let job = self
                     .state
@@ -879,6 +890,55 @@ impl Engine {
                 let job_type = job.job_type.clone();
                 let job_kind = job.kind;
 
+                // A task-listener job (ADR 0037 §6) gates a user task's deferred
+                // transition. Validate the completion up-front so a bad one is
+                // rejected wholesale: task-listener jobs may not carry variables,
+                // deny is only honoured on assigning/updating/completing, and a
+                // denial cannot also carry corrections (Zeebe parity).
+                if let state::JobKind::TaskListener {
+                    event_type,
+                    user_task_key,
+                    ..
+                } = job_kind
+                {
+                    let result = task_listener_result.clone().unwrap_or_default();
+                    if !variables.is_empty() {
+                        return Err(EngineError::TaskListenerJobWithVariables { job_key });
+                    }
+                    if result.denied && !result.corrections.is_empty() {
+                        return Err(EngineError::TaskListenerDenyWithCorrections { job_key });
+                    }
+                    if result.denied && !Self::task_event_supports_deny(event_type) {
+                        return Err(EngineError::TaskListenerDenyNotSupported { job_key });
+                    }
+                    // A creating listener cannot correct the assignee when the
+                    // task already declares an initial assignee (Zeebe parity).
+                    if matches!(event_type, crate::model::TaskListenerEventType::Creating)
+                        && result.corrections.assignee.is_some()
+                        && self
+                            .state
+                            .user_tasks
+                            .get(&user_task_key)
+                            .map(|t| {
+                                // An initial assignee may already be applied to the
+                                // record, or (when `assigning` listeners exist) be
+                                // stripped off and carried on the pending creating
+                                // transition for later routing — either forbids a
+                                // creating assignee correction (Zeebe parity).
+                                t.assignee.is_some()
+                                    || t.pending
+                                        .as_ref()
+                                        .map(|p| p.assignee.is_some())
+                                        .unwrap_or(false)
+                            })
+                            .unwrap_or(false)
+                    {
+                        return Err(EngineError::TaskListenerAssigneeCorrectionOnCreating {
+                            user_task_key,
+                        });
+                    }
+                }
+
                 self.emit(
                     &mut log,
                     Event::JobCompleted {
@@ -900,11 +960,50 @@ impl Engine {
                         self.emit(&mut log, event);
                     }
                 }
+                // A task-listener job: its completion advances (or denies) the
+                // user task's deferred transition rather than resuming a token.
+                if let state::JobKind::TaskListener {
+                    event_type,
+                    index,
+                    user_task_key,
+                } = job_kind
+                {
+                    let result = task_listener_result.unwrap_or_default();
+                    if result.denied {
+                        // The transition is rejected: clear the pending state so
+                        // the task returns to its prior available state. The
+                        // reason is journaled on the resolution event.
+                        self.emit(
+                            &mut log,
+                            Event::UserTaskTransitionResolved {
+                                user_task_key,
+                                instance_key,
+                                denied: Some(result.denied_reason.unwrap_or_default()),
+                            },
+                        );
+                    } else {
+                        if !result.corrections.is_empty() {
+                            self.emit(
+                                &mut log,
+                                Event::UserTaskCorrectionsApplied {
+                                    user_task_key,
+                                    instance_key,
+                                    corrections: result.corrections,
+                                },
+                            );
+                        }
+                        queue.push_back(Step::AdvanceTaskListener {
+                            user_task_key,
+                            event_type,
+                            index,
+                        });
+                    }
+                }
                 // An execution-listener job (ADR 0037): its completion advances the
                 // element's listener chain rather than resuming the token. The
                 // JobCompleted + variable merge above still apply (a listener may
                 // contribute variables that later listeners and the element see).
-                if let state::JobKind::ExecutionListener {
+                else if let state::JobKind::ExecutionListener {
                     event_type,
                     index,
                     scope,
@@ -996,7 +1095,7 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created {
+                if task.state != state::UserTaskState::Created || task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 // Mirror Camunda: when override is disallowed and the task is
@@ -1005,14 +1104,43 @@ impl Engine {
                     return Err(EngineError::UserTaskAlreadyAssigned { user_task_key });
                 }
                 let instance_key = task.instance_key;
-                self.emit(
-                    &mut log,
-                    Event::UserTaskAssigned {
+                let element_instance_key = task.element_instance_key;
+                let element_id = task.element_id.clone();
+                let listeners = self.task_listeners_of(
+                    instance_key,
+                    &element_id,
+                    crate::model::TaskListenerEventType::Assigning,
+                );
+                if let Some(first) = listeners.first().cloned() {
+                    // Defer the assignment behind the assigning listener chain.
+                    let pending = state::PendingUserTaskTransition {
+                        event_type: crate::model::TaskListenerEventType::Assigning,
+                        assignee: Some(assignee),
+                        update: None,
+                        variables: std::collections::HashMap::new(),
+                        corrections: crate::model::UserTaskCorrections::default(),
+                    };
+                    for event in self.start_task_listener_chain(
                         user_task_key,
                         instance_key,
-                        assignee: Some(assignee),
-                    },
-                );
+                        element_instance_key,
+                        &element_id,
+                        crate::model::TaskListenerEventType::Assigning,
+                        pending,
+                        &first,
+                    ) {
+                        self.emit(&mut log, event);
+                    }
+                } else {
+                    self.emit(
+                        &mut log,
+                        Event::UserTaskAssigned {
+                            user_task_key,
+                            instance_key,
+                            assignee: Some(assignee),
+                        },
+                    );
+                }
             }
 
             Command::UnassignUserTask { user_task_key } => {
@@ -1021,18 +1149,46 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created {
+                if task.state != state::UserTaskState::Created || task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
-                self.emit(
-                    &mut log,
-                    Event::UserTaskAssigned {
+                let element_instance_key = task.element_instance_key;
+                let element_id = task.element_id.clone();
+                let listeners = self.task_listeners_of(
+                    instance_key,
+                    &element_id,
+                    crate::model::TaskListenerEventType::Assigning,
+                );
+                if let Some(first) = listeners.first().cloned() {
+                    let pending = state::PendingUserTaskTransition {
+                        event_type: crate::model::TaskListenerEventType::Assigning,
+                        assignee: None,
+                        update: None,
+                        variables: std::collections::HashMap::new(),
+                        corrections: crate::model::UserTaskCorrections::default(),
+                    };
+                    for event in self.start_task_listener_chain(
                         user_task_key,
                         instance_key,
-                        assignee: None,
-                    },
-                );
+                        element_instance_key,
+                        &element_id,
+                        crate::model::TaskListenerEventType::Assigning,
+                        pending,
+                        &first,
+                    ) {
+                        self.emit(&mut log, event);
+                    }
+                } else {
+                    self.emit(
+                        &mut log,
+                        Event::UserTaskAssigned {
+                            user_task_key,
+                            instance_key,
+                            assignee: None,
+                        },
+                    );
+                }
             }
 
             Command::UpdateUserTask {
@@ -1044,26 +1200,65 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created {
+                if task.state != state::UserTaskState::Created || task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
+                let element_instance_key = task.element_instance_key;
+                let element_id = task.element_id.clone();
                 // Normalise empty-string dates to "reset" (None), matching the
                 // REST contract ("Reset by providing an empty String").
                 let normalize =
                     |d: Option<String>| -> Option<String> { d.filter(|s| !s.is_empty()) };
-                self.emit(
-                    &mut log,
-                    Event::UserTaskUpdated {
+                let candidate_groups = changeset.candidate_groups;
+                let candidate_users = changeset.candidate_users;
+                let due_date = changeset.due_date.map(normalize);
+                let follow_up_date = changeset.follow_up_date.map(normalize);
+                let priority = changeset.priority;
+                let listeners = self.task_listeners_of(
+                    instance_key,
+                    &element_id,
+                    crate::model::TaskListenerEventType::Updating,
+                );
+                if let Some(first) = listeners.first().cloned() {
+                    let pending = state::PendingUserTaskTransition {
+                        event_type: crate::model::TaskListenerEventType::Updating,
+                        assignee: None,
+                        update: Some(state::PendingUserTaskUpdate {
+                            candidate_groups,
+                            candidate_users,
+                            due_date,
+                            follow_up_date,
+                            priority,
+                        }),
+                        variables: std::collections::HashMap::new(),
+                        corrections: crate::model::UserTaskCorrections::default(),
+                    };
+                    for event in self.start_task_listener_chain(
                         user_task_key,
                         instance_key,
-                        candidate_groups: changeset.candidate_groups,
-                        candidate_users: changeset.candidate_users,
-                        due_date: changeset.due_date.map(normalize),
-                        follow_up_date: changeset.follow_up_date.map(normalize),
-                        priority: changeset.priority,
-                    },
-                );
+                        element_instance_key,
+                        &element_id,
+                        crate::model::TaskListenerEventType::Updating,
+                        pending,
+                        &first,
+                    ) {
+                        self.emit(&mut log, event);
+                    }
+                } else {
+                    self.emit(
+                        &mut log,
+                        Event::UserTaskUpdated {
+                            user_task_key,
+                            instance_key,
+                            candidate_groups,
+                            candidate_users,
+                            due_date,
+                            follow_up_date,
+                            priority,
+                        },
+                    );
+                }
             }
 
             Command::CompleteUserTask {
@@ -1075,36 +1270,66 @@ impl Engine {
                     .user_tasks
                     .get(&user_task_key)
                     .ok_or(EngineError::UserTaskNotFound { user_task_key })?;
-                if task.state != state::UserTaskState::Created {
+                if task.state != state::UserTaskState::Created || task.pending.is_some() {
                     return Err(EngineError::UserTaskNotActive { user_task_key });
                 }
                 let instance_key = task.instance_key;
                 let element_instance_key = task.element_instance_key;
                 let element_id = task.element_id.clone();
 
-                self.emit(
-                    &mut log,
-                    Event::UserTaskCompleted {
+                let listeners = self.task_listeners_of(
+                    instance_key,
+                    &element_id,
+                    crate::model::TaskListenerEventType::Completing,
+                );
+                if let Some(first) = listeners.first().cloned() {
+                    // Defer completion behind the completing listener chain; the
+                    // completion variables ride on the pending transition and are
+                    // applied when the chain drains.
+                    let pending = state::PendingUserTaskTransition {
+                        event_type: crate::model::TaskListenerEventType::Completing,
+                        assignee: None,
+                        update: None,
+                        variables,
+                        corrections: crate::model::UserTaskCorrections::default(),
+                    };
+                    for event in self.start_task_listener_chain(
                         user_task_key,
                         instance_key,
-                    },
-                );
-                if !variables.is_empty() {
-                    // User-task completion variables propagate from the task's
-                    // enclosing (flow) scope upward, defaulting to root (flat
-                    // `VariablesUpdated` for a root-only instance).
-                    let flow_scope = self.scope_of(instance_key, element_instance_key);
-                    for event in self.propagated_updates(instance_key, flow_scope, variables, false)
-                    {
+                        element_instance_key,
+                        &element_id,
+                        crate::model::TaskListenerEventType::Completing,
+                        pending,
+                        &first,
+                    ) {
                         self.emit(&mut log, event);
                     }
+                } else {
+                    self.emit(
+                        &mut log,
+                        Event::UserTaskCompleted {
+                            user_task_key,
+                            instance_key,
+                        },
+                    );
+                    if !variables.is_empty() {
+                        // User-task completion variables propagate from the task's
+                        // enclosing (flow) scope upward, defaulting to root (flat
+                        // `VariablesUpdated` for a root-only instance).
+                        let flow_scope = self.scope_of(instance_key, element_instance_key);
+                        for event in
+                            self.propagated_updates(instance_key, flow_scope, variables, false)
+                        {
+                            self.emit(&mut log, event);
+                        }
+                    }
+                    // The parked user-task token resumes from ACTIVATED.
+                    queue.push_back(Step::Complete {
+                        instance_key,
+                        element_instance_key,
+                        element_id,
+                    });
                 }
-                // The parked user-task token resumes from ACTIVATED.
-                queue.push_back(Step::Complete {
-                    instance_key,
-                    element_instance_key,
-                    element_id,
-                });
             }
 
             Command::ActivateJobs {
@@ -2030,13 +2255,45 @@ impl Engine {
                     })
                     .collect();
                 user_tasks.sort_unstable_by_key(|t| t.key);
-                let user_task_cancels: Vec<Event> = user_tasks
+                // Split user tasks into those that must run a `canceling` listener
+                // chain before cancellation (deferred) and those cancelled at once
+                // (ADR 0037 §6). A task already deferring another transition is
+                // cancelled immediately (its in-flight listener job is cancelled
+                // with the other jobs above). Owned tuples so we can call
+                // `task_listeners_of` (which borrows `self`) after this.
+                let user_task_infos: Vec<(Key, Key, ElementId, bool)> = user_tasks
                     .iter()
-                    .map(|t| Event::UserTaskCanceled {
-                        user_task_key: t.key,
-                        instance_key,
+                    .map(|t| {
+                        (
+                            t.key,
+                            t.element_instance_key,
+                            t.element_id.clone(),
+                            t.pending.is_none(),
+                        )
                     })
                     .collect();
+                let mut immediate_user_task_cancels: Vec<Event> = Vec::new();
+                let mut canceling_starts: Vec<(Key, Key, ElementId, crate::model::TaskListener)> =
+                    Vec::new();
+                for (key, element_instance_key, element_id, no_pending) in user_task_infos {
+                    let canceling = if no_pending {
+                        self.task_listeners_of(
+                            instance_key,
+                            &element_id,
+                            crate::model::TaskListenerEventType::Canceling,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some(first) = canceling.first().cloned() {
+                        canceling_starts.push((key, element_instance_key, element_id, first));
+                    } else {
+                        immediate_user_task_cancels.push(Event::UserTaskCanceled {
+                            user_task_key: key,
+                            instance_key,
+                        });
+                    }
+                }
 
                 for event in job_cancels {
                     self.emit(&mut log, event);
@@ -2053,10 +2310,38 @@ impl Engine {
                 for event in cond_sub_cancels {
                     self.emit(&mut log, event);
                 }
-                for event in user_task_cancels {
+                for event in immediate_user_task_cancels {
                     self.emit(&mut log, event);
                 }
-                self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
+                if canceling_starts.is_empty() {
+                    // No canceling listeners: terminate synchronously, exactly as
+                    // the pre-task-listener engine did (byte-identical).
+                    self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
+                } else {
+                    // Defer termination: run each user task's canceling chain; the
+                    // last one to drain emits `ProcessInstanceTerminated`.
+                    self.emit(&mut log, Event::ProcessInstanceTerminating { instance_key });
+                    for (key, element_instance_key, element_id, first) in canceling_starts {
+                        let pending = state::PendingUserTaskTransition {
+                            event_type: crate::model::TaskListenerEventType::Canceling,
+                            assignee: None,
+                            update: None,
+                            variables: std::collections::HashMap::new(),
+                            corrections: crate::model::UserTaskCorrections::default(),
+                        };
+                        for event in self.start_task_listener_chain(
+                            key,
+                            instance_key,
+                            element_instance_key,
+                            &element_id,
+                            crate::model::TaskListenerEventType::Canceling,
+                            pending,
+                            &first,
+                        ) {
+                            self.emit(&mut log, event);
+                        }
+                    }
+                }
             }
 
             Command::DispatchStartInstance {
@@ -2669,6 +2954,11 @@ impl Engine {
                 index,
                 scope,
             ),
+            Step::AdvanceTaskListener {
+                user_task_key,
+                event_type,
+                index,
+            } => self.advance_task_listener(user_task_key, event_type, index),
         }
     }
 
@@ -2905,19 +3195,94 @@ impl Engine {
                     .resolve_user_task_string(&element_vars, props.follow_up_date.as_deref())
                     .filter(|s| !s.is_empty());
                 let priority = self.resolve_priority(&element_vars, props.priority.as_deref());
+                // An initial assignee (zeebe:assignmentDefinition) must fire the
+                // `assigning` listeners exactly as a runtime assign does (Zeebe
+                // parity: the assignee is stripped off the CREATED record and
+                // routed through an assigning transition once the task is
+                // available). With no assigning listeners the assignee stays on
+                // CREATED, keeping listener-free/plain-assignee tasks
+                // byte-identical.
+                let has_assigning_listeners = !self
+                    .task_listeners_of(
+                        instance_key,
+                        &element_id,
+                        crate::model::TaskListenerEventType::Assigning,
+                    )
+                    .is_empty();
+                let route_initial_assignee = assignee.is_some() && has_assigning_listeners;
+                let (created_assignee, deferred_initial_assignee) = if route_initial_assignee {
+                    (None, assignee)
+                } else {
+                    (assignee, None)
+                };
                 events.push(Event::UserTaskCreated {
                     user_task_key,
                     instance_key,
                     element_instance_key,
                     element_id: element_id.clone(),
                     created_at: self.now,
-                    assignee,
+                    assignee: created_assignee,
                     candidate_groups,
                     candidate_users,
                     due_date,
                     follow_up_date,
                     priority,
                 });
+                // Creating task listeners (ADR 0037 §6): the task record exists
+                // but is not yet available for work until the creating chain
+                // drains. The pending transition blocks assign/complete/update
+                // meanwhile. Listener-free user tasks skip this entirely.
+                let creating = self.task_listeners_of(
+                    instance_key,
+                    &element_id,
+                    crate::model::TaskListenerEventType::Creating,
+                );
+                if let Some(first) = creating.first().cloned() {
+                    let pending = state::PendingUserTaskTransition {
+                        event_type: crate::model::TaskListenerEventType::Creating,
+                        // Carried through the creating chain, then routed into an
+                        // assigning transition when creating drains.
+                        assignee: deferred_initial_assignee,
+                        update: None,
+                        variables: std::collections::HashMap::new(),
+                        corrections: crate::model::UserTaskCorrections::default(),
+                    };
+                    events.extend(self.start_task_listener_chain(
+                        user_task_key,
+                        instance_key,
+                        element_instance_key,
+                        &element_id,
+                        crate::model::TaskListenerEventType::Creating,
+                        pending,
+                        &first,
+                    ));
+                } else if let Some(initial) = deferred_initial_assignee {
+                    // No creating listeners: the task is available at once, so the
+                    // initial assignee's assigning transition starts immediately.
+                    let assigning = self.task_listeners_of(
+                        instance_key,
+                        &element_id,
+                        crate::model::TaskListenerEventType::Assigning,
+                    );
+                    if let Some(first) = assigning.first().cloned() {
+                        let pending = state::PendingUserTaskTransition {
+                            event_type: crate::model::TaskListenerEventType::Assigning,
+                            assignee: Some(initial),
+                            update: None,
+                            variables: std::collections::HashMap::new(),
+                            corrections: crate::model::UserTaskCorrections::default(),
+                        };
+                        events.extend(self.start_task_listener_chain(
+                            user_task_key,
+                            instance_key,
+                            element_instance_key,
+                            &element_id,
+                            crate::model::TaskListenerEventType::Assigning,
+                            pending,
+                            &first,
+                        ));
+                    }
+                }
                 events.extend(self.arm_boundary_events(
                     instance_key,
                     element_instance_key,
@@ -4682,6 +5047,392 @@ impl Engine {
         }
     }
 
+    /// Whether a task-listener event type may *deny* its transition. Only
+    /// `assigning`, `updating` and `completing` support denial; `creating` and
+    /// `canceling` must proceed (Zeebe parity, ADR 0037 §6).
+    fn task_event_supports_deny(event_type: crate::model::TaskListenerEventType) -> bool {
+        matches!(
+            event_type,
+            crate::model::TaskListenerEventType::Assigning
+                | crate::model::TaskListenerEventType::Updating
+                | crate::model::TaskListenerEventType::Completing
+        )
+    }
+
+    /// Builds the events that begin a user task's task-listener chain: records
+    /// the deferred transition on the task and mints the first listener's job.
+    /// The caller has already checked that `first` exists (the listener-free
+    /// path never calls this, keeping listener-free user tasks byte-identical).
+    #[allow(clippy::too_many_arguments)]
+    fn start_task_listener_chain(
+        &mut self,
+        user_task_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        event_type: crate::model::TaskListenerEventType,
+        pending: state::PendingUserTaskTransition,
+        first: &crate::model::TaskListener,
+    ) -> Vec<Event> {
+        let job_event = self.mint_task_listener_job(
+            user_task_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            event_type,
+            0,
+            first,
+        );
+        vec![
+            Event::UserTaskTransitionDeferred {
+                user_task_key,
+                instance_key,
+                pending,
+            },
+            job_event,
+        ]
+    }
+
+    /// Mints a task-listener job for the listener at `index` of `event_type`'s
+    /// chain, resolving its `type`/`retries` FEEL against the user task's scope.
+    #[allow(clippy::too_many_arguments)]
+    fn mint_task_listener_job(
+        &mut self,
+        user_task_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+        event_type: crate::model::TaskListenerEventType,
+        index: usize,
+        listener: &crate::model::TaskListener,
+    ) -> Event {
+        let listener_vars = self.variables_for_element(instance_key, element_instance_key);
+        let job_key = self.mint_key();
+        let job_type = self.resolve_job_type(&listener_vars, &listener.job_type);
+        let retries = self.resolve_retries(&listener_vars, listener.retries.as_deref());
+        Event::TaskListenerJobCreated {
+            job_key,
+            instance_key,
+            element_instance_key,
+            element_id: element_id.to_string(),
+            user_task_key,
+            job_type,
+            event_type,
+            listener_index: index,
+            created_at: self.now,
+            retries,
+        }
+    }
+
+    /// Advances a user task's task-listener chain after the listener at `index`
+    /// completed: mints the next listener's job, or — when the chain drains —
+    /// commits the deferred transition (ADR 0037 §6).
+    fn advance_task_listener(
+        &mut self,
+        user_task_key: Key,
+        event_type: crate::model::TaskListenerEventType,
+        index: usize,
+    ) -> (Vec<Event>, Vec<Step>) {
+        let Some(task) = self.state.user_tasks.get(&user_task_key) else {
+            return (Vec::new(), Vec::new());
+        };
+        let instance_key = task.instance_key;
+        let element_instance_key = task.element_instance_key;
+        let element_id = task.element_id.clone();
+        let listeners = self.task_listeners_of(instance_key, &element_id, event_type);
+        let next_index = index + 1;
+        if let Some(next) = listeners.get(next_index).cloned() {
+            let job_event = self.mint_task_listener_job(
+                user_task_key,
+                instance_key,
+                element_instance_key,
+                &element_id,
+                event_type,
+                next_index,
+                &next,
+            );
+            return (vec![job_event], Vec::new());
+        }
+        // Chain drained — commit the deferred transition.
+        self.commit_user_task_transition(user_task_key)
+    }
+
+    /// Commits a user task's deferred transition once its listener chain has
+    /// drained: applies accumulated corrections, emits the appropriate lifecycle
+    /// event(s), clears the pending state and resumes the token where the
+    /// transition requires it (ADR 0037 §6).
+    fn commit_user_task_transition(&mut self, user_task_key: Key) -> (Vec<Event>, Vec<Step>) {
+        let Some(task) = self.state.user_tasks.get(&user_task_key) else {
+            return (Vec::new(), Vec::new());
+        };
+        let Some(pending) = task.pending.clone() else {
+            return (Vec::new(), Vec::new());
+        };
+        let instance_key = task.instance_key;
+        let element_instance_key = task.element_instance_key;
+        let element_id = task.element_id.clone();
+        let has_initial_assignee = task.assignee.is_some() || pending.assignee.is_some();
+        let corrections = pending.corrections.clone();
+
+        let mut events: Vec<Event> = Vec::new();
+        let mut steps: Vec<Step> = Vec::new();
+        let mut finish_termination = false;
+
+        match pending.event_type {
+            crate::model::TaskListenerEventType::Creating => {
+                // The task becomes available. A creating listener's assignee
+                // correction was already validated at job completion (rejected
+                // if an initial assignee exists), so apply corrections directly.
+                events.extend(self.apply_creating_corrections(
+                    user_task_key,
+                    instance_key,
+                    &corrections,
+                    has_initial_assignee,
+                ));
+            }
+            crate::model::TaskListenerEventType::Assigning => {
+                // The corrected assignee (if any) overrides the command's target.
+                let assignee = match &corrections.assignee {
+                    Some(a) if a.is_empty() => None,
+                    Some(a) => Some(a.clone()),
+                    None => pending.assignee.clone(),
+                };
+                events.extend(self.apply_non_assignee_corrections(
+                    user_task_key,
+                    instance_key,
+                    &corrections,
+                ));
+                events.push(Event::UserTaskAssigned {
+                    user_task_key,
+                    instance_key,
+                    assignee,
+                });
+            }
+            crate::model::TaskListenerEventType::Updating => {
+                let update = pending.update.clone().unwrap_or_default();
+                // Corrections override the corresponding update fields.
+                events.push(Event::UserTaskUpdated {
+                    user_task_key,
+                    instance_key,
+                    candidate_groups: corrections
+                        .candidate_groups
+                        .clone()
+                        .or(update.candidate_groups),
+                    candidate_users: corrections
+                        .candidate_users
+                        .clone()
+                        .or(update.candidate_users),
+                    due_date: corrections
+                        .due_date
+                        .clone()
+                        .map(|d| if d.is_empty() { None } else { Some(d) })
+                        .or(update.due_date),
+                    follow_up_date: corrections
+                        .follow_up_date
+                        .clone()
+                        .map(|d| if d.is_empty() { None } else { Some(d) })
+                        .or(update.follow_up_date),
+                    priority: corrections.priority.or(update.priority),
+                });
+                if corrections.assignee.is_some() {
+                    let assignee = corrections.assignee.clone().filter(|a| !a.is_empty());
+                    events.push(Event::UserTaskAssigned {
+                        user_task_key,
+                        instance_key,
+                        assignee,
+                    });
+                }
+            }
+            crate::model::TaskListenerEventType::Completing => {
+                // Apply corrections to the (about-to-complete) task's data, then
+                // complete it and propagate the captured completion variables.
+                events.extend(self.apply_non_assignee_corrections(
+                    user_task_key,
+                    instance_key,
+                    &corrections,
+                ));
+                if corrections.assignee.is_some() {
+                    let assignee = corrections.assignee.clone().filter(|a| !a.is_empty());
+                    events.push(Event::UserTaskAssigned {
+                        user_task_key,
+                        instance_key,
+                        assignee,
+                    });
+                }
+                events.push(Event::UserTaskCompleted {
+                    user_task_key,
+                    instance_key,
+                });
+                steps.push(Step::Complete {
+                    instance_key,
+                    element_instance_key,
+                    element_id: element_id.clone(),
+                });
+            }
+            crate::model::TaskListenerEventType::Canceling => {
+                // Cancellation must proceed; corrections are ignored.
+                events.push(Event::UserTaskCanceled {
+                    user_task_key,
+                    instance_key,
+                });
+                // If this was the last user task deferring cancellation on a
+                // terminating instance, finish the termination now (ADR 0037 §6).
+                let terminating = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| i.state == ProcessInstanceState::Terminating)
+                    .unwrap_or(false);
+                if terminating {
+                    let others_canceling = self.state.user_tasks.values().any(|t| {
+                        t.instance_key == instance_key
+                            && t.key != user_task_key
+                            && matches!(
+                                t.pending.as_ref().map(|p| p.event_type),
+                                Some(crate::model::TaskListenerEventType::Canceling)
+                            )
+                    });
+                    if !others_canceling {
+                        // Emitted after the resolution event below so pending is
+                        // cleared first.
+                        finish_termination = true;
+                    }
+                }
+            }
+        }
+
+        events.push(Event::UserTaskTransitionResolved {
+            user_task_key,
+            instance_key,
+            denied: None,
+        });
+
+        if finish_termination {
+            events.push(Event::ProcessInstanceTerminated { instance_key });
+        }
+
+        // Creating→assigning handoff (Zeebe parity): when the creating chain
+        // carried a stripped initial assignee, route it through an assigning
+        // transition now that the task is available. Emitted after the resolution
+        // event above so the creating pending is cleared before the assigning
+        // pending is set on replay.
+        if matches!(
+            pending.event_type,
+            crate::model::TaskListenerEventType::Creating
+        ) {
+            if let Some(initial) = pending.assignee.clone() {
+                let assigning = self.task_listeners_of(
+                    instance_key,
+                    &element_id,
+                    crate::model::TaskListenerEventType::Assigning,
+                );
+                if let Some(first) = assigning.first().cloned() {
+                    let new_pending = state::PendingUserTaskTransition {
+                        event_type: crate::model::TaskListenerEventType::Assigning,
+                        assignee: Some(initial),
+                        update: None,
+                        variables: std::collections::HashMap::new(),
+                        corrections: crate::model::UserTaskCorrections::default(),
+                    };
+                    events.extend(self.start_task_listener_chain(
+                        user_task_key,
+                        instance_key,
+                        element_instance_key,
+                        &element_id,
+                        crate::model::TaskListenerEventType::Assigning,
+                        new_pending,
+                        &first,
+                    ));
+                }
+            }
+        }
+
+        // For completing, the variables must merge before the token resumes; do
+        // it now (the variable events precede the resolution/step above only in
+        // ordering terms — merge here so replay sees them before the resume).
+        if matches!(
+            pending.event_type,
+            crate::model::TaskListenerEventType::Completing
+        ) && !pending.variables.is_empty()
+        {
+            let flow_scope = self.scope_of(instance_key, element_instance_key);
+            let var_events =
+                self.propagated_updates(instance_key, flow_scope, pending.variables, false);
+            // Insert variable merges just before the completion event so the
+            // completing token sees them.
+            let insert_at = events
+                .iter()
+                .position(|e| matches!(e, Event::UserTaskCompleted { .. }))
+                .unwrap_or(events.len());
+            for (offset, ev) in var_events.into_iter().enumerate() {
+                events.insert(insert_at + offset, ev);
+            }
+        }
+
+        (events, steps)
+    }
+
+    /// Applies the non-assignee corrections (candidates, dates, priority) of a
+    /// task listener as a single `UserTaskUpdated`, if any are set. Returns an
+    /// empty vec when there is nothing to update.
+    fn apply_non_assignee_corrections(
+        &self,
+        user_task_key: Key,
+        instance_key: Key,
+        corrections: &crate::model::UserTaskCorrections,
+    ) -> Vec<Event> {
+        if corrections.candidate_groups.is_none()
+            && corrections.candidate_users.is_none()
+            && corrections.due_date.is_none()
+            && corrections.follow_up_date.is_none()
+            && corrections.priority.is_none()
+        {
+            return Vec::new();
+        }
+        vec![Event::UserTaskUpdated {
+            user_task_key,
+            instance_key,
+            candidate_groups: corrections.candidate_groups.clone(),
+            candidate_users: corrections.candidate_users.clone(),
+            due_date: corrections
+                .due_date
+                .clone()
+                .map(|d| if d.is_empty() { None } else { Some(d) }),
+            follow_up_date: corrections.follow_up_date.clone().map(|d| {
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d)
+                }
+            }),
+            priority: corrections.priority,
+        }]
+    }
+
+    /// Applies a creating listener's corrections to a freshly-available user
+    /// task. The assignee correction is honoured only when no initial assignee
+    /// was declared (Zeebe parity, ADR 0037 §6).
+    fn apply_creating_corrections(
+        &self,
+        user_task_key: Key,
+        instance_key: Key,
+        corrections: &crate::model::UserTaskCorrections,
+        has_initial_assignee: bool,
+    ) -> Vec<Event> {
+        let mut events =
+            self.apply_non_assignee_corrections(user_task_key, instance_key, corrections);
+        if let Some(assignee) = &corrections.assignee {
+            if !has_initial_assignee {
+                events.push(Event::UserTaskAssigned {
+                    user_task_key,
+                    instance_key,
+                    assignee: Some(assignee.clone()).filter(|a| !a.is_empty()),
+                });
+            }
+        }
+        events
+    }
+
     /// Mints a fresh job for an already-active service-task element instance.
     /// Used by incident resolution to retry a parked service task: the element
     /// instance is left untouched (it stays active) and a new job is created in
@@ -5176,6 +5927,18 @@ pub enum EngineError {
     /// `AssignUserTask` with `allow_override = false` targeted a user task that
     /// already has an assignee; it must be unassigned first.
     UserTaskAlreadyAssigned { user_task_key: Key },
+    /// A task-listener job was completed with variables, which Zeebe forbids for
+    /// listener jobs (ADR 0037 §6).
+    TaskListenerJobWithVariables { job_key: Key },
+    /// A task-listener job denied its transition while also returning
+    /// corrections; the two are mutually exclusive (ADR 0037 §6).
+    TaskListenerDenyWithCorrections { job_key: Key },
+    /// A task-listener job denied a transition whose event type does not support
+    /// denial (only `assigning`, `updating`, `completing` do; ADR 0037 §6).
+    TaskListenerDenyNotSupported { job_key: Key },
+    /// A `creating` task listener tried to correct the assignee of a user task
+    /// that already declares an initial assignee (ADR 0037 §6, Zeebe parity).
+    TaskListenerAssigneeCorrectionOnCreating { user_task_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -5228,6 +5991,30 @@ impl std::fmt::Display for EngineError {
                 write!(
                     f,
                     "user task {user_task_key} is already assigned; unassign it before assigning again"
+                )
+            }
+            EngineError::TaskListenerJobWithVariables { job_key } => {
+                write!(
+                    f,
+                    "task-listener job {job_key} cannot be completed with variables"
+                )
+            }
+            EngineError::TaskListenerDenyWithCorrections { job_key } => {
+                write!(
+                    f,
+                    "task-listener job {job_key} cannot both deny the transition and return corrections"
+                )
+            }
+            EngineError::TaskListenerDenyNotSupported { job_key } => {
+                write!(
+                    f,
+                    "task-listener job {job_key} denied a transition whose event type does not support denial"
+                )
+            }
+            EngineError::TaskListenerAssigneeCorrectionOnCreating { user_task_key } => {
+                write!(
+                    f,
+                    "a creating task listener cannot correct the assignee of user task {user_task_key}: it already has an initial assignee"
                 )
             }
         }

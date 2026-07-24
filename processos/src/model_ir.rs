@@ -891,6 +891,7 @@ impl<'a> Parser<'a> {
             multi_instance: attrs.multi_instance.take(),
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
+            task_listeners: Vec::new(),
         };
         if let Some((leftover, _)) = attrs.scalars.iter().next() {
             return Err(format!(

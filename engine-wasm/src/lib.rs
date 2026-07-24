@@ -109,6 +109,7 @@ impl TestEngine {
             job_key: key,
             variables,
             adhoc_result: None,
+            task_listener_result: None,
         })
         .map_err(|e| js_err(&format!("complete error: {e}")))?;
         to_json(&self.snapshot_value(None))
@@ -490,6 +491,7 @@ struct TimerDto {
 fn instance_state(s: &ProcessInstanceState) -> String {
     match s {
         ProcessInstanceState::Active => "Active",
+        ProcessInstanceState::Terminating => "Terminating",
         ProcessInstanceState::Completed => "Completed",
         ProcessInstanceState::Terminated => "Terminated",
     }

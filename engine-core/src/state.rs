@@ -89,6 +89,12 @@ pub enum ProcessInstanceState {
     /// Cancelled by an operator before completing: every token was discarded.
     /// Terminal, like `Completed`, but reached via [`crate::Command::CancelInstance`].
     Terminated,
+    /// Cancellation is in progress but one or more user tasks are running their
+    /// `canceling` task listeners (ADR 0037 §6). The instance's other tokens are
+    /// already discarded; it transitions to `Terminated` once the last canceling
+    /// chain drains. Not a resting state a listener-free instance ever reaches,
+    /// so the ordinary synchronous cancel path is unchanged.
+    Terminating,
 }
 
 /// Lifecycle state of a job.
@@ -135,6 +141,15 @@ pub enum JobKind {
         event_type: crate::model::ListenerEventType,
         index: usize,
         scope: Key,
+    },
+    /// A job for one task listener in a user task's sequential chain (ADR 0037
+    /// §6). Carries the transition it fires on, its 0-based position in the
+    /// user task's listener list (filtered to this event type), and the user
+    /// task whose deferred transition it gates.
+    TaskListener {
+        event_type: crate::model::TaskListenerEventType,
+        index: usize,
+        user_task_key: Key,
     },
 }
 
@@ -212,6 +227,52 @@ pub fn default_job_retries() -> i32 {
     DEFAULT_JOB_RETRIES
 }
 
+/// The in-flight lifecycle transition a user task is deferring while its task
+/// listeners run (ADR 0037 §6). Held on [`UserTask::pending`] between the
+/// command (or termination) that triggered the transition and the moment its
+/// listener chain drains and the transition commits. Durable so replay and
+/// failover resume the chain exactly; absent (the common case) for
+/// listener-free user tasks, which transition synchronously and are
+/// byte-identical to the pre-task-listener engine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PendingUserTaskTransition {
+    /// The transition being deferred (drives which listeners run and what final
+    /// event commits).
+    pub event_type: crate::model::TaskListenerEventType,
+    /// Target assignee for an `Assigning` transition: `Some(name)` to assign,
+    /// `None` to unassign. Ignored for other transitions.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub assignee: Option<String>,
+    /// Normalised update fields for an `Updating` transition. Ignored otherwise.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub update: Option<PendingUserTaskUpdate>,
+    /// Completion variables for a `Completing` transition, applied to the
+    /// instance when the chain drains. Ignored otherwise.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variables: HashMap<String, Value>,
+    /// Corrections accumulated from listeners completed so far.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub corrections: crate::model::UserTaskCorrections,
+}
+
+/// The normalised update payload captured on a deferred `Updating` transition
+/// (mirrors [`crate::Event::UserTaskUpdated`] fields).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PendingUserTaskUpdate {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub candidate_groups: Option<Vec<String>>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub candidate_users: Option<Vec<String>>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub due_date: Option<Option<String>>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub follow_up_date: Option<Option<String>>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub priority: Option<i32>,
+}
+
 /// Lifecycle state of a (native) user task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -249,6 +310,12 @@ pub struct UserTask {
     /// The logical instant the task was created (the `now` carried on the
     /// activating command), in milliseconds since the Unix epoch.
     pub created_at: u64,
+    /// The lifecycle transition (if any) this user task is currently deferring
+    /// while its task listeners run (ADR 0037 §6). `None` (the default, and the
+    /// only value for listener-free user tasks) means no transition is in
+    /// flight; serialized-before-task-listeners records load as `None`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub pending: Option<PendingUserTaskTransition>,
 }
 
 /// A running (or completed) process instance.
@@ -1327,6 +1394,76 @@ pub fn apply(state: &mut State, event: &Event) {
                 .insert(*job_key);
         }
 
+        Event::TaskListenerJobCreated {
+            job_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            user_task_key,
+            job_type,
+            event_type,
+            listener_index,
+            created_at,
+            retries,
+        } => {
+            state.jobs.insert(
+                *job_key,
+                Job {
+                    key: *job_key,
+                    instance_key: *instance_key,
+                    element_instance_key: *element_instance_key,
+                    element_id: element_id.clone(),
+                    job_type: job_type.clone(),
+                    state: JobState::Created,
+                    worker: None,
+                    deadline: None,
+                    activated: false,
+                    retries: *retries,
+                    priority: DEFAULT_JOB_PRIORITY,
+                    created_at: *created_at,
+                    kind: JobKind::TaskListener {
+                        event_type: *event_type,
+                        index: *listener_index,
+                        user_task_key: *user_task_key,
+                    },
+                },
+            );
+            resync_job_index(state, *job_key);
+            state
+                .jobs_by_instance
+                .entry(*instance_key)
+                .or_default()
+                .insert(*job_key);
+        }
+
+        Event::UserTaskTransitionDeferred {
+            user_task_key,
+            pending,
+            ..
+        } => {
+            if let Some(task) = state.user_tasks.get_mut(user_task_key) {
+                task.pending = Some(pending.clone());
+            }
+        }
+
+        Event::UserTaskCorrectionsApplied {
+            user_task_key,
+            corrections,
+            ..
+        } => {
+            if let Some(task) = state.user_tasks.get_mut(user_task_key) {
+                if let Some(pending) = task.pending.as_mut() {
+                    pending.corrections.merge(corrections);
+                }
+            }
+        }
+
+        Event::UserTaskTransitionResolved { user_task_key, .. } => {
+            if let Some(task) = state.user_tasks.get_mut(user_task_key) {
+                task.pending = None;
+            }
+        }
+
         Event::JobActivated {
             job_key,
             worker,
@@ -1417,6 +1554,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     follow_up_date: follow_up_date.clone(),
                     priority: *priority,
                     created_at: *created_at,
+                    pending: None,
                 },
             );
         }
@@ -1556,6 +1694,12 @@ pub fn apply(state: &mut State, event: &Event) {
             decrement_inflight_by_process(state, terminal_pid);
         }
 
+        Event::ProcessInstanceTerminating { instance_key } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.state = ProcessInstanceState::Terminating;
+            }
+        }
+
         Event::ProcessInstanceTerminated { instance_key } => {
             let terminal_pid = non_terminal_process_id(state, instance_key);
             // Close any incident still active on the instance: with the instance
@@ -1632,6 +1776,12 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::UserTaskCanceled { user_task_key, .. } => {
             if let Some(task) = state.user_tasks.get_mut(user_task_key) {
                 task.state = UserTaskState::Canceled;
+                // A cancelled task has no in-flight transition: its listener job
+                // (if any) was cancelled with the instance's other jobs. Clearing
+                // pending keeps replay from reconstructing a terminal task with a
+                // permanently unresolved transition. No-op for listener-free tasks
+                // (pending is already None), so the journal stays byte-identical.
+                task.pending = None;
             }
         }
 

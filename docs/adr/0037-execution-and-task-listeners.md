@@ -153,16 +153,58 @@ The heart of the change. Split the two atomic transitions:
   correct kind + event type (observability parity with Operate's listener jobs).
 - Add `nanobpm_execution_listener_jobs_total{event_type=start|end,outcome=created|completed|failed}`.
 
-### 6. Task listeners (follow-on, specified now for coherence)
+### 6. Task listeners (implemented — engine-core runtime)
 
 Task listeners apply **only to user tasks** and add two things execution listeners
-lack: the `completing` event can **deny** the completion (`denied=true` +
-`deniedReason`) and return **corrections** (assignee, candidate groups/users, due/
-follow-up date, priority). They reuse §2/§3 machinery, hooked at the **user-task
-lifecycle** (`assigning`, `completing`, `canceling`, `updating`) rather than the
-element lifecycle, and require threading the `denied`/`corrections` fields through the
-complete-job result (a strict superset of the ad-hoc result plumbing in ADR 0023 §3).
-Kept out of v1 to bound the first cut; no v1 decision precludes it.
+lack: the `assigning`/`updating`/`completing` events can **deny** the transition
+(`denied=true` + `deniedReason`) and every event may return **corrections**
+(assignee, candidate groups/users, due/follow-up date, priority). They fire on the
+five user-task lifecycle transitions — `creating`, `assigning`, `updating`,
+`completing`, `canceling` — reusing the §2/§3 machinery (a `JobKind::TaskListener`,
+a sequential listener cursor, and an `AdvanceTaskListener` step) hooked at the
+**user-task lifecycle** rather than the element lifecycle.
+
+**What is implemented (engine-core):**
+
+- **Parsing** (`bpmn.rs`, `model.rs`): `zeebe:taskListeners`/`zeebe:taskListener`
+  (`eventType` defaulting to `creating`) parse into `Element.task_listeners`,
+  mirroring execution-listener parsing. A user task carrying no task listeners
+  parses and runs **byte-identically** to the pre-task-listener engine.
+- **Deferred transitions** (`state.rs`): a user-task transition whose payload is
+  not re-derivable from resident state (the target assignee, the update changeset,
+  the captured completion variables) is persisted durably on `UserTask.pending`
+  (`PendingUserTaskTransition`) via a `UserTaskTransitionDeferred` event, so replay
+  reconstructs the in-flight transition exactly.
+- **Runtime** (`engine/mod.rs`): each of `AssignUserTask`/`UnassignUserTask`/
+  `UpdateUserTask`/`CompleteUserTask` checks for listeners of the matching event;
+  if any exist it emits `UserTaskTransitionDeferred` + the first
+  `TaskListenerJobCreated` and does **not** apply the transition yet. `creating`
+  listeners gate the task at element `ACTIVATING`, so it is not `Created` (and not
+  assignable/completable) until the chain drains. Completing a task-listener job
+  advances the chain (`AdvanceTaskListener`); when the last one drains,
+  `commit_user_task_transition` applies accumulated corrections and emits the real
+  lifecycle event(s) plus `UserTaskTransitionResolved`.
+- **Deny + corrections** are carried on the complete-job result
+  (`TaskListenerJobResult` on `Command::CompleteJob`). Validation (Zeebe parity):
+  task-listener jobs may not carry variables; `denied` is honoured only on
+  `assigning`/`updating`/`completing`; `denied` and `corrections` are mutually
+  exclusive; a `creating` listener may not correct the assignee when the task
+  already declares an initial assignee. A denial emits
+  `UserTaskTransitionResolved{denied:Some(reason)}`, clearing `pending` and
+  returning the task to its prior available state.
+- **Canceling (deferred termination):** `CancelInstance` runs each `Created` task's
+  `canceling` chain before termination. When any chain must run it emits
+  `ProcessInstanceTerminating` (a new non-terminal `ProcessInstanceState`) instead
+  of `ProcessInstanceTerminated`; the last canceling chain to drain emits
+  `ProcessInstanceTerminated`. An instance with no canceling listeners terminates
+  synchronously, **byte-identically** to before.
+
+**Boundaries (deferred to follow-ups):** the `TaskListenerJobResult` (deny +
+corrections) plumbing stops at the engine boundary — extending it through the
+server command-stream transport and the client SDKs is a follow-on. Read-model
+projection of the new events and behaviour under process-instance **migration**/
+**modification** are likewise out of scope here.
+
 
 ### Subset (honestly stated, per the whitepaper discipline)
 
@@ -207,8 +249,10 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
     fulfilled* completions cancel any still-running tools and stay inline (the
     `cancelled` flag cannot be re-derived at drain), so they do not run end
     listeners — treated as an aborted, not a clean, completion.
-- **Deferred:** task listeners (§6 — user-task `completing` denial + corrections);
-  listener behaviour under process-instance **migration** and **modification**;
+- **Task listeners (§6) are implemented in engine-core** (user-task
+  `creating`/`assigning`/`updating`/`completing`/`canceling` denial + corrections);
+  their transport/SDK plumbing and read-model projection are the follow-ups.
+- **Deferred:** listener behaviour under process-instance **migration** and **modification**;
   interaction subtleties with non-interrupting boundary events firing mid-chain.
 
 ## Phased plan
@@ -226,7 +270,9 @@ State each boundary in `PERFORMANCE.md` / the feature matrix:
 6. **E2E parity test:** run the golden BPMN under an unmodified listener worker on
    embedded Bernd; assert listener jobs appear in the read model in order and the run
    matches Camunda's outcome. Update the feature matrix + `PERFORMANCE.md` subset note.
-7. **Task listeners** (seam 6) as a separate follow-up ADR increment.
+7. **Task listeners** (seam 6): implemented in engine-core (all five events,
+   deny + corrections, deferred termination); transport/SDK plumbing and read-model
+   projection tracked as follow-ups.
 
 ## Consequences
 

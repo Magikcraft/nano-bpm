@@ -353,6 +353,57 @@ pub enum Event {
         instance_key: Key,
     },
 
+    /// A task-listener job was created for one listener in a user task's
+    /// sequential chain (ADR 0037 §6). Mirrors [`Event::ExecutionListenerJobCreated`]
+    /// but gates a *user-task* transition rather than an element lifecycle
+    /// transition. Only emitted for user tasks that declare task listeners, so
+    /// listener-free user tasks are byte-identical to the pre-task-listener
+    /// engine.
+    TaskListenerJobCreated {
+        job_key: Key,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: ElementId,
+        user_task_key: Key,
+        job_type: String,
+        event_type: crate::model::TaskListenerEventType,
+        listener_index: usize,
+        #[cfg_attr(feature = "serde", serde(default))]
+        created_at: u64,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default = "crate::state::default_job_retries")
+        )]
+        retries: i32,
+    },
+    /// A user task began deferring a lifecycle transition behind its task
+    /// listeners (ADR 0037 §6). Records the in-flight transition on the task
+    /// until its listener chain drains (commit) or a listener denies it.
+    UserTaskTransitionDeferred {
+        user_task_key: Key,
+        instance_key: Key,
+        pending: crate::state::PendingUserTaskTransition,
+    },
+    /// A task listener returned corrections to user-task data; they merge into
+    /// the deferred transition's accumulated corrections (ADR 0037 §6).
+    UserTaskCorrectionsApplied {
+        user_task_key: Key,
+        instance_key: Key,
+        corrections: crate::model::UserTaskCorrections,
+    },
+    /// A user task's deferred transition was resolved (committed after its
+    /// listener chain drained, or denied by a listener); the pending transition
+    /// is cleared. The actual state change (assign/update/complete/cancel) is
+    /// carried by the accompanying lifecycle event on commit. `denied` is
+    /// `Some(reason)` when a task listener denied the transition (the task
+    /// returns to its prior available state) and `None` on a normal commit.
+    UserTaskTransitionResolved {
+        user_task_key: Key,
+        instance_key: Key,
+        #[cfg_attr(feature = "serde", serde(default))]
+        denied: Option<String>,
+    },
+
     /// An incident was raised (e.g. an exclusive gateway found no matching flow,
     /// or a job exhausted its retries); the token is parked until the incident
     /// is resolved. `job_key` is `Some` only for recoverable job-incidents.
@@ -390,6 +441,13 @@ pub enum Event {
     /// produced (`JobCanceled`, `TimerCanceled`, `MessageSubscriptionCanceled`)
     /// precede it; this event closes any still-active incident on the instance.
     ProcessInstanceTerminated { instance_key: Key },
+
+    /// Cancellation of a process instance began, but one or more user tasks are
+    /// running their `canceling` task listeners (ADR 0037 §6). The instance's
+    /// other tokens are already discarded (their cancellation events precede
+    /// this one); it moves to `Terminating` and finishes with
+    /// [`Event::ProcessInstanceTerminated`] once the last canceling chain drains.
+    ProcessInstanceTerminating { instance_key: Key },
 
     /// A timer was armed: either on a timer intermediate catch event (the token
     /// rests on it) or as an interrupting boundary timer on an activity (the
@@ -801,6 +859,10 @@ impl Event {
             | Event::UserTaskUpdated { instance_key, .. }
             | Event::UserTaskCompleted { instance_key, .. }
             | Event::UserTaskCanceled { instance_key, .. }
+            | Event::TaskListenerJobCreated { instance_key, .. }
+            | Event::UserTaskTransitionDeferred { instance_key, .. }
+            | Event::UserTaskCorrectionsApplied { instance_key, .. }
+            | Event::UserTaskTransitionResolved { instance_key, .. }
             | Event::IncidentRaised { instance_key, .. }
             | Event::IncidentResolved { instance_key, .. }
             | Event::TimerCreated { instance_key, .. }
@@ -832,6 +894,7 @@ impl Event {
             | Event::DecisionEvaluated { instance_key, .. }
             | Event::DecisionInstanceDeleted { instance_key, .. }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
+            Event::ProcessInstanceTerminating { instance_key } => Some(*instance_key),
             Event::ProcessDeployed { .. }
             | Event::DecisionRequirementsDeployed { .. }
             | Event::DecisionDeployed { .. }
@@ -918,6 +981,17 @@ impl Event {
                 scope,
                 ..
             } => m = m.max(*job_key).max(*element_instance_key).max(*scope),
+            Event::TaskListenerJobCreated {
+                job_key,
+                element_instance_key,
+                user_task_key,
+                ..
+            } => {
+                m = m
+                    .max(*job_key)
+                    .max(*element_instance_key)
+                    .max(*user_task_key)
+            }
             Event::JobActivated { job_key, .. }
             | Event::JobLockExpired { job_key, .. }
             | Event::JobFailed { job_key, .. }
@@ -1079,7 +1153,10 @@ impl Event {
             Event::UserTaskAssigned { user_task_key, .. }
             | Event::UserTaskUpdated { user_task_key, .. }
             | Event::UserTaskCompleted { user_task_key, .. }
-            | Event::UserTaskCanceled { user_task_key, .. } => m = m.max(*user_task_key),
+            | Event::UserTaskCanceled { user_task_key, .. }
+            | Event::UserTaskTransitionDeferred { user_task_key, .. }
+            | Event::UserTaskCorrectionsApplied { user_task_key, .. }
+            | Event::UserTaskTransitionResolved { user_task_key, .. } => m = m.max(*user_task_key),
             _ => {}
         }
         m
