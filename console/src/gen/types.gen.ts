@@ -883,6 +883,54 @@ export type SourceKindInfo = {
      */
     builtin: boolean;
     displayName?: string | null;
+    /**
+     * The fields the console's Add-trigger form renders for this kind — the core kinds' known keys (e.g. cron `spec`, file `path`) or a pack's declared `triggerSources[].configFields`.
+     *
+     */
+    configFields: Array<TriggerConfigField>;
+};
+
+export type TriggerConfigField = {
+    key: string;
+    label: string;
+    description?: string | null;
+    default?: string | null;
+    /**
+     * Whether the Add-trigger form must have a value for this field.
+     */
+    required: boolean;
+};
+
+/**
+ * A new trigger to append to the App manifest's triggers[].
+ */
+export type AddTriggerRequest = {
+    /**
+     * Unique trigger id within the App (also the ingress path segment).
+     */
+    id: string;
+    /**
+     * The source kind (a recognised core or pack `type`).
+     */
+    type: string;
+    /**
+     * Flat map of the kind's config field values (keyed by TriggerConfigField.key). The server places each into the manifest shape the kind expects.
+     *
+     */
+    config?: {
+        [key: string]: string;
+    } | null;
+    /**
+     * Optional named connection reference (for pack sources that use one).
+     */
+    connection?: string | null;
+    /**
+     * The action to apply on each event, e.g. `{ "start": "processId" }` or `{ "message": "messageName" }`.
+     *
+     */
+    action: {
+        [key: string]: unknown;
+    };
 };
 
 export type NamePath = string;
@@ -2542,6 +2590,37 @@ export type GetTriggersResponses = {
 };
 
 export type GetTriggersResponse = GetTriggersResponses[keyof GetTriggersResponses];
+
+export type AddTriggerData = {
+    body: AddTriggerRequest;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/projects/{name}/triggers';
+};
+
+export type AddTriggerErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type AddTriggerError = AddTriggerErrors[keyof AddTriggerErrors];
+
+export type AddTriggerResponses = {
+    /**
+     * Trigger added; refreshed triggers + source registry
+     */
+    200: TriggersResponse;
+};
+
+export type AddTriggerResponse = AddTriggerResponses[keyof AddTriggerResponses];
 
 export type EnqueueTriggerEventData = {
     body: TriggerEnqueueRequest;

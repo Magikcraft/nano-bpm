@@ -1186,6 +1186,41 @@ impl apis::data::Data for ServerImpl {
 
 #[async_trait]
 impl apis::triggers::Triggers for ServerImpl {
+    async fn add_trigger(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::AddTriggerPathParams,
+        body: &models::AddTriggerRequest,
+    ) -> Result<apis::triggers::AddTriggerResponse, ()> {
+        use apis::triggers::AddTriggerResponse as R;
+        let config: std::collections::BTreeMap<String, String> = flatten_nullable(&body.config)
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
+        let connection = flatten_nullable(&body.connection);
+        let action = serde_json::Value::Object(
+            body.action
+                .iter()
+                .map(|(k, v)| (k.clone(), v.0.clone()))
+                .collect(),
+        );
+        data_ok_or!(
+            super::project_trigger_add(
+                &path_params.name,
+                &body.id,
+                &body.r_type,
+                &config,
+                connection.as_deref(),
+                &action,
+            )
+            .await,
+            R::Status200_TriggerAdded,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
     async fn enqueue_trigger_event(
         &self,
         _method: &Method,

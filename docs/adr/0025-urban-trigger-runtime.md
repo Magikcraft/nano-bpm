@@ -231,6 +231,19 @@ Data panel and shown only for Urban App projects.) Two sub-surfaces:
 Reuses the console panel pattern (as the Data panel does, ADR 0024 §4). Editing the `triggers` block
 itself stays in the App manifest editor; this panel is the *runtime* view. Node-first per ADR 0038.
 
+**Add trigger (encapsulating the manifest edit, mirrors ADR 0024 §4's New Table).** An **＋ Add
+trigger** button on the Triggers sub-tab (shown in both the empty and populated states) opens a form
+so a maker wires a source without hand-editing `nano.app.json`: a trigger id, a **source kind**
+dropdown (populated from the same source registry the panel already shows — core kinds ∪ installed
+packs), the kind's **config fields**, an optional **connection** (for pack sources), and an **action**
+(start a process or publish a message). The form is *data-driven*: each `SourceKindInfo` now carries a
+`configFields[]` list (`GET …/triggers`), so a newly-installed pack's fields render automatically with
+no console change. `POST …/triggers` (`addTrigger`) validates the id is unique and the kind recognised,
+then the server (`triggers::add_trigger`) places each field into the shape that kind expects — core
+kinds read some keys at the trigger's top level (cron `spec`/`onMissed`, file `path`), while `file`'s
+`pollMs` and every pack field ride a nested `config` object — and rewrites the manifest, keeping the
+console form generic. The panel reloads on success.
+
 ## Phased plan
 
 1. **trigger-inbox** — the §2 inbox schema (on an ADR 0024 datasource) + the §4 dispatcher (persist
