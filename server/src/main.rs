@@ -20298,6 +20298,30 @@ mod clustered_startup_tests {
         panic!("survivors must re-elect a leader for partition {p}");
     }
 
+    /// Blocks until `node` has *observed* a peer as the leader of at least one
+    /// partition (`leader_node_for_create()` is `Some`).
+    ///
+    /// The "leads nothing" forward tests make `node0` lead nothing by shutting
+    /// down its Raft groups. Once shut down those groups stop receiving
+    /// AppendEntries, so `node0` can no longer learn who leads a partition — the
+    /// forward path then relies entirely on the peer-leader view `node0` *already*
+    /// held when it was still a live follower. `boot_rf3_intake_cluster` only
+    /// guarantees "node `p` leads partition `p`"; it does NOT guarantee `node0`
+    /// (a voter/follower for the partitions it doesn't lead) has yet recorded
+    /// their leaders. On a contended CI runner that record can lag, leaving
+    /// `node0` blind after the shutdown and shedding a spurious 503. Waiting for
+    /// the view here — while the groups are still up, so heartbeats keep it
+    /// converging — makes the forward deterministic without touching production.
+    async fn wait_until_observes_peer_leader(node: &ServerImpl) {
+        for _ in 0..LEADER_SHIP_POLL_ITERS {
+            if node.leader_node_for_create().is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("node must observe a peer partition leader before it leads nothing");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn failover_preserves_every_in_flight_instance() {
         // s3-test: quorum-scale survival. Many instances commit through partition
@@ -20632,6 +20656,11 @@ mod clustered_startup_tests {
 
         // Shut down node 0's Raft groups: node 0 now leads nothing, but its
         // ServerImpl and peer uplinks remain alive. Survivors re-elect.
+        //
+        // First wait until node 0 has observed a peer leader while its groups are
+        // still up: once shut down it can no longer learn one, and the forward
+        // relies on the view it already holds (see `wait_until_observes_peer_leader`).
+        wait_until_observes_peer_leader(&node0).await;
         for p in 0..3u64 {
             if let Some(part) = node0.raft_registry().get(p) {
                 part.raft.shutdown().await.ok();
@@ -20776,6 +20805,10 @@ mod clustered_startup_tests {
         use apis::process_instance::CreateProcessInstanceResponse as Resp;
         let (node0, node1, node2) = boot_rf3_intake_cluster().await;
 
+        // Wait until node 0 has observed a peer leader before its groups go down,
+        // so the leads-nothing forward has a target it can no longer learn once
+        // shut down (see `wait_until_observes_peer_leader`).
+        wait_until_observes_peer_leader(&node0).await;
         for p in 0..3u64 {
             if let Some(part) = node0.raft_registry().get(p) {
                 part.raft.shutdown().await.ok();
