@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Badge, Button } from "./ui";
+import { Badge, Button, Input, inputClass } from "./ui";
 import {
+  addTrigger,
   enqueueTriggerEvent,
   getTriggerInbox,
   getTriggers,
@@ -81,6 +82,7 @@ function TriggersTab({ name }: { name: string }) {
   const [data, setData] = useState<TriggersResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [showAdd, setShowAdd] = useState(false);
 
   const load = useCallback(async () => {
     setLoadError(null);
@@ -106,51 +108,78 @@ function TriggersTab({ name }: { name: string }) {
   }
   if (!data) return null;
 
-  if (data.triggers.length === 0) {
-    return (
-      <div className="flex h-full items-center justify-center p-8 text-center text-sm text-fg-faint">
-        <div>
-          <p className="font-medium text-fg-muted">No triggers declared.</p>
-          <p className="mt-1">
-            Add a <code className="text-fg-muted">triggers</code> block to{" "}
-            <code className="text-fg-muted">nano.app.json</code> (ADR 0025) to make this App act on a
-            schedule, a webhook, or a file change.
-          </p>
-        </div>
-      </div>
-    );
-  }
+  const header = (
+    <div className="flex items-center gap-2 px-4 pt-4">
+      <span className="text-xs text-fg-faint">
+        {data.triggers.length} trigger{data.triggers.length === 1 ? "" : "s"}
+      </span>
+      <div className="flex-1" />
+      <Button size="sm" variant="primary" onClick={() => setShowAdd(true)}>
+        ＋ Add trigger
+      </Button>
+    </div>
+  );
 
   return (
-    <div className="flex flex-col gap-4 p-4">
-      {data.errors.length > 0 && (
-        <div className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
-          <p className="font-semibold">Source configuration errors</p>
-          <ul className="mt-1 list-disc pl-4">
-            {data.errors.map((e, i) => (
-              <li key={i}>{e}</li>
-            ))}
-          </ul>
+    <div className="flex flex-col">
+      {header}
+      {data.triggers.length === 0 ? (
+        <div className="flex items-center justify-center p-8 text-center text-sm text-fg-faint">
+          <div>
+            <p className="font-medium text-fg-muted">No triggers declared.</p>
+            <p className="mt-1">
+              Click <span className="font-medium text-fg-muted">Add trigger</span> to wire this App
+              to a schedule, a webhook, or a file change — or add a{" "}
+              <code className="text-fg-muted">triggers</code> block to{" "}
+              <code className="text-fg-muted">nano.app.json</code> by hand (ADR 0025).
+            </p>
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-col gap-4 p-4">
+          {data.errors.length > 0 && (
+            <div className="rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+              <p className="font-semibold">Source configuration errors</p>
+              <ul className="mt-1 list-disc pl-4">
+                {data.errors.map((e, i) => (
+                  <li key={i}>{e}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <table className="w-full border-collapse text-sm">
+            <thead>
+              <tr className="border-b border-edge text-left text-xs uppercase tracking-wider text-fg-faint">
+                <th className="px-2 py-1.5 font-medium">Trigger</th>
+                <th className="px-2 py-1.5 font-medium">Source</th>
+                <th className="px-2 py-1.5 font-medium">Action</th>
+                <th className="px-2 py-1.5 font-medium text-right">Run</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.triggers.map((t) => (
+                <TriggerRow key={t.id} name={name} trigger={t} />
+              ))}
+            </tbody>
+          </table>
+
+          <SourceRegistry sources={data.sources} onRefresh={() => void load()} />
         </div>
       )}
 
-      <table className="w-full border-collapse text-sm">
-        <thead>
-          <tr className="border-b border-edge text-left text-xs uppercase tracking-wider text-fg-faint">
-            <th className="px-2 py-1.5 font-medium">Trigger</th>
-            <th className="px-2 py-1.5 font-medium">Source</th>
-            <th className="px-2 py-1.5 font-medium">Action</th>
-            <th className="px-2 py-1.5 font-medium text-right">Run</th>
-          </tr>
-        </thead>
-        <tbody>
-          {data.triggers.map((t) => (
-            <TriggerRow key={t.id} name={name} trigger={t} />
-          ))}
-        </tbody>
-      </table>
-
-      <SourceRegistry sources={data.sources} onRefresh={() => void load()} />
+      {showAdd && (
+        <AddTriggerDialog
+          name={name}
+          sources={data.sources}
+          existingIds={data.triggers.map((t) => t.id)}
+          onClose={() => setShowAdd(false)}
+          onAdded={() => {
+            setShowAdd(false);
+            void load();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -298,6 +327,225 @@ function SourceRegistry({
         </div>
       )}
     </div>
+  );
+}
+
+// --- Add trigger dialog -----------------------------------------------------
+
+/** A lightweight centered modal (mirrors the Data panel's New Table dialog). */
+function Modal({
+  title,
+  onClose,
+  children,
+  footer,
+}: {
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+  footer: ReactNode;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[85vh] w-full max-w-lg flex-col overflow-hidden rounded-lg border border-edge bg-panel shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-edge px-4 py-2.5">
+          <h2 className="text-sm font-semibold text-fg">{title}</h2>
+          <button
+            onClick={onClose}
+            className="rounded p-1 text-fg-faint hover:bg-hover"
+            title="Close"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto p-4">{children}</div>
+        <div className="flex items-center justify-end gap-2 border-t border-edge px-4 py-2.5">
+          {footer}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+type ActionKind = "start" | "message";
+
+/**
+ * Encapsulates wiring a trigger as a form (the Delphi-style affordance): pick a
+ * source kind, fill its declared config fields, choose an action, and POST to
+ * the manifest — no hand-editing `nano.app.json`. The server (`add_trigger`)
+ * places each field into the shape the kind expects.
+ */
+function AddTriggerDialog({
+  name,
+  sources,
+  existingIds,
+  onClose,
+  onAdded,
+}: {
+  name: string;
+  sources: SourceKindInfo[];
+  existingIds: string[];
+  onClose: () => void;
+  onAdded: () => void;
+}) {
+  const [id, setId] = useState("");
+  const [kind, setKind] = useState(sources[0]?.kind ?? "");
+  const [config, setConfig] = useState<Record<string, string>>({});
+  const [connection, setConnection] = useState("");
+  const [actionKind, setActionKind] = useState<ActionKind>("start");
+  const [actionValue, setActionValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const source = useMemo(() => sources.find((s) => s.kind === kind), [sources, kind]);
+  const fields = source?.configFields ?? [];
+
+  const setField = (key: string, value: string) =>
+    setConfig((c) => ({ ...c, [key]: value }));
+
+  const idTaken = existingIds.includes(id.trim());
+  const missingRequired = fields.some(
+    (f) => f.required && !(config[f.key] ?? "").trim(),
+  );
+  const canSubmit =
+    id.trim() !== "" && !idTaken && kind !== "" && actionValue.trim() !== "" && !missingRequired;
+
+  const submit = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    const cfg: Record<string, string> = {};
+    for (const f of fields) {
+      const v = (config[f.key] ?? "").trim();
+      if (v !== "") cfg[f.key] = v;
+    }
+    try {
+      await addTrigger({
+        path: { name },
+        body: {
+          id: id.trim(),
+          type: kind,
+          config: Object.keys(cfg).length ? cfg : undefined,
+          connection: connection.trim() || undefined,
+          action: { [actionKind]: actionValue.trim() },
+        },
+        throwOnError: true,
+      });
+      onAdded();
+    } catch (e) {
+      setError(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [fields, config, name, id, kind, connection, actionKind, actionValue, onAdded]);
+
+  return (
+    <Modal
+      title="Add trigger"
+      onClose={onClose}
+      footer={
+        <>
+          {error && <span className="mr-auto text-xs text-danger">{error}</span>}
+          <Button size="sm" variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            size="sm"
+            variant="primary"
+            disabled={!canSubmit || busy}
+            onClick={() => void submit()}
+          >
+            {busy ? "Adding…" : "Add trigger"}
+          </Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-3">
+        <label className="flex flex-col gap-1 text-xs text-fg-faint">
+          Trigger id
+          <Input
+            value={id}
+            onChange={(e) => setId(e.target.value)}
+            placeholder="e.g. nightly-report"
+            spellCheck={false}
+          />
+          {idTaken && <span className="text-danger">A trigger with this id already exists.</span>}
+        </label>
+
+        <label className="flex flex-col gap-1 text-xs text-fg-faint">
+          Source kind
+          <select
+            value={kind}
+            onChange={(e) => {
+              setKind(e.target.value);
+              setConfig({});
+            }}
+            className={inputClass}
+          >
+            {sources.map((s) => (
+              <option key={s.kind} value={s.kind}>
+                {s.kind}
+                {s.displayName ? ` — ${s.displayName}` : ""}
+                {s.builtin ? " (core)" : " (pack)"}
+              </option>
+            ))}
+          </select>
+        </label>
+
+        {fields.map((f) => (
+          <label key={f.key} className="flex flex-col gap-1 text-xs text-fg-faint">
+            <span>
+              {f.label}
+              {f.required && <span className="text-danger"> *</span>}
+            </span>
+            <Input
+              value={config[f.key] ?? ""}
+              onChange={(e) => setField(f.key, e.target.value)}
+              placeholder={f.default ?? ""}
+              spellCheck={false}
+            />
+            {f.description && <span className="text-fg-faint/80">{f.description}</span>}
+          </label>
+        ))}
+
+        {source && !source.builtin && (
+          <label className="flex flex-col gap-1 text-xs text-fg-faint">
+            Connection (optional)
+            <Input
+              value={connection}
+              onChange={(e) => setConnection(e.target.value)}
+              placeholder="named connection reference"
+              spellCheck={false}
+            />
+          </label>
+        )}
+
+        <div className="mt-1 border-t border-edge pt-3">
+          <p className="mb-2 text-xs font-semibold text-fg-muted">Action</p>
+          <div className="flex gap-2">
+            <select
+              value={actionKind}
+              onChange={(e) => setActionKind(e.target.value as ActionKind)}
+              className={`${inputClass} w-40 shrink-0`}
+            >
+              <option value="start">Start process</option>
+              <option value="message">Publish message</option>
+            </select>
+            <Input
+              value={actionValue}
+              onChange={(e) => setActionValue(e.target.value)}
+              placeholder={actionKind === "start" ? "process id" : "message name"}
+              spellCheck={false}
+              className="flex-1"
+            />
+          </div>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

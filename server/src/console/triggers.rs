@@ -752,11 +752,163 @@ pub(crate) async fn triggers_overview(project: &str) -> Result<Json, TriggerErro
                 "kind": k,
                 "builtin": super::trigger_sources::is_builtin(k),
                 "displayName": super::trigger_sources::display_name(k),
+                "configFields": config_fields_json(k),
             })
         })
         .collect();
 
     Ok(json!({ "triggers": triggers, "sources": sources, "errors": errors }))
+}
+
+/// The config fields the console's Add-trigger form renders for a source `kind`:
+/// the core kinds' known manifest keys, or a pack's declared `configFields`.
+fn config_fields_json(kind: &str) -> Vec<Json> {
+    let field = |key: &str, label: &str, desc: &str, required: bool| json!({ "key": key, "label": label, "description": desc, "default": Json::Null, "required": required });
+    match kind {
+        "cron" => vec![
+            field(
+                "spec",
+                "Cron expression",
+                "5-field crontab, e.g. */5 * * * *",
+                true,
+            ),
+            field(
+                "onMissed",
+                "On missed",
+                "catchup or skip (default skip)",
+                false,
+            ),
+        ],
+        "file" => vec![
+            field("path", "Path to watch", "A file or directory path", true),
+            field(
+                "pollMs",
+                "Poll interval (ms)",
+                "How often to poll (default 1000)",
+                false,
+            ),
+        ],
+        // webhook and manual take no source config (webhook's ingress path is the
+        // trigger id); pack kinds contribute their own declared fields.
+        "webhook" | "manual" => vec![],
+        _ => super::extensions::all_trigger_sources()
+            .into_iter()
+            .find(|s| s.kind == kind)
+            .map(|s| {
+                s.config_fields
+                    .into_iter()
+                    .map(|f| {
+                        json!({
+                            "key": f.key,
+                            "label": f.label,
+                            "description": f.description,
+                            "default": f.default,
+                            "required": false,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// Append a trigger to the App manifest's `triggers[]` and persist it. Places the
+/// supplied flat `config` map into the shape each source kind expects (core kinds
+/// read some keys at the trigger's top level; pack kinds read a nested `config`).
+pub(crate) fn add_trigger(
+    project: &str,
+    id: &str,
+    kind: &str,
+    config: &std::collections::BTreeMap<String, String>,
+    connection: Option<&str>,
+    action: &Json,
+) -> Result<(), TriggerError> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(TriggerError::Manifest("trigger id is required".into()));
+    }
+    if kind.trim().is_empty() {
+        return Err(TriggerError::Manifest(
+            "trigger type (source kind) is required".into(),
+        ));
+    }
+    if !super::trigger_sources::known_kinds().contains(kind) {
+        return Err(TriggerError::Manifest(format!(
+            "unknown source kind '{kind}' — install its pack or pick a recognised kind"
+        )));
+    }
+    if !action.is_object() || action.as_object().map(|o| o.is_empty()).unwrap_or(true) {
+        return Err(TriggerError::Manifest(
+            "an action is required (e.g. start a process or publish a message)".into(),
+        ));
+    }
+
+    let mut manifest = read_manifest(project)?;
+    let triggers = manifest
+        .as_object_mut()
+        .ok_or_else(|| TriggerError::Manifest("nano.app.json is not a JSON object".into()))?
+        .entry("triggers")
+        .or_insert_with(|| Json::Array(vec![]));
+    let arr = triggers
+        .as_array_mut()
+        .ok_or_else(|| TriggerError::Manifest("manifest 'triggers' is not an array".into()))?;
+    if arr
+        .iter()
+        .any(|t| t.get("id").and_then(Json::as_str) == Some(id))
+    {
+        return Err(TriggerError::Manifest(format!(
+            "a trigger with id '{id}' already exists"
+        )));
+    }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".into(), json!(id));
+    obj.insert("type".into(), json!(kind));
+
+    // Field placement: core kinds read some keys at the top level; everything
+    // else (incl. pack kinds) rides a nested `config` object. Empty values are
+    // dropped so the manifest stays clean.
+    let mut nested = serde_json::Map::new();
+    for (k, v) in config {
+        let v = v.trim();
+        if v.is_empty() {
+            continue;
+        }
+        let top_level = matches!(
+            (kind, k.as_str()),
+            ("cron", "spec") | ("cron", "onMissed") | ("file", "path")
+        );
+        if kind == "file" && k == "pollMs" {
+            if let Ok(n) = v.parse::<u64>() {
+                nested.insert("pollMs".into(), json!(n));
+            }
+        } else if top_level {
+            obj.insert(k.clone(), json!(v));
+        } else {
+            nested.insert(k.clone(), json!(v));
+        }
+    }
+    if !nested.is_empty() {
+        obj.insert("config".into(), Json::Object(nested));
+    }
+    if let Some(c) = connection.map(str::trim).filter(|c| !c.is_empty()) {
+        obj.insert("connection".into(), json!(c));
+    }
+    obj.insert("action".into(), action.clone());
+
+    arr.push(Json::Object(obj));
+    write_manifest(project, &manifest)?;
+    Ok(())
+}
+
+/// Persist the App manifest, pretty-printed (nano.app.json is strict JSON).
+fn write_manifest(project: &str, manifest: &Json) -> Result<(), TriggerError> {
+    let dir = projects::project_dir(project)
+        .ok_or_else(|| TriggerError::Manifest("invalid project name".to_string()))?;
+    let text = serde_json::to_string_pretty(manifest)
+        .map_err(|e| TriggerError::Manifest(format!("could not serialize manifest: {e}")))?;
+    std::fs::write(dir.join("nano.app.json"), format!("{text}\n"))
+        .map_err(|e| TriggerError::Apply(format!("could not write nano.app.json: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -1522,5 +1674,95 @@ await new Promise((r) => setTimeout(r, 60000));
         unsafe {
             std::env::remove_var(var);
         }
+    }
+
+    // --- add_trigger (console "Add trigger" form) -------------------------
+
+    fn cfg(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn add_trigger_places_cron_spec_top_level_and_appends() {
+        let _g = lock();
+        let name = setup_app("");
+        add_trigger(
+            &name,
+            "nightly",
+            "cron",
+            &cfg(&[("spec", "0 0 * * *"), ("onMissed", "skip")]),
+            None,
+            &json!({ "start": "cleanup" }),
+        )
+        .expect("add");
+        let manifest = read_manifest(&name).unwrap();
+        let t = &manifest["triggers"].as_array().unwrap()[0];
+        assert_eq!(t["id"], json!("nightly"));
+        assert_eq!(t["type"], json!("cron"));
+        assert_eq!(t["spec"], json!("0 0 * * *"));
+        assert_eq!(t["onMissed"], json!("skip"));
+        assert_eq!(t["action"], json!({ "start": "cleanup" }));
+        assert!(t.get("config").is_none());
+    }
+
+    #[test]
+    fn add_trigger_places_file_path_top_level_and_pollms_nested() {
+        let _g = lock();
+        let name = setup_app("");
+        add_trigger(
+            &name,
+            "watch",
+            "file",
+            &cfg(&[("path", "/tmp/in"), ("pollMs", "500")]),
+            None,
+            &json!({ "message": "file-seen" }),
+        )
+        .expect("add");
+        let manifest = read_manifest(&name).unwrap();
+        let t = &manifest["triggers"].as_array().unwrap()[0];
+        assert_eq!(t["path"], json!("/tmp/in"));
+        assert_eq!(t["config"]["pollMs"], json!(500));
+    }
+
+    #[test]
+    fn add_trigger_rejects_duplicate_id() {
+        let _g = lock();
+        let name = setup_app(
+            r#", "triggers": [ { "id": "dup", "type": "manual", "action": { "start": "p" } } ]"#,
+        );
+        let err = add_trigger(
+            &name,
+            "dup",
+            "manual",
+            &cfg(&[]),
+            None,
+            &json!({ "start": "p" }),
+        )
+        .unwrap_err();
+        assert!(matches!(err, TriggerError::Manifest(_)));
+    }
+
+    #[test]
+    fn add_trigger_rejects_unknown_kind_and_empty_action() {
+        let _g = lock();
+        let name = setup_app("");
+        assert!(matches!(
+            add_trigger(
+                &name,
+                "x",
+                "no-such-kind",
+                &cfg(&[]),
+                None,
+                &json!({ "start": "p" })
+            ),
+            Err(TriggerError::Manifest(_))
+        ));
+        assert!(matches!(
+            add_trigger(&name, "x", "manual", &cfg(&[]), None, &json!({})),
+            Err(TriggerError::Manifest(_))
+        ));
     }
 }
