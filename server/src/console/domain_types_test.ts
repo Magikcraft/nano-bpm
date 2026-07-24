@@ -45,7 +45,7 @@ Deno.test("emitDomainDts renders interfaces + a DomainTables map", () => {
   const tables: TableMeta[] = [
     {
       name: "customers",
-      indexes: [],
+      indexes: [], foreignKeys: [],
       columns: [
         { name: "id", type: "INTEGER", primaryKey: true, notNull: false },
         { name: "name", type: "TEXT", primaryKey: false, notNull: true },
@@ -68,7 +68,7 @@ Deno.test("emitDomainDts quotes non-identifier column names", () => {
   const dts = emitDomainDts([
     {
       name: "t",
-      indexes: [],
+      indexes: [], foreignKeys: [],
       columns: [{ name: "first name", type: "TEXT", primaryKey: false, notNull: true }],
     },
   ]);
@@ -82,7 +82,7 @@ Deno.test("emitDomainDts handles an empty schema", () => {
 Deno.test("emitDomainDtsForSources is byte-identical to emitDomainDts for one source", () => {
   const tables: TableMeta[] = [{
     name: "customers",
-    indexes: [],
+    indexes: [], foreignKeys: [],
     columns: [
       { name: "id", type: "INTEGER", primaryKey: true, notNull: false },
       { name: "name", type: "TEXT", primaryKey: false, notNull: true },
@@ -99,12 +99,12 @@ Deno.test("emitDomainDtsForSources is byte-identical to emitDomainDts for one so
 Deno.test("emitDomainDtsForSources unions sources + resolves name collisions", () => {
   const customers: TableMeta[] = [{
     name: "customers",
-    indexes: [],
+    indexes: [], foreignKeys: [],
     columns: [{ name: "id", type: "INTEGER", primaryKey: true, notNull: false }],
   }];
   const events: TableMeta[] = [{
     name: "customers", // same table name in a different source
-    indexes: [],
+    indexes: [], foreignKeys: [],
     columns: [{ name: "at", type: "TIMESTAMP", primaryKey: false, notNull: true }],
   }];
   const dts = emitDomainDtsForSources(
@@ -127,7 +127,7 @@ Deno.test("emitDomainDtsForSources unions sources + resolves name collisions", (
 Deno.test("emitDomainDtsForSources emits an empty object for a source with no tables", () => {
   const dts = emitDomainDtsForSources(
     [
-      { source: "app", tables: [{ name: "t", indexes: [], columns: [{ name: "id", type: "INTEGER", primaryKey: true, notNull: false }] }] },
+      { source: "app", tables: [{ name: "t", indexes: [], foreignKeys: [], columns: [{ name: "id", type: "INTEGER", primaryKey: true, notNull: false }] }] },
       { source: "empty", tables: [] },
     ],
     "app",
@@ -177,7 +177,7 @@ Deno.test("emitDomainTypeRegistry is empty for an empty registry", () => {
 Deno.test("emitDomainModel appends the registry to the table spine", () => {
   const tables: TableMeta[] = [{
     name: "customers",
-    indexes: [],
+    indexes: [], foreignKeys: [],
     columns: [{ name: "id", type: "INTEGER", primaryKey: true, notNull: false }],
   }];
   // No declared types → byte-identical to the table-only spine.

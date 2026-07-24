@@ -4073,6 +4073,7 @@ mod tests {
         std::fs::write(
             dir.join("db/migrations/001_init.sql"),
             "CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n\
+             CREATE TABLE lines (id INTEGER PRIMARY KEY, order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE);\n\
              INSERT INTO orders (name) VALUES ('first');",
         )
         .unwrap();
@@ -4108,6 +4109,20 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         assert!(tables.contains(&"orders".to_string()));
+
+        // schema also surfaces foreign keys (ADR 0024 structure-editor support):
+        // the `lines.order_id` FK targets `orders(id)` with ON DELETE CASCADE.
+        let lines = sc["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "lines")
+            .expect("lines table");
+        let fk = &lines["foreignKeys"][0];
+        assert_eq!(fk["column"], "order_id");
+        assert_eq!(fk["refTable"], "orders");
+        assert_eq!(fk["refColumn"], "id");
+        assert_eq!(fk["onDelete"], "CASCADE");
 
         // exec + query roundtrip a parameterised insert.
         let ex = run_data_op(
