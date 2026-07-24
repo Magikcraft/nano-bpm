@@ -222,6 +222,23 @@ impl apis::extensions::Extensions for ServerImpl {
         Ok(apis::extensions::GetMarketplaceResponse::Status200_MarketplaceListing(from_val(v)))
     }
 
+    async fn get_extension_readme(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        query_params: &models::GetExtensionReadmeQueryParams,
+    ) -> Result<apis::extensions::GetExtensionReadmeResponse, ()> {
+        match super::extensions_readme(query_params.pkg.clone()).await {
+            Ok(v) => {
+                Ok(apis::extensions::GetExtensionReadmeResponse::Status200_PackREADME(from_val(v)))
+            }
+            Err((_, msg)) => {
+                Ok(apis::extensions::GetExtensionReadmeResponse::Status404_NotFound(msg))
+            }
+        }
+    }
+
     async fn install_extension(
         &self,
         _method: &Method,

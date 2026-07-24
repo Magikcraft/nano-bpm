@@ -633,7 +633,7 @@ export type MarketEntry = {
     name: string;
     version: string;
     description: string;
-    category: 'lang' | 'app' | 'example' | 'theme' | 'other';
+    category: 'lang' | 'app' | 'example' | 'theme' | 'trigger' | 'other';
     installed: boolean;
     installedVersion?: string;
     updateAvailable: boolean;
@@ -641,6 +641,18 @@ export type MarketEntry = {
 
 export type Marketplace = {
     entries: Array<MarketEntry>;
+};
+
+export type ExtensionReadme = {
+    pkg: string;
+    /**
+     * The pack's README as raw markdown.
+     */
+    readme: string;
+    /**
+     * True when the README came from an installed pack (vs npm).
+     */
+    installed: boolean;
 };
 
 export type ServerUpdateStatus = {
@@ -2399,6 +2411,36 @@ export type GetMarketplaceResponses = {
 };
 
 export type GetMarketplaceResponse = GetMarketplaceResponses[keyof GetMarketplaceResponses];
+
+export type GetExtensionReadmeData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * The npm package name (e.g. `@nanobpm/nano-ide-trigger-mqtt`).
+         */
+        pkg: string;
+    };
+    url: '/extensions/readme';
+};
+
+export type GetExtensionReadmeErrors = {
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type GetExtensionReadmeError = GetExtensionReadmeErrors[keyof GetExtensionReadmeErrors];
+
+export type GetExtensionReadmeResponses = {
+    /**
+     * Pack README
+     */
+    200: ExtensionReadme;
+};
+
+export type GetExtensionReadmeResponse = GetExtensionReadmeResponses[keyof GetExtensionReadmeResponses];
 
 export type InstallExtensionData = {
     body: ExtPkgRequest;
