@@ -20,8 +20,9 @@
 //   rows[0].tier          // string | null — checked while authoring
 //
 // The manifest `types` registry (ADR 0029 §4.2, transient/non-persisted shapes)
-// is the *other* source; merging it in is the documented follow-up (see the ADR
-// delta) — this spike reifies the table spine.
+// is the *other* source: `emitDomainTypeRegistry` renders it as a `DomainTypes`
+// map keyed by type id, and `emitDomainModel` composes the table spine + the
+// registry into the single generated file.
 //
 // This module is a **pure emitter**: it imports only the `TableMeta`/`ColumnMeta`
 // *types* from the data SDK (a type-only import, erased at runtime), so it is
@@ -181,4 +182,92 @@ export function emitDomainDtsForSources(
     `export interface DomainSources {\n${sourceMap}\n}\n\n` +
     `/** The default datasource's tables — index by wire name. */\n` +
     `export type DomainTables = DomainSources[${JSON.stringify(def)}];\n`;
+}
+
+// --- manifest `types` registry (ADR 0029 §4.2) ------------------------------
+
+/** One field of a declared domain type in the manifest `types` registry. */
+export interface DomainFieldDef {
+  /** A primitive keyword or the id of another registry type (nominal ref). */
+  type: string;
+  optional?: boolean;
+  list?: boolean;
+}
+
+/** A declared (transient) domain record type from the manifest `types` block. */
+export interface DomainTypeDef {
+  name?: string;
+  match?: string;
+  table?: string;
+  fields: Record<string, DomainFieldDef>;
+}
+
+/** The manifest `types` registry: type id → declared record type. */
+export type DomainTypeRegistry = Record<string, DomainTypeDef>;
+
+/** Manifest primitive field keywords → TS types (ADR 0029 §4.2 / schema). */
+const PRIMITIVE_TS: Record<string, string> = {
+  string: "string",
+  number: "number",
+  integer: "number",
+  boolean: "boolean",
+  date: "string",
+  datetime: "string",
+  json: "unknown",
+};
+
+/**
+ * The TS type for a registry field. A primitive keyword maps directly (and takes
+ * precedence over an identically named type, per the schema); anything else is a
+ * nominal reference to another registry type, emitted as an indexed access into
+ * `DomainTypes` (self-contained, so no top-level interface names can collide with
+ * table interfaces). An unresolved reference degrades to `unknown`. `list` wraps
+ * the base type in `[]`.
+ */
+function fieldTsType(field: DomainFieldDef, ids: Set<string>): string {
+  const base = PRIMITIVE_TS[field.type] ??
+    (ids.has(field.type) ? `DomainTypes[${JSON.stringify(field.type)}]` : "unknown");
+  return field.list ? `${base}[]` : base;
+}
+
+/**
+ * Emit the `DomainTypes` block for the manifest `types` registry: an inline map
+ * keyed by type id, so a worker/form types against `DomainTypes["taxSubmission"]`
+ * exactly as it types against `DomainTables["customers"]`. Returns `""` when the
+ * registry is empty, so the table spine stays byte-identical when no types are
+ * declared. Field references resolve to `DomainTypes[<id>]`; `optional` widens
+ * the key with `?`.
+ */
+export function emitDomainTypeRegistry(types: DomainTypeRegistry): string {
+  const ids = new Set(Object.keys(types));
+  if (ids.size === 0) return "";
+  const entries = Object.entries(types)
+    .map(([id, def]) => {
+      const fields = Object.entries(def.fields ?? {})
+        .map(([fname, field]) => {
+          const key = isIdent(fname) ? fname : JSON.stringify(fname);
+          const opt = field.optional ? "?" : "";
+          return `    ${key}${opt}: ${fieldTsType(field, ids)};`;
+        })
+        .join("\n");
+      const body = fields.length > 0 ? `{\n${fields}\n  }` : "{}";
+      return `  ${JSON.stringify(id)}: ${body};`;
+    })
+    .join("\n");
+  return `/** Declared (transient) domain types from the manifest \`types\` registry (ADR 0029 §4.2), keyed by id. */\nexport interface DomainTypes {\n${entries}\n}\n`;
+}
+
+/**
+ * Compose the full `domain.d.ts`: the datasource table spine (every source,
+ * ADR 0029 §6) followed by the manifest `types` registry (§4.2). This is the
+ * single entry point the `domaintypes` op uses.
+ */
+export function emitDomainModel(
+  sources: SourceSchema[],
+  defaultSource: string | undefined,
+  types: DomainTypeRegistry,
+): string {
+  const spine = emitDomainDtsForSources(sources, defaultSource);
+  const registry = emitDomainTypeRegistry(types);
+  return registry ? `${spine}\n${registry}` : spine;
 }

@@ -21,8 +21,13 @@
 //   op = "sources" | "schema" | "query" | "exec" | "script" | "migrations"
 //      | "migrate" | "domaintypes"
 
-import { listSources, openDataSource } from "./data-sdk.ts";
-import { DOMAIN_DTS, emitDomainDtsForSources, type SourceSchema } from "./domain-types.ts";
+import { listSources, manifestTypes, openDataSource } from "./data-sdk.ts";
+import {
+  DOMAIN_DTS,
+  type DomainTypeRegistry,
+  emitDomainModel,
+  type SourceSchema,
+} from "./domain-types.ts";
 
 interface Request {
   op: string;
@@ -285,10 +290,11 @@ async function run(req: Request): Promise<unknown> {
       return { applied, pending: 0 };
     }
     case "domaintypes": {
-      // ADR 0029 §4.1/§6: reify the datasource schemas into TypeScript. Union
-      // *every* declared datasource (not just the default/selected one) so an
-      // App with multiple databases gets one complete domain model, emit
-      // `domain.d.ts`, and (unless `write:false`) materialise it to
+      // ADR 0029 §4.1/§4.2/§6: reify the domain model into TypeScript. Union
+      // *every* declared datasource (the table spine) and fold in the manifest
+      // `types` registry (transient/non-persisted shapes) so an App with
+      // multiple databases plus declared types gets one complete domain model,
+      // emit `domain.d.ts`, and (unless `write:false`) materialise it to
       // `.nanobpm/domain.d.ts` next to the SDK so workers type against the live
       // DBs. cwd is the project root, so the relative path lands in the project.
       const { default: def, sources } = await listSources();
@@ -301,7 +307,8 @@ async function run(req: Request): Promise<unknown> {
           db.close();
         }
       }
-      const text = emitDomainDtsForSources(schemas, def);
+      const types = await manifestTypes() as DomainTypeRegistry;
+      const text = emitDomainModel(schemas, def, types);
       let path: string | null = null;
       if (req.write !== false) {
         await RT.mkdir(".nanobpm");
