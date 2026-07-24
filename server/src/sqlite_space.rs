@@ -11,13 +11,31 @@
 //! duplicates the knowledge:
 //!
 //! * [`page_stats`] — O(1) `(file_bytes, live_bytes)` accounting from the header.
+//! * [`freelist_bytes`] — O(1) reclaimable-bytes accounting (`file − live`).
 //! * [`enable_incremental_auto_vacuum`] — puts a store into `INCREMENTAL`
 //!   auto-vacuum mode so freed pages land on a reclaimable freelist.
-//! * [`reclaim_freelist`] — returns freelist pages to the OS via
-//!   `incremental_vacuum` and truncates the WAL, gated on a byte threshold so it
-//!   runs only when there is meaningful space to reclaim.
+//! * [`reclaim_freelist_step`] — returns *up to `max_pages`* freelist pages to the
+//!   OS via a bounded `incremental_vacuum`, plus a WAL truncate. Bounded so a caller
+//!   can drain a large freelist cooperatively (releasing its lock between passes)
+//!   instead of blocking on one long copy-back; pass `max_pages == 0` for a full
+//!   one-shot drain (used where blocking is acceptable, e.g. tests/shutdown).
+//! * [`freelist_bytes`] — reports the currently reclaimable freelist size, the
+//!   signal the background reclaim worker gates on.
+//!
+//! The reclaim primitives are deliberately fsync-heavy (checkpoint + copy-back), so
+//! callers must keep them **off any latency-critical path**: on a shared disk the
+//! fsyncs contend with the engine's raft-log fsync and can trip its saturation
+//! guard. [`crate::varspill`] therefore drives them from a background thread that
+//! only fires while the store is quiescent.
 
 use rusqlite::Connection;
+
+/// Freelist bytes currently reclaimable: `file_bytes − live_bytes` (see
+/// [`page_stats`]). O(1) header reads, cheap enough to poll.
+pub fn freelist_bytes(conn: &Connection) -> u64 {
+    let (file, live) = page_stats(conn);
+    file.saturating_sub(live)
+}
 
 /// Reads a SQLite database's size as `(file_bytes, live_bytes)` from its header:
 /// `file_bytes = page_count × page_size` (the whole allocated file, freelist
@@ -41,7 +59,7 @@ pub fn page_stats(conn: &Connection) -> (u64, u64) {
 }
 
 /// Puts `conn` into `INCREMENTAL` auto-vacuum mode so that deleted rows move their
-/// pages onto a freelist that [`reclaim_freelist`] can later return to the OS.
+/// pages onto a freelist that [`reclaim_freelist_step`] can later return to the OS.
 ///
 /// Setting the pragma only *records* the request; the accompanying `VACUUM`
 /// rewrites the database to install the auto-vacuum pointer map and actually switch
@@ -55,39 +73,39 @@ pub fn enable_incremental_auto_vacuum(conn: &Connection) -> rusqlite::Result<()>
     Ok(())
 }
 
-/// Returns freelist pages to the OS when at least `threshold_bytes` are reclaimable,
-/// otherwise a no-op. Runs `PRAGMA incremental_vacuum` (moves freelist pages out of
-/// the main database file — requires [`enable_incremental_auto_vacuum`]) followed by
-/// a `wal_checkpoint(TRUNCATE)` so the freed space actually leaves the `-wal`
-/// sidecar and the main file shrinks on disk. Returns the number of bytes reclaimed
-/// from the file (0 if the gate was not met).
+/// Reclaims freelist pages to the OS in a **single bounded pass**: at most
+/// `max_pages` pages are moved out of the main file (`max_pages == 0` means "all
+/// reclaimable pages", i.e. a full drain). Returns the bytes the file shrank by.
 ///
-/// Gating avoids a per-delete `incremental_vacuum`/checkpoint storm: it fires only
-/// once enough space has accumulated to be worth a full copy-back, so in steady
-/// state (bounded live set) it rarely runs at all, and it caps the file at roughly
-/// `live + threshold` rather than the historical peak.
-pub fn reclaim_freelist(conn: &Connection, threshold_bytes: u64) -> rusqlite::Result<u64> {
-    let (file_before, live) = page_stats(conn);
-    if file_before.saturating_sub(live) < threshold_bytes {
-        return Ok(0);
-    }
-    // In WAL mode the pages freed by the just-committed eviction transaction live
-    // in the `-wal` sidecar until a checkpoint copies them into the main database;
-    // `incremental_vacuum` can only truncate pages that are already in the main
-    // file. So checkpoint first (land the frees), then vacuum (move freed pages off
-    // the end and shrink the main file), then checkpoint again to flush the
-    // truncation out of the WAL. Checkpoints are best-effort — a concurrent reader
-    // can hold TRUNCATE back, which is fine: the next reclaim retries.
+/// Sequence (WAL-mode safe): the pages freed by prior committed deletes live in the
+/// `-wal` sidecar until a checkpoint copies them into the main database, and
+/// `incremental_vacuum` can only truncate pages already in the main file — so we
+/// `wal_checkpoint(TRUNCATE)` first (land the frees), then vacuum (move freed pages
+/// off the end and shrink the main file), then checkpoint again to flush the
+/// truncation out of the WAL. Checkpoints are best-effort: a concurrent reader can
+/// hold TRUNCATE back, which is fine — the next pass retries.
+///
+/// **Bounded on purpose.** `PRAGMA incremental_vacuum(N)` frees pages as the
+/// statement is *stepped*, and rusqlite's `execute*`/`execute_batch` step a
+/// no-result pragma only once (freeing a single page); driving a prepared statement
+/// to completion frees the requested `N` (or all, when unbounded), the way the
+/// sqlite3 CLI's exec loop does. Capping `N` lets a caller drain a huge freelist
+/// across several short passes, releasing its connection lock between them, rather
+/// than holding it for one multi-second copy-back.
+///
+/// This is fsync-heavy — **never call it on a latency-critical path.**
+pub fn reclaim_freelist_step(conn: &Connection, max_pages: u32) -> rusqlite::Result<u64> {
+    let (file_before, _) = page_stats(conn);
     let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| {
         Ok::<_, rusqlite::Error>(())
     });
-    // Reclaim the whole freelist. `PRAGMA incremental_vacuum` frees pages as the
-    // statement is *stepped*, and rusqlite's `execute*`/`execute_batch` step a
-    // no-result pragma only once (freeing a single page). Driving a prepared
-    // statement to completion frees every reclaimable page in one call, the way the
-    // sqlite3 CLI's exec loop does.
+    let sql = if max_pages == 0 {
+        "PRAGMA incremental_vacuum".to_string()
+    } else {
+        format!("PRAGMA incremental_vacuum({max_pages})")
+    };
     {
-        let mut stmt = conn.prepare("PRAGMA incremental_vacuum")?;
+        let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query([])?;
         while rows.next()?.is_some() {}
     }
@@ -135,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_shrinks_file_when_gate_met() {
+    fn full_drain_shrinks_file_to_live_set() {
         let conn = open_incremental();
         let blob = "x".repeat(4096);
         for k in 0..2000 {
@@ -144,8 +162,9 @@ mod tests {
         }
         let (file_peak, _) = page_stats(&conn);
         conn.execute("DELETE FROM t", []).unwrap();
-        // Gate at 1 byte so any freelist triggers the reclaim.
-        let reclaimed = reclaim_freelist(&conn, 1).unwrap();
+        assert!(freelist_bytes(&conn) > 0, "deletes populate the freelist");
+        // max_pages == 0 => full drain in one call.
+        let reclaimed = reclaim_freelist_step(&conn, 0).unwrap();
         let (file_after, live_after) = page_stats(&conn);
         assert!(reclaimed > 0, "should reclaim freed pages to the OS");
         // The whole freelist must be drained, not a single page: the file collapses
@@ -162,16 +181,61 @@ mod tests {
     }
 
     #[test]
-    fn reclaim_is_noop_below_threshold() {
+    fn freelist_bytes_reports_reclaimable_space() {
         let conn = open_incremental();
         let blob = "x".repeat(4096);
+        assert_eq!(freelist_bytes(&conn), 0, "fresh db has an empty freelist");
         for k in 0..100 {
             conn.execute("INSERT INTO t (k, v) VALUES (?1, ?2)", (k, &blob))
                 .unwrap();
         }
+        // Live pages are not on the freelist yet.
+        assert_eq!(freelist_bytes(&conn), 0, "live pages are not reclaimable");
         conn.execute("DELETE FROM t", []).unwrap();
-        // Huge threshold: nothing should be reclaimed.
-        let reclaimed = reclaim_freelist(&conn, 1 << 30).unwrap();
-        assert_eq!(reclaimed, 0);
+        // Deleted pages become reclaimable — the signal the background worker gates on.
+        assert!(
+            freelist_bytes(&conn) > 0,
+            "deleted pages report as reclaimable freelist bytes"
+        );
+    }
+
+    #[test]
+    fn reclaim_step_is_bounded_then_drains_across_passes() {
+        let conn = open_incremental();
+        let blob = "x".repeat(4096);
+        for k in 0..4000 {
+            conn.execute("INSERT INTO t (k, v) VALUES (?1, ?2)", (k, &blob))
+                .unwrap();
+        }
+        conn.execute("DELETE FROM t", []).unwrap();
+        let (_, live) = page_stats(&conn);
+        let freelist_start = freelist_bytes(&conn);
+        assert!(freelist_start > 0, "deleted pages sit on the freelist");
+
+        // One tiny bounded pass reclaims *some* space but not the whole freelist.
+        let first = reclaim_freelist_step(&conn, 8).unwrap();
+        assert!(
+            first > 0,
+            "a bounded pass should reclaim at least one chunk"
+        );
+        assert!(
+            freelist_bytes(&conn) > 0,
+            "a single small pass must not drain the whole freelist"
+        );
+
+        // Draining in bounded passes eventually empties the freelist and collapses
+        // the file toward the live set — same end state as a full drain.
+        for _ in 0..2000 {
+            if freelist_bytes(&conn) == 0 {
+                break;
+            }
+            reclaim_freelist_step(&conn, 64).unwrap();
+        }
+        let (file_after, _) = page_stats(&conn);
+        assert_eq!(freelist_bytes(&conn), 0, "passes eventually drain freelist");
+        assert!(
+            file_after <= live + 64 * 1024,
+            "file collapses to ~live after draining (live={live}, after={file_after})"
+        );
     }
 }
