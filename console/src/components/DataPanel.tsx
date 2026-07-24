@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import CodeEditor from "./CodeEditor";
-import { Button } from "./ui";
+import { Button, Input, inputClass } from "./ui";
 import {
   execData,
   getDataMigrations,
@@ -9,6 +9,7 @@ import {
   getDataSources,
   migrateData,
   queryData,
+  saveProjectFile,
   type DataColumnMeta,
   type DataMigrationEntry,
   type DataQueryResult,
@@ -39,6 +40,59 @@ function errMsg(e: unknown): string {
 /** Quote an identifier for SQLite (double quotes, doubled to escape). */
 function quoteIdent(id: string): string {
   return `"${id.replaceAll('"', '""')}"`;
+}
+
+// --- New-table DDL model ----------------------------------------------------
+
+/** Common SQLite column affinities offered in the New Table dialog. */
+const COLUMN_TYPES = ["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB", "BOOLEAN", "TIMESTAMP"];
+
+interface NewColumn {
+  name: string;
+  type: string;
+  primaryKey: boolean;
+  notNull: boolean;
+  default: string;
+}
+
+function blankColumn(): NewColumn {
+  return { name: "", type: "TEXT", primaryKey: false, notNull: false, default: "" };
+}
+
+/** Build a `CREATE TABLE` statement from the dialog's form model. */
+function buildCreateTable(table: string, cols: NewColumn[]): string {
+  const pkCols = cols.filter((c) => c.primaryKey && c.name.trim());
+  const defs = cols
+    .filter((c) => c.name.trim())
+    .map((c) => {
+      let s = `  ${quoteIdent(c.name.trim())} ${c.type || "TEXT"}`;
+      // A single primary key is declared inline; an INTEGER one becomes the
+      // rowid alias. Composite keys use a table-level constraint instead.
+      if (pkCols.length === 1 && c.primaryKey) s += " PRIMARY KEY";
+      if (c.notNull && !c.primaryKey) s += " NOT NULL";
+      if (c.default.trim()) s += ` DEFAULT ${c.default.trim()}`;
+      return s;
+    });
+  if (pkCols.length > 1) {
+    defs.push(`  PRIMARY KEY (${pkCols.map((c) => quoteIdent(c.name.trim())).join(", ")})`);
+  }
+  return `CREATE TABLE ${quoteIdent(table.trim() || "new_table")} (\n${defs.join(",\n")}\n);`;
+}
+
+/** Next ordered migration filename, e.g. `003_create_orders.sql`. */
+function nextMigrationName(existing: DataMigrationEntry[], table: string): string {
+  const max = existing.reduce((m, e) => {
+    const n = parseInt(e.name, 10);
+    return Number.isNaN(n) ? m : Math.max(m, n);
+  }, 0);
+  const num = String(max + 1).padStart(3, "0");
+  const slug =
+    table
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "_")
+      .replace(/^_+|_+$/g, "") || "table";
+  return `${num}_create_${slug}.sql`;
 }
 
 /** Human cell rendering: NULL italic, blobs badged, objects as compact JSON. */
@@ -160,6 +214,7 @@ function TablesTab({ name, source }: { name: string; source: string }) {
   const [rows, setRows] = useState<DataQueryResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loadingRows, setLoadingRows] = useState(false);
+  const [showNew, setShowNew] = useState(false);
 
   const loadSchema = useCallback(async () => {
     setError(null);
@@ -199,8 +254,17 @@ function TablesTab({ name, source }: { name: string; source: string }) {
   return (
     <div className="flex h-full min-h-0">
       <aside className="w-56 shrink-0 overflow-y-auto border-r border-edge bg-panel">
-        <div className="px-3 py-2 text-[10px] font-bold uppercase tracking-wider text-fg-faint">
-          Tables ({tables.length})
+        <div className="flex items-center justify-between gap-2 px-3 py-2">
+          <span className="text-[10px] font-bold uppercase tracking-wider text-fg-faint">
+            Tables ({tables.length})
+          </span>
+          <button
+            onClick={() => setShowNew(true)}
+            className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10"
+            title="Create a new table"
+          >
+            ＋ New
+          </button>
         </div>
         {tables.map((t) => (
           <button
@@ -237,6 +301,17 @@ function TablesTab({ name, source }: { name: string; source: string }) {
           </div>
         )}
       </div>
+      {showNew && (
+        <NewTableDialog
+          name={name}
+          source={source}
+          onClose={() => setShowNew(false)}
+          onCreated={(table) => {
+            setShowNew(false);
+            void loadSchema().then(() => setSelected(table));
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -258,6 +333,227 @@ function ColumnStrip({ columns, indexes }: { columns: DataColumnMeta[]; indexes:
         </span>
       )}
     </div>
+  );
+}
+
+// --- Shared modal + New-table dialog ---------------------------------------
+
+/** Minimal centered modal (the console has no dialog primitive yet). */
+function Modal({
+  title,
+  onClose,
+  children,
+  footer,
+  wide,
+}: {
+  title: string;
+  onClose: () => void;
+  children: ReactNode;
+  footer: ReactNode;
+  wide?: boolean;
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        className={`flex max-h-[85vh] w-full ${wide ? "max-w-2xl" : "max-w-lg"} flex-col overflow-hidden rounded-lg border border-edge bg-panel shadow-xl`}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-edge px-4 py-2.5">
+          <h2 className="text-sm font-semibold text-fg">{title}</h2>
+          <button onClick={onClose} className="rounded p-1 text-fg-faint hover:bg-hover" title="Close">
+            ✕
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 overflow-auto p-4">{children}</div>
+        <div className="flex items-center justify-end gap-2 border-t border-edge px-4 py-2.5">
+          {footer}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Encapsulates table creation as a form (the Delphi-style affordance): the user
+ * fills in columns and we generate the `CREATE TABLE` DDL. Two apply paths match
+ * the two documented workflows — run it now against the datasource, or save it
+ * as an ordered migration file (the deployable path, ADR 0024 §4).
+ */
+function NewTableDialog({
+  name,
+  source,
+  onClose,
+  onCreated,
+}: {
+  name: string;
+  source: string;
+  onClose: () => void;
+  onCreated: (table: string) => void;
+}) {
+  const [table, setTable] = useState("");
+  const [cols, setCols] = useState<NewColumn[]>([
+    { name: "id", type: "INTEGER", primaryKey: true, notNull: false, default: "" },
+  ]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  const namedCols = cols.filter((c) => c.name.trim());
+  const valid = table.trim().length > 0 && namedCols.length > 0;
+  const sql = useMemo(() => buildCreateTable(table, cols), [table, cols]);
+
+  const setCol = (i: number, patch: Partial<NewColumn>) =>
+    setCols((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+  const addCol = () => setCols((cs) => [...cs, blankColumn()]);
+  const removeCol = (i: number) => setCols((cs) => cs.filter((_, j) => j !== i));
+
+  const runNow = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    setNote(null);
+    try {
+      await execData({ path: { name, source }, body: { sql }, throwOnError: true });
+      onCreated(table.trim());
+    } catch (e) {
+      setError(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [name, source, sql, table, onCreated]);
+
+  const saveMigration = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    setNote(null);
+    try {
+      const r = await getDataMigrations({ path: { name, source }, throwOnError: true });
+      const dir = r.data.dir || "db/migrations";
+      const file = nextMigrationName(r.data.entries ?? [], table);
+      const path = `${dir}/${file}`;
+      await saveProjectFile({ path: { name }, query: { path }, body: `${sql}\n`, throwOnError: true });
+      setNote(`Wrote ${path}. Apply it from the Migrations tab.`);
+    } catch (e) {
+      setError(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [name, source, sql, table]);
+
+  return (
+    <Modal
+      title="New table"
+      onClose={onClose}
+      wide
+      footer={
+        <>
+          {note && <span className="mr-auto truncate text-xs text-ok">{note}</span>}
+          {error && <span className="mr-auto truncate text-xs text-danger">{error}</span>}
+          <Button variant="secondary" onClick={onClose} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="secondary" onClick={() => void saveMigration()} disabled={!valid || busy}>
+            Save as migration
+          </Button>
+          <Button variant="primary" onClick={() => void runNow()} disabled={!valid || busy}>
+            {busy ? "Working…" : "Create now"}
+          </Button>
+        </>
+      }
+    >
+      <label className="mb-3 block">
+        <span className="mb-1 block text-xs font-medium text-fg-muted">Table name</span>
+        <Input
+          value={table}
+          onChange={(e) => setTable(e.target.value)}
+          placeholder="orders"
+          autoFocus
+        />
+      </label>
+
+      <div className="mb-1 flex items-center justify-between">
+        <span className="text-xs font-medium text-fg-muted">Columns</span>
+        <button onClick={addCol} className="text-xs font-medium text-accent hover:underline">
+          ＋ Add column
+        </button>
+      </div>
+      <div className="space-y-1.5">
+        <div className="flex items-center gap-2 px-0.5 text-[10px] uppercase tracking-wide text-fg-faint">
+          <span className="flex-1">Name</span>
+          <span className="w-28">Type</span>
+          <span className="w-24">Default</span>
+          <span className="w-8 text-center" title="Primary key">
+            PK
+          </span>
+          <span className="w-10 text-center" title="NOT NULL">
+            Req
+          </span>
+          <span className="w-5" />
+        </div>
+        {cols.map((c, i) => (
+          <div key={i} className="flex items-center gap-2">
+            <Input
+              className="flex-1"
+              value={c.name}
+              onChange={(e) => setCol(i, { name: e.target.value })}
+              placeholder="column"
+            />
+            <select
+              className={`${inputClass} w-28`}
+              value={c.type}
+              onChange={(e) => setCol(i, { type: e.target.value })}
+            >
+              {COLUMN_TYPES.map((t) => (
+                <option key={t} value={t}>
+                  {t}
+                </option>
+              ))}
+            </select>
+            <Input
+              className="w-24"
+              value={c.default}
+              onChange={(e) => setCol(i, { default: e.target.value })}
+              placeholder="—"
+              title="Raw SQL default, e.g. 0, 'active', CURRENT_TIMESTAMP"
+            />
+            <input
+              type="checkbox"
+              className="w-8"
+              checked={c.primaryKey}
+              onChange={(e) => setCol(i, { primaryKey: e.target.checked })}
+              title="Primary key"
+            />
+            <input
+              type="checkbox"
+              className="w-10"
+              checked={c.notNull}
+              disabled={c.primaryKey}
+              onChange={(e) => setCol(i, { notNull: e.target.checked })}
+              title="NOT NULL"
+            />
+            <button
+              onClick={() => removeCol(i)}
+              disabled={cols.length === 1}
+              className="w-5 text-fg-faint hover:text-danger disabled:opacity-30"
+              title="Remove column"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-4">
+        <span className="mb-1 block text-[10px] uppercase tracking-wide text-fg-faint">
+          Generated SQL
+        </span>
+        <pre className="max-h-40 overflow-auto rounded-md border border-edge bg-inset p-3 font-mono text-xs text-fg-muted">
+          {sql}
+        </pre>
+      </div>
+    </Modal>
   );
 }
 
