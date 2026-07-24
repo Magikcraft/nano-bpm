@@ -190,15 +190,18 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > are type-agnostic (`enrich`/`dispatch` unchanged) — `defineWorker` casts to the base options — so
 > types add zero runtime cost and are fully erased at `deno compile`.
 >
-> **Follow-ups (not in this spike):** merge the §4.2 manifest `types` registry into the emitter (the
-> spike does the *table spine* only); and regenerate as part of the App **export/`deno compile`**
+> **Follow-ups (not in this spike):** regenerate as part of the App **export/`deno compile`**
 > packaging in addition to boot. A maker-facing "Regenerate domain types" affordance now exists: the
 > `POST /projects/{name}/data/{source}/domaintypes` route (operationId `regenerateDomainTypes`)
 > and a "⟳ Types" button in the Data panel's Tables sidebar both drive the same op. The op now
 > **unions every declared datasource** into one `domain.d.ts`: `emitDomainDtsForSources` emits
 > source-prefixed interfaces (e.g. `AppCustomers`) under a `DomainSources` map keyed by alias then
 > table, with `DomainTables` aliased to the default source so the single-source
-> `DomainTables["customers"]` convention keeps working (byte-identical output for one source).
+> `DomainTables["customers"]` convention keeps working (byte-identical output for one source). The
+> **manifest `types` registry (§4.2) is folded in** too: `emitDomainTypeRegistry` emits a `DomainTypes`
+> map keyed by type id (`DomainTypes["taxSubmission"]`), mapping primitives + nominal references
+> (`DomainTypes["taxLine"]`), with `optional` widening the key and `list` wrapping in `[]` —
+> `emitDomainModel` composes the table spine + registry into the single file.
 
 ## Consequences
 

@@ -13,6 +13,8 @@ import {
   DOMAIN_DTS,
   emitDomainDts,
   emitDomainDtsForSources,
+  emitDomainModel,
+  emitDomainTypeRegistry,
   interfaceName,
   sqliteAffinityToTs,
 } from "./domain_types.ts";
@@ -140,6 +142,58 @@ Deno.test("emitDomainDtsForSources emits an empty object for a source with no ta
     "missing",
   );
   assertStringIncludes(dts2, 'export type DomainTables = DomainSources["a"];');
+});
+
+Deno.test("emitDomainTypeRegistry renders declared types with refs, optional + list", () => {
+  const dts = emitDomainTypeRegistry({
+    taxLine: { fields: { amount: { type: "number" }, note: { type: "string", optional: true } } },
+    taxSubmission: {
+      name: "Tax Submission",
+      fields: {
+        filedAt: { type: "datetime" },
+        active: { type: "boolean", optional: true },
+        blob: { type: "json" },
+        lines: { type: "taxLine", list: true },
+        ref: { type: "unknownType" }, // unresolved → unknown
+      },
+    },
+  });
+  assertStringIncludes(dts, "export interface DomainTypes {");
+  assertStringIncludes(dts, '"taxLine": {');
+  assertStringIncludes(dts, "amount: number;");
+  assertStringIncludes(dts, "note?: string;"); // optional widens the key
+  assertStringIncludes(dts, '"taxSubmission": {');
+  assertStringIncludes(dts, "filedAt: string;"); // datetime → ISO string
+  assertStringIncludes(dts, "active?: boolean;");
+  assertStringIncludes(dts, "blob: unknown;"); // json → unknown
+  assertStringIncludes(dts, 'lines: DomainTypes["taxLine"][];'); // ref + list
+  assertStringIncludes(dts, "ref: unknown;"); // unresolved ref degrades
+});
+
+Deno.test("emitDomainTypeRegistry is empty for an empty registry", () => {
+  assertEquals(emitDomainTypeRegistry({}), "");
+});
+
+Deno.test("emitDomainModel appends the registry to the table spine", () => {
+  const tables: TableMeta[] = [{
+    name: "customers",
+    indexes: [],
+    columns: [{ name: "id", type: "INTEGER", primaryKey: true, notNull: false }],
+  }];
+  // No declared types → byte-identical to the table-only spine.
+  assertEquals(
+    emitDomainModel([{ source: "app", tables }], "app", {}),
+    emitDomainDtsForSources([{ source: "app", tables }], "app"),
+  );
+  // With declared types → both DomainTables and DomainTypes are present.
+  const full = emitDomainModel(
+    [{ source: "app", tables }],
+    "app",
+    { note: { fields: { text: { type: "string" } } } },
+  );
+  assertStringIncludes(full, "export interface DomainTables {");
+  assertStringIncludes(full, "export interface DomainTypes {");
+  assertStringIncludes(full, '"note": {');
 });
 
 Deno.test("schema() → emit → write roundtrip (the CLI op's path)", async () => {

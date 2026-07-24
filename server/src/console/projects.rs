@@ -4267,4 +4267,61 @@ mod tests {
         // DomainTables aliases the declared default source.
         assert!(text.contains("export type DomainTables = DomainSources[\"analytics\"];"));
     }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn domaintypes_op_folds_in_the_manifest_types_registry() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "dtreg";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{
+                "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" }
+                } },
+                "types": {
+                    "tax-line": { "fields": { "amount": { "type": "number" } } },
+                    "tax-submission": { "fields": {
+                        "filedAt": { "type": "datetime" },
+                        "note": { "type": "string", "optional": true },
+                        "lines": { "type": "tax-line", "list": true }
+                    } }
+                }
+            }"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create table");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        // tables counts only datasource tables; the registry rides alongside.
+        assert_eq!(dt["tables"], 1);
+        let text = dt["text"].as_str().unwrap();
+        // The table spine.
+        assert!(text.contains("export interface Customers {"));
+        assert!(text.contains("\"customers\": Customers;"));
+        // The manifest types registry, folded in.
+        assert!(text.contains("export interface DomainTypes {"));
+        assert!(text.contains("\"tax-line\": {"));
+        assert!(text.contains("\"tax-submission\": {"));
+        assert!(text.contains("filedAt: string;")); // datetime → string
+        assert!(text.contains("note?: string;")); // optional widens
+        assert!(text.contains("lines: DomainTypes[\"tax-line\"][];")); // ref + list
+    }
 }

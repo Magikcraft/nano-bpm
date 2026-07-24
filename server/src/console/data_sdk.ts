@@ -169,6 +169,8 @@ export async function listSources(
 interface ManifestLocation {
   root: string;
   data: ManifestData;
+  /** The raw `types` registry block (ADR 0029 §4.2), or `{}` when absent. */
+  types: Record<string, unknown>;
 }
 
 /// Walk up from `startDir` to the first directory containing `nano.app.json` and
@@ -179,9 +181,16 @@ async function findManifest(startDir: string): Promise<ManifestLocation> {
   for (let i = 0; i < 12; i++) {
     try {
       const text = await RT.readTextFile(`${dir}/nano.app.json`);
-      const json = JSON.parse(text) as { data?: ManifestData };
+      const json = JSON.parse(text) as {
+        data?: ManifestData;
+        types?: Record<string, unknown>;
+      };
       const data = json.data ?? { sources: {} };
-      return { root: dir, data: { default: data.default, sources: data.sources ?? {} } };
+      return {
+        root: dir,
+        data: { default: data.default, sources: data.sources ?? {} },
+        types: json.types ?? {},
+      };
     } catch {
       // not here — keep walking up
     }
@@ -194,6 +203,15 @@ async function findManifest(startDir: string): Promise<ManifestLocation> {
   throw new Error(
     `nano.app.json not found at or above ${startDir}; datasources require an Urban manifest`,
   );
+}
+
+/// The manifest's domain-type registry (ADR 0029 §4.2): the transient/declared
+/// shapes with no backing table. Returns `{}` when the manifest declares none.
+/// The domain-type reifier folds these in alongside the datasource table spine.
+export async function manifestTypes(
+  cwd?: string,
+): Promise<Record<string, unknown>> {
+  return (await findManifest(cwd ?? RT.cwd())).types;
 }
 
 /// Turn a datasource `url` into a filesystem path for file-backed drivers.
