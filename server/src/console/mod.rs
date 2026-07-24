@@ -3018,6 +3018,20 @@ pub(super) async fn project_triggers(name: &str) -> ApiResult {
         .map_err(trigger_error)
 }
 
+pub(super) async fn project_trigger_add(
+    name: &str,
+    id: &str,
+    kind: &str,
+    config: &std::collections::BTreeMap<String, String>,
+    connection: Option<&str>,
+    action: &serde_json::Value,
+) -> ApiResult {
+    triggers::add_trigger(name, id, kind, config, connection, action).map_err(trigger_error)?;
+    triggers::triggers_overview(name)
+        .await
+        .map_err(trigger_error)
+}
+
 /// `DELETE /console/api/projects/{name}/file?path=...` — remove a file or folder.
 pub(super) fn project_path_delete(name: &str, rel: &str) -> ApiResult {
     let Some(path) = projects::safe_project_path(name, rel) else {

@@ -983,6 +983,32 @@ paths:
               schema: { $ref: '#/components/schemas/TriggersResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      operationId: addTrigger
+      tags: [triggers]
+      summary: Append a trigger to the App manifest (the console "Add trigger" form)
+      description: >
+        Adds a trigger to `nano.app.json`'s `triggers[]` from the console's
+        Add-trigger dialog, so a maker wires a source without hand-editing the
+        manifest. The server places the supplied `config` fields into the shape
+        each source kind expects (core kinds read some keys at the trigger's top
+        level, e.g. cron's `spec` and file's `path`; pack kinds read a nested
+        `config`), validates the id is unique and the kind is recognised, writes
+        the manifest, and returns the refreshed triggers + registry.
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddTriggerRequest' }
+      responses:
+        '200':
+          description: Trigger added; refreshed triggers + source registry
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TriggersResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /projects/{name}/triggers/enqueue:
     post:
@@ -2246,10 +2272,57 @@ components:
           description: The trigger's action block, verbatim from the manifest.
     SourceKindInfo:
       type: object
-      required: [kind, builtin]
+      required: [kind, builtin, configFields]
       properties:
         kind: { type: string }
         builtin:
           type: boolean
           description: true for a compiled-in core source; false for a pack source.
         displayName: { type: string, nullable: true }
+        configFields:
+          type: array
+          description: >
+            The fields the console's Add-trigger form renders for this kind — the
+            core kinds' known keys (e.g. cron `spec`, file `path`) or a pack's
+            declared `triggerSources[].configFields`.
+          items: { $ref: '#/components/schemas/TriggerConfigField' }
+    TriggerConfigField:
+      type: object
+      required: [key, label, required]
+      properties:
+        key: { type: string }
+        label: { type: string }
+        description: { type: string, nullable: true }
+        default: { type: string, nullable: true }
+        required:
+          type: boolean
+          description: Whether the Add-trigger form must have a value for this field.
+    AddTriggerRequest:
+      type: object
+      required: [id, type, action]
+      description: A new trigger to append to the App manifest's triggers[].
+      properties:
+        id:
+          type: string
+          description: Unique trigger id within the App (also the ingress path segment).
+        type:
+          type: string
+          description: The source kind (a recognised core or pack `type`).
+        config:
+          type: object
+          nullable: true
+          additionalProperties: { type: string }
+          description: >
+            Flat map of the kind's config field values (keyed by
+            TriggerConfigField.key). The server places each into the manifest
+            shape the kind expects.
+        connection:
+          type: string
+          nullable: true
+          description: Optional named connection reference (for pack sources that use one).
+        action:
+          type: object
+          additionalProperties: true
+          description: >
+            The action to apply on each event, e.g. `{ "start": "processId" }` or
+            `{ "message": "messageName" }`.
