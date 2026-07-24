@@ -125,12 +125,25 @@ PR #147 followed for the form JSON view). Three sub-surfaces:
 
 | Sub-surface | Delphi analog | Backed by |
 |---|---|---|
-| **Tables** — tree of tables/columns/indexes + a paged row browser/editor | Database Desktop | `schema()` + paged `query()` |
+| **Tables** — tree of tables/columns/indexes + a paged row browser/editor, and a **＋ New** dialog that generates `CREATE TABLE` DDL from a column form | Database Desktop | `schema()` + paged `query()` |
 | **SQL** — a Monaco SQL editor with a results grid | SQL Explorer | `query()` / `exec()` |
 | **Migrations** — ordered `db/migrations/*.sql`, apply + status | (a modern addition) | a `_migrations` table via `tx()` |
 
 The results grid is the honest `TDBGrid`. The panel targets a *named datasource*, so it browses
 whatever `data.app` currently resolves to — SQLite in the IDE, Postgres in prod.
+
+**Creating a table without hand-writing SQL.** The Tables sub-surface's **＋ New** button opens a
+dialog — the Delphi *Database Desktop → New Table* affordance — where the maker names the table and
+adds columns (name, type, primary key, NOT NULL, default). The dialog shows the generated
+`CREATE TABLE` DDL live and offers the two documented apply paths so the form never hides what it
+does:
+
+- **Create now** runs the DDL against the selected datasource immediately (`exec()`) — the quick,
+  develop-in-place path.
+- **Save as migration** writes the DDL to the next ordered `db/migrations/NNN_create_<table>.sql`
+  file (via the project file API) so the schema is reproducible and travels with the App when the
+  datasource is flipped from SQLite to Postgres — the deployable path. The maker then applies it
+  from the **Migrations** sub-surface.
 
 ### 5. Binding — closing the loop with the other three designers
 
