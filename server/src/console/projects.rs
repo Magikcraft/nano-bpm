@@ -4214,4 +4214,57 @@ mod tests {
         );
         assert!(!dir.join(".nanobpm/domain.d.ts").exists());
     }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn domaintypes_op_unions_every_datasource() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "dtmulti";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "analytics", "sources": {
+                "app": { "driver": "sqlite", "url": "file:./app.db" },
+                "analytics": { "driver": "sqlite", "url": "file:./analytics.db" }
+            } } }"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        // A same-named table in each source exercises collision-free naming.
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec", "source": "app",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create app.customers");
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec", "source": "analytics",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, seen TEXT)" }),
+        )
+        .await
+        .expect("create analytics.customers");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        // tables is the total across all sources.
+        assert_eq!(dt["tables"], 2);
+        let text = dt["text"].as_str().unwrap();
+        assert!(text.contains("export interface AppCustomers {"));
+        assert!(text.contains("export interface AnalyticsCustomers {"));
+        assert!(text.contains("export interface DomainSources {"));
+        assert!(text.contains("\"app\": {"));
+        assert!(text.contains("\"analytics\": {"));
+        // DomainTables aliases the declared default source.
+        assert!(text.contains("export type DomainTables = DomainSources[\"analytics\"];"));
+    }
 }
