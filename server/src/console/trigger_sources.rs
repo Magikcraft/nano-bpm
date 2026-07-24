@@ -381,12 +381,225 @@ pub(crate) fn spawn_sources(project: &str, manifest: &Json, handle: Arc<LoopHand
                 let (project, id, handle) = (project.to_string(), src.id, handle.clone());
                 tokio::spawn(run_file(project, id, path, poll_ms, handle));
             }
-            SourceConfig::Webhook | SourceConfig::External => {}
+            SourceConfig::Webhook => {}
+            SourceConfig::External => {
+                // A pack source (ADR 0025 §6): if the installed pack ships a
+                // `driver`, auto-launch + supervise it; otherwise it is a
+                // declaration-only source driven out-of-band (still emits over
+                // the ingress), so there is nothing to spawn.
+                let Some(driver) = super::extensions::trigger_driver(&src.kind) else {
+                    continue;
+                };
+                let Some(trigger) = raw_trigger(manifest, &src.id) else {
+                    continue;
+                };
+                let connection = resolve_connection(manifest, &trigger);
+                let (project, id, kind, handle) =
+                    (project.to_string(), src.id, src.kind, handle.clone());
+                tokio::spawn(run_pack_driver(
+                    project, id, kind, trigger, connection, driver, handle,
+                ));
+            }
         }
     }
 }
 
-/// The cron scheduler loop: sleep until the next fire, then enqueue an event
+/// Find a trigger's raw manifest object by id (the parsed [`TriggerSource`]
+/// intentionally discards `config`/`connection`/`auth`; a pack driver needs
+/// them, so re-read the source of truth).
+fn raw_trigger(manifest: &Json, id: &str) -> Option<Json> {
+    manifest
+        .get("triggers")
+        .and_then(Json::as_array)?
+        .iter()
+        .find(|t| t.get("id").and_then(Json::as_str) == Some(id))
+        .cloned()
+}
+
+/// Resolve a trigger's referenced `connections[]` entry (the credentials/
+/// endpoint object) into JSON for the driver, or [`Json::Null`] if the trigger
+/// names none / it is missing. Secrets inside should be env templates the
+/// driver expands itself (ADR 0025 §1) — we forward the object verbatim.
+fn resolve_connection(manifest: &Json, trigger: &Json) -> Json {
+    let Some(name) = trigger.get("connection").and_then(Json::as_str) else {
+        return Json::Null;
+    };
+    manifest
+        .get("connections")
+        .and_then(|c| c.get(name))
+        .cloned()
+        .unwrap_or(Json::Null)
+}
+
+/// Backoff floor/ceiling for respawning a crashed pack driver.
+const DRIVER_BACKOFF_MIN: Duration = Duration::from_millis(500);
+const DRIVER_BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// Supervise one pack source's out-of-process driver (ADR 0025 phase 4): launch
+/// it (Node-first, ADR 0038), pipe its logs, and on crash restart with capped
+/// exponential backoff — until [`LoopHandle::stopped`] fires, at which point the
+/// child is killed. The driver emits its events over the trigger ingress using
+/// the env contract below; this function owns only its lifecycle.
+async fn run_pack_driver(
+    project: String,
+    id: String,
+    kind: String,
+    trigger: Json,
+    connection: Json,
+    driver: super::extensions::TriggerDriver,
+    handle: Arc<LoopHandle>,
+) {
+    let port = super::workers::gateway_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let hook_url = format!("{base_url}/console/api/projects/{project}/hooks/{id}");
+    let config_json = trigger
+        .get("config")
+        .cloned()
+        .unwrap_or_else(|| json!({}))
+        .to_string();
+    let connection_json = connection.to_string();
+    // `auth` names an env var (optionally `env:VAR`) holding the shared secret
+    // the ingress expects; forward its value so the driver can present it.
+    let token = trigger
+        .get("auth")
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|a| a.strip_prefix("env:").unwrap_or(a))
+        .and_then(|v| std::env::var(v).ok());
+
+    let mut backoff = DRIVER_BACKOFF_MIN;
+    while handle.is_running() {
+        match spawn_driver_child(
+            &driver,
+            &base_url,
+            &hook_url,
+            &project,
+            &id,
+            &kind,
+            &config_json,
+            &connection_json,
+            token.as_deref(),
+        ) {
+            Ok(mut child) => {
+                let pid = child.id().unwrap_or(0);
+                tracing::info!(project, trigger = id, kind, pid, "trigger driver started");
+                let stopped = tokio::select! {
+                    _ = handle.stopped() => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        true
+                    }
+                    status = child.wait() => {
+                        tracing::warn!(
+                            project, trigger = id, kind,
+                            "trigger driver exited (status {status:?}); restarting"
+                        );
+                        false
+                    }
+                };
+                if stopped {
+                    break;
+                }
+                // A driver that stayed up a while gets a fresh backoff window.
+                backoff = DRIVER_BACKOFF_MIN;
+            }
+            Err(e) => {
+                tracing::error!(
+                    project,
+                    trigger = id,
+                    kind,
+                    "failed to launch trigger driver: {e}"
+                );
+            }
+        }
+        if !sleep_or_stop(&handle, backoff).await {
+            break;
+        }
+        backoff = (backoff * 2).min(DRIVER_BACKOFF_MAX);
+    }
+}
+
+/// Build + spawn the driver child, selecting the runtime Node-first (ADR 0038)
+/// and stripping TS types for a `.ts` entrypoint. Streams stdout/stderr to the
+/// tracing log. Returns the spawned [`tokio::process::Child`].
+#[allow(clippy::too_many_arguments)]
+fn spawn_driver_child(
+    driver: &super::extensions::TriggerDriver,
+    base_url: &str,
+    hook_url: &str,
+    project: &str,
+    id: &str,
+    kind: &str,
+    config_json: &str,
+    connection_json: &str,
+    token: Option<&str>,
+) -> Result<tokio::process::Child, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let entry = &driver.entry;
+    let is_ts = entry.ends_with(".ts") || entry.ends_with(".mts") || entry.ends_with(".cts");
+
+    let mut cmd;
+    if let Some(node) = super::workers::usable_node() {
+        cmd = Command::new(node);
+        cmd.current_dir(&driver.dir);
+        if is_ts {
+            cmd.arg("--experimental-strip-types").arg("--no-warnings");
+        }
+        cmd.arg(entry);
+    } else if let Some(deno) = super::workers::find_deno() {
+        cmd = Command::new(deno);
+        cmd.current_dir(&driver.dir)
+            .arg("run")
+            .arg("--no-prompt")
+            .arg("--allow-net")
+            .arg("--allow-env")
+            .arg(format!("--allow-read={}", driver.dir.display()))
+            .arg(entry);
+    } else {
+        return Err("no JS runtime (Node >=22.6 or Deno) available".to_string());
+    }
+
+    cmd.env("NO_COLOR", "1")
+        .env("NANOBPMN_BASE_URL", base_url)
+        .env("NANOBPMN_HOOK_URL", hook_url)
+        .env("NANOBPMN_PROJECT", project)
+        .env("NANOBPMN_TRIGGER_ID", id)
+        .env("NANOBPMN_TRIGGER_TYPE", kind)
+        .env("NANOBPMN_TRIGGER_CONFIG", config_json)
+        .env("NANOBPMN_TRIGGER_CONNECTION", connection_json)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    if let Some(tok) = token {
+        cmd.env("NANOBPMN_WEBHOOK_TOKEN", tok);
+    }
+
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+
+    if let Some(out) = child.stdout.take() {
+        let (project, id) = (project.to_string(), id.to_string());
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!(project, trigger = id, stream = "out", "{line}");
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        let (project, id) = (project.to_string(), id.to_string());
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!(project, trigger = id, stream = "err", "{line}");
+            }
+        });
+    }
+
+    Ok(child)
+}
 /// keyed `<id>:<fireEpochSecond>` (deterministic, §3 — a given instant enqueues
 /// once). On boot it applies `on_missed` to instants between the last-known and
 /// now, then schedules forward.

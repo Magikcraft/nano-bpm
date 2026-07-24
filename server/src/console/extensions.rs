@@ -69,6 +69,14 @@ pub struct TriggerSourceSpec {
     /// Config fields the console renders for a trigger of this kind.
     #[serde(default)]
     pub config_fields: Vec<ConfigField>,
+    /// Pack-relative path to the out-of-process driver entrypoint (a Node/Deno
+    /// `.ts`/`.js`/`.mjs` file). When present, the runtime **auto-launches and
+    /// supervises** the driver while an App with a trigger of this `kind` runs
+    /// (ADR 0025 phase 4): one child process per such trigger, restarted with
+    /// backoff on crash, killed when the App stops. Absent = a declaration-only
+    /// source whose driver is run out-of-band (it still emits over the ingress).
+    #[serde(default)]
+    pub driver: Option<String>,
 }
 
 /// How a pack source's events reach the runtime (ADR 0025 §6).
@@ -471,6 +479,48 @@ pub fn all_trigger_sources() -> Vec<TriggerSourceSpec> {
         }
     }
     out
+}
+
+/// An installed pack's out-of-process trigger driver, resolved on disk (ADR
+/// 0025 phase 4). The runtime launches [`entry`](TriggerDriver::entry) with
+/// [`dir`](TriggerDriver::dir) as the working directory.
+pub struct TriggerDriver {
+    /// The pack's directory — the driver's working dir (so its bundled
+    /// `node_modules` / imports resolve).
+    pub dir: PathBuf,
+    /// The driver entrypoint, pack-relative (e.g. `driver.ts`).
+    pub entry: String,
+}
+
+/// Resolve the on-disk driver for a pack-contributed source `kind` (ADR 0025
+/// §6 / phase 4). Returns `None` for a core kind, an unknown kind, a pack that
+/// declares the kind but no `driver` (declaration-only — run out-of-band), or a
+/// path-escaping / missing driver file. First matching pack wins, mirroring
+/// [`all_trigger_sources`]'s first-wins dedup.
+pub fn trigger_driver(kind: &str) -> Option<TriggerDriver> {
+    let rd = std::fs::read_dir(extensions_root()).ok()?;
+    for entry in rd.flatten() {
+        let base = entry.path();
+        let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<ExtManifest>(&txt) else {
+            continue;
+        };
+        let Some(spec) = m.trigger_sources.iter().find(|s| s.kind == kind) else {
+            continue;
+        };
+        let driver = spec.driver.as_deref().filter(|d| !d.is_empty())?;
+        let path = safe_pack_path(&base, driver)?;
+        if !path.is_file() {
+            return None;
+        }
+        return Some(TriggerDriver {
+            dir: base,
+            entry: driver.to_string(),
+        });
+    }
+    None
 }
 
 /// Resolve any installed extension (lang/app/example/theme) by manifest id.
