@@ -193,8 +193,9 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > **Follow-ups (not in this spike):** merge the §4.2 manifest `types` registry into the emitter (the
 > spike does the *table spine* only); union multiple datasources into one `domain.d.ts` (today the
 > op reifies the default source); regenerate as part of the App **export/`deno compile`** packaging
-> in addition to boot; and expose a maker-facing "Regenerate domain types" REST endpoint + Data-panel
-> button (the op is reachable server-side today, not yet as a dedicated route).
+> in addition to boot. A maker-facing "Regenerate domain types" affordance now exists: the
+> `POST /projects/{name}/data/{source}/domaintypes` route (operationId `regenerateDomainTypes`)
+> and a "⟳ Types" button in the Data panel's Tables sidebar both drive the same op.
 
 ## Consequences
 

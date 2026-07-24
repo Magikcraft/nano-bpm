@@ -10,6 +10,7 @@ import {
   getDataSources,
   migrateData,
   queryData,
+  regenerateDomainTypes,
   saveProjectFile,
   type DataColumnMeta,
   type DataMigrationEntry,
@@ -393,6 +394,8 @@ function TablesTab({ name, source }: { name: string; source: string }) {
   const [showAddRow, setShowAddRow] = useState(false);
   const [showStructure, setShowStructure] = useState(false);
   const [editRow, setEditRow] = useState<Record<string, unknown> | null>(null);
+  const [regenBusy, setRegenBusy] = useState(false);
+  const [regenNote, setRegenNote] = useState<string | null>(null);
 
   const loadSchema = useCallback(async () => {
     setError(null);
@@ -448,6 +451,20 @@ function TablesTab({ name, source }: { name: string; source: string }) {
 
   const meta = tables.find((t) => t.name === selected);
 
+  const regenTypes = useCallback(async () => {
+    setRegenBusy(true);
+    setRegenNote(null);
+    try {
+      const r = await regenerateDomainTypes({ path: { name, source }, throwOnError: true });
+      const n = r.data.tables;
+      setRegenNote(`Generated ${r.data.path ?? "domain.d.ts"} — ${n} ${n === 1 ? "table" : "tables"}.`);
+    } catch (e) {
+      setRegenNote(errMsg(e));
+    } finally {
+      setRegenBusy(false);
+    }
+  }, [name, source]);
+
   const deleteRow = useCallback(
     async (rowid: unknown) => {
       if (!selected) return;
@@ -472,14 +489,32 @@ function TablesTab({ name, source }: { name: string; source: string }) {
           <span className="text-[10px] font-bold uppercase tracking-wider text-fg-faint">
             Tables ({tables.length})
           </span>
-          <button
-            onClick={() => setShowNew(true)}
-            className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10"
-            title="Create a new table"
-          >
-            ＋ New
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={() => void regenTypes()}
+              disabled={regenBusy}
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover disabled:opacity-40"
+              title="Regenerate the TypeScript domain types (.nanobpm/domain.d.ts) from these tables"
+            >
+              {regenBusy ? "…" : "⟳ Types"}
+            </button>
+            <button
+              onClick={() => setShowNew(true)}
+              className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10"
+              title="Create a new table"
+            >
+              ＋ New
+            </button>
+          </div>
         </div>
+        {regenNote && (
+          <p
+            className="px-3 pb-1.5 text-[11px] leading-snug text-fg-faint"
+            title={regenNote}
+          >
+            {regenNote}
+          </p>
+        )}
         {tables.map((t) => (
           <button
             key={t.name}

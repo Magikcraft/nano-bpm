@@ -871,6 +871,30 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /projects/{name}/data/{source}/domaintypes:
+    post:
+      operationId: regenerateDomainTypes
+      tags: [data]
+      summary: Regenerate the generated TypeScript domain types from the live schema
+      description: >
+        Reifies the datasource schema into `.nanobpm/domain.d.ts` (ADR 0029
+        §4.1/§6): one `interface` per table plus a `DomainTables` lookup, so
+        workers type against the current tables. Also runs automatically after a
+        schema change (script/DDL exec/migrate) and at App boot; this endpoint is
+        the maker's explicit "regenerate now" affordance. Types are erased at
+        `deno compile` — this is an authoring-time convenience only.
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/SourcePath' }
+      responses:
+        '200':
+          description: The emitted domain types (and where they were written)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DomainTypesResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /server/update:
     get:
       operationId: getServerUpdate
@@ -2205,6 +2229,23 @@ components:
           type: array
           items: { type: string }
         pending: { type: integer, format: int64 }
+    DomainTypesResult:
+      type: object
+      required: [text, tables]
+      properties:
+        path:
+          type: string
+          nullable: true
+          description: >
+            The file written (relative to the project root), or null when the
+            op only returned the text without writing.
+        text:
+          type: string
+          description: The emitted `domain.d.ts` contents.
+        tables:
+          type: integer
+          format: int64
+          description: Number of tables reified into interfaces.
     TriggerEnqueueRequest:
       type: object
       required: [triggerId, body]
