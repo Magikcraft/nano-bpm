@@ -457,7 +457,7 @@ function TablesTab({ name, source }: { name: string; source: string }) {
     try {
       const r = await regenerateDomainTypes({ path: { name, source }, throwOnError: true });
       const n = r.data.tables;
-      setRegenNote(`Generated ${r.data.path ?? "domain.d.ts"} — ${n} ${n === 1 ? "table" : "tables"}.`);
+      setRegenNote(`Generated ${r.data.path ?? "domain.d.ts"} — ${n} ${n === 1 ? "table" : "tables"} across all datasources.`);
     } catch (e) {
       setRegenNote(errMsg(e));
     } finally {
@@ -494,7 +494,7 @@ function TablesTab({ name, source }: { name: string; source: string }) {
               onClick={() => void regenTypes()}
               disabled={regenBusy}
               className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover disabled:opacity-40"
-              title="Regenerate the TypeScript domain types (.nanobpm/domain.d.ts) from these tables"
+              title="Regenerate the TypeScript domain types (.nanobpm/domain.d.ts) from every datasource"
             >
               {regenBusy ? "…" : "⟳ Types"}
             </button>

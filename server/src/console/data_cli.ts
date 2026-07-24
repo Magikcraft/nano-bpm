@@ -22,7 +22,7 @@
 //      | "migrate" | "domaintypes"
 
 import { listSources, openDataSource } from "./data-sdk.ts";
-import { DOMAIN_DTS, emitDomainDts } from "./domain-types.ts";
+import { DOMAIN_DTS, emitDomainDtsForSources, type SourceSchema } from "./domain-types.ts";
 
 interface Request {
   op: string;
@@ -285,25 +285,31 @@ async function run(req: Request): Promise<unknown> {
       return { applied, pending: 0 };
     }
     case "domaintypes": {
-      // ADR 0029 §4.1/§6: reify the datasource schema into TypeScript. Introspect
-      // the tables, emit `domain.d.ts`, and (unless `write:false`) materialise it
-      // to `.nanobpm/domain.d.ts` next to the SDK so workers type against the live
-      // DB. cwd is the project root, so the relative path lands in the project.
-      const db = await openDataSource(req.source);
-      let tables;
-      try {
-        tables = await db.schema();
-      } finally {
-        db.close();
+      // ADR 0029 §4.1/§6: reify the datasource schemas into TypeScript. Union
+      // *every* declared datasource (not just the default/selected one) so an
+      // App with multiple databases gets one complete domain model, emit
+      // `domain.d.ts`, and (unless `write:false`) materialise it to
+      // `.nanobpm/domain.d.ts` next to the SDK so workers type against the live
+      // DBs. cwd is the project root, so the relative path lands in the project.
+      const { default: def, sources } = await listSources();
+      const schemas: SourceSchema[] = [];
+      for (const s of sources) {
+        const db = await openDataSource(s.name);
+        try {
+          schemas.push({ source: s.name, tables: await db.schema() });
+        } finally {
+          db.close();
+        }
       }
-      const text = emitDomainDts(tables);
+      const text = emitDomainDtsForSources(schemas, def);
       let path: string | null = null;
       if (req.write !== false) {
         await RT.mkdir(".nanobpm");
         path = `.nanobpm/${DOMAIN_DTS}`;
         await RT.writeTextFile(path, text);
       }
-      return { path, text, tables: tables.length };
+      const tables = schemas.reduce((n, s) => n + s.tables.length, 0);
+      return { path, text, tables };
     }
     default:
       throw new Error(`unknown op "${req.op}"`);

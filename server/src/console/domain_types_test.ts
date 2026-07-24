@@ -12,6 +12,7 @@ import type { TableMeta } from "./data_sdk.ts";
 import {
   DOMAIN_DTS,
   emitDomainDts,
+  emitDomainDtsForSources,
   interfaceName,
   sqliteAffinityToTs,
 } from "./domain_types.ts";
@@ -74,6 +75,71 @@ Deno.test("emitDomainDts quotes non-identifier column names", () => {
 
 Deno.test("emitDomainDts handles an empty schema", () => {
   assertStringIncludes(emitDomainDts([]), "export interface DomainTables {}");
+});
+
+Deno.test("emitDomainDtsForSources is byte-identical to emitDomainDts for one source", () => {
+  const tables: TableMeta[] = [{
+    name: "customers",
+    indexes: [],
+    columns: [
+      { name: "id", type: "INTEGER", primaryKey: true, notNull: false },
+      { name: "name", type: "TEXT", primaryKey: false, notNull: true },
+    ],
+  }];
+  assertEquals(
+    emitDomainDtsForSources([{ source: "app", tables }], "app"),
+    emitDomainDts(tables),
+  );
+  // No sources at all also degrades to the empty single-source output.
+  assertEquals(emitDomainDtsForSources([], "app"), emitDomainDts([]));
+});
+
+Deno.test("emitDomainDtsForSources unions sources + resolves name collisions", () => {
+  const customers: TableMeta[] = [{
+    name: "customers",
+    indexes: [],
+    columns: [{ name: "id", type: "INTEGER", primaryKey: true, notNull: false }],
+  }];
+  const events: TableMeta[] = [{
+    name: "customers", // same table name in a different source
+    indexes: [],
+    columns: [{ name: "at", type: "TIMESTAMP", primaryKey: false, notNull: true }],
+  }];
+  const dts = emitDomainDtsForSources(
+    [{ source: "app", tables: customers }, { source: "analytics", tables: events }],
+    "analytics",
+  );
+  // Collision-free, source-prefixed interfaces.
+  assertStringIncludes(dts, "export interface AppCustomers {");
+  assertStringIncludes(dts, "export interface AnalyticsCustomers {");
+  // A DomainSources map keyed by alias then wire table name.
+  assertStringIncludes(dts, "export interface DomainSources {");
+  assertStringIncludes(dts, '"app": {');
+  assertStringIncludes(dts, '"customers": AppCustomers;');
+  assertStringIncludes(dts, '"analytics": {');
+  assertStringIncludes(dts, '"customers": AnalyticsCustomers;');
+  // DomainTables aliases the declared default source.
+  assertStringIncludes(dts, 'export type DomainTables = DomainSources["analytics"];');
+});
+
+Deno.test("emitDomainDtsForSources emits an empty object for a source with no tables", () => {
+  const dts = emitDomainDtsForSources(
+    [
+      { source: "app", tables: [{ name: "t", indexes: [], columns: [{ name: "id", type: "INTEGER", primaryKey: true, notNull: false }] }] },
+      { source: "empty", tables: [] },
+    ],
+    "app",
+  );
+  assertStringIncludes(dts, '"empty": {};');
+  // Falls back to the first source when the default is unknown.
+  const dts2 = emitDomainDtsForSources(
+    [
+      { source: "a", tables: [] },
+      { source: "b", tables: [] },
+    ],
+    "missing",
+  );
+  assertStringIncludes(dts2, 'export type DomainTables = DomainSources["a"];');
 });
 
 Deno.test("schema() → emit → write roundtrip (the CLI op's path)", async () => {
