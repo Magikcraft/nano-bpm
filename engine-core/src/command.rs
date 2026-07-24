@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use crate::model::{AdHocJobResult, ProcessDefinition, Value};
+use crate::model::{AdHocJobResult, ProcessDefinition, TaskListenerJobResult, Value};
 use crate::state::{Key, MessageSubscriptionKind};
 
 /// An instruction submitted to [`crate::Engine::apply_command`].
@@ -58,6 +58,15 @@ pub enum Command {
             serde(default, skip_serializing_if = "Option::is_none")
         )]
         adhoc_result: Option<AdHocJobResult>,
+        /// Optional result for a *task-listener* job (ADR 0037 §6): may deny the
+        /// deferred user-task transition or return corrections. `None` for every
+        /// ordinary completion, and skipped on the wire so plain completions are
+        /// byte-unchanged.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        task_listener_result: Option<TaskListenerJobResult>,
     },
     /// Assign a user task to `assignee`. The task must be in the `Created` state.
     /// When `allow_override` is `false` and the task already has an assignee, the
@@ -369,6 +378,21 @@ impl Command {
             job_key,
             variables: HashMap::new(),
             adhoc_result: None,
+            task_listener_result: None,
+        }
+    }
+
+    /// Convenience constructor for a `CompleteJob` that carries a task-listener
+    /// result (ADR 0037 §6): a denial and/or corrections to user-task data.
+    pub fn complete_job_with_task_result(
+        job_key: Key,
+        task_listener_result: TaskListenerJobResult,
+    ) -> Self {
+        Command::CompleteJob {
+            job_key,
+            variables: HashMap::new(),
+            adhoc_result: None,
+            task_listener_result: Some(task_listener_result),
         }
     }
 
@@ -378,6 +402,7 @@ impl Command {
             job_key,
             variables,
             adhoc_result: None,
+            task_listener_result: None,
         }
     }
 
@@ -392,6 +417,7 @@ impl Command {
             job_key,
             variables,
             adhoc_result: Some(adhoc_result),
+            task_listener_result: None,
         }
     }
 
@@ -561,6 +587,7 @@ mod kind_tests {
                 job_key: 1,
                 variables: HashMap::new(),
                 adhoc_result: None,
+                task_listener_result: None,
             }
             .kind(),
             "complete_job"

@@ -232,6 +232,48 @@ pub struct ExecutionListener {
     pub retries: Option<String>,
 }
 
+/// The lifecycle transition a user-task listener fires on
+/// (`zeebe:taskListener eventType`). Unlike execution listeners, task listeners
+/// exist only on user tasks and the `assigning`, `updating` and `completing`
+/// events may *deny* the transition and return *corrections* to task data
+/// (ADR 0037 §6, Zeebe parity).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TaskListenerEventType {
+    /// Fires while the user task is being made available (element
+    /// `ACTIVATING`), before it becomes `Created`. Cannot deny.
+    Creating,
+    /// Fires when an assignee is being set (assign, or an initial assignee on
+    /// creation). May deny and correct.
+    Assigning,
+    /// Fires when task data is being updated (`UpdateUserTask`). May deny and
+    /// correct.
+    Updating,
+    /// Fires when the task is being completed, before it becomes `Completed`.
+    /// May deny and correct.
+    Completing,
+    /// Fires when the task is being canceled by process termination, before it
+    /// becomes `Canceled`. Cannot deny (cancellation must proceed).
+    Canceling,
+}
+
+/// A single BPMN task listener declared on a user task (`zeebe:taskListener`).
+/// Realised as a job of `job_type` that a worker must complete before the
+/// user-task lifecycle transition proceeds; listeners of the same event type
+/// run sequentially in declaration order (ADR 0037 §6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TaskListener {
+    /// Which user-task transition this listener fires on.
+    pub event_type: TaskListenerEventType,
+    /// The job type workers subscribe to for this listener.
+    pub job_type: String,
+    /// The raw `retries` expression (literal or FEEL). `None` (the default)
+    /// starts the job with [`crate::state::DEFAULT_JOB_RETRIES`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub retries: Option<String>,
+}
+
 /// The flavour of a FEEL timer expression, mirroring the BPMN
 /// `timerEventDefinition` children.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -650,6 +692,13 @@ pub struct Element {
     /// without listeners.
     #[cfg_attr(feature = "serde", serde(default))]
     pub end_listeners: Vec<ExecutionListener>,
+    /// Task listeners on this user task, in declaration order (all event types
+    /// share one vector; `event_type` discriminates). Empty (the default) for
+    /// non-user-task elements, user tasks without listeners, and definitions
+    /// serialized before task listeners existed, so listener-free user tasks run
+    /// on the unchanged hot path (ADR 0037 §6).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub task_listeners: Vec<TaskListener>,
 }
 
 /// The BPMN ad-hoc sub-process implementation type (Camunda `zeebe:adHoc`).
@@ -779,6 +828,98 @@ pub struct AdHocActivateElement {
     #[cfg_attr(feature = "serde", serde(default))]
     pub variables: HashMap<String, Value>,
 }
+
+/// Corrections a task listener may return to user-task data when it completes
+/// its job (ADR 0037 §6, Zeebe `JobResult` corrections). Each field is `Some`
+/// only when that attribute was corrected; corrections from successive
+/// listeners in a chain merge (a later listener overrides an earlier one) and
+/// are applied to the user task when the chain drains and the transition
+/// commits. An empty list or empty-string date *clears* the attribute.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct UserTaskCorrections {
+    /// Corrected assignee (empty string clears it).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub assignee: Option<String>,
+    /// Corrected candidate groups.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub candidate_groups: Option<Vec<String>>,
+    /// Corrected candidate users.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub candidate_users: Option<Vec<String>>,
+    /// Corrected due date (empty string clears it).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub due_date: Option<String>,
+    /// Corrected follow-up date (empty string clears it).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub follow_up_date: Option<String>,
+    /// Corrected priority (0..=100).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub priority: Option<i32>,
+}
+
+impl UserTaskCorrections {
+    /// Returns `true` when no attribute is corrected.
+    pub fn is_empty(&self) -> bool {
+        self.assignee.is_none()
+            && self.candidate_groups.is_none()
+            && self.candidate_users.is_none()
+            && self.due_date.is_none()
+            && self.follow_up_date.is_none()
+            && self.priority.is_none()
+    }
+
+    /// Merges `other` into `self`, letting each `Some` field in `other` override.
+    pub fn merge(&mut self, other: &UserTaskCorrections) {
+        if other.assignee.is_some() {
+            self.assignee = other.assignee.clone();
+        }
+        if other.candidate_groups.is_some() {
+            self.candidate_groups = other.candidate_groups.clone();
+        }
+        if other.candidate_users.is_some() {
+            self.candidate_users = other.candidate_users.clone();
+        }
+        if other.due_date.is_some() {
+            self.due_date = other.due_date.clone();
+        }
+        if other.follow_up_date.is_some() {
+            self.follow_up_date = other.follow_up_date.clone();
+        }
+        if other.priority.is_some() {
+            self.priority = other.priority;
+        }
+    }
+}
+
+/// The result a worker returns when completing a *task-listener* job (ADR 0037
+/// §6, Zeebe `JobResult` for user-task listeners). All fields default to a
+/// non-denying, correction-free result so an ordinary completion is
+/// byte-unchanged. `denied` is honoured only for the `assigning`, `updating`
+/// and `completing` events (Zeebe parity); `corrections` are mutually exclusive
+/// with `denied`.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TaskListenerJobResult {
+    /// The listener denies the transition (it must not proceed).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub denied: bool,
+    /// Human-readable reason surfaced when `denied` is true.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub denied_reason: Option<String>,
+    /// Corrections to user-task data (assignee, candidates, dates, priority).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub corrections: UserTaskCorrections,
+}
+
+impl TaskListenerJobResult {
+    /// True when the result carries no denial and no corrections — an ordinary
+    /// task-listener job completion.
+    pub fn is_empty(&self) -> bool {
+        !self.denied && self.denied_reason.is_none() && self.corrections.is_empty()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProcessDefinition {
@@ -913,6 +1054,7 @@ fn splice_call_activities(
                     multi_instance: el.multi_instance.clone(),
                     start_listeners: el.start_listeners.clone(),
                     end_listeners: el.end_listeners.clone(),
+                    task_listeners: el.task_listeners.clone(),
                 },
             );
             stack.push(called_process_id.clone());
@@ -939,6 +1081,7 @@ fn splice_call_activities(
                     multi_instance: el.multi_instance.clone(),
                     start_listeners: el.start_listeners.clone(),
                     end_listeners: el.end_listeners.clone(),
+                    task_listeners: el.task_listeners.clone(),
                 },
             );
         }
@@ -1046,6 +1189,11 @@ pub struct ProcessBuilder {
     ///
     /// [`build`]: ProcessBuilder::build
     listeners: Vec<(ElementId, Vec<ExecutionListener>, Vec<ExecutionListener>)>,
+    /// Recorded `(element id, task listeners)` declarations, applied in
+    /// [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    task_listeners: Vec<(ElementId, Vec<TaskListener>)>,
 }
 
 impl ProcessBuilder {
@@ -1061,6 +1209,7 @@ impl ProcessBuilder {
             retries: Vec::new(),
             multi_instances: Vec::new(),
             listeners: Vec::new(),
+            task_listeners: Vec::new(),
         }
     }
 
@@ -1076,6 +1225,7 @@ impl ProcessBuilder {
             multi_instance: None,
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
+            task_listeners: Vec::new(),
         });
         self
     }
@@ -1306,6 +1456,17 @@ impl ProcessBuilder {
     ) -> Self {
         self.listeners
             .push((id.into(), start_listeners, end_listeners));
+        self
+    }
+
+    /// Declares task listeners (see [`TaskListener`]) on a user task. Applied in
+    /// [`build`](ProcessBuilder::build).
+    pub fn with_task_listeners(
+        mut self,
+        id: impl Into<String>,
+        task_listeners: Vec<TaskListener>,
+    ) -> Self {
+        self.task_listeners.push((id.into(), task_listeners));
         self
     }
 
@@ -1733,6 +1894,16 @@ impl ProcessBuilder {
                 Some(element) => {
                     element.start_listeners = start_listeners.clone();
                     element.end_listeners = end_listeners.clone();
+                }
+                None => return Err(BuildError::UnknownListenerElement(id.clone())),
+            }
+        }
+
+        // Attach task listeners to their user tasks.
+        for (id, task_listeners) in &self.task_listeners {
+            match elements.get_mut(id) {
+                Some(element) => {
+                    element.task_listeners = task_listeners.clone();
                 }
                 None => return Err(BuildError::UnknownListenerElement(id.clone())),
             }

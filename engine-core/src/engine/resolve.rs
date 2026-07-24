@@ -94,6 +94,28 @@ impl Engine {
             .unwrap_or_default()
     }
 
+    /// The task listeners of `event_type` declared on the user-task `element_id`
+    /// in the given instance's process, in declaration order (ADR 0037 §6).
+    /// Empty for non-user-task elements and user tasks without listeners of that
+    /// event type, so the listener-free path is untouched.
+    pub(crate) fn task_listeners_of(
+        &self,
+        instance_key: Key,
+        element_id: &str,
+        event_type: crate::model::TaskListenerEventType,
+    ) -> Vec<crate::model::TaskListener> {
+        self.process_of_instance(instance_key)
+            .and_then(|p| p.element(element_id))
+            .map(|e| {
+                e.task_listeners
+                    .iter()
+                    .filter(|l| l.event_type == event_type)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Evaluates the given io mappings against an explicit variable context
     /// `vars` (rather than the instance's persisted variables), returning the
     /// merged projection. Used when an as-yet-unapplied result (e.g. a script
