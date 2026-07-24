@@ -23,26 +23,44 @@
 //! *file* would otherwise plateau at the high-water mark of the largest backlog
 //! ever seen (a single spike parks ~payload × peak-backlog on disk for the life of
 //! the process — e.g. 100+ GB after one bad soak). The store therefore runs in
-//! `INCREMENTAL` auto-vacuum mode and, on the batched eviction path, hands freed
-//! pages back to the OS once enough have accumulated to be worth a copy-back (see
-//! [`crate::sqlite_space`]). The file then tracks the *live* backlog rather than the
-//! historical peak. `NANOBPMN_VARSPILL_RECLAIM_MB` tunes the gate (0 disables).
+//! `INCREMENTAL` auto-vacuum mode so freed pages land on a reclaimable freelist.
+//!
+//! Reclaiming that freelist is fsync-heavy (`wal_checkpoint(TRUNCATE)` +
+//! `incremental_vacuum` copy-back). Doing it inline on the eviction path was a
+//! throughput regression: on a shared disk those fsyncs contend with the engine's
+//! raft-log fsync and repeatedly trip its ADR-0020 saturation guard, so creates get
+//! shed under sustained load. Instead a **background reclaim thread** drains the
+//! freelist only while the store is *quiescent* — which is exactly the post-spike
+//! moment the reclaim targets (the huge backlog has drained; nothing is spilling or
+//! rehydrating). Under steady load the store is never idle, so the thread never
+//! fires and adds zero fsync pressure; the file simply tracks the live working set.
+//! The drain runs in bounded passes, releasing the connection lock between them, so
+//! resuming load preempts it immediately.
+//!
+//! `NANOBPMN_VARSPILL_RECLAIM_MB` sets the freelist gate (0 disables reclaim
+//! entirely, and skips the thread). `NANOBPMN_VARSPILL_RECLAIM_IDLE_MS` sets how
+//! long the store must be quiet before a drain begins.
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use nanobpmn_engine_core::{InstanceSnapshot, Key, Value};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::sqlite_space::{enable_incremental_auto_vacuum, page_stats, reclaim_freelist};
+use crate::sqlite_space::{
+    enable_incremental_auto_vacuum, freelist_bytes, page_stats, reclaim_freelist_step,
+};
 
-/// Freelist bytes that must accumulate before [`VarSpillStore::forget`] spends an
-/// `incremental_vacuum` + `wal_checkpoint(TRUNCATE)` to return them to the OS.
+/// Freelist bytes that must accumulate before the background reclaim thread spends
+/// an `incremental_vacuum` + `wal_checkpoint(TRUNCATE)` to return them to the OS.
 /// Default 64 MiB — high enough that steady-state churn (bounded live backlog)
-/// rarely triggers a reclaim, low enough to cap the file near `live + 64 MiB`
-/// rather than the historical peak. `NANOBPMN_VARSPILL_RECLAIM_MB` overrides;
-/// 0 disables reclaim entirely (pre-fix high-water behaviour, for A/B).
+/// never crosses it, low enough to cap a drained file near `live + 64 MiB` rather
+/// than the historical peak. `NANOBPMN_VARSPILL_RECLAIM_MB` overrides; 0 disables
+/// reclaim entirely (pre-fix high-water behaviour, and skips the thread).
 fn reclaim_threshold_bytes() -> u64 {
     std::env::var("NANOBPMN_VARSPILL_RECLAIM_MB")
         .ok()
@@ -52,11 +70,46 @@ fn reclaim_threshold_bytes() -> u64 {
         * 1024
 }
 
+/// How long the store must be free of mutations before the background thread starts
+/// draining the freelist, in milliseconds. Keeps reclaim off active-load windows so
+/// its fsyncs never contend with the engine's raft-log fsync. Default 2000 ms.
+fn reclaim_idle_ms() -> u64 {
+    std::env::var("NANOBPMN_VARSPILL_RECLAIM_IDLE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(2000)
+}
+
+/// Pages reclaimed per bounded background pass (~256 MiB at a 4 KiB page). Small
+/// enough that a pass holds the connection lock only briefly (so resuming load
+/// preempts a drain), large enough to clear even a 100 GB post-spike freelist within
+/// a couple of minutes of idle.
+const RECLAIM_CHUNK_PAGES: u32 = 65_536;
+
+/// Background thread that drains the SQLite freelist while the store is quiescent.
+struct ReclaimWorker {
+    /// Bumped by every mutation ([`put`](VarSpillStore::put) /
+    /// [`take`](VarSpillStore::take) / `forget` / cold variants); the worker treats
+    /// a stable count as "idle".
+    activity: Arc<AtomicU64>,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for ReclaimWorker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// A SQLite-backed key → variables map for spilled instance payloads.
 pub struct VarSpillStore {
-    conn: Mutex<Connection>,
-    /// Freelist byte gate for on-eviction reclaim; 0 disables it.
-    reclaim_threshold_bytes: u64,
+    conn: Arc<Mutex<Connection>>,
+    /// Present iff reclaim is enabled (file-backed store with a non-zero gate).
+    reclaim: Option<ReclaimWorker>,
 }
 
 impl VarSpillStore {
@@ -72,6 +125,16 @@ impl VarSpillStore {
         path: Option<&Path>,
         reclaim_threshold_bytes: u64,
     ) -> rusqlite::Result<Self> {
+        Self::open_with_params(path, reclaim_threshold_bytes, reclaim_idle_ms())
+    }
+
+    /// Full-control constructor (gate + idle window), used by tests to drive the
+    /// background reclaimer deterministically without touching process-global env.
+    fn open_with_params(
+        path: Option<&Path>,
+        reclaim_threshold_bytes: u64,
+        idle_ms: u64,
+    ) -> rusqlite::Result<Self> {
         let conn = match path {
             Some(p) => Connection::open(p)?,
             None => Connection::open_in_memory()?,
@@ -85,13 +148,84 @@ impl VarSpillStore {
              DELETE FROM cold;",
         )?;
         // Convert to INCREMENTAL auto-vacuum now that the tables are empty (the
-        // wipe above), so the VACUUM is near-free and later evictions can hand
-        // freed pages back to the OS instead of plateauing at the high-water mark.
+        // wipe above), so the VACUUM is near-free and freed pages can later be
+        // handed back to the OS instead of plateauing at the high-water mark.
         enable_incremental_auto_vacuum(&conn)?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            reclaim_threshold_bytes,
-        })
+        let conn = Arc::new(Mutex::new(conn));
+
+        // Spawn the background reclaim thread only when it can do useful work: an
+        // in-memory store has no file to shrink, and a zero gate disables reclaim.
+        let reclaim = if path.is_some() && reclaim_threshold_bytes > 0 {
+            Some(Self::spawn_reclaim_worker(
+                Arc::clone(&conn),
+                reclaim_threshold_bytes,
+                idle_ms,
+            ))
+        } else {
+            None
+        };
+        Ok(Self { conn, reclaim })
+    }
+
+    /// Starts the idle-gated background freelist drainer. It polls activity; once the
+    /// store has been quiet for `idle_ms` and the freelist exceeds `threshold_bytes`,
+    /// it reclaims in [`RECLAIM_CHUNK_PAGES`]-sized passes, re-checking for resumed
+    /// activity between passes so live load preempts the drain.
+    fn spawn_reclaim_worker(
+        conn: Arc<Mutex<Connection>>,
+        threshold_bytes: u64,
+        idle_ms: u64,
+    ) -> ReclaimWorker {
+        let activity = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let poll = Duration::from_millis((idle_ms / 2).clamp(100, 1000));
+        let idle_ticks = (idle_ms as f64 / poll.as_millis() as f64).ceil().max(1.0) as u32;
+
+        let handle = {
+            let activity = Arc::clone(&activity);
+            let stop = Arc::clone(&stop);
+            std::thread::Builder::new()
+                .name("varspill-reclaim".into())
+                .spawn(move || {
+                    let mut last_seen = activity.load(Ordering::Relaxed);
+                    let mut quiet = 0u32;
+                    while !stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(poll);
+                        let now = activity.load(Ordering::Relaxed);
+                        if now != last_seen {
+                            last_seen = now;
+                            quiet = 0;
+                            continue;
+                        }
+                        quiet = quiet.saturating_add(1);
+                        if quiet < idle_ticks {
+                            continue;
+                        }
+                        // Quiescent: drain one bounded pass. Skip cheaply if there is
+                        // nothing worth a copy-back. Any activity during/after the
+                        // pass resets the idle counter above on the next tick.
+                        let Ok(conn) = conn.lock() else { return };
+                        if freelist_bytes(&conn) >= threshold_bytes {
+                            let _ = reclaim_freelist_step(&conn, RECLAIM_CHUNK_PAGES);
+                        }
+                    }
+                })
+                .expect("spawn varspill-reclaim thread")
+        };
+        ReclaimWorker {
+            activity,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    /// Records a mutation so the background reclaimer holds off while the store is
+    /// active. Cheap (a relaxed increment); a no-op when reclaim is disabled.
+    #[inline]
+    fn note_activity(&self) {
+        if let Some(w) = &self.reclaim {
+            w.activity.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Persists `vars` under `key`, replacing any prior payload.
@@ -102,6 +236,8 @@ impl VarSpillStore {
             "INSERT OR REPLACE INTO spill (key, vars) VALUES (?1, ?2)",
             params![key as i64, json],
         )?;
+        drop(conn);
+        self.note_activity();
         Ok(())
     }
 
@@ -120,6 +256,8 @@ impl VarSpillStore {
             .ok()?;
         let json = json?;
         let _ = conn.execute("DELETE FROM spill WHERE key = ?1", params![key as i64]);
+        drop(conn);
+        self.note_activity();
         serde_json::from_str(&json).ok()
     }
 
@@ -134,6 +272,8 @@ impl VarSpillStore {
             "INSERT OR REPLACE INTO cold (key, snapshot) VALUES (?1, ?2)",
             params![key as i64, json],
         )?;
+        drop(conn);
+        self.note_activity();
         Ok(())
     }
 
@@ -153,6 +293,8 @@ impl VarSpillStore {
             .ok()?;
         let json = json?;
         let _ = conn.execute("DELETE FROM cold WHERE key = ?1", params![key as i64]);
+        drop(conn);
+        self.note_activity();
         serde_json::from_str(&json).ok()
     }
 
@@ -162,6 +304,11 @@ impl VarSpillStore {
     /// accumulate as orphan rows (the store is destructive only on *rehydration*,
     /// and a terminal instance is never rehydrated). Absent keys are no-ops, so
     /// this is safe to call for every evicted instance whether or not it spilled.
+    ///
+    /// The freed pages land on the freelist; returning them to the OS is left to the
+    /// background reclaim thread, which drains only while the store is quiescent — so
+    /// this eviction path stays free of the fsync-heavy vacuum/checkpoint that would
+    /// otherwise contend with the engine's raft-log fsync under load.
     pub fn forget(&self, keys: &[Key]) {
         if keys.is_empty() {
             return;
@@ -186,21 +333,15 @@ impl VarSpillStore {
             }
         }
         let _ = tx.commit();
-        // Terminal eviction is the natural, batched moment to return freed pages
-        // to the OS: `take` deletions (rehydration) also land on the freelist and
-        // are reclaimed here. Gated so this runs only when enough space has piled
-        // up to be worth the copy-back — keeping the file near the live backlog
-        // instead of the historical high-water mark.
-        if self.reclaim_threshold_bytes > 0 {
-            let _ = reclaim_freelist(&conn, self.reclaim_threshold_bytes);
-        }
+        drop(conn);
+        self.note_activity();
     }
 
     /// The store's on-disk size as `(file_bytes, live_bytes)` (see
     /// [`crate::sqlite_space::page_stats`]): `file_bytes` is the whole allocated
     /// file (freelist included), `live_bytes` the pages holding actual data. With
-    /// incremental auto-vacuum + on-eviction reclaim, `file_bytes` tracks the live
-    /// cold backlog rather than plateauing at the peak-backlog high-water.
+    /// incremental auto-vacuum + background reclaim, `file_bytes` settles toward the
+    /// live cold backlog once a spike drains, rather than plateauing at the peak.
     pub fn db_page_stats(&self) -> (u64, u64) {
         let conn = self.conn.lock().expect("spill store poisoned");
         page_stats(&conn)
@@ -301,14 +442,15 @@ mod tests {
     }
 
     #[test]
-    fn forget_reclaims_file_space_to_the_os() {
-        // A file-backed store so we can observe the on-disk high-water shrink;
-        // the reclaim gate is set to 1 byte so any freelist triggers it.
+    fn forget_then_idle_reclaims_file_space_to_the_os() {
+        // A file-backed store so we can observe the on-disk high-water shrink. The
+        // reclaim gate is 1 byte (any freelist qualifies) and the idle window is
+        // short so the background drainer fires quickly once we stop mutating.
         let dir = std::env::temp_dir();
         let path = dir.join(format!("varspill-reclaim-{}.sqlite", std::process::id()));
         let _ = std::fs::remove_file(&path);
 
-        let store = VarSpillStore::open_with_reclaim_threshold(Some(&path), 1).unwrap();
+        let store = VarSpillStore::open_with_params(Some(&path), 1, 100).unwrap();
 
         // Spill a batch large enough to grow the file well past its empty size.
         let big = "x".repeat(8 * 1024);
@@ -319,17 +461,28 @@ mod tests {
         let (file_peak, live_peak) = store.db_page_stats();
         assert!(live_peak > 0 && file_peak > 0);
 
-        // Terminal eviction of the whole batch must hand the freed pages back.
+        // Terminal eviction frees the rows onto the freelist but does NOT reclaim
+        // inline any more — the file still holds the high-water right after forget.
         store.forget(&keys);
-        let (file_after, live_after) = store.db_page_stats();
-
+        let (file_right_after, live_after) = store.db_page_stats();
         assert!(
             live_after < live_peak / 4,
             "live bytes should collapse after forgetting the batch (peak={live_peak}, after={live_after})"
         );
+
+        // Once the store goes quiet, the background reclaimer drains the freelist and
+        // the file shrinks back toward the live set. Poll until it does (bounded).
+        let mut file_after = file_right_after;
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            file_after = store.db_page_stats().0;
+            if file_after < file_peak / 2 {
+                break;
+            }
+        }
         assert!(
             file_after < file_peak / 2,
-            "file should shrink back toward the live set, not hold the high-water (peak={file_peak}, after={file_after})"
+            "background reclaim should shrink the file toward the live set once idle (peak={file_peak}, after={file_after})"
         );
 
         drop(store);
