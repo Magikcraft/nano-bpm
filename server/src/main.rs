@@ -37,6 +37,7 @@ mod recovery_throttle;
 mod remote_sink;
 mod runtime_config;
 mod seglog;
+mod sqlite_space;
 mod stub_impls;
 mod varspill;
 mod varstore;
