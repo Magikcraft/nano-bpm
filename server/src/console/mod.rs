@@ -2504,6 +2504,16 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
     // on PATH) plus the pack's install hint — a bare "toolchain missing" leaves
     // them guessing which tool to install.
     let missing_toolchain = missing_toolchain_json(&cfg.lang, runnable);
+    // Absolute on-disk location of the project, so the Console can show users
+    // where their files live (header display + "copy path" in the file tree).
+    // Canonicalize to resolve symlinks / relative roots; fall back to the joined
+    // path if canonicalization fails (e.g. a transient FS error).
+    let root_path = projects::project_dir(name).map(|p| {
+        std::fs::canonicalize(&p)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .into_owned()
+    });
     Ok(serde_json::json!({
         "config": cfg,
         "files": tree,
@@ -2513,6 +2523,7 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
         "runnable": runnable,
         "missingToolchain": missing_toolchain,
         "platforms": projects::PLATFORMS,
+        "rootPath": root_path,
     }))
 }
 

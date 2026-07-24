@@ -1727,13 +1727,21 @@ components:
         label: { type: string }
     ProjectDetail:
       type: object
-      required: [config, files, runState, denoAvailable, nodeAvailable, runnable, platforms]
+      required: [config, files, runState, denoAvailable, nodeAvailable, runnable, platforms, rootPath]
       properties:
         config: { $ref: '#/components/schemas/ProjectConfig' }
         files:
           type: array
           items: { $ref: '#/components/schemas/FileNode' }
         runState: { $ref: '#/components/schemas/RunState' }
+        rootPath:
+          type: string
+          description: >-
+            Absolute path of the project directory on the host running the
+            server. Surfaced so users can locate the project's files on disk
+            (header display + "copy path" actions in the file tree). When the
+            console talks to a remote/containerized gateway this is the server's
+            path, not the client's, so treat it as informational.
         # Deno present (needed only for `deno compile`, ADR 0038).
         denoAvailable: { type: boolean }
         # Node >= 22.6 present — the primary Run runtime.

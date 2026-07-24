@@ -392,6 +392,7 @@ export default function ProjectWorkspace() {
           name={name}
           config={detail.config}
           files={detail.files}
+          rootPath={detail.rootPath}
           selected={selected}
           onSelect={setSelected}
           onChanged={reloadFiles}
@@ -511,6 +512,7 @@ function FileBrowser({
   name,
   config,
   files,
+  rootPath,
   selected,
   onSelect,
   onChanged,
@@ -518,6 +520,7 @@ function FileBrowser({
   name: string;
   config: ProjectConfig;
   files: FileNode[];
+  rootPath: string;
   selected: string | null;
   onSelect: (path: string) => void;
   onChanged: () => void;
@@ -543,6 +546,17 @@ function FileBrowser({
     }
   };
 
+  // Right-click "copy path" menu. rootPath is the project dir on the host; the
+  // path separator is inferred from it so absolute paths look native on Windows
+  // (backslashes) as well as POSIX hosts.
+  const [menu, setMenu] = useState<{ x: number; y: number; node: FileNode } | null>(null);
+  const sep = rootPath.includes("\\") && !rootPath.includes("/") ? "\\" : "/";
+  const absPathOf = (rel: string) => rootPath + sep + rel.split("/").join(sep);
+  const openMenu = (e: React.MouseEvent, node: FileNode) => {
+    e.preventDefault();
+    setMenu({ x: e.clientX, y: e.clientY, node });
+  };
+
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-edge bg-panel">
       <div className="flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-fg-faint">
@@ -557,8 +571,20 @@ function FileBrowser({
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-1 pb-2">
-        <FileTree nodes={files} depth={0} selected={selected} onSelect={onSelect} onDelete={del} />
+        <FileTree nodes={files} depth={0} selected={selected} onSelect={onSelect} onDelete={del} onContextMenu={openMenu} />
       </div>
+      {/* On-disk location of the project. Lets users find their files outside
+          the IDE; the copy button grabs the absolute path. */}
+      <ProjectPathFooter rootPath={rootPath} />
+      {menu && (
+        <PathContextMenu
+          x={menu.x}
+          y={menu.y}
+          node={menu.node}
+          absPath={absPathOf(menu.node.path)}
+          onClose={() => setMenu(null)}
+        />
+      )}
       {newFileOpen && (
         <NewFileModal
           name={name}
@@ -573,6 +599,106 @@ function FileBrowser({
         />
       )}
     </aside>
+  );
+}
+
+/// Clipboard helper — resolves to true on success. Falls back to a temporary
+/// textarea + execCommand for the rare browser/context without the async
+/// Clipboard API (the console is served from localhost, a secure context, so
+/// navigator.clipboard is normally available).
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+/// Footer of the file tree showing the project's absolute directory on the host,
+/// with a one-click copy. This is the primary "where is this on disk?" affordance.
+function ProjectPathFooter({ rootPath }: { rootPath: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    if (await copyToClipboard(rootPath)) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    }
+  };
+  return (
+    <div className="flex items-center gap-1 border-t border-edge px-2 py-1.5 text-[11px] text-fg-faint">
+      <span className="shrink-0 text-fg-faint" aria-hidden>
+        📁
+      </span>
+      <span className="truncate font-mono" title={rootPath} dir="rtl">
+        {rootPath}
+      </span>
+      <span className="flex-1" />
+      <button
+        onClick={() => void copy()}
+        title="Copy the project's path on disk"
+        className="shrink-0 rounded px-1 py-0.5 hover:bg-hover hover:text-fg"
+      >
+        {copied ? "✓" : "⧉"}
+      </button>
+    </div>
+  );
+}
+
+/// Right-click menu on a file/dir node: copy its absolute path (host path) or
+/// its project-relative path. A full-screen transparent backdrop closes it on
+/// any outside click or right-click.
+function PathContextMenu({
+  x,
+  y,
+  node,
+  absPath,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  node: FileNode;
+  absPath: string;
+  onClose: () => void;
+}) {
+  const act = async (text: string) => {
+    await copyToClipboard(text);
+    onClose();
+  };
+  return (
+    <div className="fixed inset-0 z-50" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }}>
+      <ul
+        className="absolute min-w-44 rounded-md border border-edge bg-panel py-1 text-sm shadow-lg"
+        style={{ left: x, top: y }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <li className="truncate px-3 py-1 text-[11px] uppercase tracking-wider text-fg-faint" title={node.path}>
+          {node.name}
+        </li>
+        <li>
+          <button className="block w-full px-3 py-1.5 text-left text-fg-muted hover:bg-hover hover:text-fg" onClick={() => void act(absPath)}>
+            Copy path
+          </button>
+        </li>
+        <li>
+          <button className="block w-full px-3 py-1.5 text-left text-fg-muted hover:bg-hover hover:text-fg" onClick={() => void act(node.path)}>
+            Copy relative path
+          </button>
+        </li>
+      </ul>
+    </div>
   );
 }
 
@@ -796,12 +922,14 @@ function FileTree({
   selected,
   onSelect,
   onDelete,
+  onContextMenu,
 }: {
   nodes: FileNode[];
   depth: number;
   selected: string | null;
   onSelect: (p: string) => void;
   onDelete: (p: string) => void;
+  onContextMenu: (e: React.MouseEvent, node: FileNode) => void;
 }) {
   return (
     <ul>
@@ -813,6 +941,7 @@ function FileTree({
           selected={selected}
           onSelect={onSelect}
           onDelete={onDelete}
+          onContextMenu={onContextMenu}
         />
       ))}
     </ul>
@@ -825,12 +954,14 @@ function TreeNode({
   selected,
   onSelect,
   onDelete,
+  onContextMenu,
 }: {
   node: FileNode;
   depth: number;
   selected: string | null;
   onSelect: (p: string) => void;
   onDelete: (p: string) => void;
+  onContextMenu: (e: React.MouseEvent, node: FileNode) => void;
 }) {
   const [open, setOpen] = useState(depth < 2);
   const pad = { paddingLeft: `${depth * 12 + 8}px` };
@@ -840,13 +971,14 @@ function TreeNode({
         <div
           style={pad}
           onClick={() => setOpen((v) => !v)}
+          onContextMenu={(e) => onContextMenu(e, node)}
           className="group flex cursor-pointer items-center gap-1 rounded py-1 pr-2 text-sm text-fg-muted hover:bg-hover"
         >
           <span className="text-fg-faint">{open ? "▾" : "▸"}</span>
           <span className="truncate">{node.name}</span>
         </div>
         {open && node.children && (
-          <FileTree nodes={node.children} depth={depth + 1} selected={selected} onSelect={onSelect} onDelete={onDelete} />
+          <FileTree nodes={node.children} depth={depth + 1} selected={selected} onSelect={onSelect} onDelete={onDelete} onContextMenu={onContextMenu} />
         )}
       </li>
     );
@@ -860,6 +992,7 @@ function TreeNode({
           active ? "bg-accent/10 font-medium text-accent-strong" : "text-fg-muted hover:bg-hover hover:text-fg"
         }`}
         onClick={() => onSelect(node.path)}
+        onContextMenu={(e) => onContextMenu(e, node)}
       >
         <span className="opacity-0">▸</span>
         <span className="truncate">{node.name}</span>
