@@ -2958,6 +2958,17 @@ pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult 
     res
 }
 
+/// `POST /console/api/projects/{name}/data/{source}/domaintypes` — the maker's
+/// explicit "regenerate now" affordance (ADR 0029 §4.1/§6). Reifies `source`'s
+/// live schema into `.nanobpm/domain.d.ts`, returning `{ path, text, tables }`.
+pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({ "op": "domaintypes", "source": source }),
+    )
+    .await
+}
+
 // --- triggers (ADR 0025) --------------------------------------------------
 
 fn trigger_error(e: triggers::TriggerError) -> (StatusCode, String) {

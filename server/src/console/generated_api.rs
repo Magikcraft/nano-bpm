@@ -1204,6 +1204,22 @@ impl apis::data::Data for ServerImpl {
             R::Status404_NotFound
         )
     }
+
+    async fn regenerate_domain_types(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::RegenerateDomainTypesPathParams,
+    ) -> Result<apis::data::RegenerateDomainTypesResponse, ()> {
+        use apis::data::RegenerateDomainTypesResponse as R;
+        data_ok_or!(
+            super::project_data_domaintypes(&path_params.name, &path_params.source).await,
+            R::Status200_TheEmittedDomainTypes,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
 }
 
 #[async_trait]
