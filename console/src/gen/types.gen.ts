@@ -478,6 +478,10 @@ export type ProjectDetail = {
     config: ProjectConfig;
     files: Array<FileNode>;
     runState: RunState;
+    /**
+     * Absolute path of the project directory on the host running the server. Surfaced so users can locate the project's files on disk (header display + "copy path" actions in the file tree). When the console talks to a remote/containerized gateway this is the server's path, not the client's, so treat it as informational.
+     */
+    rootPath: string;
     denoAvailable: boolean;
     nodeAvailable: boolean;
     runnable: boolean;
