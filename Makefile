@@ -22,6 +22,20 @@ PROCESSOS_DIR := $(PROJECT_ROOT)/processos
 WASM_DIR := $(PROJECT_ROOT)/engine-wasm
 UV := uv
 
+# Spec inputs for the generated crates. Listing these as prerequisites of the
+# codegen targets makes `make` regenerate when the spec (or its generator
+# config/patches/script) changes — otherwise, once generated/ exists, make
+# treats it as up to date forever and a spec change silently leaves the crate
+# stale (e.g. new endpoints added to spec-console/console-api.yaml fail the
+# release build with "cannot find type ...PathParams").
+REST_SPEC_SRCS := $(wildcard $(PROJECT_ROOT)/spec/*.yaml) \
+	$(wildcard $(PROJECT_ROOT)/spec-patches/*.yaml) \
+	$(PROJECT_ROOT)/openapi-generator-config.yaml \
+	$(PROJECT_ROOT)/scripts/generate.sh
+CONSOLE_SPEC_SRCS := $(PROJECT_ROOT)/spec-console/console-api.yaml \
+	$(PROJECT_ROOT)/openapi-generator-config-console.yaml \
+	$(PROJECT_ROOT)/scripts/generate-console.sh
+
 # Canonical formatter: pinned nightly rustfmt. The repo's rustfmt.toml uses
 # unstable options (group_imports), which stable `cargo fmt` silently ignores —
 # producing import-ordering drift. Always format via this toolchain so the tree
@@ -89,10 +103,10 @@ generate: ## Generate the Rust REST layer + server stub impls from spec/ (needs 
 generate-app-manifest: ## Generate the Urban App manifest TypeScript types from spec-app/nano-app.schema.json (ADR 0027; needs Node)
 	./scripts/generate-app-manifest.sh
 
-$(GENERATED_DIR)/Cargo.toml:
+$(GENERATED_DIR)/Cargo.toml: $(REST_SPEC_SRCS)
 	$(MAKE) generate
 
-$(CONSOLE_GENERATED_DIR)/Cargo.toml:
+$(CONSOLE_GENERATED_DIR)/Cargo.toml: $(CONSOLE_SPEC_SRCS)
 	./scripts/generate-console.sh
 
 # stub_impls.rs is generated (git-ignored) and wires each REST trait method to
@@ -104,7 +118,7 @@ $(CONSOLE_GENERATED_DIR)/Cargo.toml:
 # failure CI never sees because it regenerates the stub and compiles tests.
 # When the generated apis already exist this is a fast, Java-free re-run of just
 # the Python stub step; otherwise fall back to a full `make generate`.
-$(STUB_IMPLS): scripts/gen-stub-server.py
+$(STUB_IMPLS): scripts/gen-stub-server.py $(GENERATED_DIR)/Cargo.toml
 	@if [ -d "$(GENERATED_DIR)/src/apis" ]; then \
 		echo "Regenerating $(STUB_IMPLS) from $(GENERATED_DIR)/src/apis"; \
 		python3 scripts/gen-stub-server.py "$(GENERATED_DIR)/src/apis" "$(STUB_IMPLS)"; \
