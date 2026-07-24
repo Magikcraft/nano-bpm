@@ -4109,8 +4109,12 @@ impl ServerImpl {
                     match row.state {
                         ProcessInstanceState::Completed => return true,
                         // Terminated/canceled instances never complete; stop
-                        // waiting and report not-completed.
-                        ProcessInstanceState::Terminated => return false,
+                        // waiting and report not-completed. A `Terminating`
+                        // instance (a canceling task-listener chain draining) is
+                        // on its way to `Terminated`, so it won't complete either.
+                        ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => {
+                            return false;
+                        }
                         ProcessInstanceState::Active => {}
                     }
                 }
@@ -13728,7 +13732,13 @@ fn process_instance_state_enum(state: ProcessInstanceState) -> models::ProcessIn
     match state {
         ProcessInstanceState::Active => models::ProcessInstanceStateEnum::Active,
         ProcessInstanceState::Completed => models::ProcessInstanceStateEnum::Completed,
-        ProcessInstanceState::Terminated => models::ProcessInstanceStateEnum::Terminated,
+        // The REST enum has no transient "terminating" state; an instance draining
+        // its `canceling` task-listener chain (ADR 0037 §6) has already had its
+        // tokens discarded and is on its way to `Terminated`, so it projects as
+        // TERMINATED externally.
+        ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => {
+            models::ProcessInstanceStateEnum::Terminated
+        }
     }
 }
 
@@ -13749,11 +13759,12 @@ fn job_state_enum(state: nanobpmn_engine_core::JobState) -> models::JobStateEnum
 /// Maps an engine [`nanobpmn_engine_core::JobKind`] to the REST `jobKind` +
 /// `listenerEventType` pair. Ordinary element jobs report `BpmnElement` /
 /// `Unspecified`; an execution-listener job (ADR 0037) reports
-/// `ExecutionListener` and its start/end event type.
+/// `ExecutionListener` and its start/end event type; a task-listener job (ADR
+/// 0037 §6) reports `TaskListener` and its user-task lifecycle event type.
 fn job_kind_enums(
     kind: &nanobpmn_engine_core::JobKind,
 ) -> (models::JobKindEnum, models::JobListenerEventTypeEnum) {
-    use nanobpmn_engine_core::{JobKind, ListenerEventType};
+    use nanobpmn_engine_core::{JobKind, ListenerEventType, TaskListenerEventType};
     match kind {
         JobKind::BpmnElement => (
             models::JobKindEnum::BpmnElement,
@@ -13764,6 +13775,16 @@ fn job_kind_enums(
             match event_type {
                 ListenerEventType::Start => models::JobListenerEventTypeEnum::Start,
                 ListenerEventType::End => models::JobListenerEventTypeEnum::End,
+            },
+        ),
+        JobKind::TaskListener { event_type, .. } => (
+            models::JobKindEnum::TaskListener,
+            match event_type {
+                TaskListenerEventType::Creating => models::JobListenerEventTypeEnum::Creating,
+                TaskListenerEventType::Assigning => models::JobListenerEventTypeEnum::Assigning,
+                TaskListenerEventType::Updating => models::JobListenerEventTypeEnum::Updating,
+                TaskListenerEventType::Completing => models::JobListenerEventTypeEnum::Completing,
+                TaskListenerEventType::Canceling => models::JobListenerEventTypeEnum::Canceling,
             },
         ),
     }
@@ -14296,6 +14317,7 @@ async fn instances_debug_body(server: &ServerImpl) -> Response {
                         ProcessInstanceState::Active => "Active",
                         ProcessInstanceState::Completed => "Completed",
                         ProcessInstanceState::Terminated => "Terminated",
+                        ProcessInstanceState::Terminating => "Terminating",
                     };
                     *inst_states.entry(label).or_default() += 1;
                     if !matches!(inst.state, ProcessInstanceState::Active) {

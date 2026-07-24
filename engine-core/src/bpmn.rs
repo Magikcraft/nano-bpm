@@ -178,6 +178,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // io_stack (ADR 0037). Listeners on non-activity nodes (gateways, events)
     // are a deferred subset — they are not on the io_stack.
     let mut in_execution_listeners = false;
+    // Gates `zeebe:taskListener` reads to a real `zeebe:taskListeners` container
+    // (ADR 0037 §6). Task listeners attach to the innermost open user task.
+    let mut in_task_listeners = false;
 
     for token in &tokens {
         match token {
@@ -665,6 +668,44 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     }
                                 }
                             }
+                            // zeebe:taskListeners and its nested
+                            // zeebe:taskListener entries (ADR 0037 §6). Task
+                            // listeners exist only on user tasks; each attaches
+                            // to the innermost open activity (the user task).
+                            "taskListeners" => {
+                                in_task_listeners = true;
+                            }
+                            "taskListener" if in_task_listeners => {
+                                if let (Some(&idx), Some(job_type)) =
+                                    (io_stack.last(), attr(attrs, "type"))
+                                {
+                                    // `eventType` defaults to "creating" in Zeebe
+                                    // when omitted.
+                                    let event_type = match attr(attrs, "eventType") {
+                                        Some("assigning") => {
+                                            crate::model::TaskListenerEventType::Assigning
+                                        }
+                                        Some("updating") => {
+                                            crate::model::TaskListenerEventType::Updating
+                                        }
+                                        Some("completing") => {
+                                            crate::model::TaskListenerEventType::Completing
+                                        }
+                                        Some("canceling") => {
+                                            crate::model::TaskListenerEventType::Canceling
+                                        }
+                                        _ => crate::model::TaskListenerEventType::Creating,
+                                    };
+                                    let retries = attr(attrs, "retries").map(str::to_string);
+                                    acc.nodes[idx].task_listeners.push(
+                                        crate::model::TaskListener {
+                                            event_type,
+                                            job_type: job_type.to_string(),
+                                            retries,
+                                        },
+                                    );
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -712,6 +753,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     io_stack.clear();
                     in_io_mapping = false;
                     in_execution_listeners = false;
+                    in_task_listeners = false;
                 }
                 "serviceTask" => {
                     cur_service_task = None;
@@ -744,6 +786,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 }
                 "ioMapping" => in_io_mapping = false,
                 "executionListeners" => in_execution_listeners = false,
+                "taskListeners" => in_task_listeners = false,
                 "startEvent" => cur_start = None,
                 "message" => cur_message = None,
                 "boundaryEvent" => {
@@ -1003,6 +1046,9 @@ struct NodeAcc {
     /// completion) lists, in declaration order (ADR 0037).
     start_listeners: Vec<crate::model::ExecutionListener>,
     end_listeners: Vec<crate::model::ExecutionListener>,
+    /// Task listeners (`zeebe:taskListener`) declared on this user task, all
+    /// event types in one list in declaration order (ADR 0037 §6).
+    task_listeners: Vec<crate::model::TaskListener>,
 }
 
 #[derive(Clone, Copy)]
@@ -1113,6 +1159,7 @@ impl ProcessAcc {
             multi_instance: None,
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
+            task_listeners: Vec::new(),
         });
         Some(self.nodes.len() - 1)
     }
@@ -1324,8 +1371,10 @@ impl ProcessAcc {
             let node_retries = node.retries.clone();
             let mi_id = node.id.clone();
             let listeners_id = node.id.clone();
+            let task_listeners_id = node.id.clone();
             let node_start_listeners = node.start_listeners.clone();
             let node_end_listeners = node.end_listeners.clone();
+            let node_task_listeners = node.task_listeners.clone();
             // Only treat as multi-instance when an input collection was actually
             // declared; a bare `multiInstanceLoopCharacteristics` with no
             // `zeebe:loopCharacteristics inputCollection` degenerates to an
@@ -1478,6 +1527,9 @@ impl ProcessAcc {
             if !node_start_listeners.is_empty() || !node_end_listeners.is_empty() {
                 builder =
                     builder.with_listeners(listeners_id, node_start_listeners, node_end_listeners);
+            }
+            if !node_task_listeners.is_empty() {
+                builder = builder.with_task_listeners(task_listeners_id, node_task_listeners);
             }
         }
         for boundary in self.boundaries {

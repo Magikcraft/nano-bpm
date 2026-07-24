@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 
 use nanobpmn_engine_core::{
     Event, IncidentKind, IncidentState, JobKind, JobState, Key, ListenerEventType,
-    ProcessInstanceState, UserTaskState, Value, partition_of,
+    ProcessInstanceState, TaskListenerEventType, UserTaskState, Value, partition_of,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -158,12 +158,18 @@ fn instance_state_code(s: ProcessInstanceState) -> i64 {
         ProcessInstanceState::Active => 0,
         ProcessInstanceState::Completed => 1,
         ProcessInstanceState::Terminated => 2,
+        // A transient cancelling state (ADR 0037 §6): the instance's tokens are
+        // discarded and a `canceling` task-listener chain is draining before it
+        // becomes `Terminated`. Projected as its own code so the read model can
+        // show "cancelling".
+        ProcessInstanceState::Terminating => 3,
     }
 }
 fn instance_state_from(code: i64) -> ProcessInstanceState {
     match code {
         1 => ProcessInstanceState::Completed,
         2 => ProcessInstanceState::Terminated,
+        3 => ProcessInstanceState::Terminating,
         _ => ProcessInstanceState::Active,
     }
 }
@@ -191,8 +197,9 @@ fn job_state_from(code: i64) -> JobState {
 
 /// Encodes a [`JobKind`] into the `(job_kind, listener_event_type)` column pair
 /// stored on the jobs read-model row (ADR 0037). Ordinary element jobs store
-/// `(0, 0)`; execution-listener jobs store `(1, start=0/end=1)`. The listener
-/// index/scope are not projected.
+/// `(0, 0)`; execution-listener jobs store `(1, start=0/end=1)`; task-listener
+/// jobs store `(2, creating=0/assigning=1/updating=2/completing=3/canceling=4)`.
+/// The listener index/scope are not projected.
 fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
     match kind {
         JobKind::BpmnElement => (0, 0),
@@ -203,14 +210,25 @@ fn job_kind_codes(kind: &JobKind) -> (i64, i64) {
                 ListenerEventType::End => 1,
             },
         ),
+        JobKind::TaskListener { event_type, .. } => (
+            2,
+            match event_type {
+                TaskListenerEventType::Creating => 0,
+                TaskListenerEventType::Assigning => 1,
+                TaskListenerEventType::Updating => 2,
+                TaskListenerEventType::Completing => 3,
+                TaskListenerEventType::Canceling => 4,
+            },
+        ),
     }
 }
 
 /// Reconstructs the display-relevant [`JobKind`] from the stored column pair.
-/// The listener index/scope are not persisted, so they default to `0`.
+/// The listener index/scope/user-task key are not persisted, so they default
+/// to `0`.
 fn job_kind_from(job_kind: i64, listener_event_type: i64) -> JobKind {
-    if job_kind == 1 {
-        JobKind::ExecutionListener {
+    match job_kind {
+        1 => JobKind::ExecutionListener {
             event_type: if listener_event_type == 1 {
                 ListenerEventType::End
             } else {
@@ -218,9 +236,19 @@ fn job_kind_from(job_kind: i64, listener_event_type: i64) -> JobKind {
             },
             index: 0,
             scope: 0,
-        }
-    } else {
-        JobKind::BpmnElement
+        },
+        2 => JobKind::TaskListener {
+            event_type: match listener_event_type {
+                1 => TaskListenerEventType::Assigning,
+                2 => TaskListenerEventType::Updating,
+                3 => TaskListenerEventType::Completing,
+                4 => TaskListenerEventType::Canceling,
+                _ => TaskListenerEventType::Creating,
+            },
+            index: 0,
+            user_task_key: 0,
+        },
+        _ => JobKind::BpmnElement,
     }
 }
 

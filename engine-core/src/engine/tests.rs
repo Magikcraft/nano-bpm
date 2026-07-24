@@ -8654,3 +8654,614 @@ fn exclusive_gateway_end_listener_reselects_and_raises_incident_if_nothing_match
         "instance parked on the gateway incident, not falsely completed"
     );
 }
+
+// --- Task listeners (ADR 0037 §6) -------------------------------------------
+
+use crate::model::{
+    TaskListener, TaskListenerEventType, TaskListenerJobResult, UserTaskCorrections,
+};
+
+fn tl(event_type: TaskListenerEventType, job_type: &str) -> TaskListener {
+    TaskListener {
+        event_type,
+        job_type: job_type.to_string(),
+        retries: None,
+    }
+}
+
+/// `start -> review (user task, with the given task listeners) -> end`.
+fn user_task_with_listeners(listeners: Vec<TaskListener>) -> ProcessDefinition {
+    ProcessBuilder::new("approval")
+        .start_event("start")
+        .user_task("review")
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .with_task_listeners("review", listeners)
+        .build()
+        .unwrap()
+}
+
+/// Deploys `def`, creates an instance and returns `(engine, instance_key)`.
+fn deploy_and_start(def: ProcessDefinition) -> (Engine, Key) {
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("approval"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    (engine, instance_key)
+}
+
+fn only_user_task_key(engine: &Engine) -> Key {
+    let keys: Vec<Key> = engine.state().user_tasks.keys().copied().collect();
+    assert_eq!(keys.len(), 1, "expected exactly one user task");
+    keys[0]
+}
+
+#[test]
+fn creating_listener_gates_the_user_task_before_it_is_available() {
+    // A `creating` listener runs while the element is ACTIVATING: the user task
+    // is not completable until the chain drains.
+    let (mut engine, _inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Creating,
+        "onCreate",
+    )]));
+
+    // The task is not yet `Created`: assigning it is rejected.
+    let key = only_user_task_key(&engine);
+    assert!(
+        engine
+            .apply_command(Command::assign_user_task(key, "alice"))
+            .is_err(),
+        "task must not accept an assignment while the creating listener runs"
+    );
+
+    // The creating-listener job is activatable; completing it drains the chain
+    // and the task becomes `Created`.
+    let jobs = engine.activate_jobs("onCreate", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 1, "one creating-listener job");
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Created
+    );
+    engine
+        .apply_command(Command::assign_user_task(key, "alice"))
+        .unwrap();
+}
+
+#[test]
+fn assigning_listener_defers_the_assignment_until_it_completes() {
+    let (mut engine, _inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Assigning,
+        "onAssign",
+    )]));
+    let key = only_user_task_key(&engine);
+
+    // Assign defers behind the listener: the assignee is not yet set.
+    engine
+        .apply_command(Command::assign_user_task(key, "alice"))
+        .unwrap();
+    assert_eq!(engine.state().user_tasks[&key].assignee, None);
+
+    let jobs = engine.activate_jobs("onAssign", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 1);
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&key].assignee.as_deref(),
+        Some("alice")
+    );
+}
+
+#[test]
+fn assigning_listener_can_deny_the_assignment() {
+    let (mut engine, _inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Assigning,
+        "onAssign",
+    )]));
+    let key = only_user_task_key(&engine);
+    engine
+        .apply_command(Command::assign_user_task(key, "alice"))
+        .unwrap();
+    let jobs = engine.activate_jobs("onAssign", "W", 10, 1_000, 0);
+    engine
+        .apply_command(Command::complete_job_with_task_result(
+            jobs[0].key,
+            TaskListenerJobResult {
+                denied: true,
+                denied_reason: Some("not allowed".into()),
+                corrections: UserTaskCorrections::default(),
+            },
+        ))
+        .unwrap();
+    // Denied: the assignee stays unset and the task is assignable again.
+    assert_eq!(engine.state().user_tasks[&key].assignee, None);
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Created
+    );
+    engine
+        .apply_command(Command::assign_user_task(key, "bob"))
+        .unwrap();
+}
+
+#[test]
+fn assigning_listener_can_correct_the_assignee() {
+    let (mut engine, _inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Assigning,
+        "onAssign",
+    )]));
+    let key = only_user_task_key(&engine);
+    engine
+        .apply_command(Command::assign_user_task(key, "alice"))
+        .unwrap();
+    let jobs = engine.activate_jobs("onAssign", "W", 10, 1_000, 0);
+    engine
+        .apply_command(Command::complete_job_with_task_result(
+            jobs[0].key,
+            TaskListenerJobResult {
+                denied: false,
+                denied_reason: None,
+                corrections: UserTaskCorrections {
+                    assignee: Some("carol".into()),
+                    ..Default::default()
+                },
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&key].assignee.as_deref(),
+        Some("carol")
+    );
+}
+
+#[test]
+fn updating_listener_defers_and_can_deny() {
+    use crate::UserTaskChangeset;
+    let (mut engine, _inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Updating,
+        "onUpdate",
+    )]));
+    let key = only_user_task_key(&engine);
+
+    let changeset = UserTaskChangeset {
+        priority: Some(80),
+        ..Default::default()
+    };
+    engine
+        .apply_command(Command::update_user_task(key, changeset))
+        .unwrap();
+    // Deferred: priority not yet applied.
+    assert_eq!(engine.state().user_tasks[&key].priority, 50);
+
+    let jobs = engine.activate_jobs("onUpdate", "W", 10, 1_000, 0);
+    engine
+        .apply_command(Command::complete_job_with_task_result(
+            jobs[0].key,
+            TaskListenerJobResult {
+                denied: true,
+                denied_reason: Some("no".into()),
+                corrections: UserTaskCorrections::default(),
+            },
+        ))
+        .unwrap();
+    // Denied: priority unchanged.
+    assert_eq!(engine.state().user_tasks[&key].priority, 50);
+}
+
+#[test]
+fn completing_listener_defers_completion_and_can_deny() {
+    let (mut engine, inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Completing,
+        "onComplete",
+    )]));
+    let key = only_user_task_key(&engine);
+
+    engine
+        .apply_command(Command::complete_user_task(key))
+        .unwrap();
+    // Deferred: not completed, instance still running.
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Created
+    );
+    assert!(!engine.is_completed(inst));
+
+    let jobs = engine.activate_jobs("onComplete", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 1);
+    // Deny returns the task to Created; the instance keeps running.
+    engine
+        .apply_command(Command::complete_job_with_task_result(
+            jobs[0].key,
+            TaskListenerJobResult {
+                denied: true,
+                denied_reason: Some("blocked".into()),
+                corrections: UserTaskCorrections::default(),
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Created
+    );
+    assert!(!engine.is_completed(inst));
+
+    // A second completion now succeeds through the listener.
+    engine
+        .apply_command(Command::complete_user_task(key))
+        .unwrap();
+    let jobs = engine.activate_jobs("onComplete", "W", 10, 1_000, 0);
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Completed
+    );
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn completing_listeners_run_sequentially_in_declaration_order() {
+    let (mut engine, inst) = deploy_and_start(user_task_with_listeners(vec![
+        tl(TaskListenerEventType::Completing, "first"),
+        tl(TaskListenerEventType::Completing, "second"),
+    ]));
+    let key = only_user_task_key(&engine);
+    engine
+        .apply_command(Command::complete_user_task(key))
+        .unwrap();
+
+    // Only the first listener's job exists initially.
+    assert!(engine.activate_jobs("second", "W", 10, 1_000, 0).is_empty());
+    let first = engine.activate_jobs("first", "W", 10, 1_000, 0);
+    assert_eq!(first.len(), 1);
+    engine
+        .apply_command(Command::complete_job(first[0].key))
+        .unwrap();
+
+    // Now the second appears; completing it drains the chain.
+    let second = engine.activate_jobs("second", "W", 10, 1_000, 0);
+    assert_eq!(second.len(), 1);
+    engine
+        .apply_command(Command::complete_job(second[0].key))
+        .unwrap();
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn canceling_listener_runs_before_the_instance_terminates() {
+    let (mut engine, inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Canceling,
+        "onCancel",
+    )]));
+    let key = only_user_task_key(&engine);
+
+    engine
+        .apply_command(Command::cancel_instance(inst))
+        .unwrap();
+    // Deferred termination: the task is not yet canceled and the instance is
+    // not yet terminated.
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Created
+    );
+    assert_eq!(
+        engine.state().instances[&inst].state,
+        state::ProcessInstanceState::Terminating
+    );
+
+    let jobs = engine.activate_jobs("onCancel", "W", 10, 1_000, 0);
+    assert_eq!(jobs.len(), 1, "one canceling-listener job");
+    engine
+        .apply_command(Command::complete_job(jobs[0].key))
+        .unwrap();
+    // The chain drained: task canceled and the instance is gone.
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Canceled
+    );
+    assert_eq!(
+        engine.state().instances[&inst].state,
+        state::ProcessInstanceState::Terminated
+    );
+}
+
+#[test]
+fn task_listener_job_may_not_carry_variables() {
+    let (mut engine, _inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Completing,
+        "onComplete",
+    )]));
+    let key = only_user_task_key(&engine);
+    engine
+        .apply_command(Command::complete_user_task(key))
+        .unwrap();
+    let jobs = engine.activate_jobs("onComplete", "W", 10, 1_000, 0);
+    let vars = HashMap::from([("x".to_string(), Value::Bool(true))]);
+    assert!(matches!(
+        engine.apply_command(Command::complete_job_with(jobs[0].key, vars)),
+        Err(EngineError::TaskListenerJobWithVariables { .. })
+    ));
+}
+
+#[test]
+fn task_listener_deny_may_not_carry_corrections() {
+    let (mut engine, _inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Completing,
+        "onComplete",
+    )]));
+    let key = only_user_task_key(&engine);
+    engine
+        .apply_command(Command::complete_user_task(key))
+        .unwrap();
+    let jobs = engine.activate_jobs("onComplete", "W", 10, 1_000, 0);
+    assert!(matches!(
+        engine.apply_command(Command::complete_job_with_task_result(
+            jobs[0].key,
+            TaskListenerJobResult {
+                denied: true,
+                denied_reason: Some("x".into()),
+                corrections: UserTaskCorrections {
+                    priority: Some(10),
+                    ..Default::default()
+                },
+            },
+        )),
+        Err(EngineError::TaskListenerDenyWithCorrections { .. })
+    ));
+}
+
+#[test]
+fn creating_and_canceling_listeners_may_not_deny() {
+    let (mut engine, _inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Creating,
+        "onCreate",
+    )]));
+    let key = only_user_task_key(&engine);
+    // The creating listener job exists while the task is ACTIVATING.
+    let _ = key;
+    let jobs = engine.activate_jobs("onCreate", "W", 10, 1_000, 0);
+    assert!(matches!(
+        engine.apply_command(Command::complete_job_with_task_result(
+            jobs[0].key,
+            TaskListenerJobResult {
+                denied: true,
+                denied_reason: Some("x".into()),
+                corrections: UserTaskCorrections::default(),
+            },
+        )),
+        Err(EngineError::TaskListenerDenyNotSupported { .. })
+    ));
+}
+
+#[test]
+fn user_task_without_listeners_is_byte_identical() {
+    // A user task carrying no listeners must produce the exact same journal as
+    // the pre-task-listener engine: assign, then complete, straight through.
+    let def = ProcessBuilder::new("approval")
+        .start_event("start")
+        .user_task("review")
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+    let (mut engine, inst) = deploy_and_start(def);
+    let key = only_user_task_key(&engine);
+
+    let assign = engine
+        .apply_command(Command::assign_user_task(key, "alice"))
+        .unwrap();
+    // No task-listener machinery leaks into the journal.
+    assert!(!assign.iter().any(|e| matches!(
+        e,
+        Event::TaskListenerJobCreated { .. }
+            | Event::UserTaskTransitionDeferred { .. }
+            | Event::UserTaskTransitionResolved { .. }
+    )));
+    assert_eq!(
+        engine.state().user_tasks[&key].assignee.as_deref(),
+        Some("alice")
+    );
+
+    engine
+        .apply_command(Command::complete_user_task(key))
+        .unwrap();
+    assert!(engine.is_completed(inst));
+}
+
+#[test]
+fn cancel_without_canceling_listener_terminates_synchronously() {
+    // Byte-identical cancellation: a user task with no canceling listener is
+    // canceled and the instance terminated in the same command.
+    let def = ProcessBuilder::new("approval")
+        .start_event("start")
+        .user_task("review")
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+    let (mut engine, inst) = deploy_and_start(def);
+    let key = only_user_task_key(&engine);
+    let events = engine
+        .apply_command(Command::cancel_instance(inst))
+        .unwrap();
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminating { .. })));
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Canceled
+    );
+    assert_eq!(
+        engine.state().instances[&inst].state,
+        state::ProcessInstanceState::Terminated
+    );
+}
+
+/// `start -> review (user task w/ props + listeners) -> end`.
+fn user_task_with_props_and_listeners(
+    props: crate::model::UserTaskProps,
+    listeners: Vec<TaskListener>,
+) -> ProcessDefinition {
+    ProcessBuilder::new("approval")
+        .start_event("start")
+        .user_task_with("review", props)
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .with_task_listeners("review", listeners)
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn initial_assignee_fires_the_assigning_listener() {
+    // An initial assignee declared on the task must route through the `assigning`
+    // listener (Zeebe parity): it is stripped off the CREATED record and applied
+    // only once the assigning chain drains.
+    use crate::model::UserTaskProps;
+    let (mut engine, _inst) = deploy_and_start(user_task_with_props_and_listeners(
+        UserTaskProps {
+            assignee: Some("alice".into()),
+            ..Default::default()
+        },
+        vec![tl(TaskListenerEventType::Assigning, "onAssign")],
+    ));
+    let key = only_user_task_key(&engine);
+    // Not yet assigned: the assigning chain gates the initial assignment.
+    assert_eq!(engine.state().user_tasks[&key].assignee, None);
+
+    let jobs = engine.activate_jobs("onAssign", "W", 10, 1_000, 0);
+    assert_eq!(
+        jobs.len(),
+        1,
+        "one assigning-listener job for the initial assignee"
+    );
+    // The listener may correct it.
+    engine
+        .apply_command(Command::complete_job_with_task_result(
+            jobs[0].key,
+            TaskListenerJobResult {
+                corrections: UserTaskCorrections {
+                    assignee: Some("carol".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&key].assignee.as_deref(),
+        Some("carol")
+    );
+}
+
+#[test]
+fn initial_assignee_routes_through_assigning_after_creating() {
+    // creating chain first, then the stripped initial assignee's assigning chain.
+    use crate::model::UserTaskProps;
+    let (mut engine, _inst) = deploy_and_start(user_task_with_props_and_listeners(
+        UserTaskProps {
+            assignee: Some("alice".into()),
+            ..Default::default()
+        },
+        vec![
+            tl(TaskListenerEventType::Creating, "onCreate"),
+            tl(TaskListenerEventType::Assigning, "onAssign"),
+        ],
+    ));
+    let key = only_user_task_key(&engine);
+    assert_eq!(engine.state().user_tasks[&key].assignee, None);
+    // Only the creating job exists first.
+    assert!(engine
+        .activate_jobs("onAssign", "W", 10, 1_000, 0)
+        .is_empty());
+    let create = engine.activate_jobs("onCreate", "W", 10, 1_000, 0);
+    assert_eq!(create.len(), 1);
+    engine
+        .apply_command(Command::complete_job(create[0].key))
+        .unwrap();
+    // Now the assigning chain for the initial assignee starts.
+    let assign = engine.activate_jobs("onAssign", "W", 10, 1_000, 0);
+    assert_eq!(assign.len(), 1);
+    engine
+        .apply_command(Command::complete_job(assign[0].key))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&key].assignee.as_deref(),
+        Some("alice")
+    );
+}
+
+#[test]
+fn initial_assignee_without_assigning_listener_stays_byte_identical() {
+    // No assigning listeners: the initial assignee is applied directly on CREATED,
+    // exactly as before task listeners existed.
+    use crate::model::UserTaskProps;
+    let def = ProcessBuilder::new("approval")
+        .start_event("start")
+        .user_task_with(
+            "review",
+            UserTaskProps {
+                assignee: Some("alice".into()),
+                ..Default::default()
+            },
+        )
+        .end_event("end")
+        .connect("start", "review")
+        .connect("review", "end")
+        .build()
+        .unwrap();
+    let (engine, _inst) = deploy_and_start(def);
+    let key = only_user_task_key(&engine);
+    assert_eq!(
+        engine.state().user_tasks[&key].assignee.as_deref(),
+        Some("alice")
+    );
+}
+
+#[test]
+fn canceling_a_task_mid_transition_clears_its_pending_state() {
+    // A task deferring a `completing` transition that is force-cancelled by
+    // instance termination must not be left with an unresolvable pending
+    // transition (its listener job is cancelled with the instance's jobs).
+    let (mut engine, inst) = deploy_and_start(user_task_with_listeners(vec![tl(
+        TaskListenerEventType::Completing,
+        "onComplete",
+    )]));
+    let key = only_user_task_key(&engine);
+    engine
+        .apply_command(Command::complete_user_task(key))
+        .unwrap();
+    // The completing chain is in flight (pending set).
+    assert!(engine.state().user_tasks[&key].pending.is_some());
+
+    // Cancelling the instance (this task has no `canceling` listener) cancels it
+    // immediately and terminates.
+    engine
+        .apply_command(Command::cancel_instance(inst))
+        .unwrap();
+    assert_eq!(
+        engine.state().user_tasks[&key].state,
+        state::UserTaskState::Canceled
+    );
+    assert!(
+        engine.state().user_tasks[&key].pending.is_none(),
+        "a cancelled task must not retain a pending transition"
+    );
+    assert_eq!(
+        engine.state().instances[&inst].state,
+        state::ProcessInstanceState::Terminated
+    );
+}
