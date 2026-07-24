@@ -2807,6 +2807,12 @@ impl ProjectSupervisor {
             return Err("no such project".into());
         }
         let cfg = read_config(name).ok_or("no such project")?;
+        // Export/compile hook: refresh the generated domain types so the packaged
+        // binary bundles source that types against the current schema + manifest
+        // `types` registry (ADR 0029 §6). Best-effort and erased at `deno compile`
+        // — a failure never blocks the build.
+        let _ = ensure_project_sdk(name);
+        let _ = run_data_op(name, serde_json::json!({ "op": "domaintypes" })).await;
         // Same dispatch as run(): project snapshot > lang pack > built-in Deno.
         // The old `cfg.lang != "deno"` gate meant a project scaffolded before
         // requires[] was mandatory got its Java source pumped through
@@ -3936,6 +3942,45 @@ mod tests {
         // Nested under the project name.
         let blob = String::from_utf8_lossy(&zip);
         assert!(blob.contains("ziptest/main.ts"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn export_bundles_regenerated_domain_types() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "dtexport";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                "app": { "driver": "sqlite", "url": "file:./app.db" }
+            } } }"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)" }),
+        )
+        .await
+        .expect("create table");
+        // The export/compile hook regenerates domain types before packaging.
+        run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+
+        let zip = export_zip(name, false).expect("zip");
+        let blob = String::from_utf8_lossy(&zip);
+        // The regenerated file is bundled (STORED, so its text is verbatim).
+        assert!(blob.contains("dtexport/.nanobpm/domain.d.ts"));
+        assert!(blob.contains("export interface DomainTables {"));
     }
 
     #[test]
