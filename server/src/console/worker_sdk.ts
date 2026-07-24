@@ -32,9 +32,11 @@ export type WorkerRow = Record<string, unknown>;
 
 /** The datasource handle returned by `ctx.data()`. Mirrors the DataSource
  * contract in the `@nanobpm/data` SDK (ADR 0024); typed structurally here so the
- * worker SDK stays a single self-contained file. */
+ * worker SDK stays a single self-contained file. `query` is generic so a caller
+ * can supply a row type from the generated `domain.d.ts` (ADR 0029 §4.1):
+ * `db.query<DomainTables["customers"]>("SELECT * FROM customers")`. */
 export interface WorkerDataSource {
-  query(sql: string, params?: unknown[]): Promise<WorkerRow[]>;
+  query<T extends object = WorkerRow>(sql: string, params?: unknown[]): Promise<T[]>;
   exec(
     sql: string,
     params?: unknown[],
@@ -50,7 +52,12 @@ export interface WorkerContext {
   data(name?: string): Promise<WorkerDataSource>;
 }
 
-export interface WorkerJob {
+/** A worker's variable shapes default to untyped JSON; declaring them (from the
+ * generated `domain.d.ts` or the manifest `types` registry, ADR 0029) types the
+ * handler's inputs and outputs while authoring — erased at runtime. */
+export type WorkerVars = Record<string, unknown>;
+
+export interface WorkerJob<In extends object = WorkerVars, Out extends object = WorkerVars> {
   readonly jobKey: string;
   readonly type: string;
   readonly processInstanceKey: string;
@@ -58,26 +65,26 @@ export interface WorkerJob {
   readonly processDefinitionKey?: string;
   readonly elementId?: string;
   readonly retries?: number;
-  readonly variables: Record<string, unknown>;
+  readonly variables: In;
   readonly customHeaders: Record<string, unknown>;
   /** Complete the job, optionally setting output variables. */
-  complete(variables?: Record<string, unknown>): void;
+  complete(variables?: Out): void;
   /** Fail the job (optionally with remaining retries and a message). */
   fail(opts?: { retries?: number; errorMessage?: string } | string): void;
   /** Throw a BPMN error from the job. */
   error(errorCode: string, errorMessage?: string): void;
 }
 
-export interface WorkerOptions {
+export interface WorkerOptions<In extends object = WorkerVars, Out extends object = WorkerVars> {
   /** BPMN job type to work on. */
   type: string;
   /** Handler invoked per job. Return output vars, or call a job action. The
    * optional 2nd arg exposes the App runtime: `ctx.data(name?)` opens a
    * declared datasource (ADR 0024). Single-arg handlers keep working. */
   handle: (
-    job: WorkerJob,
+    job: WorkerJob<In, Out>,
     ctx: WorkerContext,
-  ) => Promise<void | Record<string, unknown>> | void | Record<string, unknown>;
+  ) => Promise<void | Out> | void | Out;
   /** Max jobs in flight (also the streaming credit window). Default 10. */
   maxParallelJobs?: number;
   /** Job activation lock timeout in ms. Default 60000. */
@@ -152,7 +159,13 @@ function falconUrl(baseUrl: string, worker?: string): string {
   return url.toString();
 }
 
-export function defineWorker(opts: WorkerOptions): void {
+export function defineWorker<
+  In extends object = WorkerVars,
+  Out extends object = WorkerVars,
+>(typedOpts: WorkerOptions<In, Out>): void {
+  // The machinery below is type-agnostic (it moves JSON on the wire); the
+  // generics are an authoring-time contract only, so erase them internally.
+  const opts = typedOpts as unknown as WorkerOptions;
   const baseUrl = opts.baseUrl ?? RT.env("NANOBPMN_BASE_URL") ?? "http://127.0.0.1:8080";
   const workerName = opts.worker ?? RT.env("NANOBPMN_WORKER_NAME") ?? "embedded-worker";
   const maxParallel = opts.maxParallelJobs ?? 10;
