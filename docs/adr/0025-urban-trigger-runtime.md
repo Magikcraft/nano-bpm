@@ -1,10 +1,11 @@
 # ADR 0025 — Urban trigger runtime (the Zapier primitive: sources → inbox → engine)
 
-Status: **Accepted; phases 1–3 implemented** (durable inbox + dispatcher + FEEL action planning +
+Status: **Accepted; phases 1–4 implemented** (durable inbox + dispatcher + FEEL action planning +
 gateway apply; phase 2 `cron`/`webhook`/`file` core sources behind an extensible source registry;
 **phase 3** the console Triggers panel — declared-trigger + source-registry view, per-trigger "Run
-now", and the delivery inbox). Phase 4 (auto-launch pack source drivers as supervised processes +
-a first source pack) remains.
+now", and the delivery inbox; **phase 4** auto-launching `nano-ide-trigger-*` pack source drivers as
+supervised Node/Deno processes that emit over the ingress). The first real pack (`mqtt`) ships from
+the `nano-ide` pack monorepo, not this repo.
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md`, **Urban** — the RAD App bundle; this ADR
 expands its §B "Trigger runtime" from a sketch into the one genuinely-new runtime subsystem the
@@ -176,16 +177,40 @@ boundary* (`triggers::enqueue`). The only difference is *where the source loop r
   that persists-before-acks. This is the **universal external emit endpoint** — any out-of-process
   producer uses it.
 - **A pack source** is declared data: its `nano-ide.ext.json` carries a `triggerSources[]` entry
-  (`kind`, `displayName`, `transport`, `configFields`). The installed pack's out-of-process driver
-  (a Node/Deno process, ADR 0036) emits over the same webhook ingress. Adding a `type` therefore needs
-  **no core change**.
+  (`kind`, `displayName`, `transport`, `configFields`, and an optional `driver` path). The installed
+  pack's out-of-process driver (a Node/Deno process, ADR 0036) emits over the same webhook ingress.
+  Adding a `type` therefore needs **no core change**.
 
 `known_kinds()` = the compiled-in `BUILTIN_KINDS` ∪ every installed pack's declared `triggerSources[].kind`.
 `GET …/triggers` (below) tags each manifest trigger `builtin`/`recognized` against this union, so the
-Triggers panel can show an unknown `type` as "needs a pack" rather than silently ignoring it. **Deferred
-to phase 4:** the runtime *auto-launching* a pack driver process as a supervised task — phase 2 lands
-the recognition + emit contract, which is the marketplace seam; a pack driver run today is started
-out-of-band and emits over the ingress.
+Triggers panel can show an unknown `type` as "needs a pack" rather than silently ignoring it.
+
+**Driver auto-launch (phase 4).** When a running App declares a trigger whose `type` resolves (via
+`extensions::trigger_driver(kind)`) to an installed pack that ships a non-empty `driver`, the source
+supervisor auto-launches that driver as a **supervised child process** (`trigger_sources::run_pack_driver`),
+one per such trigger. It is modeled on the worker supervisor: runtime selected **Node-first** (ADR 0038,
+Node `--experimental-strip-types` for a `.ts` entry, else Deno `run --allow-net --allow-env
+--allow-read=<packDir>`), stdout/stderr streamed to the log, `kill_on_drop`, and a `select!` on the
+shared stop signal vs `child.wait()`. A crash (exit while still desired-running) is restarted with capped
+exponential backoff (500 ms → 30 s); the shared `LoopHandle` tears every driver down with the drain loop.
+A pack that declares a `kind` but no `driver` stays **declaration-only** — recognized and ingress-driven,
+its driver run out-of-band. The driver receives its context by **environment** and authenticates to the
+ingress with a shared secret it presents as `X-Webhook-Token`:
+
+| env var | value |
+| --- | --- |
+| `NANOBPMN_HOOK_URL` | `http://127.0.0.1:{gatewayPort}/console/api/projects/{project}/hooks/{triggerId}` — POST events here |
+| `NANOBPMN_BASE_URL` | the local gateway base URL |
+| `NANOBPMN_PROJECT` / `NANOBPMN_TRIGGER_ID` / `NANOBPMN_TRIGGER_TYPE` | identity of the trigger |
+| `NANOBPMN_TRIGGER_CONFIG` | JSON of the trigger's `config` (the pack's declared `configFields`) |
+| `NANOBPMN_TRIGGER_CONNECTION` | JSON of the referenced `connections[]` entry, or `null` |
+| `NANOBPMN_WEBHOOK_TOKEN` | the value of the env var named by the trigger's `auth` (if set) |
+
+The ingress (`webhook_ingest`) accepts a POST for a `webhook` trigger **or** any recognized pack kind,
+and rejects core loop kinds (`cron`/`file`/`manual`) and unrecognized types — so a pack driver POSTs to
+the exact same persist-before-ack endpoint as a raw webhook. **Deferred:** resolving connection secrets
+for the driver (today the connection object is forwarded verbatim, secrets as env templates the driver
+expands), and non-`webhook` transports (`transport` is forward-declared but only `webhook` is honoured).
 
 ### 7. Console — the Triggers panel
 
@@ -232,7 +257,15 @@ itself stays in the App manifest editor; this panel is the *runtime* view. Node-
    sub-tab (pending/done/failed counts + recent rows with auto-refresh). Wired into `ProjectWorkspace`
    as a toolbar toggle for Urban App projects, mutually exclusive with the Data panel.**)
 4. **trigger-pack-axis** — auto-launching the §6 `nano-ide-trigger-*` pack drivers as supervised
-   Node/Deno processes + a first pack (`imap` or `mqtt`), proving the axis end-to-end.
+   Node/Deno processes, proving the axis end-to-end. **(Implemented.** `extensions.rs`:
+   `TriggerSourceSpec.driver` + `trigger_driver(kind)` (on-disk pack resolver, path-escape guarded).
+   `trigger_sources.rs`: `spawn_sources` launches `run_pack_driver` for a pack source with a driver —
+   Node-first runtime select, env contract (§6), crash-restart with capped backoff, kill on stop.
+   `triggers.rs`: `webhook_ingest` accepts recognized pack kinds (not just `webhook`). A hermetic
+   integration test installs a throwaway pack whose dependency-free `driver.mjs` POSTs two events, and
+   asserts they land in the inbox via the real `project_hook` ingress. The first real pack (`mqtt`)
+   ships from the `nano-ide` pack monorepo (`@nanobpm/nano-ide-trigger-mqtt`), not this repo. Node-first
+   per ADR 0038.**)
 
 ## Consequences
 

@@ -140,6 +140,17 @@ pub fn router(server: ServerImpl) -> Router {
         .with_state(server)
 }
 
+/// Test-only: a minimal router mounting just the trigger ingress route (the
+/// real [`project_hook`] handler, which takes no `State`), so a hermetic
+/// integration test can drive a pack source's driver end-to-end over HTTP.
+#[cfg(test)]
+pub(crate) fn test_ingress_router() -> Router {
+    Router::new().route(
+        "/console/api/projects/{name}/hooks/{triggerId}",
+        axum::routing::post(project_hook),
+    )
+}
+
 // The `*path` catch-all must not swallow `/console/api/*`. axum's matchit router
 // ranks literal segments above wildcards, so the API routes above always win;
 // the catch-all only handles SPA asset/deep-link requests. The list of

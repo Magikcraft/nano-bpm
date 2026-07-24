@@ -205,9 +205,18 @@ pub(crate) async fn webhook_ingest(
                 .find(|t| t.get("id").and_then(Json::as_str) == Some(trigger_id))
         })
         .ok_or_else(|| TriggerError::Manifest(format!("no trigger '{trigger_id}' in manifest")))?;
-    if t.get("type").and_then(Json::as_str) != Some("webhook") {
+    // The ingress (the universal emit endpoint) accepts the passive `webhook`
+    // source AND any pack source (a recognised non-core kind, ADR 0025 §6):
+    // pack drivers run out-of-process and POST their events here. Core loop
+    // kinds (`cron`/`file`/`manual`) and unrecognised kinds are refused — they
+    // are not driven by HTTP ingress.
+    let kind = t.get("type").and_then(Json::as_str).unwrap_or("");
+    let accepts_ingress = kind == "webhook"
+        || (!super::trigger_sources::is_builtin(kind)
+            && super::trigger_sources::known_kinds().contains(kind));
+    if !accepts_ingress {
         return Err(TriggerError::Manifest(format!(
-            "trigger '{trigger_id}' is not a webhook source"
+            "trigger '{trigger_id}' (type '{kind}') does not accept webhook ingress"
         )));
     }
     if let Some(auth) = t
@@ -773,6 +782,23 @@ impl LoopHandle {
     pub(crate) async fn stopped(&self) {
         self.stop.notified().await;
     }
+
+    /// Test-only: a fresh running handle for driving [`super::trigger_sources::
+    /// spawn_sources`] directly (outside the dispatcher).
+    #[cfg(test)]
+    pub(crate) fn new_running() -> Arc<Self> {
+        Arc::new(Self {
+            running: AtomicBool::new(true),
+            stop: Notify::new(),
+        })
+    }
+
+    /// Test-only: stop supervised tasks (mirrors [`TriggerDispatcher::stop`]).
+    #[cfg(test)]
+    pub(crate) fn stop_for_test(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.stop.notify_waiters();
+    }
 }
 
 /// Owns a drain loop per project (ADR 0025 §4). Modeled on the worker/project
@@ -1223,7 +1249,108 @@ mod tests {
         assert!(!dispatcher().is_running(&name).await);
     }
 
-    // --- webhook auth (pure; no runtime) ----------------------------------
+    // --- pack-source driver auto-launch (ADR 0025 phase 4) -----------------
+
+    /// A dependency-free, cross-runtime (Node/Deno) trigger driver: it reads the
+    /// env contract, POSTs two distinct events to the ingress, then stays alive
+    /// (so the supervisor doesn't treat its exit as a crash and respawn it).
+    const TEST_DRIVER_MJS: &str = r#"
+const env = globalThis.Deno ? Deno.env.toObject() : process.env;
+const url = env.NANOBPMN_HOOK_URL;
+const token = env.NANOBPMN_WEBHOOK_TOKEN;
+const cfg = JSON.parse(env.NANOBPMN_TRIGGER_CONFIG || "{}");
+for (let i = 0; i < 2; i++) {
+  const headers = { "content-type": "application/json", "idempotency-key": `evt-${i}` };
+  if (token) headers["x-webhook-token"] = token;
+  await fetch(url, { method: "POST", headers, body: JSON.stringify({ n: i, topic: cfg.topic }) });
+}
+await new Promise((r) => setTimeout(r, 60000));
+"#;
+
+    /// End-to-end: an installed pack declaring a source `kind` with a `driver`
+    /// is auto-launched + supervised, and its events reach the durable inbox
+    /// over the real ingress. Hermetic — a throwaway pack in a temp extensions
+    /// dir + the real `project_hook` handler on an ephemeral port.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pack_driver_autolaunches_and_emits_over_ingress() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+
+        // Install a throwaway trigger pack under a temp extensions dir.
+        static N: AtomicU64 = AtomicU64::new(0);
+        let ext_root = std::env::temp_dir().join(format!(
+            "nano-trig-ext-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let pack = ext_root.join("nano-ide-trigger-testpack");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{
+                "id": "nano-ide-trigger-testpack",
+                "kind": "trigger",
+                "displayName": "Test trigger pack",
+                "triggerSources": [
+                    { "kind": "testmqtt", "displayName": "Test MQTT", "driver": "driver.mjs" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("driver.mjs"), TEST_DRIVER_MJS).unwrap();
+        unsafe {
+            std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
+        }
+
+        let name = setup_app(
+            r#", "triggers": [
+                { "id": "sensor", "type": "testmqtt", "config": { "topic": "test/topic" }, "action": { "start": "p" } }
+            ]"#,
+        );
+
+        // Stand up the real ingress on an ephemeral port; point drivers at it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::console::test_ingress_router())
+                .await
+                .ok();
+        });
+        workers::set_gateway_port(port);
+
+        // Launch + supervise the pack driver via the real source layer.
+        let manifest = read_manifest(&name).unwrap();
+        let handle = LoopHandle::new_running();
+        crate::console::trigger_sources::spawn_sources(&name, &manifest, handle.clone());
+
+        // Poll until both events land in the inbox (or time out ~10s).
+        let mut pending = 0;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if let Ok(s) = inbox_status(&name).await {
+                pending = s.pending;
+                if pending >= 2 {
+                    break;
+                }
+            }
+        }
+
+        handle.stop_for_test();
+        server.abort();
+        unsafe {
+            std::env::remove_var("NANOBPMN_EXTENSIONS_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&ext_root);
+
+        assert_eq!(
+            pending, 2,
+            "the auto-launched pack driver emitted two events over the ingress"
+        );
+    }
 
     #[test]
     fn check_webhook_secret_accepts_matching_token() {
