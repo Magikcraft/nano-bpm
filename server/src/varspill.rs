@@ -352,8 +352,8 @@ impl VarSpillStore {
                 // With wal_autocheckpoint disabled, the WAL only truncates off the
                 // hot path. The idle-gated reclaim thread handles the post-load
                 // drain, but under *sustained* retirement (never idle) the WAL would
-                // grow unbounded, so the worker itself truncates once it has deleted
-                // WAL_CKPT_KEYS rows since the last checkpoint. That bound is large
+                // grow unbounded, so the worker itself truncates once it has forgotten
+                // WAL_CKPT_KEYS keys since the last checkpoint. That bound is large
                 // and the checkpoint infrequent, so its fsync barely perturbs raft
                 // fsync (unlike the per-1000-page auto-checkpoint it replaces), while
                 // still capping WAL disk growth and keeping cold reads fast.
