@@ -188,6 +188,16 @@ interface ManifestLocation {
   data: ManifestData;
   /** The raw `types` registry block (ADR 0029 §4.2), or `{}` when absent. */
   types: Record<string, unknown>;
+  /** The raw `workers` array (ADR 0022 §E / ADR 0033 §3), or `[]` when absent. */
+  workers: WorkerDecl[];
+}
+
+/** One `workers[]` entry, narrowed to the fields the typed-worker codegen reads
+ * (ADR 0033 §3). `inputType`/`outputType` name declared domain types. */
+export interface WorkerDecl {
+  taskType: string;
+  inputType?: string;
+  outputType?: string;
 }
 
 /// Walk up from `startDir` to the first directory containing `nano.app.json` and
@@ -201,12 +211,14 @@ async function findManifest(startDir: string): Promise<ManifestLocation> {
       const json = JSON.parse(text) as {
         data?: ManifestData;
         types?: Record<string, unknown>;
+        workers?: WorkerDecl[];
       };
       const data = json.data ?? { sources: {} };
       return {
         root: dir,
         data: { default: data.default, sources: data.sources ?? {} },
         types: json.types ?? {},
+        workers: Array.isArray(json.workers) ? json.workers : [],
       };
     } catch {
       // not here — keep walking up
@@ -229,6 +241,15 @@ export async function manifestTypes(
   cwd?: string,
 ): Promise<Record<string, unknown>> {
   return (await findManifest(cwd ?? RT.cwd())).types;
+}
+
+/// The manifest's `workers` declarations (ADR 0033 §3), narrowed to the fields
+/// the typed-worker codegen reads (`taskType` + `inputType`/`outputType`).
+/// Returns `[]` when the manifest declares no workers.
+export async function manifestWorkers(
+  cwd?: string,
+): Promise<WorkerDecl[]> {
+  return (await findManifest(cwd ?? RT.cwd())).workers;
 }
 
 /// Turn a datasource `url` into a filesystem path for file-backed drivers.

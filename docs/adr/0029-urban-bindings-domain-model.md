@@ -250,6 +250,73 @@ defineWorker({
 });
 ```
 
+### 6.2 Typed workers by task type — the model informs the worker types
+
+§6.1's worker still hand-casts `job.variables as { … }`: the domain model typed the *data at rest*, but
+the *variable payload in motion* (a job's `variables`, the `complete` result) stayed stringly-cast. This
+step closes the last gap so the **process model informs the worker type system**, keyed by the one join
+that already ties template↔worker (§ADR 0033 §3): the **task type** (`zeebe:taskDefinition:type` ↔
+`workers[].taskType`).
+
+Two symmetric declarations on a worker name its motion shapes, both `$ref`-ing the `types` registry
+(§4.2) and both fail-closed validated (`unknown-type`) in the schema package:
+
+- `workers[].inputType` — the type of the job's incoming `variables` (the payload the engine hands the
+  worker). New in this step; the symmetric partner of…
+- `workers[].outputType` — the type of the variables the worker writes back (already present, §ADR 0033
+  §3, where it also types output-mapped process variables for the next component's FEEL scope).
+
+The reifier emits a **gitignored `.nanobpm/workers.d.ts`** next to `domain.d.ts` (same materialize-and-ignore
+pattern), a `taskType → DomainTypes[…]` map for each direction (`WorkerInputs` / `WorkerOutputs`), plus a
+**static `.nanobpm/workers.ts`** SDK wrapper that re-exports the worker SDK and overrides `defineWorker` with
+a task-type-driven overload:
+
+```ts
+// workers.ts (static SDK, type-erased)
+export function defineWorker<K extends string>(
+  opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object>,
+): void;
+// InFor<K>  = K extends keyof WorkerInputs  ? WorkerInputs[K]  : WorkerVars
+// OutFor<K> = K extends keyof WorkerOutputs ? WorkerOutputs[K] : WorkerVars
+```
+
+TypeScript **infers `K` from the `type:` string literal**, so a worker is fully typed with **zero manual
+generics** — and an undeclared task type falls back to the untyped `WorkerVars`, so nothing breaks:
+
+```ts
+import { defineWorker } from "@nanobpm/worker";        // → .nanobpm/workers.ts
+import { openDomain } from "@nanobpm/domain";
+
+defineWorker({
+  type: "save-order",                                   // K = "save-order"
+  async handle(job) {
+    const { customerId, item, qty } = job.variables;    // typed off WorkerInputs["save-order"] — no cast
+    const db = await openDomain();
+    const orderId = await db.orders.insert({ customer_id: customerId, item, qty, status: "received" });
+    return { orderId: Number(orderId), qty };           // checked against WorkerOutputs["save-order"]
+  },
+});
+```
+
+The **degrade-to-Node invariant (ADR 0036)** holds: `workers.ts` uses only erasable type-level constructs
+(conditional types, generics, `import type`, `export *`, a single `as unknown as` cast). The explicit local
+`defineWorker` export shadows the star-export of the same name under both TS and Node ESM, so the typed
+wrapper is a strict superset — every `@nanobpm/worker` alias repoints to `workers.ts` with no runtime change.
+`workers.ts` is the static SDK (written on every `ensure_project_sdk`); `workers.d.ts` is reified by the
+`domaintypes` op (seeded-if-absent, refreshed on schema change / boot / the explicit route), and imports
+`DomainTypes` **only when ≥1 mapping references it** (the registry is omitted from `domain.d.ts` when empty).
+
+**The modeler closes the loop (the Delphi Object Inspector).** So the *model informs the types* without
+hand-editing the manifest, the BPMN properties panel shows an **"Urban domain type"** group on every service
+task carrying a literal `zeebe:taskDefinition:type`, with **Input / Output domain type** dropdowns populated
+from the manifest `types` registry. Picking a type writes the matching `workers[].inputType/outputType` back
+to `nano.app.json` (creating the `workers[]` entry if absent), which — after the next reification — flows
+straight into `WorkerInputs`/`WorkerOutputs`. The edit is **out-of-band from the BPMN document** (the type
+lives in the manifest, not the model XML), so it never touches the command stack (no false dirty); an
+optimistic overlay + an `elements.changed` refire keeps the panel in sync before the manifest reload lands.
+This is the RAD triangle: **declare the type in the modeler → the worker's `job.variables` is typed by task
+type → the same registry scopes the model's FEEL.**
+
 ## Consequences
 
 **Positive.**

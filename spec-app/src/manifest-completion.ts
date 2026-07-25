@@ -24,6 +24,7 @@ export type ReferenceSite =
   | "field-type" // types.<id>.fields.<key>.type — a primitive or declared type id
   | "body-type" // triggers[].bodyType — a declared domain type id (FEEL scope)
   | "binding-type" // bindings[].type — a declared domain type id (model FEEL scope)
+  | "input-type" // workers[].inputType — a declared domain type id (component input scope)
   | "output-type" // workers[].outputType — a declared domain type id (component output scope)
   | "form-ref" // bindings[].form — a form-js form id
   | "process-ref" // bindings[].process — a BPMN process id (process FEEL scope)
@@ -245,6 +246,10 @@ function classify(path: string[]): ReferenceSite | null {
       // workers[].llm
       if (at(2) === "workers") return "agent";
       return null;
+    case "inputType":
+      // workers[].inputType
+      if (at(2) === "workers") return "input-type";
+      return null;
     case "outputType":
       // workers[].outputType
       if (at(2) === "workers") return "output-type";
@@ -299,6 +304,12 @@ function candidatesFor(
         detail: "domain type",
       }));
     case "binding-type":
+      return Object.keys(record(manifest, "types") ?? {}).map((id) => ({
+        value: id,
+        kind: "type" as const,
+        detail: "domain type",
+      }));
+    case "input-type":
       return Object.keys(record(manifest, "types") ?? {}).map((id) => ({
         value: id,
         kind: "type" as const,

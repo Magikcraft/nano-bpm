@@ -1895,7 +1895,7 @@ defineWorker({{
 /// `import { fmt } from "@lib/money.ts"`.
 const WORKER_DENO_JSON: &str = r#"{
   "imports": {
-    "@nanobpm/worker": "../../.nanobpm/worker-sdk.ts",
+    "@nanobpm/worker": "../../.nanobpm/workers.ts",
     "@lib/": "../../lib/"
   }
 }

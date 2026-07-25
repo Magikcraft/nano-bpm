@@ -5,6 +5,7 @@ import {
   BpmnPropertiesProviderModule,
   ZeebePropertiesProviderModule,
 } from "bpmn-js-properties-panel";
+import { SelectEntry, Group, isSelectEntryEdited } from "@bpmn-io/properties-panel";
 import ZeebeModdle from "zeebe-bpmn-moddle/resources/zeebe.json";
 import {
   CloudElementTemplatesCoreModule,
@@ -135,10 +136,35 @@ interface BpmnModelerProps {
   /// adding a component file refreshes the palette without a remount. Empty/absent
   /// → an empty component palette (nothing installed).
   components?: ElementTemplate[];
+  /// The manifest domain-type binding for service tasks (ADR 0029 / 0033 §3).
+  /// When `enabled` (the open project is an Urban App with a `nano.app.json`),
+  /// the properties panel shows an "Urban domain type" group on every service
+  /// task carrying a literal `zeebe:taskDefinition:type`, letting the modeler
+  /// pick the input/output domain type for that task type. `typeIds` are the
+  /// declared registry type ids (manifest `types`); `get`/`set` read and persist
+  /// the `workers[]` entry keyed by task type in the manifest. Read live via a
+  /// ref, so edits reflect without recreating the modeler. Absent/`enabled:false`
+  /// → no domain-type group (non-App projects).
+  domainTypeBinding?: DomainTypeBinding;
+}
+
+/// The manifest domain-type binding surfaced in the BPMN properties panel.
+/// `field` is the worker-declaration key edited: the transient input payload
+/// type (`inputType`) or output payload type (`outputType`) for a task type.
+export interface DomainTypeBinding {
+  /// Whether the domain-type group is offered (true only for Urban App projects).
+  enabled: boolean;
+  /// Declared registry type ids (manifest `types`), the dropdown options.
+  typeIds: string[];
+  /// Current bound type for a task type's input/output, or "" when unset.
+  get(taskType: string, field: "inputType" | "outputType"): string;
+  /// Binds (or clears, on "") a task type's input/output domain type and
+  /// persists the manifest.
+  set(taskType: string, field: "inputType" | "outputType", value: string): void;
 }
 
 const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
-  function BpmnModeler({ onChange, onReady, getVariables, components }, ref) {
+  function BpmnModeler({ onChange, onReady, getVariables, components, domainTypeBinding }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const panelRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
@@ -164,6 +190,11 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     // recreating the modeler.
     const componentsRef = useRef<ElementTemplate[]>(components ?? []);
     componentsRef.current = components ?? [];
+    // The manifest domain-type binding, read live by the domain-type properties
+    // provider so type edits + manifest reloads reflect without recreating the
+    // modeler.
+    const domainTypeBindingRef = useRef<DomainTypeBinding | undefined>(domainTypeBinding);
+    domainTypeBindingRef.current = domainTypeBinding;
 
     // Queues a load on a single chain so imports can't race each other or the
     // initial blank diagram. Each op captures the modeler instance it was
@@ -272,6 +303,113 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         __init__: ["urbanComponentsPaletteProvider"],
         urbanComponentsPaletteProvider: ["type", UrbanComponentsPaletteProvider],
       };
+      // Properties provider (the Object Inspector): an "Urban domain type" group
+      // on every service task carrying a literal `zeebe:taskDefinition:type`,
+      // with Input/Output domain-type dropdowns bound to the manifest's declared
+      // registry types (ADR 0029 / 0033 §3). Picking a type writes the matching
+      // `workers[].inputType/outputType` back to `nano.app.json` via the live
+      // binding ref, wiring the model to the worker type system by task type.
+      // Gated on the binding being enabled (Urban App projects only). The change
+      // is out-of-band from the BPMN document, so it does NOT touch the command
+      // stack (no false dirty); an optimistic overlay + an `elements.changed`
+      // refire re-renders the group with the new value before the manifest ref
+      // catches up on the parent's next render.
+      const domainTypeOverlay = new Map<string, string>();
+      const overlayKey = (taskType: string, field: string) => `${taskType}\u0000${field}`;
+      const literalTaskType = (element: {
+        type?: string;
+        businessObject?: ModdleElement;
+      }): string | undefined => {
+        if (!element?.type || !SERVICE_TASK_TYPES.has(element.type)) return undefined;
+        const values = element.businessObject?.extensionElements?.values ?? [];
+        const td = values.find((v) => v.$type === "zeebe:TaskDefinition");
+        const t = td?.type;
+        // Only literal task types key a `workers[]` entry; skip FEEL expressions.
+        return typeof t === "string" && t && !t.startsWith("=") ? t : undefined;
+      };
+      const DomainTypeSelectEntry = (props: {
+        element: unknown;
+        field: "inputType" | "outputType";
+        taskType: string;
+      }) => {
+        const { element, field, taskType } = props;
+        const getValue = () =>
+          domainTypeOverlay.get(overlayKey(taskType, field)) ??
+          domainTypeBindingRef.current?.get(taskType, field) ??
+          "";
+        const setValue = (value: string) => {
+          const v = value ?? "";
+          domainTypeOverlay.set(overlayKey(taskType, field), v);
+          domainTypeBindingRef.current?.set(taskType, field, v);
+          try {
+            modelerRef.current
+              ?.get<{ fire(event: string, payload: unknown): void }>("eventBus")
+              .fire("elements.changed", { elements: [element] });
+          } catch {
+            // Panel refresh is best-effort; the value is already persisted.
+          }
+        };
+        const getOptions = () => [
+          { value: "", label: "<none>" },
+          ...(domainTypeBindingRef.current?.typeIds ?? []).map((id) => ({ value: id, label: id })),
+        ];
+        return SelectEntry({
+          element,
+          id: `urban-${field}`,
+          label: field === "inputType" ? "Input domain type" : "Output domain type",
+          getValue,
+          setValue,
+          getOptions,
+          description:
+            field === "inputType"
+              ? "Type of the job's variable payload (workers[].inputType)."
+              : "Type this task's output variables are typed as (workers[].outputType).",
+        });
+      };
+      interface PropertiesPanelService {
+        registerProvider(priority: number, provider: unknown): void;
+      }
+      class UrbanDomainTypePropertiesProvider {
+        // Explicit annotation so didi injection survives Vite minification.
+        static $inject = ["propertiesPanel"];
+        constructor(propertiesPanel: PropertiesPanelService) {
+          propertiesPanel.registerProvider(500, this);
+        }
+        getGroups(element: { type?: string; businessObject?: ModdleElement }) {
+          return (groups: unknown[]): unknown[] => {
+            const binding = domainTypeBindingRef.current;
+            if (!binding?.enabled) return groups;
+            const taskType = literalTaskType(element);
+            if (!taskType) return groups;
+            groups.push({
+              id: "urban-domain-type",
+              label: "Urban domain type",
+              component: Group,
+              entries: [
+                {
+                  id: "urban-inputType",
+                  component: DomainTypeSelectEntry,
+                  isEdited: isSelectEntryEdited,
+                  field: "inputType",
+                  taskType,
+                },
+                {
+                  id: "urban-outputType",
+                  component: DomainTypeSelectEntry,
+                  isEdited: isSelectEntryEdited,
+                  field: "outputType",
+                  taskType,
+                },
+              ],
+            });
+            return groups;
+          };
+        }
+      }
+      const urbanDomainTypePropertiesModule = {
+        __init__: ["urbanDomainTypePropertiesProvider"],
+        urbanDomainTypePropertiesProvider: ["type", UrbanDomainTypePropertiesProvider],
+      };
       const modeler = new Modeler({
         container: containerRef.current,
         propertiesPanel: { parent: panelRef.current },
@@ -287,6 +425,7 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           CloudElementTemplatesPropertiesProviderModule,
           CloudBehaviorsModule,
           urbanComponentsPaletteModule,
+          urbanDomainTypePropertiesModule,
           domainVariableResolverModule,
         ],
         moddleExtensions: { zeebe: ZeebeModdle },

@@ -357,6 +357,10 @@
           "type": "string",
           "description": "Name of an llm[] binding used as the worker (LLM-as-worker)."
         },
+        "inputType": {
+          "$ref": "#/$defs/slug",
+          "description": "Declared domain type this worker reads from `job.variables` — the incoming process-variable payload (ADR 0033 §3). Binds to the worker via `taskType`; declaring `inputType` types the handler's `job.variables` while authoring (the generated typed `defineWorker` keys off `taskType`), erased at runtime."
+        },
         "outputType": {
           "$ref": "#/$defs/slug",
           "description": "Declared domain type this worker writes as its result (ADR 0033 §3). A component's `zeebe:taskDefinition:type` binds to this worker via `taskType`; declaring `outputType` types the process variables its output mappings write, so downstream FEEL autocompletes on the result's fields."
