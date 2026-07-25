@@ -2851,13 +2851,13 @@ fn sql_is_ddl(sql: &str) -> bool {
     s.starts_with("CREATE ") || s.starts_with("ALTER ") || s.starts_with("DROP ")
 }
 
-/// Best-effort regeneration of `.nanobpm/domain.d.ts` from the default
+/// Best-effort regeneration of `.nanobpm/domain-rows.d.ts` from the default
 /// datasource's live schema (ADR 0029 §4.1/§6), so typed workers track the DB
 /// after a structural change. Failure is logged, never surfaced — the maker's
 /// operation already succeeded and the types are an authoring-time contract only.
 async fn regenerate_domain_types(name: &str) {
     if let Err((_, msg)) = project_data_op(name, serde_json::json!({ "op": "domaintypes" })).await {
-        tracing::debug!(project = name, "domain.d.ts regen skipped: {msg}");
+        tracing::debug!(project = name, "domain-rows.d.ts regen skipped: {msg}");
     }
 }
 
@@ -2960,7 +2960,7 @@ pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult 
 
 /// `POST /console/api/projects/{name}/data/{source}/domaintypes` — the maker's
 /// explicit "regenerate now" affordance (ADR 0029 §4.1/§6). Reifies `source`'s
-/// live schema into `.nanobpm/domain.d.ts`, returning `{ path, text, tables }`.
+/// live schema into `.nanobpm/domain-rows.d.ts`, returning `{ path, text, tables }`.
 pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiResult {
     project_data_op(
         name,

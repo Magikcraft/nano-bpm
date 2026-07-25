@@ -4,7 +4,7 @@
 //   deno test --allow-read --allow-write --allow-env server/src/console/domain_types_test.ts
 //
 // They cover the SQLite-affinity → TS mapping, interface-name sanitising, the
-// `domain.d.ts` emitter, and a full schema() → emit → write roundtrip against a
+// `domain-rows.d.ts` emitter, and a full schema() → emit → write roundtrip against a
 // temp manifest + SQLite db.
 
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
@@ -254,7 +254,7 @@ Deno.test("emitDomainBindings renders openDomain with a typed Table per table", 
     },
   ];
   const out = emitDomainBindings([{ source: "app", tables }], "app");
-  // Imports only the sibling SDK (relative) + a type-only domain.d.ts — no
+  // Imports only the sibling SDK (relative) + a type-only domain-rows.d.ts — no
   // jsr:/https: so it survives the Node fallback loader (ADR 0036).
   assertStringIncludes(out, 'import { openDataSource, type DataSource, type Table } from "./data-sdk.ts";');
   assertStringIncludes(out, `import type { Orders } from "./${DOMAIN_DTS}";`);
@@ -339,7 +339,7 @@ Deno.test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () =>
   }
 });
 
-// Regression: the generated `domain.d.ts` emits row types as `interface`s, and
+// Regression: the generated `domain-rows.d.ts` emits row types as `interface`s, and
 // an interface (unlike an inline type literal) has no implicit string index
 // signature — so it is NOT assignable to `Record<string, unknown>`. The Table
 // bound must therefore be `T extends object` (ADR 0029 §6.1), or every worker
@@ -353,7 +353,7 @@ interface RegOrderRow {
   status: string | null;
 }
 
-Deno.test("Table<T> accepts an interface row type (ADR 0029 §6.1 — the domain.d.ts shape)", async () => {
+Deno.test("Table<T> accepts an interface row type (ADR 0029 §6.1 — the domain-rows.d.ts shape)", async () => {
   const root = await Deno.makeTempDir();
   await Deno.writeTextFile(
     `${root}/nano.app.json`,
@@ -424,5 +424,5 @@ Deno.test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrap
   assertEquals(out.includes("enum "), false);
   // File basenames are stable.
   assertEquals(WORKER_BINDINGS_TS, "workers.ts");
-  assertEquals(WORKER_BINDINGS_DTS, "workers.d.ts");
+  assertEquals(WORKER_BINDINGS_DTS, "worker-io.d.ts");
 });
