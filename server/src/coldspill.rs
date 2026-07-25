@@ -46,7 +46,10 @@ struct ColdFacets {
 /// A resident index from routing keys to the cold instance that owns them.
 #[derive(Default)]
 pub struct ColdIndex {
-    instances: HashMap<Key, ColdFacets>,
+    /// Ordered by key so [`ColdIndex::retire_below`] can range-scan the instances
+    /// strictly below the low-water mark in O(log n + victims) instead of scanning
+    /// the whole index every retirement tick (see that method's note).
+    instances: BTreeMap<Key, ColdFacets>,
     by_job: HashMap<Key, Key>,
     by_job_type: HashMap<String, BTreeSet<Key>>,
     by_message: HashMap<(String, String), HashSet<Key>>,
@@ -175,15 +178,22 @@ impl ColdIndex {
     /// forever — the unbounded var-spill growth observed after a soak. Bounded per
     /// call to match the engine sweep's budget so a large backlog drains across
     /// ticks without stalling the actor.
+    ///
+    /// `instances` is a [`BTreeMap`], so this range-scans the keys strictly below
+    /// the mark in ascending order and stops after `max_remove` victims (or at the
+    /// first key `>= low_water`) — O(log n + victims), and an O(log n) no-op in the
+    /// steady state where nothing is below the mark. It must NOT scan the whole
+    /// index: it runs on the single-writer replica actor every retirement tick, so
+    /// a full O(n) sweep over a multi-million-row cold tier stalls live replication
+    /// and inflates raft-fsync latency (the regression PR #287 originally shipped).
     pub fn retire_below(&mut self, low_water: Key, max_remove: usize) -> Vec<Key> {
         if self.instances.is_empty() || max_remove == 0 {
             return Vec::new();
         }
         let victims: Vec<Key> = self
             .instances
-            .keys()
-            .copied()
-            .filter(|&k| k < low_water)
+            .range(..low_water)
+            .map(|(&k, _)| k)
             .take(max_remove)
             .collect();
         for &key in &victims {
