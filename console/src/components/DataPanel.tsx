@@ -503,6 +503,11 @@ function TablesTab({ name, source }: { name: string; source: string }) {
     try {
       const r = await regenerateDomainTypes({ path: { name, source }, throwOnError: true });
       const n = r.data.tables;
+      // The reify rewrote `.nanobpm/*` — drop the editor's cached SDK typings so
+      // the next code file opened picks up the regenerated `job.variables`/domain
+      // types without a reload.
+      const { invalidateProjectSdkLibs } = await import("./CodeEditor");
+      invalidateProjectSdkLibs();
       setRegenNote(`Generated ${r.data.path ?? "domain.d.ts"} — ${n} ${n === 1 ? "table" : "tables"} across all datasources.`);
     } catch (e) {
       setRegenNote(errMsg(e));
