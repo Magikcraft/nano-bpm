@@ -21,8 +21,13 @@
 //   op = "sources" | "schema" | "query" | "exec" | "script" | "migrations"
 //      | "migrate" | "domaintypes"
 
-import { listSources, openDataSource } from "./data-sdk.ts";
-import { DOMAIN_DTS, emitDomainDts } from "./domain-types.ts";
+import { listSources, manifestTypes, openDataSource } from "./data-sdk.ts";
+import {
+  DOMAIN_DTS,
+  type DomainTypeRegistry,
+  emitDomainModel,
+  type SourceSchema,
+} from "./domain-types.ts";
 
 interface Request {
   op: string;
@@ -285,25 +290,33 @@ async function run(req: Request): Promise<unknown> {
       return { applied, pending: 0 };
     }
     case "domaintypes": {
-      // ADR 0029 §4.1/§6: reify the datasource schema into TypeScript. Introspect
-      // the tables, emit `domain.d.ts`, and (unless `write:false`) materialise it
-      // to `.nanobpm/domain.d.ts` next to the SDK so workers type against the live
-      // DB. cwd is the project root, so the relative path lands in the project.
-      const db = await openDataSource(req.source);
-      let tables;
-      try {
-        tables = await db.schema();
-      } finally {
-        db.close();
+      // ADR 0029 §4.1/§4.2/§6: reify the domain model into TypeScript. Union
+      // *every* declared datasource (the table spine) and fold in the manifest
+      // `types` registry (transient/non-persisted shapes) so an App with
+      // multiple databases plus declared types gets one complete domain model,
+      // emit `domain.d.ts`, and (unless `write:false`) materialise it to
+      // `.nanobpm/domain.d.ts` next to the SDK so workers type against the live
+      // DBs. cwd is the project root, so the relative path lands in the project.
+      const { default: def, sources } = await listSources();
+      const schemas: SourceSchema[] = [];
+      for (const s of sources) {
+        const db = await openDataSource(s.name);
+        try {
+          schemas.push({ source: s.name, tables: await db.schema() });
+        } finally {
+          db.close();
+        }
       }
-      const text = emitDomainDts(tables);
+      const types = await manifestTypes() as DomainTypeRegistry;
+      const text = emitDomainModel(schemas, def, types);
       let path: string | null = null;
       if (req.write !== false) {
         await RT.mkdir(".nanobpm");
         path = `.nanobpm/${DOMAIN_DTS}`;
         await RT.writeTextFile(path, text);
       }
-      return { path, text, tables: tables.length };
+      const tables = schemas.reduce((n, s) => n + s.tables.length, 0);
+      return { path, text, tables };
     }
     default:
       throw new Error(`unknown op "${req.op}"`);

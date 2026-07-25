@@ -60,12 +60,25 @@ export interface ColumnMeta {
   primaryKey: boolean;
 }
 
-/** One table: its columns and the names of its indexes. Powers the DB Manager,
- * form data-binding, and the ADR 0029 domain-type ↔ table projection. */
+/** One foreign-key constraint: `column` in this table references
+ * `refTable(refColumn)`. `refColumn` is empty when the FK targets the parent's
+ * primary key without naming a column. `onDelete` is the referential action
+ * (e.g. `CASCADE`), empty when none was declared. */
+export interface ForeignKeyMeta {
+  column: string;
+  refTable: string;
+  refColumn: string;
+  onDelete: string;
+}
+
+/** One table: its columns, the names of its indexes, and its foreign keys.
+ * Powers the DB Manager, form data-binding, and the ADR 0029 domain-type ↔ table
+ * projection. */
 export interface TableMeta {
   name: string;
   columns: ColumnMeta[];
   indexes: string[];
+  foreignKeys: ForeignKeyMeta[];
 }
 
 export type Row = Record<string, unknown>;
@@ -169,6 +182,8 @@ export async function listSources(
 interface ManifestLocation {
   root: string;
   data: ManifestData;
+  /** The raw `types` registry block (ADR 0029 §4.2), or `{}` when absent. */
+  types: Record<string, unknown>;
 }
 
 /// Walk up from `startDir` to the first directory containing `nano.app.json` and
@@ -179,9 +194,16 @@ async function findManifest(startDir: string): Promise<ManifestLocation> {
   for (let i = 0; i < 12; i++) {
     try {
       const text = await RT.readTextFile(`${dir}/nano.app.json`);
-      const json = JSON.parse(text) as { data?: ManifestData };
+      const json = JSON.parse(text) as {
+        data?: ManifestData;
+        types?: Record<string, unknown>;
+      };
       const data = json.data ?? { sources: {} };
-      return { root: dir, data: { default: data.default, sources: data.sources ?? {} } };
+      return {
+        root: dir,
+        data: { default: data.default, sources: data.sources ?? {} },
+        types: json.types ?? {},
+      };
     } catch {
       // not here — keep walking up
     }
@@ -194,6 +216,15 @@ async function findManifest(startDir: string): Promise<ManifestLocation> {
   throw new Error(
     `nano.app.json not found at or above ${startDir}; datasources require an Urban manifest`,
   );
+}
+
+/// The manifest's domain-type registry (ADR 0029 §4.2): the transient/declared
+/// shapes with no backing table. Returns `{}` when the manifest declares none.
+/// The domain-type reifier folds these in alongside the datasource table spine.
+export async function manifestTypes(
+  cwd?: string,
+): Promise<Record<string, unknown>> {
+  return (await findManifest(cwd ?? RT.cwd())).types;
 }
 
 /// Turn a datasource `url` into a filesystem path for file-backed drivers.
@@ -266,6 +297,11 @@ class SqliteDataSource implements DataSource {
       const idx = this.#db
         .prepare(`PRAGMA index_list(${quoteIdent(t.name)})`)
         .all() as Array<{ name: string }>;
+      const fks = this.#db
+        .prepare(`PRAGMA foreign_key_list(${quoteIdent(t.name)})`)
+        .all() as Array<
+          { from: string; table: string; to: string | null; on_delete?: string }
+        >;
       out.push({
         name: t.name,
         columns: cols.map((c) => ({
@@ -275,6 +311,14 @@ class SqliteDataSource implements DataSource {
           primaryKey: !!c.pk,
         })),
         indexes: idx.map((i) => String(i.name)),
+        foreignKeys: fks.map((f) => ({
+          column: f.from,
+          refTable: f.table,
+          refColumn: f.to ?? "",
+          onDelete: f.on_delete && f.on_delete.toUpperCase() !== "NO ACTION"
+            ? f.on_delete.toUpperCase()
+            : "",
+        })),
       });
     }
     return Promise.resolve(out);

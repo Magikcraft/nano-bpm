@@ -733,10 +733,21 @@ export type DataColumnMeta = {
     primaryKey: boolean;
 };
 
+/**
+ * A foreign-key constraint: `column` in this table references `refTable(refColumn)`. `refColumn` is empty when the FK targets the parent's primary key. `onDelete` is the referential action (e.g. `CASCADE`), empty when none was declared.
+ */
+export type DataForeignKey = {
+    column: string;
+    refTable: string;
+    refColumn: string;
+    onDelete: string;
+};
+
 export type DataTableMeta = {
     name: string;
     columns: Array<DataColumnMeta>;
     indexes: Array<string>;
+    foreignKeys: Array<DataForeignKey>;
 };
 
 export type DataSchemaResponse = {

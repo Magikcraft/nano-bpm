@@ -2807,6 +2807,12 @@ impl ProjectSupervisor {
             return Err("no such project".into());
         }
         let cfg = read_config(name).ok_or("no such project")?;
+        // Export/compile hook: refresh the generated domain types so the packaged
+        // binary bundles source that types against the current schema + manifest
+        // `types` registry (ADR 0029 §6). Best-effort and erased at `deno compile`
+        // — a failure never blocks the build.
+        let _ = ensure_project_sdk(name);
+        let _ = run_data_op(name, serde_json::json!({ "op": "domaintypes" })).await;
         // Same dispatch as run(): project snapshot > lang pack > built-in Deno.
         // The old `cfg.lang != "deno"` gate meant a project scaffolded before
         // requires[] was mandatory got its Java source pumped through
@@ -3938,6 +3944,45 @@ mod tests {
         assert!(blob.contains("ziptest/main.ts"));
     }
 
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn export_bundles_regenerated_domain_types() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "dtexport";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                "app": { "driver": "sqlite", "url": "file:./app.db" }
+            } } }"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)" }),
+        )
+        .await
+        .expect("create table");
+        // The export/compile hook regenerates domain types before packaging.
+        run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+
+        let zip = export_zip(name, false).expect("zip");
+        let blob = String::from_utf8_lossy(&zip);
+        // The regenerated file is bundled (STORED, so its text is verbatim).
+        assert!(blob.contains("dtexport/.nanobpm/domain.d.ts"));
+        assert!(blob.contains("export interface DomainTables {"));
+    }
+
     #[test]
     fn config_roundtrips() {
         let _g = lock();
@@ -4028,6 +4073,7 @@ mod tests {
         std::fs::write(
             dir.join("db/migrations/001_init.sql"),
             "CREATE TABLE orders (id INTEGER PRIMARY KEY, name TEXT NOT NULL);\n\
+             CREATE TABLE lines (id INTEGER PRIMARY KEY, order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE);\n\
              INSERT INTO orders (name) VALUES ('first');",
         )
         .unwrap();
@@ -4063,6 +4109,20 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap().to_string())
             .collect();
         assert!(tables.contains(&"orders".to_string()));
+
+        // schema also surfaces foreign keys (ADR 0024 structure-editor support):
+        // the `lines.order_id` FK targets `orders(id)` with ON DELETE CASCADE.
+        let lines = sc["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "lines")
+            .expect("lines table");
+        let fk = &lines["foreignKeys"][0];
+        assert_eq!(fk["column"], "order_id");
+        assert_eq!(fk["refTable"], "orders");
+        assert_eq!(fk["refColumn"], "id");
+        assert_eq!(fk["onDelete"], "CASCADE");
 
         // exec + query roundtrip a parameterised insert.
         let ex = run_data_op(
@@ -4213,5 +4273,115 @@ mod tests {
                 .contains("export interface Customers {")
         );
         assert!(!dir.join(".nanobpm/domain.d.ts").exists());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn domaintypes_op_unions_every_datasource() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "dtmulti";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "analytics", "sources": {
+                "app": { "driver": "sqlite", "url": "file:./app.db" },
+                "analytics": { "driver": "sqlite", "url": "file:./analytics.db" }
+            } } }"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        // A same-named table in each source exercises collision-free naming.
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec", "source": "app",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create app.customers");
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec", "source": "analytics",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, seen TEXT)" }),
+        )
+        .await
+        .expect("create analytics.customers");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        // tables is the total across all sources.
+        assert_eq!(dt["tables"], 2);
+        let text = dt["text"].as_str().unwrap();
+        assert!(text.contains("export interface AppCustomers {"));
+        assert!(text.contains("export interface AnalyticsCustomers {"));
+        assert!(text.contains("export interface DomainSources {"));
+        assert!(text.contains("\"app\": {"));
+        assert!(text.contains("\"analytics\": {"));
+        // DomainTables aliases the declared default source.
+        assert!(text.contains("export type DomainTables = DomainSources[\"analytics\"];"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn domaintypes_op_folds_in_the_manifest_types_registry() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "dtreg";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{
+                "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" }
+                } },
+                "types": {
+                    "tax-line": { "fields": { "amount": { "type": "number" } } },
+                    "tax-submission": { "fields": {
+                        "filedAt": { "type": "datetime" },
+                        "note": { "type": "string", "optional": true },
+                        "lines": { "type": "tax-line", "list": true }
+                    } }
+                }
+            }"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create table");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        // tables counts only datasource tables; the registry rides alongside.
+        assert_eq!(dt["tables"], 1);
+        let text = dt["text"].as_str().unwrap();
+        // The table spine.
+        assert!(text.contains("export interface Customers {"));
+        assert!(text.contains("\"customers\": Customers;"));
+        // The manifest types registry, folded in.
+        assert!(text.contains("export interface DomainTypes {"));
+        assert!(text.contains("\"tax-line\": {"));
+        assert!(text.contains("\"tax-submission\": {"));
+        assert!(text.contains("filedAt: string;")); // datetime → string
+        assert!(text.contains("note?: string;")); // optional widens
+        assert!(text.contains("lines: DomainTypes[\"tax-line\"][];")); // ref + list
     }
 }
