@@ -134,6 +134,18 @@ impl Commit {
             crate::metrics::record_commit_wait(start.elapsed());
         }
     }
+
+    /// Blocks the current thread until the write backing this commit has been
+    /// fsynced. For synchronous callers (tests, startup seeding) that cannot
+    /// `.await`; must NOT be called from within an async runtime. Resolves
+    /// immediately if the writer thread is gone (shutdown) rather than hanging.
+    pub fn blocking_wait(self) {
+        if let CommitInner::Pending(rx) = self.0 {
+            let start = std::time::Instant::now();
+            let _ = rx.blocking_recv();
+            crate::metrics::record_commit_wait(start.elapsed());
+        }
+    }
 }
 
 /// The engine plus its durable event log.
