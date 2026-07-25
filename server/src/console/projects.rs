@@ -4511,6 +4511,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_emits_typed_worker_bindings() {
         let _g = lock();
         if workers::usable_node().is_none() && workers::find_deno().is_none() {

@@ -308,7 +308,7 @@ export interface DataQueryCall {
  */
 export declare function dataQueryCalls(feel: string): DataQueryCall[];
 /** The kinds of reference a manifest string value can be. */
-export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "output-type" | "form-ref" | "process-ref" | "datasource" | "agent";
+export type ReferenceSite = "process" | "message" | "decision" | "field-type" | "body-type" | "binding-type" | "input-type" | "output-type" | "form-ref" | "process-ref" | "datasource" | "agent";
 export type CandidateKind = "process" | "message" | "decision" | "primitive" | "type" | "form" | "datasource" | "agent" | "function" | "variable";
 export interface CompletionCandidate {
 	/** The literal id/name to insert (unquoted). */
@@ -491,6 +491,10 @@ type Worker = {
 	 * Name of an llm[] binding used as the worker (LLM-as-worker).
 	 */
 	llm?: string;
+	/**
+	 * Lowercase kebab-case slug.
+	 */
+	inputType?: string;
 	/**
 	 * Lowercase kebab-case slug.
 	 */
