@@ -95,7 +95,7 @@ fn wal_checkpoint_keys() -> u64 {
 }
 
 /// Maximum number of pending forget batches the background worker will hold
-/// before [`SpillStore::forget_async`] falls back to a synchronous delete. Bounds
+/// before [`VarSpillStore::forget_async`] falls back to a synchronous delete. Bounds
 /// the queue's memory so a sustained producer > consumer imbalance degrades
 /// predictably (backpressure onto the enqueuing follower actor) instead of growing
 /// without bound. Tunable via NANOBPMN_VARSPILL_FORGET_QUEUE.
@@ -128,12 +128,12 @@ const FORGET_CHUNK: usize = 4_096;
 /// never reused, so a queued forget can never clobber a later re-spill).
 ///
 /// Steady-state exporter-driven **eviction** ([`crate::journal::Journal::evict_instances`])
-/// deliberately stays synchronous ([`SpillStore::forget`]): it runs on the owner
+/// deliberately stays synchronous ([`VarSpillStore::forget`]): it runs on the owner
 /// (not a hot replica), one instance at a time, where immediate deletion keeps the
 /// durable store consistent with the read model.
 struct ForgetWorker {
     /// `None` after [`Drop`] has closed the channel. The queue is bounded
-    /// ([`forget_queue_cap`]); [`SpillStore::forget_async`] uses a non-blocking
+    /// ([`forget_queue_cap`]); [`VarSpillStore::forget_async`] uses a non-blocking
     /// `try_send` and falls back to a synchronous delete when it is full, so a
     /// slow consumer applies backpressure instead of growing memory unbounded.
     /// The worker drains and deletes in [`FORGET_CHUNK`]s.
@@ -187,9 +187,10 @@ pub struct VarSpillStore {
     /// and joins the thread.
     #[allow(dead_code)]
     reclaim: Option<ReclaimWorker>,
-    /// Present iff file-backed: applies retirement/eviction forgets off the actor.
-    /// Absent for in-memory stores (tests), where `forget_async` runs inline so
-    /// assertions observe the delete synchronously.
+    /// Present iff file-backed: applies follower *retirement* forgets off the actor
+    /// (exporter-driven *eviction* stays on the synchronous `forget` path). Absent
+    /// for in-memory stores (tests), where `forget_async` runs inline so assertions
+    /// observe the delete synchronously.
     forget: Option<ForgetWorker>,
 }
 
@@ -258,9 +259,10 @@ impl VarSpillStore {
         } else {
             None
         };
-        // Offload retirement/eviction forgets off the actor for file-backed stores.
-        // In-memory stores forget inline (see `forget_async`) so tests stay
-        // deterministic and there is no cross-actor contention to relieve.
+        // Offload follower retirement forgets off the actor for file-backed stores
+        // (eviction stays synchronous on `forget`). In-memory stores forget inline
+        // (see `forget_async`) so tests stay deterministic and there is no
+        // cross-actor contention to relieve.
         let forget = if path.is_some() {
             Some(Self::spawn_forget_worker(
                 Arc::clone(&conn),
