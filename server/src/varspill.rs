@@ -579,9 +579,16 @@ impl VarSpillStore {
             return;
         };
         let (ack_tx, ack_rx) = channel();
-        if tx.send(ForgetMsg::Flush(ack_tx)).is_ok() {
-            let _ = ack_rx.recv();
-        }
+        // A live store keeps its worker running until `ForgetWorker::drop` closes
+        // the channel, so a failed send or ack-recv here means the worker has
+        // panicked/exited. Surface that loudly rather than returning a false
+        // "flushed" signal to tests / graceful shutdown (which would mask lost or
+        // still-pending deletes — the orphan-row leak this path guards against).
+        tx.send(ForgetMsg::Flush(ack_tx))
+            .expect("varspill forget worker gone before flush");
+        ack_rx
+            .recv()
+            .expect("varspill forget worker dropped flush ack");
     }
 
     /// The store's on-disk size as `(file_bytes, live_bytes)` (see
