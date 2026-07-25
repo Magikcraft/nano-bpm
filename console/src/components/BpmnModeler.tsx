@@ -362,10 +362,7 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         const formDefault = ctx?.formId
           ? domainTypeBindingRef.current?.formType?.(ctx.formId)
           : undefined;
-        const getValue = () => {
-          if (!ctx) return "";
-          return readEnvelope(ctx.target, field) || formDefault || "";
-        };
+        const getValue = () => (ctx ? readEnvelope(ctx.target, field) : "");
         const applyValue = (value: string) => {
           const modeler = modelerRef.current;
           if (!modeler || !ctx) return;
