@@ -1723,6 +1723,7 @@ function EditorPane({
             value={content}
             language={languageForFile(path)}
             path={`file:///${name}/${path}`}
+            sdkProject={name}
             onChange={(v) => {
               setContent(v);
               setDirty(true);
