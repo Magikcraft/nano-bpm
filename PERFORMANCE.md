@@ -69,6 +69,54 @@ metered on the Prometheus `/metrics` surface via
 
 ---
 
+## 2026-07-24 — 50KB-payload throughput regression (PR #287) root-caused + fixed: var-spill WAL-checkpoint disk contention
+
+**Regression.** PR #287 added a cold-tier retirement sweep (`ColdIndex::retire_below`)
+that closed a var-spill disk leak by `forget()`-ing (SQL `DELETE`) cold replica rows
+from `var-spill.sqlite`. It silently **halved 50KB-payload create throughput**. Clean,
+journal-wiped A/B on the GCP 3-node RF3 Raft-ON cluster (12 partitions,
+leader-durable/sync, `MAXPAR=112`, open-loop) isolated it to the #287 boundary:
+
+| arm | binsha | agg tput | create-accept p50 | raft-log fsync | verdict |
+|---|---|---|---|---|---|
+| #285 (parent of #287) | `684773bc` | **3396/s** | 51 ms | ~3 ms | GOOD |
+| #287 + off-actor forget | `8e3fc93f` | **1534/s** | 188 ms | **~22 ms** | BAD |
+| #287, per-tick reap cap 2000 | `8e3fc93f` | 1355/s | 201 ms | — | BAD (refutes cap hypothesis) |
+
+**Root cause (proven, not inferred).** The operative signal is **raft-log fsync
+latency: 3 ms → 22 ms (7×), duty → ~1.05 (disk saturated).** `var-spill.sqlite` runs
+WAL + `synchronous=NORMAL`, so the cold-reclaim `DELETE`s are cheap (commit never
+fsyncs). But SQLite's implicit `wal_autocheckpoint` (every 1000 dirty WAL pages) fires
+a `wal_checkpoint` **fsync on the forget worker thread**, and that checkpoint I/O
+contends with the raft log on the **shared physical disk**. It is **disk contention,
+not actor CPU** — moving `forget()` off the single-writer engine actor (1775/s) and
+lowering the per-tick reap cap to 2000 (1355/s) both *failed*; only removing the
+checkpoint fsync recovered throughput. This refuted two earlier hypotheses (synchronous
+forget on the actor; the `ColdIndex::retire_below` scan cost).
+
+**Remediation (`server/src/varspill.rs`).** `PRAGMA wal_autocheckpoint=0` on the
+var-spill store so cold-reclaim deletes are pure WAL appends off the hot path; the WAL
+is truncated by the existing idle-gated reclaim thread **plus** a size-gated
+`PRAGMA wal_checkpoint(TRUNCATE)` backstop in the forget worker
+(`NANOBPMN_VARSPILL_WAL_CKPT_KEYS`, default 262144) so the WAL stays bounded under
+sustained load when the idle path never fires. This preserves #287's disk-leak fix —
+only *when* the WAL truncates changes, not *whether* cold rows are reclaimed. The
+off-actor forget worker (`forget_async`/`ForgetWorker`) is retained (keeps the DELETE
+work off the engine actor) but is not itself the fix.
+
+**Post-remediation state (soak-validated, same cluster/config).**
+
+| arm | binsha | agg tput | create-accept p50 | raft-log fsync |
+|---|---|---|---|---|
+| fix (`wal_autocheckpoint=0` + backstop) | `00362fd4` | **3479/s** | 51 ms | ~3.4 ms |
+
+**Full recovery:** 1534 → 3479/s (matches the #285 baseline 3396/s), raft-log fsync
+back to ~3 ms, create-accept p50 back to 51 ms. Disk no longer saturated. Regression
+test `file_backed_store_disables_wal_autocheckpoint` asserts the pragma on file-backed
+stores; 8 varspill unit tests + `clippy --all-targets` clean.
+
+---
+
 ## 2026-07-12 — Byte-bounded Raft-log hot-window cache (50KB-payload RAM) — clean A/B validated
 
 **Problem:** the compaction governor (below) bounds the log by *bytes*, but the
