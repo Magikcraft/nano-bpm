@@ -102,6 +102,71 @@ async function ensureSdkLib(): Promise<void> {
   }
 }
 
+// --- IntelliSense: the project's *typed* @nanobpm SDK surface --------------
+// `ensureSdkLib()` above wires up the generic, untyped worker SDK so a bare
+// `@nanobpm/worker` import at least resolves. But a real Urban app reifies a
+// *typed* SDK into `.nanobpm/` (ADR 0029/0033): `workers.ts` overrides
+// `defineWorker` with a taskType-keyed signature (so `job.variables` is typed
+// from the worker's declared domain type), `domain.ts` exposes `openDomain()`
+// with typed tables, and `data-sdk.ts` the raw data gateway. Register those
+// per-project files under `node_modules/@nanobpm/{worker,domain,data,llm}/` so
+// the bare specifiers resolve to the typed surface — regardless of the editing
+// model's URI scheme (Monaco resolves bare specifiers via node_modules, so this
+// works for both the standalone Workers editor and the project workspace, whose
+// files live under different `file:///…` roots). Missing files (a non-Urban
+// project, or one not yet reified) are tolerated: the generic SDK stays.
+let projectSdkLoaded = "";
+export async function ensureProjectSdkLibs(project: string | undefined): Promise<void> {
+  if (!project || projectSdkLoaded === project) return;
+  const read = async (p: string): Promise<string | null> => {
+    try {
+      const { projectFileEx } = await import("../lib/api");
+      const f = await projectFileEx(project, p);
+      return f.binary ? null : f.text;
+    } catch {
+      return null;
+    }
+  };
+  const [workersTs, workerSdk, workersDts, domainTs, domainDts, dataSdk, llm] =
+    await Promise.all([
+      read(".nanobpm/workers.ts"),
+      read(".nanobpm/worker-sdk.ts"),
+      read(".nanobpm/workers.d.ts"),
+      read(".nanobpm/domain.ts"),
+      read(".nanobpm/domain.d.ts"),
+      read(".nanobpm/data-sdk.ts"),
+      read(".nanobpm/llm-worker.ts"),
+    ]);
+  const add = (content: string | null, path: string) => {
+    if (content == null) return;
+    monaco.languages.typescript.typescriptDefaults.addExtraLib(content, path);
+  };
+  // @nanobpm/worker → the typed `defineWorker` wrapper + the relative modules it
+  // (and its `workers.d.ts`) import, co-located so `./worker-sdk.ts`,
+  // `./workers.d.ts` and `./domain.d.ts` all resolve within the package dir.
+  add(workersTs, "file:///node_modules/@nanobpm/worker/index.ts");
+  add(workerSdk, "file:///node_modules/@nanobpm/worker/worker-sdk.ts");
+  add(workersDts, "file:///node_modules/@nanobpm/worker/workers.d.ts");
+  add(domainDts, "file:///node_modules/@nanobpm/worker/domain.d.ts");
+  add(dataSdk, "file:///node_modules/@nanobpm/worker/data-sdk.ts");
+  // @nanobpm/domain → `openDomain()` + its relative deps (`data-sdk.ts` for the
+  // Table gateway, `domain.d.ts` for the row interfaces).
+  add(domainTs, "file:///node_modules/@nanobpm/domain/index.ts");
+  add(dataSdk, "file:///node_modules/@nanobpm/domain/data-sdk.ts");
+  add(domainDts, "file:///node_modules/@nanobpm/domain/domain.d.ts");
+  // @nanobpm/data → the raw typed data SDK.
+  add(dataSdk, "file:///node_modules/@nanobpm/data/index.ts");
+  // @nanobpm/llm → the LLM worker helper, when the app declares LLM workers.
+  add(llm, "file:///node_modules/@nanobpm/llm/index.ts");
+  if (workersTs) projectSdkLoaded = project;
+}
+
+/** Drop the cached project so the next `ensureProjectSdkLibs` refetches — call
+ * after a reify / manifest change so the editor picks up the new typings. */
+export function invalidateProjectSdkLibs(): void {
+  projectSdkLoaded = "";
+}
+
 // --- IntelliSense: Automatic Type Acquisition (npm packages) ---------------
 // Scan the edited source for imported packages and fetch their .d.ts from the
 // jsdelivr CDN, registering each as a Monaco extra-lib — so importing e.g.
@@ -193,6 +258,7 @@ export default function CodeEditor({
   path,
   readOnly,
   extraModels,
+  sdkProject,
   onChange,
   onSave,
 }: {
@@ -206,6 +272,10 @@ export default function CodeEditor({
    * `@lib/` modules), registered as background Monaco models so cross-file and
    * `@lib/…` imports type-check and complete. */
   extraModels?: ExtraModel[];
+  /** The project whose *typed* `.nanobpm` SDK should back the `@nanobpm/*` bare
+   * specifiers (so `job.variables` is typed from the worker's declared domain
+   * type). Pass this when editing a project's worker/`main.ts` code. */
+  sdkProject?: string;
   onChange: (value: string) => void;
   onSave?: () => void;
 }) {
@@ -238,10 +308,13 @@ export default function CodeEditor({
   useEffect(() => {
     void ensureSdkLib();
     void ensureDenoLib();
-    if (isCode) acquireTypes(value);
+    if (isCode) {
+      void ensureProjectSdkLibs(sdkProject);
+      acquireTypes(value);
+    }
     return () => clearTimeout(ataTimer.current);
     // Re-run when switching to a different file/value.
-  }, [path, isCode, value]);
+  }, [path, isCode, value, sdkProject]);
 
   return (
     <Editor
