@@ -180,6 +180,11 @@ export interface DomainTypeBinding {
   /// and refreshes `typeIds`, so a maker can declare + pick an envelope in one
   /// gesture (the "Create new envelope…" affordance). Absent → no create option.
   createType?(id: string): Promise<void> | void;
+  /// The declared domain type bound to a form in the manifest `bindings[]`
+  /// (ADR 0029 §5), or undefined. A user task whose linked form is typed defaults
+  /// its envelope to this (ADR 0033 §6) — the form binding stays the single source
+  /// of truth unless the maker sets an explicit override on the task in the model.
+  formType?(formId: string): string | undefined;
 }
 
 const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
@@ -351,6 +356,12 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       }) => {
         const { element, field } = props;
         const ctx = envelopeContext(element);
+        // A user task whose linked form is typed defaults its envelope to the
+        // form's bound type (ADR 0033 §6): the form binding stays the single
+        // source of truth; an explicit ref on the task overrides it.
+        const formDefault = ctx?.formId
+          ? domainTypeBindingRef.current?.formType?.(ctx.formId)
+          : undefined;
         const getValue = () => (ctx ? readEnvelope(ctx.target, field) : "");
         const applyValue = (value: string) => {
           const modeler = modelerRef.current;
@@ -370,12 +381,18 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           if (ctx.taskType) domainTypeBindingRef.current?.set(ctx.taskType, field, v);
         };
         const getOptions = () => [
-          { value: "", label: "<none>" },
+          // With a form default, clearing (this option) reverts to the inherited
+          // type rather than "no type", so name it accordingly.
+          { value: "", label: formDefault ? `Inherit from form (${formDefault})` : "<none>" },
           ...(domainTypeBindingRef.current?.typeIds ?? []).map((id) => ({ value: id, label: id })),
           ...(domainTypeBindingRef.current?.createType
             ? [{ value: CREATE_ENVELOPE, label: "➕ Create new envelope…" }]
             : []),
         ];
+        const baseDescription =
+          field === "inputType"
+            ? "Domain type of the data this element receives — travels in the model."
+            : "Domain type of the data this element produces — travels in the model.";
         return SelectEntry({
           element,
           id: `urban-envelope-${field}`,
@@ -389,10 +406,9 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             applyValue(value);
           },
           getOptions,
-          description:
-            field === "inputType"
-              ? "Domain type of the data this element receives — travels in the model."
-              : "Domain type of the data this element produces — travels in the model.",
+          description: formDefault
+            ? `${baseDescription} Defaults to the linked form's type (${formDefault}).`
+            : baseDescription,
         });
       };
       interface PropertiesPanelService {

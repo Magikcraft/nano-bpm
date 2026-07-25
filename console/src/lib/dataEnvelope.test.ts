@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   ENVELOPE_KEY,
   referencedMessage,
+  userTaskFormId,
   envelopeContext,
   readEnvelope,
   writeEnvelope,
@@ -56,12 +57,25 @@ test("envelopeContext: service task with no worker type has no envelope", () => 
   assert.equal(ctx, undefined);
 });
 
-test("envelopeContext: user task targets the element (no taskType)", () => {
-  const bo: EnvModdleElement = { $type: "bpmn:UserTask" };
+test("envelopeContext: user task targets the element and exposes its linked form id", () => {
+  const bo: EnvModdleElement = {
+    $type: "bpmn:UserTask",
+    extensionElements: { $type: "bpmn:ExtensionElements", values: [{ $type: "zeebe:FormDefinition", formId: "order-form" }] },
+  };
   const ctx = envelopeContext({ type: "bpmn:UserTask", businessObject: bo });
   assert.ok(ctx);
   assert.equal(ctx.target, bo);
   assert.equal(ctx.taskType, undefined);
+  assert.equal(ctx.formId, "order-form");
+});
+
+test("userTaskFormId: reads zeebe:FormDefinition formId, undefined when absent/embedded", () => {
+  const withForm: EnvModdleElement = {
+    extensionElements: { values: [{ $type: "zeebe:FormDefinition", formId: "f1" }] },
+  };
+  assert.equal(userTaskFormId(withForm), "f1");
+  assert.equal(userTaskFormId({ extensionElements: { values: [{ $type: "zeebe:FormDefinition", formId: "" }] } }), undefined);
+  assert.equal(userTaskFormId({}), undefined);
 });
 
 test("envelopeContext: message-bearing element targets the shared bpmn:Message", () => {

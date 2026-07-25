@@ -18,6 +18,7 @@ export interface EnvModdleElement {
   id?: string;
   name?: string;
   value?: string;
+  formId?: string;
   values?: EnvModdleElement[];
   properties?: EnvModdleElement[];
   eventDefinitions?: EnvModdleElement[];
@@ -58,6 +59,9 @@ export interface EnvelopeContext {
   // For service-ish tasks: the worker task type, so the envelope can be
   // projected onto the manifest `workers[]` entry that keeps `defineWorker` typed.
   taskType?: string;
+  // For user tasks: the linked form id (`zeebe:formDefinition:formId`), if any,
+  // so the envelope can default to the form's bound type (ADR 0033 §6 / 0029 §5).
+  formId?: string;
 }
 
 // The `bpmn:Message` a message-bearing element references, if any.
@@ -66,6 +70,14 @@ export function referencedMessage(bo: EnvModdleElement | undefined): EnvModdleEl
   if (bo.$type === "bpmn:ReceiveTask") return bo.messageRef;
   const evd = (bo.eventDefinitions ?? []).find((d) => d.$type === "bpmn:MessageEventDefinition");
   return evd?.messageRef;
+}
+
+// The linked form id a user task references via `zeebe:FormDefinition:formId`
+// (a Camunda "linked form"), if any. An inline `formKey`/embedded form has no id.
+export function userTaskFormId(bo: EnvModdleElement | undefined): string | undefined {
+  const fd = (bo?.extensionElements?.values ?? []).find((v) => v.$type === "zeebe:FormDefinition");
+  const id = fd?.formId;
+  return typeof id === "string" && id ? id : undefined;
 }
 
 // Whether `element` supports a data envelope, and where it is carried. Returns
@@ -85,7 +97,7 @@ export function envelopeContext(
     if (typeof t !== "string" || !t || t.startsWith("=")) return undefined;
     return { target: bo, taskType: t };
   }
-  if (element.type === "bpmn:UserTask") return { target: bo };
+  if (element.type === "bpmn:UserTask") return { target: bo, formId: userTaskFormId(bo) };
   return undefined;
 }
 

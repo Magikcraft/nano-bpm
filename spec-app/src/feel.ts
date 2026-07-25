@@ -178,6 +178,25 @@ export function outputTypeForTaskType(manifest: unknown, taskType: string | unde
 }
 
 /**
+ * The declared domain type id bound to a form in `bindings[]` (ADR 0029 §5), or
+ * `undefined` when the form has no binding or the bound type is not declared. A
+ * user task's data envelope (ADR 0033 §6) defaults to this: a user task whose
+ * linked form (`zeebe:formDefinition:formId`) is typed inherits that type as its
+ * envelope, so the form binding stays the single source of truth (no second
+ * per-task binding is authored unless the maker overrides it in the model).
+ */
+export function formTypeId(manifest: unknown, formId: string | undefined): string | undefined {
+  if (!formId) return undefined;
+  const bindings = (manifest as { bindings?: unknown })?.bindings;
+  if (!Array.isArray(bindings)) return undefined;
+  const binding = bindings.find(
+    (b) => b && typeof b === "object" && (b as Record<string, unknown>).form === formId,
+  ) as { type?: unknown } | undefined;
+  const typeId = typeof binding?.type === "string" ? binding.type : undefined;
+  return isDeclaredType(manifest, typeId) ? typeId : undefined;
+}
+
+/**
  * The variable scope contributed by a process's component outputs (ADR 0033 §3):
  * each output-mapped process variable typed by the domain type its worker
  * declares (`workers[].outputType`). This is the "component output → typed

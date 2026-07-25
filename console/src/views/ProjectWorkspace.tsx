@@ -42,6 +42,7 @@ import {
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import { processFeelVariables, componentOutputFeelVariables, type ComponentOutput } from "../lib/bpmnDomainVariables";
+import { formTypeId } from "@nanobpm/nano-app-schema";
 import { loadProjectComponents, loadPackComponents, combineComponents, type ElementTemplate } from "../lib/projectComponents";
 import {
   subscribe as subscribeDebug,
@@ -1241,6 +1242,9 @@ function EditorPane({
       typeIds: domainTypeIds,
       set: setWorkerType,
       createType: createDomainType,
+      // A user task's envelope defaults to the domain type bound to its linked
+      // form in `bindings[]` (ADR 0033 §6 / 0029 §5).
+      formType: (formId: string) => formTypeId(manifest, formId),
     }),
     [manifest, domainTypeIds, setWorkerType, createDomainType],
   );

@@ -347,3 +347,31 @@ jobs:
         # (The server crate is a binary with no lib target, so there are no
         # doctests to run separately.)
         run: cargo nextest run --features console
+  console:
+    name: console (typecheck + test)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          # `npm test` runs `node --test` over the `.ts` unit tests directly, so
+          # this job needs a Node with TypeScript type-stripping on by default
+          # (>= 23.6). Matches the spec-app job.
+          node-version: '24'
+      - name: Install (locked)
+        run: npm ci
+      - name: Typecheck (regen API client + app + tests)
+        # `typecheck` runs `gen:api` (regenerating src/gen from the console spec),
+        # then type-checks the browser app (tsconfig.json) and the node-runtime
+        # unit tests (tsconfig.test.json) separately.
+        run: npm run typecheck
+      - name: Fail if generated API client is stale
+        # `typecheck` regenerated src/gen in place; fail if the committed client
+        # drifted from spec-console/console-api.yaml (the maker forgot `npm run
+        # gen:api`). src/gen is committed and imported directly by the SPA.
+        run: git diff --exit-code -- src/gen
+      - name: Test (node:test unit tests)
+        run: npm test
