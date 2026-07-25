@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -94,6 +94,19 @@ fn wal_checkpoint_keys() -> u64 {
         .unwrap_or(262_144)
 }
 
+/// Maximum number of pending forget batches the background worker will hold
+/// before [`SpillStore::forget_async`] falls back to a synchronous delete. Bounds
+/// the queue's memory so a sustained producer > consumer imbalance degrades
+/// predictably (backpressure onto the enqueuing follower actor) instead of growing
+/// without bound. Tunable via NANOBPMN_VARSPILL_FORGET_QUEUE.
+fn forget_queue_cap() -> usize {
+    std::env::var("NANOBPMN_VARSPILL_FORGET_QUEUE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(256)
+}
+
 /// Pages reclaimed per bounded background pass (~256 MiB at a 4 KiB page). Small
 /// enough that a pass holds the connection lock only briefly (so resuming load
 /// preempts a drain), large enough to clear even a 100 GB post-spike freelist within
@@ -114,9 +127,12 @@ const FORGET_CHUNK: usize = 4_096;
 /// keeps the actor free while still reclaiming the rows (keys are unique and
 /// never reused, so a queued forget can never clobber a later re-spill).
 struct ForgetWorker {
-    /// `None` after [`Drop`] has closed the channel. Sending a batch is a cheap,
-    /// non-blocking handoff; the worker drains and deletes in [`FORGET_CHUNK`]s.
-    tx: Option<Sender<ForgetMsg>>,
+    /// `None` after [`Drop`] has closed the channel. The queue is bounded
+    /// ([`forget_queue_cap`]); [`SpillStore::forget_async`] uses a non-blocking
+    /// `try_send` and falls back to a synchronous delete when it is full, so a
+    /// slow consumer applies backpressure instead of growing memory unbounded.
+    /// The worker drains and deletes in [`FORGET_CHUNK`]s.
+    tx: Option<SyncSender<ForgetMsg>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -318,7 +334,7 @@ impl VarSpillStore {
     /// their spill/cold rows off the engine actor, in [`FORGET_CHUNK`]-sized
     /// transactions so each commit holds the connection lock only briefly.
     fn spawn_forget_worker(conn: Arc<Mutex<Connection>>, activity: Arc<AtomicU64>) -> ForgetWorker {
-        let (tx, rx) = channel::<ForgetMsg>();
+        let (tx, rx) = sync_channel::<ForgetMsg>(forget_queue_cap());
         let handle = std::thread::Builder::new()
             .name("varspill-forget".into())
             .spawn(move || {
@@ -338,12 +354,11 @@ impl VarSpillStore {
                     match msg {
                         ForgetMsg::Keys(keys) => {
                             let n = keys.len() as u64;
-                            // Bump activity *before* the delete so a long batch keeps
-                            // the store non-idle for the whole time it holds the
-                            // connection, preventing the reclaim worker from starting
-                            // a pass while deletes are in-flight.
-                            activity.fetch_add(1, Ordering::Relaxed);
-                            Self::delete_keys(&conn, &keys);
+                            // delete_keys bumps `activity` per chunk, so even a long
+                            // multi-chunk batch keeps the store non-idle for its whole
+                            // duration and the reclaim worker won't start a pass while
+                            // deletes are in-flight.
+                            Self::delete_keys(&conn, &activity, &keys);
                             since_ckpt = since_ckpt.saturating_add(n);
                             if since_ckpt >= ckpt_keys {
                                 since_ckpt = 0;
@@ -371,8 +386,11 @@ impl VarSpillStore {
 
     /// Deletes the spill and cold rows for `keys`, chunked into short transactions
     /// so a large batch never holds the connection lock (and its fsync) for long.
-    fn delete_keys(conn: &Mutex<Connection>, keys: &[Key]) {
+    /// Bumps `activity` once per chunk so the reclaim worker sees the store as busy
+    /// for the entire (potentially long) sweep, not just at its start.
+    fn delete_keys(conn: &Mutex<Connection>, activity: &AtomicU64, keys: &[Key]) {
         for chunk in keys.chunks(FORGET_CHUNK) {
+            activity.fetch_add(1, Ordering::Relaxed);
             // A poisoned lock means another thread panicked mid-mutation, leaving the
             // connection in an unknown state; treat it as fatal (matching `put`/`take`)
             // rather than silently skipping deletes and leaking orphan cold rows.
@@ -484,8 +502,8 @@ impl VarSpillStore {
         if keys.is_empty() {
             return;
         }
-        Self::delete_keys(&self.conn, keys);
-        self.note_activity();
+        // delete_keys bumps activity per chunk, so no separate note_activity is needed.
+        Self::delete_keys(&self.conn, &self.activity, keys);
     }
 
     /// Like [`forget`](Self::forget), but hands the deletes to the background
@@ -502,8 +520,11 @@ impl VarSpillStore {
             return;
         }
         match self.forget.as_ref().and_then(|w| w.tx.as_ref()) {
-            // If the worker has gone away, fall back to a synchronous delete.
-            Some(tx) if tx.send(ForgetMsg::Keys(keys.to_vec())).is_ok() => {}
+            // Non-blocking handoff. If the bounded queue is full (slow consumer) or
+            // the worker has gone away, fall back to a synchronous delete so a
+            // producer > consumer imbalance applies backpressure here instead of
+            // growing the queue's memory without bound.
+            Some(tx) if tx.try_send(ForgetMsg::Keys(keys.to_vec())).is_ok() => {}
             _ => self.forget(keys),
         }
     }
