@@ -1602,9 +1602,12 @@ mod tests {
                 .expect("write combined snapshot");
 
             // Post-snapshot instance on partition 1 (lands in the fresh active
-            // tail, not covered by any snapshot).
-            let (e1, _) = j1.apply_command(Command::create_instance("demo")).unwrap();
+            // tail, not covered by any snapshot). Await its commit so the write
+            // is durable before we drop the writer and recover (otherwise it
+            // races the background group-commit thread).
+            let (e1, commit) = j1.apply_command(Command::create_instance("demo")).unwrap();
             let post1 = e1.iter().find_map(|e| e.instance_key()).unwrap();
+            commit.blocking_wait();
 
             (pre0, post1)
         };
@@ -1699,10 +1702,13 @@ mod tests {
 
             // Post-checkpoint variable merge: lands in the fresh active tail (NOT
             // covered by the snapshot, NOT yet in the store's checkpoint) — the
-            // merge-onto-base case recovery must get right.
+            // merge-onto-base case recovery must get right. Await its commit so
+            // the write is durable in the segment before we drop the writer and
+            // recover (otherwise it races the background group-commit thread).
             let mut post = HashMap::new();
             post.insert("c".to_string(), Value::Int(3i64));
-            let _ = j0.apply_command(Command::set_variables(key, post)).unwrap();
+            let (_, commit) = j0.apply_command(Command::set_variables(key, post)).unwrap();
+            commit.blocking_wait();
 
             key
         };
