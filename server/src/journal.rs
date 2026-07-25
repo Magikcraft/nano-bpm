@@ -1598,6 +1598,25 @@ impl Journal {
         self.engine.retire_instances(keys)
     }
 
+    /// Owned-`Vec` variant of [`Journal::retire_instances`] for the digest apply
+    /// path, whose caller ([`apply_retirement_digest`](crate::AppState::apply_retirement_digest))
+    /// already owns the key vec. Moves the vec into the forget worker instead of
+    /// cloning it (this runs on the single-writer replica actor and the set can be
+    /// large), mirroring the [`Journal::retire_below`] copy-free change.
+    pub fn retire_instances_owned(&mut self, keys: Vec<Key>) -> usize {
+        // Consume the borrowed work first, then move `keys` into the worker queue.
+        if let Some(cold) = self.cold.as_mut() {
+            for &key in &keys {
+                cold.index.remove(key);
+            }
+        }
+        let n = self.engine.retire_instances(&keys);
+        if let Some(store) = self.spill_store() {
+            store.forget_async_owned(keys);
+        }
+        n
+    }
+
     /// The shared disk-backed spill/cold store, if either tier is wired. Both
     /// tiers share one [`VarSpillStore`] (one file, one WAL), so either handle
     /// reaches the same `spill` and `cold` tables.

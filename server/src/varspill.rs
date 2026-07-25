@@ -411,25 +411,30 @@ impl VarSpillStore {
             // connection in an unknown state; treat it as fatal (matching `put`/`take`)
             // rather than silently skipping deletes and leaking orphan cold rows.
             let mut guard = conn.lock().expect("spill store poisoned");
-            let tx = match guard.transaction() {
-                Ok(tx) => tx,
-                Err(_) => return,
-            };
+            // Surface any SQLite failure loudly, for the same reason the poisoned
+            // lock is fatal above: silently swallowing a transaction/prepare/execute/
+            // commit error would drop deletes mid-batch and reintroduce the orphan
+            // cold rows (and unbounded file growth) this path exists to prevent.
+            let tx = guard
+                .transaction()
+                .expect("spill store: begin forget transaction");
             {
-                let mut del_spill = match tx.prepare_cached("DELETE FROM spill WHERE key = ?1") {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let mut del_cold = match tx.prepare_cached("DELETE FROM cold WHERE key = ?1") {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
+                let mut del_spill = tx
+                    .prepare_cached("DELETE FROM spill WHERE key = ?1")
+                    .expect("spill store: prepare spill delete");
+                let mut del_cold = tx
+                    .prepare_cached("DELETE FROM cold WHERE key = ?1")
+                    .expect("spill store: prepare cold delete");
                 for &key in chunk {
-                    let _ = del_spill.execute(params![key as i64]);
-                    let _ = del_cold.execute(params![key as i64]);
+                    del_spill
+                        .execute(params![key as i64])
+                        .expect("spill store: delete spill row");
+                    del_cold
+                        .execute(params![key as i64])
+                        .expect("spill store: delete cold row");
                 }
             }
-            let _ = tx.commit();
+            tx.commit().expect("spill store: commit forget transaction");
         }
     }
 

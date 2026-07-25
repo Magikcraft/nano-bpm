@@ -11102,7 +11102,7 @@ impl ServerImpl {
         let handle = self.raft_replicas.lock().unwrap().get(&p).cloned();
         if let Some(handle) = handle {
             handle.spawn_job(move |journal| {
-                journal.retire_instances(&keys);
+                journal.retire_instances_owned(keys);
             });
         }
     }
