@@ -49,6 +49,16 @@ declare module "bpmn-js-properties-panel" {
   };
 }
 
+declare module "@bpmn-io/properties-panel" {
+  /** A properties-panel entry component (preact). Called directly as a function
+   *  in the established provider pattern, returning a vnode. */
+  export const SelectEntry: (props: unknown) => unknown;
+  /** Default group renderer used as a group's `component`. */
+  export const Group: unknown;
+  /** `isEdited` predicate for a select entry (dirty dot). */
+  export function isSelectEntryEdited(node: unknown): boolean;
+}
+
 declare module "zeebe-bpmn-moddle/resources/zeebe.json" {
   const value: Record<string, unknown>;
   export default value;

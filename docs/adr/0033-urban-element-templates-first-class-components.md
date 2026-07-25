@@ -175,3 +175,10 @@ input scoping (§3), and the pack axis (§4) are the increments below.
    `nano-ide.ext.json` (pack-relative paths to element-template JSON); the server reads + forwards them
    in the extensions overview (`Extension.components`), and the console merges them **under** the project's
    own components (project wins on an id collision) to drive the palette — PR (this). ✅
+7. **input typing + the Object Inspector dropdown** — `workers[].inputType` declares a component's job
+   payload type, the symmetric partner of `outputType` (increment 5). The reifier emits typed
+   `WorkerInputs`/`WorkerOutputs` maps + a task-type-driven `defineWorker` (`.nanobpm/workers.ts`/`.d.ts`),
+   so a worker's `job.variables` is typed by task type with zero manual generics (ADR 0029 §6.2). The BPMN
+   properties panel gains an **"Urban domain type"** group on service tasks — Input/Output domain-type
+   dropdowns populated from the manifest `types` registry that write `workers[].inputType/outputType` back
+   to `nano.app.json` — so the model informs the worker types from the modeler — PR (this). ✅

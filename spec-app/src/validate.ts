@@ -144,6 +144,9 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     if (w.llm != null && !llmNames.has(w.llm)) {
       push(`/workers/${i}/llm`, `worker llm "${w.llm}" is not declared in llm`, "unknown-llm");
     }
+    if (w.inputType != null && !typeIds.has(w.inputType)) {
+      push(`/workers/${i}/inputType`, `inputType "${w.inputType}" is not a declared domain type`, "unknown-type");
+    }
     if (w.outputType != null && !typeIds.has(w.outputType)) {
       push(`/workers/${i}/outputType`, `outputType "${w.outputType}" is not a declared domain type`, "unknown-type");
     }

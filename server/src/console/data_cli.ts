@@ -21,14 +21,18 @@
 //   op = "sources" | "schema" | "query" | "exec" | "script" | "migrations"
 //      | "migrate" | "domaintypes"
 
-import { listSources, manifestTypes, openDataSource } from "./data-sdk.ts";
+import { listSources, manifestTypes, manifestWorkers, openDataSource } from "./data-sdk.ts";
 import {
   DOMAIN_BINDINGS,
   DOMAIN_DTS,
   type DomainTypeRegistry,
   emitDomainBindings,
   emitDomainModel,
+  emitWorkerBindings,
+  emitWorkerBindingsRuntime,
   type SourceSchema,
+  WORKER_BINDINGS_DTS,
+  WORKER_BINDINGS_TS,
 } from "./domain-types.ts";
 
 interface Request {
@@ -315,17 +319,37 @@ async function run(req: Request): Promise<unknown> {
       // generated alongside the `.d.ts` spine so workers get both the row types
       // and the runtime gateway from one op.
       const bindings = emitDomainBindings(schemas, def);
+      // The worker-IO map (ADR 0033 §3): `taskType → {in,out}` from the manifest
+      // `workers[]` (inputType/outputType) resolved against the declared types, so
+      // the typed `defineWorker` types a handler by its job type. The runtime
+      // wrapper (`workers.ts`) is static — it re-exports the SDK and overrides
+      // `defineWorker` — so it is written verbatim.
+      const workers = await manifestWorkers();
+      const workerBindings = emitWorkerBindings(workers, Object.keys(types));
+      const workerRuntime = emitWorkerBindingsRuntime();
       let path: string | null = null;
       let bindingsPath: string | null = null;
+      let workerBindingsPath: string | null = null;
       if (req.write !== false) {
         await RT.mkdir(".nanobpm");
         path = `.nanobpm/${DOMAIN_DTS}`;
         await RT.writeTextFile(path, text);
         bindingsPath = `.nanobpm/${DOMAIN_BINDINGS}`;
         await RT.writeTextFile(bindingsPath, bindings);
+        workerBindingsPath = `.nanobpm/${WORKER_BINDINGS_DTS}`;
+        await RT.writeTextFile(workerBindingsPath, workerBindings);
+        await RT.writeTextFile(`.nanobpm/${WORKER_BINDINGS_TS}`, workerRuntime);
       }
       const tables = schemas.reduce((n, s) => n + s.tables.length, 0);
-      return { path, text, tables, bindingsPath, bindings };
+      return {
+        path,
+        text,
+        tables,
+        bindingsPath,
+        bindings,
+        workerBindingsPath,
+        workerBindings,
+      };
     }
     default:
       throw new Error(`unknown op "${req.op}"`);
