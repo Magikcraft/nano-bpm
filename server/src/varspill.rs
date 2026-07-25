@@ -338,8 +338,12 @@ impl VarSpillStore {
                     match msg {
                         ForgetMsg::Keys(keys) => {
                             let n = keys.len() as u64;
-                            Self::delete_keys(&conn, &keys);
+                            // Bump activity *before* the delete so a long batch keeps
+                            // the store non-idle for the whole time it holds the
+                            // connection, preventing the reclaim worker from starting
+                            // a pass while deletes are in-flight.
                             activity.fetch_add(1, Ordering::Relaxed);
+                            Self::delete_keys(&conn, &keys);
                             since_ckpt = since_ckpt.saturating_add(n);
                             if since_ckpt >= ckpt_keys {
                                 since_ckpt = 0;
@@ -369,10 +373,10 @@ impl VarSpillStore {
     /// so a large batch never holds the connection lock (and its fsync) for long.
     fn delete_keys(conn: &Mutex<Connection>, keys: &[Key]) {
         for chunk in keys.chunks(FORGET_CHUNK) {
-            let mut guard = match conn.lock() {
-                Ok(g) => g,
-                Err(_) => return,
-            };
+            // A poisoned lock means another thread panicked mid-mutation, leaving the
+            // connection in an unknown state; treat it as fatal (matching `put`/`take`)
+            // rather than silently skipping deletes and leaking orphan cold rows.
+            let mut guard = conn.lock().expect("spill store poisoned");
             let tx = match guard.transaction() {
                 Ok(tx) => tx,
                 Err(_) => return,
