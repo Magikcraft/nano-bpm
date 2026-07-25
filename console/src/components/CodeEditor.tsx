@@ -131,9 +131,9 @@ export async function ensureProjectSdkLibs(project: string | undefined): Promise
     await Promise.all([
       read(".nanobpm/workers.ts"),
       read(".nanobpm/worker-sdk.ts"),
-      read(".nanobpm/workers.d.ts"),
+      read(".nanobpm/worker-io.d.ts"),
       read(".nanobpm/domain.ts"),
-      read(".nanobpm/domain.d.ts"),
+      read(".nanobpm/domain-rows.d.ts"),
       read(".nanobpm/data-sdk.ts"),
       read(".nanobpm/llm-worker.ts"),
     ]);
@@ -142,18 +142,18 @@ export async function ensureProjectSdkLibs(project: string | undefined): Promise
     monaco.languages.typescript.typescriptDefaults.addExtraLib(content, path);
   };
   // @nanobpm/worker → the typed `defineWorker` wrapper + the relative modules it
-  // (and its `workers.d.ts`) import, co-located so `./worker-sdk.ts`,
-  // `./workers.d.ts` and `./domain.d.ts` all resolve within the package dir.
+  // (and its `worker-io.d.ts`) import, co-located so `./worker-sdk.ts`,
+  // `./worker-io.d.ts` and `./domain-rows.d.ts` all resolve within the package dir.
   add(workersTs, "file:///node_modules/@nanobpm/worker/index.ts");
   add(workerSdk, "file:///node_modules/@nanobpm/worker/worker-sdk.ts");
-  add(workersDts, "file:///node_modules/@nanobpm/worker/workers.d.ts");
-  add(domainDts, "file:///node_modules/@nanobpm/worker/domain.d.ts");
+  add(workersDts, "file:///node_modules/@nanobpm/worker/worker-io.d.ts");
+  add(domainDts, "file:///node_modules/@nanobpm/worker/domain-rows.d.ts");
   add(dataSdk, "file:///node_modules/@nanobpm/worker/data-sdk.ts");
   // @nanobpm/domain → `openDomain()` + its relative deps (`data-sdk.ts` for the
-  // Table gateway, `domain.d.ts` for the row interfaces).
+  // Table gateway, `domain-rows.d.ts` for the row interfaces).
   add(domainTs, "file:///node_modules/@nanobpm/domain/index.ts");
   add(dataSdk, "file:///node_modules/@nanobpm/domain/data-sdk.ts");
-  add(domainDts, "file:///node_modules/@nanobpm/domain/domain.d.ts");
+  add(domainDts, "file:///node_modules/@nanobpm/domain/domain-rows.d.ts");
   // @nanobpm/data → the raw typed data SDK.
   add(dataSdk, "file:///node_modules/@nanobpm/data/index.ts");
   // @nanobpm/llm → the LLM worker helper, when the app declares LLM workers.

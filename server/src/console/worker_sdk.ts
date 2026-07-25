@@ -32,7 +32,7 @@ export type WorkerRow = Record<string, unknown>;
 
 /** A typed table gateway (the RAD "TTable") over one table — manipulate rows as
  * typed records instead of hand-writing SQL. Structurally mirrors `Table` in the
- * `@nanobpm/data` SDK; `T` comes from the generated `domain.d.ts` (ADR 0029 §6).
+ * `@nanobpm/data` SDK; `T` comes from the generated `domain-rows.d.ts` (ADR 0029 §6).
  * For the full named accessor (`db.orders.insert(...)`) import `openDomain` from
  * `@nanobpm/domain`. */
 export interface WorkerTable<T extends object = WorkerRow> {
@@ -49,7 +49,7 @@ export interface WorkerTable<T extends object = WorkerRow> {
 /** The datasource handle returned by `ctx.data()`. Mirrors the DataSource
  * contract in the `@nanobpm/data` SDK (ADR 0024); typed structurally here so the
  * worker SDK stays a single self-contained file. `query` is generic so a caller
- * can supply a row type from the generated `domain.d.ts` (ADR 0029 §4.1):
+ * can supply a row type from the generated `domain-rows.d.ts` (ADR 0029 §4.1):
  * `db.query<DomainTables["customers"]>("SELECT * FROM customers")`. */
 export interface WorkerDataSource {
   query<T extends object = WorkerRow>(sql: string, params?: unknown[]): Promise<T[]>;
@@ -72,7 +72,7 @@ export interface WorkerContext {
 }
 
 /** A worker's variable shapes default to untyped JSON; declaring them (from the
- * generated `domain.d.ts` or the manifest `types` registry, ADR 0029) types the
+ * generated `domain-rows.d.ts` or the manifest `types` registry, ADR 0029) types the
  * handler's inputs and outputs while authoring — erased at runtime. */
 export type WorkerVars = Record<string, unknown>;
 

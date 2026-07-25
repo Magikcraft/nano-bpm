@@ -41,7 +41,7 @@ interface Request {
   sql?: string;
   params?: unknown[];
   statements?: string[];
-  /** `domaintypes`: also write `.nanobpm/domain.d.ts` (default true). */
+  /** `domaintypes`: also write `.nanobpm/domain-rows.d.ts` (default true). */
   write?: boolean;
 }
 
@@ -300,8 +300,8 @@ async function run(req: Request): Promise<unknown> {
       // *every* declared datasource (the table spine) and fold in the manifest
       // `types` registry (transient/non-persisted shapes) so an App with
       // multiple databases plus declared types gets one complete domain model,
-      // emit `domain.d.ts`, and (unless `write:false`) materialise it to
-      // `.nanobpm/domain.d.ts` next to the SDK so workers type against the live
+      // emit `domain-rows.d.ts`, and (unless `write:false`) materialise it to
+      // `.nanobpm/domain-rows.d.ts` next to the SDK so workers type against the live
       // DBs. cwd is the project root, so the relative path lands in the project.
       const { default: def, sources } = await listSources();
       const schemas: SourceSchema[] = [];

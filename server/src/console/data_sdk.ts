@@ -105,7 +105,7 @@ export interface DataSource {
   schema(): Promise<TableMeta[]>;
   /** A typed gateway over one table — the RAD "TTable": manipulate rows as typed
    * records instead of hand-writing SQL. The row type comes from the generated
-   * `domain.d.ts` (ADR 0029); `pk` is the primary-key column (default "id"). */
+   * `domain-rows.d.ts` (ADR 0029); `pk` is the primary-key column (default "id"). */
   table<T extends object = Row>(name: string, pk?: string): Table<T>;
   /** Close the underlying connection. */
   close(): void;
@@ -291,7 +291,7 @@ function whereClause(where: object): { clause: string; params: unknown[] } {
 /// worker binds to instead of hand-writing SQL (the Delphi `TTable`/data-module
 /// idea, ADR 0029 §6). It builds parameterised SQL from a typed row object's own
 /// keys, so callers manipulate rows as records. `T` comes from the generated
-/// `domain.d.ts`; this class is generic *runtime* and knows nothing about any
+/// `domain-rows.d.ts`; this class is generic *runtime* and knows nothing about any
 /// specific schema, so it stays a plain dual-runtime (Node + Deno) module — no
 /// codegen, no Deno-only APIs. `pk` is the primary-key column (default `id`).
 export class Table<T extends object = Row> {

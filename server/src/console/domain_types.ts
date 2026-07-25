@@ -3,7 +3,7 @@
 // The datasource schema is the *spine* of the domain model: a table is already a
 // declared record type, so `DataSource.schema()`'s `TableMeta` reifies straight
 // into a named TypeScript record. This module turns those tables into a generated
-// `domain.d.ts` (the "models directory" makers asked for — but generated, never
+// `domain-rows.d.ts` (the "models directory" makers asked for — but generated, never
 // hand-edited, so it can't drift from the DB), and the worker SDK + App loader
 // type against it. Types are a compile/boot-time contract only: they are erased
 // at `deno compile`, and the shipped App is still untyped JSON on the wire
@@ -11,11 +11,11 @@
 //
 //   import { emitDomainDts } from "./domain-types.ts";
 //   const tables = await (await openDataSource("app")).schema();
-//   await Deno.writeTextFile(".nanobpm/domain.d.ts", emitDomainDts(tables));
+//   await Deno.writeTextFile(".nanobpm/domain-rows.d.ts", emitDomainDts(tables));
 //
 // then a worker is typed end-to-end:
 //
-//   import type { DomainTables } from "./.nanobpm/domain.d.ts";
+//   import type { DomainTables } from "./.nanobpm/domain-rows.d.ts";
 //   const rows = await db.query<DomainTables["customers"]>("SELECT * FROM customers");
 //   rows[0].tier          // string | null — checked while authoring
 //
@@ -34,7 +34,12 @@
 import type { ColumnMeta, TableMeta } from "./data_sdk.ts";
 
 /** The generated file's basename, written under a project's `.nanobpm/`. */
-export const DOMAIN_DTS = "domain.d.ts";
+// Distinct stem from the runtime accessor `domain.ts`: TypeScript otherwise pairs
+// `domain-rows.d.ts` as the *declaration of* `domain.ts`, so the accessor importing its
+// own row types reads as a circular self-import (TS2303/TS2459) under a project
+// `tsconfig.json` `paths` map. `-rows` also avoids colliding with the emitter
+// module `domain-types.ts`. See the scaffolder's `PROJECT_TSCONFIG_JSON`.
+export const DOMAIN_DTS = "domain-rows.d.ts";
 
 /**
  * Map a SQLite declared column type to a TypeScript field type. SQLite is
@@ -98,7 +103,7 @@ function tableInterface(t: TableMeta): string {
 }
 
 /**
- * Emit the full `domain.d.ts` from a datasource's tables: one `interface` per
+ * Emit the full `domain-rows.d.ts` from a datasource's tables: one `interface` per
  * table plus a `DomainTables` lookup keyed by the *raw* table name (the stable
  * wire identifier), so callers write `DomainTables["customers"]`.
  */
@@ -134,7 +139,7 @@ function prefixedInterfaceName(source: string, table: string): string {
 }
 
 /**
- * Emit `domain.d.ts` for an App that declares *multiple* datasources: one
+ * Emit `domain-rows.d.ts` for an App that declares *multiple* datasources: one
  * `interface` per (source, table), a `DomainSources` map keyed by alias then
  * wire table name, and a `DomainTables` alias to the default source so the
  * single-source convention (`DomainTables["customers"]`) keeps working. When
@@ -258,7 +263,7 @@ export function emitDomainTypeRegistry(types: DomainTypeRegistry): string {
 }
 
 /**
- * Compose the full `domain.d.ts`: the datasource table spine (every source,
+ * Compose the full `domain-rows.d.ts`: the datasource table spine (every source,
  * ADR 0029 §6) followed by the manifest `types` registry (§4.2). This is the
  * single entry point the `domaintypes` op uses.
  */
@@ -275,7 +280,7 @@ export function emitDomainModel(
 // --- domain bindings: the typed data-object accessor (ADR 0029 §6) ----------
 
 /** The generated bindings file's basename — the typed `openDomain()` accessor
- * materialised next to `domain.d.ts` under a project's `.nanobpm/`. */
+ * materialised next to `domain-rows.d.ts` under a project's `.nanobpm/`. */
 export const DOMAIN_BINDINGS = "domain.ts";
 
 /** The primary-key column for a table's `Table` gateway: its first declared PK
@@ -289,8 +294,8 @@ function primaryKeyOf(t: TableMeta): string {
  * datasource, so a worker writes `db.orders.insert({...})` / `db.orders.get(id)`
  * instead of hand-writing SQL (ADR 0029 §6 — the Delphi data-module idea). The
  * generic `Table<T>` runtime lives in `data-sdk.ts`; this generated module only
- * binds each table name to its row type (from `domain.d.ts`) and primary key, so
- * it imports nothing but the sibling SDK (relative) and a type-only `domain.d.ts`
+ * binds each table name to its row type (from `domain-rows.d.ts`) and primary key, so
+ * it imports nothing but the sibling SDK (relative) and a type-only `domain-rows.d.ts`
  * — staying dual-runtime (Node + Deno) and erased at `deno compile`. When the App
  * declares multiple datasources the accessor reflects the default one; `db.raw`
  * is the escape hatch (and `openDataSource(name)` reaches the others).
@@ -313,7 +318,7 @@ export function emitDomainBindings(
   const primary = sources.find((s) => s.source === def);
   const tables = primary?.tables ?? [];
 
-  // Interface names must match `domain.d.ts` exactly (prefixed when multi-source).
+  // Interface names must match `domain-rows.d.ts` exactly (prefixed when multi-source).
   const typeName = (table: string) =>
     multi ? prefixedInterfaceName(primary!.source, table) : interfaceName(table);
   const propKey = (table: string) =>
@@ -360,8 +365,10 @@ export function emitDomainBindings(
 // --- worker bindings: typed job workers keyed by taskType (ADR 0033 §3) ------
 
 /** The generated worker-IO type map's basename — the `taskType → {in,out}` map
- * materialised next to `domain.d.ts` under a project's `.nanobpm/`. */
-export const WORKER_BINDINGS_DTS = "workers.d.ts";
+ * materialised next to `domain-rows.d.ts` under a project's `.nanobpm/`. */
+// Distinct stem from the runtime wrapper `workers.ts` (same pairing hazard as
+// `DOMAIN_DTS`): a `worker-io.d.ts` reads as the declaration of `workers.ts`.
+export const WORKER_BINDINGS_DTS = "worker-io.d.ts";
 
 /** The generated typed-`defineWorker` wrapper's basename — re-exports the worker
  * SDK and overrides `defineWorker` with a taskType-keyed typed signature. */
@@ -383,11 +390,11 @@ function typeRefFor(id: string | undefined, declared: Set<string>): string | und
 }
 
 /**
- * Emit `workers.d.ts`: the machine-readable bridge from the process model to the
+ * Emit `worker-io.d.ts`: the machine-readable bridge from the process model to the
  * worker type system (ADR 0033 §3). Each declared worker's `taskType` maps to the
  * TS type of its input payload (`job.variables`, from `inputType`) and its result
  * (from `outputType`), resolved against the `DomainTypes` registry in
- * `domain.d.ts`. Only entries whose type is actually declared are emitted; a
+ * `domain-rows.d.ts`. Only entries whose type is actually declared are emitted; a
  * taskType with no declared type is absent and falls back to `WorkerVars` in the
  * typed `defineWorker`. Imports `DomainTypes` type-only (so it erases at compile
  * and stays dual-runtime) — and only when at least one entry references it, so an
@@ -447,7 +454,7 @@ export function emitWorkerBindings(
  * result are typed from the declared domain type; otherwise they fall back to
  * `WorkerVars`. The body is a pass-through — the wire stays untyped JSON (ADR 0029
  * §3). This file never changes with the schema, so it is written verbatim (unlike
- * the regenerated `workers.d.ts`). Dual-runtime: only type-level constructs +
+ * the regenerated `worker-io.d.ts`). Dual-runtime: only type-level constructs +
  * `export *` + a type assertion, so Node's strip-only mode accepts it (ADR 0036).
  */
 export function emitWorkerBindingsRuntime(): string {

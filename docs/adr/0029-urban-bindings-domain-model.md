@@ -101,7 +101,7 @@ Types come from two sources, in priority order:
    annotated `schema()` as powering form data-binding, so this is the seam it anticipated.
 
    > **Reifier — implemented (spike).** `server/src/console/domain_types.ts` is the concrete §4.1
-   > reifier: `emitDomainDts(tables)` turns `schema()`'s `TableMeta[]` into a `domain.d.ts` — one
+   > reifier: `emitDomainDts(tables)` turns `schema()`'s `TableMeta[]` into a `domain-rows.d.ts` — one
    > `export interface` per table plus a `DomainTables` lookup keyed by the raw table name. The
    > datasource CLI's `domaintypes` op (`data_cli.ts`) runs `schema()` → emit → write.
    > `sqliteAffinityToTs`
@@ -111,6 +111,16 @@ Types come from two sources, in priority order:
    > Node+Deno-portable (ADR 0036) and unit- +
    > roundtrip-tested (`domain_types_test.ts`, run under Deno). *This is the "generate a models
    > directory" answer — but generated, never hand-edited, so it cannot drift from the DB.*
+   >
+   > **File naming — distinct stem (required for `tsconfig.json` `paths`).** The reified type
+   > files are named `domain-rows.d.ts` and `worker-io.d.ts`, *not* `domain.d.ts`/`workers.d.ts`.
+   > TypeScript pairs a `foo.d.ts` as the *declaration of* a sibling `foo.ts`, so with the runtime
+   > accessors `domain.ts`/`workers.ts` present, a project `tsconfig.json` `paths` map made the
+   > accessor importing its own row types read as a circular self-import (TS2303/TS2459), breaking
+   > type resolution under standard tooling (VS Code/`tsc`). Distinct stems avoid the pairing; the
+   > scaffolder emits a `tsconfig.json` (paths mirroring the `deno.json` map) + `package.json`
+   > (`@types/node`) so `@nanobpm/*` and `node:*` resolve natively without the console's Monaco
+   > extra-libs (ADR 0038 Node-first tooling parity).
 2. **A manifest type registry** — a small `types` block for **transient, non-persisted** shapes
    (an event body, a worker payload, a computed context) that no table backs.
 
@@ -172,7 +182,7 @@ domain records**, so worker handlers and the Deno App loader are typed against t
 panels edit. Types are erased at `deno compile`; the shipped App is still untyped JSON on the wire.
 
 > **Codegen + typed SDK — implemented (spike).** The reifier (§4.1) emits a **gitignored**
-> `.nanobpm/domain.d.ts` under the maker's project — same materialize-and-ignore pattern as the
+> `.nanobpm/domain-rows.d.ts` under the maker's project — same materialize-and-ignore pattern as the
 > generated `data-cli.ts`/`data-sdk.ts`, so there is never a committed, hand-editable `models/` dir
 > to drift. Generation is wired to two real triggers: a `domaintypes` datasource op
 > (`data_cli.ts`, exposed through the same `run_data_op` gateway) that emits + writes the file, fired
@@ -193,7 +203,7 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > **Follow-ups (all now implemented).** A maker-facing "Regenerate domain types" affordance exists: the
 > `POST /projects/{name}/data/{source}/domaintypes` route (operationId `regenerateDomainTypes`)
 > and a "⟳ Types" button in the Data panel's Tables sidebar both drive the same op. The op
-> **unions every declared datasource** into one `domain.d.ts`: `emitDomainDtsForSources` emits
+> **unions every declared datasource** into one `domain-rows.d.ts`: `emitDomainDtsForSources` emits
 > source-prefixed interfaces (e.g. `AppCustomers`) under a `DomainSources` map keyed by alias then
 > table, with `DomainTables` aliased to the default source so the single-source
 > `DomainTables["customers"]` convention keeps working (byte-identical output for one source). The
@@ -219,10 +229,10 @@ Two pieces, split so codegen stays minimal and the Node fallback (ADR 0036) is n
   from a typed row object's own keys. It is schema-agnostic (`T` is a caller-supplied type), so it lives in
   the hand-written SDK, not codegen. `DataSource.table<T>(name, pk?)` opens one; `pk` defaults to `id`.
 - **Generated bindings — `.nanobpm/domain.ts`.** The reifier (`emitDomainBindings`) additionally emits a
-  typed accessor next to `domain.d.ts`, written by the **same `domaintypes` op** that writes the `.d.ts`:
+  typed accessor next to `domain-rows.d.ts`, written by the **same `domaintypes` op** that writes the `.d.ts`:
   `openDomain()` → `Domain`, an object with one `Table<Row>` per table bound to its **real primary key**
   (`db.orders.insert({...})`, `db.orders.get(id)`), plus `db.raw` as the raw-SQL escape hatch. It imports
-  only the sibling SDK (relative) and a **type-only** `domain.d.ts`, so it carries no runtime dependency and
+  only the sibling SDK (relative) and a **type-only** `domain-rows.d.ts`, so it carries no runtime dependency and
   erases at `deno compile`.
 
 The **degrade-to-Node invariant (ADR 0036) is load-bearing here.** The worker runtime runs Node-first
@@ -266,7 +276,7 @@ Two symmetric declarations on a worker name its motion shapes, both `$ref`-ing t
 - `workers[].outputType` — the type of the variables the worker writes back (already present, §ADR 0033
   §3, where it also types output-mapped process variables for the next component's FEEL scope).
 
-The reifier emits a **gitignored `.nanobpm/workers.d.ts`** next to `domain.d.ts` (same materialize-and-ignore
+The reifier emits a **gitignored `.nanobpm/worker-io.d.ts`** next to `domain-rows.d.ts` (same materialize-and-ignore
 pattern), a `taskType → DomainTypes[…]` map for each direction (`WorkerInputs` / `WorkerOutputs`), plus a
 **static `.nanobpm/workers.ts`** SDK wrapper that re-exports the worker SDK and overrides `defineWorker` with
 a task-type-driven overload:
@@ -302,9 +312,9 @@ The **degrade-to-Node invariant (ADR 0036)** holds: `workers.ts` uses only erasa
 (conditional types, generics, `import type`, `export *`, a single `as unknown as` cast). The explicit local
 `defineWorker` export shadows the star-export of the same name under both TS and Node ESM, so the typed
 wrapper is a strict superset — every `@nanobpm/worker` alias repoints to `workers.ts` with no runtime change.
-`workers.ts` is the static SDK (written on every `ensure_project_sdk`); `workers.d.ts` is reified by the
+`workers.ts` is the static SDK (written on every `ensure_project_sdk`); `worker-io.d.ts` is reified by the
 `domaintypes` op (seeded-if-absent, refreshed on schema change / boot / the explicit route), and imports
-`DomainTypes` **only when ≥1 mapping references it** (the registry is omitted from `domain.d.ts` when empty).
+`DomainTypes` **only when ≥1 mapping references it** (the registry is omitted from `domain-rows.d.ts` when empty).
 
 **The modeler closes the loop (the Delphi Object Inspector).** So the *model informs the types* without
 hand-editing the manifest, the BPMN properties panel shows an **"Urban domain type"** group on every service
