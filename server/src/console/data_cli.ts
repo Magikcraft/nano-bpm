@@ -23,8 +23,10 @@
 
 import { listSources, manifestTypes, openDataSource } from "./data-sdk.ts";
 import {
+  DOMAIN_BINDINGS,
   DOMAIN_DTS,
   type DomainTypeRegistry,
+  emitDomainBindings,
   emitDomainModel,
   type SourceSchema,
 } from "./domain-types.ts";
@@ -309,14 +311,21 @@ async function run(req: Request): Promise<unknown> {
       }
       const types = await manifestTypes() as DomainTypeRegistry;
       const text = emitDomainModel(schemas, def, types);
+      // The typed data-object accessor (`db.orders.insert(...)`, ADR 0029 §6) is
+      // generated alongside the `.d.ts` spine so workers get both the row types
+      // and the runtime gateway from one op.
+      const bindings = emitDomainBindings(schemas, def);
       let path: string | null = null;
+      let bindingsPath: string | null = null;
       if (req.write !== false) {
         await RT.mkdir(".nanobpm");
         path = `.nanobpm/${DOMAIN_DTS}`;
         await RT.writeTextFile(path, text);
+        bindingsPath = `.nanobpm/${DOMAIN_BINDINGS}`;
+        await RT.writeTextFile(bindingsPath, bindings);
       }
       const tables = schemas.reduce((n, s) => n + s.tables.length, 0);
-      return { path, text, tables };
+      return { path, text, tables, bindingsPath, bindings };
     }
     default:
       throw new Error(`unknown op "${req.op}"`);
