@@ -1584,7 +1584,7 @@ impl Journal {
     /// [`Engine::retire_instances`]; keys absent locally are ignored.
     pub fn retire_instances(&mut self, keys: &[Key]) -> usize {
         if let Some(store) = self.spill_store() {
-            store.forget(keys);
+            store.forget_async(keys);
         }
         // Drop any cold-index entries for these keys too: the digest path forgets
         // the disk rows above, but a cold-spilled replica instance named in the
@@ -1638,7 +1638,7 @@ impl Journal {
         if !reaped.is_empty()
             && let Some(store) = self.spill_store()
         {
-            store.forget(&reaped);
+            store.forget_async(&reaped);
         }
         reaped.len()
     }
