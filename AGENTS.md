@@ -32,11 +32,18 @@ There are no pre-existing failures or warnings, and you will not allow any to en
 
 All BPMN Models need DI for rendering for humans.
 
-## PRs Auto-Merge
+## Merging PRs
 
-This repository auto-merges pull requests once their checks pass (via the Mergify merge queue). Treat opening a PR as committing to `main`:
+This repository does **not** auto-merge pull requests. Opening a PR is *not* the
+same as committing to `main` — a PR sits open until a human or agent deliberately
+merges it:
 
-- A branch must be **complete and correct before you open the PR** — do not plan to "add a follow-up commit" to an open PR, as it may already be merged and closed by the time you push.
-- **The only legitimate reason to push another commit to an open PR is to unblock failing CI.** Any new feature work, follow-up, or scope addition belongs in a *fresh* PR off the latest `main`, never appended to an open PR.
-- After pushing to a branch with an open PR, **verify the PR actually picked up your commit** (`gh pr view <n> --json headRefOid`); if the PR has already merged, open a new PR off the latest `main` for the additional change.
-- Never leave a branch in a knowingly-broken intermediate state expecting a later fix to land in the same PR.
+- Merge is a manual act: click **Merge** in the GitHub UI once the required CI
+  checks are green, or enqueue with a `@mergifyio queue` comment to get the
+  always-green rebase-and-retest queue. Nothing merges on its own.
+- Because a PR stays open until merged, it is **safe to push follow-up commits**
+  to an open PR (address review feedback, fix CI, iterate) before you merge it.
+- Still keep each PR focused: land unrelated scope in its own PR rather than
+  piling it onto an open one.
+- Do not merge a branch you know to be in a broken intermediate state; merge only
+  when the change is complete and correct.

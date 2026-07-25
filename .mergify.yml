@@ -5,11 +5,14 @@
 # it. Mergify is a GitHub App that gives us the same "always-green main" queue
 # plus BATCHING — the CI-minutes lever native Team can't offer.
 #
-# Behaviour (mirrors the old native auto-merge-on-green, minus the O(n^2) rebase
-# churn): every non-draft PR to `main` is auto-queued once the required CI
-# checks pass, then squash-merged. The queue rebases each PR on the real,
-# up-to-date `main` and validates it there, so a stale PR is retested against
-# current `main` automatically — no branch-update commits.
+# Behaviour: AUTO-MERGE IS OFF. PRs are NOT merged automatically when their
+# checks go green. Merging is a deliberate act — a human or agent either clicks
+# "Merge" in the GitHub UI (allowed once the required CI checks pass) or, to get
+# the always-green rebase-and-retest guarantee, explicitly enqueues the PR with
+# a `@mergifyio queue` comment. The queue itself is unchanged (serial, batched,
+# squash, rebases each PR on the real up-to-date `main` and validates it there);
+# it just no longer auto-enqueues every green PR. See `merge_protections_settings`
+# below (`auto_merge_conditions: false`).
 #
 # CI-minutes posture (deliberately frugal):
 #   * mode: serial + max_parallel_checks: 1  -> NO speculative parallel checks
@@ -69,6 +72,9 @@ merge_protections:
           - check-skipped=processos (clippy + test)
 
 merge_protections_settings:
-  # Auto-queue every PR that satisfies the merge protections (i.e. all required
-  # checks green). Equivalent to the old "auto-merge every non-draft PR" flow.
-  auto_merge_conditions: true
+  # AUTO-MERGE OFF. When true, Mergify auto-enqueued (and thus auto-merged) every
+  # PR that satisfied the merge protections. We deliberately do NOT want that:
+  # merging is now a manual act (GitHub "Merge" button once required checks pass,
+  # or an explicit `@mergifyio queue` to use the queue). Do not flip this back to
+  # true without also updating AGENTS.md "## Merging PRs".
+  auto_merge_conditions: false
