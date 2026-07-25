@@ -16190,6 +16190,10 @@ async fn main() {
             );
             let (mut prev_raft_fsync_sum, mut prev_raft_fsync_count) =
                 crate::metrics::raft_fsync_sum_count();
+            // Previous global in-flight backlog, for the Tier-1 latency-causal gate's
+            // growth term (ADR-0021): the fsync knee may only shed when the backlog is
+            // above its Little's-law band and still rising.
+            let mut prev_tier1_backlog: f64 = monitor_server.active_backlog() as f64;
             let mut recovery_throttle_engaged = false;
             // Catch-up hold: keep the recovery throttle engaged while this node is
             // still feeding a rejoined peer's post-hand-off learner catch-up (which
@@ -16488,11 +16492,29 @@ async fn main() {
                             monitor_server.engine.exporter_min_fill_permille();
                         crate::metrics::set_exporter_fill_permille(exporter_fill_permille as i64);
                         let exporter_fill = exporter_fill_permille as f64 / 1000.0;
+                        // ADR-0021 latency-causal gate for the fsync knee: only shed
+                        // when the global in-flight backlog is above its Little's-law
+                        // band and rising (the busy write path is actually backing work
+                        // up), so a healthy-but-loaded disk is not shed for no latency
+                        // gain. `completes_per_sec` is λ; the growth term is dL/dt.
+                        let tier1_backlog = backlog as f64;
+                        let tier1_growth = if dt > 0.0 {
+                            (tier1_backlog - prev_tier1_backlog) / dt
+                        } else {
+                            0.0
+                        };
+                        prev_tier1_backlog = tier1_backlog;
+                        let latency_causal = monitor_server.guard.latency_causal(
+                            tier1_backlog,
+                            completes_per_sec,
+                            tier1_growth,
+                        );
                         let tier1_permille = monitor_server.guard.step(
                             fsync_avg_us,
                             tier1_active,
                             recovering,
                             exporter_fill,
+                            latency_causal,
                         );
                         crate::metrics::set_tier1_pressure(tier1_permille as i64);
                         let cap = recovery_throttle.observe(fsync_avg_us, recovering);

@@ -1034,6 +1034,24 @@ pub struct Tier1Config {
     /// slow (~60–130 s) relaxation oscillation (admit cycling ~800↔5300/bucket);
     /// knee 0.3 + a ~4 GB queue removes the big slow integrator and the honeymoon.
     pub exporter_knee: f64,
+    /// **Latency-causal gate** target sojourn (seconds) for the fsync knee (ADR-0021
+    /// "shedding must be latency-causal"). The raft-fsync knee alone only means the
+    /// shared write path is *busy* — under a disk-bound workload the healthy loaded
+    /// fsync (several ms) permanently sits above an idle-seeded knee, so an ungated
+    /// knee sheds ~all intake while the backlog is flat/zero, punishing admission for
+    /// *zero* latency gain. The fsync term may therefore only attack when the global
+    /// in-flight backlog is above its Little's-law band `L* = W_target · λ` (realized
+    /// global sojourn past target) and still rising — i.e. the write path is actually
+    /// backing work up, so pacing intake buys latency. Below band / draining, the
+    /// elevated fsync is the normal loaded operating point and the knee holds/releases
+    /// (and *learns* that loaded level as its baseline, breaking the idle-seed latch).
+    /// Default 30 s (mirrors the Tier-2 `W_target`); `NANOBPMN_TIER1_W_TARGET_MS`.
+    /// The exporter term is memory protection and stays *ungated*.
+    pub w_target_s: f64,
+    /// Deadband half-width for the latency-causal gate as a fraction of λ (min 1
+    /// instance): the hold zone around the band so a backlog hovering at target does
+    /// not chatter the gate. Default 0.1; `NANOBPMN_TIER1_DEADBAND_FRAC`.
+    pub deadband_frac: f64,
 }
 
 impl Default for Tier1Config {
@@ -1050,6 +1068,8 @@ impl Default for Tier1Config {
             recovery_relax: true,
             recovery_ratio: 4.0,
             exporter_knee: 0.3,
+            w_target_s: 30.0,
+            deadband_frac: 0.1,
         }
     }
 }
@@ -1092,6 +1112,8 @@ impl Tier1Config {
             recovery_relax,
             recovery_ratio: f("NANOBPMN_TIER1_RECOVERY_RATIO", d.recovery_ratio),
             exporter_knee: f("NANOBPMN_TIER1_EXPORTER_KNEE", d.exporter_knee).clamp(0.0, 1.0),
+            w_target_s: f("NANOBPMN_TIER1_W_TARGET_MS", d.w_target_s * 1000.0) / 1000.0,
+            deadband_frac: f("NANOBPMN_TIER1_DEADBAND_FRAC", d.deadband_frac),
         }
     }
 }
@@ -1145,6 +1167,15 @@ impl GlobalGuard {
     /// (failover incumbent or returning owner, from `recovery_fsync_load_active`):
     /// while it holds the guard defers to the recovery admission throttle and only
     /// sheds past a wider hard-ceiling backstop (see [`Tier1Config::recovery_relax`]).
+    ///
+    /// `latency_causal` is the ADR-0021 gate on the fsync knee: `true` only when the
+    /// global in-flight backlog is above its Little's-law band and rising (see
+    /// [`GlobalGuard::latency_causal`]), i.e. the busy write path is actually backing
+    /// work up so pacing intake buys latency. When `false` the fsync term must not
+    /// attack — the elevated fsync is the normal loaded operating point, and shedding
+    /// there punishes admission for no latency gain. The gate applies only to the
+    /// fsync term; the exporter term (memory protection) is always evaluated.
+    ///
     /// Returns the published shed fraction in per-mille (for the
     /// `nanobpm_tier1_pressure` gauge).
     pub fn step(
@@ -1153,6 +1184,7 @@ impl GlobalGuard {
         active: bool,
         recovering: bool,
         exporter_fill: f64,
+        latency_causal: bool,
     ) -> u32 {
         // Second shared-write-path saturation input: the read-model export queue.
         // Already a normalised fill fraction, so it needs no baseline learning and
@@ -1228,10 +1260,12 @@ impl GlobalGuard {
             .max(self.cfg.baseline_floor_us);
         let threshold = baseline * self.cfg.congestion_ratio;
 
-        if signal > threshold {
-            // Shared write path saturating: freeze the baseline (never adapt it
-            // toward the congested latency) and attack, steepening with the
-            // fractional overshoot past the knee.
+        if signal > threshold && latency_causal {
+            // Shared write path saturating *and* the backlog is above its Little's-law
+            // band and rising (ADR-0021 latency-causal gate): the busy write path is
+            // actually backing work up, so pacing intake buys latency. Freeze the
+            // baseline (never adapt it toward the congested latency) and attack,
+            // steepening with the fractional overshoot past the knee.
             let severity = (signal / threshold - 1.0).clamp(0.0, 1.0);
             let step = self.cfg.attack * (1.0 + self.cfg.attack_gain * severity);
             st.pressure = (st.pressure + step).min(1.0);
@@ -1243,8 +1277,16 @@ impl GlobalGuard {
                 );
             }
         } else {
-            // Headroom: calibrate the baseline (snap down to the min seen, else
-            // creep up slowly) and release.
+            // One of two headroom cases, both of which learn the baseline and release:
+            //   (a) `signal <= threshold`: genuine headroom below the knee.
+            //   (b) `signal > threshold` but NOT latency-causal (backlog flat/zero or
+            //       draining): the knee is crossed but shedding buys no latency — the
+            //       elevated fsync is the *normal loaded operating point*, not a
+            //       create-driven saturation. Per ADR-0021 do not shed; and, crucially,
+            //       *learn* this loaded level (creep the baseline up toward it) so the
+            //       knee reflects steady-state load. This breaks the idle-seed latch
+            //       where the baseline froze at the sub-ms warmup floor and the knee
+            //       then sat permanently below the multi-ms loaded fsync.
             st.baseline_us = Some(match st.baseline_us {
                 Some(b) if signal < b => signal,
                 Some(b) => b + (signal - b) * self.cfg.baseline_creep,
@@ -1255,6 +1297,22 @@ impl GlobalGuard {
 
         let fsync_permille = (st.pressure * 1000.0).round().clamp(0.0, 1000.0) as u32;
         self.finish(fsync_permille, exporter_permille)
+    }
+
+    /// The ADR-0021 **latency-causal gate** for the fsync knee: `true` only when the
+    /// global in-flight `backlog` is above its Little's-law band `L* = W_target · λ`
+    /// (with a `deadband_frac · λ` hold zone) *and* still rising (`growth_per_s >= 0`).
+    /// That is exactly "realized global sojourn is past target and accumulating", so
+    /// the busy write path is backing work up and pacing intake buys latency. Below
+    /// band or draining it returns `false`, and [`step`](Self::step) then holds/releases
+    /// the fsync term instead of shedding a healthy-but-loaded write path. `lambda` is
+    /// the throughput proxy (completions/s); when it is ~0 the band collapses to the
+    /// `deadband` floor so a stalled node with a real backlog still gates open.
+    pub fn latency_causal(&self, backlog: f64, lambda: f64, growth_per_s: f64) -> bool {
+        let lambda = lambda.max(0.0);
+        let band = self.cfg.w_target_s * lambda; // L* = W_target · λ
+        let deadband = (self.cfg.deadband_frac * lambda).max(1.0);
+        backlog > band + deadband && growth_per_s >= 0.0
     }
 
     /// Graded even-spread shed fraction (per-mille) for the read-model export
@@ -1943,7 +2001,7 @@ mod tests {
         // Idle-then-healthy raft fsync (sub-ms, under the floored knee): baseline
         // calibrates, pressure stays at zero.
         for _ in 0..10 {
-            assert_eq!(g.step(700.0, true, false, 0.0), 0);
+            assert_eq!(g.step(700.0, true, false, 0.0, true), 0);
         }
         assert!(!g.should_shed());
     }
@@ -1952,16 +2010,16 @@ mod tests {
     fn tier1_attacks_when_the_fsync_knee_is_crossed_and_releases_on_recovery() {
         let g = tight_guard();
         // Calibrate a healthy baseline of ~0.7ms (floored to 500us → knee 1ms).
-        assert_eq!(g.step(700.0, true, false, 0.0), 0);
+        assert_eq!(g.step(700.0, true, false, 0.0, true), 0);
 
         // Shared write path saturates (fsync 3ms >> 1ms knee): attack.
-        let p1 = g.step(3_000.0, true, false, 0.0);
-        let p2 = g.step(3_000.0, true, false, 0.0);
+        let p1 = g.step(3_000.0, true, false, 0.0, true);
+        let p2 = g.step(3_000.0, true, false, 0.0, true);
         assert!(p1 > 0, "crossing the fsync knee must raise pressure");
         assert!(p2 > p1, "sustained saturation keeps rising: {p1} -> {p2}");
 
         // Write path recovers (fsync back under the knee): release.
-        let p3 = g.step(700.0, true, false, 0.0);
+        let p3 = g.step(700.0, true, false, 0.0, true);
         assert!(p3 < p2, "headroom must release pressure: {p2} -> {p3}");
     }
 
@@ -1970,10 +2028,10 @@ mod tests {
         let g = tight_guard();
         // A near-zero idle baseline (50us) would give a 100us knee and trip on any
         // real load; the 500us floor keeps the knee at 1ms so ~700us load is fine.
-        g.step(50.0, true, false, 0.0); // baseline calibrates to 50us
+        g.step(50.0, true, false, 0.0, true); // baseline calibrates to 50us
         for _ in 0..5 {
             assert_eq!(
-                g.step(700.0, true, false, 0.0),
+                g.step(700.0, true, false, 0.0, true),
                 0,
                 "sub-knee load must not trip the floored guard"
             );
@@ -1986,7 +2044,7 @@ mod tests {
         // saturating signal.
         let g = tight_guard();
         for _ in 0..10 {
-            assert_eq!(g.step(5_000.0, false, false, 0.0), 0);
+            assert_eq!(g.step(5_000.0, false, false, 0.0, true), 0);
         }
         assert!(!g.should_shed());
 
@@ -1996,7 +2054,7 @@ mod tests {
             ..tight_guard_cfg()
         });
         for _ in 0..10 {
-            assert_eq!(g.step(5_000.0, true, false, 0.0), 0);
+            assert_eq!(g.step(5_000.0, true, false, 0.0, true), 0);
         }
         assert!(!g.should_shed());
     }
@@ -2004,10 +2062,10 @@ mod tests {
     #[test]
     fn tier1_should_shed_paces_the_pressure_fraction() {
         let g = tight_guard();
-        g.step(700.0, true, false, 0.0); // baseline
+        g.step(700.0, true, false, 0.0, true); // baseline
         let mut permille = 0;
         for _ in 0..20 {
-            permille = g.step(5_000.0, true, false, 0.0); // drive pressure up under saturation
+            permille = g.step(5_000.0, true, false, 0.0, true); // drive pressure up under saturation
         }
         assert!(permille > 0);
         let n = 10_000;
@@ -2026,13 +2084,13 @@ mod tests {
         // under the wide hard-ceiling backstop: with the recovery window flagged,
         // Tier-1 must NOT shed its own creates (the recovery throttle owns pacing).
         let g = tight_guard();
-        assert_eq!(g.step(700.0, true, false, 0.0), 0); // healthy baseline (knee 1.4ms, ceiling 2.8ms)
+        assert_eq!(g.step(700.0, true, false, 0.0, true), 0); // healthy baseline (knee 1.4ms, ceiling 2.8ms)
 
         // 2.5ms fsync: crosses the 1.4ms soft knee (would attack in steady state) but
         // is under the 2.8ms hard ceiling → no shed while recovering.
         for _ in 0..20 {
             assert_eq!(
-                g.step(2_500.0, true, true, 0.0),
+                g.step(2_500.0, true, true, 0.0, true),
                 0,
                 "recovery window must defer the soft knee to the recovery throttle"
             );
@@ -2044,10 +2102,10 @@ mod tests {
     fn tier1_recovery_hard_ceiling_still_sheds_a_drowning_node() {
         // Backstop: even in recovery, fsync past the wide hard ceiling still sheds.
         let g = tight_guard();
-        assert_eq!(g.step(700.0, true, false, 0.0), 0); // baseline (hard ceiling 2.8ms)
+        assert_eq!(g.step(700.0, true, false, 0.0, true), 0); // baseline (hard ceiling 2.8ms)
 
-        let p1 = g.step(10_000.0, true, true, 0.0); // 10ms >> 2.8ms hard ceiling
-        let p2 = g.step(10_000.0, true, true, 0.0);
+        let p1 = g.step(10_000.0, true, true, 0.0, true); // 10ms >> 2.8ms hard ceiling
+        let p2 = g.step(10_000.0, true, true, 0.0, true);
         assert!(
             p1 > 0,
             "past the hard ceiling a drowning node must still shed"
@@ -2060,16 +2118,16 @@ mod tests {
         // Recovery must not calibrate the baseline toward the congested latency, or
         // the steady-state knee would inflate afterward and stop protecting latency.
         let g = tight_guard();
-        assert_eq!(g.step(700.0, true, false, 0.0), 0); // baseline ~500us floor → knee 1ms
+        assert_eq!(g.step(700.0, true, false, 0.0, true), 0); // baseline ~500us floor → knee 1ms
 
         // A long recovery window at elevated (but sub-hard-ceiling) fsync.
         for _ in 0..30 {
-            g.step(3_000.0, true, true, 0.0);
+            g.step(3_000.0, true, true, 0.0, true);
         }
 
         // Back to steady state: the soft knee is still ~1ms, so a fresh 3ms spike
         // attacks as before (baseline was NOT dragged up to 3ms during recovery).
-        let p = g.step(3_000.0, true, false, 0.0);
+        let p = g.step(3_000.0, true, false, 0.0, true);
         assert!(
             p > 0,
             "post-recovery soft knee must be intact (baseline stayed frozen)"
@@ -2084,17 +2142,17 @@ mod tests {
         let g = tight_guard();
         for _ in 0..10 {
             assert_eq!(
-                g.step(5_000.0, true, true, 0.0),
+                g.step(5_000.0, true, true, 0.0, true),
                 0,
                 "no baseline yet → defer, don't seed from congestion"
             );
         }
         // Recovery clears with healthy load: baseline calibrates, still no shed.
         for _ in 0..5 {
-            assert_eq!(g.step(700.0, true, false, 0.0), 0);
+            assert_eq!(g.step(700.0, true, false, 0.0, true), 0);
         }
         // A genuine steady-state spike now attacks off the healthy baseline.
-        assert!(g.step(3_000.0, true, false, 0.0) > 0);
+        assert!(g.step(3_000.0, true, false, 0.0, true) > 0);
     }
 
     #[test]
@@ -2105,8 +2163,8 @@ mod tests {
             recovery_relax: false,
             ..tight_guard_cfg()
         });
-        assert_eq!(g.step(700.0, true, false, 0.0), 0); // baseline
-        let p = g.step(3_000.0, true, true, 0.0); // 3ms > 1ms soft knee, recovery ignored
+        assert_eq!(g.step(700.0, true, false, 0.0, true), 0); // baseline
+        let p = g.step(3_000.0, true, true, 0.0, true); // 3ms > 1ms soft knee, recovery ignored
         assert!(p > 0, "relax disabled must keep the soft knee in recovery");
     }
 
@@ -2119,34 +2177,137 @@ mod tests {
         let g = tight_guard();
 
         // Below the knee (0.8): no shed, in any mode.
-        assert_eq!(g.step(700.0, false, false, 0.5), 0);
+        assert_eq!(g.step(700.0, false, false, 0.5, true), 0);
         // Above the knee while the fsync guard is INACTIVE: still sheds (graded).
         // fill=0.9 → (0.9-0.8)/(1-0.8) = 0.5 → ~500 permille.
-        let mid = g.step(700.0, false, false, 0.9);
+        let mid = g.step(700.0, false, false, 0.9, true);
         assert!(
             (400..=600).contains(&mid),
             "graded exporter shed even with fsync inactive, got {mid}"
         );
         // At/above budget → full shed.
-        assert_eq!(g.step(700.0, false, false, 1.0), 1000);
-        assert_eq!(g.step(700.0, false, false, 1.5), 1000);
+        assert_eq!(g.step(700.0, false, false, 1.0, true), 1000);
+        assert_eq!(g.step(700.0, false, false, 1.5, true), 1000);
     }
 
     #[test]
     fn tier1_publishes_max_of_fsync_and_exporter_pressure() {
         // When both inputs are hot the guard publishes the larger of the two.
         let g = tight_guard();
-        g.step(700.0, true, false, 0.0); // calibrate healthy baseline
+        g.step(700.0, true, false, 0.0, true); // calibrate healthy baseline
         // Drive fsync pressure up under saturation with no export pressure.
         let mut fsync_only = 0;
         for _ in 0..20 {
-            fsync_only = g.step(5_000.0, true, false, 0.0);
+            fsync_only = g.step(5_000.0, true, false, 0.0, true);
         }
         assert!(fsync_only > 0, "fsync term should be shedding");
         // A full export queue must pin the published pressure to the max (1000),
         // regardless of the (lower) fsync term.
-        let combined = g.step(700.0, true, false, 1.0);
+        let combined = g.step(700.0, true, false, 1.0, true);
         assert_eq!(combined, 1000, "export saturation dominates via max");
+    }
+
+    #[test]
+    fn tier1_latency_causal_gate_opens_only_above_band_and_rising() {
+        // Gate cfg: w_target_s = 1.0s, deadband_frac = 0.1. Band L* = W_target·λ.
+        let g = tight_guard();
+        let lambda = 1000.0; // 1000 completions/s → band = 1000 instances, deadband 100.
+
+        // Backlog well below band: no latency to relieve → gate closed.
+        assert!(
+            !g.latency_causal(0.0, lambda, 0.0),
+            "flat/zero backlog must gate closed"
+        );
+        assert!(
+            !g.latency_causal(500.0, lambda, 50.0),
+            "below-band backlog gates closed"
+        );
+
+        // Above band and rising: realized sojourn past target and accumulating → open.
+        assert!(
+            g.latency_causal(2_000.0, lambda, 100.0),
+            "above-band, rising backlog must gate open"
+        );
+
+        // Above band but draining: the shed would not buy latency (already recovering)
+        // → gate closed so the fsync term releases instead of attacking.
+        assert!(
+            !g.latency_causal(2_000.0, lambda, -100.0),
+            "above-band but draining must gate closed"
+        );
+
+        // Near-zero throughput (stalled node) with a real backlog: band collapses to
+        // the deadband floor (1 instance), so a genuine backlog still gates open.
+        assert!(
+            g.latency_causal(50.0, 0.0, 0.0),
+            "stalled node with a real backlog must gate open"
+        );
+    }
+
+    #[test]
+    fn tier1_does_not_shed_a_loaded_write_path_when_backlog_is_flat() {
+        // The core ADR-0021 fix: a healthy-but-loaded disk (fsync far above the knee)
+        // with a FLAT/zero backlog must not be shed — the elevated fsync is the normal
+        // loaded operating point, and a shed buys no latency. (Reproduces the soak:
+        // ~9ms loaded fsync vs a 1ms knee, active_backlog=0, shedding 99% for nothing.)
+        let g = tight_guard();
+        g.step(700.0, true, false, 0.0, true); // calibrate a healthy ~0.7ms baseline
+        let mut permille = 0;
+        for _ in 0..40 {
+            // fsync 9ms >> 1ms knee, but latency_causal=false (backlog flat/zero).
+            permille = g.step(9_000.0, true, false, 0.0, false);
+        }
+        assert_eq!(
+            permille, 0,
+            "loaded-but-not-backing-up write path must not shed"
+        );
+        assert!(!g.should_shed());
+    }
+
+    #[test]
+    fn tier1_learns_the_loaded_baseline_when_the_knee_is_crossed_without_backlog() {
+        // Breaking the idle-seed latch: when the knee is crossed but the shed is not
+        // latency-causal, the baseline must CREEP UP toward the loaded signal so the
+        // knee reflects steady-state load — otherwise it stays pinned at the sub-ms
+        // warmup floor and trips forever. After learning the ~9ms loaded level, a
+        // subsequent genuinely-causal 9ms signal is now *within* the learned knee and
+        // no longer a runaway (the guard has adapted to the real operating point).
+        let g = GlobalGuard::new(Tier1Config {
+            baseline_creep: 0.5, // fast creep so the test converges quickly
+            ..tight_guard_cfg()
+        });
+        g.step(700.0, true, false, 0.0, true); // seed a ~0.7ms (floored 500us) baseline
+        // Sustained loaded fsync with a flat backlog: never sheds, and the baseline
+        // climbs toward 9ms so the knee rises above the loaded operating point.
+        for _ in 0..60 {
+            assert_eq!(
+                g.step(9_000.0, true, false, 0.0, false),
+                0,
+                "non-causal loaded fsync must never shed while it learns the baseline"
+            );
+        }
+        // The learned baseline now puts the knee above 9ms: even a causal 9ms sample
+        // is at/under the knee, so no spurious attack from the old idle-seeded knee.
+        let p = g.step(9_000.0, true, false, 0.0, true);
+        assert_eq!(
+            p, 0,
+            "after learning the loaded floor the knee no longer trips at 9ms"
+        );
+    }
+
+    #[test]
+    fn tier1_still_sheds_a_write_path_that_is_backing_work_up() {
+        // Protection is preserved: when the fsync knee is crossed AND the backlog is
+        // above band and rising (a genuine create-driven write-path saturation), the
+        // guard still attacks.
+        let g = tight_guard();
+        g.step(700.0, true, false, 0.0, true); // baseline
+        let p1 = g.step(3_000.0, true, false, 0.0, true); // knee crossed, gate open
+        let p2 = g.step(3_000.0, true, false, 0.0, true);
+        assert!(
+            p1 > 0 && p2 > p1,
+            "a backing-up write path must still be shed: {p1} -> {p2}"
+        );
     }
 
     fn tight_guard_cfg() -> Tier1Config {
@@ -2162,6 +2323,8 @@ mod tests {
             recovery_relax: true,
             recovery_ratio: 4.0,
             exporter_knee: 0.8,
+            w_target_s: 1.0,
+            deadband_frac: 0.1,
         }
     }
 }
