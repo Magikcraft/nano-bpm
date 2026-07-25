@@ -89,6 +89,10 @@ export type Worker = {
   /**
    * Lowercase kebab-case slug.
    */
+  inputType?: string;
+  /**
+   * Lowercase kebab-case slug.
+   */
   outputType?: string;
 } & Worker1;
 export type Worker1 = {

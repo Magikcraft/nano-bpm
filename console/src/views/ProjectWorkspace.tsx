@@ -2,7 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } fro
 import { Link, useParams } from "react-router-dom";
 import CodeEditor, { languageForFile } from "../components/CodeEditor";
 import MarkdownPreview from "../components/MarkdownPreview";
-import BpmnModeler, { type BpmnModelerHandle } from "../components/BpmnModeler";
+import BpmnModeler, {
+  type BpmnModelerHandle,
+  type DomainTypeBinding,
+} from "../components/BpmnModeler";
 import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
 import FormPreview from "../components/FormPreview";
@@ -1108,6 +1111,10 @@ function EditorPane({
       return undefined;
     }
   }, [manifestText]);
+  // Latest manifest text, read by the domain-type binding's `set` so a service-
+  // task type edit patches the current `nano.app.json` (avoids a stale closure).
+  const manifestTextRef = useRef(manifestText);
+  manifestTextRef.current = manifestText;
   // The components (element templates) installed for this project drive the BPMN
   // palette + template chooser (ADR 0033 increment 2). Load them from the
   // project's component dirs while a BPMN model is open; reload when the file
@@ -1146,6 +1153,78 @@ function EditorPane({
       ...componentOutputFeelVariables(manifest, taskOutputs),
     ],
     [manifest, primaryProcessId],
+  );
+  // The declared registry type ids (manifest `types`), the options a service
+  // task's Input/Output domain-type dropdowns offer (ADR 0029 / 0033 §3).
+  const domainTypeIds = useMemo<string[]>(() => {
+    const types = (manifest as { types?: unknown } | undefined)?.types;
+    if (!types || typeof types !== "object") return [];
+    return Object.keys(types as Record<string, unknown>);
+  }, [manifest]);
+  // Reads the type currently bound to a task type's input/output payload, from
+  // the manifest's `workers[]` entry keyed by task type.
+  const getWorkerType = useCallback(
+    (taskType: string, field: "inputType" | "outputType"): string => {
+      const workers = (manifest as { workers?: unknown } | undefined)?.workers;
+      if (!Array.isArray(workers)) return "";
+      const entry = workers.find(
+        (w) => w && typeof w === "object" && (w as { taskType?: unknown }).taskType === taskType,
+      ) as { inputType?: unknown; outputType?: unknown } | undefined;
+      const v = entry?.[field];
+      return typeof v === "string" ? v : "";
+    },
+    [manifest],
+  );
+  // Binds (or clears, on "") a task type's input/output domain type: patches the
+  // matching `workers[]` entry (creating it if absent) in the current
+  // `nano.app.json` and persists it. Optimistic — updates the in-memory manifest
+  // immediately so the modeler's FEEL scopes + the panel reflect the change
+  // before the write lands. Out-of-band from the BPMN document (the type lives in
+  // the manifest, not the model XML).
+  const setWorkerType = useCallback(
+    (taskType: string, field: "inputType" | "outputType", value: string): void => {
+      const prev = manifestTextRef.current;
+      if (prev == null) return;
+      let obj: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(prev);
+        if (!parsed || typeof parsed !== "object") return;
+        obj = parsed as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      const workers = Array.isArray(obj.workers)
+        ? (obj.workers as Record<string, unknown>[])
+        : ((obj.workers = []) as Record<string, unknown>[]);
+      let entry = workers.find((w) => w && w.taskType === taskType);
+      if (!entry) {
+        entry = { taskType };
+        workers.push(entry);
+      }
+      if (value) entry[field] = value;
+      else delete entry[field];
+      const next = `${JSON.stringify(obj, null, 2)}\n`;
+      setManifestText(next);
+      void saveProjectFile({
+        path: { name },
+        query: { path: "nano.app.json" },
+        body: next,
+        throwOnError: true,
+      }).catch(() => {
+        // Best-effort persist; the optimistic in-memory manifest still reflects
+        // the edit for this session.
+      });
+    },
+    [name],
+  );
+  const bpmnDomainTypeBinding = useMemo<DomainTypeBinding>(
+    () => ({
+      enabled: manifest != null,
+      typeIds: domainTypeIds,
+      get: getWorkerType,
+      set: setWorkerType,
+    }),
+    [manifest, domainTypeIds, getWorkerType, setWorkerType],
   );
   // Datasource aliases declared in the App manifest (`data.sources`), for the
   // form editor's "Data source" binding inspector (ADR 0024 §5). Recomputed when
@@ -1546,7 +1625,7 @@ function EditorPane({
               The XML editor is layered above via absolute positioning.
             */}
             <div className={bpmnView === "visual" ? "h-full" : "h-full invisible"}>
-              <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} getVariables={bpmnGetVariables} components={components} />
+              <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} getVariables={bpmnGetVariables} components={components} domainTypeBinding={bpmnDomainTypeBinding} />
             </div>
             {bpmnView === "xml" && (
               <div className="absolute inset-0 bg-app">

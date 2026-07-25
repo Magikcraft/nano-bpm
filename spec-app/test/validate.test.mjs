@@ -196,6 +196,18 @@ test("a worker outputType must name a declared domain type (ADR 0033 §3)", asyn
   assert.deepEqual(codesFor(result, "/workers/1/outputType"), ["unknown-type"]);
 });
 
+test("a worker inputType must name a declared domain type (ADR 0033 §3)", async () => {
+  const index = await buildSymbolIndex(models);
+  const m = manifest();
+  m.types = { ...(m.types ?? {}), reading: { fields: { room: { type: "string" } } } };
+  // fixture workers[0]=read-thermostat (handler), [1]=classify (llm)
+  m.workers[0].inputType = "reading"; // declared → valid
+  m.workers[1].inputType = "ghost"; // undeclared → unknown-type
+  const result = validateManifest(m, index);
+  assert.deepEqual(codesFor(result, "/workers/0/inputType"), []);
+  assert.deepEqual(codesFor(result, "/workers/1/inputType"), ["unknown-type"]);
+});
+
 test("a form field's datasource binding must name a declared source (ADR 0024 §5)", async () => {
   const boundForm = JSON.stringify({
     id: "orders",

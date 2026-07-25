@@ -17,8 +17,12 @@ import {
   emitDomainDtsForSources,
   emitDomainModel,
   emitDomainTypeRegistry,
+  emitWorkerBindings,
+  emitWorkerBindingsRuntime,
   interfaceName,
   sqliteAffinityToTs,
+  WORKER_BINDINGS_DTS,
+  WORKER_BINDINGS_TS,
 } from "./domain_types.ts";
 
 Deno.test("sqliteAffinityToTs applies affinity rules + Urban overrides", () => {
@@ -333,4 +337,50 @@ Deno.test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () =>
     db.close();
     await Deno.remove(root, { recursive: true });
   }
+});
+
+Deno.test("emitWorkerBindings maps taskType → declared input/output types (ADR 0033 §3)", () => {
+  const out = emitWorkerBindings(
+    [
+      { taskType: "save-order", inputType: "orderRequest", outputType: "savedOrder" },
+      { taskType: "review-order", inputType: "savedOrder" }, // input only
+      { taskType: "noop" }, // no declared types → absent
+      { taskType: "ghost", inputType: "undeclared" }, // undeclared id → absent
+    ],
+    ["orderRequest", "savedOrder"],
+  );
+  assertStringIncludes(out, `import type { DomainTypes } from "./${DOMAIN_DTS}";`);
+  assertStringIncludes(out, "export interface WorkerInputs {");
+  assertStringIncludes(out, `"save-order": DomainTypes["orderRequest"];`);
+  assertStringIncludes(out, `"review-order": DomainTypes["savedOrder"];`);
+  assertStringIncludes(out, "export interface WorkerOutputs {");
+  assertStringIncludes(out, `"save-order": DomainTypes["savedOrder"];`);
+  // Type-less and undeclared-type workers never appear.
+  assertEquals(out.includes('"noop"'), false);
+  assertEquals(out.includes('"ghost"'), false);
+  // review-order has no output → not in WorkerOutputs.
+  assertEquals(out.split(`"review-order"`).length, 2); // exactly one occurrence
+});
+
+Deno.test("emitWorkerBindings with no declared worker types is a valid empty map", () => {
+  const out = emitWorkerBindings([{ taskType: "noop" }], []);
+  assertStringIncludes(out, "export interface WorkerInputs {}");
+  assertStringIncludes(out, "export interface WorkerOutputs {}");
+  assertStringIncludes(out, "export type WorkerVars = Record<string, unknown>;");
+  // No registry import when nothing references it.
+  assertEquals(out.includes("import type { DomainTypes }"), false);
+});
+
+Deno.test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrapper", () => {
+  const out = emitWorkerBindingsRuntime();
+  assertStringIncludes(out, `export * from "./worker-sdk.ts";`);
+  assertStringIncludes(out, `import type { WorkerInputs, WorkerOutputs, WorkerVars } from "./${WORKER_BINDINGS_DTS}";`);
+  assertStringIncludes(out, "export function defineWorker<K extends string>(");
+  assertStringIncludes(out, "opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object>,");
+  // Node strip-only safety (ADR 0036): no TS parameter properties/enums.
+  assertEquals(out.includes("constructor(private"), false);
+  assertEquals(out.includes("enum "), false);
+  // File basenames are stable.
+  assertEquals(WORKER_BINDINGS_TS, "workers.ts");
+  assertEquals(WORKER_BINDINGS_DTS, "workers.d.ts");
 });
