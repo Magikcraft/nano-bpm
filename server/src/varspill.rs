@@ -670,6 +670,33 @@ mod tests {
     }
 
     #[test]
+    fn file_backed_store_disables_wal_autocheckpoint() {
+        // Regression for the #287 50KB throughput regression: the forget worker's
+        // cold-row DELETEs must never trigger SQLite's implicit 1000-page
+        // wal_checkpoint, whose fsync (on the shared disk) inflates live raft-log
+        // fsync ~7x. The store pins wal_autocheckpoint=0 so the WAL only truncates
+        // off the hot path (idle reclaim + the size-gated forget-worker backstop).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("varspill-noautockpt-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let store = VarSpillStore::open_with_params(Some(&path), 1, 100).unwrap();
+        let autockpt: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            autockpt, 0,
+            "auto-checkpoint must be disabled on the hot path"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn forget_async_deletes_rows_off_thread_and_flush_makes_them_observable() {
         // A file-backed store spawns the background forget worker; `forget_async`
         // hands the deletes to it, and `flush_forgets` blocks until they land.
