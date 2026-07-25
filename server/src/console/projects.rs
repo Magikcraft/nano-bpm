@@ -38,6 +38,7 @@ use tokio::sync::{Mutex, Notify, broadcast};
 use super::{triggers, worker_export, workers, workspace};
 
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
+const LLM_WORKER_TS: &str = include_str!("llm_worker.ts");
 const DATA_SDK_TS: &str = include_str!("data_sdk.ts");
 const DATA_CLI_TS: &str = include_str!("data_cli.ts");
 const DOMAIN_TYPES_TS: &str = include_str!("domain_types.ts");
@@ -530,6 +531,7 @@ pub fn write_config(name: &str, cfg: &ProjectConfig) -> std::io::Result<()> {
 const PROJECT_DENO_JSON: &str = r#"{
   "imports": {
     "@nanobpm/worker": "./.nanobpm/worker-sdk.ts",
+    "@nanobpm/llm": "./.nanobpm/llm-worker.ts",
     "@nanobpm/data": "./.nanobpm/data-sdk.ts",
     "@lib/": "./lib/"
   },
@@ -543,10 +545,11 @@ const PROJECT_DENO_JSON: &str = r#"{
 /// and workers on disk, so dropping a file into the project is all it takes.
 const MAIN_TS: &str = r#"// Generated entrypoint for your Nano application. Edit freely. The deploy +
 // worker bootstrap helpers live in lib/nano.ts so this stays a clean entrypoint.
-import { deployAllResources, startWorkers } from "@lib/nano.ts";
+import { deployAllResources, startLlmWorkers, startWorkers } from "@lib/nano.ts";
 
 await deployAllResources();
 await startWorkers();
+await startLlmWorkers();
 
 // ---- Your application logic below ----
 console.log("application running.");
@@ -620,6 +623,24 @@ export async function startWorkers(workers?: WorkerSelection): Promise<string[]>
       console.error(`worker ${name} failed to start: ${err}`);
     }
   }
+  return started;
+}
+
+/// Starts every LLM-as-worker declared in an Urban manifest: for each
+/// `workers[]` entry with an `llm` binding, resolves `llm.<id>` and registers a
+/// Falcon worker on its `taskType` whose handler calls the model (ADR 0022 §E
+/// role 1, via @nanobpm/llm). Returns the task types started; a no-op ([]) when
+/// there is no `nano.app.json` (i.e. a non-Urban app).
+export async function startLlmWorkers(manifestPath = "./nano.app.json"): Promise<string[]> {
+  let manifest;
+  try {
+    manifest = JSON.parse(await Deno.readTextFile(manifestPath));
+  } catch {
+    return []; // no manifest — nothing to start
+  }
+  const { startLlmWorkers: start } = await import("@nanobpm/llm");
+  const started = await start({ manifest, baseUrl: BASE_URL });
+  if (started.length) console.log(`started ${started.length} llm worker(s): ${started.join(", ")}`);
   return started;
 }
 "#;
@@ -1033,6 +1054,7 @@ or, equivalently:\n\n\
 const DEMO_STREAM_DENO_JSON: &str = r#"{
   "imports": {
     "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1",
+    "@nanobpm/llm": "./.nanobpm/llm-worker.ts",
     "@lib/": "./lib/"
   },
   "tasks": {
@@ -1158,7 +1180,7 @@ pipelining native producer (Rust beats REST ~32k vs ~20k).\n\n\
 // ---------------------------------------------------------------------------
 
 const GUI_DENO_JSON: &str = r#"{
-  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@lib/": "./lib/" },
+  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/llm": "./.nanobpm/llm-worker.ts", "@lib/": "./lib/" },
   "tasks": { "start": "deno run --allow-net --allow-read --allow-env main.ts" }
 }
 "#;
@@ -1208,7 +1230,7 @@ for a self-contained engine+UI binary.\n"
 // for the sqlite datasource + `public/` for static assets.
 
 const URBAN_DENO_JSON: &str = r#"{
-  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/data": "./.nanobpm/data-sdk.ts", "@lib/": "./lib/" },
+  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/worker": "./.nanobpm/worker-sdk.ts", "@nanobpm/llm": "./.nanobpm/llm-worker.ts", "@nanobpm/data": "./.nanobpm/data-sdk.ts", "@lib/": "./lib/" },
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-write --allow-env main.ts"
   }
@@ -1222,12 +1244,14 @@ const URBAN_DENO_JSON: &str = r#"{
 const URBAN_MAIN_TS: &str = r#"// Urban App entrypoint. The `nano.app.json` manifest is the source of truth for
 // this application (models, datasources, triggers, surfaces). `deno compile
 // --include nano.app.json --include public` bundles it into a single binary.
-import { deployAllResources } from "@lib/nano.ts";
+import { deployAllResources, startLlmWorkers, startWorkers } from "@lib/nano.ts";
 
 const manifest = JSON.parse(await Deno.readTextFile("./nano.app.json"));
 const PORT = Number(Deno.env.get("PORT") ?? 8090);
 
 await deployAllResources();
+await startWorkers();
+await startLlmWorkers();
 
 Deno.serve({ port: PORT }, async (req) => {
   const url = new URL(req.url);
@@ -1319,6 +1343,15 @@ fn urban_manifest(app_id: &str, display_name: &str) -> String {
   }},
   "surfaces": {{
     "taskInbox": {{ "enabled": true }}
+  }},
+  "workers": [
+    {{ "taskType": "classify", "llm": "classifier" }}
+  ],
+  "llm": {{
+    "classifier": {{
+      "provider": "env",
+      "model": "${{NANO_APP_LLM_MODEL}}"
+    }}
   }}
 }}
 "#
@@ -1344,7 +1377,22 @@ console.log(await db.query(\"SELECT * FROM notes\"));\n\
 ```\n\n\
 Inside a worker handler the same source is on `ctx.data(name?)`. Bind by *name*, \
 never by driver: flip `${{NANO_APP_DB_*}}` env to run the same app on a server \
-database in production with no source change.\n"
+database in production with no source change.\n\n\
+## LLM workers\n\n\
+Declare an LLM job worker in the manifest — no handler code needed \
+(ADR 0022 §E). Each `workers[]` entry with an `llm` id resolves `llm.<id>` and \
+registers a Falcon worker on its `taskType` whose handler calls the model:\n\n\
+```jsonc\n\
+\"workers\": [{{ \"taskType\": \"classify\", \"llm\": \"classifier\" }}],\n\
+\"llm\": {{ \"classifier\": {{ \"provider\": \"env\", \"model\": \"${{NANO_APP_LLM_MODEL}}\" }} }}\n\
+```\n\n\
+The job's `prompt` (or a `messages` array, plus optional `system`) becomes the \
+chat request; the model's reply completes the job as `{{ text }}`. Add \
+`\"output\": {{}}` to parse a JSON reply, or `\"output\": {{ \"decision\": \"my-dmn\" }}` \
+to run the parsed JSON through a DMN decision as *rails*. Provider `env` targets \
+any OpenAI-compatible endpoint via `NANO_APP_LLM_BASE_URL` (default \
+`http://localhost:11434/v1`, Ollama), `NANO_APP_LLM_API_KEY` (optional) and \
+`NANO_APP_LLM_MODEL` — so the same app runs fully offline against a local model.\n"
     )
 }
 
@@ -1381,6 +1429,7 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     std::fs::write(nano.join("domain-types.ts"), DOMAIN_TYPES_TS)?;
     std::fs::write(nano.join("node-loader.mjs"), NODE_LOADER_MJS)?;
     std::fs::write(nano.join("node-register.mjs"), NODE_REGISTER_MJS)?;
+    std::fs::write(nano.join("llm-worker.ts"), LLM_WORKER_TS)?;
     std::fs::write(nano.join("worker-sdk.ts"), WORKER_SDK_TS)
 }
 
@@ -1620,6 +1669,7 @@ pub fn create_project(
         NODE_REGISTER_MJS,
     )?;
     w(dir.join(".nanobpm").join("worker-sdk.ts"), WORKER_SDK_TS)?;
+    w(dir.join(".nanobpm").join("llm-worker.ts"), LLM_WORKER_TS)?;
     w(dir.join("lib").join("nano.ts"), NANO_LIB_TS)?;
 
     // All remaining built-in scaffolds are Deno-flavoured (Rust/Java are
@@ -3227,6 +3277,12 @@ mod tests {
         assert_eq!(manifest["name"], "Home_Heating");
         assert_eq!(manifest["data"]["sources"]["app"]["driver"], "sqlite");
         assert_eq!(manifest["surfaces"]["taskInbox"]["enabled"], true);
+        // The scaffold ships a complete LLM-worker example matching the
+        // classify-llm component: workers[].llm → llm.classifier (ADR 0022 §E).
+        assert_eq!(manifest["workers"][0]["taskType"], "classify");
+        assert_eq!(manifest["workers"][0]["llm"], "classifier");
+        assert_eq!(manifest["llm"]["classifier"]["provider"], "env");
+        assert!(manifest["llm"]["classifier"]["model"].is_string());
         // ADR 0024 phase-1 core: the embedded datasource SDK is materialised and
         // its `@nanobpm/data` alias is wired into the project + worker import maps
         // so `openDataSource()` / `ctx.data()` resolve at runtime.
@@ -3240,6 +3296,21 @@ mod tests {
         assert_eq!(
             deno_json["imports"]["@nanobpm/data"], "./.nanobpm/data-sdk.ts",
             "@nanobpm/data must be import-mapped"
+        );
+        // ADR 0022 §E role 1: the LLM-as-worker runtime is materialised and
+        // aliased, and the Urban entrypoint boots it (workers[].llm → llm.<id>).
+        assert!(
+            dir.join(".nanobpm/llm-worker.ts").is_file(),
+            ".nanobpm/llm-worker.ts must be materialised"
+        );
+        assert_eq!(
+            deno_json["imports"]["@nanobpm/llm"], "./.nanobpm/llm-worker.ts",
+            "@nanobpm/llm must be import-mapped"
+        );
+        let urban_main = std::fs::read_to_string(dir.join("main.ts")).unwrap();
+        assert!(
+            urban_main.contains("startLlmWorkers()"),
+            "Urban entrypoint must boot llm workers"
         );
         // Components (element templates) seed the BPMN palette (ADR 0033
         // increment 2): the modeler loads them from the project's `components/`
@@ -3858,7 +3929,16 @@ mod tests {
         assert!(dir.join("deno.json").is_file());
         assert!(dir.join(CONFIG_FILE).is_file());
         assert!(dir.join(".nanobpm/worker-sdk.ts").is_file());
+        assert!(dir.join(".nanobpm/llm-worker.ts").is_file());
         assert!(dir.join(".nanobpm/data-sdk.ts").is_file());
+        // The default entrypoint boots handler + llm workers (ADR 0022 §E).
+        let main_ts = std::fs::read_to_string(dir.join("main.ts")).unwrap();
+        assert!(main_ts.contains("startLlmWorkers()"));
+        // The import map exposes @nanobpm/llm → the materialised runtime.
+        let ddj: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("deno.json")).unwrap())
+                .expect("deno.json parses");
+        assert_eq!(ddj["imports"]["@nanobpm/llm"], "./.nanobpm/llm-worker.ts");
         // Worker import map carries the datasource alias so handlers can
         // `import { openDataSource } from "@nanobpm/data"` (ADR 0024).
         let wdj: serde_json::Value = serde_json::from_str(

@@ -237,6 +237,14 @@ so an App develops on embedded SQLite and deploys on Postgres by config alone, w
    **constrained by a referenced DMN decision or JSON schema** — the decision layer is exactly
    how an LLM's output is kept on rails (`workers[].llm` + `llm.<id>.output.decision`). This is
    shippable now and needs no new engine concept.
+   **Status: shipped (Tier-1 batteries-included runtime).** `server/src/console/llm_worker.ts` is
+   materialised into every project as `.nanobpm/llm-worker.ts` (alias `@nanobpm/llm`) and booted by
+   the App entrypoint via `startLlmWorkers()`: for each `workers[]` entry with an `llm` binding it
+   registers a Falcon worker on that `taskType` whose handler builds a chat request from the job
+   (`prompt`/`messages`/`system`), calls an OpenAI-compatible endpoint (`provider: "env"` →
+   `NANO_APP_LLM_BASE_URL` default Ollama, `NANO_APP_LLM_API_KEY`, `NANO_APP_LLM_MODEL`), and — when
+   `output` is set — parses JSON, optionally routing it through `output.decision`'s DMN evaluation as
+   the rails. No handler code and no external connector runtime required; works fully offline.
 2. **Chat agent.** The `/chat` surface's agent, whose *tools* are App capabilities
    (`start-process`, `complete-task`, `query-data`). It is the human surface (C) wired to an LLM
    rather than to forms.
