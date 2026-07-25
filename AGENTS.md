@@ -47,3 +47,25 @@ merges it:
   piling it onto an open one.
 - Do not merge a branch you know to be in a broken intermediate state; merge only
   when the change is complete and correct.
+
+### Converge Copilot review before merging
+
+Every PR must be driven to **review convergence** before it is merged — use the
+`pr-copilot-review-loop` skill (the "review convergence" loop) to do this:
+
+- After opening a PR (and after each round of fixes), **re-request the GitHub
+  Copilot review** and wait for its verdict.
+- Triage and address each Copilot comment (fix, silently apply nitpicks, or push
+  back with evidence on false positives), reply in-thread, then **re-request the
+  review again**.
+- **Keep looping** until Copilot's review comes back with **no actionable
+  comments** — its PR-level summary reports nothing new (Copilot reviews are
+  `COMMENTED`, never `APPROVED`, so the summary body is the verdict) — or the
+  Copilot review is **exhausted** (it reiterates a point already addressed or
+  pushed back on; two rounds of the same substantive point = converged).
+- At convergence, **rebase the PR if it is behind `main`, resolve any conflicts**,
+  ensure checks are green, and **merge** (UI merge or `@mergifyio queue`).
+- Stop early and sync with the user only if a comment genuinely **needs their
+  input** (a design/product tradeoff you can't decide) — after resolving
+  everything else in the round.
+
