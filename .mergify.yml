@@ -11,8 +11,8 @@
 # the always-green rebase-and-retest guarantee, explicitly enqueues the PR with
 # a `@mergifyio queue` comment. The queue itself is unchanged (serial, batched,
 # squash, rebases each PR on the real up-to-date `main` and validates it there);
-# it just no longer auto-enqueues every green PR. See `merge_protections_settings`
-# below (`auto_merge_conditions: false`).
+# it just no longer auto-enqueues every green PR. See the note above
+# `merge_protections` below (there is deliberately no `auto_merge_conditions`).
 #
 # CI-minutes posture (deliberately frugal):
 #   * mode: serial + max_parallel_checks: 1  -> NO speculative parallel checks
@@ -71,10 +71,11 @@ merge_protections:
           - check-success=processos (clippy + test)
           - check-skipped=processos (clippy + test)
 
-merge_protections_settings:
-  # AUTO-MERGE OFF. When true, Mergify auto-enqueued (and thus auto-merged) every
-  # PR that satisfied the merge protections. We deliberately do NOT want that:
-  # merging is now a manual act (GitHub "Merge" button once required checks pass,
-  # or an explicit `@mergifyio queue` to use the queue). Do not flip this back to
-  # true without also updating AGENTS.md "## Merging PRs".
-  auto_merge_conditions: false
+# AUTO-MERGE OFF. There is deliberately NO `merge_protections_settings.
+# auto_merge_conditions` key here: omitting it is Mergify's documented way to
+# disable auto-merge, so no PR is ever auto-enqueued/auto-merged on green.
+# Merging is a manual act — click "Merge" in the GitHub UI once the required CI
+# checks pass, or `@mergifyio queue` to use the queue on demand. (Note: the key
+# does NOT accept `false`; a boolean there fails config validation. To re-enable
+# auto-merge, set `auto_merge_conditions: true` — a list, not a bool — and update
+# AGENTS.md "## Merging PRs".)
