@@ -11117,7 +11117,12 @@ impl ServerImpl {
     pub fn apply_retirement_watermark(&self, p: u64, low_water: Key) {
         // Cap per-tick reaping so draining a multi-hundred-thousand backlog does
         // not stall the single-writer replica actor against live create replication.
-        const MAX_REMOVE_PER_TICK: usize = 100_000;
+        // Tunable via NANOBPMN_RETIRE_MAX_PER_TICK for soak sweeps.
+        let max_remove: usize = std::env::var("NANOBPMN_RETIRE_MAX_PER_TICK")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(100_000);
         // Only the follower replica needs this; the owner's own set is authoritative.
         if self.engine.local_for_partition(p).is_some() {
             return;
@@ -11125,7 +11130,7 @@ impl ServerImpl {
         let handle = self.raft_replicas.lock().unwrap().get(&p).cloned();
         if let Some(handle) = handle {
             handle.spawn_job(move |journal| {
-                journal.retire_below(low_water, MAX_REMOVE_PER_TICK);
+                journal.retire_below(low_water, max_remove);
             });
         }
     }
