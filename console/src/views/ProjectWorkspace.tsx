@@ -1154,33 +1154,51 @@ function EditorPane({
     ],
     [manifest, primaryProcessId],
   );
-  // The declared registry type ids (manifest `types`), the options a service
-  // task's Input/Output domain-type dropdowns offer (ADR 0029 / 0033 §3).
+  // The declared registry type ids (manifest `types`), the options a Data
+  // envelope picker offers (ADR 0033 §6).
   const domainTypeIds = useMemo<string[]>(() => {
     const types = (manifest as { types?: unknown } | undefined)?.types;
     if (!types || typeof types !== "object") return [];
     return Object.keys(types as Record<string, unknown>);
   }, [manifest]);
-  // Reads the type currently bound to a task type's input/output payload, from
-  // the manifest's `workers[]` entry keyed by task type.
-  const getWorkerType = useCallback(
-    (taskType: string, field: "inputType" | "outputType"): string => {
-      const workers = (manifest as { workers?: unknown } | undefined)?.workers;
-      if (!Array.isArray(workers)) return "";
-      const entry = workers.find(
-        (w) => w && typeof w === "object" && (w as { taskType?: unknown }).taskType === taskType,
-      ) as { inputType?: unknown; outputType?: unknown } | undefined;
-      const v = entry?.[field];
-      return typeof v === "string" ? v : "";
+  // Creates a new transient domain type in the manifest `types` registry (the
+  // "Create new envelope…" affordance, ADR 0033 §6) and persists `nano.app.json`,
+  // so a maker can declare + pick an envelope in one gesture. Seeds a stub field
+  // (schema requires ≥1) the maker fleshes out in the types editor. Throws on a
+  // failed save so the modeler aborts selecting a type that was never persisted.
+  const createDomainType = useCallback(
+    async (id: string): Promise<void> => {
+      const prev = manifestTextRef.current;
+      if (prev == null) return;
+      let obj: Record<string, unknown>;
+      try {
+        const parsed = JSON.parse(prev);
+        if (!parsed || typeof parsed !== "object") return;
+        obj = parsed as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      const types =
+        obj.types && typeof obj.types === "object"
+          ? (obj.types as Record<string, unknown>)
+          : ((obj.types = {}) as Record<string, unknown>);
+      if (!types[id]) types[id] = { fields: { value: { type: "string" } } };
+      const next = `${JSON.stringify(obj, null, 2)}\n`;
+      setManifestText(next);
+      await saveProjectFile({
+        path: { name },
+        query: { path: "nano.app.json" },
+        body: next,
+        throwOnError: true,
+      });
     },
-    [manifest],
+    [name],
   );
-  // Binds (or clears, on "") a task type's input/output domain type: patches the
-  // matching `workers[]` entry (creating it if absent) in the current
-  // `nano.app.json` and persists it. Optimistic — updates the in-memory manifest
-  // immediately so the modeler's FEEL scopes + the panel reflect the change
-  // before the write lands. Out-of-band from the BPMN document (the type lives in
-  // the manifest, not the model XML).
+  // Projects a service task's chosen envelope onto its `workers[]` entry (creating
+  // it if absent, clearing on ""), so the reifier keeps `defineWorker` typed while
+  // the model stays the source of truth (ADR 0033 §6). Optimistic — updates the
+  // in-memory manifest immediately so the modeler's FEEL scopes + the panel reflect
+  // the change before the write lands.
   const setWorkerType = useCallback(
     (taskType: string, field: "inputType" | "outputType", value: string): void => {
       const prev = manifestTextRef.current;
@@ -1221,10 +1239,10 @@ function EditorPane({
     () => ({
       enabled: manifest != null,
       typeIds: domainTypeIds,
-      get: getWorkerType,
       set: setWorkerType,
+      createType: createDomainType,
     }),
-    [manifest, domainTypeIds, getWorkerType, setWorkerType],
+    [manifest, domainTypeIds, setWorkerType, createDomainType],
   );
   // Datasource aliases declared in the App manifest (`data.sources`), for the
   // form editor's "Data source" binding inspector (ADR 0024 §5). Recomputed when

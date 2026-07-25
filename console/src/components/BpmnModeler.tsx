@@ -17,6 +17,14 @@ import { getVariablesForElement as extractZeebeVariables } from "@bpmn-io/extrac
 import type { ElementTemplate } from "../lib/urbanComponents";
 import type { FeelVariable } from "../lib/feelVariables";
 import type { ComponentOutput } from "../lib/bpmnDomainVariables";
+import {
+  SERVICE_TASK_TYPES,
+  CREATE_ENVELOPE,
+  envelopeContext,
+  readEnvelope,
+  writeEnvelope,
+  type EnvelopeField,
+} from "../lib/dataEnvelope";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
@@ -32,6 +40,10 @@ interface Canvas {
 }
 interface Modeling {
   updateProperties(element: unknown, props: Record<string, unknown>): void;
+  updateModdleProperties(element: unknown, moddleElement: unknown, props: Record<string, unknown>): void;
+}
+interface Moddle {
+  create(type: string, attrs?: Record<string, unknown>): ModdleElement;
 }
 
 // --- Component output extraction (ADR 0033 §3) -------------------------------
@@ -44,9 +56,16 @@ interface ModdleElement {
   $type?: string;
   type?: string;
   target?: string;
+  id?: string;
+  name?: string;
+  value?: string;
   values?: ModdleElement[];
+  properties?: ModdleElement[];
   outputParameters?: ModdleElement[];
-  extensionElements?: { values?: ModdleElement[] };
+  eventDefinitions?: ModdleElement[];
+  messageRef?: ModdleElement;
+  extensionElements?: ModdleElement;
+  $parent?: unknown;
 }
 interface RegistryElement {
   type?: string;
@@ -55,13 +74,6 @@ interface RegistryElement {
 interface ElementRegistry {
   getAll(): RegistryElement[];
 }
-
-const SERVICE_TASK_TYPES = new Set([
-  "bpmn:ServiceTask",
-  "bpmn:BusinessRuleTask",
-  "bpmn:ScriptTask",
-  "bpmn:SendTask",
-]);
 
 function collectComponentOutputs(registry: ElementRegistry): ComponentOutput[] {
   const outputs: ComponentOutput[] = [];
@@ -136,31 +148,38 @@ interface BpmnModelerProps {
   /// adding a component file refreshes the palette without a remount. Empty/absent
   /// → an empty component palette (nothing installed).
   components?: ElementTemplate[];
-  /// The manifest domain-type binding for service tasks (ADR 0029 / 0033 §3).
-  /// When `enabled` (the open project is an Urban App with a `nano.app.json`),
-  /// the properties panel shows an "Urban domain type" group on every service
-  /// task carrying a literal `zeebe:taskDefinition:type`, letting the modeler
-  /// pick the input/output domain type for that task type. `typeIds` are the
-  /// declared registry type ids (manifest `types`); `get`/`set` read and persist
-  /// the `workers[]` entry keyed by task type in the manifest. Read live via a
-  /// ref, so edits reflect without recreating the modeler. Absent/`enabled:false`
-  /// → no domain-type group (non-App projects).
+  /// The manifest domain-type binding for the **Data envelope** group (ADR 0033
+  /// §6). When `enabled` (the open project is an Urban App with a `nano.app.json`),
+  /// the properties panel shows a Data envelope group on every element with a
+  /// typed data boundary — service-ish tasks, user tasks, and message-bearing
+  /// elements — letting the modeler pick the input/output domain type. The
+  /// reference is written into the model; `typeIds` are the declared registry
+  /// type ids (the dropdown options), `createType` declares a new one, and `set`
+  /// projects a service task's choice onto its `workers[]` entry so `defineWorker`
+  /// stays typed. Read live via a ref, so edits reflect without recreating the
+  /// modeler. Absent/`enabled:false` → no Data envelope group (non-App projects).
   domainTypeBinding?: DomainTypeBinding;
 }
 
-/// The manifest domain-type binding surfaced in the BPMN properties panel.
-/// `field` is the worker-declaration key edited: the transient input payload
-/// type (`inputType`) or output payload type (`outputType`) for a task type.
+/// The manifest domain-type binding surfaced in the BPMN properties panel's
+/// **Data envelope** group (ADR 0033 §6). The envelope reference itself lives in
+/// the model (a reserved `zeebe:property`); this binding supplies the picker's
+/// options (`typeIds`), the create-a-new-type action (`createType`), and the
+/// service-task projection (`set`) that keeps the manifest `workers[]` entry —
+/// and thus `defineWorker` typing — in sync with the model.
 export interface DomainTypeBinding {
-  /// Whether the domain-type group is offered (true only for Urban App projects).
+  /// Whether the Data envelope group is offered (true only for Urban App projects).
   enabled: boolean;
   /// Declared registry type ids (manifest `types`), the dropdown options.
   typeIds: string[];
-  /// Current bound type for a task type's input/output, or "" when unset.
-  get(taskType: string, field: "inputType" | "outputType"): string;
-  /// Binds (or clears, on "") a task type's input/output domain type and
-  /// persists the manifest.
+  /// Projects a service task's chosen envelope onto its `workers[]` entry
+  /// (`inputType`/`outputType`, keyed by task type), creating it if absent and
+  /// clearing on "". A cache for the reifier until server-side derivation lands.
   set(taskType: string, field: "inputType" | "outputType", value: string): void;
+  /// Creates a new (transient) domain type `id` in the manifest `types` registry
+  /// and refreshes `typeIds`, so a maker can declare + pick an envelope in one
+  /// gesture (the "Create new envelope…" affordance). Absent → no create option.
+  createType?(id: string): Promise<void> | void;
 }
 
 const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
@@ -303,67 +322,77 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         __init__: ["urbanComponentsPaletteProvider"],
         urbanComponentsPaletteProvider: ["type", UrbanComponentsPaletteProvider],
       };
-      // Properties provider (the Object Inspector): an "Urban domain type" group
-      // on every service task carrying a literal `zeebe:taskDefinition:type`,
-      // with Input/Output domain-type dropdowns bound to the manifest's declared
-      // registry types (ADR 0029 / 0033 §3). Picking a type writes the matching
-      // `workers[].inputType/outputType` back to `nano.app.json` via the live
-      // binding ref, wiring the model to the worker type system by task type.
-      // Gated on the binding being enabled (Urban App projects only). The change
-      // is out-of-band from the BPMN document, so it does NOT touch the command
-      // stack (no false dirty); an optimistic overlay + an `elements.changed`
-      // refire re-renders the group with the new value before the manifest ref
-      // catches up on the parent's next render.
-      const domainTypeOverlay = new Map<string, string>();
-      const overlayKey = (taskType: string, field: string) => `${taskType}\u0000${field}`;
-      const literalTaskType = (element: {
-        type?: string;
-        businessObject?: ModdleElement;
-      }): string | undefined => {
-        if (!element?.type || !SERVICE_TASK_TYPES.has(element.type)) return undefined;
-        const values = element.businessObject?.extensionElements?.values ?? [];
-        const td = values.find((v) => v.$type === "zeebe:TaskDefinition");
-        const t = td?.type;
-        // Only literal task types key a `workers[]` entry; skip FEEL expressions.
-        return typeof t === "string" && t && !t.startsWith("=") ? t : undefined;
+      // Properties provider (the Object Inspector): a "Data envelope" group on
+      // every element with a typed data boundary — service-ish tasks (job I/O),
+      // user tasks (form I/O) and message-bearing elements (correlation payload,
+      // carried on the referenced `bpmn:Message`). Input/Output envelope pickers
+      // bound to the manifest's declared registry types (ADR 0033 §6). Picking a
+      // type writes a reserved `zeebe:property` *into the model* as a normal,
+      // undoable modeling command (so the data contract travels in the `.bpmn`);
+      // for service tasks it is also projected onto the manifest `workers[]`
+      // entry so the reifier keeps `defineWorker` typed. Gated on the binding
+      // being enabled (Urban App projects only).
+      const createEnvelope = async (apply: (value: string) => void) => {
+        const binding = domainTypeBindingRef.current;
+        if (!binding?.createType) return;
+        const id = (globalThis.prompt?.("New domain type id (e.g. orderPlaced):") ?? "").trim();
+        if (!id) return;
+        try {
+          await binding.createType(id);
+        } catch {
+          // Surfaced by the parent's manifest-save error handling.
+          return;
+        }
+        apply(id);
       };
-      const DomainTypeSelectEntry = (props: {
-        element: unknown;
-        field: "inputType" | "outputType";
-        taskType: string;
+      const DataEnvelopeEntry = (props: {
+        element: { type?: string; businessObject?: ModdleElement };
+        field: EnvelopeField;
       }) => {
-        const { element, field, taskType } = props;
-        const getValue = () =>
-          domainTypeOverlay.get(overlayKey(taskType, field)) ??
-          domainTypeBindingRef.current?.get(taskType, field) ??
-          "";
-        const setValue = (value: string) => {
+        const { element, field } = props;
+        const ctx = envelopeContext(element);
+        const getValue = () => (ctx ? readEnvelope(ctx.target, field) : "");
+        const applyValue = (value: string) => {
+          const modeler = modelerRef.current;
+          if (!modeler || !ctx) return;
           const v = value ?? "";
-          domainTypeOverlay.set(overlayKey(taskType, field), v);
-          domainTypeBindingRef.current?.set(taskType, field, v);
-          try {
-            modelerRef.current
-              ?.get<{ fire(event: string, payload: unknown): void }>("eventBus")
-              .fire("elements.changed", { elements: [element] });
-          } catch {
-            // Panel refresh is best-effort; the value is already persisted.
-          }
+          writeEnvelope(
+            modeler.get<Moddle>("moddle"),
+            modeler.get<Modeling>("modeling"),
+            element,
+            ctx.target,
+            field,
+            v,
+          );
+          // Projection (service tasks only): keep the worker-IO map that types
+          // `defineWorker` in sync with the model (ADR 0033 §6, until the
+          // server-side derivation of increment 12 retires this cache).
+          if (ctx.taskType) domainTypeBindingRef.current?.set(ctx.taskType, field, v);
         };
         const getOptions = () => [
           { value: "", label: "<none>" },
           ...(domainTypeBindingRef.current?.typeIds ?? []).map((id) => ({ value: id, label: id })),
+          ...(domainTypeBindingRef.current?.createType
+            ? [{ value: CREATE_ENVELOPE, label: "➕ Create new envelope…" }]
+            : []),
         ];
         return SelectEntry({
           element,
-          id: `urban-${field}`,
-          label: field === "inputType" ? "Input domain type" : "Output domain type",
+          id: `urban-envelope-${field}`,
+          label: field === "inputType" ? "Input envelope" : "Output envelope",
           getValue,
-          setValue,
+          setValue: (value: string) => {
+            if (value === CREATE_ENVELOPE) {
+              void createEnvelope(applyValue);
+              return;
+            }
+            applyValue(value);
+          },
           getOptions,
           description:
             field === "inputType"
-              ? "Type of the job's variable payload (workers[].inputType)."
-              : "Type this task's output variables are typed as (workers[].outputType).",
+              ? "Domain type of the data this element receives — travels in the model."
+              : "Domain type of the data this element produces — travels in the model.",
         });
       };
       interface PropertiesPanelService {
@@ -379,26 +408,23 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           return (groups: unknown[]): unknown[] => {
             const binding = domainTypeBindingRef.current;
             if (!binding?.enabled) return groups;
-            const taskType = literalTaskType(element);
-            if (!taskType) return groups;
+            if (!envelopeContext(element)) return groups;
             groups.push({
-              id: "urban-domain-type",
-              label: "Urban domain type",
+              id: "urban-data-envelope",
+              label: "Data envelope",
               component: Group,
               entries: [
                 {
-                  id: "urban-inputType",
-                  component: DomainTypeSelectEntry,
+                  id: "urban-envelope-in",
+                  component: DataEnvelopeEntry,
                   isEdited: isSelectEntryEdited,
                   field: "inputType",
-                  taskType,
                 },
                 {
-                  id: "urban-outputType",
-                  component: DomainTypeSelectEntry,
+                  id: "urban-envelope-out",
+                  component: DataEnvelopeEntry,
                   isEdited: isSelectEntryEdited,
                   field: "outputType",
-                  taskType,
                 },
               ],
             });
