@@ -11,11 +11,11 @@
 //
 //   import { emitDomainDts } from "./domain-types.ts";
 //   const tables = await (await openDataSource("app")).schema();
-//   await Deno.writeTextFile(".nanobpm/domain-rows.d.ts", emitDomainDts(tables));
+//   await Deno.writeTextFile("nano-generated/domain-rows.d.ts", emitDomainDts(tables));
 //
 // then a worker is typed end-to-end:
 //
-//   import type { DomainTables } from "./.nanobpm/domain-rows.d.ts";
+//   import type { DomainTables } from "./nano-generated/domain-rows.d.ts";
 //   const rows = await db.query<DomainTables["customers"]>("SELECT * FROM customers");
 //   rows[0].tier          // string | null — checked while authoring
 //
@@ -26,14 +26,21 @@
 //
 // This module is a **pure emitter**: it imports only the `TableMeta`/`ColumnMeta`
 // *types* from the data SDK (a type-only import, erased at runtime), so it is
-// materialised verbatim next to `data-cli.ts` as `.nanobpm/domain-types.ts` and
+// materialised verbatim next to `data-cli.ts` as `nano-generated/domain-types.ts` and
 // the data CLI's `domaintypes` op imports `emitDomainDts` from it. Opening the
 // datasource, running `schema()`, and writing the file are the CLI op's job
 // (`data_cli.ts`), which already owns the datasource seam and the file writer.
 
 import type { ColumnMeta, TableMeta } from "./data_sdk.ts";
 
-/** The generated file's basename, written under a project's `.nanobpm/`. */
+/**
+ * The per-project generated-SDK directory. Visible (not dot-hidden) so makers
+ * can read the generated accessors. Single source of truth for the TS side;
+ * the Rust scaffolder (`projects.rs::GEN_DIR`) must agree.
+ */
+export const GEN_DIR = "nano-generated";
+
+/** The generated file's basename, written under a project's `nano-generated/`. */
 // Distinct stem from the runtime accessor `domain.ts`: TypeScript otherwise pairs
 // `domain-rows.d.ts` as the *declaration of* `domain.ts`, so the accessor importing its
 // own row types reads as a circular self-import (TS2303/TS2459) under a project
@@ -280,7 +287,7 @@ export function emitDomainModel(
 // --- domain bindings: the typed data-object accessor (ADR 0029 §6) ----------
 
 /** The generated bindings file's basename — the typed `openDomain()` accessor
- * materialised next to `domain-rows.d.ts` under a project's `.nanobpm/`. */
+ * materialised next to `domain-rows.d.ts` under a project's `nano-generated/`. */
 export const DOMAIN_BINDINGS = "domain.ts";
 
 /** The primary-key column for a table's `Table` gateway: its first declared PK
@@ -365,7 +372,7 @@ export function emitDomainBindings(
 // --- worker bindings: typed job workers keyed by taskType (ADR 0033 §3) ------
 
 /** The generated worker-IO type map's basename — the `taskType → {in,out}` map
- * materialised next to `domain-rows.d.ts` under a project's `.nanobpm/`. */
+ * materialised next to `domain-rows.d.ts` under a project's `nano-generated/`. */
 // Distinct stem from the runtime wrapper `workers.ts` (same pairing hazard as
 // `DOMAIN_DTS`): a `worker-io.d.ts` reads as the declaration of `workers.ts`.
 export const WORKER_BINDINGS_DTS = "worker-io.d.ts";
@@ -406,6 +413,19 @@ export function emitWorkerBindings(
 ): string {
   const declared = new Set(declaredTypeIds);
   const propKey = (t: string) => JSON.stringify(t);
+  const taskTypes = [
+    ...new Set(
+      workers
+        .map((w) => w?.taskType)
+        .filter((t): t is string => typeof t === "string" && t.length > 0),
+    ),
+  ];
+  // The model-derived set of job types the typed `defineWorker` accepts. A finite
+  // union when workers are declared (so `type:` autocompletes and rejects typos);
+  // `string` for an app with none, so `defineWorker` stays usable pre-declaration.
+  const taskTypeUnion = taskTypes.length > 0
+    ? taskTypes.map((t) => JSON.stringify(t)).join(" | ")
+    : "string";
   const inputs: string[] = [];
   const outputs: string[] = [];
   for (const w of workers) {
@@ -440,6 +460,9 @@ export function emitWorkerBindings(
     importTypes +
     `\n/** Untyped fallback for a job whose worker declares no input/output type. */\n` +
     `export type WorkerVars = Record<string, unknown>;\n\n` +
+    `/** Every declared worker \`taskType\` (ADR 0033 §3): the model-derived set the\n` +
+    ` * typed \`defineWorker\` accepts, so \`type\` autocompletes and rejects unknown jobs. */\n` +
+    `export type WorkerTaskType = ${taskTypeUnion};\n\n` +
     `/** Input payload (\`job.variables\`) per declared worker, keyed by \`taskType\`. */\n` +
     inputsIface +
     `\n/** Output payload (worker result) per declared worker, keyed by \`taskType\`. */\n` +
@@ -465,16 +488,18 @@ export function emitWorkerBindingsRuntime(): string {
     "// eslint-disable\n\n" +
     `import { defineWorker as defineWorkerRaw } from "./worker-sdk.ts";\n` +
     `import type { WorkerOptions } from "./worker-sdk.ts";\n` +
-    `import type { WorkerInputs, WorkerOutputs, WorkerVars } from "./${WORKER_BINDINGS_DTS}";\n\n` +
+    `import type { WorkerInputs, WorkerOutputs, WorkerTaskType, WorkerVars } from "./${WORKER_BINDINGS_DTS}";\n\n` +
     `export * from "./worker-sdk.ts";\n\n` +
-    `type InFor<K extends string> = K extends keyof WorkerInputs ? WorkerInputs[K] : WorkerVars;\n` +
-    `type OutFor<K extends string> = K extends keyof WorkerOutputs ? WorkerOutputs[K] : WorkerVars;\n\n` +
+    `type InFor<K extends WorkerTaskType> = K extends keyof WorkerInputs ? WorkerInputs[K] : WorkerVars;\n` +
+    `type OutFor<K extends WorkerTaskType> = K extends keyof WorkerOutputs ? WorkerOutputs[K] : WorkerVars;\n\n` +
     `/**\n` +
-    ` * Typed \`defineWorker\`: the handler's \`job.variables\` and result are typed from\n` +
-    ` * the worker's declared \`inputType\`/\`outputType\` (ADR 0033 §3), keyed off the\n` +
-    ` * \`type\` string literal. A job type with no declared type falls back to WorkerVars.\n` +
+    ` * Typed \`defineWorker\`: \`type\` is constrained to the model's declared job types\n` +
+    ` * (\`WorkerTaskType\`, ADR 0033 §3) so it autocompletes and rejects unknown jobs,\n` +
+    ` * and the handler's \`job.variables\` + result are typed from the worker's declared\n` +
+    ` * \`inputType\`/\`outputType\`. A declared job type with no domain type falls back to\n` +
+    ` * WorkerVars.\n` +
     ` */\n` +
-    `export function defineWorker<K extends string>(\n` +
+    `export function defineWorker<K extends WorkerTaskType>(\n` +
     `  opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object>,\n` +
     `): void {\n` +
     `  defineWorkerRaw(opts as unknown as WorkerOptions);\n` +

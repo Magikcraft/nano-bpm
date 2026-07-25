@@ -40,6 +40,7 @@ const STATIC_EXT_TO_LANG: Record<string, string> = {
   ".html": "html",
   ".css": "css",
   ".scss": "scss",
+  ".sql": "sql",
 };
 
 // Extensionless filenames Monaco already tokenises via basic-languages. Matched

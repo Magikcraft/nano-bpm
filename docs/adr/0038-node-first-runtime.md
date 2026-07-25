@@ -51,7 +51,7 @@ mirror of ADR 0036's order.
 ### 2. The datasource gateway degrades too
 
 `run_data_op` builds a Node command (`--experimental-strip-types --no-warnings --import
-.nanobpm/node-register.mjs data-cli.ts`) just like the worker/run paths. `data-cli.ts` gained the same
+nano-generated/node-register.mjs data-cli.ts`) just like the worker/run paths. `data-cli.ts` gained the same
 `RT` runtime shim already in `data_sdk.ts`/`worker_sdk.ts` for its own host calls (stdin, `readDir`,
 `readTextFile`, `exit`). The two bare-`Deno.*` sites the ADR 0036 shim missed in `data_sdk.ts` are
 fixed. `DataError::NoDeno` → `NoRuntime`.
@@ -69,6 +69,16 @@ The console API carries **both** `denoAvailable` (⇒ Compile) and a new `nodeAv
 "Run requires Deno"; they warn only when **no** JS runtime is present, and a Deno-less host gets a
 soft note that Deno is needed only to Compile. The `deno` entry in the dependency panel is reframed as
 **optional (compile-only)**.
+
+### 5. Visible generated dir + a real `package.json` entrypoint
+
+The reified SDK moved out of the hidden `.nanobpm/` into a **visible `nano-generated/`** directory —
+isolation without opaque magic, so users can open and read the generated types/loaders. The directory
+name is a single `GEN_DIR` constant (Rust `projects.rs`, TS `domain_types.ts`, console `CodeEditor.tsx`)
+templated into every emitted `deno.json`/`tsconfig.json` via a `{GEN}` marker — *derive, don't duplicate*.
+The scaffolded `package.json` also gains an entrypoint (`"main": "main.ts"` + a `"start"` script that
+delegates to `deno task start`, since the app entrypoint uses `Deno.*` globals); the `@nanobpm/*` alias
+stays in `deno.json`/`tsconfig` `paths` because npm `imports` keys must be `#`-prefixed.
 
 ## Consequences
 

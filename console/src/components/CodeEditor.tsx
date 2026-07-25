@@ -105,7 +105,7 @@ async function ensureSdkLib(): Promise<void> {
 // --- IntelliSense: the project's *typed* @nanobpm SDK surface --------------
 // `ensureSdkLib()` above wires up the generic, untyped worker SDK so a bare
 // `@nanobpm/worker` import at least resolves. But a real Urban app reifies a
-// *typed* SDK into `.nanobpm/` (ADR 0029/0033): `workers.ts` overrides
+// *typed* SDK into `nano-generated/` (ADR 0029/0033): `workers.ts` overrides
 // `defineWorker` with a taskType-keyed signature (so `job.variables` is typed
 // from the worker's declared domain type), `domain.ts` exposes `openDomain()`
 // with typed tables, and `data-sdk.ts` the raw data gateway. Register those
@@ -116,6 +116,8 @@ async function ensureSdkLib(): Promise<void> {
 // files live under different `file:///…` roots). Missing files (a non-Urban
 // project, or one not yet reified) are tolerated: the generic SDK stays.
 let projectSdkLoaded = "";
+/** Per-project generated-SDK directory (mirror of `domain_types.ts::GEN_DIR`). */
+const GEN_DIR = "nano-generated";
 export async function ensureProjectSdkLibs(project: string | undefined): Promise<void> {
   if (!project || projectSdkLoaded === project) return;
   const read = async (p: string): Promise<string | null> => {
@@ -129,13 +131,13 @@ export async function ensureProjectSdkLibs(project: string | undefined): Promise
   };
   const [workersTs, workerSdk, workersDts, domainTs, domainDts, dataSdk, llm] =
     await Promise.all([
-      read(".nanobpm/workers.ts"),
-      read(".nanobpm/worker-sdk.ts"),
-      read(".nanobpm/worker-io.d.ts"),
-      read(".nanobpm/domain.ts"),
-      read(".nanobpm/domain-rows.d.ts"),
-      read(".nanobpm/data-sdk.ts"),
-      read(".nanobpm/llm-worker.ts"),
+      read(`${GEN_DIR}/workers.ts`),
+      read(`${GEN_DIR}/worker-sdk.ts`),
+      read(`${GEN_DIR}/worker-io.d.ts`),
+      read(`${GEN_DIR}/domain.ts`),
+      read(`${GEN_DIR}/domain-rows.d.ts`),
+      read(`${GEN_DIR}/data-sdk.ts`),
+      read(`${GEN_DIR}/llm-worker.ts`),
     ]);
   const add = (content: string | null, path: string) => {
     if (content == null) return;

@@ -223,7 +223,7 @@ Deno.test("schema() → emit → write roundtrip (the CLI op's path)", async () 
 
   // Mirror the data-cli `domaintypes` op: emit from schema() and write.
   const text = emitDomainDts(tables);
-  const outDir = `${root}/.nanobpm`;
+  const outDir = `${root}/nano-generated`;
   await Deno.mkdir(outDir, { recursive: true });
   const path = `${outDir}/${DOMAIN_DTS}`;
   await Deno.writeTextFile(path, text);
@@ -397,11 +397,17 @@ Deno.test("emitWorkerBindings maps taskType → declared input/output types (ADR
   assertStringIncludes(out, `"review-order": DomainTypes["savedOrder"];`);
   assertStringIncludes(out, "export interface WorkerOutputs {");
   assertStringIncludes(out, `"save-order": DomainTypes["savedOrder"];`);
-  // Type-less and undeclared-type workers never appear.
-  assertEquals(out.includes('"noop"'), false);
-  assertEquals(out.includes('"ghost"'), false);
-  // review-order has no output → not in WorkerOutputs.
-  assertEquals(out.split(`"review-order"`).length, 2); // exactly one occurrence
+  // Every declared taskType is in the model-derived union, including type-less
+  // (`noop`) and undeclared-type (`ghost`) workers…
+  assertStringIncludes(
+    out,
+    `export type WorkerTaskType = "save-order" | "review-order" | "noop" | "ghost";`,
+  );
+  // …but type-less/undeclared workers carry no typed input/output entry.
+  assertEquals(out.includes('"noop": DomainTypes'), false);
+  assertEquals(out.includes('"ghost": DomainTypes'), false);
+  // review-order has no output → exactly one typed entry (its input).
+  assertEquals(out.split(`"review-order": DomainTypes`).length, 2);
 });
 
 Deno.test("emitWorkerBindings with no declared worker types is a valid empty map", () => {
@@ -409,15 +415,22 @@ Deno.test("emitWorkerBindings with no declared worker types is a valid empty map
   assertStringIncludes(out, "export interface WorkerInputs {}");
   assertStringIncludes(out, "export interface WorkerOutputs {}");
   assertStringIncludes(out, "export type WorkerVars = Record<string, unknown>;");
+  // The taskType is still surfaced in the model-derived union.
+  assertStringIncludes(out, `export type WorkerTaskType = "noop";`);
   // No registry import when nothing references it.
   assertEquals(out.includes("import type { DomainTypes }"), false);
+});
+
+Deno.test("emitWorkerBindings with no workers at all yields a permissive WorkerTaskType", () => {
+  const out = emitWorkerBindings([], []);
+  assertStringIncludes(out, "export type WorkerTaskType = string;");
 });
 
 Deno.test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrapper", () => {
   const out = emitWorkerBindingsRuntime();
   assertStringIncludes(out, `export * from "./worker-sdk.ts";`);
-  assertStringIncludes(out, `import type { WorkerInputs, WorkerOutputs, WorkerVars } from "./${WORKER_BINDINGS_DTS}";`);
-  assertStringIncludes(out, "export function defineWorker<K extends string>(");
+  assertStringIncludes(out, `import type { WorkerInputs, WorkerOutputs, WorkerTaskType, WorkerVars } from "./${WORKER_BINDINGS_DTS}";`);
+  assertStringIncludes(out, "export function defineWorker<K extends WorkerTaskType>(");
   assertStringIncludes(out, "opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object>,");
   // Node strip-only safety (ADR 0036): no TS parameter properties/enums.
   assertEquals(out.includes("constructor(private"), false);

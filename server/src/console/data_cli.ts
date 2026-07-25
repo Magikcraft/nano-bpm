@@ -1,7 +1,7 @@
 // nanobpmn datasource CLI (Deno-preferred, Node-capable) — ADR 0024 phase-2
 // (DB Manager gateway); dual-runtime per ADR 0036/0038.
 //
-// Materialised verbatim to <project>/.nanobpm/data-cli.ts next to data-sdk.ts.
+// Materialised verbatim to <project>/nano-generated/data-cli.ts next to data-sdk.ts.
 // The Rust console server invokes it as a one-shot subprocess to serve the
 // console **Data** panel (Tables / SQL / Migrations). It is the panel's bridge
 // to the datasource seam: every operation runs THROUGH `@nanobpm/data`
@@ -30,6 +30,7 @@ import {
   emitDomainModel,
   emitWorkerBindings,
   emitWorkerBindingsRuntime,
+  GEN_DIR,
   type SourceSchema,
   WORKER_BINDINGS_DTS,
   WORKER_BINDINGS_TS,
@@ -41,7 +42,7 @@ interface Request {
   sql?: string;
   params?: unknown[];
   statements?: string[];
-  /** `domaintypes`: also write `.nanobpm/domain-rows.d.ts` (default true). */
+  /** `domaintypes`: also write `nano-generated/domain-rows.d.ts` (default true). */
   write?: boolean;
 }
 
@@ -301,7 +302,7 @@ async function run(req: Request): Promise<unknown> {
       // `types` registry (transient/non-persisted shapes) so an App with
       // multiple databases plus declared types gets one complete domain model,
       // emit `domain-rows.d.ts`, and (unless `write:false`) materialise it to
-      // `.nanobpm/domain-rows.d.ts` next to the SDK so workers type against the live
+      // `nano-generated/domain-rows.d.ts` next to the SDK so workers type against the live
       // DBs. cwd is the project root, so the relative path lands in the project.
       const { default: def, sources } = await listSources();
       const schemas: SourceSchema[] = [];
@@ -331,14 +332,14 @@ async function run(req: Request): Promise<unknown> {
       let bindingsPath: string | null = null;
       let workerBindingsPath: string | null = null;
       if (req.write !== false) {
-        await RT.mkdir(".nanobpm");
-        path = `.nanobpm/${DOMAIN_DTS}`;
+        await RT.mkdir(GEN_DIR);
+        path = `${GEN_DIR}/${DOMAIN_DTS}`;
         await RT.writeTextFile(path, text);
-        bindingsPath = `.nanobpm/${DOMAIN_BINDINGS}`;
+        bindingsPath = `${GEN_DIR}/${DOMAIN_BINDINGS}`;
         await RT.writeTextFile(bindingsPath, bindings);
-        workerBindingsPath = `.nanobpm/${WORKER_BINDINGS_DTS}`;
+        workerBindingsPath = `${GEN_DIR}/${WORKER_BINDINGS_DTS}`;
         await RT.writeTextFile(workerBindingsPath, workerBindings);
-        await RT.writeTextFile(`.nanobpm/${WORKER_BINDINGS_TS}`, workerRuntime);
+        await RT.writeTextFile(`${GEN_DIR}/${WORKER_BINDINGS_TS}`, workerRuntime);
       }
       const tables = schemas.reduce((n, s) => n + s.tables.length, 0);
       return {

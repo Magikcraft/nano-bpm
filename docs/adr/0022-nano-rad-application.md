@@ -238,7 +238,7 @@ so an App develops on embedded SQLite and deploys on Postgres by config alone, w
    how an LLM's output is kept on rails (`workers[].llm` + `llm.<id>.output.decision`). This is
    shippable now and needs no new engine concept.
    **Status: shipped (Tier-1 batteries-included runtime).** `server/src/console/llm_worker.ts` is
-   materialised into every project as `.nanobpm/llm-worker.ts` (alias `@nanobpm/llm`) and booted by
+   materialised into every project as `nano-generated/llm-worker.ts` (alias `@nanobpm/llm`) and booted by
    the App entrypoint via `startLlmWorkers()`: for each `workers[]` entry with an `llm` binding it
    registers a Falcon worker on that `taskType` whose handler builds a chat request from the job
    (`prompt`/`messages`/`system`), calls an OpenAI-compatible endpoint (`provider: "env"` →

@@ -1,6 +1,6 @@
 // nanobpmn embedded worker SDK (Deno-preferred, Node-capable).
 //
-// This file is written verbatim into <workspace>/.nanobpm/worker-sdk.ts by the
+// This file is written verbatim into <workspace>/nano-generated/worker-sdk.ts by the
 // console worker supervisor and imported by each worker's `worker.ts`. It speaks
 // the nanobpmn Falcon protocol directly over the platform's native WebSocket
 // (no `ws`, no node:events) so a worker is a single self-contained process.

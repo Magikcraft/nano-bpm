@@ -182,7 +182,7 @@ domain records**, so worker handlers and the Deno App loader are typed against t
 panels edit. Types are erased at `deno compile`; the shipped App is still untyped JSON on the wire.
 
 > **Codegen + typed SDK — implemented (spike).** The reifier (§4.1) emits a **gitignored**
-> `.nanobpm/domain-rows.d.ts` under the maker's project — same materialize-and-ignore pattern as the
+> `nano-generated/domain-rows.d.ts` under the maker's project — same materialize-and-ignore pattern as the
 > generated `data-cli.ts`/`data-sdk.ts`, so there is never a committed, hand-editable `models/` dir
 > to drift. Generation is wired to two real triggers: a `domaintypes` datasource op
 > (`data_cli.ts`, exposed through the same `run_data_op` gateway) that emits + writes the file, fired
@@ -190,7 +190,7 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > `exec`, or a `migrate`); and an **App-boot hook** (`projects.rs` run path) that refreshes the
 > types before the App starts. Both are best-effort and type-erased — a failure never blocks the
 > maker's DDL or the App. The emitter itself is a pure module (`domain_types.ts`, type-only import)
-> so it materialises next to `data-cli.ts` as `.nanobpm/domain-types.ts`. The worker SDK
+> so it materialises next to `data-cli.ts` as `nano-generated/domain-types.ts`. The worker SDK
 > (`worker_sdk.ts`) carries authoring-only generics that consume it:
 > `defineWorker<In, Out>({ handle(job) })` types `job.variables` as `In` and `job.complete(out)` as
 > `Out`, and `ctx.data().query<T>()` returns `T[]` — e.g.
@@ -228,7 +228,7 @@ Two pieces, split so codegen stays minimal and the Node fallback (ADR 0036) is n
   `insert` / `get` / `all` / `find` / `findOne` / `update` / `delete` / `count`, building parameterised SQL
   from a typed row object's own keys. It is schema-agnostic (`T` is a caller-supplied type), so it lives in
   the hand-written SDK, not codegen. `DataSource.table<T>(name, pk?)` opens one; `pk` defaults to `id`.
-- **Generated bindings — `.nanobpm/domain.ts`.** The reifier (`emitDomainBindings`) additionally emits a
+- **Generated bindings — `nano-generated/domain.ts`.** The reifier (`emitDomainBindings`) additionally emits a
   typed accessor next to `domain-rows.d.ts`, written by the **same `domaintypes` op** that writes the `.d.ts`:
   `openDomain()` → `Domain`, an object with one `Table<Row>` per table bound to its **real primary key**
   (`db.orders.insert({...})`, `db.orders.get(id)`), plus `db.raw` as the raw-SQL escape hatch. It imports
@@ -276,9 +276,9 @@ Two symmetric declarations on a worker name its motion shapes, both `$ref`-ing t
 - `workers[].outputType` — the type of the variables the worker writes back (already present, §ADR 0033
   §3, where it also types output-mapped process variables for the next component's FEEL scope).
 
-The reifier emits a **gitignored `.nanobpm/worker-io.d.ts`** next to `domain-rows.d.ts` (same materialize-and-ignore
+The reifier emits a **gitignored `nano-generated/worker-io.d.ts`** next to `domain-rows.d.ts` (same materialize-and-ignore
 pattern), a `taskType → DomainTypes[…]` map for each direction (`WorkerInputs` / `WorkerOutputs`), plus a
-**static `.nanobpm/workers.ts`** SDK wrapper that re-exports the worker SDK and overrides `defineWorker` with
+**static `nano-generated/workers.ts`** SDK wrapper that re-exports the worker SDK and overrides `defineWorker` with
 a task-type-driven overload:
 
 ```ts
@@ -294,7 +294,7 @@ TypeScript **infers `K` from the `type:` string literal**, so a worker is fully 
 generics** — and an undeclared task type falls back to the untyped `WorkerVars`, so nothing breaks:
 
 ```ts
-import { defineWorker } from "@nanobpm/worker";        // → .nanobpm/workers.ts
+import { defineWorker } from "@nanobpm/worker";        // → nano-generated/workers.ts
 import { openDomain } from "@nanobpm/domain";
 
 defineWorker({
@@ -387,5 +387,5 @@ type → the same registry scopes the model's FEEL.**
 3. **type-codegen** — emit the domain-record TypeScript from `generate-app-manifest.sh` (§6) and
    scaffold **typed worker signatures** against it.
 4. **data-objects** — the typed table gateway (§6.1): `Table<T>` in `data-sdk.ts` + a generated
-   `.nanobpm/domain.ts` (`openDomain()` → `db.<table>.insert/get/find/update/delete`), so workers
+   `nano-generated/domain.ts` (`openDomain()` → `db.<table>.insert/get/find/update/delete`), so workers
    manipulate typed records instead of hand-writing SQL.

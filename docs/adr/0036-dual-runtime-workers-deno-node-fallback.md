@@ -53,7 +53,7 @@ No other SDK code changes; the wire protocol and control-line format are identic
 
 ### 2. Node honours `deno.json` via a `module.register` loader
 
-Two files are materialised beside the SDK (`.nanobpm/`):
+Two files are materialised beside the SDK (`nano-generated/`):
 
 - `node-loader.mjs` — a `resolve` hook implementing the `deno.json` import map: exact keys, `/`-suffixed
   prefix keys, and `npm:` → bare specifier. It bases relative map values on **`process.cwd()`**, which
@@ -61,7 +61,7 @@ Two files are materialised beside the SDK (`.nanobpm/`):
   for a legacy `worker.ts`). `jsr:` / `http(s):` specifiers throw (unsupported under the fallback).
 - `node-register.mjs` — `module.register("./node-loader.mjs", import.meta.url)`, passed via `--import`.
 
-Node argv: `node --experimental-strip-types --no-warnings --import <.nanobpm/node-register.mjs> <entry>`.
+Node argv: `node --experimental-strip-types --no-warnings --import <nano-generated/node-register.mjs> <entry>`.
 `--experimental-strip-types` runs `.ts` directly (landed 22.6); `WebSocket` (22.4) and `node:sqlite`
 (22.5) are built in. Hence the **`NODE_MIN = (22, 6)`** floor, gated by `usable_node()` probing
 `node --version`.
