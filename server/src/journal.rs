@@ -141,7 +141,9 @@ impl Commit {
     /// immediately if the writer thread is gone (shutdown) rather than hanging.
     pub fn blocking_wait(self) {
         if let CommitInner::Pending(rx) = self.0 {
+            let start = std::time::Instant::now();
             let _ = rx.blocking_recv();
+            crate::metrics::record_commit_wait(start.elapsed());
         }
     }
 }
