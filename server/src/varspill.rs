@@ -81,6 +81,19 @@ fn reclaim_idle_ms() -> u64 {
         .unwrap_or(2000)
 }
 
+/// Rows the forget worker deletes between its own `wal_checkpoint(TRUNCATE)`
+/// backstop passes. With `wal_autocheckpoint=0` the WAL only truncates off the
+/// hot path; this bounds WAL growth under sustained retirement (when the idle
+/// reclaim thread never runs) without checkpointing so often that its fsync
+/// contends with live raft-log fsync. Tunable via NANOBPMN_VARSPILL_WAL_CKPT_KEYS.
+fn wal_checkpoint_keys() -> u64 {
+    std::env::var("NANOBPMN_VARSPILL_WAL_CKPT_KEYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(262_144)
+}
+
 /// Pages reclaimed per bounded background pass (~256 MiB at a 4 KiB page). Small
 /// enough that a pass holds the connection lock only briefly (so resuming load
 /// preempts a drain), large enough to clear even a 100 GB post-spike freelist within
@@ -187,8 +200,19 @@ impl VarSpillStore {
             None => Connection::open_in_memory()?,
         };
         conn.execute_batch(
+            // wal_autocheckpoint=0 disables SQLite's implicit 1000-page checkpoint.
+            // Under sustained retirement the forget worker deletes at a high rate;
+            // an auto-checkpoint fires an fsync-heavy `wal_checkpoint` on that
+            // thread, and because the spill file shares the physical disk with the
+            // raft log, that checkpoint I/O inflates live raft-log fsync latency
+            // ~7x (measured), halving create throughput. With auto-checkpoint off,
+            // deletes are cheap WAL appends (synchronous=NORMAL never fsyncs a
+            // commit); the WAL is truncated off the hot path — by the idle-gated
+            // reclaim thread, and by the forget worker's own size-gated backstop
+            // (see spawn_forget_worker) so it can never grow without bound.
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
+             PRAGMA wal_autocheckpoint=0;
              CREATE TABLE IF NOT EXISTS spill (key INTEGER PRIMARY KEY, vars TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS cold (key INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);
              DELETE FROM spill;
@@ -298,13 +322,35 @@ impl VarSpillStore {
         let handle = std::thread::Builder::new()
             .name("varspill-forget".into())
             .spawn(move || {
+                // With wal_autocheckpoint disabled, the WAL only truncates off the
+                // hot path. The idle-gated reclaim thread handles the post-load
+                // drain, but under *sustained* retirement (never idle) the WAL would
+                // grow unbounded, so the worker itself truncates once it has deleted
+                // WAL_CKPT_KEYS rows since the last checkpoint. That bound is large
+                // and the checkpoint infrequent, so its fsync barely perturbs raft
+                // fsync (unlike the per-1000-page auto-checkpoint it replaces), while
+                // still capping WAL disk growth and keeping cold reads fast.
+                let ckpt_keys = wal_checkpoint_keys();
+                let mut since_ckpt: u64 = 0;
                 // Exits when the channel closes (every sender dropped), after
                 // draining any batches still queued — so no forget is lost.
                 while let Ok(msg) = rx.recv() {
                     match msg {
                         ForgetMsg::Keys(keys) => {
+                            let n = keys.len() as u64;
                             Self::delete_keys(&conn, &keys);
                             activity.fetch_add(1, Ordering::Relaxed);
+                            since_ckpt = since_ckpt.saturating_add(n);
+                            if since_ckpt >= ckpt_keys {
+                                since_ckpt = 0;
+                                if let Ok(guard) = conn.lock() {
+                                    let _ = guard.query_row(
+                                        "PRAGMA wal_checkpoint(TRUNCATE)",
+                                        [],
+                                        |_| Ok(()),
+                                    );
+                                }
+                            }
                         }
                         ForgetMsg::Flush(ack) => {
                             let _ = ack.send(());
