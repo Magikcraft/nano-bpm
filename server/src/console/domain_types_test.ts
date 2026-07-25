@@ -339,6 +339,48 @@ Deno.test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () =>
   }
 });
 
+// Regression: the generated `domain.d.ts` emits row types as `interface`s, and
+// an interface (unlike an inline type literal) has no implicit string index
+// signature — so it is NOT assignable to `Record<string, unknown>`. The Table
+// bound must therefore be `T extends object` (ADR 0029 §6.1), or every worker
+// that imports the reified `domain.ts` fails `deno check` with TS2344. This test
+// passes an `interface` through `db.table<T>()`, so the harness's own type-check
+// is the guard (a regression to `T extends Row` would fail to compile here).
+interface RegOrderRow {
+  id: number;
+  item: string;
+  qty: number;
+  status: string | null;
+}
+
+Deno.test("Table<T> accepts an interface row type (ADR 0029 §6.1 — the domain.d.ts shape)", async () => {
+  const root = await Deno.makeTempDir();
+  await Deno.writeTextFile(
+    `${root}/nano.app.json`,
+    JSON.stringify({
+      data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
+    }),
+  );
+  const { openDataSource } = await import("./data_sdk.ts");
+  const db = await openDataSource("app", { cwd: root });
+  try {
+    await db.exec(
+      "CREATE TABLE orders(id INTEGER PRIMARY KEY, item TEXT NOT NULL, qty INTEGER NOT NULL, status TEXT)",
+    );
+    // The `interface` type argument is the crux — this line would not compile
+    // under a `T extends Row` bound.
+    const orders = db.table<RegOrderRow>("orders", "id");
+    const id = Number(await orders.insert({ item: "Widget", qty: 3, status: "received" }));
+    assertEquals((await orders.get(id))?.item, "Widget");
+    assertEquals(await orders.update(id, { status: "done" }), 1);
+    assertEquals((await orders.findOne({ status: "done" }))?.id, id);
+    assertEquals(await orders.count({ item: "Widget" }), 1);
+  } finally {
+    db.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test("emitWorkerBindings maps taskType → declared input/output types (ADR 0033 §3)", () => {
   const out = emitWorkerBindings(
     [

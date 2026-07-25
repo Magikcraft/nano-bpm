@@ -106,7 +106,7 @@ export interface DataSource {
   /** A typed gateway over one table — the RAD "TTable": manipulate rows as typed
    * records instead of hand-writing SQL. The row type comes from the generated
    * `domain.d.ts` (ADR 0029); `pk` is the primary-key column (default "id"). */
-  table<T extends Row = Row>(name: string, pk?: string): Table<T>;
+  table<T extends object = Row>(name: string, pk?: string): Table<T>;
   /** Close the underlying connection. */
   close(): void;
 }
@@ -275,13 +275,16 @@ function quoteIdent(name: string): string {
 // --- typed table gateway (the RAD "TTable") --------------------------------
 
 /** Build a parameterised ` WHERE a = ? AND b = ?` clause from an equality map;
- * an empty map yields an empty clause (matches all rows). */
-function whereClause(where: Row): { clause: string; params: unknown[] } {
-  const keys = Object.keys(where);
+ * an empty map yields an empty clause (matches all rows). Takes `object` (not
+ * `Row`) so a `Partial<T>` for a generated `interface` row type (which lacks a
+ * string index signature) is accepted; keys/values are read via a `Row` cast. */
+function whereClause(where: object): { clause: string; params: unknown[] } {
+  const w = where as Row;
+  const keys = Object.keys(w);
   if (keys.length === 0) return { clause: "", params: [] };
   const clause = " WHERE " +
     keys.map((k) => `${quoteIdent(k)} = ?`).join(" AND ");
-  return { clause, params: keys.map((k) => where[k]) };
+  return { clause, params: keys.map((k) => w[k]) };
 }
 
 /// A typed gateway over a single table — the record-oriented data object a RAD
@@ -291,7 +294,7 @@ function whereClause(where: Row): { clause: string; params: unknown[] } {
 /// `domain.d.ts`; this class is generic *runtime* and knows nothing about any
 /// specific schema, so it stays a plain dual-runtime (Node + Deno) module — no
 /// codegen, no Deno-only APIs. `pk` is the primary-key column (default `id`).
-export class Table<T extends Row = Row> {
+export class Table<T extends object = Row> {
   readonly name: string;
   readonly pk: string;
   #src: DataSource;
@@ -471,7 +474,7 @@ class SqliteDataSource implements DataSource {
     this.#onClose?.();
   }
 
-  table<T extends Row = Row>(name: string, pk = "id"): Table<T> {
+  table<T extends object = Row>(name: string, pk = "id"): Table<T> {
     return new Table<T>(this, name, pk);
   }
 }
