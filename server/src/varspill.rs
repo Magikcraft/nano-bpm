@@ -121,11 +121,14 @@ const FORGET_CHUNK: usize = 4_096;
 
 /// Background thread that applies follower **retirement** `forget` deletes off the
 /// engine actor. The follower retirement backstop can reap up to 100k cold
-/// victims per tick; deleting them inline on the single-writer replica actor
-/// (a synchronous SQLite transaction that fsyncs) stalls live raft replication
-/// and roughly halves 50 KB-payload throughput. Offloading the deletes here
-/// keeps the actor free while still reclaiming the rows (keys are unique and
-/// never reused, so a queued forget can never clobber a later re-spill).
+/// victims per tick; running that DELETE inline on the single-writer replica actor
+/// holds the actor in SQLite work every retirement tick and (before
+/// `wal_autocheckpoint` was disabled) tripped WAL checkpoints whose fsyncs
+/// contended with live raft-log fsync — stalling replication and roughly halving
+/// 50 KB-payload throughput. Offloading the deletes here keeps the actor free
+/// while still reclaiming the rows, and the worker checkpoints only on its own
+/// bounded, infrequent cadence (keys are unique and never reused, so a queued
+/// forget can never clobber a later re-spill).
 ///
 /// Steady-state exporter-driven **eviction** ([`crate::journal::Journal::evict_instances`])
 /// deliberately stays synchronous ([`VarSpillStore::forget`]): it runs on the owner
@@ -397,9 +400,10 @@ impl VarSpillStore {
     }
 
     /// Deletes the spill and cold rows for `keys`, chunked into short transactions
-    /// so a large batch never holds the connection lock (and its fsync) for long.
-    /// Bumps `activity` once per chunk so the reclaim worker sees the store as busy
-    /// for the entire (potentially long) sweep, not just at its start.
+    /// so a large batch never holds the connection lock for long (blocking the
+    /// engine actor's own spill/rehydrate access). Bumps `activity` once per chunk
+    /// so the reclaim worker sees the store as busy for the entire (potentially
+    /// long) sweep, not just at its start.
     fn delete_keys(conn: &Mutex<Connection>, activity: &AtomicU64, keys: &[Key]) {
         for chunk in keys.chunks(FORGET_CHUNK) {
             activity.fetch_add(1, Ordering::Relaxed);
