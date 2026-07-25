@@ -81,8 +81,9 @@ fn reclaim_idle_ms() -> u64 {
         .unwrap_or(2000)
 }
 
-/// Rows the forget worker deletes between its own `wal_checkpoint(TRUNCATE)`
-/// backstop passes. With `wal_autocheckpoint=0` the WAL only truncates off the
+/// Keys the forget worker forgets between its own `wal_checkpoint(TRUNCATE)`
+/// backstop passes (each key can delete up to two rows — a `spill` row and a
+/// `cold` row). With `wal_autocheckpoint=0` the WAL only truncates off the
 /// hot path; this bounds WAL growth under sustained retirement (when the idle
 /// reclaim thread never runs) without checkpointing so often that its fsync
 /// contends with live raft-log fsync. Tunable via NANOBPMN_VARSPILL_WAL_CKPT_KEYS.
@@ -377,13 +378,15 @@ impl VarSpillStore {
                                 // worker won't classify the store as idle and start a
                                 // vacuum pass during/around this maintenance I/O.
                                 activity.fetch_add(1, Ordering::Relaxed);
-                                if let Ok(guard) = conn.lock() {
-                                    let _ = guard.query_row(
-                                        "PRAGMA wal_checkpoint(TRUNCATE)",
-                                        [],
-                                        |_| Ok(()),
-                                    );
-                                }
+                                // Surface a poisoned lock or checkpoint failure
+                                // loudly (matching `delete_keys`): silently
+                                // swallowing them here would let the WAL grow
+                                // without bound under sustained retirement — the
+                                // very failure this backstop exists to prevent.
+                                let guard = conn.lock().expect("spill store poisoned");
+                                guard
+                                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                                    .expect("spill store: wal_checkpoint(TRUNCATE)");
                             }
                         }
                         ForgetMsg::Flush(ack) => {
