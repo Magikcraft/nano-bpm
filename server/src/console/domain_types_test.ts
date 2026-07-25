@@ -10,7 +10,9 @@
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import type { TableMeta } from "./data_sdk.ts";
 import {
+  DOMAIN_BINDINGS,
   DOMAIN_DTS,
+  emitDomainBindings,
   emitDomainDts,
   emitDomainDtsForSources,
   emitDomainModel,
@@ -232,4 +234,103 @@ Deno.test("schema() → emit → write roundtrip (the CLI op's path)", async () 
   assertStringIncludes(written, '"customers": Customers;');
 
   await Deno.remove(root, { recursive: true });
+});
+
+Deno.test("emitDomainBindings renders openDomain with a typed Table per table", () => {
+  const tables: TableMeta[] = [
+    {
+      name: "orders",
+      columns: [
+        { name: "id", type: "INTEGER", notNull: true, primaryKey: true },
+        { name: "customer_id", type: "INTEGER", notNull: true, primaryKey: false },
+        { name: "status", type: "TEXT", notNull: false, primaryKey: false },
+      ],
+      indexes: [],
+      foreignKeys: [],
+    },
+  ];
+  const out = emitDomainBindings([{ source: "app", tables }], "app");
+  // Imports only the sibling SDK (relative) + a type-only domain.d.ts — no
+  // jsr:/https: so it survives the Node fallback loader (ADR 0036).
+  assertStringIncludes(out, 'import { openDataSource, type DataSource, type Table } from "./data-sdk.ts";');
+  assertStringIncludes(out, `import type { Orders } from "./${DOMAIN_DTS}";`);
+  assertStringIncludes(out, "export interface Domain {");
+  assertStringIncludes(out, "readonly raw: DataSource;");
+  assertStringIncludes(out, "readonly orders: Table<Orders>;");
+  assertStringIncludes(out, "export async function openDomain(source?: string): Promise<Domain> {");
+  // The gateway is bound with the table's real primary key.
+  assertStringIncludes(out, 'orders: raw.table<Orders>("orders", "id"),');
+  assertStringIncludes(out, "close: () => raw.close(),");
+  assertEquals(DOMAIN_BINDINGS, "domain.ts");
+});
+
+Deno.test("emitDomainBindings uses the first declared PK (not always id)", () => {
+  const tables: TableMeta[] = [
+    {
+      name: "sessions",
+      columns: [
+        { name: "token", type: "TEXT", notNull: true, primaryKey: true },
+        { name: "user_id", type: "INTEGER", notNull: true, primaryKey: false },
+      ],
+      indexes: [],
+      foreignKeys: [],
+    },
+  ];
+  const out = emitDomainBindings([{ source: "app", tables }], "app");
+  assertStringIncludes(out, 'sessions: raw.table<Sessions>("sessions", "token"),');
+});
+
+Deno.test("emitDomainBindings handles an empty schema (raw-only Domain)", () => {
+  const out = emitDomainBindings([{ source: "app", tables: [] }], "app");
+  assertStringIncludes(out, "export interface Domain {");
+  assertStringIncludes(out, "readonly raw: DataSource;");
+  assertStringIncludes(out, "export async function openDomain(");
+  // No table imports and no Table fields.
+  assertEquals(out.includes(`from "./${DOMAIN_DTS}"`), false);
+  assertEquals(out.includes("raw.table<"), false);
+});
+
+Deno.test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () => {
+  const root = await Deno.makeTempDir();
+  await Deno.writeTextFile(
+    `${root}/nano.app.json`,
+    JSON.stringify({
+      data: { default: "app", sources: { app: { driver: "sqlite", url: "file:./app.db" } } },
+    }),
+  );
+  const { openDataSource } = await import("./data_sdk.ts");
+  const db = await openDataSource("app", { cwd: root });
+  try {
+    await db.exec(
+      "CREATE TABLE orders(id INTEGER PRIMARY KEY, item TEXT NOT NULL, qty INTEGER NOT NULL, status TEXT)",
+    );
+    const orders = db.table<
+      { id: number; item: string; qty: number; status: string | null }
+    >("orders", "id");
+
+    // insert returns the new rowid; get fetches it back typed.
+    const id = Number(await orders.insert({ item: "Widget", qty: 3, status: "received" }));
+    assertEquals(id, 1);
+    const row = await orders.get(id);
+    assertEquals(row?.item, "Widget");
+    assertEquals(row?.qty, 3);
+
+    // update by pk, then re-read.
+    assertEquals(await orders.update(id, { status: "fulfilled" }), 1);
+    assertEquals((await orders.get(id))?.status, "fulfilled");
+
+    // find/count on an equality filter.
+    await orders.insert({ item: "Gadget", qty: 12, status: "received" });
+    assertEquals((await orders.find({ status: "received" })).length, 1);
+    assertEquals(await orders.count(), 2);
+    assertEquals((await orders.findOne({ item: "Gadget" }))?.qty, 12);
+
+    // delete by pk.
+    assertEquals(await orders.delete(id), 1);
+    assertEquals(await orders.count(), 1);
+    assertEquals(await orders.get(id), undefined);
+  } finally {
+    db.close();
+    await Deno.remove(root, { recursive: true });
+  }
 });

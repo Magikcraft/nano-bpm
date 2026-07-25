@@ -103,6 +103,10 @@ export interface DataSource {
   tx<T>(fn: (t: DataSource) => Promise<T>): Promise<T>;
   /** Introspect the datasource's tables/columns/indexes. */
   schema(): Promise<TableMeta[]>;
+  /** A typed gateway over one table — the RAD "TTable": manipulate rows as typed
+   * records instead of hand-writing SQL. The row type comes from the generated
+   * `domain.d.ts` (ADR 0029); `pk` is the primary-key column (default "id"). */
+  table<T extends Row = Row>(name: string, pk?: string): Table<T>;
   /** Close the underlying connection. */
   close(): void;
 }
@@ -247,6 +251,123 @@ function quoteIdent(name: string): string {
   return `"${name.replaceAll('"', '""')}"`;
 }
 
+// --- typed table gateway (the RAD "TTable") --------------------------------
+
+/** Build a parameterised ` WHERE a = ? AND b = ?` clause from an equality map;
+ * an empty map yields an empty clause (matches all rows). */
+function whereClause(where: Row): { clause: string; params: unknown[] } {
+  const keys = Object.keys(where);
+  if (keys.length === 0) return { clause: "", params: [] };
+  const clause = " WHERE " +
+    keys.map((k) => `${quoteIdent(k)} = ?`).join(" AND ");
+  return { clause, params: keys.map((k) => where[k]) };
+}
+
+/// A typed gateway over a single table — the record-oriented data object a RAD
+/// worker binds to instead of hand-writing SQL (the Delphi `TTable`/data-module
+/// idea, ADR 0029 §6). It builds parameterised SQL from a typed row object's own
+/// keys, so callers manipulate rows as records. `T` comes from the generated
+/// `domain.d.ts`; this class is generic *runtime* and knows nothing about any
+/// specific schema, so it stays a plain dual-runtime (Node + Deno) module — no
+/// codegen, no Deno-only APIs. `pk` is the primary-key column (default `id`).
+export class Table<T extends Row = Row> {
+  readonly name: string;
+  readonly pk: string;
+  #src: DataSource;
+
+  constructor(src: DataSource, name: string, pk = "id") {
+    this.#src = src;
+    this.name = name;
+    this.pk = pk;
+  }
+
+  /** Insert one row (only the present keys are written); returns the new
+   * primary-key value (the inserted rowid for an INTEGER PRIMARY KEY). */
+  async insert(row: Partial<T>): Promise<number | bigint> {
+    const keys = Object.keys(row);
+    if (keys.length === 0) {
+      throw new Error(`Table(${this.name}).insert: no columns to insert`);
+    }
+    const cols = keys.map(quoteIdent).join(", ");
+    const ph = keys.map(() => "?").join(", ");
+    const r = await this.#src.exec(
+      `INSERT INTO ${quoteIdent(this.name)} (${cols}) VALUES (${ph})`,
+      keys.map((k) => (row as Row)[k]),
+    );
+    return r.lastInsertId ?? 0;
+  }
+
+  /** Fetch the row with the given primary key, or `undefined`. */
+  async get(id: unknown): Promise<T | undefined> {
+    const rows = await this.#src.query(
+      `SELECT * FROM ${quoteIdent(this.name)} WHERE ${quoteIdent(this.pk)} = ? LIMIT 1`,
+      [id],
+    );
+    return rows[0] as T | undefined;
+  }
+
+  /** Every row (optionally capped at `limit`). */
+  async all(limit?: number): Promise<T[]> {
+    const lim = typeof limit === "number"
+      ? ` LIMIT ${Math.max(0, Math.floor(limit))}`
+      : "";
+    return (await this.#src.query(
+      `SELECT * FROM ${quoteIdent(this.name)}${lim}`,
+    )) as T[];
+  }
+
+  /** Rows matching an equality filter (keys ANDed). An empty filter matches
+   * all rows. */
+  async find(where: Partial<T> = {}): Promise<T[]> {
+    const { clause, params } = whereClause(where as Row);
+    return (await this.#src.query(
+      `SELECT * FROM ${quoteIdent(this.name)}${clause}`,
+      params,
+    )) as T[];
+  }
+
+  /** The first row matching an equality filter, or `undefined`. */
+  async findOne(where: Partial<T> = {}): Promise<T | undefined> {
+    const { clause, params } = whereClause(where as Row);
+    const rows = await this.#src.query(
+      `SELECT * FROM ${quoteIdent(this.name)}${clause} LIMIT 1`,
+      params,
+    );
+    return rows[0] as T | undefined;
+  }
+
+  /** Patch the row with the given primary key; returns rows changed. */
+  async update(id: unknown, patch: Partial<T>): Promise<number> {
+    const keys = Object.keys(patch);
+    if (keys.length === 0) return 0;
+    const set = keys.map((k) => `${quoteIdent(k)} = ?`).join(", ");
+    const r = await this.#src.exec(
+      `UPDATE ${quoteIdent(this.name)} SET ${set} WHERE ${quoteIdent(this.pk)} = ?`,
+      [...keys.map((k) => (patch as Row)[k]), id],
+    );
+    return r.changed;
+  }
+
+  /** Delete the row with the given primary key; returns rows changed. */
+  async delete(id: unknown): Promise<number> {
+    const r = await this.#src.exec(
+      `DELETE FROM ${quoteIdent(this.name)} WHERE ${quoteIdent(this.pk)} = ?`,
+      [id],
+    );
+    return r.changed;
+  }
+
+  /** Count rows matching an equality filter (all rows when omitted). */
+  async count(where: Partial<T> = {}): Promise<number> {
+    const { clause, params } = whereClause(where as Row);
+    const rows = await this.#src.query(
+      `SELECT COUNT(*) AS n FROM ${quoteIdent(this.name)}${clause}`,
+      params,
+    );
+    return Number((rows[0] as Row)?.n ?? 0);
+  }
+}
+
 class SqliteDataSource implements DataSource {
   #db: DatabaseSync;
   #onClose?: () => void;
@@ -327,6 +448,10 @@ class SqliteDataSource implements DataSource {
   close(): void {
     this.#db.close();
     this.#onClose?.();
+  }
+
+  table<T extends Row = Row>(name: string, pk = "id"): Table<T> {
+    return new Table<T>(this, name, pk);
   }
 }
 

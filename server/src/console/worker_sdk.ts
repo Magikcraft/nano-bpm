@@ -30,6 +30,22 @@
 /** A row from a datasource query. */
 export type WorkerRow = Record<string, unknown>;
 
+/** A typed table gateway (the RAD "TTable") over one table — manipulate rows as
+ * typed records instead of hand-writing SQL. Structurally mirrors `Table` in the
+ * `@nanobpm/data` SDK; `T` comes from the generated `domain.d.ts` (ADR 0029 §6).
+ * For the full named accessor (`db.orders.insert(...)`) import `openDomain` from
+ * `@nanobpm/domain`. */
+export interface WorkerTable<T extends object = WorkerRow> {
+  insert(row: Partial<T>): Promise<number | bigint>;
+  get(id: unknown): Promise<T | undefined>;
+  all(limit?: number): Promise<T[]>;
+  find(where?: Partial<T>): Promise<T[]>;
+  findOne(where?: Partial<T>): Promise<T | undefined>;
+  update(id: unknown, patch: Partial<T>): Promise<number>;
+  delete(id: unknown): Promise<number>;
+  count(where?: Partial<T>): Promise<number>;
+}
+
 /** The datasource handle returned by `ctx.data()`. Mirrors the DataSource
  * contract in the `@nanobpm/data` SDK (ADR 0024); typed structurally here so the
  * worker SDK stays a single self-contained file. `query` is generic so a caller
@@ -43,6 +59,9 @@ export interface WorkerDataSource {
   ): Promise<{ changed: number; lastInsertId?: number | bigint }>;
   tx<T>(fn: (t: WorkerDataSource) => Promise<T>): Promise<T>;
   schema(): Promise<unknown[]>;
+  /** A typed table gateway (the RAD "TTable", ADR 0029 §6): manipulate rows as
+   * records instead of hand-writing SQL. `pk` defaults to "id". */
+  table<T extends object = WorkerRow>(name: string, pk?: string): WorkerTable<T>;
   close(): void;
 }
 

@@ -205,6 +205,51 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
 > and export handlers refresh the file before packaging, so a shipped App carries current types —
 > best-effort and type-erased at compile).
 
+### 6.1 The typed data-object layer — records, not SQL strings
+
+The §6 codegen types *read* rows (`query<DomainTables["customers"]>(...)`), but a worker still hand-wrote
+every `INSERT`/`UPDATE` as a SQL string — the domain model described the data without being the thing the
+code *manipulated*. This step closes that gap with a **typed table gateway** — the RAD "TTable" / Delphi
+data-module idea: the code binds to a record-oriented object, not a query.
+
+Two pieces, split so codegen stays minimal and the Node fallback (ADR 0036) is never at risk:
+
+- **Generic runtime — `Table<T>` in `data-sdk.ts`.** A single dual-runtime class exposing
+  `insert` / `get` / `all` / `find` / `findOne` / `update` / `delete` / `count`, building parameterised SQL
+  from a typed row object's own keys. It is schema-agnostic (`T` is a caller-supplied type), so it lives in
+  the hand-written SDK, not codegen. `DataSource.table<T>(name, pk?)` opens one; `pk` defaults to `id`.
+- **Generated bindings — `.nanobpm/domain.ts`.** The reifier (`emitDomainBindings`) additionally emits a
+  typed accessor next to `domain.d.ts`, written by the **same `domaintypes` op** that writes the `.d.ts`:
+  `openDomain()` → `Domain`, an object with one `Table<Row>` per table bound to its **real primary key**
+  (`db.orders.insert({...})`, `db.orders.get(id)`), plus `db.raw` as the raw-SQL escape hatch. It imports
+  only the sibling SDK (relative) and a **type-only** `domain.d.ts`, so it carries no runtime dependency and
+  erases at `deno compile`.
+
+The **degrade-to-Node invariant (ADR 0036) is load-bearing here.** The worker runtime runs Node-first
+(`node --experimental-strip-types --import node-register.mjs`), whose *strip-only* mode transforms nothing —
+so **TypeScript parameter properties** (`constructor(private readonly x)`) are rejected even though Deno
+accepts them. `Table` therefore uses plain field declarations + a JS-private `#src`, and the console test
+harness (`run_data_op` over the Node fallback) is the guard that keeps it that way. A stub `domain.ts` (raw
+accessor only) is seeded at scaffold so `@nanobpm/domain` resolves before the first reification, and is
+re-seeded — never clobbering the reified per-table file — on SDK re-materialisation.
+
+A worker is now SQL-free and typed end-to-end:
+
+```ts
+import { defineWorker } from "@nanobpm/worker";
+import { openDomain } from "@nanobpm/domain";
+
+defineWorker({
+  type: "save-order",
+  async handle(job) {
+    const { customerId, item, qty } = job.variables as { customerId: number; item: string; qty: number };
+    const db = await openDomain();
+    const orderId = await db.orders.insert({ customer_id: customerId, item, qty, status: "received" });
+    return { orderId: Number(orderId), qty };
+  },
+});
+```
+
 ## Consequences
 
 **Positive.**
@@ -264,3 +309,6 @@ panels edit. Types are erased at `deno compile`; the shipped App is still untype
    + **variable-path autocomplete** (§5); forms/variables/DMN reference types by name.
 3. **type-codegen** — emit the domain-record TypeScript from `generate-app-manifest.sh` (§6) and
    scaffold **typed worker signatures** against it.
+4. **data-objects** — the typed table gateway (§6.1): `Table<T>` in `data-sdk.ts` + a generated
+   `.nanobpm/domain.ts` (`openDomain()` → `db.<table>.insert/get/find/update/delete`), so workers
+   manipulate typed records instead of hand-writing SQL.
