@@ -44,6 +44,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -80,18 +81,91 @@ fn reclaim_idle_ms() -> u64 {
         .unwrap_or(2000)
 }
 
+/// Keys the forget worker forgets between its own `wal_checkpoint(TRUNCATE)`
+/// backstop passes (each key can delete up to two rows — a `spill` row and a
+/// `cold` row). With `wal_autocheckpoint=0` the WAL only truncates off the
+/// hot path; this bounds WAL growth under sustained retirement (when the idle
+/// reclaim thread never runs) without checkpointing so often that its fsync
+/// contends with live raft-log fsync. Tunable via NANOBPMN_VARSPILL_WAL_CKPT_KEYS.
+fn wal_checkpoint_keys() -> u64 {
+    std::env::var("NANOBPMN_VARSPILL_WAL_CKPT_KEYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(262_144)
+}
+
+/// Maximum number of pending forget batches the background worker will hold
+/// before [`VarSpillStore::forget_async`] falls back to a synchronous delete. Bounds
+/// the queue's memory so a sustained producer > consumer imbalance degrades
+/// predictably (backpressure onto the enqueuing follower actor) instead of growing
+/// without bound. Tunable via NANOBPMN_VARSPILL_FORGET_QUEUE.
+fn forget_queue_cap() -> usize {
+    std::env::var("NANOBPMN_VARSPILL_FORGET_QUEUE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(256)
+}
+
 /// Pages reclaimed per bounded background pass (~256 MiB at a 4 KiB page). Small
 /// enough that a pass holds the connection lock only briefly (so resuming load
 /// preempts a drain), large enough to clear even a 100 GB post-spike freelist within
 /// a couple of minutes of idle.
 const RECLAIM_CHUNK_PAGES: u32 = 65_536;
 
+/// Keys deleted per background-forget transaction. Small enough that the
+/// forget worker holds the connection lock only briefly per commit, so it
+/// interleaves with the engine actor's own spill/rehydrate access instead of
+/// stalling it with one huge multi-hundred-thousand-row transaction.
+const FORGET_CHUNK: usize = 4_096;
+
+/// Background thread that applies follower **retirement** `forget` deletes off the
+/// engine actor. The follower retirement backstop can reap up to 100k cold
+/// victims per tick; running that DELETE inline on the single-writer replica actor
+/// holds the actor in SQLite work every retirement tick and (before
+/// `wal_autocheckpoint` was disabled) tripped WAL checkpoints whose fsyncs
+/// contended with live raft-log fsync — stalling replication and roughly halving
+/// 50 KB-payload throughput. Offloading the deletes here keeps the actor free
+/// while still reclaiming the rows, and the worker checkpoints only on its own
+/// bounded, infrequent cadence (keys are unique and never reused, so a queued
+/// forget can never clobber a later re-spill).
+///
+/// Steady-state exporter-driven **eviction** ([`crate::journal::Journal::evict_instances`])
+/// deliberately stays synchronous ([`VarSpillStore::forget`]): it runs on the owner
+/// (not a hot replica), one instance at a time, where immediate deletion keeps the
+/// durable store consistent with the read model.
+struct ForgetWorker {
+    /// `None` after [`Drop`] has closed the channel. The queue is bounded
+    /// ([`forget_queue_cap`]); [`VarSpillStore::forget_async`] uses a non-blocking
+    /// `try_send` and falls back to a synchronous delete when it is full, so a
+    /// slow consumer applies backpressure instead of growing memory unbounded.
+    /// The worker drains and deletes in [`FORGET_CHUNK`]s.
+    tx: Option<SyncSender<ForgetMsg>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+/// Work item for the [`ForgetWorker`]: a batch of keys to delete, or a flush
+/// barrier that acks once every batch queued before it has been applied (used by
+/// tests and graceful shutdown to observe the async deletes deterministically).
+enum ForgetMsg {
+    Keys(Vec<Key>),
+    Flush(Sender<()>),
+}
+
+impl Drop for ForgetWorker {
+    fn drop(&mut self) {
+        // Closing the channel lets the worker drain any queued batches (so no
+        // forget is lost on shutdown) and then exit its `recv` loop; join it.
+        drop(self.tx.take());
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 /// Background thread that drains the SQLite freelist while the store is quiescent.
 struct ReclaimWorker {
-    /// Bumped by every mutation ([`put`](VarSpillStore::put) /
-    /// [`take`](VarSpillStore::take) / `forget` / cold variants); the worker treats
-    /// a stable count as "idle".
-    activity: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -108,8 +182,20 @@ impl Drop for ReclaimWorker {
 /// A SQLite-backed key → variables map for spilled instance payloads.
 pub struct VarSpillStore {
     conn: Arc<Mutex<Connection>>,
+    /// Mutation counter shared by [`put`](Self::put) / [`take`](Self::take) /
+    /// `forget` / the background forget worker; the reclaim thread treats a stable
+    /// count as "idle" and holds off its fsync-heavy vacuum while the store churns.
+    activity: Arc<AtomicU64>,
     /// Present iff reclaim is enabled (file-backed store with a non-zero gate).
+    /// Held only to keep the background reclaim thread alive; its [`Drop`] stops
+    /// and joins the thread.
+    #[allow(dead_code)]
     reclaim: Option<ReclaimWorker>,
+    /// Present iff file-backed: applies follower *retirement* forgets off the actor
+    /// (exporter-driven *eviction* stays on the synchronous `forget` path). Absent
+    /// for in-memory stores (tests), where `forget_async` runs inline so assertions
+    /// observe the delete synchronously.
+    forget: Option<ForgetWorker>,
 }
 
 impl VarSpillStore {
@@ -140,8 +226,19 @@ impl VarSpillStore {
             None => Connection::open_in_memory()?,
         };
         conn.execute_batch(
+            // wal_autocheckpoint=0 disables SQLite's implicit 1000-page checkpoint.
+            // Under sustained retirement the forget worker deletes at a high rate;
+            // an auto-checkpoint fires an fsync-heavy `wal_checkpoint` on that
+            // thread, and because the spill file shares the physical disk with the
+            // raft log, that checkpoint I/O inflates live raft-log fsync latency
+            // ~7x (measured), halving create throughput. With auto-checkpoint off,
+            // deletes are cheap WAL appends (synchronous=NORMAL never fsyncs a
+            // commit); the WAL is truncated off the hot path — by the idle-gated
+            // reclaim thread, and by the forget worker's own size-gated backstop
+            // (see spawn_forget_worker) so it can never grow without bound.
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
+             PRAGMA wal_autocheckpoint=0;
              CREATE TABLE IF NOT EXISTS spill (key INTEGER PRIMARY KEY, vars TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS cold (key INTEGER PRIMARY KEY, snapshot TEXT NOT NULL);
              DELETE FROM spill;
@@ -152,19 +249,38 @@ impl VarSpillStore {
         // handed back to the OS instead of plateauing at the high-water mark.
         enable_incremental_auto_vacuum(&conn)?;
         let conn = Arc::new(Mutex::new(conn));
+        let activity = Arc::new(AtomicU64::new(0));
 
         // Spawn the background reclaim thread only when it can do useful work: an
         // in-memory store has no file to shrink, and a zero gate disables reclaim.
         let reclaim = if path.is_some() && reclaim_threshold_bytes > 0 {
             Some(Self::spawn_reclaim_worker(
                 Arc::clone(&conn),
+                Arc::clone(&activity),
                 reclaim_threshold_bytes,
                 idle_ms,
             ))
         } else {
             None
         };
-        Ok(Self { conn, reclaim })
+        // Offload follower retirement forgets off the actor for file-backed stores
+        // (eviction stays synchronous on `forget`). In-memory stores forget inline
+        // (see `forget_async`) so tests stay deterministic and there is no
+        // cross-actor contention to relieve.
+        let forget = if path.is_some() {
+            Some(Self::spawn_forget_worker(
+                Arc::clone(&conn),
+                Arc::clone(&activity),
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            conn,
+            activity,
+            reclaim,
+            forget,
+        })
     }
 
     /// Starts the idle-gated background freelist drainer. It polls activity; once the
@@ -173,10 +289,10 @@ impl VarSpillStore {
     /// activity between passes so live load preempts the drain.
     fn spawn_reclaim_worker(
         conn: Arc<Mutex<Connection>>,
+        activity: Arc<AtomicU64>,
         threshold_bytes: u64,
         idle_ms: u64,
     ) -> ReclaimWorker {
-        let activity = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let poll = Duration::from_millis((idle_ms / 2).clamp(100, 1000));
         let idle_ticks = (idle_ms as f64 / poll.as_millis() as f64).ceil().max(1.0) as u32;
@@ -213,18 +329,115 @@ impl VarSpillStore {
                 .expect("spawn varspill-reclaim thread")
         };
         ReclaimWorker {
-            activity,
             stop,
             handle: Some(handle),
         }
     }
 
     /// Records a mutation so the background reclaimer holds off while the store is
-    /// active. Cheap (a relaxed increment); a no-op when reclaim is disabled.
+    /// active. Cheap (a relaxed increment).
     #[inline]
     fn note_activity(&self) {
-        if let Some(w) = &self.reclaim {
-            w.activity.fetch_add(1, Ordering::Relaxed);
+        self.activity.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Starts the background forget worker: receives batches of keys and deletes
+    /// their spill/cold rows off the engine actor, in [`FORGET_CHUNK`]-sized
+    /// transactions so each commit holds the connection lock only briefly.
+    fn spawn_forget_worker(conn: Arc<Mutex<Connection>>, activity: Arc<AtomicU64>) -> ForgetWorker {
+        let (tx, rx) = sync_channel::<ForgetMsg>(forget_queue_cap());
+        let handle = std::thread::Builder::new()
+            .name("varspill-forget".into())
+            .spawn(move || {
+                // With wal_autocheckpoint disabled, the WAL only truncates off the
+                // hot path. The idle-gated reclaim thread handles the post-load
+                // drain, but under *sustained* retirement (never idle) the WAL would
+                // grow unbounded, so the worker itself truncates once it has forgotten
+                // WAL_CKPT_KEYS keys since the last checkpoint. That bound is large
+                // and the checkpoint infrequent, so its fsync barely perturbs raft
+                // fsync (unlike the per-1000-page auto-checkpoint it replaces), while
+                // still capping WAL disk growth and keeping cold reads fast.
+                let ckpt_keys = wal_checkpoint_keys();
+                let mut since_ckpt: u64 = 0;
+                // Exits when the channel closes (every sender dropped), after
+                // draining any batches still queued — so no forget is lost.
+                while let Ok(msg) = rx.recv() {
+                    match msg {
+                        ForgetMsg::Keys(keys) => {
+                            let n = keys.len() as u64;
+                            // delete_keys bumps `activity` per chunk, so even a long
+                            // multi-chunk batch keeps the store non-idle for its whole
+                            // duration and the reclaim worker won't start a pass while
+                            // deletes are in-flight.
+                            Self::delete_keys(&conn, &activity, &keys);
+                            since_ckpt = since_ckpt.saturating_add(n);
+                            if since_ckpt >= ckpt_keys {
+                                since_ckpt = 0;
+                                // A WAL-truncate checkpoint can itself be a long,
+                                // fsync-heavy operation; bump activity so the reclaim
+                                // worker won't classify the store as idle and start a
+                                // vacuum pass during/around this maintenance I/O.
+                                activity.fetch_add(1, Ordering::Relaxed);
+                                // Surface a poisoned lock or checkpoint failure
+                                // loudly (matching `delete_keys`): silently
+                                // swallowing them here would let the WAL grow
+                                // without bound under sustained retirement — the
+                                // very failure this backstop exists to prevent.
+                                let guard = conn.lock().expect("spill store poisoned");
+                                guard
+                                    .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+                                    .expect("spill store: wal_checkpoint(TRUNCATE)");
+                            }
+                        }
+                        ForgetMsg::Flush(ack) => {
+                            let _ = ack.send(());
+                        }
+                    }
+                }
+            })
+            .expect("spawn varspill-forget thread");
+        ForgetWorker {
+            tx: Some(tx),
+            handle: Some(handle),
+        }
+    }
+
+    /// Deletes the spill and cold rows for `keys`, chunked into short transactions
+    /// so a large batch never holds the connection lock for long (blocking the
+    /// engine actor's own spill/rehydrate access). Bumps `activity` once per chunk
+    /// so the reclaim worker sees the store as busy for the entire (potentially
+    /// long) sweep, not just at its start.
+    fn delete_keys(conn: &Mutex<Connection>, activity: &AtomicU64, keys: &[Key]) {
+        for chunk in keys.chunks(FORGET_CHUNK) {
+            activity.fetch_add(1, Ordering::Relaxed);
+            // A poisoned lock means another thread panicked mid-mutation, leaving the
+            // connection in an unknown state; treat it as fatal (matching `put`/`take`)
+            // rather than silently skipping deletes and leaking orphan cold rows.
+            let mut guard = conn.lock().expect("spill store poisoned");
+            // Surface any SQLite failure loudly, for the same reason the poisoned
+            // lock is fatal above: silently swallowing a transaction/prepare/execute/
+            // commit error would drop deletes mid-batch and reintroduce the orphan
+            // cold rows (and unbounded file growth) this path exists to prevent.
+            let tx = guard
+                .transaction()
+                .expect("spill store: begin forget transaction");
+            {
+                let mut del_spill = tx
+                    .prepare_cached("DELETE FROM spill WHERE key = ?1")
+                    .expect("spill store: prepare spill delete");
+                let mut del_cold = tx
+                    .prepare_cached("DELETE FROM cold WHERE key = ?1")
+                    .expect("spill store: prepare cold delete");
+                for &key in chunk {
+                    del_spill
+                        .execute(params![key as i64])
+                        .expect("spill store: delete spill row");
+                    del_cold
+                        .execute(params![key as i64])
+                        .expect("spill store: delete cold row");
+                }
+            }
+            tx.commit().expect("spill store: commit forget transaction");
         }
     }
 
@@ -313,28 +526,72 @@ impl VarSpillStore {
         if keys.is_empty() {
             return;
         }
-        let mut conn = self.conn.lock().expect("spill store poisoned");
-        let tx = match conn.transaction() {
-            Ok(tx) => tx,
-            Err(_) => return,
-        };
-        {
-            let mut del_spill = match tx.prepare_cached("DELETE FROM spill WHERE key = ?1") {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let mut del_cold = match tx.prepare_cached("DELETE FROM cold WHERE key = ?1") {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            for &key in keys {
-                let _ = del_spill.execute(params![key as i64]);
-                let _ = del_cold.execute(params![key as i64]);
-            }
+        // delete_keys bumps activity per chunk, so no separate note_activity is needed.
+        Self::delete_keys(&self.conn, &self.activity, keys);
+    }
+
+    /// Like [`forget`](Self::forget), but hands the deletes to the background
+    /// [`ForgetWorker`] instead of running them on the caller's thread. Used by the
+    /// follower retirement paths ([`crate::journal::Journal::retire_below`] /
+    /// `retire_instances`), which run on the single-writer replica actor and would
+    /// otherwise stall live raft replication with a large synchronous DELETE
+    /// transaction every retirement tick. Falls back to a synchronous
+    /// [`forget`](Self::forget) for in-memory stores (no worker) so tests observe
+    /// the delete immediately; keys are unique and never reused, so a queued forget
+    /// can never clobber a later re-spill of the same key.
+    pub fn forget_async(&self, keys: &[Key]) {
+        if keys.is_empty() {
+            return;
         }
-        let _ = tx.commit();
-        drop(conn);
-        self.note_activity();
+        self.forget_async_owned(keys.to_vec());
+    }
+
+    /// Owned variant of [`forget_async`](Self::forget_async) that moves the batch
+    /// into the worker queue without cloning. Callers that already own a `Vec<Key>`
+    /// (notably [`crate::journal::Journal::retire_below`]'s reaped set, up to 100k
+    /// keys per tick) should use this so the single-writer replica actor doesn't pay
+    /// a large copy just to hand the deletes off.
+    pub fn forget_async_owned(&self, keys: Vec<Key>) {
+        if keys.is_empty() {
+            return;
+        }
+        // Non-blocking handoff. If the bounded queue is full (slow consumer) or the
+        // worker has gone away, recover the batch and delete synchronously so a
+        // producer > consumer imbalance applies backpressure here instead of growing
+        // the queue's memory without bound.
+        match self.forget.as_ref().and_then(|w| w.tx.as_ref()) {
+            Some(tx) => {
+                // Only `Keys` is ever sent on this path, so a Full/Disconnected error
+                // always hands the same batch back for the synchronous fallback.
+                if let Err(TrySendError::Full(ForgetMsg::Keys(k)))
+                | Err(TrySendError::Disconnected(ForgetMsg::Keys(k))) =
+                    tx.try_send(ForgetMsg::Keys(keys))
+                {
+                    self.forget(&k);
+                }
+            }
+            None => self.forget(&keys),
+        }
+    }
+
+    /// Blocks until every batch queued on the background forget worker before this
+    /// call has been applied. A no-op for in-memory stores (forgets run inline).
+    /// Used by tests and graceful shutdown to make the async deletes observable.
+    pub fn flush_forgets(&self) {
+        let Some(tx) = self.forget.as_ref().and_then(|w| w.tx.as_ref()) else {
+            return;
+        };
+        let (ack_tx, ack_rx) = channel();
+        // A live store keeps its worker running until `ForgetWorker::drop` closes
+        // the channel, so a failed send or ack-recv here means the worker has
+        // panicked/exited. Surface that loudly rather than returning a false
+        // "flushed" signal to tests / graceful shutdown (which would mask lost or
+        // still-pending deletes — the orphan-row leak this path guards against).
+        tx.send(ForgetMsg::Flush(ack_tx))
+            .expect("varspill forget worker gone before flush");
+        ack_rx
+            .recv()
+            .expect("varspill forget worker dropped flush ack");
     }
 
     /// The store's on-disk size as `(file_bytes, live_bytes)` (see
@@ -487,5 +744,83 @@ mod tests {
 
         drop(store);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_backed_store_disables_wal_autocheckpoint() {
+        // Regression for the #287 50KB throughput regression: the forget worker's
+        // cold-row DELETEs must never trigger SQLite's implicit 1000-page
+        // wal_checkpoint, whose fsync (on the shared disk) inflates live raft-log
+        // fsync ~7x. The store pins wal_autocheckpoint=0 so the WAL only truncates
+        // off the hot path (idle reclaim + the size-gated forget-worker backstop).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("varspill-noautockpt-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let store = VarSpillStore::open_with_params(Some(&path), 1, 100).unwrap();
+        let autockpt: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            autockpt, 0,
+            "auto-checkpoint must be disabled on the hot path"
+        );
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forget_async_deletes_rows_off_thread_and_flush_makes_them_observable() {
+        // A file-backed store spawns the background forget worker; `forget_async`
+        // hands the deletes to it, and `flush_forgets` blocks until they land.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("varspill-forget-{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+
+        let store = VarSpillStore::open_with_params(Some(&path), 0, 2000).unwrap();
+        store.put(1, &vars("a")).unwrap();
+        store.put(2, &vars("b")).unwrap();
+        store.put(3, &vars("c")).unwrap();
+
+        // Enqueue the forget; the actual DELETEs run on the worker thread.
+        store.forget_async(&[1, 2]);
+        // A flush barrier acks only after every batch queued before it is applied.
+        store.flush_forgets();
+
+        assert!(
+            store.take(1).is_none(),
+            "async-forgotten row gone after flush"
+        );
+        assert!(
+            store.take(2).is_none(),
+            "async-forgotten row gone after flush"
+        );
+        assert!(store.take(3).is_some(), "untouched row survives");
+
+        // Empty slice is a cheap no-op (no message queued).
+        store.forget_async(&[]);
+        store.flush_forgets();
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn forget_async_falls_back_to_sync_for_in_memory_stores() {
+        // In-memory stores have no worker; `forget_async` must delete inline so
+        // callers/tests observe the effect immediately, with no flush needed.
+        let store = VarSpillStore::open(None).unwrap();
+        store.put(5, &vars("x")).unwrap();
+        store.forget_async(&[5]);
+        assert!(
+            store.take(5).is_none(),
+            "in-memory forget_async is synchronous"
+        );
+        // flush is a no-op when there is no worker.
+        store.flush_forgets();
     }
 }
