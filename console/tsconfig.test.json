@@ -1,0 +1,11 @@
+{
+  // Node-runtime unit tests (node:test / node:assert) — typechecked apart from
+  // the browser app so they get @types/node globals without leaking node types
+  // into the DOM app build. Run via `tsc -p tsconfig.test.json --noEmit`.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "include": ["src/**/*.test.ts"],
+  "exclude": []
+}

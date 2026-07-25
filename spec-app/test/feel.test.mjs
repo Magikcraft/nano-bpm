@@ -2,7 +2,7 @@
 // and `resolveBodyPath` type-walking. `node --test`.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope, processScope, outputTypeForTaskType, componentOutputScope, dataQueryCalls, DATA_QUERY } from "../src/feel.ts";
+import { bodyPaths, resolveBodyPath, isDeclaredType, scopeVarsForType, decisionScope, processScope, outputTypeForTaskType, componentOutputScope, formTypeId, dataQueryCalls, DATA_QUERY } from "../src/feel.ts";
 
 const manifest = {
   types: {
@@ -164,6 +164,22 @@ test("componentOutputScope types each output-mapped variable by its worker (ADR 
   assert.deepEqual(scope[0].entries.map((e) => e.name).sort(), ["meta", "readings", "room", "sensor", "temp"]);
   // no outputs, or all untyped → empty scope
   assert.deepEqual(componentOutputScope(m, []), []);
+});
+
+test("formTypeId resolves the declared type bound to a form, else undefined (ADR 0033 §6)", () => {
+  const m = {
+    types: manifest.types,
+    bindings: [
+      { form: "order-form", type: "reading" },
+      { decision: "order-form", type: "sensor" }, // same id, different discriminator → ignored
+      { form: "ghost-form", type: "ghost" }, // undeclared type → undefined
+    ],
+  };
+  assert.equal(formTypeId(m, "order-form"), "reading");
+  assert.equal(formTypeId(m, "ghost-form"), undefined);
+  assert.equal(formTypeId(m, "no-such-form"), undefined);
+  assert.equal(formTypeId(m, undefined), undefined);
+  assert.equal(formTypeId({ types: manifest.types }, "order-form"), undefined); // no bindings
 });
 
 // --- data.query builtin (ADR 0024 §5) --------------------------------------

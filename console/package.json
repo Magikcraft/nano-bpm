@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "vite",
     "gen:api": "openapi-ts",
+    "typecheck": "npm run gen:api && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
+    "test": "node --experimental-strip-types --test",
     "build:assets": "npm run gen:api && node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && node scripts/build-whitepaper.mjs && tsc",
     "build": "npm run build:assets && vite build && node scripts/precompress.mjs dist",
     "build:observe": "npm run build:assets && VITE_CONSOLE_PROFILE=observe vite build --outDir dist-observe --emptyOutDir && node scripts/precompress.mjs dist-observe",
@@ -36,6 +38,7 @@
     "@hey-api/openapi-ts": "^0.99.0",
     "@tailwindcss/vite": "^4.0.0",
     "@types/markdown-it": "^14.1.2",
+    "@types/node": "^24.13.3",
     "@types/react": "^18.3.11",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.3",

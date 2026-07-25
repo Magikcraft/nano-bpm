@@ -321,12 +321,14 @@ palette ships with its envelope baked in (the Delphi win: drag a typed component
 payload shape is a property of the message, shared by every event that references it — exactly the
 `bpmn:message` + `messageRef` split BPMN already uses for the message *name*.
 
-**User-task ↔ `bindings[].form` reconciliation (increment 10, partial).** Urban already types a form via
+**User-task ↔ `bindings[].form` reconciliation (increment 10).** Urban already types a form via
 `bindings[].form` (a manifest, model-id-keyed binding). Rather than introduce a competing per-task ref, the
-user-task envelope is the *in-model, per-task* expression of the same type. This PR lands the carrier and
-panel on user tasks (the maker can pick an envelope, and it travels in the model); the *auto-default* — a
-user task's envelope defaulting to and staying consistent with its bound form's type — is a follow-up, so
-no second source of truth is created once it lands.
+user-task envelope is the *in-model, per-task* expression of the same type: when a user task references a
+linked form (`zeebe:formDefinition:formId`) that carries a `bindings[].form` type, its envelope **defaults
+to that type** (resolved live by `formTypeId(manifest, formId)` in the schema package, ADR 0029 §5), shown
+in the panel as *Inherit from form (T)*. The maker may set an explicit envelope on the task to override it;
+absent an override, the envelope tracks the form binding. So no second source of truth is created — the form
+binding stays authoritative, and the task-level envelope is either inherited or an explicit in-model upgrade.
 
 ### Consequences
 
@@ -344,8 +346,9 @@ no second source of truth is created once it lands.
 
 - **9 — service-task envelope** *(this PR)*: reserved-property carrier + in-band editing + the *Data
   envelope* panel group on service-ish tasks + the `workers[]` projection so `defineWorker` stays typed.
-- **10 — user-task envelope** *(this PR: carrier + panel)*: the same group on `bpmn:UserTask`. The
-  auto-default from `bindings[].form` (envelope = the bound form's type) is a follow-up.
+- **10 — user-task envelope** *(this PR)*: the same group on `bpmn:UserTask`, defaulting to the type bound
+  to the task's linked form in `bindings[].form` (`formTypeId`) — inherited unless the maker sets an
+  explicit in-model override.
 - **11 — message envelope** *(this PR)*: the group on message events / receive tasks, writing the envelope
   on the shared `bpmn:Message` through `messageRef` — typed correlation payloads.
 - **12 — server-side derivation** *(follow-up)*: the console derives `workers[]` I/O from the process
