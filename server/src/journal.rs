@@ -1638,7 +1638,11 @@ impl Journal {
         if !reaped.is_empty()
             && let Some(store) = self.spill_store()
         {
-            store.forget_async(&reaped);
+            // Move the reaped set into the worker queue rather than cloning it —
+            // this runs on the single-writer replica actor and the set can be large.
+            let n = reaped.len();
+            store.forget_async_owned(reaped);
+            return n;
         }
         reaped.len()
     }

@@ -44,7 +44,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
+use std::sync::mpsc::{Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -119,13 +119,18 @@ const RECLAIM_CHUNK_PAGES: u32 = 65_536;
 /// stalling it with one huge multi-hundred-thousand-row transaction.
 const FORGET_CHUNK: usize = 4_096;
 
-/// Background thread that applies retirement/eviction `forget` deletes off the
+/// Background thread that applies follower **retirement** `forget` deletes off the
 /// engine actor. The follower retirement backstop can reap up to 100k cold
 /// victims per tick; deleting them inline on the single-writer replica actor
 /// (a synchronous SQLite transaction that fsyncs) stalls live raft replication
 /// and roughly halves 50 KB-payload throughput. Offloading the deletes here
 /// keeps the actor free while still reclaiming the rows (keys are unique and
 /// never reused, so a queued forget can never clobber a later re-spill).
+///
+/// Steady-state exporter-driven **eviction** ([`crate::journal::Journal::evict_instances`])
+/// deliberately stays synchronous ([`SpillStore::forget`]): it runs on the owner
+/// (not a hot replica), one instance at a time, where immediate deletion keeps the
+/// durable store consistent with the read model.
 struct ForgetWorker {
     /// `None` after [`Drop`] has closed the channel. The queue is bounded
     /// ([`forget_queue_cap`]); [`SpillStore::forget_async`] uses a non-blocking
@@ -362,6 +367,11 @@ impl VarSpillStore {
                             since_ckpt = since_ckpt.saturating_add(n);
                             if since_ckpt >= ckpt_keys {
                                 since_ckpt = 0;
+                                // A WAL-truncate checkpoint can itself be a long,
+                                // fsync-heavy operation; bump activity so the reclaim
+                                // worker won't classify the store as idle and start a
+                                // vacuum pass during/around this maintenance I/O.
+                                activity.fetch_add(1, Ordering::Relaxed);
                                 if let Ok(guard) = conn.lock() {
                                     let _ = guard.query_row(
                                         "PRAGMA wal_checkpoint(TRUNCATE)",
@@ -519,13 +529,34 @@ impl VarSpillStore {
         if keys.is_empty() {
             return;
         }
+        self.forget_async_owned(keys.to_vec());
+    }
+
+    /// Owned variant of [`forget_async`](Self::forget_async) that moves the batch
+    /// into the worker queue without cloning. Callers that already own a `Vec<Key>`
+    /// (notably [`crate::journal::Journal::retire_below`]'s reaped set, up to 100k
+    /// keys per tick) should use this so the single-writer replica actor doesn't pay
+    /// a large copy just to hand the deletes off.
+    pub fn forget_async_owned(&self, keys: Vec<Key>) {
+        if keys.is_empty() {
+            return;
+        }
+        // Non-blocking handoff. If the bounded queue is full (slow consumer) or the
+        // worker has gone away, recover the batch and delete synchronously so a
+        // producer > consumer imbalance applies backpressure here instead of growing
+        // the queue's memory without bound.
         match self.forget.as_ref().and_then(|w| w.tx.as_ref()) {
-            // Non-blocking handoff. If the bounded queue is full (slow consumer) or
-            // the worker has gone away, fall back to a synchronous delete so a
-            // producer > consumer imbalance applies backpressure here instead of
-            // growing the queue's memory without bound.
-            Some(tx) if tx.try_send(ForgetMsg::Keys(keys.to_vec())).is_ok() => {}
-            _ => self.forget(keys),
+            Some(tx) => {
+                // Only `Keys` is ever sent on this path, so a Full/Disconnected error
+                // always hands the same batch back for the synchronous fallback.
+                if let Err(TrySendError::Full(ForgetMsg::Keys(k)))
+                | Err(TrySendError::Disconnected(ForgetMsg::Keys(k))) =
+                    tx.try_send(ForgetMsg::Keys(keys))
+                {
+                    self.forget(&k);
+                }
+            }
+            None => self.forget(&keys),
         }
     }
 
