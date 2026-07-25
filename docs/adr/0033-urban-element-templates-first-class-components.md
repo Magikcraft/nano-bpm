@@ -270,18 +270,27 @@ pickers) becomes an in-band modeling edit:
   seam), and selects it on the element in one gesture. Registry stays single-source; the modeler just
   gains a create-or-pick entry point, exactly like "Create new message".
 
-### Reifier: the model becomes the source of truth for worker I/O
+### Reifier: the model is authoritative; the manifest `workers[]` becomes a maintained projection
 
-`worker-io.d.ts` still keys `defineWorker` typing by `taskType` (one handler per task type). Its input
-changes from *reading the manifest list* to *deriving from the model*: a new pass reads the App's process
-models, groups service tasks by `zeebe:taskDefinition:type`, and collects each group's `in`/`out`
-envelope refs into the existing `WorkerBindingDecl[]` the emitter already consumes (`emitWorkerBindings`).
-The `WorkerBindingDecl` shape is unchanged; only its provenance moves. Because a task type has exactly one
-worker, all elements sharing a task type must agree on their `in` (and `out`) envelope; a disagreement is a
-fail-closed **`envelope-conflict`** validation (mirroring the existing `unknown-type` / `unknown-process`
-diagnostics). `workers[].inputType/outputType` is **retired as an authored field**; a one-time
-load-time projection migrates any existing manifest bindings onto their model elements (best-effort,
-matched by task type).
+`worker-io.d.ts` keys `defineWorker` typing by `taskType` (one handler per task type), and the reifier
+that emits it runs **inside the materialised, strip-only SDK** (`nano-generated/`, ADR 0036) — a runtime
+that deliberately carries no XML/BPMN parser. So the reifier does *not* read the `.bpmn`. Instead:
+
+- The **model is the authoritative, hand-edited source**: the maker sets a task's envelope in the modeler,
+  writing the `zeebe:property` on the element (above). This is what travels and what a human edits.
+- The **manifest `workers[].inputType/outputType` becomes a modeler-maintained projection**, not an
+  authored field. On each envelope edit the panel projects the service task's `in`/`out` onto its
+  `workers[]` entry (keyed by `taskType`), so the untouched reifier keeps typing `defineWorker`. Because a
+  task type has exactly one worker, all elements sharing a task type resolve to one entry; a
+  same-`taskType` disagreement is surfaced as an **`envelope-conflict`** warning (last-write-wins in the
+  projection for now).
+
+This keeps the model the single source of truth for *authoring* while avoiding an XML parser in the
+strip-only SDK. **Follow-up (increment 12):** a *server-side* model→manifest projection — the console
+(Rust, which already links `engine-core`'s `parse_bpmn`) derives the `workers[]` I/O from the process
+models on regen/deploy and drops the modeler-maintained cache entirely, so the manifest field can be fully
+retired. The `WorkerBindingDecl` shape and `emitWorkerBindings` are unchanged throughout; only the
+*provenance* of the entries moves (authored → modeler-projected → server-derived).
 
 ### Surface rename — label only, explicitly scoped
 
@@ -293,15 +302,54 @@ and a concept-level rename would be a churny, cross-cutting change for zero beha
 ever earns first-class status in the model (the `urban:DataEnvelope` alternative above), that is its own
 future ADR.
 
+### Which elements carry an envelope — and what consumes it
+
+The envelope is a general *typed data boundary*, but each element type has its own boundary semantics and
+its own downstream consumer. The carrier (reserved `zeebe:property`) and the panel affordance are uniform;
+the consumer differs:
+
+| Element | `in` envelope | `out` envelope | Carrier home | Consumer |
+|---|---|---|---|---|
+| **Service-ish task** (`ServiceTask`/`BusinessRuleTask`/`ScriptTask`/`SendTask` with `zeebe:taskDefinition:type`) | job `job.variables` | job result | the task element | `defineWorker` typing (via the `workers[]` projection) + FEEL I/O scope |
+| **User task** (`bpmn:UserTask`) | variables prefilling its form | variables its form submits | the task element | FEEL scope of the task's I/O; *unifies with* the existing `bindings[].form` (ADR 0029 §5) |
+| **Message** (message events / receive tasks, via `messageRef`) | payload the process publishes on a throw/send | payload correlated **into** the process on a catch/receive | the shared **`bpmn:Message`** (reached through `messageRef`, the literal messageRef parallel) | typed correlation variables; a typed `publishMessage` client is a later downstream |
+
+A blank element carries **no** envelope by default (absent = untyped, the existing `WorkerVars` fallback) —
+the property is added only when the maker picks one, *or* when a component/element-template stamped from the
+palette ships with its envelope baked in (the Delphi win: drag a typed component, it arrives typed). For
+**messages**, homing the envelope on the `bpmn:Message` (not each event) is deliberate and correct: the
+payload shape is a property of the message, shared by every event that references it — exactly the
+`bpmn:message` + `messageRef` split BPMN already uses for the message *name*.
+
+**User-task ↔ `bindings[].form` reconciliation (increment 10, partial).** Urban already types a form via
+`bindings[].form` (a manifest, model-id-keyed binding). Rather than introduce a competing per-task ref, the
+user-task envelope is the *in-model, per-task* expression of the same type. This PR lands the carrier and
+panel on user tasks (the maker can pick an envelope, and it travels in the model); the *auto-default* — a
+user task's envelope defaulting to and staying consistent with its bound form's type — is a follow-up, so
+no second source of truth is created once it lands.
+
 ### Consequences
 
 - **Positive** — the data contract travels in the model (reviewable, copyable, portable); per-element
   grain; edits are undoable/dirtying like every other model change; the create-or-pick UX matches the
-  message-definition muscle memory; the registry stays the single motion↔rest source.
-- **Negative / risk** — the reifier gains a BPMN-reading pass (it read only the manifest before); a
-  same-task-type envelope disagreement is now an error the maker must resolve (intended, but a new failure
-  mode); the reserved-key `zeebe:property` is a convention, not a schema-enforced element — a typo in the
-  key silently drops the ref (mitigated: the modeler only ever writes it through the picker).
+  message-definition muscle memory; the registry stays the single motion↔rest source; the affordance is
+  uniform across service tasks, user tasks, and messages.
+- **Negative / risk** — the service-task type flows through a modeler-maintained manifest projection until
+  the server-side derivation (increment 12) lands, so a project edited outside the modeler can drift (the
+  projection is a cache, not yet the source); a same-`taskType` envelope disagreement is a warning the maker
+  must resolve; the reserved-key `zeebe:property` is a convention, not a schema-enforced element — a typo in
+  the key silently drops the ref (mitigated: the modeler only ever writes it through the picker).
+
+### Increments (this and next)
+
+- **9 — service-task envelope** *(this PR)*: reserved-property carrier + in-band editing + the *Data
+  envelope* panel group on service-ish tasks + the `workers[]` projection so `defineWorker` stays typed.
+- **10 — user-task envelope** *(this PR: carrier + panel)*: the same group on `bpmn:UserTask`. The
+  auto-default from `bindings[].form` (envelope = the bound form's type) is a follow-up.
+- **11 — message envelope** *(this PR)*: the group on message events / receive tasks, writing the envelope
+  on the shared `bpmn:Message` through `messageRef` — typed correlation payloads.
+- **12 — server-side derivation** *(follow-up)*: the console derives `workers[]` I/O from the process
+  models (Rust `parse_bpmn`) on regen, retiring the modeler-maintained manifest projection.
 
 
 
