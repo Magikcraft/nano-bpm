@@ -154,6 +154,29 @@ fn recovery_coalesce_enabled() -> bool {
     )
 }
 
+/// Whether a `sync` store defers its *committed* marker to the background flusher
+/// instead of fsyncing `state.json` (an atomic write + dir-fsync) on every commit
+/// advance. `NANOBPMN_RAFT_DEFER_COMMITTED` — **default OFF** (byte-identical to the
+/// prior behaviour).
+///
+/// Unlike recovery coalescing, this does **not** relax log durability: appends are
+/// still fsynced inline before their openraft flush callback fires (the append path
+/// keys off [`Inner::async_durability`], which this flag does not affect), and the
+/// election vote and the safety-critical `last_purged` marker are still persisted
+/// synchronously. Only the committed marker — an *optional* openraft optimisation
+/// that is re-derived from the durable log + membership on restart — is amortised
+/// onto the async cadence. It removes one `state.json` fsync + one directory fsync
+/// per commit round, which on a fsync-latency-bound, contended disk is a large
+/// share of the total media barriers (the log-append fsync that gates client acks
+/// then completes faster because the disk queue is no longer saturated by the
+/// per-commit marker rewrites).
+fn defer_committed_marker_enabled() -> bool {
+    matches!(
+        std::env::var("NANOBPMN_RAFT_DEFER_COMMITTED"),
+        Ok(ref v) if v.trim() == "1" || v.trim().eq_ignore_ascii_case("true")
+    )
+}
+
 /// Async flush policy from env. `NANOBPMN_ASYNC_FLUSH_MS` (default 10, clamped to
 /// 1s) bounds the unfsynced time window; `NANOBPMN_ASYNC_FLUSH_BYTES` (default
 /// 8 MiB) bounds the unfsynced byte window. Shared with the journal.
@@ -510,6 +533,11 @@ struct Inner {
     /// default on). Fixed at open; also gates spawning the background flusher for
     /// a `sync` store so the relieved tail is bounded when the partition goes quiet.
     coalesce_capable: bool,
+    /// Whether a `sync` store defers its *committed* marker to the background
+    /// flusher instead of fsyncing `state.json` on every commit advance
+    /// (`NANOBPMN_RAFT_DEFER_COMMITTED`, default off). Fixed at open. Does not relax
+    /// log durability (appends still fsync inline) — see [`defer_committed_marker_enabled`].
+    defer_committed: bool,
 }
 
 impl Inner {
@@ -750,6 +778,26 @@ impl RaftLogStore {
         self.inner.lock().unwrap().coalesce_capable = on;
     }
 
+    /// Test-only: force the sync-mode committed-marker deferral on/off without
+    /// touching the process environment.
+    #[cfg(test)]
+    fn force_defer_committed(&self, on: bool) {
+        self.inner.lock().unwrap().defer_committed = on;
+    }
+
+    /// Test-only: whether the committed/purge markers are dirty in memory (awaiting
+    /// a background-flusher persist to `state.json`).
+    #[cfg(test)]
+    fn is_state_dirty(&self) -> bool {
+        self.inner.lock().unwrap().state_dirty
+    }
+
+    /// Test-only: run one background-flusher pass synchronously.
+    #[cfg(test)]
+    fn flush_now(&self) -> io::Result<()> {
+        self.inner.lock().unwrap().flush_async()
+    }
+
     /// Opens (creating if absent) a durable log store rooted at `dir`, replaying
     /// any existing `seg-*.ndjson` segments (or a legacy `log.ndjson`), `vote.json`
     /// and `state.json` to reconstruct the in-memory index, the persisted vote and
@@ -858,6 +906,7 @@ impl RaftLogStore {
                 state_dirty: false,
                 compress: raft_log_compress_from_env(),
                 coalesce_capable: recovery_coalesce_enabled(),
+                defer_committed: defer_committed_marker_enabled(),
             })),
             bytes: Arc::new(AtomicI64::new(log_bytes as i64)),
         };
@@ -876,7 +925,10 @@ impl RaftLogStore {
         // shutdown handshake needed. When neither applies it is not spawned, so
         // a pure `sync` store with coalescing disabled keeps its exact prior
         // thread model (no background flusher, every append fsynced inline).
-        if mode == DurabilityMode::Async || recovery_coalesce_enabled() {
+        if mode == DurabilityMode::Async
+            || recovery_coalesce_enabled()
+            || defer_committed_marker_enabled()
+        {
             store.spawn_flusher();
         }
 
@@ -1308,13 +1360,17 @@ impl RaftLogStorage<RaftConfig> for RaftLogStore {
     ) -> Result<(), StorageError<NodeId>> {
         let mut inner = self.inner.lock().unwrap();
         inner.committed = committed;
-        match inner.async_durability() {
-            // Sync: persist the committed marker durably (atomic write + fsync).
+        // Defer the committed marker to the background flusher when either the store
+        // is behaving as `async` (base async mode or the recovery fsync-relief
+        // window), or the sync-mode committed-marker deferral is enabled. The marker
+        // is an *optional* openraft optimisation (re-derived from the log +
+        // membership on restart), so deferring it never affects safety; it removes
+        // the per-commit `state.json` fsync + dir-fsync. The log-append fsync (which
+        // gates client acks) and the safety-critical purge marker are unaffected.
+        match inner.async_durability() || inner.defer_committed {
+            // Sync (no deferral): persist the committed marker durably now.
             false => Self::persist_state(&inner),
-            // Async (base mode, or the recovery fsync-relief window): the committed
-            // marker is an *optional* openraft optimisation (re-derived from the
-            // log + membership on restart), so defer it to the background flusher
-            // rather than fsyncing on every commit.
+            // Deferred: the background flusher persists it within the flush cadence.
             true => {
                 inner.state_dirty = true;
                 Ok(())
@@ -1857,6 +1913,62 @@ mod tests {
         assert!(
             !on_store.would_defer_fsync(),
             "relief clearing must restore inline fsync"
+        );
+
+        let _ = std::fs::remove_dir_all(&off_dir);
+        let _ = std::fs::remove_dir_all(&on_dir);
+    }
+
+    /// The sync-mode committed-marker deferral: OFF by default (every commit advance
+    /// rewrites `state.json` inline), and when enabled the marker is held in memory
+    /// (`state_dirty`) and only persisted by the background flusher — without
+    /// relaxing log-append durability. On restart the deferred marker is re-derived
+    /// from the log, so a not-yet-flushed committed advance is never a safety loss.
+    #[tokio::test]
+    async fn defer_committed_marker_defers_the_state_json_fsync_when_enabled() {
+        use openraft::storage::RaftLogStorage;
+
+        // --- Default posture: deferral off => save_committed persists inline. ---
+        let off_dir = tmp_dir("defer-committed-off");
+        let mut off_store = RaftLogStore::open(&off_dir).unwrap();
+        off_store.save_committed(Some(log_id(7))).await.unwrap();
+        assert!(
+            !off_store.is_state_dirty(),
+            "a default sync store must persist the committed marker inline (not dirty)"
+        );
+        let persisted: PersistedState = read_json(&state_path(&off_dir)).unwrap().unwrap();
+        assert_eq!(
+            persisted.committed,
+            Some(log_id(7)),
+            "inline persist must land the committed marker on disk immediately"
+        );
+
+        // --- Opt-in posture: deferral on => marker stays in memory until the
+        // background flusher persists it. ---
+        let on_dir = tmp_dir("defer-committed-on");
+        let mut on_store = RaftLogStore::open(&on_dir).unwrap();
+        on_store.force_defer_committed(true);
+        on_store.save_committed(Some(log_id(9))).await.unwrap();
+        assert!(
+            on_store.is_state_dirty(),
+            "a deferring sync store must hold the committed marker dirty, not fsync it inline"
+        );
+        let on_disk: Option<PersistedState> = read_json(&state_path(&on_dir)).unwrap();
+        assert!(
+            on_disk.map(|s| s.committed).unwrap_or(None).is_none(),
+            "the committed marker must NOT be on disk before the flusher runs"
+        );
+        // The background flusher persists it and clears the dirty flag.
+        on_store.flush_now().unwrap();
+        assert!(
+            !on_store.is_state_dirty(),
+            "flush must clear the dirty flag"
+        );
+        let flushed: PersistedState = read_json(&state_path(&on_dir)).unwrap().unwrap();
+        assert_eq!(
+            flushed.committed,
+            Some(log_id(9)),
+            "the flusher must persist the deferred committed marker"
         );
 
         let _ = std::fs::remove_dir_all(&off_dir);
