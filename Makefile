@@ -7,6 +7,11 @@
 #                      compile the gateway (server) and ProcessOS (debug).
 #   make all-release — same, but build optimized release binaries of the gateway
 #                      (nano) and ProcessOS.
+#   make release     — the optimized self-contained distribution (gateway with the
+#                      embedded web console + Swagger).
+#   make debug       — the same full self-contained stack as `make release`, but an
+#                      unoptimized debug build — far faster to compile, for a tight
+#                      local iteration loop.
 #
 # `make generate` produces the Rust REST layer + server stubs from spec/; the
 # output under generated/ and server/src/stub_impls.rs is git-ignored.
@@ -140,6 +145,16 @@ release: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_
 	touch $(PROJECT_ROOT)/server/src/console/mod.rs
 	cd $(PROJECT_ROOT)/server && cargo build --release --features console
 	@echo "Built self-contained distribution: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
+	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"
+
+.PHONY: debug
+debug: $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend ## Full self-contained stack (gateway + embedded console + Swagger) as an UNOPTIMIZED debug build — same as `release` but far faster to compile, for a tight local loop
+	@# Force the RustEmbed derive to re-run so the just-built console/dist is
+	@# embedded, even if the gateway sources are otherwise unchanged (mirrors
+	@# `release`; the embed is a compile-time bake regardless of profile).
+	touch $(PROJECT_ROOT)/server/src/console/mod.rs
+	cd $(PROJECT_ROOT)/server && cargo build --features console
+	@echo "Built self-contained debug distribution: $(PROJECT_ROOT)/server/target/debug/nanobpm-gateway-rest-server"
 	@echo "  landing /  ·  console /console  ·  API docs /swagger  ·  REST /v2"
 
 .PHONY: release-gateway
