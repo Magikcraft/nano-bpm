@@ -182,9 +182,126 @@ input scoping (§3), and the pack axis (§4) are the increments below.
    properties panel gains an **"Urban domain type"** group on service tasks — Input/Output domain-type
    dropdowns populated from the manifest `types` registry that write `workers[].inputType/outputType` back
    to `nano.app.json` — so the model informs the worker types from the modeler — PR (this). ✅
+   *(Superseded by increment 9: the reference moves off the per-taskType manifest list and onto the
+   element in the model, and the group is renamed **Data envelope**.)*
 8. **model-derived `type` constraint** — the reifier also emits a `WorkerTaskType` union of every declared
    worker `taskType`, and the typed `defineWorker<K extends WorkerTaskType>` constrains its `type:` to that
    union: the modeler's job types autocomplete and an undeclared/typo task type is a compile error (not a
    silent untyped fallback). An app with no declared workers gets `WorkerTaskType = string` so `defineWorker`
    stays usable pre-declaration — PR (this). ✅
+9. **the data envelope — typing carried by reference in the model** *(proposed)* — the task↔type binding
+   moves from a per-**taskType** entry beside the model (`workers[].inputType/outputType`, increment 7) to a
+   per-**element** reference *inside* the model, so the data contract of a task travels in the `.bpmn` — the
+   `messageRef` pattern applied to data. Details below (§6). PR (this).
+
+## §6 — The data envelope (increment 9, proposed)
+
+### The problem with increment 7's carrier
+
+Increment 7 let the modeler set a task's input/output domain type, but it homed the *reference* on the
+manifest — `workers[].inputType/outputType`, keyed by the task's `zeebe:taskDefinition:type` — and wrote
+it **out-of-band** (deliberately off the command stack, so the BPMN document stayed unchanged). Two
+consequences fall out of that choice:
+
+- **The typing does not travel with the model.** Copy a service task into another process, hand someone
+  the `.bpmn`, or diff a model in review — the data contract is invisible; it lives in a sibling
+  `nano.app.json` list. BPMN already solved exactly this shape for messages (`bpmn:message` +
+  `messageRef`) and errors (`bpmn:error` + `errorRef`): the *definition* is named once, the *reference*
+  rides on the element.
+- **The grain is wrong.** Keying on `taskType` means every element sharing a task type is forced to one
+  input type. That is right for the *worker* (one handler per task type) but wrong for the *element*,
+  whose FEEL input/output scoping is legitimately per-instance.
+
+### Decision
+
+Split the two facets the way BPMN does, and give each its natural home:
+
+| Facet | Home | Rationale |
+|---|---|---|
+| **type *definition*** (`fields`, `table`) | manifest `types` registry (unchanged, ADR 0029 §4) | one type projects onto face/motion/rest (ADR 0031); inlining it into one `.bpmn` would fragment the registry and break the motion↔rest bridge. Kept app-scoped. |
+| **type *reference*** (which envelope this element speaks) | the **element**, in `bpmn:extensionElements` | travels in the model; per-element grain; edited in-band (command stack, undoable, saved with the diagram). |
+
+We call the referenced type, at the boundary of a task, its **data envelope** — the typed payload a task
+receives (`in`) and the typed result it produces (`out`). "Envelope" names the *reference at the seam*;
+the underlying registry entry is still a domain type. This is a **surface (UI/label) rename only** — see
+below.
+
+### Carrier: a reserved `zeebe:property` on the element
+
+The reference is carried as two reserved `zeebe:property` entries in the element's `zeebe:extensionElements`:
+
+```xml
+<bpmn:serviceTask id="Task_fulfil" name="Fulfil order">
+  <bpmn:extensionElements>
+    <zeebe:taskDefinition type="fulfil-order" />
+    <zeebe:properties>
+      <zeebe:property name="io.nanobpm.dataEnvelope.in"  value="orderPlaced" />
+      <zeebe:property name="io.nanobpm.dataEnvelope.out" value="orderFulfilled" />
+    </zeebe:properties>
+  </bpmn:extensionElements>
+</bpmn:serviceTask>
+```
+
+`value` is a manifest `types` id (a nominal reference, matching every other Urban reference picker). We
+choose `zeebe:property` over a bespoke `urban:DataEnvelope` moddle element deliberately:
+
+- **Zero format invention** (the ADR's thesis): the `zeebe` moddle is already registered in
+  `BpmnModeler.tsx` (`moddleExtensions: { zeebe: ZeebeModdle }`) — no new namespace, no new descriptor.
+- **Round-trip-safe**: `zeebe:properties` is a first-class Zeebe extension, so a model stays
+  Camunda-portable; a foreign tool won't strip a reserved-key property the way it might strip an unknown
+  `urban:` namespace.
+- The nano engine ignores these keys at runtime — the envelope is *design-time typing metadata*, not
+  behaviour.
+
+*(Alternative considered: a dedicated `urban:DataEnvelope` extension element for a more first-class,
+messageRef-shaped ref. Deferred — it buys self-description at the cost of a new moddle descriptor and
+round-trip fragility, for no functional gain over a reserved property.)*
+
+### Editing in the model (message-definition parity)
+
+The Object Inspector group (renamed **Data envelope**, with **Input envelope** / **Output envelope**
+pickers) becomes an in-band modeling edit:
+
+- **Use existing** — a dropdown of the manifest `types` ids; picking one sets/clears the reserved
+  `zeebe:property` via a `modeling.updateModdleProperties` command (so it is **undoable** and marks the
+  diagram dirty — the reference is now model data, not an out-of-band manifest poke).
+- **＋ Create new envelope…** — the message-definition affordance: prompts for an id/name, writes a new
+  entry into the manifest `types` registry (`POST .../types`, the create half of the existing regen
+  seam), and selects it on the element in one gesture. Registry stays single-source; the modeler just
+  gains a create-or-pick entry point, exactly like "Create new message".
+
+### Reifier: the model becomes the source of truth for worker I/O
+
+`worker-io.d.ts` still keys `defineWorker` typing by `taskType` (one handler per task type). Its input
+changes from *reading the manifest list* to *deriving from the model*: a new pass reads the App's process
+models, groups service tasks by `zeebe:taskDefinition:type`, and collects each group's `in`/`out`
+envelope refs into the existing `WorkerBindingDecl[]` the emitter already consumes (`emitWorkerBindings`).
+The `WorkerBindingDecl` shape is unchanged; only its provenance moves. Because a task type has exactly one
+worker, all elements sharing a task type must agree on their `in` (and `out`) envelope; a disagreement is a
+fail-closed **`envelope-conflict`** validation (mirroring the existing `unknown-type` / `unknown-process`
+diagnostics). `workers[].inputType/outputType` is **retired as an authored field**; a one-time
+load-time projection migrates any existing manifest bindings onto their model elements (best-effort,
+matched by task type).
+
+### Surface rename — label only, explicitly scoped
+
+Only the **UI surface** renames to *Data envelope* / *Input envelope* / *Output envelope* (the panel group,
+its labels + descriptions, and doc copy). The underlying identifiers — the manifest `types` registry, the
+`domainType`/`DomainTypes` codegen, `WorkerInputs`/`WorkerOutputs`, and the schema `$defs` — are **not**
+renamed; they are wired through the schema, the reifier, ADRs 0029/0031/0033, and every generated project,
+and a concept-level rename would be a churny, cross-cutting change for zero behavioural gain. If "envelope"
+ever earns first-class status in the model (the `urban:DataEnvelope` alternative above), that is its own
+future ADR.
+
+### Consequences
+
+- **Positive** — the data contract travels in the model (reviewable, copyable, portable); per-element
+  grain; edits are undoable/dirtying like every other model change; the create-or-pick UX matches the
+  message-definition muscle memory; the registry stays the single motion↔rest source.
+- **Negative / risk** — the reifier gains a BPMN-reading pass (it read only the manifest before); a
+  same-task-type envelope disagreement is now an error the maker must resolve (intended, but a new failure
+  mode); the reserved-key `zeebe:property` is a convention, not a schema-enforced element — a typo in the
+  key silently drops the ref (mitigated: the modeler only ever writes it through the picker).
+
+
 
