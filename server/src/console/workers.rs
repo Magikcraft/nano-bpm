@@ -2,7 +2,7 @@
 //!
 //! Runs each enabled worker as a sandboxed **Deno** subprocess (one process per
 //! worker), independent of any browser. The worker code (`workers/<name>/worker.ts`)
-//! imports the embedded SDK (`.nanobpm/worker-sdk.ts`), which speaks the
+//! imports the embedded SDK (`nano-generated/worker-sdk.ts`), which speaks the
 //! falcon protocol and prints structured metric/status lines that this
 //! supervisor parses. Everything here is feature-gated behind `console`; the
 //! base gateway build never spawns Deno and does not require it on PATH.
@@ -186,7 +186,7 @@ pub(crate) fn gateway_port() -> u16 {
     supervisor().gateway_port.load(Ordering::Relaxed)
 }
 
-/// Writes the embedded worker SDK to `<workspace>/.nanobpm/worker-sdk.ts`,
+/// Writes the embedded worker SDK to `<workspace>/nano-generated/worker-sdk.ts`,
 /// overwriting any prior copy so it tracks the running binary.
 fn ensure_sdk_written() -> std::io::Result<()> {
     let dir = workspace::sdk_dir();

@@ -503,7 +503,7 @@ function TablesTab({ name, source }: { name: string; source: string }) {
     try {
       const r = await regenerateDomainTypes({ path: { name, source }, throwOnError: true });
       const n = r.data.tables;
-      // The reify rewrote `.nanobpm/*` — drop the editor's cached SDK typings so
+      // The reify rewrote `nano-generated/*` — drop the editor's cached SDK typings so
       // the next code file opened picks up the regenerated `job.variables`/domain
       // types without a reload.
       const { invalidateProjectSdkLibs } = await import("./CodeEditor");
@@ -545,7 +545,7 @@ function TablesTab({ name, source }: { name: string; source: string }) {
               onClick={() => void regenTypes()}
               disabled={regenBusy}
               className="rounded px-1.5 py-0.5 text-xs font-medium text-fg-muted hover:bg-hover disabled:opacity-40"
-              title="Regenerate the TypeScript domain types (.nanobpm/domain-rows.d.ts) from every datasource"
+              title="Regenerate the TypeScript domain types (nano-generated/domain-rows.d.ts) from every datasource"
             >
               {regenBusy ? "…" : "⟳ Types"}
             </button>

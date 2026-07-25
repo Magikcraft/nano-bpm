@@ -1,6 +1,6 @@
 // Urban LLM-as-job-worker runtime (ADR 0022 §E role 1).
 //
-// This file is materialised verbatim into <workspace>/.nanobpm/llm-worker.ts by
+// This file is materialised verbatim into <workspace>/nano-generated/llm-worker.ts by
 // the console supervisor (like worker-sdk.ts / data-sdk.ts) and started from the
 // App entrypoint via `startLlmWorkers()`. It is the *batteries-included*,
 // offline-capable implementation of the manifest's `llm` seam: for every
@@ -28,7 +28,7 @@
 // `{ type, handle }` back to the registrar, so it declares those shapes locally
 // (structural mirrors of @nanobpm/worker's WorkerJob/WorkerOptions) and needs no
 // sibling import — which keeps it a single self-contained file that type-checks
-// identically in the source tree and once materialised into `.nanobpm/`.
+// identically in the source tree and once materialised into `nano-generated/`.
 
 /** Job variables/headers default to untyped JSON. */
 export type LlmVars = Record<string, unknown>;

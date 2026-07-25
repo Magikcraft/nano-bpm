@@ -241,7 +241,7 @@ tenant **row-level scoping** (Postgres RLS vs. app-level filters) is a shared op
 1. **datasource-core** — *implemented.* The §2 `DataSource` interface + the SQLite driver
    (Deno `node:sqlite`, embedded) + manifest §1 parsing (named sources, env-resolvable
    driver/URL via `${VAR:-default}`, `default`). Ships as the `@nanobpm/data` SDK
-   (`server/src/console/data_sdk.ts`, materialised to `<project>/.nanobpm/data-sdk.ts`) with
+   (`server/src/console/data_sdk.ts`, materialised to `<project>/nano-generated/data-sdk.ts`) with
    `openDataSource(name?)`; `ctx.data(name?)` is wired into the worker host (`worker_sdk.ts`),
    and the App-run sandbox now grants project-root write so a `file:./app.db` source is
    creatable. Ships the swap seam even before the GUI.

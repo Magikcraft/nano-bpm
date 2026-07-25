@@ -7,7 +7,7 @@
 //! ```text
 //! <workspace>/models/<name>.bpmn
 //! <workspace>/workers/<name>/{worker.ts, deno.json, ...}
-//! <workspace>/.nanobpm/worker-sdk.ts   (the embedded Deno worker SDK)
+//! <workspace>/nano-generated/worker-sdk.ts   (the embedded Deno worker SDK)
 //! <workspace>/.deno-cache/             (DENO_DIR for worker dependency caching)
 //! ```
 //! The root defaults to `./nanobpm-workspace` (relative to the server's cwd) and
@@ -175,12 +175,12 @@ pub fn list_worker_files(name: &str) -> std::io::Result<Vec<String>> {
     Ok(files)
 }
 
-/// The hidden directory holding the embedded Deno worker SDK.
+/// The generated directory holding the embedded Deno worker SDK.
 pub fn sdk_dir() -> PathBuf {
-    workspace_dir().join(".nanobpm")
+    workspace_dir().join(super::projects::GEN_DIR)
 }
 
-/// Path to the embedded worker SDK file (`.nanobpm/worker-sdk.ts`).
+/// Path to the embedded worker SDK file (`nano-generated/worker-sdk.ts`).
 pub fn sdk_path() -> PathBuf {
     sdk_dir().join("worker-sdk.ts")
 }

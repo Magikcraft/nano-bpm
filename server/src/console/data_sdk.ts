@@ -1,6 +1,6 @@
 // nanobpmn embedded datasource SDK (Deno-preferred, Node-capable) — ADR 0024.
 //
-// Materialised verbatim to <workspace>/<project>/.nanobpm/data-sdk.ts and
+// Materialised verbatim to <workspace>/<project>/nano-generated/data-sdk.ts and
 // imported as `@nanobpm/data` (or `./data-sdk.ts` from the sibling worker SDK).
 // It is the runtime half of Urban's "BDE alias": a named, swappable data
 // connection. Consumers bind to a datasource BY NAME (`data.app`), never by
