@@ -239,14 +239,17 @@ export async function publishMessage(
   // missing/empty key or an unparseable body is a broken response, not a success
   // — fail fast rather than hand back an empty key.
   const json = (await resp.json().catch(() => null)) as
-    | { messageKey?: string; tenantId?: string }
+    | { messageKey?: unknown; tenantId?: unknown }
     | null;
   if (json?.messageKey == null || json.messageKey === "") {
     throw new Error(
       `publishMessage "${name}" returned HTTP ${resp.status} but no messageKey`,
     );
   }
-  return { messageKey: String(json.messageKey), tenantId: json.tenantId };
+  return {
+    messageKey: String(json.messageKey),
+    tenantId: json.tenantId == null ? undefined : String(json.tenantId),
+  };
 }
 
 export function defineWorker<
