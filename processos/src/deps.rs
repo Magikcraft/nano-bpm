@@ -126,6 +126,10 @@ fn check_deno() -> Dependency {
 /// enumerates devices; it does not load a model, so it is cheap.
 fn detect_llama_accel(bin: &str) -> Option<bool> {
     let out = Command::new(bin).arg("--list-devices").output().ok()?;
+    // If the command failed, assume we can't reliably interpret the output.
+    if !out.status.success() {
+        return None;
+    }
     let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&out.stderr));
     let lc = text.to_ascii_lowercase();
@@ -137,7 +141,7 @@ fn detect_llama_accel(bin: &str) -> Option<bool> {
         return Some(true);
     }
     // The flag was recognised (it printed a device listing) but no accelerator appeared → CPU-only.
-    if lc.contains("available devices") || lc.contains("device") {
+    if lc.contains("available devices") {
         return Some(false);
     }
     None
