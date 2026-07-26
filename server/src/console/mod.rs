@@ -36,6 +36,7 @@ use crate::ServerImpl;
 use crate::backpressure::SlaMode;
 
 pub mod config;
+mod envelope_scan;
 pub mod extensions;
 mod generated_api;
 pub mod projects;

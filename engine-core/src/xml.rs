@@ -1,5 +1,6 @@
 //! A tiny, dependency-free XML scanner shared by the [`crate::bpmn`] and
-//! [`crate::dmn`] parsers.
+//! [`crate::dmn`] parsers, and by the console's Urban-specific model scans (e.g.
+//! the data-envelope worker-IO derivation).
 //!
 //! It is deliberately minimal: a hand-rolled, namespace-prefix agnostic scanner
 //! that turns a document into a flat stream of [`Token`]s (start/end tags with

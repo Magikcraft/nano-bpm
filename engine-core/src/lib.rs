@@ -79,7 +79,7 @@ pub mod bpmn;
 pub mod dmn;
 pub mod feel;
 
-mod xml;
+pub mod xml;
 
 #[cfg(feature = "ffi")]
 pub mod ffi;
