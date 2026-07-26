@@ -19,8 +19,8 @@ ADR 0033 (`0033-urban-element-templates-first-class-components.md`, the data-env
 increment 12 — "server-side derivation of `workers[]`" — **is slice 1 of this ADR's scan pipeline**),
 ADR 0024 (`0024-urban-data-layer-datasource-abstraction.md`, the datasource = source #2, the rest
 bank; its `driver`/`url` seam is what makes source #3 — external shapes — a distinct provenance),
-ADR 0027 (`0027-urban-app-manifest-spec.md`, the manifest — where the *derived* fuse and any authored
-external-shape contracts are persisted, spec-first),
+ADR 0027 (`0027-urban-app-manifest-spec.md`, the manifest — where the *derived* fuse cache is persisted,
+spec-first; external-shape contracts live in their **own** spec-first artifact, not inline here),
 Borland **Delphi** (design-your-tables *and* BDE-alias-an-existing-DB — the "own it or import it"
 lineage this ADR generalizes to three sources).
 
@@ -70,7 +70,7 @@ artifact**, not a source of truth.
 |---|---|---|---|---|
 | 1 | **Models** (`.bpmn`) | motion shapes (composed payloads) + process/data-in-motion metadata | the Modeller | `model:<processId>` |
 | 2 | **Database** | owned relational rest shapes + FK relations | the schema / DB designer | `db:<source>.<table>` |
-| 3 | **External shapes** | typed contracts for data the app does not own | a data-layer authoring surface | `external:<name>` |
+| 3 | **External shapes** | typed contracts for data the app does not own | a standalone external-shapes artifact (its own file) | `external:<name>` |
 
 FK relationships are relational structure and belong where relations live (source #2) — a generic
 type registry modelling FKs would be unnatural. Data the app cannot introspect (remote services,
@@ -105,10 +105,11 @@ contributed to the fuse, and (per 0031) conjugated into its rest/face projection
 metadata fields participate in persist/rehydrate for free where they map, and are flagged where they
 do not (a metadata-only field has no rest column unless the fuse also owns/creates one).
 
-**Runtime semantics (proposed).** *Carrying* an entity **snapshots values into the process instance**
+**Runtime semantics (decided).** *Carrying* an entity **snapshots values into the process instance**
 — the payload travels as Zeebe variables (values, not a live DB cursor), consistent with the
 engine's untyped-JSON, values-in-motion model (ADR 0029 §3). The projection defines *which* values are
-lifted in; it is not a live view. (See Open #6 for reconciliation with live/at-rest reads.)
+lifted in; it is not a live view. A task that needs live at-rest data reads it explicitly (the PRM's
+rehydrate, 0031); "carry" never means "live cursor".
 
 ### 5. Model-carried metadata
 
@@ -170,26 +171,28 @@ PRM's rest/face projections (0031).
 - **Negative — ADR 0029 §4.2 is revised.** The authored `types` registry is demoted to a derived
   cache; existing fixtures that hand-author `types` need a migration/compat story.
 
+## Resolved (2026-07-27, @jwulf)
+
+- **Carry is by snapshot.** Confirmed: carrying an entity snapshots values into the instance (§4);
+  live at-rest reads are a separate, explicit gesture (the PRM's rehydrate, 0031). Not a live cursor.
+- **External shapes live in their own file.** Source #3 is authored as a **standalone external-shapes
+  artifact** (its own spec-first file), *not* as a subsection of the manifest or the datasource designer.
+  It is scanned/fused as a leaf like the other sources.
+- **Owned-table DDL writes through to the DB.** The Modeller stays introspection-first for rest: if it
+  later *creates* an owned table, it **writes through to the datasource** (source #2), which then re-fuses
+  as `db:<source>.<table>`. The model does not become a fourth seed for rest.
+
 ## Open questions
 
-1. **External-shape authoring home** — where is source #3 authored and stored? A manifest block
-   (`externalShapes`), a standalone artifact, or an extension of the datasource designer? (Leaning:
-   manifest block, spec-first per 0027, since it is authored, not scanned.)
-2. **Fuse cache location & format** — is the computed fuse persisted (a generated `domain` artifact) for
+1. **Fuse cache location & format** — is the computed fuse persisted (a generated `domain` artifact) for
    fast IDE/codegen reads, or recomputed on demand? What invalidates it?
-3. **Structural vs nominal *within composition*** — nominal id-matching stays for references (0029 §4),
+2. **Structural vs nominal *within composition*** — nominal id-matching stays for references (0029 §4),
    but *carry/project* is structural by nature (pick fields). How do the two coexist in the schema and
    the diagnostics?
-4. **Metadata schema & namespace** — the nano extension-element vocabulary for §5 (shape-level extend
+3. **Metadata schema & namespace** — the nano extension-element vocabulary for §5 (shape-level extend
    fields vs model-level metadata) and how much is free-form vs typed.
-5. **Reference/cycle grain** — do we allow a motion shape to carry another motion shape from a *different*
+4. **Reference/cycle grain** — do we allow a motion shape to carry another motion shape from a *different*
    model, and how aggressively do we guard cycles vs. lazily diagnose them?
-6. **Carry-by-snapshot vs live read** — §4's snapshot semantics vs. a task that wants live at-rest data;
-   is a "live carry" a projection flavor, or strictly the PRM's rehydrate (0031)? Ties to 0031 Open #1
-   (grain) and 0030 Open (which noun is primary).
-7. **Owned-table DDL** — this ADR keeps source #2 introspection-first (DB authoritative for rest). If the
-   Modeller later *creates* owned tables (design-data-first), does that make the model a fourth seed for
-   rest, or does it write through to the DB (which then re-fuses as #2)? (Leaning: write-through to #2.)
 
 ## Increments
 
@@ -199,7 +202,8 @@ PRM's rest/face projections (0031).
   scan lifts them into the fuse; nominal references resolve through the fuse (§3, §6).
 - **3 — composition algebra + Modeller surface**: carry/project/extend/reference authoring (§4),
   FK-aware, with same-id/cycle diagnostics (§6).
-- **4 — external-shape contracts** *(source #3)*: the authoring home from Open #1, fused as leaves.
+- **4 — external-shape contracts** *(source #3)*: a standalone external-shapes artifact (its own file),
+  fused as leaves.
 - **5 — model & shape metadata** *(§5)*: the extension vocabulary and app-wide surfacing.
 - **6 — PRM wiring**: the fuse feeds 0031's rest/face projections (persist/rehydrate from composed
   shapes, including extended metadata where it maps).
