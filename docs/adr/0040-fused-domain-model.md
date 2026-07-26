@@ -198,6 +198,14 @@ PRM's rest/face projections (0031).
 
 - **1 — model scan → worker I/O from the fuse** *(= ADR 0033 increment 12)*: `parse_bpmn` the models,
   extract task/message I/O bindings, emit `worker-io` from the fuse; retire hand-maintained `workers[]`.
+  - **1b — message payloads from the fuse** *(slice 2)*: the same model scan lifts the data envelope off
+    each shared `bpmn:message` (`io.nanobpm.dataEnvelope.in`/`.out`, keyed by the message `name`) and
+    emits a typed publish registry (`message-io.d.ts`: `MessageName` union + `MessagePayloads`) plus a
+    typed `publishMessage` wrapper (`messages.ts`, `@nanobpm/messages`), so publishing a message is typed
+    by the model. There is no manifest projection for messages (unlike `workers[]`), so the model-derived
+    map is authoritative directly. The message `name` is a correlation identity, so it is matched verbatim
+    (not trimmed). The received (`in`) type keys `publishMessage`; the `out` side is scanned but reserved
+    for future correlate-response typing.
 - **2 — motion-shape carrier in the model**: store composed motion shapes as nano extension elements;
   scan lifts them into the fuse; nominal references resolve through the fuse (§3, §6).
 - **3 — composition algebra + Modeller surface**: carry/project/extend/reference authoring (§4),
