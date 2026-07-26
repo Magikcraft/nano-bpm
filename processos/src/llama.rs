@@ -231,8 +231,12 @@ const PERF_DEFAULTS: &[(&[&str], &[&str])] = &[
 /// default is skipped when any of its alias flags is already present, so we never emit a duplicate
 /// flag or clobber an operator-provided value.
 fn perf_default_args(operator_args: &[String]) -> Vec<String> {
-    let present: std::collections::HashSet<&str> =
-        operator_args.iter().map(String::as_str).collect();
+    // Match on the flag portion only, so an operator's `--flag=value` form (e.g.
+    // `--cache-reuse=512`) suppresses the default just like the spaced `--flag value` form.
+    let present: std::collections::HashSet<&str> = operator_args
+        .iter()
+        .map(|a| a.split('=').next().unwrap_or(a.as_str()))
+        .collect();
     let mut out = Vec::new();
     for (argv, aliases) in PERF_DEFAULTS {
         if aliases.iter().any(|a| present.contains(a)) {
@@ -1051,6 +1055,21 @@ mod tests {
         assert!(a
             .windows(2)
             .any(|w| w[0] == "--cache-reuse" && w[1] == "512"));
+
+        // The `--flag=value` form also suppresses the matching default (no duplicate flag).
+        let p = profile(
+            "m.gguf",
+            "http://127.0.0.1:8080/v1",
+            Some("--gpu-layers=20 --cache-reuse=512"),
+        );
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, None).unwrap();
+        let a = &plan.args;
+        assert!(!a.iter().any(|x| x == "-ngl"));
+        assert!(!a.iter().any(|x| x == "--cache-reuse"));
+        assert!(a.iter().any(|x| x == "--gpu-layers=20"));
+        assert!(a.iter().any(|x| x == "--cache-reuse=512"));
+        // -fa was not overridden, so its default is still present.
+        assert!(a.iter().any(|x| x == "-fa"));
     }
 
     #[test]
