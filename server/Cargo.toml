@@ -158,6 +158,16 @@ strip = false
 [patch.crates-io]
 openraft = { path = "../third_party/openraft-0.9.24" }
 
+# Vendored proc-macro-error2 2.0.1 (pulled in transitively via validator_derive)
+# with the one-line upstream fix from GnomedDev/proc-macro-error-2#14: its
+# top-level `extern crate proc_macro;` is private, so the `pub use proc_macro;`
+# re-export in the crate's hidden `__export` module trips future-incompat lint
+# E0365 (rust-lang/rust#127909), which will become a hard error. Project policy
+# bans warnings (`[lints.rust] warnings = "deny" below), so we carry the fix
+# (`#[doc(hidden)] pub extern crate proc_macro;`) until an upstream release ships it. Only
+# src/lib.rs differs from the crates.io release. See third_party/proc-macro-error2-2.0.1.
+proc-macro-error2 = { path = "../third_party/proc-macro-error2-2.0.1" }
+
 [lints.rust]
 # Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
 # warning (unused code, deprecations, future-incompat lints, etc.).
