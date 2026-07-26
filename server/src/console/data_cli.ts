@@ -28,9 +28,14 @@ import {
   type DomainTypeRegistry,
   emitDomainBindings,
   emitDomainModel,
+  emitMessageBindings,
+  emitMessageBindingsRuntime,
   emitWorkerBindings,
   emitWorkerBindingsRuntime,
   GEN_DIR,
+  MESSAGE_BINDINGS_DTS,
+  MESSAGE_BINDINGS_TS,
+  type MessageBindingDecl,
   type SourceSchema,
   WORKER_BINDINGS_DTS,
   WORKER_BINDINGS_TS,
@@ -53,6 +58,14 @@ interface Request {
    * manifest projection alone.
    */
   derivedWorkers?: WorkerDecl[];
+  /**
+   * `domaintypes`: the model-derived message-payload map (`messageName ->
+   * {in,out}`), scanned from the process models' `bpmn:message` envelopes by the
+   * server (ADR 0040 slice 2). It is authoritative for the typed `publishMessage`
+   * registry (there is no manifest projection for messages, unlike `workers[]`),
+   * so it is emitted directly. Absent → no message registry is derived.
+   */
+  derivedMessages?: MessageBindingDecl[];
 }
 
 /**
@@ -369,9 +382,18 @@ async function run(req: Request): Promise<unknown> {
         : manifestW;
       const workerBindings = emitWorkerBindings(workers, Object.keys(types));
       const workerRuntime = emitWorkerBindingsRuntime();
+      // The message-payload registry (ADR 0040 slice 2): `messageName → {in,out}`,
+      // scanned from the process models' `bpmn:message` envelopes. There is no
+      // manifest projection for messages, so the model-derived map is authoritative
+      // and emitted directly (no overlay). Feeds the typed `publishMessage`; the
+      // runtime wrapper (`messages.ts`) is static — written verbatim.
+      const messages = req.derivedMessages ?? [];
+      const messageBindings = emitMessageBindings(messages, Object.keys(types));
+      const messageRuntime = emitMessageBindingsRuntime();
       let path: string | null = null;
       let bindingsPath: string | null = null;
       let workerBindingsPath: string | null = null;
+      let messageBindingsPath: string | null = null;
       if (req.write !== false) {
         await RT.mkdir(GEN_DIR);
         path = `${GEN_DIR}/${DOMAIN_DTS}`;
@@ -381,6 +403,9 @@ async function run(req: Request): Promise<unknown> {
         workerBindingsPath = `${GEN_DIR}/${WORKER_BINDINGS_DTS}`;
         await RT.writeTextFile(workerBindingsPath, workerBindings);
         await RT.writeTextFile(`${GEN_DIR}/${WORKER_BINDINGS_TS}`, workerRuntime);
+        messageBindingsPath = `${GEN_DIR}/${MESSAGE_BINDINGS_DTS}`;
+        await RT.writeTextFile(messageBindingsPath, messageBindings);
+        await RT.writeTextFile(`${GEN_DIR}/${MESSAGE_BINDINGS_TS}`, messageRuntime);
       }
       const tables = schemas.reduce((n, s) => n + s.tables.length, 0);
       return {
@@ -391,6 +416,8 @@ async function run(req: Request): Promise<unknown> {
         bindings,
         workerBindingsPath,
         workerBindings,
+        messageBindingsPath,
+        messageBindings,
       };
     }
     default:

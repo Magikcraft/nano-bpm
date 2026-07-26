@@ -178,6 +178,80 @@ function falconUrl(baseUrl: string, worker?: string): string {
   return url.toString();
 }
 
+/** Untyped fallback payload for a message with no declared envelope. */
+export type MessageVars = Record<string, unknown>;
+
+/** Options for [`publishMessage`]. `variables` is the message payload (typed by
+ * the generated `messages.ts` wrapper against the model's envelope). */
+export interface PublishMessageOptions<V extends object = MessageVars> {
+  /** The correlation key selecting the target subscription (default ""). */
+  correlationKey?: string;
+  /** The message payload delivered to correlated instances. */
+  variables?: V;
+  /** Buffer lifetime in ms. nanobpmn does not buffer, so this is advisory. */
+  timeToLive?: number;
+  /** Idempotency id for the publish (dedup on the gateway when supported). */
+  messageId?: string;
+  /** Gateway base URL. Defaults to env NANOBPMN_BASE_URL or http://127.0.0.1:8080. */
+  baseUrl?: string;
+}
+
+/** The result of a successful [`publishMessage`]. */
+export interface PublishMessageResult {
+  /** The minted message key. */
+  messageKey: string;
+  /** The tenant the message was published to, when the gateway reports one. */
+  tenantId?: string;
+}
+
+/**
+ * Publish a message and correlate it to any matching open subscription, via the
+ * gateway's `POST /v2/messages/publication` endpoint (the same call an SDK client
+ * makes, ADR 0025). nanobpmn does not buffer messages: the message is minted,
+ * correlated to every matching open subscription, then dropped. The generated
+ * `messages.ts` wrapper narrows `name` to the model's declared message names and
+ * types `variables` from the message's data envelope (ADR 0040 slice 2); this raw
+ * form moves untyped JSON on the wire. Throws on a non-2xx response.
+ */
+export async function publishMessage(
+  name: string,
+  opts: PublishMessageOptions = {},
+): Promise<PublishMessageResult> {
+  const baseUrl = opts.baseUrl ?? RT.env("NANOBPMN_BASE_URL") ?? "http://127.0.0.1:8080";
+  const url = baseUrl.replace(/\/+$/, "").replace(/\/v2$/, "") + "/v2/messages/publication";
+  const body: Record<string, unknown> = {
+    name,
+    correlationKey: opts.correlationKey ?? "",
+    variables: opts.variables ?? {},
+  };
+  if (opts.timeToLive != null) body.timeToLive = opts.timeToLive;
+  if (opts.messageId != null) body.messageId = opts.messageId;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!resp.ok) {
+    const detail = await resp.text().catch(() => "");
+    throw new Error(`publishMessage "${name}" failed: ${resp.status} ${detail}`.trim());
+  }
+  // The gateway mints and returns a `messageKey` on every 2xx (ADR 0025), so a
+  // missing/empty key or an unparseable body is a broken response, not a success
+  // — fail fast rather than hand back an empty key.
+  const json = (await resp.json().catch(() => null)) as
+    | { messageKey?: unknown; tenantId?: unknown }
+    | null;
+  if (json?.messageKey == null || json.messageKey === "") {
+    throw new Error(
+      `publishMessage "${name}" returned HTTP ${resp.status} but no messageKey`,
+    );
+  }
+  return {
+    messageKey: String(json.messageKey),
+    tenantId: json.tenantId == null ? undefined : String(json.tenantId),
+  };
+}
+
 export function defineWorker<
   In extends object = WorkerVars,
   Out extends object = WorkerVars,
