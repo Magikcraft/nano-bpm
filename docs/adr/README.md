@@ -52,6 +52,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0037](0037-execution-and-task-listeners.md) | Execution listeners (and task listeners): BPMN lifecycle-hook parity | Proposed | 2026-07-23 |
 | [0038](0038-node-first-runtime.md) | Node-first runtime: Deno optional, only for `deno compile` | Accepted | 2026-07-24 |
 | [0039](0039-falcon-client-cluster-channel-split.md) | Splitting Falcon: a public client channel vs an authenticated cluster channel | Proposed | 2026-07-24 |
+| [0040](0040-fused-domain-model.md) | The Fused Domain Model: the registry is derived, not authored (three sources → one fuse) | Proposed | 2026-07-27 |
 
 ## Reading paths
 

@@ -352,7 +352,9 @@ binding stays authoritative, and the task-level envelope is either inherited or 
 - **11 — message envelope** *(this PR)*: the group on message events / receive tasks, writing the envelope
   on the shared `bpmn:Message` through `messageRef` — typed correlation payloads.
 - **12 — server-side derivation** *(follow-up)*: the console derives `workers[]` I/O from the process
-  models (Rust `parse_bpmn`) on regen, retiring the modeler-maintained manifest projection.
+  models (Rust `parse_bpmn`) on regen, retiring the modeler-maintained manifest projection. **This is
+  slice 1 of ADR 0040 (the Fused Domain Model)**: the model scan that makes the `.bpmn` carrier
+  authoritative and rebuilds the derived registry, of which `workers[]` becomes a pure cache read.
 
 
 
