@@ -235,11 +235,18 @@ export async function publishMessage(
     const detail = await resp.text().catch(() => "");
     throw new Error(`publishMessage "${name}" failed: ${resp.status} ${detail}`.trim());
   }
-  const json = (await resp.json().catch(() => ({}))) as {
-    messageKey?: string;
-    tenantId?: string;
-  };
-  return { messageKey: String(json.messageKey ?? ""), tenantId: json.tenantId };
+  // The gateway mints and returns a `messageKey` on every 2xx (ADR 0025), so a
+  // missing/empty key or an unparseable body is a broken response, not a success
+  // — fail fast rather than hand back an empty key.
+  const json = (await resp.json().catch(() => null)) as
+    | { messageKey?: string; tenantId?: string }
+    | null;
+  if (json?.messageKey == null || json.messageKey === "") {
+    throw new Error(
+      `publishMessage "${name}" returned HTTP ${resp.status} but no messageKey`,
+    );
+  }
+  return { messageKey: String(json.messageKey), tenantId: json.tenantId };
 }
 
 export function defineWorker<

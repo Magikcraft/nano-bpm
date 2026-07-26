@@ -168,14 +168,24 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
             } => {
                 let ln = local_name(name);
                 if cur.is_none() {
-                    if !self_closing && SERVICE_TASK_LOCALS.contains(&ln) {
-                        cur = Some((depth, Accum::new(Kind::Worker, None)));
-                    } else if !self_closing && ln == "message" {
-                        // A `bpmn:message` keys by its own `name` (read now).
-                        cur = Some((
-                            depth,
-                            Accum::new(Kind::Message, message_name(attr(attrs, "name"))),
-                        ));
+                    if SERVICE_TASK_LOCALS.contains(&ln) {
+                        // A self-closing service task carries no `taskDefinition`
+                        // child, so it has no job type and contributes nothing;
+                        // only an open task can key a worker entry.
+                        if !self_closing {
+                            cur = Some((depth, Accum::new(Kind::Worker, None)));
+                        }
+                    } else if ln == "message" {
+                        // A `bpmn:message` keys by its own `name` (read now). A
+                        // self-closing `<bpmn:message name=.. />` carries no
+                        // envelope, but its name still completes the `MessageName`
+                        // union (ADR 0040 slice 2), so flush it straight away.
+                        let acc = Accum::new(Kind::Message, message_name(attr(attrs, "name")));
+                        if *self_closing {
+                            flush(&mut workers, &mut messages, acc);
+                        } else {
+                            cur = Some((depth, acc));
+                        }
                     }
                 } else if let Some((_, acc)) = cur.as_mut() {
                     match ln {
@@ -516,6 +526,21 @@ mod tests {
     #[test]
     fn emits_named_message_with_no_envelope_so_the_name_union_is_complete() {
         let xml = defs(&message("ping", ""));
+        assert_eq!(
+            messages(&xml),
+            vec![MessageIo {
+                message_name: "ping".into(),
+                input_type: None,
+                output_type: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn emits_a_self_closing_named_message() {
+        // A hand-edited `<bpmn:message name=.. />` carries no envelope children,
+        // but its name must still complete the `MessageName` union.
+        let xml = defs(r#"<bpmn:message id="m" name="ping" />"#);
         assert_eq!(
             messages(&xml),
             vec![MessageIo {
