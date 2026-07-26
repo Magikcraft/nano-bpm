@@ -124,6 +124,13 @@ Types come from two sources, in priority order:
 2. **A manifest type registry** — a small `types` block for **transient, non-persisted** shapes
    (an event body, a worker payload, a computed context) that no table backs.
 
+   > **Revised by ADR 0040 (the Fused Domain Model).** This *authored* `types` block is superseded: the
+   > registry becomes **derived** — a fusion of three authoring sources (models carry motion shapes,
+   > the datasource carries rest, external contracts cover the rest), so it cannot drift from its
+   > sources. Motion shapes move into the models (authored in the Modeller); any persisted `types`
+   > becomes a fuse cache, not a source of truth. The nominal id-matching and the reifier (§6) below
+   > are unchanged. See `0040-fused-domain-model.md`.
+
 Everything then **references a type by name**: form fields bind to a type's fields; a process gets an
 optional declared `variables` type; DMN `typeRef`s map to the same registry; worker payloads are
 typed against it. Matching is **nominal** — a reference resolves against the type's stable id (the
