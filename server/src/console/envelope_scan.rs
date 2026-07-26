@@ -69,11 +69,61 @@ pub struct MessageIo {
 }
 
 /// Everything one model scan lifts from a BPMN document: the service-task worker
-/// I/O map (slice 1) and the message payload map (slice 2).
+/// I/O map (slice 1), the message payload map (slice 2), and the composed motion
+/// shapes (§9/§10).
 #[derive(Default)]
 pub struct BpmnScan {
     pub workers: Vec<WorkerIo>,
     pub messages: Vec<MessageIo>,
+    pub shapes: Vec<ShapeDecl>,
+}
+
+/// One composition operation of a `nano:shape`, in author (XML) order. Serializes
+/// to the `{ op, .. }` tagged union the reifier's `ShapeOp` (`domain_types.ts`)
+/// reads, so the ordered fold semantics survive the scan → resolve boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "op", rename_all = "lowercase")]
+pub enum ShapeOp {
+    /// Spread every field of the fused entity `ref`.
+    Carry { r#ref: String },
+    /// Spread only the named `fields` of `ref`, optionally reached via an FK path.
+    Project {
+        r#ref: String,
+        fields: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        via: Option<String>,
+    },
+    /// Add a process-authored field (scalar keyword or a fused entity id).
+    Extend {
+        name: String,
+        r#type: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        optional: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        list: Option<bool>,
+    },
+    /// Pull in another motion shape: `spread` inlines its fields, else nests it.
+    Reference {
+        name: String,
+        r#ref: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        spread: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        list: Option<bool>,
+    },
+}
+
+/// A composed motion-shape declaration lifted from a `nano:shape` element (ADR
+/// 0040 §9). Serializes to the `ShapeDecl` shape the reifier resolves through the
+/// fuse into a flat `DomainTypeDef`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ShapeDecl {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    pub ops: Vec<ShapeOp>,
 }
 
 /// Which motion-shape carrier the scanner is accumulating inside an open element.
@@ -159,6 +209,14 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
     let mut depth: usize = 0;
     let mut cur: Option<(usize, Accum)> = None;
 
+    // Composed-shape scan (ADR 0040 §9), independent of the worker/message carrier
+    // above: `nano:shape` declarations live under `bpmn:process` extension elements,
+    // never inside a service task, so the two states never overlap. `process_id`
+    // tags each shape's provenance; `cur_shape` accumulates the open shape's ops.
+    let mut process_id: Option<String> = None;
+    let mut shapes: Vec<ShapeDecl> = Vec::new();
+    let mut cur_shape: Option<(usize, ShapeDecl)> = None;
+
     for tok in &tokens {
         match tok {
             Token::Start {
@@ -206,6 +264,35 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         _ => {}
                     }
                 }
+                // Composed-shape carrier (independent of `cur`): track the enclosing
+                // process for provenance, open a `nano:shape`, and fold its op
+                // children (`nano:carry`/`project`/`extend`/`reference`) in order.
+                if ln == "process"
+                    && let Some(id) = attr(attrs, "id")
+                {
+                    process_id = Some(id.to_string());
+                }
+                if cur_shape.is_none() {
+                    if ln == "shape" {
+                        let decl = ShapeDecl {
+                            id: attr(attrs, "id").unwrap_or("").to_string(),
+                            name: attr(attrs, "name").map(str::to_string),
+                            process: process_id.clone(),
+                            ops: Vec::new(),
+                        };
+                        if *self_closing {
+                            if !decl.id.is_empty() {
+                                shapes.push(decl);
+                            }
+                        } else {
+                            cur_shape = Some((depth, decl));
+                        }
+                    }
+                } else if let Some((_, decl)) = cur_shape.as_mut()
+                    && let Some(op) = parse_shape_op(ln, attrs)
+                {
+                    decl.ops.push(op);
+                }
                 if !self_closing {
                     depth += 1;
                 }
@@ -219,6 +306,15 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         cur = Some((open_depth, acc));
                     }
                 }
+                if let Some((open_depth, decl)) = cur_shape.take() {
+                    if depth == open_depth {
+                        if !decl.id.is_empty() {
+                            shapes.push(decl);
+                        }
+                    } else {
+                        cur_shape = Some((open_depth, decl));
+                    }
+                }
             }
             Token::Text(_) => {}
         }
@@ -227,7 +323,65 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
     BpmnScan {
         workers: workers.into_values().collect(),
         messages: messages.into_values().collect(),
+        shapes,
     }
+}
+
+/// Parse one `nano:shape` composition child into a `ShapeOp`. An op missing its
+/// identifying attribute (a `ref` for carry/project/reference; a `name`+`type` for
+/// extend) is malformed and dropped, so a broken child does not synthesise a
+/// spurious binding. Non-op local names (e.g. the `nano:shapes` container) yield
+/// `None`.
+fn parse_shape_op(ln: &str, attrs: &[(String, String)]) -> Option<ShapeOp> {
+    match ln {
+        "carry" => Some(ShapeOp::Carry {
+            r#ref: shape_attr(attrs, "ref")?,
+        }),
+        "project" => Some(ShapeOp::Project {
+            r#ref: shape_attr(attrs, "ref")?,
+            fields: attr(attrs, "fields").map(split_fields).unwrap_or_default(),
+            via: shape_attr(attrs, "via"),
+        }),
+        "extend" => Some(ShapeOp::Extend {
+            name: shape_attr(attrs, "name")?,
+            r#type: shape_attr(attrs, "type")?,
+            optional: bool_attr(attrs, "optional"),
+            list: bool_attr(attrs, "list"),
+        }),
+        "reference" => Some(ShapeOp::Reference {
+            name: shape_attr(attrs, "name")?,
+            r#ref: shape_attr(attrs, "ref")?,
+            spread: bool_attr(attrs, "spread"),
+            list: bool_attr(attrs, "list"),
+        }),
+        _ => None,
+    }
+}
+
+/// Read a shape attribute, trimming whitespace and dropping an empty value (so a
+/// blank `ref=""` is treated as absent rather than a ref to `""`).
+fn shape_attr(attrs: &[(String, String)], local: &str) -> Option<String> {
+    let v = attr(attrs, local)?.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
+/// Split a `project fields="a, b ,c"` attribute into trimmed, non-empty names.
+fn split_fields(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Read a boolean shape attribute; `Some(true)`/`Some(false)` only when present,
+/// so an absent flag serializes as omitted (matching the TS optional field).
+fn bool_attr(attrs: &[(String, String)], local: &str) -> Option<bool> {
+    attr(attrs, local).map(|v| v.trim().eq_ignore_ascii_case("true"))
 }
 
 /// Fold one closed carrier's accumulator into the right map. Workers are keyed by
@@ -289,6 +443,7 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
     };
     let mut workers: BTreeMap<String, WorkerIo> = BTreeMap::new();
     let mut messages: BTreeMap<String, MessageIo> = BTreeMap::new();
+    let mut shapes: Vec<ShapeDecl> = Vec::new();
     let mut files: Vec<std::path::PathBuf> = entries
         .flatten()
         .map(|e| e.path())
@@ -322,10 +477,16 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
             fill(&mut entry.input_type, io.input_type);
             fill(&mut entry.output_type, io.output_type);
         }
+        // Shapes are model-scoped declarations; gather them across every model so
+        // the reifier resolves references (including cross-model carries) against
+        // the combined set (ADR 0040 §10 second pass). Deterministic file order
+        // (files are sorted) keeps the merged list stable.
+        shapes.extend(scan.shapes);
     }
     BpmnScan {
         workers: workers.into_values().collect(),
         messages: messages.into_values().collect(),
+        shapes,
     }
 }
 
@@ -608,5 +769,183 @@ mod tests {
         assert_eq!(v["messageName"], "orderPlaced");
         assert_eq!(v["inputType"], "Order");
         assert!(v.get("outputType").is_none());
+    }
+
+    // --- composed motion shapes (ADR 0040 §9/§10) --------------------------
+
+    /// Test helper: the composed shapes derived from a single document.
+    fn shapes(xml: &str) -> Vec<ShapeDecl> {
+        scan_bpmn(xml).shapes
+    }
+
+    /// Wrap shape declarations in a `nano:shapes` container on the process's
+    /// extension elements, in a process document with the nano namespace declared.
+    fn shape_doc(shapes_body: &str) -> String {
+        format!(
+            r#"<?xml version="1.0"?>
+            <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                              xmlns:nano="http://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="orders" isExecutable="true">
+                <bpmn:extensionElements>
+                  <nano:shapes>{shapes_body}</nano:shapes>
+                </bpmn:extensionElements>
+              </bpmn:process>
+            </bpmn:definitions>"#
+        )
+    }
+
+    #[test]
+    fn scans_the_four_op_algebra_in_author_order() {
+        let xml = shape_doc(
+            r#"<nano:shape id="ApprovedOrder" name="Approved order">
+                 <nano:carry ref="Order" />
+                 <nano:project ref="Customer" fields="tier, region" via="Order.customerId" />
+                 <nano:extend name="approved" type="boolean" />
+                 <nano:extend name="reviewedBy" type="string" optional="true" />
+                 <nano:reference name="lines" ref="OrderLine" spread="false" list="true" />
+               </nano:shape>"#,
+        );
+        assert_eq!(
+            shapes(&xml),
+            vec![ShapeDecl {
+                id: "ApprovedOrder".into(),
+                name: Some("Approved order".into()),
+                process: Some("orders".into()),
+                ops: vec![
+                    ShapeOp::Carry {
+                        r#ref: "Order".into()
+                    },
+                    ShapeOp::Project {
+                        r#ref: "Customer".into(),
+                        fields: vec!["tier".into(), "region".into()],
+                        via: Some("Order.customerId".into()),
+                    },
+                    ShapeOp::Extend {
+                        name: "approved".into(),
+                        r#type: "boolean".into(),
+                        optional: None,
+                        list: None,
+                    },
+                    ShapeOp::Extend {
+                        name: "reviewedBy".into(),
+                        r#type: "string".into(),
+                        optional: Some(true),
+                        list: None,
+                    },
+                    ShapeOp::Reference {
+                        name: "lines".into(),
+                        r#ref: "OrderLine".into(),
+                        spread: Some(false),
+                        list: Some(true),
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn scans_multiple_shapes_and_tags_their_process() {
+        let xml = shape_doc(
+            r#"<nano:shape id="A"><nano:carry ref="Order" /></nano:shape>
+               <nano:shape id="B"><nano:carry ref="A" /></nano:shape>"#,
+        );
+        let got = shapes(&xml);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].id, "A");
+        assert_eq!(got[1].id, "B");
+        assert!(got.iter().all(|s| s.process.as_deref() == Some("orders")));
+    }
+
+    #[test]
+    fn drops_malformed_ops_and_unidentified_shapes() {
+        // A carry with no `ref` and an extend missing its `type` are malformed and
+        // dropped; a shape with no `id` cannot be referenced, so it is dropped too.
+        let xml = shape_doc(
+            r#"<nano:shape id="Ok">
+                 <nano:carry />
+                 <nano:extend name="approved" />
+                 <nano:carry ref="Order" />
+               </nano:shape>
+               <nano:shape><nano:carry ref="Order" /></nano:shape>"#,
+        );
+        assert_eq!(
+            shapes(&xml),
+            vec![ShapeDecl {
+                id: "Ok".into(),
+                name: None,
+                process: Some("orders".into()),
+                ops: vec![ShapeOp::Carry {
+                    r#ref: "Order".into()
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn scans_a_self_closing_empty_shape() {
+        let xml = shape_doc(r#"<nano:shape id="Empty" />"#);
+        assert_eq!(
+            shapes(&xml),
+            vec![ShapeDecl {
+                id: "Empty".into(),
+                name: None,
+                process: Some("orders".into()),
+                ops: vec![],
+            }]
+        );
+    }
+
+    #[test]
+    fn serializes_ops_to_the_tagged_union_shape() {
+        let decl = ShapeDecl {
+            id: "ApprovedOrder".into(),
+            name: None,
+            process: Some("orders".into()),
+            ops: vec![
+                ShapeOp::Carry {
+                    r#ref: "Order".into(),
+                },
+                ShapeOp::Extend {
+                    name: "approved".into(),
+                    r#type: "boolean".into(),
+                    optional: None,
+                    list: None,
+                },
+            ],
+        };
+        let v = serde_json::to_value(&decl).unwrap();
+        assert_eq!(v["id"], "ApprovedOrder");
+        assert_eq!(v["ops"][0]["op"], "carry");
+        assert_eq!(v["ops"][0]["ref"], "Order");
+        assert_eq!(v["ops"][1]["op"], "extend");
+        assert_eq!(v["ops"][1]["name"], "approved");
+        assert_eq!(v["ops"][1]["type"], "boolean");
+        // Absent optional/list flags are omitted, not serialized as null/false.
+        assert!(v["ops"][1].get("optional").is_none());
+        assert!(v["ops"][1].get("list").is_none());
+    }
+
+    #[test]
+    fn shapes_and_workers_coexist_in_one_document() {
+        // A process carrying both a service task and a shapes container yields both.
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+            <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                              xmlns:nano="http://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="orders" isExecutable="true">
+                <bpmn:extensionElements>
+                  <nano:shapes><nano:shape id="S"><nano:carry ref="Order" /></nano:shape></nano:shapes>
+                </bpmn:extensionElements>
+                {}
+              </bpmn:process>
+            </bpmn:definitions>"#,
+            task("t", "serviceTask", "charge", IN_ORDER),
+        );
+        let scan = scan_bpmn(&xml);
+        assert_eq!(scan.workers.len(), 1);
+        assert_eq!(scan.workers[0].task_type, "charge");
+        assert_eq!(scan.shapes.len(), 1);
+        assert_eq!(scan.shapes[0].id, "S");
     }
 }
