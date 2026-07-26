@@ -69,6 +69,19 @@ fn literal_task_type(t: &str) -> Option<&str> {
     }
 }
 
+/// Normalise an envelope type ref read from the model: trim surrounding
+/// whitespace and treat an empty (or all-whitespace) value as "no envelope", so a
+/// hand-edited `.bpmn` with a blank or padded value doesn't yield a ref that
+/// silently fails to resolve against any declared type id.
+fn envelope_ref(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_string())
+    }
+}
+
 /// Derive the `taskType -> {in,out}` worker-IO map from a single BPMN document.
 /// Every service-ish task carrying a literal job type contributes an entry (even
 /// with no envelope, so a stale manifest projection is *cleared* on rebuild, not
@@ -80,8 +93,8 @@ pub fn scan_bpmn_worker_io(xml: &str) -> Vec<WorkerIo> {
     };
 
     // Entries keyed by job type so a rebuild is deterministic and duplicate job
-    // types across tasks fold to one entry (last non-empty envelope wins — the
-    // fuse-conflict diagnostic of ADR 0040 §6 is a later slice).
+    // types across tasks fold to one entry (the first non-empty envelope on each
+    // side wins; the fuse-conflict diagnostic of ADR 0040 §6 is a later slice).
     let mut out: BTreeMap<String, WorkerIo> = BTreeMap::new();
 
     // Depth of the currently-open service task's start tag; `None` when not
@@ -111,10 +124,10 @@ pub fn scan_bpmn_worker_io(xml: &str) -> Vec<WorkerIo> {
                         }
                         "property" => match attr(attrs, "name") {
                             Some(ENVELOPE_IN) => {
-                                acc.input_type = attr(attrs, "value").map(str::to_string);
+                                acc.input_type = envelope_ref(attr(attrs, "value"));
                             }
                             Some(ENVELOPE_OUT) => {
-                                acc.output_type = attr(attrs, "value").map(str::to_string);
+                                acc.output_type = envelope_ref(attr(attrs, "value"));
                             }
                             _ => {}
                         },
@@ -325,6 +338,23 @@ mod tests {
     #[test]
     fn malformed_xml_yields_no_bindings() {
         assert_eq!(scan_bpmn_worker_io("<bpmn:definitions <<>"), vec![]);
+    }
+
+    #[test]
+    fn trims_whitespace_and_drops_blank_envelope_refs() {
+        let env = concat!(
+            r#"<zeebe:property name="io.nanobpm.dataEnvelope.in" value="  Order  " />"#,
+            r#"<zeebe:property name="io.nanobpm.dataEnvelope.out" value="   " />"#,
+        );
+        let xml = doc(&task("t", "serviceTask", "charge", env));
+        assert_eq!(
+            scan_bpmn_worker_io(&xml),
+            vec![WorkerIo {
+                task_type: "charge".into(),
+                input_type: Some("Order".into()),
+                output_type: None,
+            }]
+        );
     }
 
     #[test]
