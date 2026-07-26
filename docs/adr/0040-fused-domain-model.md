@@ -153,6 +153,92 @@ first slice of the scan-and-rebuild pipeline** (§7 scans models into the fuse; 
 Later slices grow the same path to the full composition algebra (§4), external contracts (§3), and the
 PRM's rest/face projections (0031).
 
+### 9. Shape-carrier representation in the model (increments 2–3)
+
+§3–§5 fix *what* a composed motion shape is and *where* it lives; this section fixes the concrete
+model representation the scan reads and the Modeller writes.
+
+**Namespace.** Composed shapes are carried in a dedicated nano namespace —
+`xmlns:nano="http://nanobpm.io/schema/shapes/1.0"` — registered as a bpmn-js **moddle extension**
+(a descriptor JSON) alongside the existing Zeebe descriptors, so bpmn-js parses/serialises the
+elements and the properties panel can edit them as first-class moddle objects. The reserved
+`zeebe:property` envelope keys (`io.nanobpm.dataEnvelope.in`/`.out`, ADR 0033 §6) are **unchanged** —
+this keeps slices 1/1b intact — but the id they carry may now name a composed `nano:shape` in
+addition to a DB table or manifest type. The envelope stays a *reference*; §9 adds the *definitions*
+it can point at.
+
+**Where.** A shape is a reusable, model-scoped declaration, not a per-task attachment, so shape
+declarations live in a single `nano:shapes` container on the defining `bpmn:process`'s
+`bpmn:extensionElements` (process-level extension elements are well-supported by bpmn-js/moddle;
+`bpmn:definitions`-level custom elements are not portably editable). Reuse across models resolves
+**through the fuse** by id (§3), never by cross-file XML import.
+
+**Schema.** Each `nano:shape` has an `id` (fuse identity), an optional `name`, and an **ordered** list
+of composition children encoding the §4 algebra:
+
+```xml
+<bpmn:process id="orders" isExecutable="true">
+  <bpmn:extensionElements>
+    <nano:shapes>
+      <nano:shape id="ApprovedOrder" name="Approved order">
+        <nano:carry ref="Order" />                                  <!-- spread an entity whole -->
+        <nano:project ref="Customer" fields="tier,region" via="Order.customerId" />
+        <nano:extend name="approved" type="boolean" />              <!-- process-authored field -->
+        <nano:extend name="reviewedBy" type="string" optional="true" />
+        <nano:reference name="lines" ref="OrderLine" spread="false" list="true" />
+      </nano:shape>
+    </nano:shapes>
+    <nano:meta key="classification" value="internal" />             <!-- model-level metadata (§5) -->
+  </bpmn:extensionElements>
+  ...
+</bpmn:process>
+```
+
+- **`nano:carry ref`** — spread every field of the fused entity `ref` (a DB table, manifest type,
+  external contract, or another shape) into this shape.
+- **`nano:project ref fields via?`** — spread only the named `fields` of `ref`; the optional `via`
+  FK-path (`Entity.fkColumn`, chainable with `.`) reaches fields on a related entity.
+- **`nano:extend name type optional? list?`** — add a process-authored field. `type` is a scalar
+  keyword (the existing `PRIMITIVE_TS` set: `string|number|integer|boolean|date|datetime|json`) or a
+  fused entity id (a nominal reference, emitted as `DomainTypes[<id>]`). This is the load-bearing
+  §4 *extend* case.
+- **`nano:reference name ref spread? list?`** — pull in another motion shape: `spread="true"`
+  inlines its fields, `spread="false"` (default) nests it as a single field `name: DomainTypes[ref]`.
+
+The XML order is authoritative: composition is a left-to-right fold, so a later `extend` can shadow a
+carried field (surfaced as a diagnostic when the types differ, §10).
+
+### 10. Shape resolution in the fuse + diagnostics (increment 2)
+
+A composed shape resolves, at scan/regen time, to a flat `DomainTypeDef { fields }` — the *same*
+record shape the manifest `types` registry and DB tables already produce — so composed shapes enter
+`DomainTypes` and every downstream consumer (the envelope pickers, `defineWorker`, `publishMessage`,
+the FEEL scopes) types against `DomainTypes["ApprovedOrder"]` **for free**, with no new codegen path.
+
+**Build order (per §6).** Leaves — DB tables (`db:<source>.<table>`), manifest types, external
+contracts — fuse first. Shapes resolve in a **second pass**: gather every `nano:shape` across all the
+project's models, then resolve their references against the combined registry. This lets a shape carry
+another shape regardless of file/declaration order.
+
+**Resolution (author-order fold).** Starting from an empty field map, for each child in XML order:
+`carry(E)` copies all of `E`'s fields; `project(E, fields, via)` copies the named subset, following the
+`via` FK path to the related entity for cross-entity fields; `extend(name, type)` adds a local field;
+`reference(ref, spread)` either spreads `ref`'s fields or adds a nested `name: DomainTypes[ref]`
+(wrapped `[]` when `list`). The result is provenance-tagged `model:<processId>` and added to the fuse.
+
+**Diagnostics (scan-time, surfaced like the `workers[]` drift warning — never a silent merge):**
+
+- **unresolved reference** — a `carry`/`project`/`reference`/`extend` names an id absent from the fuse.
+- **reference cycle** — the second-pass shape graph has a cycle (DFS); reported with the offending path.
+- **field conflict** — two composition steps contribute the same field name with **different** types
+  (same type is an idempotent no-op; a deliberate shadow is a warning, not an error).
+- **unknown project field / FK path** — a `project` names a field or `via` hop the source entity lacks.
+- **same-id across independent sources** — a shape id collides with a leaf entity that it does *not*
+  declare as a source (projection is not conflict, §6).
+
+Diagnostics are returned by the scan and rendered by the reifier/panel; a shape that fails to resolve
+is omitted from `DomainTypes` (so a broken shape degrades to untyped, it does not break codegen).
+
 ## Consequences
 
 - **Positive — drift becomes structurally impossible.** The registry is derived; a source and its
@@ -181,18 +267,24 @@ PRM's rest/face projections (0031).
 - **Owned-table DDL writes through to the DB.** The Modeller stays introspection-first for rest: if it
   later *creates* an owned table, it **writes through to the datasource** (source #2), which then re-fuses
   as `db:<source>.<table>`. The model does not become a fourth seed for rest.
+- **Shape-carrier representation fixed (§9–§10).** Composed shapes are named `nano:shape` declarations
+  in a `nano:shapes` container on the process's `bpmn:extensionElements`, in a dedicated
+  `http://nanobpm.io/schema/shapes/1.0` moddle namespace; the existing `dataEnvelope.in/out` reference
+  is unchanged and may now name a composed shape. This resolves **OQ3** for the shape-level `extend`
+  vocabulary (scalar keywords ∪ fused ids) and model-level metadata (`nano:meta`).
+- **Structural vs nominal within composition (OQ2).** Resolved: a composed shape resolves to a flat
+  `DomainTypeDef` (structural, a field map), but every *reference* inside it (`carry`/`project`/
+  `reference`/`extend`-to-entity) is **nominal** by fused id (ADR 0029 §4). Structure is the *output*
+  of a fold over nominal inputs; the two do not compete.
 
 ## Open questions
 
 1. **Fuse cache location & format** — is the computed fuse persisted (a generated `domain` artifact) for
    fast IDE/codegen reads, or recomputed on demand? What invalidates it?
-2. **Structural vs nominal *within composition*** — nominal id-matching stays for references (0029 §4),
-   but *carry/project* is structural by nature (pick fields). How do the two coexist in the schema and
-   the diagnostics?
-3. **Metadata schema & namespace** — the nano extension-element vocabulary for §5 (shape-level extend
-   fields vs model-level metadata) and how much is free-form vs typed.
-4. **Reference/cycle grain** — do we allow a motion shape to carry another motion shape from a *different*
-   model, and how aggressively do we guard cycles vs. lazily diagnose them?
+2. **Reference/cycle grain** — do we allow a motion shape to carry another motion shape from a *different*
+   model, and how aggressively do we guard cycles vs. lazily diagnose them? (§10 resolves shapes in a
+   second cross-model pass with cycle-as-diagnostic; the remaining question is whether cross-model
+   *carry* is offered in the authoring surface or restricted to same-model shapes in increment 3.)
 
 ## Increments
 
@@ -206,10 +298,24 @@ PRM's rest/face projections (0031).
     map is authoritative directly. The message `name` is a correlation identity, so it is matched verbatim
     (not trimmed). The received (`in`) type keys `publishMessage`; the `out` side is scanned but reserved
     for future correlate-response typing.
-- **2 — motion-shape carrier in the model**: store composed motion shapes as nano extension elements;
-  scan lifts them into the fuse; nominal references resolve through the fuse (§3, §6).
-- **3 — composition algebra + Modeller surface**: carry/project/extend/reference authoring (§4),
-  FK-aware, with same-id/cycle diagnostics (§6).
+- **2 — shape carrier in the model + full-algebra resolution** *(§9–§10)*: the headless engine layer.
+  - a **nano moddle descriptor** (`http://nanobpm.io/schema/shapes/1.0`) registered with bpmn-js so
+    `nano:shapes`/`nano:shape`/`nano:carry`/`nano:project`/`nano:extend`/`nano:reference`/`nano:meta`
+    parse and serialise;
+  - pure **read/write carrier helpers** (a `shapeCarrier.ts` sibling of `dataEnvelope.ts`, unit-tested)
+    so a shape declaration round-trips in the `.bpmn` as undoable modeling commands;
+  - a **Rust model scan** (extend `envelope_scan.rs`/a new `shape_scan.rs`) lifting `nano:shape`
+    declarations into a `derivedShapes` payload injected on the `domaintypes` op;
+  - **full-algebra fuse resolution** in the reifier (all four operations at once, §10), folding
+    resolved shapes into the `DomainTypes` registry `emitDomainModel` already consumes, with the §10
+    diagnostics returned by the op. No sophisticated UI yet — a raw list/JSON view is enough to prove
+    the round-trip and the emitted types.
+- **3 — composition authoring surface** *(§4 / Consequences)*: the sophisticated visual
+  structural-type composer in the Modeller — add/reorder carry/project/extend/reference rows,
+  FK-path pickers for `project.via`, scalar/entity type pickers for `extend`, live-resolved field
+  preview, and inline rendering of the §10 diagnostics. The **Data envelope** pickers (ADR 0033 §6)
+  gain composed `nano:shape` ids as selectable envelope types, closing the loop from authoring a shape
+  to typing a worker/message against it.
 - **4 — external-shape contracts** *(source #3)*: a standalone external-shapes artifact (its own file),
   fused as leaves.
 - **5 — model & shape metadata** *(§5)*: the extension vocabulary and app-wide surfacing.
