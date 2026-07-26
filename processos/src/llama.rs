@@ -145,11 +145,17 @@ impl LaunchPlan {
                 args.push(n.to_string());
             }
         }
-        // Append the operator's extra args verbatim (e.g. "-ngl 99 -c 32768 --jinja") last, so
-        // they can override the defaults above.
-        if let Some(extra) = profile.sidecar_args.as_deref() {
-            args.extend(split_args(extra));
-        }
+        // Performance defaults (GPU offload, flash attention, prompt-prefix KV reuse). Each is
+        // suppressed when the operator already set an equivalent flag, so their value still wins.
+        let operator_args = profile
+            .sidecar_args
+            .as_deref()
+            .map(split_args)
+            .unwrap_or_default();
+        args.extend(perf_default_args(&operator_args));
+        // Append the operator's extra args verbatim (e.g. "-ngl 20 -c 32768 --jinja") last, so
+        // they can override every default above.
+        args.extend(operator_args);
 
         Ok(Self {
             bin,
@@ -202,6 +208,43 @@ fn pick_free_port(preferred: Option<u16>, exclude: &[u16]) -> Option<u16> {
     }
     (PORT_BASE..PORT_BASE.saturating_add(PORT_RANGE))
         .find(|p| !exclude.contains(p) && port_bindable(*p))
+}
+
+/// llama.cpp performance defaults applied to every sidecar launch, each suppressed when the
+/// operator's `sidecar_args` already sets an equivalent flag (matched on the listed aliases) so
+/// the operator's value always wins. Conservative and fully overridable:
+///  * `-ngl 99` — offload all layers to the GPU: the single biggest local-inference speedup on a
+///    GPU/Metal build, and a no-op on a CPU-only build. Operators on a VRAM-limited GPU can cap it
+///    with their own `-ngl N`.
+///  * `-fa` — flash attention: faster attention and a smaller KV cache.
+///  * `--cache-reuse 256` — reuse the KV cache across a shared prompt prefix, a large per-turn win
+///    for ProcessOS's fixed investigation system prompt.
+///
+/// Each entry is `(canonical argv, &[aliases that suppress it])`.
+const PERF_DEFAULTS: &[(&[&str], &[&str])] = &[
+    (&["-ngl", "99"], &["-ngl", "--gpu-layers", "--n-gpu-layers"]),
+    (&["-fa"], &["-fa", "--flash-attn"]),
+    (&["--cache-reuse", "256"], &["--cache-reuse"]),
+];
+
+/// The perf defaults to insert for a launch, given the operator's already-split extra args. A
+/// default is skipped when any of its alias flags is already present, so we never emit a duplicate
+/// flag or clobber an operator-provided value.
+fn perf_default_args(operator_args: &[String]) -> Vec<String> {
+    // Match on the flag portion only, so an operator's `--flag=value` form (e.g.
+    // `--cache-reuse=512`) suppresses the default just like the spaced `--flag value` form.
+    let present: std::collections::HashSet<&str> = operator_args
+        .iter()
+        .map(|a| a.split('=').next().unwrap_or(a.as_str()))
+        .collect();
+    let mut out = Vec::new();
+    for (argv, aliases) in PERF_DEFAULTS {
+        if aliases.iter().any(|a| present.contains(a)) {
+            continue;
+        }
+        out.extend(argv.iter().map(|s| (*s).to_string()));
+    }
+    out
 }
 
 /// Split a free-text args string into argv on whitespace, honouring simple single/double quotes
@@ -889,6 +932,11 @@ mod tests {
                 "127.0.0.1",
                 "--port",
                 "8888",
+                // Perf defaults: -ngl is suppressed (operator set it below); -fa + --cache-reuse
+                // are inserted before the operator args.
+                "-fa",
+                "--cache-reuse",
+                "256",
                 "-ngl",
                 "99",
                 "-c",
@@ -974,6 +1022,54 @@ mod tests {
             .args
             .iter()
             .any(|x| x == "--draft-max" || x == "--draft-min"));
+    }
+
+    #[test]
+    fn perf_defaults_added_and_overridable() {
+        // No operator args → all three defaults present.
+        let p = profile("m.gguf", "http://127.0.0.1:8080/v1", None);
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, None).unwrap();
+        let a = &plan.args;
+        assert!(a.windows(2).any(|w| w[0] == "-ngl" && w[1] == "99"));
+        assert!(a.iter().any(|x| x == "-fa"));
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "--cache-reuse" && w[1] == "256"));
+
+        // Operator-set flags suppress the matching default (incl. aliases) — no duplicate, and the
+        // operator's value wins.
+        let p = profile(
+            "m.gguf",
+            "http://127.0.0.1:8080/v1",
+            Some("--gpu-layers 20 -fa --cache-reuse 512"),
+        );
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, None).unwrap();
+        let a = &plan.args;
+        // -ngl default suppressed by the --gpu-layers alias.
+        assert!(!a.iter().any(|x| x == "-ngl"));
+        assert!(a.windows(2).any(|w| w[0] == "--gpu-layers" && w[1] == "20"));
+        // -fa appears exactly once (default suppressed by operator's own -fa).
+        assert_eq!(a.iter().filter(|x| *x == "-fa").count(), 1);
+        // --cache-reuse appears once with the operator's value, not the default 256.
+        assert_eq!(a.iter().filter(|x| *x == "--cache-reuse").count(), 1);
+        assert!(a
+            .windows(2)
+            .any(|w| w[0] == "--cache-reuse" && w[1] == "512"));
+
+        // The `--flag=value` form also suppresses the matching default (no duplicate flag).
+        let p = profile(
+            "m.gguf",
+            "http://127.0.0.1:8080/v1",
+            Some("--gpu-layers=20 --cache-reuse=512"),
+        );
+        let plan = LaunchPlan::build(&p, Path::new("/models"), None, 8080, None).unwrap();
+        let a = &plan.args;
+        assert!(!a.iter().any(|x| x == "-ngl"));
+        assert!(!a.iter().any(|x| x == "--cache-reuse"));
+        assert!(a.iter().any(|x| x == "--gpu-layers=20"));
+        assert!(a.iter().any(|x| x == "--cache-reuse=512"));
+        // -fa was not overridden, so its default is still present.
+        assert!(a.iter().any(|x| x == "-fa"));
     }
 
     #[test]
