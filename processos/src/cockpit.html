@@ -425,6 +425,10 @@
   .dep-warn { display: flex; align-items: flex-start; gap: 10px; background: var(--po-warn-wash); border: 1px solid var(--po-warn-edge); border-radius: 10px; padding: 10px 12px; color: var(--po-warn-soft); font-size: 13px; line-height: 1.5; }
   .dep-warn-body { flex: 1; }
   .dep-warn .dep-purpose { color: var(--po-warn-soft); }
+  /* Advisory (non-blocking, e.g. CPU-only llama.cpp): softer than a missing-tool warning. */
+  .dep-warn.dep-advisory { background: var(--po-panel); border-color: var(--po-border); color: var(--po-text-faint); }
+  .dep-warn.dep-advisory a { color: var(--po-accent-strong); }
+  .dep-warn.dep-advisory .dep-x { color: var(--po-text-faint); }
   .dep-warn a { color: var(--po-warn); font-weight: 600; white-space: nowrap; }
   .dep-x { background: transparent; border: none; color: var(--po-warn-soft); font-size: 18px; line-height: 1; cursor: pointer; padding: 0 2px; }
   .dep-x:hover { color: var(--po-text); }
@@ -1083,9 +1087,13 @@ async function refreshDeps(){
   const host = document.getElementById('depBanner');
   if(!host) return;
   let st; try { st = await api('/api/system/dependencies'); } catch(e){ host.innerHTML=''; return; }
-  const missing = ((st && st.dependencies) || []).filter(d => !d.present && !DEPS_DISMISSED[d.id]);
-  if(!missing.length){ host.innerHTML=''; return; }
-  host.innerHTML = missing.map(d =>
+  const deps = (st && st.dependencies) || [];
+  const missing = deps.filter(d => !d.present && !DEPS_DISMISSED[d.id]);
+  // Present tools can still carry a non-blocking advisory `note` (e.g. a CPU-only
+  // llama.cpp build that makes local inference slow) — surface those too.
+  const advisories = deps.filter(d => d.present && d.note && !DEPS_DISMISSED[d.id]);
+  if(!missing.length && !advisories.length){ host.innerHTML=''; return; }
+  const missingHtml = missing.map(d =>
     '<div class="dep-warn" data-dep="'+esc(d.id)+'">'
     + '<div class="dep-warn-body">'
     + '<b>'+esc(d.name)+' is not installed.</b> '
@@ -1095,7 +1103,18 @@ async function refreshDeps(){
     + '</div>'
     + '<button class="dep-x" data-dismiss="'+esc(d.id)+'" title="Dismiss">×</button>'
     + '</div>'
-  ).join('');
+  );
+  const advisoryHtml = advisories.map(d =>
+    '<div class="dep-warn dep-advisory" data-dep="'+esc(d.id)+'">'
+    + '<div class="dep-warn-body">'
+    + '<b>'+esc(d.name)+':</b> '
+    + esc(d.note)
+    + ' <a href="'+esc(d.installUrl)+'" target="_blank" rel="noopener">Install instructions →</a>'
+    + '</div>'
+    + '<button class="dep-x" data-dismiss="'+esc(d.id)+'" title="Dismiss">×</button>'
+    + '</div>'
+  );
+  host.innerHTML = missingHtml.concat(advisoryHtml).join('');
   host.querySelectorAll('[data-dismiss]').forEach(b => b.addEventListener('click', () => {
     DEPS_DISMISSED[b.getAttribute('data-dismiss')] = true; refreshDeps();
   }));

@@ -37,6 +37,15 @@ pub struct Dependency {
     pub install_url: &'static str,
     /// A one-line, actionable hint shown when the tool is missing.
     pub hint: String,
+    /// Whether the tool is a hardware-accelerated build, when it can be determined.
+    /// `Some(true)` = a GPU/Metal/Vulkan/… backend is available; `Some(false)` = a
+    /// CPU-only build; `None` = not applicable (Deno) or undeterminable (older
+    /// `llama-server` without `--list-devices`).
+    pub accelerated: Option<bool>,
+    /// A non-blocking advisory shown even when the tool is present (e.g. a CPU-only
+    /// llama.cpp build that will make local inference slow). Distinct from `hint`,
+    /// which is reserved for the missing-tool case.
+    pub note: Option<String>,
 }
 
 /// Probe `<bin> --version`. Returns `Some(first non-empty output line)` when the
@@ -105,7 +114,33 @@ fn check_deno() -> Dependency {
             "Deno was not found. Install it (see the link) so `deno` is on PATH, or set NANOBPMN_DENO_BIN to its path. Until then, embedded Nano workers cannot run."
                 .to_string()
         },
+        accelerated: None,
+        note: None,
     }
+}
+
+/// Best-effort backend probe: ask `llama-server --list-devices` and look for a hardware
+/// accelerator in its output. `Some(true)` = a GPU/Metal/Vulkan/… device is available;
+/// `Some(false)` = it ran but reported only CPU; `None` = couldn't tell (an older build without
+/// the flag, or the spawn failed) — in which case we stay quiet rather than nag. The flag only
+/// enumerates devices; it does not load a model, so it is cheap.
+fn detect_llama_accel(bin: &str) -> Option<bool> {
+    let out = Command::new(bin).arg("--list-devices").output().ok()?;
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    let lc = text.to_ascii_lowercase();
+    // Accelerator backend markers llama.cpp prints when a GPU device or backend is present.
+    const ACCEL: &[&str] = &[
+        "cuda", "metal", "vulkan", "rocm", "hip", "sycl", "cann", "musa", "opencl",
+    ];
+    if ACCEL.iter().any(|k| lc.contains(k)) {
+        return Some(true);
+    }
+    // The flag was recognised (it printed a device listing) but no accelerator appeared → CPU-only.
+    if lc.contains("available devices") || lc.contains("device") {
+        return Some(false);
+    }
+    None
 }
 
 /// Resolve the `llama-server` binary ProcessOS supervises: the operator-configured
@@ -119,6 +154,25 @@ fn check_llama(llama_bin: Option<&str>) -> Dependency {
     let probed = probe(&bin);
     let present = probed.is_some();
     let version = probed.filter(|s| !s.is_empty());
+
+    // Only worth probing the backend when the binary is actually present.
+    let accelerated = if present {
+        detect_llama_accel(&bin)
+    } else {
+        None
+    };
+    // A non-blocking advisory when the present binary is a CPU-only build: local inference will be
+    // slow and the `-ngl` GPU-offload default is a no-op until an accelerated build is installed.
+    let note = if accelerated == Some(false) {
+        Some(
+            "llama-server appears to be a CPU-only build — local model inference will be slow. \
+             Install a GPU-accelerated build (CUDA / Metal / Vulkan / ROCm) so GPU offload (-ngl) \
+             takes effect."
+                .to_string(),
+        )
+    } else {
+        None
+    };
 
     Dependency {
         id: "llama",
@@ -134,6 +188,8 @@ fn check_llama(llama_bin: Option<&str>) -> Dependency {
             "`llama-server` was not found. Install llama.cpp (see the link) so it is on PATH, or set the llama binary path in Settings. Until then, local model sidecars cannot start."
                 .to_string()
         },
+        accelerated,
+        note,
     }
 }
 
@@ -178,5 +234,16 @@ mod tests {
         assert_eq!(dep.bin, "/no/such/llama-server");
         assert!(!dep.present);
         assert!(!dep.hint.is_empty());
+        // A missing binary is never probed for acceleration and carries no advisory note.
+        assert_eq!(dep.accelerated, None);
+        assert_eq!(dep.note, None);
+    }
+
+    #[test]
+    fn accel_probe_is_unknown_for_a_missing_binary() {
+        assert_eq!(
+            detect_llama_accel("definitely-not-a-real-binary-xyzzy-42"),
+            None
+        );
     }
 }
