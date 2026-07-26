@@ -1,11 +1,10 @@
 <!--
 VENDORED COPY — DO NOT treat as upstream.
 
-This is proc-macro-error2 v2.0.1 from crates.io with a single local change carried
-from upstream PR GnomedDev/proc-macro-error-2#14 ("Fix future incompatibility"):
+This is proc-macro-error2 v2.0.1 from crates.io with a small local patch carried
+from upstream PR GnomedDev/proc-macro-error-2#14 ("Fix future incompatibility") plus a short repo-local note:
 
   src/lib.rs:  `extern crate proc_macro;`  ->  `#[doc(hidden)] pub extern crate proc_macro;`
-
 Rationale: the crate's hidden `__export` module does `pub use proc_macro;`, which
 re-exports a *private* extern crate and trips rustc future-incompat lint E0365
 (rust-lang/rust#127909) — slated to become a hard error. This crate is pulled in
