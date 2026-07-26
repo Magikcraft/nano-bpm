@@ -1652,9 +1652,26 @@ pub async fn run_data_op(
 ) -> Result<serde_json::Value, DataError> {
     use tokio::io::AsyncWriteExt;
 
+    let mut request = request;
     let dir = project_dir(project).ok_or(DataError::NoProject)?;
     if !dir.is_dir() {
         return Err(DataError::NoProject);
+    }
+    // Model-first worker IO (ADR 0040 slice 1 / ADR 0033 §6 increment 12): the
+    // BPMN model is the source of truth for the data-envelope worker map, so for
+    // the reifying op we derive `taskType -> {in,out}` from the project's process
+    // models and inject it as `derivedWorkers`. The reifier overlays it on the
+    // manifest `workers[]` (which still carries non-IO bindings like `llm`), so
+    // the emitted `worker-io.d.ts` reflects the model, not a hand-maintained
+    // projection that can drift.
+    if request.get("op").and_then(|v| v.as_str()) == Some("domaintypes")
+        && let Some(obj) = request.as_object_mut()
+    {
+        let derived = super::envelope_scan::scan_project_worker_io(&dir);
+        obj.insert(
+            "derivedWorkers".to_string(),
+            serde_json::to_value(derived).unwrap_or(serde_json::Value::Null),
+        );
     }
     // The gateway runs the data CLI Node-first: Node (>= 22.6) is always present
     // (the npm launcher is Node), so it is the primary path; Deno is an equal
@@ -4698,6 +4715,131 @@ mod tests {
         let wt = std::fs::read_to_string(dir.join("nano-generated/workers.ts")).unwrap();
         assert_eq!(wt, WORKERS_TS);
         assert!(wt.contains("export function defineWorker<K extends WorkerTaskType>("));
+    }
+
+    /// Write a one-service-task process model carrying a data envelope into a
+    /// project's `resources/processes/`, so the server-side model scan (ADR 0040
+    /// slice 1) can derive the worker IO from it.
+    #[cfg(test)]
+    fn write_envelope_model(dir: &std::path::Path, job: &str, env_in: &str, env_out: &str) {
+        let procs = dir.join("resources").join("processes");
+        std::fs::create_dir_all(&procs).unwrap();
+        let mut props = String::new();
+        if !env_in.is_empty() {
+            props.push_str(&format!(
+                r#"<zeebe:property name="io.nanobpm.dataEnvelope.in" value="{env_in}" />"#
+            ));
+        }
+        if !env_out.is_empty() {
+            props.push_str(&format!(
+                r#"<zeebe:property name="io.nanobpm.dataEnvelope.out" value="{env_out}" />"#
+            ));
+        }
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:serviceTask id="t" name="t">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="{job}" />
+        <zeebe:properties>{props}</zeebe:properties>
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+  </bpmn:process>
+</bpmn:definitions>"#
+        );
+        std::fs::write(procs.join("p.bpmn"), xml).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_derives_worker_io_from_the_model() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "modelio";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The manifest declares the types but NO `workers[]` at all: the envelope
+        // lives only in the model (ADR 0040 — the model is authoritative).
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{
+                "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" }
+                } },
+                "types": {
+                    "Order": { "fields": { "item": { "type": "string" } } },
+                    "Receipt": { "fields": { "total": { "type": "integer" } } }
+                }
+            }"#,
+        )
+        .unwrap();
+        write_envelope_model(&dir, "charge", "Order", "Receipt");
+        ensure_project_sdk(name).unwrap();
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let wb = dt["workerBindings"].as_str().unwrap();
+        // The typed worker map is derived from the model, with no manifest
+        // `workers[]` entry backing it.
+        assert!(wb.contains("export type WorkerTaskType = \"charge\";"));
+        assert!(wb.contains("\"charge\": DomainTypes[\"Order\"];"));
+        assert!(wb.contains("\"charge\": DomainTypes[\"Receipt\"];"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_model_worker_io_overrides_a_stale_manifest_projection() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "staleio";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The manifest carries a STALE projection (`charge` → input `Wrong`) plus a
+        // non-IO worker binding (`notify`, kept for its `llm` binding). The model
+        // says `charge` carries `Order` and no output. The model must win, and the
+        // unrelated `notify` binding must survive.
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{
+                "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" }
+                } },
+                "types": {
+                    "Order": { "fields": { "item": { "type": "string" } } },
+                    "Wrong": { "fields": { "x": { "type": "string" } } }
+                },
+                "workers": [
+                    { "taskType": "charge", "inputType": "Wrong", "outputType": "Wrong" },
+                    { "taskType": "notify", "llm": "gpt" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        write_envelope_model(&dir, "charge", "Order", "");
+        ensure_project_sdk(name).unwrap();
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let wb = dt["workerBindings"].as_str().unwrap();
+        // The model's input wins; the stale `Wrong` input/output are gone.
+        assert!(wb.contains("\"charge\": DomainTypes[\"Order\"];"));
+        assert!(!wb.contains("DomainTypes[\"Wrong\"]"));
+        // The model carries no output for `charge`, so no output entry remains.
+        assert!(!wb.contains("export interface WorkerOutputs {\n"));
+        // The unrelated manifest worker (no service task) is preserved in the union.
+        assert!(wb.contains("\"notify\""));
     }
 
     #[tokio::test]

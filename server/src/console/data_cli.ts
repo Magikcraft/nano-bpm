@@ -21,7 +21,7 @@
 //   op = "sources" | "schema" | "query" | "exec" | "script" | "migrations"
 //      | "migrate" | "domaintypes"
 
-import { listSources, manifestTypes, manifestWorkers, openDataSource } from "./data-sdk.ts";
+import { listSources, manifestTypes, manifestWorkers, openDataSource, type WorkerDecl } from "./data-sdk.ts";
 import {
   DOMAIN_BINDINGS,
   DOMAIN_DTS,
@@ -44,6 +44,43 @@ interface Request {
   statements?: string[];
   /** `domaintypes`: also write `nano-generated/domain-rows.d.ts` (default true). */
   write?: boolean;
+  /**
+   * `domaintypes`: the model-derived worker-IO map (`taskType -> {in,out}`),
+   * scanned from the process models by the server (ADR 0040 slice 1 / ADR 0033
+   * §6 increment 12). When present, it is the authoritative source of each
+   * worker's envelope types; it is overlaid on the manifest `workers[]` (which
+   * still carries non-IO bindings such as `llm`). Absent → fall back to the
+   * manifest projection alone.
+   */
+  derivedWorkers?: WorkerDecl[];
+}
+
+/**
+ * Overlay the model-derived worker-IO map onto the manifest `workers[]`. The
+ * model is authoritative for the envelope (`inputType`/`outputType`), so every
+ * scanned `taskType` takes its I/O from `derived` (clearing a stale manifest
+ * value when the model carries none); manifest entries the scan did not cover
+ * (e.g. a worker declared only for an `llm` binding, with no service task) are
+ * preserved. New `taskType`s seen only in the model are appended.
+ */
+export function overlayDerivedWorkerIo(
+  manifest: WorkerDecl[],
+  derived: WorkerDecl[],
+): WorkerDecl[] {
+  const byType = new Map<string, WorkerDecl>();
+  for (const w of manifest) byType.set(w.taskType, { ...w });
+  for (const d of derived) {
+    const existing = byType.get(d.taskType);
+    const merged: WorkerDecl = existing
+      ? { ...existing, taskType: d.taskType }
+      : { taskType: d.taskType };
+    if (d.inputType) merged.inputType = d.inputType;
+    else delete merged.inputType;
+    if (d.outputType) merged.outputType = d.outputType;
+    else delete merged.outputType;
+    byType.set(d.taskType, merged);
+  }
+  return [...byType.values()];
 }
 
 // Runtime adapter (ADR 0036/0038): the host calls that differ between Deno
@@ -320,12 +357,16 @@ async function run(req: Request): Promise<unknown> {
       // generated alongside the `.d.ts` spine so workers get both the row types
       // and the runtime gateway from one op.
       const bindings = emitDomainBindings(schemas, def);
-      // The worker-IO map (ADR 0033 §3): `taskType → {in,out}` from the manifest
-      // `workers[]` (inputType/outputType) resolved against the declared types, so
-      // the typed `defineWorker` types a handler by its job type. The runtime
-      // wrapper (`workers.ts`) is static — it re-exports the SDK and overrides
-      // `defineWorker` — so it is written verbatim.
-      const workers = await manifestWorkers();
+      // The worker-IO map (ADR 0033 §3): `taskType → {in,out}`. The model is the
+      // source of truth for the envelope, so when the server injected the
+      // model-derived map (`derivedWorkers`) it is overlaid on the manifest
+      // `workers[]` (which still carries non-IO bindings). This retires the
+      // hand-maintained projection as the authority (ADR 0040 slice 1). The
+      // runtime wrapper (`workers.ts`) is static — written verbatim.
+      const manifestW = await manifestWorkers();
+      const workers = req.derivedWorkers
+        ? overlayDerivedWorkerIo(manifestW, req.derivedWorkers)
+        : manifestW;
       const workerBindings = emitWorkerBindings(workers, Object.keys(types));
       const workerRuntime = emitWorkerBindingsRuntime();
       let path: string | null = null;
