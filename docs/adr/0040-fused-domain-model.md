@@ -142,7 +142,7 @@ models + datasources + external contracts, not a build-once artifact.
 
 The console already scans nothing from the model; ADR 0033 increment 12 — "derive `workers[]` I/O from
 the process models (Rust `parse_bpmn`) on regen, retiring the modeler-maintained projection" — **is the
-first slice of §6's scan pipeline**:
+first slice of the scan-and-rebuild pipeline** (§7 scans models into the fuse; §6 supplies the fuse rules):
 
 1. `parse_bpmn` the project's models → extract motion shapes + task/message I/O bindings + metadata.
 2. Contribute them to the fuse (leaves-first, then models, §6).
