@@ -9,6 +9,9 @@ import BpmnModeler, {
 import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
 import FormPreview from "../components/FormPreview";
+import ShapeComposer, { type ShapePreview } from "../components/ShapeComposer";
+import type { ShapeDecl } from "../lib/shapeCarrier";
+import type { ComposerEntity } from "../lib/shapeComposer";
 import AppManifestEditor, { isAppManifestPath } from "../components/AppManifestEditor";
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 const DataPanel = lazy(() => import("../components/DataPanel"));
@@ -18,7 +21,10 @@ import {
   createProjectPath,
   deleteProjectPath,
   getProject,
+  getDataSchema,
+  getDataSources,
   listProjectFiles,
+  previewDomainTypes,
   runProject,
   saveProjectConfig,
   saveProjectFile,
@@ -1264,6 +1270,115 @@ function EditorPane({
     return typeof d === "string" ? d : undefined;
   }, [manifest]);
 
+  // --- Composed-shape composer (ADR 0040 §9/§10) -----------------------------
+  // The composer is a right-side drawer over the BPMN canvas that edits the
+  // primary process's `nano:shape` set via the modeler handle (undoable). Its
+  // `shapes` are mirrored into local state so React re-renders as the maker
+  // edits, and re-synced whenever the model changes (undo/redo, XML round-trip).
+  const [shapesOpen, setShapesOpen] = useState(false);
+  const [composerShapes, setComposerShapes] = useState<ShapeDecl[]>([]);
+  const [composerEntities, setComposerEntities] = useState<ComposerEntity[]>([]);
+
+  // The fuse leaf entities the composer's pickers offer: every DB table (across
+  // datasources) as a `carry`/`project` source with its columns + FK paths, and
+  // every manifest `type` as a nominal `extend`/`reference` target. Loaded when
+  // the drawer opens; sibling composed shapes are merged in client-side from the
+  // live preview (ShapeComposer).
+  const loadComposerEntities = useCallback(async () => {
+    const tableEntities: ComposerEntity[] = [];
+    try {
+      const srcRes = await getDataSources({ path: { name }, throwOnError: true });
+      const sources = (srcRes.data.sources ?? []).map((s) => s.name);
+      for (const source of sources) {
+        try {
+          const schema = await getDataSchema({ path: { name, source }, throwOnError: true });
+          for (const t of schema.data.tables ?? []) {
+            // Qualify table ids as `source.table` — the server always indexes a
+            // table under that unambiguous alias (and FK targets are stored
+            // qualified), so this disambiguates same-named tables across sources
+            // and lets the composer author a qualified ref. Bare names would
+            // collide silently across datasources.
+            tableEntities.push({
+              id: `${source}.${t.name}`,
+              kind: "table",
+              fields: t.columns.map((c) => c.name),
+              fks: t.foreignKeys.map((fk) => ({
+                column: fk.column,
+                refId: `${source}.${fk.refTable}`,
+              })),
+            });
+          }
+        } catch {
+          // A datasource that fails to introspect just contributes no tables.
+        }
+      }
+    } catch {
+      // No datasources configured — tables simply aren't offered.
+    }
+    const typeEntities: ComposerEntity[] = domainTypeIds.map((id) => ({
+      id,
+      kind: "type",
+      fields: [],
+    }));
+    setComposerEntities([...tableEntities, ...typeEntities]);
+  }, [name, domainTypeIds]);
+
+  // Resolve the in-editor shapes server-side (the preview endpoint bypasses the
+  // saved-model scan, so unsaved edits are reflected). `source` is nominal — the
+  // CLI unions every datasource regardless of the path param.
+  const previewShapes = useCallback(
+    async (shapes: ShapeDecl[]): Promise<ShapePreview> => {
+      const source = defaultDataSource ?? dataSourceNames[0] ?? "default";
+      const r = await previewDomainTypes({
+        path: { name, source },
+        body: { shapes },
+        throwOnError: true,
+      });
+      return { text: r.data.text, diagnostics: r.data.shapeDiagnostics ?? [] };
+    },
+    [name, defaultDataSource, dataSourceNames],
+  );
+
+  // Open the drawer: seed the shapes from the model and (re)load the picker
+  // entities. Only meaningful for a BPMN model in an App project (a manifest).
+  const openShapes = useCallback(() => {
+    setComposerShapes(bpmnRef.current?.getShapes() ?? []);
+    void loadComposerEntities();
+    setShapesOpen(true);
+  }, [loadComposerEntities]);
+
+  // Persist an edited shape set to the model (one undoable command) and mirror it
+  // into local state so the drawer reflects the edit immediately. The write fires
+  // `commandStack.changed`, so `composerWriteRef` marks it as self-inflicted for
+  // `onBpmnChange` to skip the resync (the controlled React state is already
+  // authoritative — a resync would `readShapes` and drop a mid-rename blank id).
+  const composerWriteRef = useRef(false);
+  const onShapesChange = useCallback((next: ShapeDecl[]) => {
+    composerWriteRef.current = true;
+    bpmnRef.current?.setShapes(next);
+    setComposerShapes(next);
+    setDirty(true);
+  }, []);
+
+  // Re-read shapes from the model on any *external* diagram change while the drawer
+  // is open, so undo/redo and XML-tab round-trips keep the composer in sync. A
+  // change from our own `setShapes` is skipped (controlled state already holds it),
+  // so clearing the Id input mid-rename can't momentarily drop the shape.
+  const onBpmnChange = useCallback(() => {
+    setDirty(true);
+    if (composerWriteRef.current) {
+      composerWriteRef.current = false;
+      return;
+    }
+    if (shapesOpen) setComposerShapes(bpmnRef.current?.getShapes() ?? []);
+  }, [shapesOpen]);
+
+  // Close the drawer when leaving the BPMN model (file switch / not a manifest).
+  useEffect(() => {
+    if (kind !== "bpmn" || manifest == null) setShapesOpen(false);
+  }, [kind, manifest, path]);
+
+
   useEffect(() => {
     let alive = true;
     setContent(null);
@@ -1630,6 +1745,19 @@ function EditorPane({
             Test
           </button>
         )}
+        {kind === "bpmn" && manifest != null && (
+          <button
+            onClick={() => (shapesOpen ? setShapesOpen(false) : openShapes())}
+            title="Author composed motion shapes (ADR 0040)"
+            className={`rounded-md border px-3 py-1 text-xs font-medium transition-colors ${
+              shapesOpen
+                ? "border-accent text-accent-strong"
+                : "border-edge-strong text-fg hover:border-accent hover:text-accent-strong"
+            }`}
+          >
+            Shapes
+          </button>
+        )}
         <button
           onClick={() => void save()}
           disabled={saving || !dirty}
@@ -1647,7 +1775,7 @@ function EditorPane({
               The XML editor is layered above via absolute positioning.
             */}
             <div className={bpmnView === "visual" ? "h-full" : "h-full invisible"}>
-              <BpmnModeler ref={bpmnRef} onChange={() => setDirty(true)} getVariables={bpmnGetVariables} components={components} domainTypeBinding={bpmnDomainTypeBinding} />
+              <BpmnModeler ref={bpmnRef} onChange={onBpmnChange} getVariables={bpmnGetVariables} components={components} domainTypeBinding={bpmnDomainTypeBinding} />
             </div>
             {bpmnView === "xml" && (
               <div className="absolute inset-0 bg-app">
@@ -1675,6 +1803,17 @@ function EditorPane({
                 >
                   <TestRunPanel xml={testXml} onClose={() => setTestXml(null)} />
                 </Suspense>
+              </div>
+            )}
+            {shapesOpen && (
+              <div className="absolute inset-y-0 right-0 z-20 w-[36rem] max-w-full border-l border-edge shadow-xl">
+                <ShapeComposer
+                  shapes={composerShapes}
+                  entities={composerEntities}
+                  onShapesChange={onShapesChange}
+                  preview={previewShapes}
+                  onClose={() => setShapesOpen(false)}
+                />
               </div>
             )}
             {startModalOpen && primaryProcessId && (

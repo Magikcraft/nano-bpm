@@ -2970,6 +2970,37 @@ pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiRes
     .await
 }
 
+/// `POST /console/api/projects/{name}/data/{source}/domaintypes/preview` — resolve
+/// the composed shapes the modeller is editing (sent in the body) for the shape
+/// composer's live field preview + inline diagnostics (ADR 0040 §9/§10). It avoids
+/// the saved-model scan (the caller-supplied `derivedShapes` win over the disk scan
+/// in `run_data_op`) and, with `write:false`, does not materialise the `domaintypes`
+/// outputs (`domain-rows.d.ts` + the worker/message bindings) — so it never
+/// regenerates the typed SDK the maker consumes. (It still runs through
+/// `run_data_op`, which ensures the `nano-generated/` SDK scaffolding exists.)
+pub(super) async fn project_data_preview_domaintypes(
+    name: &str,
+    source: &str,
+    shapes: serde_json::Value,
+) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({
+            "op": "domaintypes",
+            "source": source,
+            "write": false,
+            "derivedShapes": shapes,
+            // The preview only needs `text` + `shapeDiagnostics` (both independent
+            // of worker/message IO), so supply empty lists: with all three derived
+            // maps present, `run_data_op` skips the `resources/processes/*.bpmn`
+            // scan entirely on this debounced, latency-sensitive path.
+            "derivedWorkers": [],
+            "derivedMessages": [],
+        }),
+    )
+    .await
+}
+
 // --- triggers (ADR 0025) --------------------------------------------------
 
 fn trigger_error(e: triggers::TriggerError) -> (StatusCode, String) {

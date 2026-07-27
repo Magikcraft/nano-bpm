@@ -319,12 +319,29 @@ is omitted from `DomainTypes` (so a broken shape degrades to untyped, it does no
     resolved shapes into the `DomainTypes` registry `emitDomainModel` already consumes, with the §10
     diagnostics returned by the op. No sophisticated UI yet — a raw list/JSON view is enough to prove
     the round-trip and the emitted types.
-- **3 — composition authoring surface** *(§4 / Consequences)*: the sophisticated visual
-  structural-type composer in the Modeller — add/reorder carry/project/extend/reference rows,
-  FK-path pickers for `project.via`, scalar/entity type pickers for `extend`, live-resolved field
-  preview, and inline rendering of the §10 diagnostics. The **Data envelope** pickers (ADR 0033 §6)
-  gain composed `nano:shape` ids as selectable envelope types, closing the loop from authoring a shape
-  to typing a worker/message against it.
+- **3 — composition authoring surface** *(§4 / Consequences)* — **done (PR: shape-composer-ui)**: the
+  sophisticated visual structural-type composer in the Modeller. A dedicated React drawer
+  (`ShapeComposer.tsx`) over the BPMN canvas, opened by a **Shapes** toolbar button on any BPMN model
+  in an App project. It edits the primary process's `nano:shape` set through the modeler handle
+  (`BpmnModeler` gains `getShapes()`/`setShapes()`, each write one undoable modeling command via
+  `shapeCarrier.writeShapes`), so composer edits share the diagram's undo stack and dirty state.
+  - add/reorder/remove carry/project/extend/reference rows (author order is the fold order, so
+    reordering is a first-class edit), FK-path input for `project.via`, scalar/entity type pickers for
+    `extend`, and multi-select field pickers for `project`;
+  - **live-resolved field preview + inline §10 diagnostics** via a new server round-trip preview
+    endpoint, `POST /projects/{name}/data/{source}/domaintypes/preview` (`previewDomainTypes`). It
+    resolves the *in-editor* shapes (posted in the body) instead of the saved-model scan — `run_data_op`
+    injects the caller-supplied `derivedShapes` only when absent, and runs with `write:false` — so the
+    preview reflects unsaved edits without writing the generated files. Reuses the same `resolveShapes`
+    path as the reifier, so there is no drift between preview and build. Debounced (350ms,
+    request-id-guarded) so a burst of edits collapses to one round-trip;
+  - the pure editing/parsing rules live in `shapeComposer.ts` (unit-tested, no modeler/server), including
+    `shapeEntities` which folds sibling shapes into the pickers (so a shape can be composed from other
+    shapes, with their preview-resolved fields);
+  - the **Data envelope** pickers (ADR 0033 §6) gain composed `nano:shape` ids (across every process) as
+    selectable envelope types, closing the loop from authoring a shape to typing a worker/message against
+    it. (Deferred: cross-model `carry`/OQ2 — the composer offers only same-model + fused-datasource
+    entities; a nominal ref to a shape/type in another model is not yet an authoring affordance.)
 - **4 — external-shape contracts** *(source #3)*: a standalone external-shapes artifact (its own file),
   fused as leaves.
 - **5 — model & shape metadata** *(§5)*: the extension vocabulary and app-wide surfacing.
