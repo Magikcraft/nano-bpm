@@ -325,6 +325,16 @@ export function emitDomainBindings(
   const primary = sources.find((s) => s.source === def);
   const tables = primary?.tables ?? [];
 
+  // Multi-source apps: emit a *keyed* accessor so `openDomain("analytics")` is
+  // typed against that source's tables, not the default's. The row-type spine
+  // (`DomainSources`, keyed by alias then wire table name) is already emitted in
+  // `domain-rows.d.ts`; here we bind a runtime table-descriptor map per source and
+  // a generic `openDomain<K>` that indexes it. Single-source apps keep the
+  // zero-arg concrete form below (byte-stable).
+  if (multi) {
+    return emitKeyedDomainBindings(header, sources, def!);
+  }
+
   // Interface names must match `domain-rows.d.ts` exactly (prefixed when multi-source).
   const typeName = (table: string) =>
     multi ? prefixedInterfaceName(primary!.source, table) : interfaceName(table);
@@ -369,7 +379,71 @@ export function emitDomainBindings(
     `\n${domainIface}\n\n${openFn}\n\nexport type { Table };\n`;
 }
 
-// --- worker bindings: typed job workers keyed by taskType (ADR 0033 §3) ------
+/**
+ * Emit the *keyed* `domain.ts` for a multi-datasource App. `openDomain(source)`
+ * is runtime-polymorphic (it opens whichever source you name) but was previously
+ * type-*mono*morphic — always typed as the default source's `Domain`, so
+ * `openDomain("analytics").customers` was mistyped against `app`'s tables. Here
+ * `openDomain<K extends DomainSource>(source?: K)` selects the row-type map for
+ * the requested source from `DomainSources` (emitted in `domain-rows.d.ts`), and a
+ * runtime per-source table-descriptor map binds the matching `Table<T>` gateways.
+ * Zero-arg / default-source calls keep resolving to the default source.
+ */
+function emitKeyedDomainBindings(
+  header: string,
+  sources: SourceSchema[],
+  def: string,
+): string {
+  const tableDescriptors = sources
+    .map((s) => {
+      const rows = s.tables
+        .map((t) =>
+          `{ name: ${JSON.stringify(t.name)}, pk: ${JSON.stringify(primaryKeyOf(t))} }`
+        )
+        .join(", ");
+      return `  ${JSON.stringify(s.source)}: [${rows}],`;
+    })
+    .join("\n");
+
+  const runtimeMap =
+    `const DOMAIN_TABLES: Record<string, { name: string; pk: string }[]> = {\n` +
+    `${tableDescriptors}\n};\n` +
+    `const DEFAULT_SOURCE = ${JSON.stringify(def)};`;
+
+  const types =
+    `/** The App's datasource aliases (ADR 0024). */\n` +
+    `export type DomainSource = keyof DomainSources;\n\n` +
+    `interface DomainBase {\n` +
+    `  /** The underlying datasource handle — the raw-SQL escape hatch. */\n` +
+    `  readonly raw: DataSource;\n` +
+    `  /** Close the underlying connection. */\n  close(): void;\n}\n\n` +
+    `type DomainTablesOf<M extends Record<string, object>> = { readonly [K in keyof M]: Table<M[K]> };\n\n` +
+    `/** A datasource opened as a typed domain: one \`Table<T>\` per table, plus\n` +
+    ` * \`raw\`/\`close\`. Defaults to the default source (\`${def}\`) when unparameterised. */\n` +
+    `export type Domain<M extends Record<string, object> = DomainSources[${JSON.stringify(def)}]> =\n` +
+    `  DomainBase & DomainTablesOf<M>;`;
+
+  const openFn =
+    `/**\n` +
+    ` * Open one of the App's datasources as a typed domain. The \`source\` key\n` +
+    ` * selects that source's tables (\`openDomain("analytics").customers\`); omit it\n` +
+    ` * for the default source (\`${def}\`). \`db.raw\` is the raw-SQL escape hatch.\n` +
+    ` */\n` +
+    `export async function openDomain<K extends DomainSource = ${JSON.stringify(def)}>(\n` +
+    `  source?: K,\n` +
+    `): Promise<Domain<DomainSources[K]>> {\n` +
+    `  const raw = await openDataSource(source as string | undefined);\n` +
+    `  const key = (source ?? DEFAULT_SOURCE) as string;\n` +
+    `  const db: Record<string, unknown> = { raw, close: () => raw.close() };\n` +
+    `  for (const t of DOMAIN_TABLES[key] ?? []) db[t.name] = raw.table(t.name, t.pk);\n` +
+    `  return db as Domain<DomainSources[K]>;\n}`;
+
+  return `${header}\n` +
+    `import { openDataSource, type DataSource, type Table } from "./data-sdk.ts";\n` +
+    `import type { DomainSources } from "./${DOMAIN_DTS}";\n\n` +
+    `${runtimeMap}\n\n${types}\n\n${openFn}\n\nexport type { Table };\n`;
+}
+
 
 /** The generated worker-IO type map's basename — the `taskType → {in,out}` map
  * materialised next to `domain-rows.d.ts` under a project's `nano-generated/`. */

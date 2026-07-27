@@ -299,6 +299,49 @@ Deno.test("emitDomainBindings handles an empty schema (raw-only Domain)", () => 
   assertEquals(out.includes("raw.table<"), false);
 });
 
+Deno.test("emitDomainBindings emits a keyed openDomain<K> for multiple datasources", () => {
+  const appTables: TableMeta[] = [
+    {
+      name: "orders",
+      columns: [{ name: "id", type: "INTEGER", notNull: true, primaryKey: true }],
+      indexes: [],
+      foreignKeys: [],
+    },
+  ];
+  const analyticsTables: TableMeta[] = [
+    {
+      name: "events",
+      columns: [{ name: "uuid", type: "TEXT", notNull: true, primaryKey: true }],
+      indexes: [],
+      foreignKeys: [],
+    },
+  ];
+  const out = emitDomainBindings(
+    [
+      { source: "app", tables: appTables },
+      { source: "analytics", tables: analyticsTables },
+    ],
+    "app",
+  );
+  // Row-type spine is indexed from domain-rows.d.ts (no per-interface imports).
+  assertStringIncludes(out, `import type { DomainSources } from "./${DOMAIN_DTS}";`);
+  // A source union + a generic, source-keyed accessor defaulting to "app".
+  assertStringIncludes(out, "export type DomainSource = keyof DomainSources;");
+  assertStringIncludes(
+    out,
+    'export async function openDomain<K extends DomainSource = "app">(',
+  );
+  assertStringIncludes(out, "): Promise<Domain<DomainSources[K]>> {");
+  // Per-source runtime table descriptors carrying each table's real primary key.
+  assertStringIncludes(out, 'const DEFAULT_SOURCE = "app";');
+  assertStringIncludes(out, '"app": [{ name: "orders", pk: "id" }],');
+  assertStringIncludes(out, '"analytics": [{ name: "events", pk: "uuid" }],');
+  // Gateways are bound dynamically for the selected source.
+  assertStringIncludes(out, "db[t.name] = raw.table(t.name, t.pk);");
+  // The single-source concrete shape is NOT used in the multi case.
+  assertEquals(out.includes("export interface Domain {"), false);
+});
+
 Deno.test("Table<T> CRUD roundtrip via the data SDK (ADR 0029 §6)", async () => {
   const root = await Deno.makeTempDir();
   await Deno.writeTextFile(
