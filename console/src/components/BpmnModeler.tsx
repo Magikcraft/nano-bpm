@@ -27,8 +27,11 @@ import {
   type EnvelopeField,
 } from "../lib/dataEnvelope";
 import {
+  readMeta,
   readShapes,
+  writeMeta,
   writeShapes,
+  type MetaEntry,
   type ShapeDecl,
   type ShapeModdle,
   type ShapeModdleElement,
@@ -184,6 +187,12 @@ export interface BpmnModelerHandle {
   /// Replaces the primary process's composed shapes as one undoable command;
   /// no-ops when no process is loaded.
   setShapes(shapes: ShapeDecl[]): void;
+  /// The model-level metadata (`nano:meta`) on the primary process (ADR 0040 §5),
+  /// or `[]` when none are declared or no process is loaded yet.
+  getMeta(): MetaEntry[];
+  /// Replaces the primary process's model-level metadata as one undoable command;
+  /// no-ops when no process is loaded.
+  setMeta(meta: MetaEntry[]): void;
 }
 
 interface BpmnModelerProps {
@@ -641,6 +650,28 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             p.element,
             p.processBo,
             shapes,
+          );
+        } catch {
+          // Root not ready (e.g. a load is still settling) — ignore.
+        }
+      },
+      getMeta() {
+        const modeler = modelerRef.current;
+        if (!modeler || disposedRef.current) return [];
+        return readMeta(primaryProcess(modeler)?.processBo);
+      },
+      setMeta(meta: MetaEntry[]) {
+        const modeler = modelerRef.current;
+        if (!modeler || disposedRef.current) return;
+        const p = primaryProcess(modeler);
+        if (!p) return;
+        try {
+          writeMeta(
+            modeler.get<ShapeModdle>("moddle"),
+            modeler.get<ShapeModeling>("modeling"),
+            p.element,
+            p.processBo,
+            meta,
           );
         } catch {
           // Root not ready (e.g. a load is still settling) — ignore.

@@ -10,7 +10,7 @@ import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
 import FormPreview from "../components/FormPreview";
 import ShapeComposer, { type ShapePreview } from "../components/ShapeComposer";
-import type { ShapeDecl } from "../lib/shapeCarrier";
+import type { MetaEntry, ShapeDecl } from "../lib/shapeCarrier";
 import type { ComposerEntity } from "../lib/shapeComposer";
 import AppManifestEditor, { isAppManifestPath } from "../components/AppManifestEditor";
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
@@ -1277,6 +1277,7 @@ function EditorPane({
   // edits, and re-synced whenever the model changes (undo/redo, XML round-trip).
   const [shapesOpen, setShapesOpen] = useState(false);
   const [composerShapes, setComposerShapes] = useState<ShapeDecl[]>([]);
+  const [composerMeta, setComposerMeta] = useState<MetaEntry[]>([]);
   const [composerEntities, setComposerEntities] = useState<ComposerEntity[]>([]);
 
   // The fuse leaf entities the composer's pickers offer: every DB table (across
@@ -1327,11 +1328,11 @@ function EditorPane({
   // saved-model scan, so unsaved edits are reflected). `source` is nominal — the
   // CLI unions every datasource regardless of the path param.
   const previewShapes = useCallback(
-    async (shapes: ShapeDecl[]): Promise<ShapePreview> => {
+    async (shapes: ShapeDecl[], meta: MetaEntry[]): Promise<ShapePreview> => {
       const source = defaultDataSource ?? dataSourceNames[0] ?? "default";
       const r = await previewDomainTypes({
         path: { name, source },
-        body: { shapes },
+        body: { shapes, meta },
         throwOnError: true,
       });
       return { text: r.data.text, diagnostics: r.data.shapeDiagnostics ?? [] };
@@ -1339,10 +1340,11 @@ function EditorPane({
     [name, defaultDataSource, dataSourceNames],
   );
 
-  // Open the drawer: seed the shapes from the model and (re)load the picker
-  // entities. Only meaningful for a BPMN model in an App project (a manifest).
+  // Open the drawer: seed the shapes + metadata from the model and (re)load the
+  // picker entities. Only meaningful for a BPMN model in an App project.
   const openShapes = useCallback(() => {
     setComposerShapes(bpmnRef.current?.getShapes() ?? []);
+    setComposerMeta(bpmnRef.current?.getMeta() ?? []);
     void loadComposerEntities();
     setShapesOpen(true);
   }, [loadComposerEntities]);
@@ -1360,17 +1362,29 @@ function EditorPane({
     setDirty(true);
   }, []);
 
-  // Re-read shapes from the model on any *external* diagram change while the drawer
-  // is open, so undo/redo and XML-tab round-trips keep the composer in sync. A
-  // change from our own `setShapes` is skipped (controlled state already holds it),
-  // so clearing the Id input mid-rename can't momentarily drop the shape.
+  // Persist edited model-level metadata to the model (one undoable command),
+  // mirrored into local state. Same self-inflicted-change guard as the shapes.
+  const onMetaChange = useCallback((next: MetaEntry[]) => {
+    composerWriteRef.current = true;
+    bpmnRef.current?.setMeta(next);
+    setComposerMeta(next);
+    setDirty(true);
+  }, []);
+
+  // Re-read shapes + metadata from the model on any *external* diagram change while
+  // the drawer is open, so undo/redo and XML-tab round-trips keep the composer in
+  // sync. A change from our own `setShapes`/`setMeta` is skipped (controlled React
+  // state already holds it), so clearing an input mid-edit can't momentarily drop it.
   const onBpmnChange = useCallback(() => {
     setDirty(true);
     if (composerWriteRef.current) {
       composerWriteRef.current = false;
       return;
     }
-    if (shapesOpen) setComposerShapes(bpmnRef.current?.getShapes() ?? []);
+    if (shapesOpen) {
+      setComposerShapes(bpmnRef.current?.getShapes() ?? []);
+      setComposerMeta(bpmnRef.current?.getMeta() ?? []);
+    }
   }, [shapesOpen]);
 
   // Close the drawer when leaving the BPMN model (file switch / not a manifest).
@@ -1809,8 +1823,10 @@ function EditorPane({
               <div className="absolute inset-y-0 right-0 z-20 w-[36rem] max-w-full border-l border-edge shadow-xl">
                 <ShapeComposer
                   shapes={composerShapes}
+                  meta={composerMeta}
                   entities={composerEntities}
                   onShapesChange={onShapesChange}
+                  onMetaChange={onMetaChange}
                   preview={previewShapes}
                   onClose={() => setShapesOpen(false)}
                 />

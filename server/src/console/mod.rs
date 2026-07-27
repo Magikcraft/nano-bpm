@@ -2982,23 +2982,29 @@ pub(super) async fn project_data_preview_domaintypes(
     name: &str,
     source: &str,
     shapes: serde_json::Value,
+    meta: Option<serde_json::Value>,
 ) -> ApiResult {
-    project_data_op(
-        name,
-        serde_json::json!({
-            "op": "domaintypes",
-            "source": source,
-            "write": false,
-            "derivedShapes": shapes,
-            // The preview only needs `text` + `shapeDiagnostics` (both independent
-            // of worker/message IO), so supply empty lists: with all three derived
-            // maps present, `run_data_op` skips the `resources/processes/*.bpmn`
-            // scan entirely on this debounced, latency-sensitive path.
-            "derivedWorkers": [],
-            "derivedMessages": [],
-        }),
-    )
-    .await
+    let mut request = serde_json::json!({
+        "op": "domaintypes",
+        "source": source,
+        "write": false,
+        "derivedShapes": shapes,
+        // The preview only needs `text` + `shapeDiagnostics` (both independent
+        // of worker/message IO), so supply empty lists: with all derived maps
+        // present, `run_data_op` skips the `resources/processes/*.bpmn` scan
+        // entirely on this debounced, latency-sensitive path.
+        "derivedWorkers": [],
+        "derivedMessages": [],
+    });
+    // The composer edits model-level metadata alongside shapes, so preview the
+    // in-editor `nano:meta` too (ADR 0040 §5) — it feeds the resolved fuse/accessor
+    // the same way `derivedShapes` do. Injected only when the caller supplied it: an
+    // omitted `meta` leaves `derivedMeta` absent so `run_data_op` falls back to the
+    // saved-model scan (an explicit `meta: []` still previews an emptied list).
+    if let Some(meta) = meta {
+        request["derivedMeta"] = meta;
+    }
+    project_data_op(name, request).await
 }
 
 // --- triggers (ADR 0025) --------------------------------------------------
