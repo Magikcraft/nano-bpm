@@ -1,143 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import NavigatedViewer from "bpmn-js/lib/NavigatedViewer";
+import { useEffect, useMemo, useState } from "react";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
-import init, { TestEngine } from "@nanobpm/engine-wasm";
+import { useBojtos, BpmnRuntimeView } from "@nanobpm/bojtos-react";
 import { TraceTimeline } from "./TraceTimeline";
-import { foldSimTrace, stepFmt, type WasmEvent } from "../lib/simTrace";
+import { foldSimTrace, stepFmt } from "../lib/simTrace";
 import { Badge, Button, ErrorText, SectionLabel } from "./ui";
-
-interface ActiveEl {
-  key: string;
-  elementId: string;
-}
-interface InstanceDto {
-  key: string;
-  processId: string;
-  state: string;
-  completed: boolean;
-  activeElements: ActiveEl[];
-  variables: Record<string, unknown>;
-}
-interface JobDto {
-  key: string;
-  instanceKey: string;
-  elementId: string;
-  jobType: string;
-  state: string;
-  retries: number;
-}
-interface IncidentDto {
-  key: string;
-  instanceKey: string;
-  elementId: string;
-  kind: string;
-  reason: string;
-}
-interface TimerDto {
-  key: string;
-  instanceKey: string;
-  elementId: string;
-  dueAt: number;
-  dueInMs: number;
-}
-interface Snapshot {
-  now: number;
-  eventCount: number;
-  created?: string;
-  totalInstances: number;
-  completedInstances: number;
-  instances: InstanceDto[];
-  jobs: JobDto[];
-  incidents: IncidentDto[];
-  timers: TimerDto[];
-  activeElementIds: string[];
-  incidentElementIds: string[];
-}
-
-interface Canvas {
-  zoom(mode: string): void;
-  addMarker(elementId: string, marker: string): void;
-  removeMarker(elementId: string, marker: string): void;
-}
-
-// Lazily initialise the wasm module exactly once per page.
-let wasmReady: Promise<void> | null = null;
-function ensureWasm(): Promise<void> {
-  if (!wasmReady) wasmReady = init().then(() => undefined);
-  return wasmReady;
-}
-
-/// Read-only diagram that imports the XML once and updates token/incident
-/// markers in place (no re-import, so the zoom/scroll position is preserved
-/// while stepping through the simulation).
-function SimDiagram({
-  xml,
-  activeIds,
-  incidentIds,
-}: {
-  xml: string;
-  activeIds: string[];
-  incidentIds: string[];
-}) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const viewerRef = useRef<NavigatedViewer | null>(null);
-  const importedRef = useRef(false);
-  const markedRef = useRef<{ id: string; cls: string }[]>([]);
-
-  useEffect(() => {
-    if (!containerRef.current) return;
-    const viewer = new NavigatedViewer({ container: containerRef.current });
-    viewerRef.current = viewer;
-    importedRef.current = false;
-    viewer
-      .importXML(xml)
-      .then(() => {
-        viewer.get<Canvas>("canvas").zoom("fit-viewport");
-        importedRef.current = true;
-        applyMarkers();
-      })
-      .catch(() => {
-        /* malformed XML — leave blank */
-      });
-    return () => {
-      viewer.destroy();
-      viewerRef.current = null;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [xml]);
-
-  function applyMarkers() {
-    const viewer = viewerRef.current;
-    if (!viewer || !importedRef.current) return;
-    const canvas = viewer.get<Canvas>("canvas");
-    for (const { id, cls } of markedRef.current) {
-      try {
-        canvas.removeMarker(id, cls);
-      } catch {
-        /* ignore */
-      }
-    }
-    const next: { id: string; cls: string }[] = [];
-    for (const id of activeIds) next.push({ id, cls: "nano-active" });
-    for (const id of incidentIds) next.push({ id, cls: "nano-incident" });
-    for (const { id, cls } of next) {
-      try {
-        canvas.addMarker(id, cls);
-      } catch {
-        /* element not in this diagram */
-      }
-    }
-    markedRef.current = next;
-  }
-
-  useEffect(() => {
-    applyMarkers();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeIds, incidentIds]);
-
-  return <div ref={containerRef} className="h-full w-full bg-white" />;
-}
 
 export default function TestRunPanel({
   xml,
@@ -146,91 +13,49 @@ export default function TestRunPanel({
   xml: string;
   onClose: () => void;
 }) {
-  const engineRef = useRef<TestEngine | null>(null);
-  const [phase, setPhase] = useState<"loading" | "ready" | "error">("loading");
-  const [error, setError] = useState<string | null>(null);
-  const [processIds, setProcessIds] = useState<string[]>([]);
+  const {
+    phase,
+    error,
+    processIds,
+    snapshot,
+    events,
+    createInstance,
+    completeJob: completeJobCmd,
+    failJob: failJobCmd,
+    advanceTime,
+    reset: resetEngine,
+  } = useBojtos({ bpmn: xml });
+
   const [process, setProcess] = useState<string>("");
   const [startVars, setStartVars] = useState("{}");
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [jobVars, setJobVars] = useState<Record<string, string>>({});
   const [advanceMs, setAdvanceMs] = useState("60000");
   const [leftView, setLeftView] = useState<"diagram" | "trace">("diagram");
-  const [events, setEvents] = useState<WasmEvent[]>([]);
   const [traceKey, setTraceKey] = useState<string | null>(null);
 
-  function deployInto(engine: TestEngine) {
-    const res = JSON.parse(engine.deploy(xml)) as { processIds: string[] };
-    setProcessIds(res.processIds);
-    setProcess(res.processIds[0] ?? "");
-    setSnapshot(null);
-    setJobVars({});
-    setEvents([]);
-    setTraceKey(null);
-    setError(null);
-  }
-
+  // Each (re)deployment produces a fresh `processIds` array; when it changes,
+  // default the process selection and clear the per-run UI state — matching the
+  // original panel's `deployInto` reset.
   useEffect(() => {
-    let cancelled = false;
-    ensureWasm()
-      .then(() => {
-        if (cancelled) return;
-        const engine = new TestEngine();
-        engineRef.current = engine;
-        deployInto(engine);
-        setPhase("ready");
-      })
-      .catch((e) => {
-        if (cancelled) return;
-        setError(String(e));
-        setPhase("error");
-      });
-    return () => {
-      cancelled = true;
-      engineRef.current?.free();
-      engineRef.current = null;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [xml]);
-
-  function run(fn: (e: TestEngine) => string): Snapshot | null {
-    const engine = engineRef.current;
-    if (!engine) return null;
-    try {
-      const snap = JSON.parse(fn(engine)) as Snapshot;
-      setSnapshot(snap);
-      setEvents(JSON.parse(engine.events()) as WasmEvent[]);
-      setError(null);
-      return snap;
-    } catch (e) {
-      setError(String(e));
-      return null;
-    }
-  }
+    setProcess(processIds[0] ?? "");
+    setJobVars({});
+    setTraceKey(null);
+  }, [processIds]);
 
   function start() {
-    const snap = run((e) => e.createInstance(process, startVars || "{}"));
+    const snap = createInstance(process, startVars || "{}");
     if (snap?.created) setTraceKey(snap.created);
   }
   function completeJob(key: string) {
     const vars = jobVars[key]?.trim() || "{}";
-    run((e) => e.completeJob(key, vars));
+    completeJobCmd(key, vars);
   }
   function failJob(key: string) {
-    run((e) => e.failJob(key, 0, "Failed in test run"));
+    failJobCmd(key, 0, "Failed in test run");
   }
   function advance() {
     const ms = Number(advanceMs);
-    run((e) => e.advanceTime(Number.isFinite(ms) ? ms : 0));
-  }
-  function reset() {
-    const engine = engineRef.current;
-    if (!engine) return;
-    try {
-      deployInto(engine);
-    } catch (e) {
-      setError(String(e));
-    }
+    advanceTime(Number.isFinite(ms) ? ms : 0);
   }
 
   const activeIds = snapshot?.activeElementIds ?? [];
@@ -313,10 +138,11 @@ export default function TestRunPanel({
                 : "Start an instance to simulate this process."}
             </div>
           ) : leftView === "diagram" ? (
-            <SimDiagram
+            <BpmnRuntimeView
               xml={xml}
               activeIds={activeIds}
               incidentIds={incidentIds}
+              className="h-full w-full bg-white"
             />
           ) : simTrace ? (
             <div className="h-full overflow-auto p-6">
@@ -374,7 +200,7 @@ export default function TestRunPanel({
               </h3>
               {started && (
                 <button
-                  onClick={reset}
+                  onClick={resetEngine}
                   className="text-xs text-fg-muted hover:text-fg"
                 >
                   Reset

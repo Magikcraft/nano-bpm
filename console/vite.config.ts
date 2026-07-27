@@ -48,9 +48,15 @@ export default defineConfig({
   // binary via `new URL('nanobpmn_engine_bg.wasm', import.meta.url)`. Excluding
   // it from esbuild's dependency pre-bundling keeps that asset reference intact
   // so Vite emits the `.wasm` as a hashed asset instead of esbuild rewriting the
-  // `import.meta.url` and losing the binary.
+  // `import.meta.url` and losing the binary. The Bojtos packages
+  // (`@nanobpm/bojtos-kit` / `-react`) load the engine through that same loader,
+  // so they are excluded too to keep the wasm asset reference intact end to end.
   optimizeDeps: {
-    exclude: ["@nanobpm/engine-wasm"],
+    exclude: [
+      "@nanobpm/engine-wasm",
+      "@nanobpm/bojtos-kit",
+      "@nanobpm/bojtos-react",
+    ],
   },
   build: {
     outDir: "dist",

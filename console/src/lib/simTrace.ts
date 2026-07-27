@@ -5,15 +5,11 @@ import type {
   TraceJob,
   TraceOutcome,
 } from "../gen";
+import type { WasmEvent } from "@nanobpm/bojtos-kit";
 
-/// A flattened wasm engine event: `{ seq, now, type, ...snake_case fields }`.
-/// Produced by `TestEngine.events()`.
-export interface WasmEvent {
-  seq: number;
-  now: number;
-  type: string;
-  [k: string]: unknown;
-}
+// `WasmEvent` (the shape of `engine.events()`) now lives in the engine contract
+// package; re-export it so existing `../lib/simTrace` importers stay unchanged.
+export type { WasmEvent };
 
 function s(v: unknown): string {
   return v == null ? "" : String(v);
