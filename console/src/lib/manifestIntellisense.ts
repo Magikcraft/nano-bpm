@@ -7,14 +7,25 @@
 //
 // One provider is registered process-wide (lazily) for the `json` language. It
 // only acts on models a manifest editor has registered via `setManifestSource`,
-// so every other JSON file keeps Monaco's default behaviour.
+// so every other JSON file keeps Monaco's default *completion* behaviour.
+//
+// `setManifestSource` additionally registers the app-manifest JSON *schema* via
+// `ensureManifestSchema()`. Unlike the completion provider, that call
+// (`jsonDefaults.setDiagnosticsOptions`) is process-wide for ALL JSON models: it
+// disables remote `$schema` fetching (`enableSchemaRequest: false`) and adds the
+// bundled schema, scoped to manifests by `fileMatch`. Other JSON files are only
+// affected in that Monaco no longer fetches their `$schema` over the network —
+// intentional (offline-first). A future change adding another JSON schema
+// provider must merge into these defaults rather than assume Monaco's originals.
 
 import * as monaco from "monaco-editor";
+import appSchema from "@nanobpm/nano-app-schema/schema";
 import {
   manifestCompletionAt,
   type CandidateKind,
   type CompletionIndex,
 } from "@nanobpm/nano-app-schema";
+import { buildManifestSchemaOptions } from "./manifestSchema";
 
 /** The live state a registered manifest model exposes to the provider. */
 export interface ManifestSource {
@@ -28,6 +39,32 @@ export interface ManifestSource {
 // reading fresh state without re-registering on every keystroke.
 const sources = new Map<string, { get: () => ManifestSource }>();
 let registered = false;
+let schemaRegistered = false;
+
+// The manifest's `$schema` points at the published schema URL. Rather than let
+// Monaco's JSON worker try to *fetch* it (there is no schema-request service
+// wired up, and the console is offline-first — the fetch fails with "No schema
+// request service available"), we register the bundled schema content locally,
+// keyed by that same URL, so `$schema` resolves in-process with no network.
+// The URI list + options shape live in `manifestSchema.ts` (pure, unit-tested).
+/**
+ * Register the Urban App manifest JSON Schema with Monaco's JSON language
+ * service as bundled, in-process content, and disable remote schema requests.
+ * Idempotent. This is what makes `nano.app.json` validate + autocomplete against
+ * the schema offline, and is the fix for the "No schema request service
+ * available" error raised when the manifest's `$schema` URL would otherwise be
+ * fetched.
+ */
+function ensureManifestSchema(): void {
+  if (schemaRegistered) return;
+  // Mark registered only after the call succeeds, so a transient failure (e.g.
+  // Monaco JSON defaults not yet initialized) doesn't permanently prevent a
+  // later retry from registering the schema for the session.
+  monaco.languages.json.jsonDefaults.setDiagnosticsOptions(
+    buildManifestSchemaOptions(appSchema as Record<string, unknown>),
+  );
+  schemaRegistered = true;
+}
 
 const KIND_ICON: Record<CandidateKind, monaco.languages.CompletionItemKind> = {
   process: monaco.languages.CompletionItemKind.Class,
@@ -86,6 +123,7 @@ function ensureProvider(): void {
  */
 export function setManifestSource(uri: string, get: () => ManifestSource): () => void {
   ensureProvider();
+  ensureManifestSchema();
   sources.set(uri, { get });
   return () => {
     sources.delete(uri);
