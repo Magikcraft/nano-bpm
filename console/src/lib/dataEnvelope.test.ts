@@ -10,6 +10,7 @@ import {
   envelopeContext,
   readEnvelope,
   writeEnvelope,
+  collectEnvelopeTypeRefs,
   type EnvModdle,
   type EnvModdleElement,
   type EnvModeling,
@@ -248,4 +249,58 @@ test("writeEnvelope: clearing removes only the reserved property", () => {
     propsOut.map((p) => p.name),
     ["other"],
   );
+});
+
+// A service task whose envelope references `id` (in and/or out), for the
+// registry-derivation test below.
+function taskWithEnvelope(
+  taskType: string,
+  input?: string,
+  output?: string,
+): { type: string; businessObject: EnvModdleElement } {
+  const properties: EnvModdleElement[] = [];
+  if (input) properties.push({ name: ENVELOPE_KEY.inputType, value: input });
+  if (output) properties.push({ name: ENVELOPE_KEY.outputType, value: output });
+  return {
+    type: "bpmn:ServiceTask",
+    businessObject: {
+      $type: "bpmn:ServiceTask",
+      extensionElements: {
+        values: [
+          { $type: "zeebe:TaskDefinition", type: taskType },
+          { $type: "zeebe:Properties", properties },
+        ],
+      },
+    },
+  };
+}
+
+test("collectEnvelopeTypeRefs: derives every referenced in/out type, deduped", () => {
+  const refs = collectEnvelopeTypeRefs([
+    taskWithEnvelope("senior:pr-review", "PrReviewRoundIn", "PrReviewRoundOut"),
+    taskWithEnvelope("charge", "PrReviewRoundIn"), // dup input id
+    taskWithEnvelope("noop"), // no envelope -> contributes nothing
+    undefined, // tolerated
+  ]);
+  assert.deepEqual(refs, ["PrReviewRoundIn", "PrReviewRoundOut"]);
+});
+
+test("collectEnvelopeTypeRefs: ignores elements with no envelope context", () => {
+  // A FEEL (`=expr`) task type has no worker key, so no envelope context.
+  const feelTask = {
+    type: "bpmn:ServiceTask",
+    businessObject: {
+      $type: "bpmn:ServiceTask",
+      extensionElements: {
+        values: [
+          { $type: "zeebe:TaskDefinition", type: "=dynamicType" },
+          {
+            $type: "zeebe:Properties",
+            properties: [{ name: ENVELOPE_KEY.inputType, value: "Ghost" }],
+          },
+        ],
+      },
+    },
+  };
+  assert.deepEqual(collectEnvelopeTypeRefs([feelTask]), []);
 });
