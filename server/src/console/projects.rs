@@ -1725,11 +1725,13 @@ pub async fn run_data_op(
     // Model-first envelope IO (ADR 0040 slices 1–2 / ADR 0033 §6 increment 12):
     // the BPMN model is the source of truth for the data-envelope maps, so for the
     // reifying op we scan the project's process models once and inject both
-    // `derivedWorkers` (`taskType -> {in,out}`) and `derivedMessages`
-    // (`messageName -> {in,out}`). The reifier overlays the workers on the manifest
-    // `workers[]` (which still carries non-IO bindings like `llm`) and emits the
-    // typed message registry, so `worker-io.d.ts` / `message-io.d.ts` reflect the
-    // model, not a hand-maintained projection that can drift.
+    // `derivedWorkers` (`taskType -> {in,out}`), `derivedMessages`
+    // (`messageName -> {in,out}`), and `derivedShapes` (composed `nano:shape`
+    // declarations, ADR 0040 §9/§10). The reifier overlays the workers on the
+    // manifest `workers[]`, emits the typed message registry, and resolves each
+    // shape through the fuse into a `DomainTypes` entry, so `worker-io.d.ts` /
+    // `message-io.d.ts` / `domain-rows.d.ts` reflect the model, not a
+    // hand-maintained projection that can drift.
     if request.get("op").and_then(|v| v.as_str()) == Some("domaintypes")
         && let Some(obj) = request.as_object_mut()
     {
@@ -1741,6 +1743,10 @@ pub async fn run_data_op(
         obj.insert(
             "derivedMessages".to_string(),
             serde_json::to_value(scan.messages).unwrap_or(serde_json::Value::Null),
+        );
+        obj.insert(
+            "derivedShapes".to_string(),
+            serde_json::to_value(scan.shapes).unwrap_or(serde_json::Value::Null),
         );
     }
     // The gateway runs the data CLI Node-first: Node (>= 22.6) is always present
@@ -4858,6 +4864,327 @@ mod tests {
 </bpmn:definitions>"#
         );
         std::fs::write(procs.join("m.bpmn"), xml).unwrap();
+    }
+
+    /// Write a process model carrying a composed `nano:shape` (ADR 0040 §9): a
+    /// `nano:shapes` container on the process's extension elements holding the raw
+    /// shape XML (op children), so the scan → resolve → emit pipeline can be
+    /// exercised end to end.
+    fn write_shape_model(dir: &std::path::Path, shapes_xml: &str) {
+        let procs = dir.join("resources").join("processes");
+        std::fs::create_dir_all(&procs).unwrap();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:nano="http://nanobpm.io/schema/shapes/1.0" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:extensionElements>
+      <nano:shapes>{shapes_xml}</nano:shapes>
+    </bpmn:extensionElements>
+  </bpmn:process>
+</bpmn:definitions>"#
+        );
+        std::fs::write(procs.join("shapes.bpmn"), xml).unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_resolves_a_composed_shape_into_the_registry() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapes";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Leaf entities the shape composes from: a manifest `Order` type and a DB
+        // `customers` table (created below), plus a scalar `extend`.
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{
+                "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" }
+                } },
+                "types": {
+                    "Order": { "fields": {
+                        "item": { "type": "string" },
+                        "qty": { "type": "integer" }
+                    } }
+                }
+            }"#,
+        )
+        .unwrap();
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="ApprovedOrder" name="Approved order">
+                 <nano:carry ref="Order" />
+                 <nano:project ref="customers" fields="name" />
+                 <nano:extend name="approved" type="boolean" />
+               </nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create table");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        // The composed shape lands in DomainTypes as a first-class entry, folding
+        // carried `Order` fields, the projected `customers.name`, and the extend.
+        assert!(
+            text.contains("\"ApprovedOrder\": {"),
+            "shape missing: {text}"
+        );
+        assert!(text.contains("item: string;"));
+        assert!(text.contains("qty: number;"));
+        assert!(text.contains("name: string;"));
+        assert!(text.contains("approved: boolean;"));
+        // No diagnostics on a clean resolution.
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_reports_a_shape_with_an_unresolved_reference() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesbad";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } } }"#,
+        )
+        .unwrap();
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="Broken"><nano:carry ref="DoesNotExist" /></nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        // A broken shape degrades to untyped — it is omitted from DomainTypes.
+        assert!(!text.contains("\"Broken\""), "broken shape leaked: {text}");
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["kind"], "unresolved-reference");
+        assert_eq!(diags[0]["shape"], "Broken");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_reports_duplicate_shape_ids_and_omits_them() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesdup";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } },
+                  "types": { "Order": { "fields": { "id": { "type": "string" } } } } } }"#,
+        )
+        .unwrap();
+        // Two shapes share the id "Dup" — a fuse-identity collision. Both are
+        // omitted (untyped) and a single duplicate-id diagnostic is reported.
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="Dup"><nano:carry ref="Order" /></nano:shape>
+               <nano:shape id="Dup"><nano:carry ref="Order" /></nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        assert!(!text.contains("\"Dup\""), "duplicate shape leaked: {text}");
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["kind"], "duplicate-id");
+        assert_eq!(diags[0]["shape"], "Dup");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_rejects_a_nominal_reference_to_a_table() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesnom";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } } }"#,
+        )
+        .unwrap();
+        // A non-spread reference to a DB table cannot be expressed as a DomainTypes
+        // ref (it would emit `unknown`), so the shape is rejected and omitted.
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="Bad"><nano:reference name="cust" ref="customers" /></nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create table");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        assert!(!text.contains("\"Bad\""), "rejected shape leaked: {text}");
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["kind"], "nominal-table-ref");
+        assert_eq!(diags[0]["shape"], "Bad");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_warns_on_a_type_table_name_collision_and_prefers_the_type() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesambig";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Both a manifest type "Order" (field `total`) and a table "order" (column
+        // `note`) exist. carry ref="order" resolves to the *type* (which wins the
+        // bare id) with an `ambiguous-reference` warning, so the shape carries
+        // `total`, not `note`.
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{
+                "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } },
+                "types": { "order": { "fields": { "total": { "type": "number" } } } }
+            }"#,
+        )
+        .unwrap();
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="Composed"><nano:carry ref="order" /></nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE \"order\" (id INTEGER PRIMARY KEY, note TEXT)" }),
+        )
+        .await
+        .expect("create table");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        assert!(text.contains("\"Composed\": {"), "shape missing: {text}");
+        // The type won the bare id: Composed carries `total` (the type's field), not
+        // the table's `note`/`id`. (`note` still appears in the table's own interface.)
+        assert!(
+            text.contains("total: number;"),
+            "type fields expected: {text}"
+        );
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["kind"], "ambiguous-reference");
+        assert_eq!(diags[0]["severity"], "warning");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_validates_a_qualified_via_path_through_a_fk() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesvia";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } } }"#,
+        )
+        .unwrap();
+        // A qualified `via` start ("app.orders") must resolve via the longest index
+        // prefix, then hop through the `customer_id` FK to `app.customers` — with no
+        // false "unknown entity" warning (which the bare-parts[0] split produced).
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="OrderView">
+                 <nano:project ref="customers" fields="name" via="app.orders.customer_id" />
+               </nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create customers");
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id))" }),
+        )
+        .await
+        .expect("create orders");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        assert!(text.contains("\"OrderView\": {"), "shape missing: {text}");
+        assert!(
+            text.contains("name: string;"),
+            "projected field missing: {text}"
+        );
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert!(
+            diags.is_empty(),
+            "qualified via should validate cleanly: {diags:?}"
+        );
     }
 
     #[tokio::test]

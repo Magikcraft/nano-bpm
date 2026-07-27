@@ -626,3 +626,470 @@ export function emitMessageBindingsRuntime(): string {
     `  return publishMessageRaw(name, opts as unknown as PublishMessageOptions);\n` +
     `}\n`;
 }
+
+// --- composed motion shapes: the fuse composition algebra (ADR 0040 §9/§10) ---
+//
+// A composed shape is a named, model-scoped declaration authored in the Modeller
+// and carried in the `.bpmn` as a `nano:shape` (see `console/src/lib/shapeCarrier.ts`
+// and the Rust scan `envelope_scan.rs`). It composes existing fused entities — DB
+// tables, manifest `types`, and other shapes — via four ordered operations:
+//
+//   carry(ref)                 spread every field of `ref`
+//   project(ref, fields, via)  spread only the named fields of `ref`
+//   extend(name, type, ...)    add a process-authored field
+//   reference(name, ref, ...)  nest (or spread) another shape
+//
+// Resolution folds the ops, in author (XML) order, into a flat `DomainTypeDef`, so
+// a composed shape enters the same `DomainTypes` registry a manifest `type` does —
+// every downstream consumer (envelope pickers, `defineWorker`, `publishMessage`,
+// FEEL scopes) types against `DomainTypes["ApprovedOrder"]` with no new codegen
+// path. Broken shapes are omitted (degrade to untyped) and reported as diagnostics.
+
+/** One composition operation of a `nano:shape`, in author (XML) order. */
+export type ShapeOp =
+  | { op: "carry"; ref: string }
+  | { op: "project"; ref: string; fields: string[]; via?: string }
+  | { op: "extend"; name: string; type: string; optional?: boolean; list?: boolean }
+  | { op: "reference"; name: string; ref: string; spread?: boolean; list?: boolean };
+
+/** A composed motion-shape declaration lifted from the model (ADR 0040 §9). */
+export interface ShapeDecl {
+  /** The fuse identity; also the `DomainTypes` key the resolved shape lands under. */
+  id: string;
+  /** Optional human label (`nano:shape name`). */
+  name?: string;
+  /** The defining process id, for the `model:<processId>` provenance tag. */
+  process?: string;
+  /** The ordered composition operations. */
+  ops: ShapeOp[];
+  /** Model-level metadata (`nano:meta`), free-form key/value (ADR 0040 §5). */
+  meta?: Record<string, string>;
+}
+
+/** A scan/resolve-time problem with a shape, surfaced like the `workers[]` drift
+ * warning (never a silent merge). A shape with any `error` diagnostic is omitted
+ * from the fuse; a `warning` (e.g. a deliberate field shadow) still resolves. */
+export interface ShapeDiagnostic {
+  /** The offending shape id. */
+  shape: string;
+  kind:
+    | "unresolved-reference"
+    | "reference-cycle"
+    | "field-conflict"
+    | "unknown-field"
+    | "duplicate-id"
+    | "ambiguous-reference"
+    | "nominal-table-ref"
+    | "same-id-collision";
+  severity: "error" | "warning";
+  message: string;
+}
+
+/** The result of resolving the project's shapes against the leaf fuse. */
+export interface ShapeResolution {
+  /** The resolved shapes as registry entries, keyed by shape id, ready to fold
+   * into the manifest `types` registry before `emitDomainModel`. */
+  types: DomainTypeRegistry;
+  diagnostics: ShapeDiagnostic[];
+}
+
+/** An entity the fuse can resolve a `carry`/`project`/`reference` against: its
+ * field map, plus (DB tables only) its FK columns for `via`-path validation. */
+interface FuseEntity {
+  fields: Record<string, DomainFieldDef>;
+  /** FK column name → referenced table, for `project via` validation. */
+  fks?: Record<string, string>;
+}
+
+/** Map one datasource column to a domain field. A nullable column widens to
+ * `optional` (the composed shape is a motion snapshot: an absent value reads as
+ * undefined, not SQL NULL). The manifest keyword is inferred from the column's
+ * SQLite affinity so it flows through `fieldTsType` like any declared field;
+ * affinities with no keyword (BLOB/opaque) fall back to `json`. */
+function columnToField(col: ColumnMeta): DomainFieldDef {
+  const ts = sqliteAffinityToTs(col.type);
+  const keyword = ts === "string" || ts === "number" || ts === "boolean" ? ts : "json";
+  const nullable = !(col.notNull || col.primaryKey);
+  return nullable ? { type: keyword, optional: true } : { type: keyword };
+}
+
+/** Build the leaf entity index the shape fold resolves references against: every
+ * datasource table (by raw wire name, and by `source.table` to disambiguate a
+ * name shared across sources) and every manifest `type` (by id). A raw table name
+ * shared across sources keeps the first (default-source-first) binding; the
+ * qualified `source.table` alias is always unambiguous.
+ *
+ * When a manifest `type` id collides with a bare table name, the **type wins** the
+ * unqualified id (it is the more first-class, `DomainTypes`-visible entity) and the
+ * collision is surfaced via `ambiguousIds` so resolution can warn; the table stays
+ * reachable through its `source.table` alias. `tableIds` records every id (bare +
+ * qualified) that resolves to a DB table, so a nominal reference (which the emitter
+ * can only express against `DomainTypes` keys) can be rejected. */
+function leafEntityIndex(
+  sources: SourceSchema[],
+  types: DomainTypeRegistry,
+): { index: Map<string, FuseEntity>; tableIds: Set<string>; ambiguousIds: Set<string> } {
+  const index = new Map<string, FuseEntity>();
+  const tableIds = new Set<string>();
+  for (const s of sources) {
+    for (const t of s.tables) {
+      const fields: Record<string, DomainFieldDef> = {};
+      const fks: Record<string, string> = {};
+      for (const c of t.columns) fields[c.name] = columnToField(c);
+      // Store FK targets as the unambiguous `source.table` id (FKs are intra-source)
+      // so `via`-path following resolves the intended table, never a same-named
+      // table in another source or a type-preferred bare id.
+      for (const fk of t.foreignKeys ?? []) fks[fk.column] = `${s.source}.${fk.refTable}`;
+      const entity: FuseEntity = { fields, fks };
+      index.set(`${s.source}.${t.name}`, entity);
+      tableIds.add(`${s.source}.${t.name}`);
+      if (!index.has(t.name)) {
+        index.set(t.name, entity);
+        tableIds.add(t.name);
+      }
+    }
+  }
+  const ambiguousIds = new Set<string>();
+  for (const [id, def] of Object.entries(types)) {
+    // The manifest type wins an unqualified id that also names a table; the table
+    // remains reachable by its `source.table` alias.
+    if (tableIds.has(id)) ambiguousIds.add(id);
+    index.set(id, { fields: { ...def.fields } });
+  }
+  return { index, tableIds, ambiguousIds };
+}
+
+/** Whether a manifest field keyword resolves to a primitive (vs a nominal ref). */
+function isPrimitiveKeyword(type: string): boolean {
+  return Object.prototype.hasOwnProperty.call(PRIMITIVE_TS, type);
+}
+
+/** The shape ids a shape references (carry/project/reference targets, and an
+ * `extend` whose type names a shape) — the edges of the shape dependency graph. */
+function referencedShapeIds(shape: ShapeDecl, shapeIds: Set<string>): string[] {
+  const refs = new Set<string>();
+  for (const op of shape.ops) {
+    if (op.op === "carry" || op.op === "project" || op.op === "reference") {
+      if (shapeIds.has(op.ref)) refs.add(op.ref);
+    } else if (op.op === "extend" && shapeIds.has(op.type)) {
+      refs.add(op.type);
+    }
+  }
+  return [...refs];
+}
+
+/** Structural equality of two domain field defs (`type` + normalized optional/list
+ * flags), so a differing property insertion order does not read as a conflict. */
+function sameFieldDef(a: DomainFieldDef, b: DomainFieldDef): boolean {
+  return (
+    a.type === b.type &&
+    !!a.optional === !!b.optional &&
+    !!a.list === !!b.list
+  );
+}
+
+/**
+ * Resolve the project's composed shapes into `DomainTypeDef`s and diagnostics
+ * (ADR 0040 §10). Leaves (DB tables, manifest types) fuse first; shapes resolve in
+ * dependency order so a shape can carry another shape regardless of declaration
+ * order. A shape in a reference cycle, or one that names an unresolvable id, is
+ * omitted (degrades to untyped) with an `error` diagnostic; a deliberate field
+ * shadow with a differing type resolves with a `field-conflict` warning.
+ */
+export function resolveShapes(
+  shapes: ShapeDecl[],
+  types: DomainTypeRegistry,
+  sources: SourceSchema[] = [],
+): ShapeResolution {
+  const diagnostics: ShapeDiagnostic[] = [];
+  const resolved: DomainTypeRegistry = {};
+  if (shapes.length === 0) return { types: resolved, diagnostics };
+
+  const { index, tableIds, ambiguousIds } = leafEntityIndex(sources, types);
+  // A nominal reference (an `extend` type or a non-spread `reference`) must resolve
+  // to a `DomainTypes` key at emit time — a manifest type or a resolved shape id.
+  // DB tables are spread-only (their fields flatten via carry/project); nominally
+  // referencing one would degrade to `unknown` in the emitted `.d.ts`, so we reject.
+  const nominalIds = new Set<string>(Object.keys(types));
+  // Duplicate shape ids are fuse-identity collisions: since resolution keys by id,
+  // a later declaration would silently shadow an earlier one. Report every id that
+  // appears more than once and omit all of its declarations from resolution.
+  const idCounts = new Map<string, number>();
+  for (const s of shapes) if (s.id) idCounts.set(s.id, (idCounts.get(s.id) ?? 0) + 1);
+  const duplicated = new Set<string>();
+  for (const [id, n] of idCounts) {
+    if (n > 1) {
+      duplicated.add(id);
+      diagnostics.push({
+        shape: id,
+        kind: "duplicate-id",
+        severity: "error",
+        message: `shape id "${id}" is declared ${n} times; ids are fuse identities and must be unique`,
+      });
+    }
+  }
+  const byId = new Map<string, ShapeDecl>();
+  for (const s of shapes) if (s.id && !duplicated.has(s.id)) byId.set(s.id, s);
+  const shapeIds = new Set(byId.keys());
+
+  // Cycle detection over the shape-only dependency graph (DFS three-colour). Every
+  // shape on a back edge is failed; the reported path aids the maker's fix.
+  const failed = new Set<string>();
+  const colour = new Map<string, 0 | 1 | 2>(); // 0=unvisited 1=on-stack 2=done
+  const visit = (id: string, stack: string[]): void => {
+    colour.set(id, 1);
+    stack.push(id);
+    for (const dep of referencedShapeIds(byId.get(id)!, shapeIds)) {
+      const c = colour.get(dep) ?? 0;
+      if (c === 1) {
+        const cycle = stack.slice(stack.indexOf(dep)).concat(dep);
+        for (const n of cycle) {
+          if (!failed.has(n)) {
+            failed.add(n);
+            diagnostics.push({
+              shape: n,
+              kind: "reference-cycle",
+              severity: "error",
+              message: `shape "${n}" is part of a reference cycle: ${cycle.join(" → ")}`,
+            });
+          }
+        }
+      } else if (c === 0) {
+        visit(dep, stack);
+      }
+    }
+    stack.pop();
+    colour.set(id, 2);
+  };
+  for (const id of byId.keys()) if ((colour.get(id) ?? 0) === 0) visit(id, []);
+
+  // Topological resolution: resolve a shape only after its (non-failed) shape
+  // dependencies, adding each resolved shape to the index so later shapes see it.
+  const done = new Set<string>();
+  const resolveOne = (shape: ShapeDecl): void => {
+    if (done.has(shape.id) || failed.has(shape.id)) return;
+    // Resolve shape dependencies first (they may themselves be pending).
+    for (const dep of referencedShapeIds(shape, shapeIds)) {
+      const d = byId.get(dep);
+      if (d && !done.has(dep) && !failed.has(dep)) resolveOne(d);
+    }
+
+    const fields: Record<string, DomainFieldDef> = {};
+    let broken = false;
+    const addField = (name: string, field: DomainFieldDef): void => {
+      const existing = fields[name];
+      if (existing && !sameFieldDef(existing, field)) {
+        diagnostics.push({
+          shape: shape.id,
+          kind: "field-conflict",
+          severity: "warning",
+          message:
+            `field "${name}" is contributed twice with differing types; the later value wins (author-order fold)`,
+        });
+      }
+      fields[name] = field; // last (author-order) wins
+    };
+    const lookup = (ref: string): FuseEntity | undefined => index.get(ref);
+    const unresolved = (ref: string): void => {
+      broken = true;
+      diagnostics.push({
+        shape: shape.id,
+        kind: "unresolved-reference",
+        severity: "error",
+        message: `shape "${shape.id}" references unknown entity "${ref}"`,
+      });
+    };
+    // A bare id that names both a manifest type and a table resolves to the type;
+    // warn so the (silent) precedence is visible and the maker can qualify.
+    const noteAmbiguity = (ref: string): void => {
+      if (ambiguousIds.has(ref)) {
+        diagnostics.push({
+          shape: shape.id,
+          kind: "ambiguous-reference",
+          severity: "warning",
+          message:
+            `"${ref}" names both a manifest type and a table; resolved to the type — qualify as "<source>.${ref}" to target the table`,
+        });
+      }
+    };
+    // Report a nominal reference (extend type / non-spread reference) that targets a
+    // DB table, which cannot be expressed as a `DomainTypes` ref (it would degrade to
+    // `unknown`); the maker should spread it instead (carry/project or spread=true).
+    const nominalTableRef = (kind: string, ref: string): void => {
+      broken = true;
+      diagnostics.push({
+        shape: shape.id,
+        kind: "nominal-table-ref",
+        severity: "error",
+        message:
+          `${kind} nominally references table "${ref}", which is not a DomainTypes entity; spread its fields (carry/project or reference spread="true") instead`,
+      });
+    };
+
+    for (const op of shape.ops) {
+      switch (op.op) {
+        case "carry": {
+          const e = lookup(op.ref);
+          if (!e) { unresolved(op.ref); break; }
+          noteAmbiguity(op.ref);
+          for (const [k, f] of Object.entries(e.fields)) addField(k, f);
+          break;
+        }
+        case "project": {
+          const e = lookup(op.ref);
+          if (!e) { unresolved(op.ref); break; }
+          noteAmbiguity(op.ref);
+          for (const fname of op.fields) {
+            const f = e.fields[fname];
+            if (!f) {
+              broken = true;
+              diagnostics.push({
+                shape: shape.id,
+                kind: "unknown-field",
+                severity: "error",
+                message: `projected field "${fname}" is not a field of "${op.ref}"`,
+              });
+              continue;
+            }
+            addField(fname, f);
+          }
+          if (op.via) validateVia(shape.id, op.via, index, diagnostics);
+          break;
+        }
+        case "extend": {
+          if (!isPrimitiveKeyword(op.type)) {
+            if (nominalIds.has(op.type)) {
+              // ok — a manifest type or an already-resolved shape id
+            } else if (tableIds.has(op.type)) {
+              nominalTableRef(`extend field "${op.name}"`, op.type);
+              break;
+            } else {
+              broken = true;
+              diagnostics.push({
+                shape: shape.id,
+                kind: "unresolved-reference",
+                severity: "error",
+                message:
+                  `extend field "${op.name}" has type "${op.type}", which is neither a scalar keyword nor a fused entity`,
+              });
+              break;
+            }
+          }
+          const field: DomainFieldDef = { type: op.type };
+          if (op.optional) field.optional = true;
+          if (op.list) field.list = true;
+          addField(op.name, field);
+          break;
+        }
+        case "reference": {
+          const e = lookup(op.ref);
+          if (!e) { unresolved(op.ref); break; }
+          if (op.spread) {
+            noteAmbiguity(op.ref);
+            for (const [k, f] of Object.entries(e.fields)) addField(k, f);
+          } else if (!nominalIds.has(op.ref)) {
+            // `e` exists but the id is not a DomainTypes key — it is a DB table.
+            nominalTableRef(`reference "${op.name}"`, op.ref);
+          } else {
+            const field: DomainFieldDef = { type: op.ref };
+            if (op.list) field.list = true;
+            addField(op.name, field);
+          }
+          break;
+        }
+      }
+    }
+
+    // same-id collision: the shape id shadows a leaf entity it does not source.
+    const sourcesRef = new Set(
+      shape.ops.flatMap((o) => (o.op === "extend" ? [] : [o.ref])),
+    );
+    if (index.has(shape.id) && !sourcesRef.has(shape.id)) {
+      diagnostics.push({
+        shape: shape.id,
+        kind: "same-id-collision",
+        severity: "error",
+        message:
+          `shape id "${shape.id}" collides with an existing fused entity it does not compose`,
+      });
+      broken = true;
+    }
+
+    done.add(shape.id);
+    if (broken) {
+      failed.add(shape.id);
+      return;
+    }
+    const def: DomainTypeDef = { name: shape.name, fields };
+    resolved[shape.id] = def;
+    // Later shapes may carry this one; expose its resolved fields to the index and
+    // mark it nominal-referenceable (it will be a `DomainTypes` key).
+    index.set(shape.id, { fields });
+    nominalIds.add(shape.id);
+  };
+  for (const s of shapes) if (s.id && !duplicated.has(s.id)) resolveOne(s);
+
+  return { types: resolved, diagnostics };
+}
+
+/** Validate a `project via` FK path (`Entity.column[.column...]`): the leading
+ * entity must resolve and carry the named column (an FK column on a DB table, or
+ * any field on a manifest type/shape). Deeper hops are validated leniently — the
+ * FK target is followed when the leading entity is a DB table with that FK. */
+function validateVia(
+  shape: string,
+  via: string,
+  index: Map<string, FuseEntity>,
+  diagnostics: ShapeDiagnostic[],
+): void {
+  const parts = via.split(".");
+  if (parts.length < 2) {
+    diagnostics.push({
+      shape,
+      kind: "unknown-field",
+      severity: "warning",
+      message: `via path "${via}" is not of the form Entity.column`,
+    });
+    return;
+  }
+  // Resolve the starting entity as the *longest* dotted prefix present in the index
+  // (so a qualified `source.table` start works, not just a bare id), leaving at least
+  // one trailing segment as a hop column. The remaining segments are hop columns.
+  let entity: FuseEntity | undefined;
+  let start = 0;
+  for (let p = 1; p < parts.length; p++) {
+    const candidate = parts.slice(0, p).join(".");
+    const hit = index.get(candidate);
+    if (hit) {
+      entity = hit;
+      start = p;
+    }
+  }
+  if (!entity) {
+    diagnostics.push({
+      shape,
+      kind: "unknown-field",
+      severity: "warning",
+      message: `via path "${via}" starts at unknown entity "${parts.slice(0, -1).join(".")}"`,
+    });
+    return;
+  }
+  for (let i = start; i < parts.length; i++) {
+    const col = parts[i];
+    const hasField = Object.prototype.hasOwnProperty.call(entity.fields, col);
+    const fkTarget = entity.fks?.[col];
+    if (!hasField && !fkTarget) {
+      diagnostics.push({
+        shape,
+        kind: "unknown-field",
+        severity: "warning",
+        message: `via path "${via}" hops through unknown column "${col}"`,
+      });
+      return;
+    }
+    // Follow the FK to the next entity when we can; otherwise stop (lenient).
+    const next = fkTarget ? index.get(fkTarget) : undefined;
+    if (!next) return;
+    entity = next;
+  }
+}
