@@ -117,7 +117,10 @@ Models carry metadata **about the process and about the data in motion** (e.g. `
 nano-namespaced extension elements. The scan lifts this into the fuse alongside the shapes, so
 governance/state metadata is queryable app-wide without a second store. Shape-level metadata (a field
 like `approved` on a payload) is the **extend** case of §4; model-level metadata (this *process/model*
-is approved) is a property of the `model:` provenance entry.
+is approved) is a property of the `model:` provenance entry. Model-level metadata is authored as
+`nano:meta key/value` siblings of the `nano:shapes` container and surfaces as a typed accessor
+(`@nanobpm/meta` — `meta("classification")`) plus a folded, process-tagged section of the `domain.json`
+fuse cache (see OQ1).
 
 ### 6. The fuse: identity, conflict, build order
 
@@ -288,8 +291,18 @@ is omitted from `DomainTypes` (so a broken shape degrades to untyped, it does no
 
 ## Open questions
 
-1. **Fuse cache location & format** — is the computed fuse persisted (a generated `domain` artifact) for
-   fast IDE/codegen reads, or recomputed on demand? What invalidates it?
+1. **Fuse cache location & format (OQ1).** Resolved: the computed fuse is persisted as a **generated,
+   git-ignored `nano-generated/domain.json`** — the maker's manifest stays a pure *source*, and the
+   `domaintypes` op regenerates the cache write-through on every run alongside the TS artifacts. It is a
+   structured, queryable index: provenance-tagged entities (`db:`/`manifest:`/`model:<processId>`), the
+   folded model-level metadata (§5), diagnostics, and an `inputsHash` for staleness detection. The hash
+   is **FNV-1a (hex) over `JSON.stringify` of the domain-model object with the `inputsHash` field omitted**
+   — i.e. the compact JSON in property-insertion order (`$generated`, `version`, `default?`, `sources`,
+   `entities`, `meta`, `diagnostics`), *not* the pretty-printed file bytes — so a consumer recomputes it
+   by re-serialising the parsed object without `inputsHash`, not by hashing the file. An input change that
+   produces identical output keeps
+   the hash — acceptable for a cache whose only job is fast reads. It is never hand-authored; deleting it
+   is harmless (the next op rebuilds it).
 2. **Reference/cycle grain** — do we allow a motion shape to carry another motion shape from a *different*
    model, and how aggressively do we guard cycles vs. lazily diagnose them? (§10 resolves shapes in a
    second cross-model pass with cycle-as-diagnostic; the remaining question is whether cross-model
@@ -344,6 +357,17 @@ is omitted from `DomainTypes` (so a broken shape degrades to untyped, it does no
     entities; a nominal ref to a shape/type in another model is not yet an authoring affordance.)
 - **4 — external-shape contracts** *(source #3)*: a standalone external-shapes artifact (its own file),
   fused as leaves.
-- **5 — model & shape metadata** *(§5)*: the extension vocabulary and app-wide surfacing.
+- **5 — model & shape metadata** *(§5)* — **done (PR: fuse-cache-meta)**: model-level `nano:meta`
+  key/value pairs are lifted by the Rust scan (`envelope_scan.rs`, only siblings of the `nano:shapes`
+  container — not `nano:extend` ops inside a shape), injected on the `domaintypes` op as `derivedMeta`,
+  and folded into the fuse. They surface two ways: (a) a typed accessor `meta.ts` (`@nanobpm/meta`:
+  `AppMeta` interface + `appMeta` const + an overloaded `meta()` reader), seeded from a stub byte-
+  identical to `emitMeta([])` so a no-meta scaffold never drifts; and (b) the §5/OQ1 `domain.json` cache,
+  where each entry is tagged with its defining process for `model:<processId>` provenance. The composer
+  drawer (increment 3) gains a **Model metadata** editor (add/edit/remove key/value rows via
+  `BpmnModeler.getMeta()`/`setMeta()` → `shapeCarrier.writeMeta`, each write one undoable command,
+  preserving the `nano:shapes` container in place), and the debounced preview posts the in-editor `meta`
+  so the fuse/accessor reflect unsaved edits. This increment also resolves **OQ1**: the write-through,
+  git-ignored `nano-generated/domain.json` fuse cache with an `inputsHash`.
 - **6 — PRM wiring**: the fuse feeds 0031's rest/face projections (persist/rehydrate from composed
   shapes, including extended metadata where it maps).

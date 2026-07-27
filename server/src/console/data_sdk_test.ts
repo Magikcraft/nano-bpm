@@ -1,6 +1,6 @@
 // Deno unit tests for the Urban datasource SDK (ADR 0024 phase-1 core).
 //
-// CI cannot run Deno, so these are run locally with:
+// Run in CI by the `console-deno` job, and locally with:
 //   deno test --allow-read --allow-write --allow-env server/src/console/data_sdk_test.ts
 //
 // They cover the env-template alias flip, url→path resolution, and a full SQLite

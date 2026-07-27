@@ -817,6 +817,36 @@ export type DomainTypesResult = {
      *
      */
     shapeDiagnostics: Array<ShapeDiagnostic>;
+    /**
+     * The generated typed model-metadata accessor written (`nano-generated/meta.ts`, `@nanobpm/meta`, ADR 0040 §5), or null when the op ran with `write:false` (e.g. the preview endpoint).
+     *
+     */
+    metaPath?: string | null;
+    /**
+     * The structured Fused Domain Model cache written (`nano-generated/domain.json`, ADR 0040 §1), or null under `write:false`.
+     *
+     */
+    domainModelPath?: string | null;
+    /**
+     * The emitted typed model-metadata accessor (`meta.ts`, `@nanobpm/meta`, ADR 0040 §5) contents. Present whenever the op resolved (including the preview endpoint under `write:false`, which returns it without writing).
+     *
+     */
+    meta?: string | null;
+    /**
+     * The emitted structured Fused Domain Model (`domain.json`, ADR 0040 §1) contents. Present whenever the op resolved (including the preview endpoint under `write:false`, which returns it without writing).
+     *
+     */
+    domainModel?: string | null;
+};
+
+/**
+ * One model-level metadata entry (`nano:meta`) the modeller is editing (ADR 0040 §5), tagged with its defining process for `model:<processId>` provenance.
+ *
+ */
+export type MetaDeclSpec = {
+    process?: string;
+    key: string;
+    value: string;
 };
 
 /**
@@ -850,6 +880,11 @@ export type DomainTypesPreviewRequest = {
      *
      */
     shapes: Array<ShapeDeclSpec>;
+    /**
+     * The model-level metadata (`nano:meta`) currently in the editor, previewed instead of the saved-model scan so the fuse/accessor reflect unsaved edits (ADR 0040 §5).
+     *
+     */
+    meta?: Array<MetaDeclSpec>;
 };
 
 /**
