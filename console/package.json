@@ -18,6 +18,7 @@
     "@bpmn-io/form-js": "^1.21.3",
     "@bpmn-io/properties-panel": "^3.44.1",
     "@camunda/zeebe-element-templates-json-schema": "0.44.0",
+    "@craftjs/core": "^0.2.12",
     "@monaco-editor/react": "^4.7.0",
     "@nanobpm/nano-app-schema": "file:../spec-app",
     "@tanstack/react-query": "^5.59.0",
