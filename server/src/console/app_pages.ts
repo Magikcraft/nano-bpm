@@ -60,6 +60,15 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
   const sourceName = ctx.sourceName ?? "app";
   const readPage = ctx.readPage ?? ((p: string) => Deno.readTextFile(p));
 
+  // The table-name whitelist is memoised: an Urban app runs its migrations at
+  // boot (before `servePages`), so the schema is stable for the process lifetime,
+  // and the renderer refreshes grids repeatedly — re-introspecting the sqlite
+  // schema (multiple PRAGMAs per table) on every `/app/data` hit would be a hot
+  // path. Introspect once, lazily, and reuse.
+  let tableNames: Promise<Set<string>> | null = null;
+  const knownTables = (): Promise<Set<string>> =>
+    (tableNames ??= ctx.db.schema().then((t) => new Set(t.map((x) => x.name))));
+
   return async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
@@ -99,8 +108,8 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
         return json({ error: `unknown datasource "${source}"` }, 404);
       }
       if (!IDENT.test(table)) return json({ error: "invalid table name" }, 400);
-      const tables = await ctx.db.schema();
-      if (!tables.some((t) => t.name === table)) {
+      const tables = await knownTables();
+      if (!tables.has(table)) {
         return json({ error: `unknown table "${table}"` }, 404);
       }
       const rows = await ctx.db.query(`SELECT * FROM ${table} LIMIT ${rowLimit}`);

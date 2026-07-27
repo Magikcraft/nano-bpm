@@ -1591,7 +1591,7 @@ for a self-contained engine+UI binary.\n"
 // and surfaces; a Deno binary serves the generated UI and boots the App. The
 // scaffold lays down the manifest + the resource dirs the Console's model
 // editors read from (`resources/processes|decisions|forms`) + `db/migrations`
-// for the sqlite datasource + `public/` for static assets.
+// for the sqlite datasource + `pages/` for the composed screens (ADR 0042).
 
 const URBAN_DENO_JSON: &str = r#"{
   "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/worker": "./{GEN}/workers.ts", "@nanobpm/messages": "./{GEN}/messages.ts", "@nanobpm/meta": "./{GEN}/meta.ts", "@nanobpm/llm": "./{GEN}/llm-worker.ts", "@nanobpm/data": "./{GEN}/data-sdk.ts", "@nanobpm/domain": "./{GEN}/domain.ts", "@nanobpm/app": "./{GEN}/app-pages.ts", "@lib/": "./lib/" },
@@ -1629,14 +1629,6 @@ const nano = createCamundaClient();
 
 servePages({ db, nano, port: PORT });
 console.log(`Urban App serving its composed pages on :${PORT}`);
-"#;
-
-const URBAN_INDEX_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Urban App</title>
-<style>body{font:16px system-ui;margin:3rem;max-width:40rem}</style></head>
-<body><h1 id="title">Urban App</h1><p>A Nano RAD application. Design its models, data,
-triggers and surfaces in the Console, then run or compile it to a binary.</p>
-<script>fetch('/api/app').then(r=>r.json()).then(a=>{title.textContent=a.name})</script>
-</body></html>
 "#;
 
 // Sample components (Zeebe element templates) the scaffold drops into the
@@ -2235,14 +2227,12 @@ pub fn create_project(
         )?;
         cfg_app = "deno-gui";
     } else if template == "urban-starter" {
-        mk(dir.join("public"))?;
         mk(dir.join("pages"))?;
         mk(dir.join("db").join("migrations"))?;
         let app_id = slugify_app_id(name);
         w(dir.join("deno.json"), &gendir(URBAN_DENO_JSON))?;
         w(dir.join("main.ts"), URBAN_MAIN_TS)?;
         w(dir.join("nano.app.json"), &urban_manifest(&app_id, name))?;
-        w(dir.join("public").join("index.html"), URBAN_INDEX_HTML)?;
         w(
             dir.join("pages").join("home.page.json"),
             &urban_home_page(name),
@@ -4242,7 +4232,13 @@ mod tests {
         assert!(dir.join("resources/decisions").is_dir());
         assert!(dir.join("resources/forms").is_dir());
         assert!(dir.join("db/migrations").is_dir());
-        assert!(dir.join("public/index.html").is_file());
+        // The Urban entrypoint serves its composed pages via `@nanobpm/app`, so
+        // the scaffold no longer ships a static `public/index.html` (which used to
+        // reference a `/api/app` endpoint that no longer exists).
+        assert!(
+            !dir.join("public/index.html").exists(),
+            "no vestigial public/index.html"
+        );
         assert!(dir.join("main.ts").is_file());
         // ADR 0042: the app's composed screen is scaffolded and the Urban
         // entrypoint serves it via the generic `@nanobpm/app` runtime — no
