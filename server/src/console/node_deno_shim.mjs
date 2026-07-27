@@ -49,14 +49,18 @@ if (globalThis.Deno === undefined) {
   function bridge(handler, hostname) {
     return async (nodeReq, nodeRes) => {
       try {
-        const url = `http://${nodeReq.headers.host ?? hostname}${nodeReq.url}`;
+        // Node's IncomingMessage can leave `url`/`method` undefined on atypical
+        // requests; default them so we never build a malformed web `Request`.
+        const method = nodeReq.method ?? "GET";
+        const path = nodeReq.url ?? "/";
+        const url = `http://${nodeReq.headers.host ?? hostname}${path}`;
         const headers = new Headers();
         for (const [k, v] of Object.entries(nodeReq.headers)) {
           if (Array.isArray(v)) for (const vv of v) headers.append(k, vv);
           else if (v != null) headers.set(k, v);
         }
-        const hasBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD";
-        const init = { method: nodeReq.method, headers };
+        const hasBody = method !== "GET" && method !== "HEAD";
+        const init = { method, headers };
         if (hasBody) {
           const chunks = [];
           for await (const c of nodeReq) chunks.push(c);
