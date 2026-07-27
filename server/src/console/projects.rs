@@ -5130,6 +5130,65 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_validates_a_qualified_via_path_through_a_fk() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesvia";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } } }"#,
+        )
+        .unwrap();
+        // A qualified `via` start ("app.orders") must resolve via the longest index
+        // prefix, then hop through the `customer_id` FK to `app.customers` — with no
+        // false "unknown entity" warning (which the bare-parts[0] split produced).
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="OrderView">
+                 <nano:project ref="customers" fields="name" via="app.orders.customer_id" />
+               </nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create customers");
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER REFERENCES customers(id))" }),
+        )
+        .await
+        .expect("create orders");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        assert!(text.contains("\"OrderView\": {"), "shape missing: {text}");
+        assert!(
+            text.contains("name: string;"),
+            "projected field missing: {text}"
+        );
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert!(
+            diags.is_empty(),
+            "qualified via should validate cleanly: {diags:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_derives_message_payload_from_the_model() {
         let _g = lock();
         if workers::usable_node().is_none() && workers::find_deno().is_none() {

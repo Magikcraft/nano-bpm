@@ -736,7 +736,10 @@ function leafEntityIndex(
       const fields: Record<string, DomainFieldDef> = {};
       const fks: Record<string, string> = {};
       for (const c of t.columns) fields[c.name] = columnToField(c);
-      for (const fk of t.foreignKeys ?? []) fks[fk.column] = fk.refTable;
+      // Store FK targets as the unambiguous `source.table` id (FKs are intra-source)
+      // so `via`-path following resolves the intended table, never a same-named
+      // table in another source or a type-preferred bare id.
+      for (const fk of t.foreignKeys ?? []) fks[fk.column] = `${s.source}.${fk.refTable}`;
       const entity: FuseEntity = { fields, fks };
       index.set(`${s.source}.${t.name}`, entity);
       tableIds.add(`${s.source}.${t.name}`);
@@ -1049,7 +1052,19 @@ function validateVia(
     });
     return;
   }
-  let entity = index.get(parts[0]);
+  // Resolve the starting entity as the *longest* dotted prefix present in the index
+  // (so a qualified `source.table` start works, not just a bare id), leaving at least
+  // one trailing segment as a hop column. The remaining segments are hop columns.
+  let entity: FuseEntity | undefined;
+  let start = 0;
+  for (let p = 1; p < parts.length; p++) {
+    const candidate = parts.slice(0, p).join(".");
+    const hit = index.get(candidate);
+    if (hit) {
+      entity = hit;
+      start = p;
+    }
+  }
   if (!entity) {
     diagnostics.push({
       shape,
@@ -1059,7 +1074,7 @@ function validateVia(
     });
     return;
   }
-  for (let i = 1; i < parts.length; i++) {
+  for (let i = start; i < parts.length; i++) {
     const col = parts[i];
     const hasField = Object.prototype.hasOwnProperty.call(entity.fields, col);
     const fkTarget = entity.fks?.[col];
