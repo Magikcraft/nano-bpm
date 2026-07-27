@@ -2126,14 +2126,20 @@ components:
         yolo: { type: boolean }
     MarketEntry:
       type: object
-      required: [name, version, description, category, installed, updateAvailable]
+      required: [name, version, description, category, official, installed, updateAvailable]
       properties:
         name: { type: string }
         version: { type: string }
         description: { type: string }
         category:
           type: string
-          enum: [lang, app, example, theme, trigger, other]
+          enum: [lang, app, example, theme, trigger, agentic-sdlc, other]
+        official:
+          type: boolean
+          description: >-
+            True when the package is first-party (npm name scoped `@nanobpm/`).
+            Non-official packages carrying the marketplace keyword are grouped
+            under the "Community extensions" section.
         installed: { type: boolean }
         installedVersion: { type: string }
         updateAvailable: { type: boolean }
@@ -2334,7 +2340,7 @@ components:
         pending: { type: integer, format: int64 }
     DomainTypesResult:
       type: object
-      required: [text, tables, shapeDiagnostics, migrated]
+      required: [text, tables, shapeDiagnostics]
       properties:
         path:
           type: string
@@ -2357,17 +2363,6 @@ components:
             (ADR 0040 §10). Always present (empty when every shape resolved);
             the preview endpoint surfaces these live for the in-editor shapes.
           items: { $ref: '#/components/schemas/ShapeDiagnostic' }
-        migrated:
-          type: object
-          additionalProperties:
-            type: array
-            items: { type: string }
-          description: >
-            Pending schema migrations applied *before* introspecting each
-            datasource (ADR 0029 §4.1/§6), keyed by source name → the applied
-            migration filenames in order. Always present; empty on the preview
-            endpoint (`write:false` never mutates the DB) and whenever no
-            migration was outstanding.
         metaPath:
           type: string
           nullable: true
