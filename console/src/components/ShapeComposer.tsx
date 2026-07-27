@@ -89,6 +89,7 @@ export default function ShapeComposer({
   useEffect(() => {
     if (shapes.length === 0) {
       setResult(null);
+      setPreviewing(false);
       return;
     }
     const id = ++reqId.current;

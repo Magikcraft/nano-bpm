@@ -1735,28 +1735,38 @@ pub async fn run_data_op(
     if request.get("op").and_then(|v| v.as_str()) == Some("domaintypes")
         && let Some(obj) = request.as_object_mut()
     {
-        let scan = super::envelope_scan::scan_project(&dir);
-        // Insert each map only when the caller did not already supply it: the
-        // `domaintypes` preview (ADR 0040 §9/§10) POSTs the in-editor
-        // `derivedShapes` so its live field preview/diagnostics reflect *unsaved*
-        // composer edits, and must win over the saved-model scan.
-        if !obj.contains_key("derivedWorkers") {
-            obj.insert(
-                "derivedWorkers".to_string(),
-                serde_json::to_value(scan.workers).unwrap_or(serde_json::Value::Null),
-            );
-        }
-        if !obj.contains_key("derivedMessages") {
-            obj.insert(
-                "derivedMessages".to_string(),
-                serde_json::to_value(scan.messages).unwrap_or(serde_json::Value::Null),
-            );
-        }
-        if !obj.contains_key("derivedShapes") {
-            obj.insert(
-                "derivedShapes".to_string(),
-                serde_json::to_value(scan.shapes).unwrap_or(serde_json::Value::Null),
-            );
+        // Scan only when at least one derived map is missing: the `domaintypes`
+        // preview (ADR 0040 §9/§10) supplies all three (its in-editor
+        // `derivedShapes` plus empty `derivedWorkers`/`derivedMessages`, which it
+        // does not need), so the latency-sensitive preview path skips reading
+        // every `resources/processes/*.bpmn` on each debounced keystroke.
+        let needs_scan = ["derivedWorkers", "derivedMessages", "derivedShapes"]
+            .iter()
+            .any(|k| !obj.contains_key(*k));
+        if needs_scan {
+            let scan = super::envelope_scan::scan_project(&dir);
+            // Insert each map only when the caller did not already supply it: the
+            // preview POSTs the in-editor `derivedShapes` so its live field
+            // preview/diagnostics reflect *unsaved* composer edits, and must win
+            // over the saved-model scan.
+            if !obj.contains_key("derivedWorkers") {
+                obj.insert(
+                    "derivedWorkers".to_string(),
+                    serde_json::to_value(scan.workers).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if !obj.contains_key("derivedMessages") {
+                obj.insert(
+                    "derivedMessages".to_string(),
+                    serde_json::to_value(scan.messages).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            if !obj.contains_key("derivedShapes") {
+                obj.insert(
+                    "derivedShapes".to_string(),
+                    serde_json::to_value(scan.shapes).unwrap_or(serde_json::Value::Null),
+                );
+            }
         }
     }
     // The gateway runs the data CLI Node-first: Node (>= 22.6) is always present
