@@ -279,7 +279,7 @@ test("collectEnvelopeTypeRefs: derives every referenced in/out type, deduped", (
   const refs = collectEnvelopeTypeRefs([
     taskWithEnvelope("senior:pr-review", "PrReviewRoundIn", "PrReviewRoundOut"),
     taskWithEnvelope("charge", "PrReviewRoundIn"), // dup input id
-    taskWithEnvelope("noop"), // no envelope -> contributes nothing
+    taskWithEnvelope("noop"), // envelope context but no in/out refs -> contributes nothing
     undefined, // tolerated
   ]);
   assert.deepEqual(refs, ["PrReviewRoundIn", "PrReviewRoundOut"]);
