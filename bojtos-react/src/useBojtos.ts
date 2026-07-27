@@ -68,9 +68,11 @@ export function useBojtos({ bpmn }: UseBojtosOptions): BojtosControls {
   useEffect(() => {
     let cancelled = false;
     // A new diagram means a fresh engine: drop back to `loading` and clear the
-    // previous session's state so consumers never see `ready` against a freed
-    // session while the new one is still loading.
+    // previous session's state — including `processIds` — so consumers never
+    // see `ready` (or a stale process list) against a freed session while the
+    // new one is still loading.
     setPhase("loading");
+    setProcessIds([]);
     setSnapshot(null);
     setEvents([]);
     setError(null);
@@ -80,8 +82,18 @@ export function useBojtos({ bpmn }: UseBojtosOptions): BojtosControls {
           session.free();
           return;
         }
+        try {
+          deployInto(session);
+        } catch (e) {
+          // A failed deploy (e.g. invalid BPMN) must free the just-created
+          // engine rather than leak it until unmount, and must not be stored
+          // as the active session.
+          session.free();
+          setError(String(e));
+          setPhase("error");
+          return;
+        }
         sessionRef.current = session;
-        deployInto(session);
         setPhase("ready");
       })
       .catch((e) => {
