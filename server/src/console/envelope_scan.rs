@@ -275,8 +275,8 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                 if cur_shape.is_none() {
                     if ln == "shape" {
                         let decl = ShapeDecl {
-                            id: attr(attrs, "id").unwrap_or("").to_string(),
-                            name: attr(attrs, "name").map(str::to_string),
+                            id: shape_attr(attrs, "id").unwrap_or_default(),
+                            name: shape_attr(attrs, "name"),
                             process: process_id.clone(),
                             ops: Vec::new(),
                         };
@@ -337,11 +337,19 @@ fn parse_shape_op(ln: &str, attrs: &[(String, String)]) -> Option<ShapeOp> {
         "carry" => Some(ShapeOp::Carry {
             r#ref: shape_attr(attrs, "ref")?,
         }),
-        "project" => Some(ShapeOp::Project {
-            r#ref: shape_attr(attrs, "ref")?,
-            fields: attr(attrs, "fields").map(split_fields).unwrap_or_default(),
-            via: shape_attr(attrs, "via"),
-        }),
+        "project" => {
+            // A project with no field names is a silent no-op (`carry` already
+            // spreads all fields), so treat an empty list as malformed and drop it.
+            let fields = attr(attrs, "fields").map(split_fields).unwrap_or_default();
+            if fields.is_empty() {
+                return None;
+            }
+            Some(ShapeOp::Project {
+                r#ref: shape_attr(attrs, "ref")?,
+                fields,
+                via: shape_attr(attrs, "via"),
+            })
+        }
         "extend" => Some(ShapeOp::Extend {
             name: shape_attr(attrs, "name")?,
             r#type: shape_attr(attrs, "type")?,
@@ -876,6 +884,32 @@ mod tests {
                 process: Some("orders".into()),
                 ops: vec![ShapeOp::Carry {
                     r#ref: "Order".into()
+                }],
+            }]
+        );
+    }
+
+    #[test]
+    fn drops_a_project_with_no_field_names_and_trims_ids() {
+        // A project with an empty/whitespace `fields` list is a silent no-op, so it
+        // is dropped; a shape id is trimmed and a whitespace-only id is unusable.
+        let xml = shape_doc(
+            r#"<nano:shape id="  Trimmed  ">
+                 <nano:project ref="Customer" fields="  " />
+                 <nano:project ref="Customer" fields="tier" via="Order.customerId" />
+               </nano:shape>
+               <nano:shape id="   "><nano:carry ref="Order" /></nano:shape>"#,
+        );
+        assert_eq!(
+            shapes(&xml),
+            vec![ShapeDecl {
+                id: "Trimmed".into(),
+                name: None,
+                process: Some("orders".into()),
+                ops: vec![ShapeOp::Project {
+                    r#ref: "Customer".into(),
+                    fields: vec!["tier".into()],
+                    via: Some("Order.customerId".into()),
                 }],
             }]
         );

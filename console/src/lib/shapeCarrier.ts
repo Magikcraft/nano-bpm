@@ -99,7 +99,11 @@ function readOp(el: ShapeModdleElement): ShapeOp | undefined {
       return ref ? { op: "carry", ref } : undefined;
     case "Project": {
       if (!ref) return undefined;
-      const op: ShapeOp = { op: "project", ref, fields: splitFields(el.fields) };
+      // A project with no field names is a silent no-op (`carry` spreads all
+      // fields), so treat an empty list as malformed and drop it.
+      const fields = splitFields(el.fields);
+      if (fields.length === 0) return undefined;
+      const op: ShapeOp = { op: "project", ref, fields };
       const via = el.via?.trim();
       if (via) op.via = via;
       return op;

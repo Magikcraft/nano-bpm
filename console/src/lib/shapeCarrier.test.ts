@@ -83,6 +83,8 @@ test("readShapes: drops a shape with no id and malformed ops", () => {
             ops: [
               { $type: "nano:Carry" }, // no ref → dropped
               { $type: "nano:Extend", name: "approved" }, // no type → dropped
+              { $type: "nano:Project", ref: "Customer" }, // no fields → dropped
+              { $type: "nano:Project", ref: "Customer", fields: "  " }, // empty fields → dropped
               { $type: "nano:Carry", ref: "Order" },
             ],
           },

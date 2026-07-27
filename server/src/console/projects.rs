@@ -4992,6 +4992,45 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_reports_duplicate_shape_ids_and_omits_them() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesdup";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } },
+                  "types": { "Order": { "fields": { "id": { "type": "string" } } } } } }"#,
+        )
+        .unwrap();
+        // Two shapes share the id "Dup" — a fuse-identity collision. Both are
+        // omitted (untyped) and a single duplicate-id diagnostic is reported.
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="Dup"><nano:carry ref="Order" /></nano:shape>
+               <nano:shape id="Dup"><nano:carry ref="Order" /></nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        assert!(!text.contains("\"Dup\""), "duplicate shape leaked: {text}");
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["kind"], "duplicate-id");
+        assert_eq!(diags[0]["shape"], "Dup");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_derives_message_payload_from_the_model() {
         let _g = lock();
         if workers::usable_node().is_none() && workers::find_deno().is_none() {

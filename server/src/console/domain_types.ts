@@ -677,6 +677,7 @@ export interface ShapeDiagnostic {
     | "reference-cycle"
     | "field-conflict"
     | "unknown-field"
+    | "duplicate-id"
     | "same-id-collision";
   severity: "error" | "warning";
   message: string;
@@ -756,6 +757,16 @@ function referencedShapeIds(shape: ShapeDecl, shapeIds: Set<string>): string[] {
   return [...refs];
 }
 
+/** Structural equality of two domain field defs (`type` + normalized optional/list
+ * flags), so a differing property insertion order does not read as a conflict. */
+function sameFieldDef(a: DomainFieldDef, b: DomainFieldDef): boolean {
+  return (
+    a.type === b.type &&
+    !!a.optional === !!b.optional &&
+    !!a.list === !!b.list
+  );
+}
+
 /**
  * Resolve the project's composed shapes into `DomainTypeDef`s and diagnostics
  * (ADR 0040 §10). Leaves (DB tables, manifest types) fuse first; shapes resolve in
@@ -774,8 +785,25 @@ export function resolveShapes(
   if (shapes.length === 0) return { types: resolved, diagnostics };
 
   const index = leafEntityIndex(sources, types);
+  // Duplicate shape ids are fuse-identity collisions: since resolution keys by id,
+  // a later declaration would silently shadow an earlier one. Report every id that
+  // appears more than once and omit all of its declarations from resolution.
+  const idCounts = new Map<string, number>();
+  for (const s of shapes) if (s.id) idCounts.set(s.id, (idCounts.get(s.id) ?? 0) + 1);
+  const duplicated = new Set<string>();
+  for (const [id, n] of idCounts) {
+    if (n > 1) {
+      duplicated.add(id);
+      diagnostics.push({
+        shape: id,
+        kind: "duplicate-id",
+        severity: "error",
+        message: `shape id "${id}" is declared ${n} times; ids are fuse identities and must be unique`,
+      });
+    }
+  }
   const byId = new Map<string, ShapeDecl>();
-  for (const s of shapes) if (s.id) byId.set(s.id, s);
+  for (const s of shapes) if (s.id && !duplicated.has(s.id)) byId.set(s.id, s);
   const shapeIds = new Set(byId.keys());
 
   // Cycle detection over the shape-only dependency graph (DFS three-colour). Every
@@ -824,7 +852,7 @@ export function resolveShapes(
     let broken = false;
     const addField = (name: string, field: DomainFieldDef): void => {
       const existing = fields[name];
-      if (existing && JSON.stringify(existing) !== JSON.stringify(field)) {
+      if (existing && !sameFieldDef(existing, field)) {
         diagnostics.push({
           shape: shape.id,
           kind: "field-conflict",
@@ -932,7 +960,7 @@ export function resolveShapes(
     // Later shapes may carry this one; expose its resolved fields to the index.
     index.set(shape.id, { fields });
   };
-  for (const s of shapes) if (s.id) resolveOne(s);
+  for (const s of shapes) if (s.id && !duplicated.has(s.id)) resolveOne(s);
 
   return { types: resolved, diagnostics };
 }
