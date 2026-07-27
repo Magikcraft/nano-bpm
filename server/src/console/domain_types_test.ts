@@ -273,6 +273,60 @@ Deno.test("emitDomainBindings renders openDomain with a typed Table per table", 
   assertEquals(DOMAIN_BINDINGS, "domain.ts");
 });
 
+Deno.test("emitDomainBindings drops reserved-named tables (raw/close) from the typed surface", () => {
+  const tables: TableMeta[] = [
+    {
+      name: "raw",
+      columns: [{ name: "id", type: "INTEGER", notNull: true, primaryKey: true }],
+      indexes: [],
+      foreignKeys: [],
+    },
+    {
+      name: "close",
+      columns: [{ name: "id", type: "INTEGER", notNull: true, primaryKey: true }],
+      indexes: [],
+      foreignKeys: [],
+    },
+    {
+      name: "orders",
+      columns: [{ name: "id", type: "INTEGER", notNull: true, primaryKey: true }],
+      indexes: [],
+      foreignKeys: [],
+    },
+  ];
+  // Single-source: the escape hatch must not be clobbered, and the emitted
+  // object literal / interface must not carry a duplicate `raw`/`close` member.
+  const single = emitDomainBindings([{ source: "app", tables }], "app");
+  assertStringIncludes(single, "readonly raw: DataSource;");
+  assertStringIncludes(single, "close(): void;");
+  assertStringIncludes(single, 'orders: raw.table<Orders>("orders", "id"),');
+  assertEquals(single.includes('raw: raw.table<'), false);
+  assertEquals(single.includes('close: raw.table<'), false);
+  // Multi-source keyed: reserved names are absent from the runtime descriptors,
+  // so the `for … db[t.name] = …` loop can never overwrite `raw`/`close`.
+  const multi = emitDomainBindings(
+    [
+      { source: "app", tables },
+      {
+        source: "analytics",
+        tables: [{
+          name: "events",
+          columns: [{ name: "id", type: "INTEGER", notNull: true, primaryKey: true }],
+          indexes: [],
+          foreignKeys: [],
+        }],
+      },
+    ],
+    "app",
+  );
+  assertStringIncludes(multi, '"app": [{ name: "orders", pk: "id" }],');
+  assertEquals(multi.includes('name: "raw"'), false);
+  assertEquals(multi.includes('name: "close"'), false);
+  // The handle type omits the reserved keys so `db.raw`/`db.close` stay the
+  // escape hatch even if the row-type spine keys such a table.
+  assertStringIncludes(multi, 'as K extends "raw" | "close" ? never : K');
+});
+
 Deno.test("emitDomainBindings uses the first declared PK (not always id)", () => {
   const tables: TableMeta[] = [
     {
