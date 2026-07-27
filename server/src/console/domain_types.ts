@@ -1070,7 +1070,7 @@ function validateVia(
       shape,
       kind: "unknown-field",
       severity: "warning",
-      message: `via path "${via}" starts at unknown entity "${parts[0]}"`,
+      message: `via path "${via}" starts at unknown entity "${parts.slice(0, -1).join(".")}"`,
     });
     return;
   }

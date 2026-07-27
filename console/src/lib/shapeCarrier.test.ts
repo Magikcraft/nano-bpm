@@ -79,7 +79,8 @@ test("readShapes: drops a shape with no id and malformed ops", () => {
         shapes: [
           {
             $type: "nano:Shape",
-            id: "Ok",
+            id: "  Ok  ",
+            name: "  ",
             ops: [
               { $type: "nano:Carry" }, // no ref → dropped
               { $type: "nano:Extend", name: "approved" }, // no type → dropped
@@ -142,6 +143,25 @@ test("writeShapes: preserves other extension elements and swaps only the shapes 
   assert.equal(values[1].$type, "nano:Shapes");
   const nextExt: ShapeModdleElement = { $type: "bpmn:ExtensionElements", values };
   assert.deepEqual(readShapes({ ...bo, extensionElements: nextExt }), sample);
+});
+
+test("writeShapes: replaces the container in place when it is not the last sibling", () => {
+  // The `nano:Shapes` container precedes `nano:meta`; a correct in-place swap keeps
+  // it at index 0 (the old append-at-end path would reorder to [meta, shapes]).
+  const meta: ShapeModdleElement = { $type: "nano:Meta", key: "k", value: "v" };
+  const bo: ShapeModdleElement = {
+    $type: "bpmn:Process",
+    extensionElements: {
+      $type: "bpmn:ExtensionElements",
+      values: [buildShapesContainer(moddle, [{ id: "Old", ops: [] }]), meta],
+    },
+  };
+  const modeling = recordingModeling();
+  writeShapes(moddle, modeling, {}, bo, sample);
+  const values = modeling.calls[0].props.values as ShapeModdleElement[];
+  assert.equal(values.length, 2);
+  assert.equal(values[0].$type, "nano:Shapes"); // container stays first
+  assert.equal(values[1], meta); // meta stays after it
 });
 
 test("writeShapes: an empty shape list removes the container but keeps meta", () => {

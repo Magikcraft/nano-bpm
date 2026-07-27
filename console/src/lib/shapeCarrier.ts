@@ -144,7 +144,8 @@ export function readShapes(processBo: ShapeModdleElement | undefined): ShapeDecl
       if (op) ops.push(op);
     }
     const decl: ShapeDecl = { id, ops };
-    if (s.name) decl.name = s.name;
+    const name = s.name?.trim();
+    if (name) decl.name = name;
     out.push(decl);
   }
   return out;
@@ -219,8 +220,19 @@ export function writeShapes(
   shapes: ShapeDecl[],
 ): void {
   const ext = processBo.extensionElements;
-  const kept = (ext?.values ?? []).filter((v) => localType(v.$type) !== "Shapes");
-  const next = shapes.length > 0 ? [...kept, buildShapesContainer(moddle, shapes)] : kept;
+  const existing = ext?.values ?? [];
+  const container = shapes.length > 0 ? buildShapesContainer(moddle, shapes) : undefined;
+  // Replace the `nano:Shapes` container *in place* (preserving the order of sibling
+  // extension elements like `nano:meta`); only append when none existed.
+  const idx = existing.findIndex((v) => localType(v.$type) === "Shapes");
+  let next: ShapeModdleElement[];
+  if (idx >= 0) {
+    next = existing.slice();
+    if (container) next[idx] = container;
+    else next.splice(idx, 1);
+  } else {
+    next = container ? [...existing, container] : existing.slice();
+  }
   if (ext) {
     for (const v of next) v.$parent = ext;
     modeling.updateModdleProperties(element, ext, { values: next });
