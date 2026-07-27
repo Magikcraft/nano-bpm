@@ -2209,7 +2209,10 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
     // resurrect as an imported project once its directory is gone.
     let workspace_dir = projects_root().join(name);
     if workspace_dir.is_dir() {
-        let _ = remove_project_ref(name);
+        // Drop a coexisting ref before removing the directory; propagate an IO
+        // error so a pointer that can't be removed can't silently resurrect the
+        // name later (fail closed).
+        remove_project_ref(name)?;
         return std::fs::remove_dir_all(workspace_dir);
     }
     // A pure imported-by-reference project (ADR 0041) owns only its pointer file
