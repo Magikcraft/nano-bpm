@@ -2201,14 +2201,22 @@ pub fn create_project(
 
 /// Deletes a project directory and everything in it.
 pub fn delete_project(name: &str) -> std::io::Result<()> {
-    // A project imported by reference (ADR 0041) owns only its pointer file —
-    // deleting it must remove the reference, never the external checkout.
-    if remove_project_ref(name)? {
-        return Ok(());
-    }
     let dir = project_dir(name).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid project name")
     })?;
+    // A real workspace directory shadows any reference (matching `project_dir`),
+    // so delete it. Also drop a coexisting ref so the name can't silently
+    // resurrect as an imported project once its directory is gone.
+    let workspace_dir = projects_root().join(name);
+    if workspace_dir.is_dir() {
+        let _ = remove_project_ref(name);
+        return std::fs::remove_dir_all(workspace_dir);
+    }
+    // A pure imported-by-reference project (ADR 0041) owns only its pointer file
+    // — deleting it must remove the reference, never the external checkout.
+    if remove_project_ref(name)? {
+        return Ok(());
+    }
     std::fs::remove_dir_all(dir)
 }
 
@@ -3889,6 +3897,37 @@ mod tests {
         let dups: Vec<_> = list.iter().filter(|p| p.name == "dup").collect();
         assert_eq!(dups.len(), 1, "exactly one tile for a shadowed ref");
         assert_eq!(dups[0].source, "workspace");
+    }
+
+    #[test]
+    fn delete_project_with_both_a_workspace_dir_and_a_ref_removes_the_dir_and_the_ref() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = ext_app_dir("coexist");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"c","name":"C"}"#,
+        )
+        .unwrap();
+        // A workspace directory and a same-named ref coexist (the workspace dir
+        // shadows the ref per project_dir).
+        std::fs::create_dir_all(root.join("both")).unwrap();
+        std::fs::write(root.join("both").join("marker"), "x").unwrap();
+        std::fs::write(
+            projects_root().join("both.project-ref.json"),
+            format!(
+                r#"{{"source":"path","path":"{}"}}"#,
+                std::fs::canonicalize(&ext).unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
+
+        delete_project("both").expect("delete ok");
+        // The real directory is gone, the ref is dropped (name can't resurrect),
+        // and the external checkout is untouched.
+        assert!(!root.join("both").exists(), "workspace dir removed");
+        assert!(read_project_ref("both").is_none(), "ref removed too");
+        assert!(ext.join("nano.app.json").is_file(), "external untouched");
     }
 
     // --- discover_deployables --------------------------------------------
