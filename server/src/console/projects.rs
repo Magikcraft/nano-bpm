@@ -5081,7 +5081,10 @@ mod tests {
             meta_ts.contains(r#"m["owner"] = "sre";"#),
             "last-wins fold: {meta_ts}"
         );
-        assert!(!meta_ts.contains(r#""ops""#));
+        assert!(
+            !meta_ts.contains(r#"m["owner"] = "ops";"#),
+            "overridden value must not be emitted: {meta_ts}"
+        );
         // The accessor dict is null-prototype (safe for user-authored keys).
         assert!(
             meta_ts.contains("Object.create(null)"),
@@ -5277,6 +5280,14 @@ mod tests {
         // write:false ⇒ nothing materialised.
         assert!(preview["path"].is_null());
         assert!(!dir.join("nano-generated/domain-rows.d.ts").exists());
+        // The heavy `domain.json` fuse cache is not built on the latency-sensitive
+        // preview path — the composer consumes only `text` + `shapeDiagnostics`.
+        assert!(preview["domainModelPath"].is_null());
+        assert!(
+            preview["domainModel"].is_null(),
+            "preview must not emit the domain.json payload: {}",
+            preview["domainModel"]
+        );
     }
 
     /// The preview `derivedMeta` contract (ADR 0040 §5): an *absent* `derivedMeta`

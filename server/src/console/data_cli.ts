@@ -418,14 +418,10 @@ async function run(req: Request): Promise<unknown> {
       const metaAccessor = emitMeta(derivedMeta);
       // The structured Fused Domain Model (`domain.json`, ADR 0040 §1): a fast-read
       // cache of every fused entity + metadata + diagnostics for the IDE/codegen.
-      const domainModelJson = emitDomainModelJson({
-        sources: schemas,
-        default: def,
-        manifestTypes: manifestTypesSnapshot,
-        shapes: shapeEntities,
-        meta: derivedMeta,
-        diagnostics: shapeResolution.diagnostics,
-      });
+      // Computed only when persisting: it is the largest emitted artifact (every
+      // fused entity's fields + an FNV-1a hash over the whole model) and the
+      // latency-sensitive composer preview (`write:false`) consumes only `text` +
+      // `shapeDiagnostics`, so a debounced keystroke must not pay to build it.
       // The worker-IO map (ADR 0033 §3): `taskType → {in,out}`. The model is the
       // source of truth for the envelope, so when the server injected the
       // model-derived map (`derivedWorkers`) it is overlaid on the manifest
@@ -452,6 +448,7 @@ async function run(req: Request): Promise<unknown> {
       let messageBindingsPath: string | null = null;
       let metaPath: string | null = null;
       let domainModelPath: string | null = null;
+      let domainModelJson: string | null = null;
       if (req.write !== false) {
         await RT.mkdir(GEN_DIR);
         path = `${GEN_DIR}/${DOMAIN_DTS}`;
@@ -466,6 +463,14 @@ async function run(req: Request): Promise<unknown> {
         await RT.writeTextFile(`${GEN_DIR}/${MESSAGE_BINDINGS_TS}`, messageRuntime);
         metaPath = `${GEN_DIR}/${META_TS}`;
         await RT.writeTextFile(metaPath, metaAccessor);
+        domainModelJson = emitDomainModelJson({
+          sources: schemas,
+          default: def,
+          manifestTypes: manifestTypesSnapshot,
+          shapes: shapeEntities,
+          meta: derivedMeta,
+          diagnostics: shapeResolution.diagnostics,
+        });
         domainModelPath = `${GEN_DIR}/${DOMAIN_MODEL_JSON}`;
         await RT.writeTextFile(domainModelPath, domainModelJson);
       }
