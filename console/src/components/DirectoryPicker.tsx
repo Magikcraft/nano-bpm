@@ -134,8 +134,8 @@ export default function DirectoryPicker({
             </Button>
             <Button
               variant="primary"
-              disabled={loading || !data}
-              onClick={() => data && onPick(data.path)}
+              disabled={loading || !data?.isNanoApp}
+              onClick={() => data?.isNanoApp && onPick(data.path)}
             >
               Select this folder
             </Button>
