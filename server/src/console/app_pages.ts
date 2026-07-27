@@ -56,7 +56,7 @@ const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/;
 export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise<Response> {
   const pagesDir = ctx.pagesDir ?? "pages";
   const homePage = ctx.homePage ?? "home";
-  const rowLimit = ctx.rowLimit ?? 200;
+  const rowLimit = Math.max(0, Math.floor(Number(ctx.rowLimit) || 200));
   const sourceName = ctx.sourceName ?? "app";
   const readPage = ctx.readPage ?? ((p: string) => Deno.readTextFile(p));
 
@@ -146,6 +146,10 @@ export function servePages(ctx: PagesContext & { port?: number }): Deno.HttpServ
   return Deno.serve({ port: ctx.port ?? 8090 }, handle);
 }
 
+function escapeAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 function rendererShell(homePage: string): string {
   return `<!doctype html>
 <html lang="en">
@@ -156,7 +160,7 @@ function rendererShell(homePage: string): string {
   <style>${RENDERER_CSS}</style>
 </head>
 <body>
-  <main id="page" data-home="${homePage}"><p class="pc-empty">Loading…</p></main>
+  <main id="page" data-home="${escapeAttr(homePage)}"><p class="pc-empty">Loading…</p></main>
   <script type="module" src="/app/runtime.js"></script>
 </body>
 </html>`;
@@ -276,7 +280,7 @@ const RENDERERS = { text: renderText, actionForm: renderActionForm, dataGrid: re
 
 async function main() {
   try {
-    const doc = await getJSON("/app/pages/" + HOME);
+    const doc = await getJSON("/app/pages/" + encodeURIComponent(HOME));
     if (doc.title) document.title = doc.title;
     root.replaceChildren(...(doc.nodes || []).map((n) => (RENDERERS[n.type] || (() => el("div")))(n)));
   } catch (e) {

@@ -161,8 +161,8 @@ export function parsePageDoc(value: unknown): { ok: true; doc: PageDoc } | { ok:
             fields: fields.filter(isRecord).map((f) => ({
               key: typeof f.key === "string" ? f.key : "",
               label: typeof f.label === "string" ? f.label : "",
-              type: "text",
-            })),
+              type: "text" as const,
+            })).filter((f) => f.key !== ""),
           },
         });
         break;

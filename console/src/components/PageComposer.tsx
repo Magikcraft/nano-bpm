@@ -10,7 +10,7 @@
 import {
   forwardRef,
   useImperativeHandle,
-  useMemo,
+  useState,
   type ReactElement,
 } from "react";
 import {
@@ -311,42 +311,56 @@ function ListEditor({
 
 // ── the imperative bridge (get/set page.json from inside <Editor>) ───────────
 
-const Bridge = forwardRef<PageComposerHandle, { title: string }>(function Bridge({ title }, ref) {
-  const { query, actions } = useEditor();
-  useImperativeHandle(ref, () => ({
-    getPageJson(): string {
-      const state = JSON.parse(query.serialize()) as CraftState;
-      const doc = toPageDoc(state, title);
-      return JSON.stringify(doc, null, 2);
-    },
-    setPageJson(text: string): void {
-      let doc: PageDoc = emptyPage(title);
-      const trimmed = text.trim();
-      if (trimmed) {
-        try {
-          const parsed = parsePageDoc(JSON.parse(trimmed));
-          if (parsed.ok) doc = parsed.doc;
-        } catch {
-          // Invalid/partial JSON (mid-edit, a merge conflict): fall back to an
-          // empty page rather than throwing and crashing the editor pane.
+const Bridge = forwardRef<PageComposerHandle, { title: string; onTitleChange: (t: string) => void }>(
+  function Bridge({ title, onTitleChange }, ref) {
+    const { query, actions } = useEditor();
+    useImperativeHandle(ref, () => ({
+      getPageJson(): string {
+        const state = JSON.parse(query.serialize()) as CraftState;
+        const doc = toPageDoc(state, title);
+        return JSON.stringify(doc, null, 2);
+      },
+      setPageJson(text: string): void {
+        let doc: PageDoc = emptyPage(title);
+        const trimmed = text.trim();
+        if (trimmed) {
+          try {
+            const parsed = parsePageDoc(JSON.parse(trimmed));
+            if (parsed.ok) doc = parsed.doc;
+          } catch {
+            // Invalid/partial JSON (mid-edit, a merge conflict): fall back to an
+            // empty page rather than throwing and crashing the editor pane.
+          }
         }
-      }
-      actions.deserialize(JSON.stringify(fromPageDoc(doc)));
-    },
-  }), [query, actions, title]);
-  return null;
-});
+        // Preserve the loaded page's title so a round-trip save doesn't clobber it.
+        onTitleChange(doc.title);
+        actions.deserialize(JSON.stringify(fromPageDoc(doc)));
+      },
+    }), [query, actions, title, onTitleChange]);
+    return null;
+  },
+);
 
 // ── the exported surface ─────────────────────────────────────────────────────
 
 const PageComposer = forwardRef<PageComposerHandle, PageComposerProps>(
   function PageComposer({ onChange, entities = [], processes = [] }, ref) {
-    const title = useMemo(() => "Page", []);
+    const [title, setTitle] = useState("Page");
     return (
       <div className="pc-root">
         <style>{PAGE_COMPOSER_CSS}</style>
         <Editor resolver={RESOLVER} onNodesChange={() => onChange?.()}>
-          <Bridge ref={ref} title={title} />
+          <Bridge ref={ref} title={title} onTitleChange={setTitle} />
+          <div className="pc-toolbar">
+            <label className="pc-row">
+              <span>Page title</span>
+              <input
+                className="pc-title-input"
+                value={title}
+                onChange={(e) => { setTitle(e.target.value); onChange?.(); }}
+              />
+            </label>
+          </div>
           <div className="pc-layout">
             <Palette />
             <div className="pc-frame">
@@ -365,8 +379,11 @@ const PageComposer = forwardRef<PageComposerHandle, PageComposerProps>(
 export default PageComposer;
 
 const PAGE_COMPOSER_CSS = `
-.pc-root { height:100%; }
-.pc-layout { display:grid; grid-template-columns:12rem 1fr 18rem; height:100%; min-height:0; }
+.pc-root { height:100%; display:flex; flex-direction:column; }
+.pc-toolbar { padding:.5rem .75rem; border-bottom:1px solid var(--color-edge,#d0d0d8); }
+.pc-toolbar .pc-row { display:flex; align-items:center; gap:.5rem; }
+.pc-title-input { flex:1; font:inherit; padding:.3rem .5rem; }
+.pc-layout { display:grid; grid-template-columns:12rem 1fr 18rem; flex:1; min-height:0; }
 .pc-palette, .pc-settings { border-color:var(--color-edge,#d0d0d8); padding:.75rem; overflow:auto; font-size:.85rem; }
 .pc-palette { border-right:1px solid var(--color-edge,#d0d0d8); }
 .pc-settings { border-left:1px solid var(--color-edge,#d0d0d8); }
