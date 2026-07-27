@@ -108,8 +108,10 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 
 /**
  * Validate an arbitrary value as a `PageDoc`, returning the parsed doc or a list
- * of human-readable errors. The renderer and the save path both go through this so
- * a malformed page fails loudly rather than rendering half a screen.
+ * of human-readable errors. The Console's Page Composer and its serializer go
+ * through this on open/save so a malformed page fails loudly rather than
+ * rendering half a screen. (The App-side runtime renderer trusts the persisted
+ * `page.json` and does not re-validate.)
  */
 export function parsePageDoc(value: unknown): { ok: true; doc: PageDoc } | { ok: false; errors: string[] } {
   const errors: string[] = [];

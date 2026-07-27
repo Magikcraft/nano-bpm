@@ -323,8 +323,13 @@ const Bridge = forwardRef<PageComposerHandle, { title: string }>(function Bridge
       let doc: PageDoc = emptyPage(title);
       const trimmed = text.trim();
       if (trimmed) {
-        const parsed = parsePageDoc(JSON.parse(trimmed));
-        if (parsed.ok) doc = parsed.doc;
+        try {
+          const parsed = parsePageDoc(JSON.parse(trimmed));
+          if (parsed.ok) doc = parsed.doc;
+        } catch {
+          // Invalid/partial JSON (mid-edit, a merge conflict): fall back to an
+          // empty page rather than throwing and crashing the editor pane.
+        }
       }
       actions.deserialize(JSON.stringify(fromPageDoc(doc)));
     },

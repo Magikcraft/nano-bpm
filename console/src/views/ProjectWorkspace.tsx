@@ -1290,6 +1290,9 @@ function EditorPane({
   const [composerShapes, setComposerShapes] = useState<ShapeDecl[]>([]);
   const [composerMeta, setComposerMeta] = useState<MetaEntry[]>([]);
   const [composerEntities, setComposerEntities] = useState<ComposerEntity[]>([]);
+  // Process ids the `actionForm` picker offers — enumerated from the app's BPMN
+  // files (ADR 0042 fuse-typed action binding). Loaded when a page is edited.
+  const [pageProcessIds, setPageProcessIds] = useState<string[]>([]);
 
   // The fuse leaf entities the composer's pickers offer: every DB table (across
   // datasources) as a `carry`/`project` source with its columns + FK paths, and
@@ -1334,6 +1337,47 @@ function EditorPane({
     }));
     setComposerEntities([...tableEntities, ...typeEntities]);
   }, [name, domainTypeIds]);
+
+  // Editing a page: the composer's pickers are fed by the fuse, not by the
+  // currently-open file. Load the datasource table entities (for the dataGrid
+  // picker) and enumerate the app's process ids (for the actionForm picker) by
+  // scanning every BPMN file — once, when a page opens.
+  useEffect(() => {
+    if (kind !== "page") return;
+    let alive = true;
+    void loadComposerEntities();
+    void (async () => {
+      try {
+        const proj = (await getProject({ path: { name }, throwOnError: true })).data;
+        const bpmnPaths: string[] = [];
+        const walk = (nodes: FileNode[] | undefined) => {
+          for (const n of nodes ?? []) {
+            if (n.kind === "dir") walk(n.children);
+            else if (n.path.endsWith(".bpmn")) bpmnPaths.push(n.path);
+          }
+        };
+        walk(proj.files);
+        const ids = new Set<string>();
+        for (const p of bpmnPaths) {
+          try {
+            const f = await projectFileEx(name, p);
+            if (f.binary || !f.text) continue;
+            for (const m of f.text.matchAll(/<(?:bpmn2?:)?process\b[^>]*\bid=["']([^"']+)["']/g)) {
+              ids.add(m[1]);
+            }
+          } catch {
+            // A file that fails to read just contributes no process ids.
+          }
+        }
+        if (alive) setPageProcessIds([...ids]);
+      } catch {
+        // No project/files — the picker degrades to a free-text field.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [kind, name, loadComposerEntities]);
 
   // Resolve the in-editor shapes server-side (the preview endpoint bypasses the
   // saved-model scan, so unsaved edits are reflected). `source` is nominal — the
@@ -1863,7 +1907,7 @@ function EditorPane({
             ref={pageRef}
             onChange={() => setDirty(true)}
             entities={composerEntities}
-            processes={[]}
+            processes={pageProcessIds}
           />
         )}
         {kind === "form" && (
