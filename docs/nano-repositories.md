@@ -65,9 +65,9 @@ console; it is not a running service.
 - **Discovery.** The console finds packs by the `nano-ide-ext` npm keyword,
   installs the tarball into the workspace, reads the manifest, and wires the pack
   in. No `preinstall`/`postinstall` scripts run.
-- **Baseline.** First-party packs (`deno`, `rust`, `deno-gui`) ship built into
-  the server so the console works offline with zero installs; everything else is
-  an installable pack here.
+- **Baseline.** The `deno` runtime and the `deno-gui` app template ship built
+  into the server so the console works offline with zero installs; every other
+  pack (including `rust`) is installed from here.
 - **Pack kinds:** `lang` (file types + toolchain + templates), `app` (a runnable
   project template), `example` (a complete app copied into a new project),
   `theme` (console colour themes as pure data), and `trigger` (an event source

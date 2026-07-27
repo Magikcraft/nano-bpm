@@ -717,8 +717,9 @@ The console has five tabs, each described below.
 The console is also **extensible**: language support, project templates, examples,
 themes, and event triggers are shipped as **extension packs** — plain npm packages
 discovered by the `nano-ide-ext` keyword and installed from the console UI. The
-console can install any `nano-ide-ext-*` package; the **first-party** packs live in
-the [`nano-ide`](https://github.com/jwulf/nano-ide) repo. Their manifest schema is
+console can install any pack published with the `nano-ide-ext` keyword; the
+**first-party** packs live in the
+[`nano-ide`](https://github.com/jwulf/nano-ide) repo. Their manifest schema is
 defined here in `server/src/console/extensions.rs`. See
 [`docs/nano-repositories.md`](docs/nano-repositories.md) for how the pieces relate.
 
