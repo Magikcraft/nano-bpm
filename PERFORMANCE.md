@@ -74,11 +74,11 @@ metered on the Prometheus `/metrics` surface via
 Two clean 30-minute soaks on current `main` (`4ff70d4`; #311 throughput fix + #314
 seglog recovery-test write-durability fix + #315 build-dep vendor all merged) to establish a fresh baseline on
 the **standard console build**. GCP 3-node RF3 Raft-ON cluster, 12 partitions,
-leader-durable/sync, `MAXPAR=112`, open-loop (`maxInflight=50000`, `rate=14000/prod`,
+leader-durable/sync, `MAXPAR=112`, open-loop (`MI=50000`, `rate=14000/prod`,
 1 loadgen/node, 128 prod conns). Journal wiped between arms (clean A/B).
 
 > **Build note.** Both binaries are the standard soak build — `build-tagged.sh
-> <ref> --stage` with the embedded console (`--features console` + built
+> 4ff70d4 --stage` with the embedded console (`--features console` + built
 > `console/dist` SPA), binsha `c526fd156f7c0774`. This is the first apples-to-apples
 > **console-build** baseline; `--no-console` bisect binaries are not comparable.
 > Aggregate throughput = SUM of the 3 per-node `tput` values (one loadgen/node).
