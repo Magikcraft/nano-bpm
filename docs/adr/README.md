@@ -54,6 +54,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0039](0039-falcon-client-cluster-channel-split.md) | Splitting Falcon: a public client channel vs an authenticated cluster channel | Proposed | 2026-07-24 |
 | [0040](0040-fused-domain-model.md) | The Fused Domain Model: the registry is derived, not authored (three sources → one fuse) | Proposed | 2026-07-27 |
 | [0041](0041-urban-app-import-registry.md) | Importing an Urban App by reference: external project pointers + headless run | Proposed | 2026-07-27 |
+| [0042](0042-bojtos-demo-framework.md) | Bojtos: a publishable in-browser BPMN demo framework | Proposed | 2026-07-28 |
 | [0042](0042-urban-page-screen-composer.md) | The Urban Page/Screen Composer: a Craft.js WYSIWYG surface over an owned `page.json`, served by a generic runtime | Proposed | 2026-07-27 |
 
 ## Reading paths
