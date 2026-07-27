@@ -17,6 +17,12 @@ export function BpmnRuntimeView({ xml, activeIds, incidentIds, className, }) {
     const viewerRef = useRef(null);
     const importedRef = useRef(false);
     const markedRef = useRef([]);
+    // Track the latest ids in a ref so the post-import `applyMarkers()` (fired from
+    // the `[xml]` effect's async `.then`) uses current values, not the ids that
+    // were current when the import started — otherwise ids changing mid-import
+    // would leave the diagram unmarked until the next change.
+    const idsRef = useRef({ activeIds, incidentIds });
+    idsRef.current = { activeIds, incidentIds };
     useEffect(() => {
         if (!containerRef.current)
             return;
@@ -53,9 +59,9 @@ export function BpmnRuntimeView({ xml, activeIds, incidentIds, className, }) {
             }
         }
         const next = [];
-        for (const id of activeIds)
+        for (const id of idsRef.current.activeIds)
             next.push({ id, cls: "nano-active" });
-        for (const id of incidentIds)
+        for (const id of idsRef.current.incidentIds)
             next.push({ id, cls: "nano-incident" });
         for (const { id, cls } of next) {
             try {

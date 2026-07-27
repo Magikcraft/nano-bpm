@@ -27,6 +27,13 @@ export function useBojtos({ bpmn }) {
     }, [bpmn]);
     useEffect(() => {
         let cancelled = false;
+        // A new diagram means a fresh engine: drop back to `loading` and clear the
+        // previous session's state so consumers never see `ready` against a freed
+        // session while the new one is still loading.
+        setPhase("loading");
+        setSnapshot(null);
+        setEvents([]);
+        setError(null);
         createBojtosSession()
             .then((session) => {
             if (cancelled) {
