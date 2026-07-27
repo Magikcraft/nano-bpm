@@ -38,9 +38,16 @@ This repository does **not** auto-merge pull requests. Opening a PR is *not* the
 same as committing to `main` — a PR sits open until a human or agent deliberately
 merges it:
 
-- Merge is a manual act: click **Merge** in the GitHub UI once the required CI
-  checks are green, or enqueue with a `@mergifyio queue` comment to get the
-  always-green rebase-and-retest queue. Nothing merges on its own.
+- Merge is a manual act. CI runs **once when the PR is opened**; follow-up pushes
+  (review-fix commits) deliberately do **not** re-run CI, to keep review cycles
+  cheap. So before merging, run CI **once more on the PR head** to produce the
+  required check contexts — either `gh workflow run ci.yml --ref <branch>`
+  (`workflow_dispatch`) or by toggling the PR to draft and back to ready
+  (`ready_for_review`). Once those head checks are green (and review threads are
+  resolved), merge via the UI **Merge** button or a **`@mergifyio queue`** comment.
+  Note: Mergify requires the required checks on the PR head as an entry condition,
+  so a head with no checks will sit "waiting for queue conditions" — that's why
+  the convergence-time head run is required. Nothing merges on its own.
 - Because a PR stays open until merged, it is **safe to push follow-up commits**
   to an open PR (address review feedback, fix CI, iterate) before you merge it.
 - Still keep each PR focused: land unrelated scope in its own PR rather than
@@ -63,8 +70,9 @@ Every PR must be driven to **review convergence** before it is merged — use th
   `COMMENTED`, never `APPROVED`, so the summary body is the verdict) — or the
   Copilot review is **exhausted** (it reiterates a point already addressed or
   pushed back on; two rounds of the same substantive point = converged).
-- At convergence, **rebase the PR if it is behind `main`, resolve any conflicts**,
-  ensure checks are green, and **merge** (UI merge or `@mergifyio queue`).
+- At convergence, **rebase the PR if it is behind `main`, resolve any conflicts
+  and review threads**, run CI once on the head (`gh workflow run ci.yml --ref
+  <branch>`), wait for green, then **merge** (UI button or `@mergifyio queue`).
 - Stop early and sync with the user only if a comment genuinely **needs their
   input** (a design/product tradeoff you can't decide) — after resolving
   everything else in the round.
