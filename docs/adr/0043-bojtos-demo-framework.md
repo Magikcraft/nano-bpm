@@ -35,6 +35,9 @@ variable payload, and lists waiting jobs. What it is **not** is:
    means.
 3. **Packaged for a demo author.** A demo author wants to drop `<Bojtos bpmn workers seed autoplay/>`
    into a page — not wire up wasm init, a viewer, marker CSS, a trace model and a dispatch loop by hand.
+4. **Interactively editable.** The teaching payload is the worker code: a viewer should see each worker in
+   an editable box beside the diagram and watch an edit take effect in real time (the next job runs the new
+   code). `TestRunPanel` has no editable-worker surface at all.
 
 Two prior decisions from the design conversation are fixed and shape this ADR:
 
@@ -124,29 +127,71 @@ Both demo affordances already exist in the substrate and are just **derived view
   real time as in-browser workers run (`TestRunPanel.tsx:20,392`; `nanobpmn_engine.d.ts:23-27`). This is
   the payoff of the dispatch loop.
 
-### 5. `DemoScenario` — demos are data
+### 5. Editable worker code — live boxes with realtime effect
+
+The demo's teaching payload is the **worker code**, so a demo author (and a demo *viewer*) must be able to
+see each worker's code in an editable box next to the diagram and **watch the effect of an edit in real
+time** — change a handler, and the very next job it services runs the new code, moving the token and
+mutating the variable payload differently. This is the interactive heart of Bojtos, not a nicety.
+
+Design:
+
+- **Workers can be authored as source, not just as functions.** A `WorkerDef` is either a live
+  `JobHandler` (function) or `{ code: string }` — a snippet whose body is `(job, ctx) => …`. Source-form
+  workers keep `DemoScenario` **fully serializable** (see §6), so a demo — including its editable worker
+  code — is data an MDX page or a shared link can carry.
+- **Each source worker renders in a Monaco box.** The console already ships `monaco-editor`
+  (`console/package.json`), so `@nanobpm/bojtos-react` reuses it for a `<WorkerEditor jobType>` per worker,
+  with the JS/TS language services the console already configures.
+- **Edits re-register the handler live.** `@nanobpm/bojtos-kit` compiles the edited source to a
+  `JobHandler` and swaps it in the **worker registry** (the same registry the dispatch loop reads on each
+  `activateJobs`). No engine restart, no re-deploy: the loop simply picks up the new handler on the next
+  activation. Combined with `autoplay`/re-run, the edit-to-effect latency is one job cycle — "realtime."
+- **A failed edit is a demo state, not a crash.** A compile error or a throwing handler surfaces as an
+  inline editor diagnostic and, at runtime, as a job failure/incident the viewer already visualizes
+  (§4) — so "break it and see what happens" is a first-class teaching move.
+
+API additions (still small):
+
+```ts
+type WorkerDef = JobHandler | { code: string };   // code body: (job, ctx) => variables
+
+<Bojtos
+  workers={Record<string, WorkerDef>}   // function OR editable source
+  editableWorkers?={boolean | string[]} // render code boxes for all / named jobTypes
+  onWorkerEdit?={(jobType: string, code: string) => void}   // e.g. persist to a shareable scenario
+/>
+```
+
+The **compile/execution model** is the one real design question this raises — see Open questions
+(evaluating viewer-edited source safely in the browser).
+
+### 6. `DemoScenario` — demos are data
 
 A demo is a serializable descriptor, so "different demos for different use cases" is different data, not
-different code — and MDX-driven docs can interleave narration between runtime views:
+different code — and MDX-driven docs can interleave narration between runtime views. Because workers may be
+**source strings** (§5), the *editable worker code* is part of that data too, so a whole interactive demo
+round-trips through a link or an MDX frontmatter block:
 
 ```ts
 type DemoScenario = {
   bpmn: string;
-  workers: Record<string, JobHandler>;
+  workers: Record<string, WorkerDef>;   // function or { code } (§5)
   seed?: Record<string, unknown>;
   narration?: NarrationStep[];   // optional guided steps
   autoplay?: boolean;
+  editableWorkers?: boolean | string[];
 };
 ```
 
-### 6. Versioning is a release contract, not a repo sync
+### 7. Versioning is a release contract, not a repo sync
 
 `@nanobpm/engine-wasm` pins an `engine-core` version and is published on its own semver; `@nanobpm/bojtos-kit`
 depends on it via a semver range. A CI drift-guard rebuilds/republishes `engine-wasm` when `engine-core`
 changes — hung off the existing `engine-wasm-check` + `engine-wasm-ffi (dist + verify)` jobs
 (`Makefile:210-220`). This dissolves the current "re-sync the committed blob" concern.
 
-### 7. Sequenced rollout — dogfooding is the acceptance test
+### 8. Sequenced rollout — dogfooding is the acceptance test
 
 1. **`@nanobpm/engine-wasm`** (§1) — relocate the wasm-pack out-dir to a publishable package; migrate the
    console to consume it via `file:`; delete the committed-artifact sync. Small, high-leverage,
@@ -156,7 +201,9 @@ changes — hung off the existing `engine-wasm-check` + `engine-wasm-ffi (dist +
    on the package, the API isn't ready to publish — so the console rebuild **is** the acceptance test.
 3. **Add the worker dispatch loop** to `@nanobpm/bojtos-kit` (activate → JS handler → complete/fail) and ship a
    first example `DemoScenario`.
-4. **Publish** `@nanobpm/bojtos-kit` + `@nanobpm/bojtos-react`; optional `npm create @nanobpm/bojtos-app` template later.
+4. **Add editable worker boxes** (§5): the Monaco `<WorkerEditor>`, source→handler compile, and live
+   registry swap — the interactive edit-and-see-the-effect loop.
+5. **Publish** `@nanobpm/bojtos-kit` + `@nanobpm/bojtos-react`; optional `npm create @nanobpm/bojtos-app` template later.
 
 ## Consequences
 
@@ -181,5 +228,10 @@ changes — hung off the existing `engine-wasm-check` + `engine-wasm-ffi (dist +
 - **Worker execution model.** Do in-browser workers run on the main thread (simplest, fine for demos) or
   in a Web Worker (keeps a heavy handler from janking the page)? Release 1 can be main-thread with a
   Web-Worker option later.
+- **Compiling viewer-edited worker source (§5).** Editable worker boxes mean *viewer*-supplied source is
+  executed in the page. How is `{ code }` compiled to a `JobHandler` — a `Function`/`AsyncFunction`
+  constructor (simple) vs an ES-module blob eval, and with what isolation (a sandboxed Web Worker with a
+  narrow message API, so an edited handler can't touch the host page's DOM/network)? This is the security
+  boundary of the editable-demo feature and should be decided before §5 ships.
 - **Scenario provenance for docs.** Should `DemoScenario` support loading `bpmn` by URL/import for MDX
   ergonomics, or only inline strings? Affects the docs authoring story.
