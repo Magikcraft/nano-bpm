@@ -800,7 +800,7 @@ export type DataMigrateResult = {
 
 export type DomainTypesResult = {
     /**
-     * The file written (relative to the project root), or null when the op only returned the text without writing.
+     * The file written (relative to the project root), or null when the op only returned the text without writing (e.g. the preview endpoint, which resolves with `write:false`).
      *
      */
     path?: string | null;
@@ -812,6 +812,11 @@ export type DomainTypesResult = {
      * Number of tables reified into interfaces.
      */
     tables: number;
+    /**
+     * Resolve-time problems with the composed `nano:shape` declarations (ADR 0040 §10). Always present (empty when every shape resolved); the preview endpoint surfaces these live for the in-editor shapes.
+     *
+     */
+    shapeDiagnostics: Array<ShapeDiagnostic>;
 };
 
 /**
@@ -856,18 +861,6 @@ export type ShapeDiagnostic = {
     kind: 'unresolved-reference' | 'reference-cycle' | 'field-conflict' | 'unknown-field' | 'duplicate-id' | 'ambiguous-reference' | 'nominal-table-ref' | 'same-id-collision';
     severity: 'error' | 'warning';
     message: string;
-};
-
-export type DomainTypesPreviewResult = {
-    /**
-     * The emitted domain text with the resolved shapes folded in.
-     */
-    text: string;
-    /**
-     * Number of tables reified into interfaces.
-     */
-    tables: number;
-    shapeDiagnostics: Array<ShapeDiagnostic>;
 };
 
 export type TriggerEnqueueRequest = {
@@ -2607,7 +2600,7 @@ export type PreviewDomainTypesResponses = {
     /**
      * The resolved domain text and per-shape diagnostics
      */
-    200: DomainTypesPreviewResult;
+    200: DomainTypesResult;
 };
 
 export type PreviewDomainTypesResponse = PreviewDomainTypesResponses[keyof PreviewDomainTypesResponses];

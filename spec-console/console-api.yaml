@@ -921,7 +921,7 @@ paths:
           description: The resolved domain text and per-shape diagnostics
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/DomainTypesPreviewResult' }
+              schema: { $ref: '#/components/schemas/DomainTypesResult' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
@@ -2277,14 +2277,15 @@ components:
         pending: { type: integer, format: int64 }
     DomainTypesResult:
       type: object
-      required: [text, tables]
+      required: [text, tables, shapeDiagnostics]
       properties:
         path:
           type: string
           nullable: true
           description: >
             The file written (relative to the project root), or null when the
-            op only returned the text without writing.
+            op only returned the text without writing (e.g. the preview
+            endpoint, which resolves with `write:false`).
         text:
           type: string
           description: The emitted `domain.d.ts` contents.
@@ -2292,6 +2293,13 @@ components:
           type: integer
           format: int64
           description: Number of tables reified into interfaces.
+        shapeDiagnostics:
+          type: array
+          description: >
+            Resolve-time problems with the composed `nano:shape` declarations
+            (ADR 0040 §10). Always present (empty when every shape resolved);
+            the preview endpoint surfaces these live for the in-editor shapes.
+          items: { $ref: '#/components/schemas/ShapeDiagnostic' }
     ShapeOpSpec:
       type: object
       required: [op]
@@ -2359,20 +2367,6 @@ components:
           type: string
           enum: [error, warning]
         message: { type: string }
-    DomainTypesPreviewResult:
-      type: object
-      required: [text, tables, shapeDiagnostics]
-      properties:
-        text:
-          type: string
-          description: The emitted domain text with the resolved shapes folded in.
-        tables:
-          type: integer
-          format: int64
-          description: Number of tables reified into interfaces.
-        shapeDiagnostics:
-          type: array
-          items: { $ref: '#/components/schemas/ShapeDiagnostic' }
     TriggerEnqueueRequest:
       type: object
       required: [triggerId, body]

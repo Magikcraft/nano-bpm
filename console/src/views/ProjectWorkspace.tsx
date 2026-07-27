@@ -1293,11 +1293,19 @@ function EditorPane({
         try {
           const schema = await getDataSchema({ path: { name, source }, throwOnError: true });
           for (const t of schema.data.tables ?? []) {
+            // Qualify table ids as `source.table` — the server always indexes a
+            // table under that unambiguous alias (and FK targets are stored
+            // qualified), so this disambiguates same-named tables across sources
+            // and lets the composer author a qualified ref. Bare names would
+            // collide silently across datasources.
             tableEntities.push({
-              id: t.name,
+              id: `${source}.${t.name}`,
               kind: "table",
               fields: t.columns.map((c) => c.name),
-              fks: t.foreignKeys.map((fk) => ({ column: fk.column, refId: fk.refTable })),
+              fks: t.foreignKeys.map((fk) => ({
+                column: fk.column,
+                refId: `${source}.${fk.refTable}`,
+              })),
             });
           }
         } catch {
