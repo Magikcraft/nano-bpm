@@ -2227,21 +2227,40 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
 /// the source is missing, the target name is unsafe, or the target exists. The
 /// caller must ensure the project is stopped first.
 pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
-    // Refuse to rename an imported-by-reference project: a plain directory
-    // rename would move the external checkout into the projects root. Remove and
-    // re-import under the new name instead.
-    if read_project_ref(old).is_some() {
-        return Err("cannot rename an imported-by-reference project; remove and re-import".into());
+    if !workspace::is_safe_name(new) {
+        return Err("invalid new name".into());
     }
-    let from = project_dir(old).ok_or("invalid project name")?;
-    let to = project_dir(new).ok_or("invalid new name")?;
+    if !workspace::is_safe_name(old) {
+        return Err("invalid project name".into());
+    }
+    // Rename is workspace-scoped: it moves a real directory under the projects
+    // root. Compute both endpoints from the root — never `project_dir`, whose
+    // ref resolution could point `to` (a dangling `new` reference) at an
+    // external path and move the workspace project outside the root.
+    let from = projects_root().join(old);
     if !from.is_dir() {
+        // A pure imported-by-reference project (no workspace dir) can't be
+        // renamed by a directory move; remove and re-import under the new name.
+        if read_project_ref(old).is_some() {
+            return Err(
+                "cannot rename an imported-by-reference project; remove and re-import".into(),
+            );
+        }
         return Err("no such project".into());
     }
+    // Refuse renaming *into* any referenced name (even a dangling ref) — that
+    // name is taken, and letting the move win would shadow the pointer.
+    if read_project_ref(new).is_some() {
+        return Err("a project with that name already exists".into());
+    }
+    let to = projects_root().join(new);
     if to.exists() {
         return Err("a project with that name already exists".into());
     }
     std::fs::rename(&from, &to).map_err(|e| format!("rename: {e}"))?;
+    // Drop any ref coexisting with `old` so the moved-away name can't resurrect
+    // as an imported project once its directory is gone (fail closed).
+    remove_project_ref(old).map_err(|e| format!("remove reference: {e}"))?;
     let mut cfg = read_config(new).ok_or("config missing after rename")?;
     cfg.name = new.to_string();
     cfg.updated_ms = now_ms();
@@ -3931,6 +3950,53 @@ mod tests {
         assert!(!root.join("both").exists(), "workspace dir removed");
         assert!(read_project_ref("both").is_none(), "ref removed too");
         assert!(ext.join("nano.app.json").is_file(), "external untouched");
+    }
+
+    #[test]
+    fn rename_project_stays_workspace_scoped_and_ignores_refs() {
+        let _g = lock();
+        let root = temp_root();
+        // A real workspace project (with a config) that also carries a stale ref
+        // of its own name — a directory rename must win and drop the pointer.
+        create_project("src", "S", "starter").expect("create src");
+        std::fs::write(
+            projects_root().join("src.project-ref.json"),
+            r#"{"source":"path","path":"/somewhere/else"}"#,
+        )
+        .unwrap();
+        // A *dangling* ref occupies the destination name and points outside the
+        // root: rename must refuse rather than move `src` into that path.
+        let outside = ext_app_dir("outside");
+        std::fs::write(
+            projects_root().join("dst.project-ref.json"),
+            format!(
+                r#"{{"source":"path","path":"{}"}}"#,
+                std::fs::canonicalize(&outside).unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
+
+        let err = match rename_project("src", "dst") {
+            Err(e) => e,
+            Ok(_) => panic!("expected refusal renaming into a referenced name"),
+        };
+        assert!(err.contains("already exists"), "got: {err}");
+        assert!(root.join("src").is_dir(), "src not moved");
+        assert!(
+            !outside.join("nano.app.json").exists(),
+            "never wrote into the external target"
+        );
+
+        // Renaming to a free name succeeds, drops the coexisting `src` ref, and
+        // moves only within the root.
+        let cfg = rename_project("src", "fresh").expect("rename to a free name");
+        assert_eq!(cfg.name, "fresh");
+        assert!(root.join("fresh").is_dir(), "moved within root");
+        assert!(!root.join("src").exists(), "old dir gone");
+        assert!(
+            read_project_ref("src").is_none(),
+            "stale src ref dropped so the name can't resurrect"
+        );
     }
 
     // --- discover_deployables --------------------------------------------
