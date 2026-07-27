@@ -1217,19 +1217,25 @@ function EditorPane({
   const envelopeResolverRef = useRef<((id: string | undefined) => void) | null>(
     null,
   );
-  const createDomainType = useCallback(
-    (): Promise<string | undefined> =>
-      new Promise<string | undefined>((resolve) => {
-        envelopeResolverRef.current = resolve;
-        setEnvelopeEditorOpen(true);
-      }),
-    [],
-  );
+  // The single in-flight open request. Re-entrant calls (double-click, a second
+  // envelope picker) return this same promise instead of overwriting the
+  // resolver — otherwise the first awaiter would hang forever.
+  const envelopePromiseRef = useRef<Promise<string | undefined> | null>(null);
+  const createDomainType = useCallback((): Promise<string | undefined> => {
+    if (envelopePromiseRef.current) return envelopePromiseRef.current;
+    const p = new Promise<string | undefined>((resolve) => {
+      envelopeResolverRef.current = resolve;
+      setEnvelopeEditorOpen(true);
+    });
+    envelopePromiseRef.current = p;
+    return p;
+  }, []);
   const closeEnvelopeEditor = useCallback(
     (id: string | undefined) => {
       setEnvelopeEditorOpen(false);
       const resolve = envelopeResolverRef.current;
       envelopeResolverRef.current = null;
+      envelopePromiseRef.current = null;
       resolve?.(id);
     },
     [],
