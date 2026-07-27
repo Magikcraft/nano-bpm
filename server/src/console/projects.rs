@@ -370,14 +370,28 @@ pub fn read_project_ref(name: &str) -> Option<ProjectRef> {
 /// directory; every other project keeps the default `<root>/<name>` location.
 /// All *within-project* path access still goes through [`safe_project_path`],
 /// so the external base does not widen traversal beyond that directory.
+///
+/// Fails closed on a hand-edited/corrupted reference: a real workspace directory
+/// always wins over a reference, and a reference is honored only when it is
+/// well-formed (`source == "path"` with an **absolute** path). Otherwise the
+/// default workspace location is returned, so a bad ref can never redirect the
+/// console's file APIs to an unexpected base.
 pub fn project_dir(name: &str) -> Option<PathBuf> {
     if !workspace::is_safe_name(name) {
         return None;
     }
-    if let Some(r) = read_project_ref(name) {
-        return Some(PathBuf::from(r.path));
+    let workspace_dir = projects_root().join(name);
+    // A real workspace project always shadows a (possibly stale) reference.
+    if workspace_dir.is_dir() {
+        return Some(workspace_dir);
     }
-    Some(projects_root().join(name))
+    if let Some(r) = read_project_ref(name) {
+        let p = PathBuf::from(&r.path);
+        if r.source == "path" && p.is_absolute() {
+            return Some(p);
+        }
+    }
+    Some(workspace_dir)
 }
 
 /// Register a project reference (ADR 0041, `path` source): point `name` at an
@@ -406,9 +420,15 @@ pub fn import_project_ref(name: &str, path: &str) -> Result<ProjectRef, String> 
             src.display()
         ));
     }
+    // Reject a non-UTF-8 canonical path rather than storing a lossy string that
+    // would later resolve to the wrong directory.
+    let path = src
+        .to_str()
+        .ok_or_else(|| format!("path \"{}\" is not valid UTF-8", src.display()))?
+        .to_string();
     let r = ProjectRef {
         source: "path".to_string(),
-        path: src.to_string_lossy().to_string(),
+        path,
     };
     let f = project_ref_file(name).ok_or_else(|| format!("invalid project name \"{name}\""))?;
     let body = serde_json::to_vec_pretty(&r).map_err(|e| format!("serialize reference: {e}"))?;
@@ -1963,6 +1983,12 @@ pub fn create_project(
     template: &str,
 ) -> Result<ProjectConfig, String> {
     let dir = project_dir(name).ok_or("invalid project name")?;
+    // A name that already has an import reference (ADR 0041) — even a dangling
+    // one — is taken. Never let `create_project` scaffold into a ref's external
+    // target: refuse here and write only within the projects root.
+    if read_project_ref(name).is_some() {
+        return Err("a project with that name already exists".into());
+    }
     if dir.exists() {
         return Err("a project with that name already exists".into());
     }
@@ -3741,6 +3767,96 @@ mod tests {
             ext.join("nano.app.json").is_file(),
             "external checkout untouched"
         );
+    }
+
+    #[test]
+    fn create_project_refuses_a_referenced_name_and_never_writes_the_external_dir() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("noscaffold");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"e","name":"E"}"#,
+        )
+        .unwrap();
+        import_project_ref("linked", ext.to_str().unwrap()).unwrap();
+
+        // create_project must not scaffold into the reference's external target.
+        let err = match create_project("linked", "desc", "starter") {
+            Err(e) => e,
+            Ok(_) => panic!("expected create_project to refuse a referenced name"),
+        };
+        assert!(err.contains("already exists"), "got: {err}");
+        // The external checkout is untouched: no starter files leaked in.
+        assert!(!ext.join("main.ts").exists(), "no scaffold in external dir");
+        assert!(
+            !ext.join("resources").exists(),
+            "no scaffold in external dir"
+        );
+    }
+
+    #[test]
+    fn create_project_into_a_dangling_reference_name_does_not_write_outside_root() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("dangling-create");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"d","name":"D"}"#,
+        )
+        .unwrap();
+        import_project_ref("linked", ext.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(&ext).unwrap(); // the checkout disappears
+
+        // Even with a dangling ref (external dir gone), create_project refuses
+        // rather than recreating and scaffolding into the external location.
+        let err = match create_project("linked", "desc", "starter") {
+            Err(e) => e,
+            Ok(_) => panic!("expected create_project to refuse a dangling-referenced name"),
+        };
+        assert!(err.contains("already exists"), "got: {err}");
+        assert!(!ext.exists(), "external path was not recreated");
+    }
+
+    #[test]
+    fn project_dir_prefers_workspace_and_ignores_a_corrupted_ref() {
+        let _g = lock();
+        let root = temp_root();
+        // A real workspace directory shadows any reference of the same name.
+        std::fs::create_dir_all(root.join("both")).unwrap();
+        std::fs::write(
+            projects_root().join("both.project-ref.json"),
+            r#"{"source":"path","path":"/somewhere/else"}"#,
+        )
+        .unwrap();
+        assert_eq!(project_dir("both").unwrap(), root.join("both"));
+
+        // A corrupted ref (relative path) falls back to the default workspace
+        // location rather than resolving file APIs to an unexpected base.
+        std::fs::write(
+            projects_root().join("rel.project-ref.json"),
+            r#"{"source":"path","path":"not/absolute"}"#,
+        )
+        .unwrap();
+        assert_eq!(project_dir("rel").unwrap(), root.join("rel"));
+
+        // A ref with an unknown source is not honored either.
+        std::fs::write(
+            projects_root().join("weird.project-ref.json"),
+            r#"{"source":"git","path":"/abs/but/wrong/source"}"#,
+        )
+        .unwrap();
+        assert_eq!(project_dir("weird").unwrap(), root.join("weird"));
+    }
+
+    #[test]
+    fn import_project_ref_rejects_a_relative_path() {
+        let _g = lock();
+        let _root = temp_root();
+        // canonicalize resolves relative paths against the CWD, so a bare
+        // relative non-existent path fails to resolve rather than sneaking in.
+        let err = import_project_ref("rel", "some/relative/dir").unwrap_err();
+        assert!(err.contains("cannot resolve path"), "got: {err}");
     }
 
     // --- discover_deployables --------------------------------------------

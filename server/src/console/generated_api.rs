@@ -815,10 +815,13 @@ impl apis::projects::Projects for ServerImpl {
         match out {
             Ok(r) => Ok(
                 apis::projects::ImportProjectResponse::Status200_ProjectReferenceRegistered(
-                    from_val(serde_json::to_value(r).unwrap_or_default()),
+                    from_dto(r),
                 ),
             ),
-            Err(e) if e.contains("already exists") => {
+            // The only 409 `import_project_ref` produces is the workspace-name
+            // conflict, whose message starts with this exact phrase — match it
+            // precisely so an unrelated error can't be misclassified as 409.
+            Err(e) if e.starts_with("a workspace project named") => {
                 Ok(apis::projects::ImportProjectResponse::Status409_AlreadyExists(e))
             }
             Err(e) => Ok(apis::projects::ImportProjectResponse::Status400_InvalidRequest(e)),
