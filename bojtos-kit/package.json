@@ -27,6 +27,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --experimental-strip-types --test test/*.test.ts",
     "prepack": "npm run build"
   },
   "dependencies": {

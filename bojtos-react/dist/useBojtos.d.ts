@@ -1,9 +1,15 @@
-import { type Snapshot, type WasmEvent } from "@nanobpm/bojtos-kit";
+import { type DispatchOptions, type JobHandler, type RoundResult, type Snapshot, type WasmEvent, type WasmSource } from "@nanobpm/bojtos-kit";
 /** Lifecycle of the in-browser engine load. */
 export type BojtosPhase = "loading" | "ready" | "error";
 export interface UseBojtosOptions {
     /** The BPMN diagram XML to deploy. Re-deploys on a fresh engine when it changes. */
     bpmn: string;
+    /**
+     * Optional engine wasm source. Pass a `URL` / bytes / `WebAssembly.Module`
+     * when the default `import.meta.url` loader can't resolve the binary (the
+     * external-`.wasm` "wasmUrl" mode, or a non-Vite bundler — ADR 0043 §3).
+     */
+    wasm?: WasmSource;
 }
 export interface BojtosControls {
     phase: BojtosPhase;
@@ -22,6 +28,20 @@ export interface BojtosControls {
     failJob(jobKey: string, retries: number, message: string): Snapshot | null;
     /** Advance the virtual clock. */
     advanceTime(byMs: number): Snapshot | null;
+    /**
+     * Run the registered worker handlers until the process settles (activate →
+     * handler → complete/fail), then reflect the resulting snapshot/events.
+     * Resolves to the settled snapshot, or null if there is no live session.
+     */
+    runWorkers(workers: Record<string, JobHandler>, opts?: DispatchOptions): Promise<Snapshot | null>;
+    /**
+     * Run a single activate-and-handle pass of the registered workers (one
+     * {@link dispatchRound}), reflecting the resulting snapshot/events. Returns
+     * how many jobs it handled (0 once the process is quiescent) plus the
+     * snapshot, or null if there is no live session — drive it on a timer to
+     * animate the token advancing one step at a time.
+     */
+    stepWorkers(workers: Record<string, JobHandler>, opts?: DispatchOptions): Promise<RoundResult | null>;
     /** Re-deploy the diagram on the existing engine, clearing run state. */
     reset(): void;
 }
@@ -36,4 +56,4 @@ export interface BojtosControls {
  * test-run panel is its first consumer (§8 step 2 — dogfooding is the acceptance
  * test).
  */
-export declare function useBojtos({ bpmn }: UseBojtosOptions): BojtosControls;
+export declare function useBojtos({ bpmn, wasm }: UseBojtosOptions): BojtosControls;

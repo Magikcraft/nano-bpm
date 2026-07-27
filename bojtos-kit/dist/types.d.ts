@@ -21,6 +21,20 @@ export interface JobDto {
     state: string;
     retries: number;
 }
+/**
+ * A job locked to a worker by {@link BojtosSession.activateJobs}, ready to hand
+ * to a {@link JobHandler}. Carries the instance's current `variables` so a
+ * handler can compute its output from the live payload. `key` is what
+ * `completeJob` / `failJob` take.
+ */
+export interface ActivatedJob {
+    key: string;
+    type: string;
+    instanceKey: string;
+    elementId: string;
+    retries: number;
+    variables: Record<string, unknown>;
+}
 /** An incident raised on an element. */
 export interface IncidentDto {
     key: string;
