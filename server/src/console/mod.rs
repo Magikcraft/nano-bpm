@@ -2789,16 +2789,22 @@ async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuer
 /// to a checked-out Urban app instead of requiring a hand-typed absolute path.
 /// With no `path`, opens on the operator's home directory.
 ///
-/// **Loopback only.** This exposes the server's filesystem, so it is refused for
-/// any non-local peer (the browser also hides the Browse button off-localhost).
-/// Behind a reverse proxy the peer is the proxy, so a hosted console — which the
-/// proxy makes non-loopback for real clients — never reaches this handler with a
-/// genuine remote user; the button is hidden there too.
 async fn fs_browse(
     ConnectInfo(peer): ConnectInfo<crate::PeerAddr>,
+    headers: HeaderMap,
     Query(q): Query<BrowseQuery>,
 ) -> Response {
-    if !peer.0.ip().is_loopback() {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let host_is_loopback = host.starts_with("localhost")
+        || host.starts_with("127.0.0.1")
+        || host.starts_with("[::1]")
+        || host.starts_with("::1");
+
+    if !peer.0.ip().is_loopback() || !host_is_loopback {
         return (
             StatusCode::FORBIDDEN,
             "filesystem browsing is available on localhost only",
