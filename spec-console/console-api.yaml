@@ -895,6 +895,36 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /projects/{name}/data/{source}/domaintypes/preview:
+    post:
+      operationId: previewDomainTypes
+      tags: [data]
+      summary: Resolve the in-editor composed shapes for a live preview, writing nothing
+      description: >
+        The authoring-time counterpart to `regenerateDomainTypes` (ADR 0040
+        §9/§10): resolve the composed motion-shapes the modeller is *currently
+        editing* — sent in the request body, not scanned from the saved `.bpmn`
+        — against the live datasource + manifest-type fuse, and return the
+        emitted domain text plus the per-shape diagnostics. Writes nothing: it
+        powers the shape composer's live field preview and inline diagnostics, so
+        it never touches the generated SDK on disk. `write:false` under the hood.
+      parameters:
+        - { $ref: '#/components/parameters/NamePath' }
+        - { $ref: '#/components/parameters/SourcePath' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DomainTypesPreviewRequest' }
+      responses:
+        '200':
+          description: The resolved domain text and per-shape diagnostics
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DomainTypesPreviewResult' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /server/update:
     get:
       operationId: getServerUpdate
@@ -2262,6 +2292,87 @@ components:
           type: integer
           format: int64
           description: Number of tables reified into interfaces.
+    ShapeOpSpec:
+      type: object
+      required: [op]
+      description: >
+        One composition operation of a composed motion-shape, in author order
+        (ADR 0040 §9). Which fields apply depends on `op`: `carry`/`project`/
+        `reference` name a source entity in `ref`; `project` adds the `fields`
+        subset (and an optional `via` FK path); `extend`/`reference` add a `name`;
+        `extend` adds a scalar/entity `type`.
+      properties:
+        op:
+          type: string
+          enum: [carry, project, extend, reference]
+        ref: { type: string }
+        fields:
+          type: array
+          items: { type: string }
+        via: { type: string }
+        name: { type: string }
+        type: { type: string }
+        optional: { type: boolean }
+        list: { type: boolean }
+        spread: { type: boolean }
+    ShapeDeclSpec:
+      type: object
+      required: [id, ops]
+      description: A composed motion-shape the modeller is editing (ADR 0040 §9).
+      properties:
+        id: { type: string }
+        name: { type: string }
+        ops:
+          type: array
+          items: { $ref: '#/components/schemas/ShapeOpSpec' }
+    DomainTypesPreviewRequest:
+      type: object
+      required: [shapes]
+      properties:
+        shapes:
+          type: array
+          description: >
+            The composed shapes currently in the editor, resolved instead of the
+            saved-model scan so the preview reflects unsaved edits.
+          items: { $ref: '#/components/schemas/ShapeDeclSpec' }
+    ShapeDiagnostic:
+      type: object
+      required: [shape, kind, severity, message]
+      description: >
+        A resolve-time problem with a composed shape, surfaced like the
+        `workers[]` drift warning (ADR 0040 §10). A shape with any `error`
+        diagnostic is omitted from the fuse; a `warning` still resolves.
+      properties:
+        shape: { type: string }
+        kind:
+          type: string
+          enum:
+            - unresolved-reference
+            - reference-cycle
+            - field-conflict
+            - unknown-field
+            - duplicate-id
+            - ambiguous-reference
+            - nominal-table-ref
+            - same-id-collision
+        severity:
+          type: string
+          enum: [error, warning]
+        message: { type: string }
+    DomainTypesPreviewResult:
+      type: object
+      required: [text, tables, shapeDiagnostics]
+      properties:
+        text:
+          type: string
+          description: The emitted domain text with the resolved shapes folded in.
+        tables:
+          type: integer
+          format: int64
+          description: Number of tables reified into interfaces.
+        shapeDiagnostics:
+          type: array
+          items: { $ref: '#/components/schemas/ShapeDiagnostic' }
     TriggerEnqueueRequest:
       type: object
       required: [triggerId, body]

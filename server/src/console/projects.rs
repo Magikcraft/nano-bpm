@@ -1736,18 +1736,28 @@ pub async fn run_data_op(
         && let Some(obj) = request.as_object_mut()
     {
         let scan = super::envelope_scan::scan_project(&dir);
-        obj.insert(
-            "derivedWorkers".to_string(),
-            serde_json::to_value(scan.workers).unwrap_or(serde_json::Value::Null),
-        );
-        obj.insert(
-            "derivedMessages".to_string(),
-            serde_json::to_value(scan.messages).unwrap_or(serde_json::Value::Null),
-        );
-        obj.insert(
-            "derivedShapes".to_string(),
-            serde_json::to_value(scan.shapes).unwrap_or(serde_json::Value::Null),
-        );
+        // Insert each map only when the caller did not already supply it: the
+        // `domaintypes` preview (ADR 0040 §9/§10) POSTs the in-editor
+        // `derivedShapes` so its live field preview/diagnostics reflect *unsaved*
+        // composer edits, and must win over the saved-model scan.
+        if !obj.contains_key("derivedWorkers") {
+            obj.insert(
+                "derivedWorkers".to_string(),
+                serde_json::to_value(scan.workers).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !obj.contains_key("derivedMessages") {
+            obj.insert(
+                "derivedMessages".to_string(),
+                serde_json::to_value(scan.messages).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if !obj.contains_key("derivedShapes") {
+            obj.insert(
+                "derivedShapes".to_string(),
+                serde_json::to_value(scan.shapes).unwrap_or(serde_json::Value::Null),
+            );
+        }
     }
     // The gateway runs the data CLI Node-first: Node (>= 22.6) is always present
     // (the npm launcher is Node), so it is the primary path; Deno is an equal
@@ -4952,6 +4962,83 @@ mod tests {
         // No diagnostics on a clean resolution.
         let diags = dt["shapeDiagnostics"].as_array().unwrap();
         assert!(diags.is_empty(), "unexpected diagnostics: {diags:?}");
+    }
+
+    /// The `domaintypes` *preview* path (ADR 0040 §9/§10): caller-supplied
+    /// `derivedShapes` override the saved-model scan and `write:false` touches no
+    /// file, so the composer can preview *unsaved* edits. The saved model carries
+    /// `ApprovedOrder`, but the preview resolves a different in-editor shape
+    /// (`DraftOrder`) — the result must reflect the caller's shape, not the disk.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn domaintypes_preview_uses_caller_shapes_over_the_scan_and_writes_nothing() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapeprev";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{
+                "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" }
+                } },
+                "types": {
+                    "Order": { "fields": {
+                        "item": { "type": "string" },
+                        "qty": { "type": "integer" }
+                    } }
+                }
+            }"#,
+        )
+        .unwrap();
+        // The saved model carries `ApprovedOrder` — which the preview must ignore.
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="ApprovedOrder" name="Approved order">
+                 <nano:carry ref="Order" />
+                 <nano:extend name="approved" type="boolean" />
+               </nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+
+        // The in-editor shape the composer is previewing (never written to disk).
+        let preview = run_data_op(
+            name,
+            serde_json::json!({
+                "op": "domaintypes",
+                "write": false,
+                "derivedShapes": [{
+                    "id": "DraftOrder",
+                    "ops": [
+                        { "op": "carry", "ref": "Order" },
+                        { "op": "extend", "name": "note", "type": "string", "optional": true }
+                    ]
+                }]
+            }),
+        )
+        .await
+        .expect("domaintypes preview");
+        let text = preview["text"].as_str().unwrap();
+        // The caller's shape resolves; the saved-model shape does not appear.
+        assert!(text.contains("\"DraftOrder\": {"), "preview text: {text}");
+        assert!(text.contains("note?: string;"), "preview text: {text}");
+        assert!(
+            !text.contains("ApprovedOrder"),
+            "scan leaked into preview: {text}"
+        );
+        assert!(
+            preview["shapeDiagnostics"].as_array().unwrap().is_empty(),
+            "unexpected diagnostics: {:?}",
+            preview["shapeDiagnostics"]
+        );
+        // write:false ⇒ nothing materialised.
+        assert!(preview["path"].is_null());
+        assert!(!dir.join("nano-generated/domain-rows.d.ts").exists());
     }
 
     #[tokio::test]

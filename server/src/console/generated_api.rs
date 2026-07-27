@@ -1220,6 +1220,25 @@ impl apis::data::Data for ServerImpl {
             R::Status404_NotFound
         )
     }
+
+    async fn preview_domain_types(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::PreviewDomainTypesPathParams,
+        body: &models::DomainTypesPreviewRequest,
+    ) -> Result<apis::data::PreviewDomainTypesResponse, ()> {
+        use apis::data::PreviewDomainTypesResponse as R;
+        let shapes = serde_json::to_value(&body.shapes).unwrap_or(serde_json::Value::Null);
+        data_ok_or!(
+            super::project_data_preview_domaintypes(&path_params.name, &path_params.source, shapes)
+                .await,
+            R::Status200_TheResolvedDomainTextAndPer,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
 }
 
 #[async_trait]

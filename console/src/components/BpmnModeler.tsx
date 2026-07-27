@@ -26,6 +26,14 @@ import {
   writeEnvelope,
   type EnvelopeField,
 } from "../lib/dataEnvelope";
+import {
+  readShapes,
+  writeShapes,
+  type ShapeDecl,
+  type ShapeModdle,
+  type ShapeModdleElement,
+  type ShapeModeling,
+} from "../lib/shapeCarrier";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import "bpmn-js/dist/assets/bpmn-js.css";
@@ -45,6 +53,50 @@ interface Modeling {
 }
 interface Moddle {
   create(type: string, attrs?: Record<string, unknown>): ModdleElement;
+}
+
+// --- composed motion-shapes (ADR 0040 §9) -----------------------------------
+// Shapes live in a `nano:shapes` container on a `bpmn:process`'s extension
+// elements; the composer edits the *primary* process's set, and the Data envelope
+// pickers offer shapes from *any* process (all shapes fold into one global
+// registry). These helpers locate the process business object(s) in the model.
+
+/** The local (namespace-stripped) name of a moddle `$type`. */
+const shapeLocalType = (t: string | undefined): string => (t ?? "").split(":").pop() ?? "";
+
+interface DefinitionsBo extends ShapeModdleElement {
+  rootElements?: ShapeModdleElement[];
+}
+
+/** Every `bpmn:process` business object in the open definitions. */
+function allProcessBos(modeler: Modeler): ShapeModdleElement[] {
+  try {
+    const rootBo = modeler.get<Canvas>("canvas").getRootElement()
+      .businessObject as unknown as ShapeModdleElement;
+    const defs = (shapeLocalType(rootBo?.$type) === "Definitions"
+      ? rootBo
+      : (rootBo?.$parent as DefinitionsBo | undefined)) as DefinitionsBo | undefined;
+    return (defs?.rootElements ?? []).filter((e) => shapeLocalType(e?.$type) === "Process");
+  } catch {
+    return [];
+  }
+}
+
+/** The process the composer edits (the root process, or the first participant's
+ * process in a collaboration) plus the diagram element the undoable command hangs
+ * on. Null when no process is loaded yet. */
+function primaryProcess(
+  modeler: Modeler,
+): { element: unknown; processBo: ShapeModdleElement } | null {
+  try {
+    const rootEl = modeler.get<Canvas>("canvas").getRootElement();
+    const rootBo = rootEl.businessObject as unknown as ShapeModdleElement;
+    if (shapeLocalType(rootBo?.$type) === "Process") return { element: rootEl, processBo: rootBo };
+    const procs = allProcessBos(modeler);
+    return procs.length ? { element: rootEl, processBo: procs[0] } : null;
+  } catch {
+    return null;
+  }
 }
 
 // --- Component output extraction (ADR 0033 §3) -------------------------------
@@ -126,6 +178,12 @@ export interface BpmnModelerHandle {
   getProcessId(): string | null;
   /// Renames the root process element's id (the BPMN deploy identity).
   setProcessId(id: string): void;
+  /// The composed motion-shapes on the primary process (ADR 0040 §9), or `[]`
+  /// when none are declared or no process is loaded yet.
+  getShapes(): ShapeDecl[];
+  /// Replaces the primary process's composed shapes as one undoable command;
+  /// no-ops when no process is loaded.
+  setShapes(shapes: ShapeDecl[]): void;
 }
 
 interface BpmnModelerProps {
@@ -381,15 +439,35 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           // server-side derivation of increment 12 retires this cache).
           if (ctx.taskType) domainTypeBindingRef.current?.set(ctx.taskType, field, v);
         };
-        const getOptions = () => [
-          // With a form default, clearing (this option) reverts to the inherited
-          // type rather than "no type", so name it accordingly.
-          { value: "", label: formDefault ? `Inherit from form (${formDefault})` : "<none>" },
-          ...(domainTypeBindingRef.current?.typeIds ?? []).map((id) => ({ value: id, label: id })),
-          ...(domainTypeBindingRef.current?.createType
-            ? [{ value: CREATE_ENVELOPE, label: "➕ Create new envelope…" }]
-            : []),
-        ];
+        const getOptions = () => {
+          const modeler = modelerRef.current;
+          const typeIds = domainTypeBindingRef.current?.typeIds ?? [];
+          const known = new Set(typeIds);
+          // Composed shapes are first-class registry entries (ADR 0040 §9), so a
+          // shape id is a selectable envelope type too — gathered from every
+          // process (shapes fold into one global registry) and de-duped against
+          // the manifest types.
+          const shapeIds = modeler
+            ? [
+                ...new Set(
+                  allProcessBos(modeler)
+                    .flatMap((p) => readShapes(p))
+                    .map((s) => s.id)
+                    .filter((id): id is string => !!id && !known.has(id)),
+                ),
+              ]
+            : [];
+          return [
+            // With a form default, clearing (this option) reverts to the inherited
+            // type rather than "no type", so name it accordingly.
+            { value: "", label: formDefault ? `Inherit from form (${formDefault})` : "<none>" },
+            ...typeIds.map((id) => ({ value: id, label: id })),
+            ...shapeIds.map((id) => ({ value: id, label: `${id} (shape)` })),
+            ...(domainTypeBindingRef.current?.createType
+              ? [{ value: CREATE_ENVELOPE, label: "➕ Create new envelope…" }]
+              : []),
+          ];
+        };
         const baseDescription =
           field === "inputType"
             ? "Domain type of the data this element receives — travels in the model."
@@ -542,6 +620,28 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           const canvas = modeler.get<Canvas>("canvas");
           const modeling = modeler.get<Modeling>("modeling");
           modeling.updateProperties(canvas.getRootElement(), { id });
+        } catch {
+          // Root not ready (e.g. a load is still settling) — ignore.
+        }
+      },
+      getShapes() {
+        const modeler = modelerRef.current;
+        if (!modeler || disposedRef.current) return [];
+        return readShapes(primaryProcess(modeler)?.processBo);
+      },
+      setShapes(shapes: ShapeDecl[]) {
+        const modeler = modelerRef.current;
+        if (!modeler || disposedRef.current) return;
+        const p = primaryProcess(modeler);
+        if (!p) return;
+        try {
+          writeShapes(
+            modeler.get<ShapeModdle>("moddle"),
+            modeler.get<ShapeModeling>("modeling"),
+            p.element,
+            p.processBo,
+            shapes,
+          );
         } catch {
           // Root not ready (e.g. a load is still settling) — ignore.
         }

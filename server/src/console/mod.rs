@@ -2970,6 +2970,28 @@ pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiRes
     .await
 }
 
+/// `POST /console/api/projects/{name}/data/{source}/domaintypes/preview` — resolve
+/// the composed shapes the modeller is editing (sent in the body) for the shape
+/// composer's live field preview + inline diagnostics, without scanning the saved
+/// model or writing the generated SDK (ADR 0040 §9/§10). `write:false` +
+/// caller-supplied `derivedShapes` win over the disk scan in `run_data_op`.
+pub(super) async fn project_data_preview_domaintypes(
+    name: &str,
+    source: &str,
+    shapes: serde_json::Value,
+) -> ApiResult {
+    project_data_op(
+        name,
+        serde_json::json!({
+            "op": "domaintypes",
+            "source": source,
+            "write": false,
+            "derivedShapes": shapes,
+        }),
+    )
+    .await
+}
+
 // --- triggers (ADR 0025) --------------------------------------------------
 
 fn trigger_error(e: triggers::TriggerError) -> (StatusCode, String) {
