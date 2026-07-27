@@ -17,8 +17,9 @@ by the console via a `file:` dependency; ADR 0027).
 
 The concrete goal: publish something that lets **external developers** rapidly build in-browser BPMN
 **demo pages** — show a BPMN model in the browser and *execute it with workers running in the browser* —
-so different demos for different use cases are cheap to author. This framework is named **Bojtos**
-(Hungarian, "tasseled" — a bundle of in-browser workers hanging off a running diagram). Camunda's own
+so different demos for different use cases are cheap to author. This framework is named **Bojtos**,
+after **Peter Bojtos** — who leads Camunda's Getting Started experience, is a passionate UX advocate, and
+whose idea this is. Camunda's own
 web modeler already has the mechanism (the "test" function): `TestRunPanel.tsx` loads the wasm engine, deploys a diagram, starts an
 instance, glows the active element through the diagram as the token advances, renders the running
 variable payload, and lists waiting jobs. What it is **not** is:
@@ -52,8 +53,8 @@ single UI binding:
 | Package | Role | Depends on |
 |---|---|---|
 | **`@nanobpm/engine-wasm`** | The real `engine-core`, compiled `wasm-pack --target web`, as a **versioned, publishable** npm package. **The linchpin** — nothing external is possible until the engine is installable. | — |
-| **`@bojtos/kit`** (headless, framework-agnostic) | Engine lifecycle, the **worker registry + dispatch loop** (net-new), the trace model, the bpmn-js viewer + active/incident markers, and the serializable `DemoScenario` type. | engine-wasm |
-| **`@bojtos/react`** | The ergonomic "rapidly build pages" layer: `<Bojtos>`, `<BpmnRuntimeView>`, `<TraceTimeline>`, a player, and a `useBojtos()` hook. | @bojtos/kit |
+| **`@nanobpm/bojtos-kit`** (headless, framework-agnostic) | Engine lifecycle, the **worker registry + dispatch loop** (net-new), the trace model, the bpmn-js viewer + active/incident markers, and the serializable `DemoScenario` type. | engine-wasm |
+| **`@nanobpm/bojtos-react`** | The ergonomic "rapidly build pages" layer: `<Bojtos>`, `<BpmnRuntimeView>`, `<TraceTimeline>`, a player, and a `useBojtos()` hook. | @nanobpm/bojtos-kit |
 
 Headless core + thin React binding means a later `@nanobpm/demo-vue` / web-component wrapper is additive,
 not a rewrite.
@@ -73,7 +74,7 @@ committed-artifact sync and makes the engine installable, with no behaviour chan
 ### 2. The public API surface, frozen small for release 1
 
 ```ts
-// @bojtos/react
+// @nanobpm/bojtos-react
 <Bojtos
   bpmn={string}                      // the diagram XML
   workers={Record<string, JobHandler>}   // jobType -> async (job) => variables
@@ -86,7 +87,7 @@ useBojtos(scenario: DemoScenario) =>
   { engine, snapshot, play, pause, step, reset, trace }
 ```
 
-Everything else — a Vue binding, a framework-agnostic web component, an `npm create @bojtos/app`
+Everything else — a Vue binding, a framework-agnostic web component, an `npm create @nanobpm/bojtos-app`
 template — is explicitly **post-1.0**.
 
 ### 3. Next.js-first: the two hazards a *published* wasm package must design for on day one
@@ -140,7 +141,7 @@ type DemoScenario = {
 
 ### 6. Versioning is a release contract, not a repo sync
 
-`@nanobpm/engine-wasm` pins an `engine-core` version and is published on its own semver; `@bojtos/kit`
+`@nanobpm/engine-wasm` pins an `engine-core` version and is published on its own semver; `@nanobpm/bojtos-kit`
 depends on it via a semver range. A CI drift-guard rebuilds/republishes `engine-wasm` when `engine-core`
 changes — hung off the existing `engine-wasm-check` + `engine-wasm-ffi (dist + verify)` jobs
 (`Makefile:210-220`). This dissolves the current "re-sync the committed blob" concern.
@@ -150,12 +151,12 @@ changes — hung off the existing `engine-wasm-check` + `engine-wasm-ffi (dist +
 1. **`@nanobpm/engine-wasm`** (§1) — relocate the wasm-pack out-dir to a publishable package; migrate the
    console to consume it via `file:`; delete the committed-artifact sync. Small, high-leverage,
    independently valuable, behaviour-preserving. **This ADR's first executable step.**
-2. **Extract `@bojtos/kit` / `@bojtos/react`** from `TestRunPanel` (behaviour-preserving, green/green), and
+2. **Extract `@nanobpm/bojtos-kit` / `@nanobpm/bojtos-react`** from `TestRunPanel` (behaviour-preserving, green/green), and
    **repoint `TestRunPanel` at the public API**. If the modeler's own test panel can't be rebuilt cleanly
    on the package, the API isn't ready to publish — so the console rebuild **is** the acceptance test.
-3. **Add the worker dispatch loop** to `@bojtos/kit` (activate → JS handler → complete/fail) and ship a
+3. **Add the worker dispatch loop** to `@nanobpm/bojtos-kit` (activate → JS handler → complete/fail) and ship a
    first example `DemoScenario`.
-4. **Publish** `@bojtos/kit` + `@bojtos/react`; optional `npm create @bojtos/app` template later.
+4. **Publish** `@nanobpm/bojtos-kit` + `@nanobpm/bojtos-react`; optional `npm create @nanobpm/bojtos-app` template later.
 
 ## Consequences
 
