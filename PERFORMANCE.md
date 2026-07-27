@@ -99,8 +99,9 @@ leader-durable/sync, `MAXPAR=112`, open-loop (`MI=50000`, `rate=14000/prod`,
 **Verdict.** 50KB ~4,987/s aggregate is on par with the pre-console reference
 (~4,954/s) and well above the #311-fix soak (~3,479/s) and the earlier regressed
 ~1,836/s. neg ~25,368/s is the open-loop pure-engine ceiling. No regression on
-current main. One create-accept tail outlier on the neg run (`creMax` ~3.5 s single
-sample) but `creP999` held at ~100 ms — a momentary blip, not sustained.
+current main. One create-accept latency outlier on the neg run (a single ~3.5 s
+max sample) but the create-accept p99.9 held at ~100 ms — a momentary blip, not
+sustained.
 
 **Reference config for future comparison:** standard console build, GCP 3-node RF3
 Raft-ON 12-partition leader-durable, `MAXPAR=112`, open-loop `MI=50000`, journal
