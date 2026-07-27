@@ -445,7 +445,7 @@ pub fn import_project_ref(name: &str, path: &str) -> Result<ProjectRef, String> 
     if !src.is_dir() {
         return Err(format!("\"{}\" is not a directory", src.display()));
     }
-    if !src.join("nano.app.json").is_file() && !src.join("nanobpm.project.json").is_file() {
+    if !is_nano_app_dir(&src) {
         return Err(format!(
             "\"{}\" is not a Nano app/project (no nano.app.json or nanobpm.project.json)",
             src.display()
@@ -478,6 +478,116 @@ pub fn remove_project_ref(name: &str) -> std::io::Result<bool> {
         return Ok(true);
     }
     Ok(false)
+}
+
+/// True when `dir` looks like a checked-out Nano app/project: it holds either a
+/// `nano.app.json` (Urban app, ADR 0027) or a `nanobpm.project.json` manifest.
+/// Shared by import validation and the filesystem browser so both agree on what
+/// counts as importable.
+pub fn is_nano_app_dir(dir: &Path) -> bool {
+    dir.join("nano.app.json").is_file() || dir.join("nanobpm.project.json").is_file()
+}
+
+/// A sub-directory surfaced by [`browse_dir`], with a hint of whether it is
+/// directly importable as a Nano app (ADR 0041 import-by-reference).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowseEntry {
+    /// Directory basename (never a path — the client joins it via `path`).
+    pub name: String,
+    /// Absolute path of the sub-directory (canonical, UTF-8).
+    pub path: String,
+    /// Whether this sub-directory is itself an importable Nano app/project.
+    pub is_nano_app: bool,
+}
+
+/// A single level of the host filesystem, as seen by the Import-by-reference
+/// directory picker (ADR 0041). Only directories are listed — the picker is for
+/// choosing a project folder, not files.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowseResult {
+    /// The canonical absolute path being listed.
+    pub path: String,
+    /// The parent directory's absolute path, or `null` at the filesystem root.
+    pub parent: Option<String>,
+    /// Whether `path` itself is an importable Nano app/project (so the picker
+    /// can offer "select this folder" directly).
+    pub is_nano_app: bool,
+    /// Immediate child directories, sorted case-insensitively by name.
+    pub entries: Vec<BrowseEntry>,
+}
+
+/// The directory the filesystem browser opens on when no path is supplied:
+/// the operator's home directory, falling back to the filesystem root. This is
+/// only ever reached from a loopback-gated handler (see `console::fs_browse`).
+fn default_browse_root() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// List the immediate sub-directories of an absolute host path so the
+/// Import-by-reference picker (ADR 0041) can browse to an app instead of
+/// requiring a typed absolute path. With no `path`, opens on
+/// [`default_browse_root`]. Hidden entries (dot-prefixed) are skipped. This
+/// exposes the server filesystem, so its only caller gates it to loopback peers.
+pub fn browse_dir(path: Option<&str>) -> Result<BrowseResult, String> {
+    let start = match path.map(str::trim).filter(|p| !p.is_empty()) {
+        Some(p) => {
+            let pb = PathBuf::from(p);
+            if !pb.is_absolute() {
+                return Err(format!("path \"{p}\" must be an absolute path"));
+            }
+            pb
+        }
+        None => default_browse_root(),
+    };
+    let canon = std::fs::canonicalize(&start)
+        .map_err(|e| format!("cannot open \"{}\": {e}", start.display()))?;
+    if !canon.is_dir() {
+        return Err(format!("\"{}\" is not a directory", canon.display()));
+    }
+    let mut entries = Vec::new();
+    let rd = std::fs::read_dir(&canon)
+        .map_err(|e| format!("cannot read \"{}\": {e}", canon.display()))?;
+    for e in rd.flatten() {
+        // `file_type()` avoids following symlinks to decide directory-ness; a
+        // symlink to a directory is intentionally not descended into.
+        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = e.file_name().to_str().map(str::to_string) else {
+            continue; // skip non-UTF-8 names rather than emit a lossy path
+        };
+        if name.starts_with('.') {
+            continue; // hidden dirs (.git, .cache, …) are noise for app-picking
+        }
+        let p = e.path();
+        let Some(path) = p.to_str().map(str::to_string) else {
+            continue;
+        };
+        let is_nano_app = is_nano_app_dir(&p);
+        entries.push(BrowseEntry {
+            name,
+            path,
+            is_nano_app,
+        });
+    }
+    entries.sort_by_key(|e| e.name.to_lowercase());
+    let path = canon
+        .to_str()
+        .ok_or_else(|| format!("path \"{}\" is not valid UTF-8", canon.display()))?
+        .to_string();
+    let parent = canon.parent().and_then(|p| p.to_str()).map(str::to_string);
+    let is_nano_app = is_nano_app_dir(&canon);
+    Ok(BrowseResult {
+        path,
+        parent,
+        is_nano_app,
+        entries,
+    })
 }
 
 /// Resolves a project-relative path (which may contain `/` separators) to an
@@ -4043,6 +4153,88 @@ mod tests {
         assert!(
             read_project_ref("src").is_none(),
             "stale src ref dropped so the name can't resurrect"
+        );
+    }
+
+    // --- filesystem browser (ADR 0041 import picker) ---------------------
+
+    #[test]
+    fn browse_dir_lists_only_subdirs_and_flags_nano_apps() {
+        let _g = lock();
+        let _root = temp_root();
+        let base = ext_app_dir("browse");
+        // Two child dirs (one a Nano app), a plain file, and a hidden dir.
+        std::fs::create_dir_all(base.join("app-a")).unwrap();
+        std::fs::write(base.join("app-a").join("nano.app.json"), "{}").unwrap();
+        std::fs::create_dir_all(base.join("plain")).unwrap();
+        std::fs::create_dir_all(base.join(".hidden")).unwrap();
+        std::fs::write(base.join("notes.txt"), "x").unwrap();
+
+        let r = browse_dir(Some(base.to_str().unwrap())).expect("browse ok");
+        let names: Vec<&str> = r.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["app-a", "plain"],
+            "files + hidden dirs excluded"
+        );
+        let app = r.entries.iter().find(|e| e.name == "app-a").unwrap();
+        assert!(app.is_nano_app, "dir with nano.app.json flagged importable");
+        assert!(
+            !r.entries
+                .iter()
+                .find(|e| e.name == "plain")
+                .unwrap()
+                .is_nano_app
+        );
+        assert!(!r.is_nano_app, "the browsed dir itself is not an app");
+        // The parent is exposed so the picker can walk up (compare canonically —
+        // macOS resolves /var → /private/var).
+        let canon_base = std::fs::canonicalize(&base).unwrap();
+        assert_eq!(r.path, canon_base.to_str().unwrap());
+        assert_eq!(
+            r.parent.as_deref(),
+            canon_base.parent().and_then(|p| p.to_str())
+        );
+    }
+
+    #[test]
+    fn browse_dir_reports_when_the_dir_itself_is_a_nano_app() {
+        let _g = lock();
+        let _root = temp_root();
+        let base = ext_app_dir("browse-self");
+        std::fs::write(base.join("nanobpm.project.json"), "{}").unwrap();
+        let r = browse_dir(Some(base.to_str().unwrap())).expect("browse ok");
+        assert!(
+            r.is_nano_app,
+            "nanobpm.project.json marks the dir importable"
+        );
+    }
+
+    #[test]
+    fn browse_dir_rejects_a_relative_path_and_a_missing_dir() {
+        let _g = lock();
+        let _root = temp_root();
+        assert!(
+            browse_dir(Some("relative/dir")).is_err(),
+            "relative paths are refused (CWD-independent, like import)"
+        );
+        assert!(
+            browse_dir(Some("/no/such/path/xyzzy")).is_err(),
+            "a non-existent path is an error, not an empty listing"
+        );
+    }
+
+    #[test]
+    fn browse_dir_defaults_to_a_readable_root_when_no_path_given() {
+        let _g = lock();
+        let _root = temp_root();
+        // With no path the browser opens on a real directory (home or `/`) and
+        // returns a canonical absolute path — never an error.
+        let r = browse_dir(None).expect("default root browses");
+        assert!(
+            r.path.starts_with('/'),
+            "canonical absolute path: {}",
+            r.path
         );
     }
 

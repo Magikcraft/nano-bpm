@@ -14992,6 +14992,25 @@ impl axum::serve::Listener for NoDelayListener {
     }
 }
 
+/// Connection peer address, wired through `ConnectInfo` so handlers can tell a
+/// loopback client from a remote one (the console's filesystem browser is
+/// loopback-only). A local newtype is required because the orphan rule forbids
+/// implementing axum's `Connected` for the foreign `SocketAddr` directly.
+#[derive(Clone, Copy)]
+pub(crate) struct PeerAddr(pub(crate) SocketAddr);
+
+/// Enables `ConnectInfo<PeerAddr>` extraction when the app is served over the
+/// custom [`NoDelayListener`]; axum ships a `Connected` impl for the stock
+/// `TcpListener` but not for a wrapper, so we forward the peer address the
+/// listener already yields.
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, NoDelayListener>>
+    for PeerAddr
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, NoDelayListener>) -> Self {
+        PeerAddr(*stream.remote_addr())
+    }
+}
+
 /// Reported binary name for `--version` / `--help`.
 const GATEWAY_NAME: &str = "nanobpm-gateway-rest-server";
 
@@ -16785,10 +16804,13 @@ async fn main() {
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 
-    axum::serve(NoDelayListener(listener), app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .expect("server error");
+    axum::serve(
+        NoDelayListener(listener),
+        app.into_make_service_with_connect_info::<PeerAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await
+    .expect("server error");
 }
 
 /// Routes every panic through `tracing::error!` (thread name, location, payload,

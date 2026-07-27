@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use axum::{
     Router,
-    extract::{Path, Query, State},
+    extract::{ConnectInfo, Path, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Json, Response,
@@ -121,6 +121,10 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/projects/{name}/file", get(project_file_get))
         .route("/console/api/projects/{name}/logs", get(project_logs))
         .route("/console/api/projects/{name}/export", get(project_export))
+        // Loopback-only host filesystem browser for the Import-by-reference
+        // picker (ADR 0041). Hand-wired (not in the OpenAPI spec) because it
+        // exposes the server's filesystem and is gated on the peer being local.
+        .route("/console/api/fs/browse", get(fs_browse))
         // Trigger webhook ingress (ADR 0025 phase 2): the universal external
         // emit endpoint. Hand-wired (not in the OpenAPI spec) because it accepts
         // an arbitrary body + custom shared-secret auth and acks after persist.
@@ -1916,6 +1920,13 @@ struct FilePathQuery {
     path: String,
 }
 
+/// Query for the loopback-only filesystem browser (`fs_browse`). `path` is an
+/// optional absolute host path; when absent the browser opens on the home dir.
+#[derive(Deserialize)]
+struct BrowseQuery {
+    path: Option<String>,
+}
+
 pub(super) async fn worker_summary(name: &str) -> Option<WorkerSummaryDto> {
     let dir = workspace::worker_dir(name)?;
     if !dir.is_dir() {
@@ -2773,7 +2784,33 @@ async fn project_file_get(Path(name): Path<String>, Query(q): Query<FilePathQuer
     }
 }
 
-/// `PUT /console/api/projects/{name}/file?path=...` — save (create/overwrite).
+/// `GET /console/api/fs/browse?path=...` — list the immediate sub-directories of
+/// an absolute host path so the Import-by-reference picker (ADR 0041) can browse
+/// to a checked-out Urban app instead of requiring a hand-typed absolute path.
+/// With no `path`, opens on the operator's home directory.
+///
+/// **Loopback only.** This exposes the server's filesystem, so it is refused for
+/// any non-local peer (the browser also hides the Browse button off-localhost).
+/// Behind a reverse proxy the peer is the proxy, so a hosted console — which the
+/// proxy makes non-loopback for real clients — never reaches this handler with a
+/// genuine remote user; the button is hidden there too.
+async fn fs_browse(
+    ConnectInfo(peer): ConnectInfo<crate::PeerAddr>,
+    Query(q): Query<BrowseQuery>,
+) -> Response {
+    if !peer.0.ip().is_loopback() {
+        return (
+            StatusCode::FORBIDDEN,
+            "filesystem browsing is available on localhost only",
+        )
+            .into_response();
+    }
+    match projects::browse_dir(q.path.as_deref()) {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
 pub(super) fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
     let Some(path) = projects::safe_project_path(name, rel) else {
         return Err((StatusCode::BAD_REQUEST, "invalid path".to_string()));
