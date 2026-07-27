@@ -2354,7 +2354,7 @@ function EnvelopeEditorModal({
     const tid = id.trim();
     if (!tid) return "Enter a type id.";
     if (!IDENT_RE.test(tid))
-      return "Type id must be a valid identifier (letters, digits, _; not starting with a digit).";
+      return "Type id must be a valid identifier (letters, digits, _ or $; not starting with a digit).";
     if (existingIds.includes(tid)) return `Type "${tid}" already exists.`;
     const named = fields
       .map((f) => ({ ...f, name: f.name.trim() }))
@@ -2437,6 +2437,8 @@ function EnvelopeEditorModal({
                   variant="secondary"
                   onClick={() => removeField(i)}
                   disabled={fields.length <= 1}
+                  aria-label="Remove field"
+                  title="Remove field"
                 >
                   ✕
                 </Button>

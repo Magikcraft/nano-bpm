@@ -304,8 +304,10 @@ function primaryKeyOf(t: TableMeta): string {
  * binds each table name to its row type (from `domain-rows.d.ts`) and primary key, so
  * it imports nothing but the sibling SDK (relative) and a type-only `domain-rows.d.ts`
  * — staying dual-runtime (Node + Deno) and erased at `deno compile`. When the App
- * declares multiple datasources the accessor reflects the default one; `db.raw`
- * is the escape hatch (and `openDataSource(name)` reaches the others).
+ * declares multiple datasources this emits a *keyed* `openDomain<K>(source?)` whose
+ * returned accessor is typed against that source's tables (defaulting to the default
+ * source); `db.raw` is the per-source escape hatch. Single-source apps keep the
+ * zero-arg `openDomain()` concrete form (byte-stable).
  */
 export function emitDomainBindings(
   sources: SourceSchema[],
