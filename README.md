@@ -17,6 +17,10 @@ existing Camunda 8 clients and tooling.
 > See [DEVELOPMENT.md](DEVELOPMENT.md). This README is for running and operating
 > the distributed binary.
 
+> Nano spans three repositories (this engine, the console **extension packs**, and
+> the **c8ctl plugin** that runs it). For the map of what lives where and how they
+> relate, see [`docs/nano-repositories.md`](docs/nano-repositories.md).
+
 ## Self-optimizing by design: one decision, not a hundred knobs
 
 Nano is built on a single design principle:
@@ -709,6 +713,14 @@ landing page, and `/swagger` serves an **offline** Swagger UI with the OpenAPI
 spec bundled in (nothing fetched from a CDN).
 
 The console has five tabs, each described below.
+
+The console is also **extensible**: language support, project templates, examples,
+themes, and event triggers are shipped as **extension packs** — plain npm packages
+discovered by the `nano-ide-ext` keyword and installed from the console UI. The
+packs live in the [`nano-ide`](https://github.com/jwulf/nano-ide) repo; their
+manifest schema is defined here in `server/src/console/extensions.rs`. See
+[`docs/nano-repositories.md`](docs/nano-repositories.md) for how the pieces relate.
+
 
 ### Topology
 
