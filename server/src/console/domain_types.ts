@@ -1152,11 +1152,19 @@ export function emitMeta(metas: MetaDecl[]): string {
   const iface = keys.length > 0
     ? `export interface AppMeta {\n${keys.map((k) => `  ${propKey(k)}: string;`).join("\n")}\n}\n`
     : `export interface AppMeta {}\n`;
+  // `appMeta` is a **null-prototype** dict populated by bracket assignment: meta
+  // keys are user-authored, so a prototype chain would let `meta("toString")` /
+  // `meta("constructor")` return an inherited function instead of `undefined`, and
+  // a literal `__proto__` key would corrupt the object. `Object.create(null)` +
+  // `m[key] = …` makes every lookup an own-property read and every write a plain
+  // data property (safe even for a `__proto__` key). Strip-safe (plain JS + erased
+  // annotations, ADR 0036).
   const constDecl = keys.length > 0
-    ? `export const appMeta: AppMeta = {\n${
-      keys.map((k) => `  ${propKey(k)}: ${JSON.stringify(folded[k])},`).join("\n")
-    }\n};\n`
-    : `export const appMeta: AppMeta = {} as AppMeta;\n`;
+    ? `export const appMeta: AppMeta = (() => {\n` +
+      `  const m: Record<string, string> = Object.create(null);\n` +
+      keys.map((k) => `  m[${JSON.stringify(k)}] = ${JSON.stringify(folded[k])};`).join("\n") +
+      `\n  return m as AppMeta;\n})();\n`
+    : `export const appMeta: AppMeta = Object.create(null) as AppMeta;\n`;
   const accessor =
     `\n/** Read a model-level metadata value. A declared key is typed; a dynamic key\n` +
     ` * returns \`string | undefined\`. */\n` +
