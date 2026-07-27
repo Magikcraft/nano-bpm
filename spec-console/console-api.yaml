@@ -899,15 +899,19 @@ paths:
     post:
       operationId: previewDomainTypes
       tags: [data]
-      summary: Resolve the in-editor composed shapes for a live preview, writing nothing
+      summary: Resolve the in-editor composed shapes for a live preview (no domain-type output written)
       description: >
         The authoring-time counterpart to `regenerateDomainTypes` (ADR 0040
         §9/§10): resolve the composed motion-shapes the modeller is *currently
         editing* — sent in the request body, not scanned from the saved `.bpmn`
         — against the live datasource + manifest-type fuse, and return the
-        emitted domain text plus the per-shape diagnostics. Writes nothing: it
-        powers the shape composer's live field preview and inline diagnostics, so
-        it never touches the generated SDK on disk. `write:false` under the hood.
+        emitted domain text plus the per-shape diagnostics. Runs with
+        `write:false`, so it does not materialise the `domaintypes` outputs
+        (`domain-rows.d.ts` and the worker/message bindings): it powers the shape
+        composer's live field preview and inline diagnostics without regenerating
+        the typed SDK the maker consumes. (Like every project op it does ensure the
+        generated SDK *scaffolding* exists, so the first call may seed the
+        `nano-generated/` helpers.)
       parameters:
         - { $ref: '#/components/parameters/NamePath' }
         - { $ref: '#/components/parameters/SourcePath' }

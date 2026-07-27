@@ -2972,9 +2972,12 @@ pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiRes
 
 /// `POST /console/api/projects/{name}/data/{source}/domaintypes/preview` — resolve
 /// the composed shapes the modeller is editing (sent in the body) for the shape
-/// composer's live field preview + inline diagnostics, without scanning the saved
-/// model or writing the generated SDK (ADR 0040 §9/§10). `write:false` +
-/// caller-supplied `derivedShapes` win over the disk scan in `run_data_op`.
+/// composer's live field preview + inline diagnostics (ADR 0040 §9/§10). It avoids
+/// the saved-model scan (the caller-supplied `derivedShapes` win over the disk scan
+/// in `run_data_op`) and, with `write:false`, does not materialise the `domaintypes`
+/// outputs (`domain-rows.d.ts` + the worker/message bindings) — so it never
+/// regenerates the typed SDK the maker consumes. (It still runs through
+/// `run_data_op`, which ensures the `nano-generated/` SDK scaffolding exists.)
 pub(super) async fn project_data_preview_domaintypes(
     name: &str,
     source: &str,

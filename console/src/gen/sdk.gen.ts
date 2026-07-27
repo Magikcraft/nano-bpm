@@ -445,9 +445,9 @@ export const migrateData = <ThrowOnError extends boolean = false>(options: Optio
 export const regenerateDomainTypes = <ThrowOnError extends boolean = false>(options: Options<RegenerateDomainTypesData, ThrowOnError>): RequestResult<RegenerateDomainTypesResponses, RegenerateDomainTypesErrors, ThrowOnError> => (options.client ?? client).post<RegenerateDomainTypesResponses, RegenerateDomainTypesErrors, ThrowOnError>({ url: '/projects/{name}/data/{source}/domaintypes', ...options });
 
 /**
- * Resolve the in-editor composed shapes for a live preview, writing nothing
+ * Resolve the in-editor composed shapes for a live preview (no domain-type output written)
  *
- * The authoring-time counterpart to `regenerateDomainTypes` (ADR 0040 §9/§10): resolve the composed motion-shapes the modeller is *currently editing* — sent in the request body, not scanned from the saved `.bpmn` — against the live datasource + manifest-type fuse, and return the emitted domain text plus the per-shape diagnostics. Writes nothing: it powers the shape composer's live field preview and inline diagnostics, so it never touches the generated SDK on disk. `write:false` under the hood.
+ * The authoring-time counterpart to `regenerateDomainTypes` (ADR 0040 §9/§10): resolve the composed motion-shapes the modeller is *currently editing* — sent in the request body, not scanned from the saved `.bpmn` — against the live datasource + manifest-type fuse, and return the emitted domain text plus the per-shape diagnostics. Runs with `write:false`, so it does not materialise the `domaintypes` outputs (`domain-rows.d.ts` and the worker/message bindings): it powers the shape composer's live field preview and inline diagnostics without regenerating the typed SDK the maker consumes. (Like every project op it does ensure the generated SDK *scaffolding* exists, so the first call may seed the `nano-generated/` helpers.)
  *
  */
 export const previewDomainTypes = <ThrowOnError extends boolean = false>(options: Options<PreviewDomainTypesData, ThrowOnError>): RequestResult<PreviewDomainTypesResponses, PreviewDomainTypesErrors, ThrowOnError> => (options.client ?? client).post<PreviewDomainTypesResponses, PreviewDomainTypesErrors, ThrowOnError>({

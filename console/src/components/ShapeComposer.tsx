@@ -88,6 +88,10 @@ export default function ShapeComposer({
   const shapesKey = JSON.stringify(shapes);
   useEffect(() => {
     if (shapes.length === 0) {
+      // Advance the request id so any preview already in flight fails its
+      // `id === reqId.current` guard and can't repopulate `result` after the
+      // drawer emptied.
+      reqId.current++;
       setResult(null);
       setPreviewing(false);
       return;
