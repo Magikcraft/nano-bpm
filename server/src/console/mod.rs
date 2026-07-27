@@ -2797,11 +2797,11 @@ async fn fs_browse(
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
+        .unwrap_or("");
     let host_name = if let Some(rest) = host.strip_prefix('[') {
         rest.split(']').next().unwrap_or("")
     } else if host.matches(':').count() > 1 {
-        host.as_str()
+        host
     } else {
         host.split(':').next().unwrap_or("")
     };
