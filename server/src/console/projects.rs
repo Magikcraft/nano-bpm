@@ -338,9 +338,95 @@ pub fn ensure_projects_root() -> std::io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// An imported-by-reference project (ADR 0041): a `name` that resolves to an
+/// **external** directory (a checked-out repo) rather than a subdir of the
+/// projects root. Persisted as `<name>.project-ref.json` in the projects root,
+/// so the resolver finds it without moving any project data. Read **live** — a
+/// Run re-reads the pointed-at directory, giving the maker a no-copy dev loop.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRef {
+    /// Source kind. Currently only `"path"` (an external checked-out directory).
+    pub source: String,
+    /// Canonical absolute directory the project resolves to.
+    pub path: String,
+}
+
+/// Path to the reference file for `name`, or `None` when the name is unsafe.
+fn project_ref_file(name: &str) -> Option<PathBuf> {
+    workspace::is_safe_name(name).then(|| projects_root().join(format!("{name}.project-ref.json")))
+}
+
+/// Reads the project reference for `name`, if one is registered.
+pub fn read_project_ref(name: &str) -> Option<ProjectRef> {
+    let f = project_ref_file(name)?;
+    let text = std::fs::read_to_string(f).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 /// The directory for project `name`, or `None` when the name is unsafe.
+///
+/// A project imported by reference (ADR 0041) resolves to its external
+/// directory; every other project keeps the default `<root>/<name>` location.
+/// All *within-project* path access still goes through [`safe_project_path`],
+/// so the external base does not widen traversal beyond that directory.
 pub fn project_dir(name: &str) -> Option<PathBuf> {
-    workspace::is_safe_name(name).then(|| projects_root().join(name))
+    if !workspace::is_safe_name(name) {
+        return None;
+    }
+    if let Some(r) = read_project_ref(name) {
+        return Some(PathBuf::from(r.path));
+    }
+    Some(projects_root().join(name))
+}
+
+/// Register a project reference (ADR 0041, `path` source): point `name` at an
+/// external directory, read live, without copying it. Fails closed when the name
+/// is unsafe, a real workspace project already owns the name, the path does not
+/// resolve to a directory, or that directory is not a Nano app/project (has
+/// neither `nano.app.json` nor `nanobpm.project.json`).
+pub fn import_project_ref(name: &str, path: &str) -> Result<ProjectRef, String> {
+    if !workspace::is_safe_name(name) {
+        return Err(format!("invalid project name \"{name}\""));
+    }
+    let root = ensure_projects_root().map_err(|e| format!("projects root: {e}"))?;
+    if root.join(name).is_dir() {
+        return Err(format!(
+            "a workspace project named \"{name}\" already exists; choose another name"
+        ));
+    }
+    let src = std::fs::canonicalize(path)
+        .map_err(|e| format!("cannot resolve path \"{path}\": {e}"))?;
+    if !src.is_dir() {
+        return Err(format!("\"{}\" is not a directory", src.display()));
+    }
+    if !src.join("nano.app.json").is_file() && !src.join("nanobpm.project.json").is_file() {
+        return Err(format!(
+            "\"{}\" is not a Nano app/project (no nano.app.json or nanobpm.project.json)",
+            src.display()
+        ));
+    }
+    let r = ProjectRef {
+        source: "path".to_string(),
+        path: src.to_string_lossy().to_string(),
+    };
+    let f = project_ref_file(name).ok_or_else(|| format!("invalid project name \"{name}\""))?;
+    let body = serde_json::to_vec_pretty(&r).map_err(|e| format!("serialize reference: {e}"))?;
+    std::fs::write(&f, body).map_err(|e| format!("write reference: {e}"))?;
+    Ok(r)
+}
+
+/// Remove a project reference (does **not** touch the external directory).
+/// Returns `true` when a reference existed and was removed.
+pub fn remove_project_ref(name: &str) -> std::io::Result<bool> {
+    let Some(f) = project_ref_file(name) else {
+        return Ok(false);
+    };
+    if f.is_file() {
+        std::fs::remove_file(f)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Resolves a project-relative path (which may contain `/` separators) to an
@@ -2083,6 +2169,11 @@ pub fn create_project(
 
 /// Deletes a project directory and everything in it.
 pub fn delete_project(name: &str) -> std::io::Result<()> {
+    // A project imported by reference (ADR 0041) owns only its pointer file —
+    // deleting it must remove the reference, never the external checkout.
+    if remove_project_ref(name)? {
+        return Ok(());
+    }
     let dir = project_dir(name).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid project name")
     })?;
@@ -2093,6 +2184,12 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
 /// the source is missing, the target name is unsafe, or the target exists. The
 /// caller must ensure the project is stopped first.
 pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
+    // Refuse to rename an imported-by-reference project: a plain directory
+    // rename would move the external checkout into the projects root. Remove and
+    // re-import under the new name instead.
+    if read_project_ref(old).is_some() {
+        return Err("cannot rename an imported-by-reference project; remove and re-import".into());
+    }
     let from = project_dir(old).ok_or("invalid project name")?;
     let to = project_dir(new).ok_or("invalid new name")?;
     if !from.is_dir() {
@@ -2126,6 +2223,9 @@ pub struct ProjectSummary {
     pub forms: usize,
     pub workers: usize,
     pub running: bool,
+    /// Where the project lives: `"workspace"` (a directory under the projects
+    /// root) or `"path"` (an external directory imported by reference, ADR 0041).
+    pub source: String,
     /// Language pack id (from the project config; default "deno"). The Console
     /// resolves the card's language icon by matching this to a lang Extension.
     pub lang: String,
@@ -2184,6 +2284,65 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
             forms: count_ext(&res.join("forms"), "form"),
             workers: count_dirs(&path.join("workers")),
             running: false,
+            source: "workspace".to_string(),
+            lang: cfg.lang,
+            template: cfg.template,
+            scaffolded_from: cfg.scaffolded_from,
+        });
+    }
+    // Imported-by-reference projects (ADR 0041): `<name>.project-ref.json` files
+    // in the projects root that resolve to an external directory, read live.
+    for entry in std::fs::read_dir(&root)?.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|f| f.strip_suffix(".project-ref.json"))
+        else {
+            continue;
+        };
+        if !workspace::is_safe_name(name) {
+            continue;
+        }
+        let Some(dir) = project_dir(name) else {
+            continue;
+        };
+        // A dangling pointer (the external checkout moved/was removed) is still
+        // surfaced so the operator can see and fix it, rather than vanishing.
+        if !dir.is_dir() {
+            out.push(ProjectSummary {
+                name: name.to_string(),
+                description: "(source not found)".to_string(),
+                deploy_target: default_deploy_target(),
+                updated_ms: 0,
+                processes: 0,
+                decisions: 0,
+                forms: 0,
+                workers: 0,
+                running: false,
+                source: "path".to_string(),
+                lang: "deno".to_string(),
+                template: None,
+                scaffolded_from: None,
+            });
+            continue;
+        }
+        let cfg = read_config(name).unwrap_or_else(|| ProjectConfig::new(name, ""));
+        let res = dir.join("resources");
+        out.push(ProjectSummary {
+            name: name.to_string(),
+            description: cfg.description,
+            deploy_target: cfg.deploy_target,
+            updated_ms: cfg.updated_ms,
+            processes: count_ext(&res.join("processes"), "bpmn"),
+            decisions: count_ext(&res.join("decisions"), "dmn"),
+            forms: count_ext(&res.join("forms"), "form"),
+            workers: count_dirs(&dir.join("workers")),
+            running: false,
+            source: "path".to_string(),
             lang: cfg.lang,
             template: cfg.template,
             scaffolded_from: cfg.scaffolded_from,
@@ -3434,6 +3593,118 @@ mod tests {
         assert!(safe_project_path("app", "a/../b").is_none());
         assert!(safe_project_path("app", "resources/processes/x.bpmn").is_some());
         assert!(safe_project_path("../bad", "x").is_none());
+    }
+
+    // --- import-by-reference (ADR 0041) ----------------------------------
+
+    /// A throwaway external directory standing in for a checked-out app repo.
+    fn ext_app_dir(marker: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "nano-ext-app-{}-{}-{}",
+            std::process::id(),
+            marker,
+            N.fetch_add(1, AOrd::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn import_project_ref_points_project_dir_at_external_dir_read_live() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("live");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"x","name":"X"}"#).unwrap();
+
+        let r = import_project_ref("pr-review", ext.to_str().unwrap()).expect("import ok");
+        assert_eq!(r.source, "path");
+
+        // project_dir now resolves to the (canonicalised) external directory, so
+        // every existing file-access helper transparently reads it live.
+        let resolved = project_dir("pr-review").expect("resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&ext).unwrap());
+
+        // An edit in the checkout is visible immediately (no copy).
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"y","name":"Y"}"#).unwrap();
+        let live = std::fs::read_to_string(project_dir("pr-review").unwrap().join("nano.app.json")).unwrap();
+        assert!(live.contains("\"id\":\"y\""));
+    }
+
+    #[test]
+    fn import_project_ref_rejects_non_app_dir_and_missing_path() {
+        let _g = lock();
+        let _root = temp_root();
+        let empty = ext_app_dir("empty"); // a dir, but no nano.app.json / project.json
+        let err = import_project_ref("nope", empty.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not a Nano app/project"), "got: {err}");
+
+        let err = import_project_ref("nope", "/no/such/path/here").unwrap_err();
+        assert!(err.contains("cannot resolve path"), "got: {err}");
+    }
+
+    #[test]
+    fn import_project_ref_refuses_to_shadow_a_workspace_project() {
+        let _g = lock();
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("taken")).unwrap(); // a real workspace project dir
+        let ext = ext_app_dir("shadow");
+        std::fs::write(ext.join("nanobpm.project.json"), "{}").unwrap();
+        let err = import_project_ref("taken", ext.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("already exists"), "got: {err}");
+    }
+
+    #[test]
+    fn list_projects_tags_source_and_remove_ref_reverts() {
+        let _g = lock();
+        let root = temp_root();
+        // one workspace project + one imported-by-reference project
+        std::fs::create_dir_all(root.join("local")).unwrap();
+        let ext = ext_app_dir("listed");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"z","name":"Z"}"#).unwrap();
+        import_project_ref("linked", ext.to_str().unwrap()).unwrap();
+
+        let list = list_projects().unwrap();
+        let local = list.iter().find(|p| p.name == "local").expect("local listed");
+        let linked = list.iter().find(|p| p.name == "linked").expect("linked listed");
+        assert_eq!(local.source, "workspace");
+        assert_eq!(linked.source, "path");
+
+        // Removing the reference drops it from the listing without touching the
+        // external directory.
+        assert!(remove_project_ref("linked").unwrap());
+        assert!(ext.join("nano.app.json").is_file(), "external dir untouched");
+        let list = list_projects().unwrap();
+        assert!(list.iter().all(|p| p.name != "linked"));
+    }
+
+    #[test]
+    fn list_projects_surfaces_a_dangling_reference() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("gone");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"g","name":"G"}"#).unwrap();
+        import_project_ref("ghost", ext.to_str().unwrap()).unwrap();
+        std::fs::remove_dir_all(&ext).unwrap(); // the checkout moves/disappears
+
+        let list = list_projects().unwrap();
+        let ghost = list.iter().find(|p| p.name == "ghost").expect("dangling ref still surfaced");
+        assert_eq!(ghost.source, "path");
+        assert_eq!(ghost.description, "(source not found)");
+    }
+
+    #[test]
+    fn delete_project_on_a_reference_keeps_the_external_checkout() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("keep");
+        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"k","name":"K"}"#).unwrap();
+        import_project_ref("linked", ext.to_str().unwrap()).unwrap();
+
+        delete_project("linked").expect("delete ok");
+        assert!(read_project_ref("linked").is_none(), "reference removed");
+        assert!(ext.join("nano.app.json").is_file(), "external checkout untouched");
     }
 
     // --- discover_deployables --------------------------------------------

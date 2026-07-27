@@ -113,6 +113,22 @@ starts the engine/triggers/surfaces and refuses to start on an invalid manifest 
 - **The engine stays Zeebe-pure** and **distribution is unchanged** (npm extensions).
 - **No drift**: validation remains the single TS implementation at the existing gates.
 
+## Status
+
+**Increment 1 — import-by-reference: implemented.** `project_dir` resolves a
+`<name>.project-ref.json` pointer to its external directory (read live);
+`import_project_ref`/`remove_project_ref` register/drop pointers with fail-closed
+guardrails (safe name, no workspace shadowing, canonicalised path, must be a Nano
+app/project); `list_projects` source-tags each project (`workspace`/`path`) and
+surfaces dangling pointers; `delete_project`/`rename_project` are guarded so they
+never destroy or move the external checkout. Wired as hand-routed
+`POST /console/api/projects/import {name, path}` (mod.rs). Unit-tested.
+
+Running an imported app then reuses the **existing** `POST /console/api/projects/{name}/run`
+supervisor path unchanged — so "import by reference → run" is already achievable
+end-to-end over the API / `c8ctl`. The dedicated **headless boot entrypoint**
+(open question 2) is deferred pending the boot-flag-vs-`c8ctl`-subcommand decision.
+
 ## Open questions
 
 1. **Reference storage** — a per-project `<name>.project-ref.json` in the projects root, or a single
