@@ -121,8 +121,9 @@ starts the engine/triggers/surfaces and refuses to start on an invalid manifest 
 guardrails (safe name, no workspace shadowing, canonicalised path, must be a Nano
 app/project); `list_projects` source-tags each project (`workspace`/`path`) and
 surfaces dangling pointers; `delete_project`/`rename_project` are guarded so they
-never destroy or move the external checkout. Wired as hand-routed
-`POST /console/api/projects/import {name, path}` (mod.rs). Unit-tested.
+never destroy or move the external checkout. Exposed as the spec-first
+`POST /console/api/projects/import {name, path}` operation (console-api.yaml
+`importProject`), so the console gets a typed client. Unit-tested.
 
 Running an imported app then reuses the **existing** `POST /console/api/projects/{name}/run`
 supervisor path unchanged — so "import by reference → run" is already achievable

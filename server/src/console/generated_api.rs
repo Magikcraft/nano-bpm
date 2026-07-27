@@ -799,6 +799,32 @@ impl apis::projects::Projects for ServerImpl {
         }
     }
 
+    async fn import_project(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        body: &models::ImportProjectRequest,
+    ) -> Result<apis::projects::ImportProjectResponse, ()> {
+        let name = body.name.trim().to_string();
+        let path = body.path.trim().to_string();
+        let out =
+            tokio::task::spawn_blocking(move || super::projects::import_project_ref(&name, &path))
+                .await
+                .unwrap_or_else(|e| Err(format!("import task panicked: {e}")));
+        match out {
+            Ok(r) => Ok(
+                apis::projects::ImportProjectResponse::Status200_ProjectReferenceRegistered(
+                    from_val(serde_json::to_value(r).unwrap_or_default()),
+                ),
+            ),
+            Err(e) if e.contains("already exists") => {
+                Ok(apis::projects::ImportProjectResponse::Status409_AlreadyExists(e))
+            }
+            Err(e) => Ok(apis::projects::ImportProjectResponse::Status400_InvalidRequest(e)),
+        }
+    }
+
     async fn create_project_path(
         &self,
         _method: &Method,

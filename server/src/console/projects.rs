@@ -395,8 +395,8 @@ pub fn import_project_ref(name: &str, path: &str) -> Result<ProjectRef, String> 
             "a workspace project named \"{name}\" already exists; choose another name"
         ));
     }
-    let src = std::fs::canonicalize(path)
-        .map_err(|e| format!("cannot resolve path \"{path}\": {e}"))?;
+    let src =
+        std::fs::canonicalize(path).map_err(|e| format!("cannot resolve path \"{path}\": {e}"))?;
     if !src.is_dir() {
         return Err(format!("\"{}\" is not a directory", src.display()));
     }
@@ -3616,7 +3616,11 @@ mod tests {
         let _g = lock();
         let _root = temp_root();
         let ext = ext_app_dir("live");
-        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"x","name":"X"}"#).unwrap();
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"x","name":"X"}"#,
+        )
+        .unwrap();
 
         let r = import_project_ref("pr-review", ext.to_str().unwrap()).expect("import ok");
         assert_eq!(r.source, "path");
@@ -3627,8 +3631,13 @@ mod tests {
         assert_eq!(resolved, std::fs::canonicalize(&ext).unwrap());
 
         // An edit in the checkout is visible immediately (no copy).
-        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"y","name":"Y"}"#).unwrap();
-        let live = std::fs::read_to_string(project_dir("pr-review").unwrap().join("nano.app.json")).unwrap();
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"y","name":"Y"}"#,
+        )
+        .unwrap();
+        let live = std::fs::read_to_string(project_dir("pr-review").unwrap().join("nano.app.json"))
+            .unwrap();
         assert!(live.contains("\"id\":\"y\""));
     }
 
@@ -3662,19 +3671,32 @@ mod tests {
         // one workspace project + one imported-by-reference project
         std::fs::create_dir_all(root.join("local")).unwrap();
         let ext = ext_app_dir("listed");
-        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"z","name":"Z"}"#).unwrap();
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"z","name":"Z"}"#,
+        )
+        .unwrap();
         import_project_ref("linked", ext.to_str().unwrap()).unwrap();
 
         let list = list_projects().unwrap();
-        let local = list.iter().find(|p| p.name == "local").expect("local listed");
-        let linked = list.iter().find(|p| p.name == "linked").expect("linked listed");
+        let local = list
+            .iter()
+            .find(|p| p.name == "local")
+            .expect("local listed");
+        let linked = list
+            .iter()
+            .find(|p| p.name == "linked")
+            .expect("linked listed");
         assert_eq!(local.source, "workspace");
         assert_eq!(linked.source, "path");
 
         // Removing the reference drops it from the listing without touching the
         // external directory.
         assert!(remove_project_ref("linked").unwrap());
-        assert!(ext.join("nano.app.json").is_file(), "external dir untouched");
+        assert!(
+            ext.join("nano.app.json").is_file(),
+            "external dir untouched"
+        );
         let list = list_projects().unwrap();
         assert!(list.iter().all(|p| p.name != "linked"));
     }
@@ -3684,12 +3706,19 @@ mod tests {
         let _g = lock();
         let _root = temp_root();
         let ext = ext_app_dir("gone");
-        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"g","name":"G"}"#).unwrap();
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"g","name":"G"}"#,
+        )
+        .unwrap();
         import_project_ref("ghost", ext.to_str().unwrap()).unwrap();
         std::fs::remove_dir_all(&ext).unwrap(); // the checkout moves/disappears
 
         let list = list_projects().unwrap();
-        let ghost = list.iter().find(|p| p.name == "ghost").expect("dangling ref still surfaced");
+        let ghost = list
+            .iter()
+            .find(|p| p.name == "ghost")
+            .expect("dangling ref still surfaced");
         assert_eq!(ghost.source, "path");
         assert_eq!(ghost.description, "(source not found)");
     }
@@ -3699,12 +3728,19 @@ mod tests {
         let _g = lock();
         let _root = temp_root();
         let ext = ext_app_dir("keep");
-        std::fs::write(ext.join("nano.app.json"), r#"{"schemaVersion":1,"id":"k","name":"K"}"#).unwrap();
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"k","name":"K"}"#,
+        )
+        .unwrap();
         import_project_ref("linked", ext.to_str().unwrap()).unwrap();
 
         delete_project("linked").expect("delete ok");
         assert!(read_project_ref("linked").is_none(), "reference removed");
-        assert!(ext.join("nano.app.json").is_file(), "external checkout untouched");
+        assert!(
+            ext.join("nano.app.json").is_file(),
+            "external checkout untouched"
+        );
     }
 
     // --- discover_deployables --------------------------------------------

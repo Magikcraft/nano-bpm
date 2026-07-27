@@ -135,14 +135,6 @@ pub fn router(server: ServerImpl) -> Router {
             "/console/api/export-workers-app",
             axum::routing::post(workers_export),
         )
-        // Import an external checked-out directory as a project pointer, read
-        // live (ADR 0041). Hand-wired (not in the console OpenAPI spec) because
-        // it is an operator/dev-loop affordance that accepts a host filesystem
-        // path rather than project-relative data.
-        .route(
-            "/console/api/projects/import",
-            axum::routing::post(project_import),
-        )
         .route("/console", get(spa_index))
         .route("/console/", get(spa_index))
         .route("/console/{*path}", get(spa_asset))
@@ -2011,42 +2003,6 @@ struct ExportWorkersBody {
     /// The worker names to bundle into the standalone application.
     #[serde(default)]
     workers: Vec<String>,
-}
-
-/// Body for `POST /console/api/projects/import`.
-#[derive(serde::Deserialize)]
-struct ImportProjectBody {
-    name: String,
-    path: String,
-}
-
-/// `POST /console/api/projects/import` — register an external checked-out
-/// directory as a project pointer, read live (ADR 0041). The pointed-at
-/// directory must be a Nano app/project (`nano.app.json` or
-/// `nanobpm.project.json`) and the name must not shadow a workspace project.
-async fn project_import(Json(body): Json<ImportProjectBody>) -> Response {
-    let name = body.name.trim().to_string();
-    let path = body.path.trim().to_string();
-    let out = tokio::task::spawn_blocking(move || projects::import_project_ref(&name, &path))
-        .await
-        .unwrap_or_else(|e| Err(format!("import task panicked: {e}")));
-    match out {
-        Ok(r) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(r).unwrap_or_default()),
-        )
-            .into_response(),
-        Err(e) if e.contains("already exists") => (StatusCode::CONFLICT, e).into_response(),
-        Err(e)
-            if e.contains("invalid")
-                || e.contains("not a Nano")
-                || e.contains("not a directory")
-                || e.contains("cannot resolve") =>
-        {
-            (StatusCode::BAD_REQUEST, e).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-    }
 }
 
 /// `POST /console/api/export-workers-app` — bundle the selected workers into a

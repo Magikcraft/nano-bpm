@@ -389,6 +389,10 @@ export type ProjectSummary = {
     workers: number;
     running: boolean;
     /**
+     * Where the project lives: "workspace" (a directory under the projects root) or "path" (an external checked-out directory imported by reference, ADR 0041, read live).
+     */
+    source: 'workspace' | 'path';
+    /**
      * Language pack id driving the project (e.g. "deno", "rust", "java"). The console resolves the card's language icon by matching this to an Extension of kind "lang".
      */
     lang: string;
@@ -527,6 +531,25 @@ export type CreateProjectRequest = {
     name: string;
     description?: string;
     template?: string | null;
+};
+
+export type ImportProjectRequest = {
+    name: string;
+    /**
+     * Absolute host filesystem path to a checked-out Urban app/project directory (containing nano.app.json or nanobpm.project.json).
+     */
+    path: string;
+};
+
+export type ProjectReference = {
+    /**
+     * Reference source kind (currently only "path").
+     */
+    source: 'path';
+    /**
+     * Canonical absolute directory the project resolves to.
+     */
+    path: string;
 };
 
 export type RenameProjectRequest = {
@@ -1895,6 +1918,35 @@ export type CreateProjectResponses = {
 };
 
 export type CreateProjectResponse = CreateProjectResponses[keyof CreateProjectResponses];
+
+export type ImportProjectData = {
+    body: ImportProjectRequest;
+    path?: never;
+    query?: never;
+    url: '/projects/import';
+};
+
+export type ImportProjectErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Already exists
+     */
+    409: string;
+};
+
+export type ImportProjectError = ImportProjectErrors[keyof ImportProjectErrors];
+
+export type ImportProjectResponses = {
+    /**
+     * Project reference registered
+     */
+    200: ProjectReference;
+};
+
+export type ImportProjectResponse = ImportProjectResponses[keyof ImportProjectResponses];
 
 export type DeleteProjectData = {
     body?: never;
