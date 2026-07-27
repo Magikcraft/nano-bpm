@@ -2337,16 +2337,22 @@ function EnvelopeEditorModal({
   onCancel: () => void;
 }) {
   const [id, setId] = useState("");
-  const [fields, setFields] = useState<{ name: string; type: string }[]>([
-    { name: "", type: "string" },
-  ]);
+  const [fields, setFields] = useState<
+    { key: number; name: string; type: string }[]
+  >([{ key: 0, name: "", type: "string" }]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Monotonic id source so each row keeps a stable React key across
+  // removals/reorders (index keys would make edited values appear to jump rows).
+  const nextFieldKey = useRef(1);
 
   const setField = (i: number, patch: Partial<{ name: string; type: string }>) =>
     setFields((prev) => prev.map((f, j) => (j === i ? { ...f, ...patch } : f)));
   const addField = () =>
-    setFields((prev) => [...prev, { name: "", type: "string" }]);
+    setFields((prev) => [
+      ...prev,
+      { key: nextFieldKey.current++, name: "", type: "string" },
+    ]);
   const removeField = (i: number) =>
     setFields((prev) => (prev.length > 1 ? prev.filter((_, j) => j !== i) : prev));
 
@@ -2412,7 +2418,7 @@ function EnvelopeEditorModal({
           </span>
           <div className="space-y-2">
             {fields.map((f, i) => (
-              <div key={i} className="grid grid-cols-[1fr_auto_auto] items-center gap-2">
+              <div key={f.key} className="grid grid-cols-[1fr_auto_auto] items-center gap-2">
                 <input
                   value={f.name}
                   onChange={(e) => setField(i, { name: e.target.value })}
