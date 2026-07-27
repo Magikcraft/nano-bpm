@@ -50,9 +50,9 @@ test("associates by component-dir file globs for missing/stale $schema", () => {
   for (const entry of entries) {
     assert.deepEqual(entry.fileMatch, [...ELEMENT_TEMPLATE_FILE_MATCH]);
   }
-  assert.ok(ELEMENT_TEMPLATE_FILE_MATCH.includes("**/components/*.json"));
+  assert.ok(ELEMENT_TEMPLATE_FILE_MATCH.includes("**/components/**/*.json"));
   assert.ok(
-    ELEMENT_TEMPLATE_FILE_MATCH.includes("**/.camunda/element-templates/*.json"),
+    ELEMENT_TEMPLATE_FILE_MATCH.includes("**/.camunda/element-templates/**/*.json"),
   );
 });
 

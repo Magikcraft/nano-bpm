@@ -39,10 +39,9 @@ export const APP_MANIFEST_FILE_MATCH = ["*.nano.app.json", "nano.app.json"];
 /**
  * The Monaco JSON schema-registration entries for the bundled manifest schema,
  * keyed by the canonical + legacy-alias URLs and scoped by `fileMatch`. Returned
- * as entries (not full `DiagnosticsOptions`) so `bundledJsonSchemas.ts` can merge
- * them with the element-template schema into a single `setDiagnosticsOptions`
- * call — Monaco's JSON diagnostics options are process-wide and replace, not
- * merge.
+ * as entries (not full `DiagnosticsOptions`) so `jsonSchemas.ts` can merge them
+ * with the element-template schema into a single `setDiagnosticsOptions` call —
+ * Monaco's JSON diagnostics options are process-wide and replace, not merge.
  */
 export function manifestSchemaEntries(
   schema: Record<string, unknown>,

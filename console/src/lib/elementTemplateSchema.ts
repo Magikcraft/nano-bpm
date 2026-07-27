@@ -44,21 +44,22 @@ export const ELEMENT_TEMPLATE_SCHEMA_URIS: readonly string[] = [
 
 // File globs that associate a `.json` document with the element-template schema
 // even when its `$schema` is missing or stale, so a component still validates.
-// Mirrors `projectComponents.COMPONENT_DIRS` (`.camunda/element-templates` +
-// `components`); kept as literals here so this pure module stays free of the
-// `../gen`/`./api` imports that module pulls in.
+// Recursive to mirror `projectComponents` (which collects every `.json` *under*
+// `.camunda/element-templates` + `components`, nested paths included); kept as
+// literals here so this pure module stays free of the `../gen`/`./api` imports
+// that module pulls in.
 export const ELEMENT_TEMPLATE_FILE_MATCH = [
-  "**/components/*.json",
-  "**/.camunda/element-templates/*.json",
+  "**/components/**/*.json",
+  "**/.camunda/element-templates/**/*.json",
 ];
 
 /**
  * The Monaco JSON schema-registration entries for the bundled element-template
  * schema, keyed by the published `$schema` URL (+ the canonical `$id` alias) and
  * scoped by `fileMatch` to the component dirs. Returned as entries (not full
- * `DiagnosticsOptions`) so `bundledJsonSchemas.ts` can merge them with the
- * manifest schema into a single `setDiagnosticsOptions` call — Monaco's JSON
- * diagnostics options are process-wide and replace, not merge.
+ * `DiagnosticsOptions`) so `jsonSchemas.ts` can merge them with the manifest
+ * schema into a single `setDiagnosticsOptions` call — Monaco's JSON diagnostics
+ * options are process-wide and replace, not merge.
  */
 export function elementTemplateSchemaEntries(
   schema: Record<string, unknown>,
