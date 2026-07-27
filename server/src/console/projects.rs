@@ -42,6 +42,10 @@ use super::{triggers, worker_export, workers, workspace};
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 const LLM_WORKER_TS: &str = include_str!("llm_worker.ts");
 const DATA_SDK_TS: &str = include_str!("data_sdk.ts");
+/// The Urban App page runtime (ADR 0042 §3): the generic `servePages` helper + the
+/// schema-driven browser renderer that turns a composed `page.json` into a served,
+/// data-bound screen. Materialised as `nano-generated/app-pages.ts` (`@nanobpm/app`).
+const APP_PAGES_TS: &str = include_str!("app_pages.ts");
 const DATA_CLI_TS: &str = include_str!("data_cli.ts");
 const DOMAIN_TYPES_TS: &str = include_str!("domain_types.ts");
 /// Seed `nano-generated/domain.ts` — the typed data-object accessor (ADR 0029 §6). It
@@ -832,6 +836,7 @@ const PROJECT_DENO_JSON: &str = r#"{
     "@nanobpm/llm": "./{GEN}/llm-worker.ts",
     "@nanobpm/data": "./{GEN}/data-sdk.ts",
     "@nanobpm/domain": "./{GEN}/domain.ts",
+    "@nanobpm/app": "./{GEN}/app-pages.ts",
     "@lib/": "./lib/"
   },
   "tasks": {
@@ -864,6 +869,7 @@ const PROJECT_TSCONFIG_JSON: &str = r#"{
       "@nanobpm/llm": ["./{GEN}/llm-worker.ts"],
       "@nanobpm/data": ["./{GEN}/data-sdk.ts"],
       "@nanobpm/domain": ["./{GEN}/domain.ts"],
+      "@nanobpm/app": ["./{GEN}/app-pages.ts"],
       "@lib/*": ["./lib/*"]
     }
   },
@@ -1588,7 +1594,7 @@ for a self-contained engine+UI binary.\n"
 // for the sqlite datasource + `public/` for static assets.
 
 const URBAN_DENO_JSON: &str = r#"{
-  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/worker": "./{GEN}/workers.ts", "@nanobpm/messages": "./{GEN}/messages.ts", "@nanobpm/meta": "./{GEN}/meta.ts", "@nanobpm/llm": "./{GEN}/llm-worker.ts", "@nanobpm/data": "./{GEN}/data-sdk.ts", "@nanobpm/domain": "./{GEN}/domain.ts", "@lib/": "./lib/" },
+  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/worker": "./{GEN}/workers.ts", "@nanobpm/messages": "./{GEN}/messages.ts", "@nanobpm/meta": "./{GEN}/meta.ts", "@nanobpm/llm": "./{GEN}/llm-worker.ts", "@nanobpm/data": "./{GEN}/data-sdk.ts", "@nanobpm/domain": "./{GEN}/domain.ts", "@nanobpm/app": "./{GEN}/app-pages.ts", "@lib/": "./lib/" },
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-write --allow-env main.ts"
   }
@@ -1601,31 +1607,28 @@ const URBAN_DENO_JSON: &str = r#"{
 // this boots the engine resources and serves `public/` + a start endpoint.
 const URBAN_MAIN_TS: &str = r#"// Urban App entrypoint. The `nano.app.json` manifest is the source of truth for
 // this application (models, datasources, triggers, surfaces). `deno compile
-// --include nano.app.json --include public` bundles it into a single binary.
+// --include nano.app.json --include pages` bundles it into a single binary.
+//
+// The UI is a composed screen: `pages/home.page.json` is authored in the Console
+// Page Composer (ADR 0042) and served by the generic `@nanobpm/app` runtime — no
+// hand-written frontend or JSON API. `servePages` binds its data-aware controls to
+// the datasource (`@nanobpm/data`) and the engine (`@nanobpm/nano-sdk`).
 import { deployAllResources, startLlmWorkers, startWorkers } from "@lib/nano.ts";
+import { servePages } from "@nanobpm/app";
+import { openDataSource } from "@nanobpm/data";
+import { createCamundaClient } from "@nanobpm/nano-sdk";
 
-const manifest = JSON.parse(await Deno.readTextFile("./nano.app.json"));
 const PORT = Number(Deno.env.get("PORT") ?? 8090);
 
 await deployAllResources();
 await startWorkers();
 await startLlmWorkers();
 
-Deno.serve({ port: PORT }, async (req) => {
-  const url = new URL(req.url);
-  if (url.pathname === "/api/app") {
-    return Response.json({ id: manifest.id, name: manifest.name });
-  }
-  const path = url.pathname === "/" ? "/index.html" : url.pathname;
-  try {
-    return new Response(await Deno.readTextFile(`./public${path}`), {
-      headers: { "content-type": path.endsWith(".html") ? "text/html" : "text/plain" },
-    });
-  } catch {
-    return new Response("not found", { status: 404 });
-  }
-});
-console.log(`Urban App "${manifest.id}" serving on :${PORT}`);
+const db = await openDataSource();
+const nano = createCamundaClient();
+
+servePages({ db, nano, port: PORT });
+console.log(`Urban App serving its composed pages on :${PORT}`);
 "#;
 
 const URBAN_INDEX_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Urban App</title>
@@ -1722,8 +1725,15 @@ fn urban_readme(name: &str) -> String {
 A Nano RAD application (ADR 0022). `nano.app.json` is the source of truth: it \
 declares the app's **models** (`resources/processes|decisions|forms`), \
 **data** (a sqlite datasource with migrations under `db/`), **triggers** and \
-**surfaces**. Design them in the Console's App panels, then **Run** the Deno \
-binary or **Compile** it (`deno compile --include nano.app.json --include public`).\n\n\
+**surfaces**, and compose its **screen** (`pages/home.page.json`) in the Console \
+Page Composer. Then **Run** the Deno binary or **Compile** it \
+(`deno compile --include nano.app.json --include pages`).\n\n\
+## Screen\n\n\
+`pages/home.page.json` is the app's composed UI (ADR 0042) — a titled, ordered \
+list of controls (`text`, `actionForm`, `dataGrid`). The `@nanobpm/app` runtime \
+serves it with **no hand-written frontend**: an `actionForm` starts a process via \
+`@nanobpm/nano-sdk`, a `dataGrid` reads a datasource table via `@nanobpm/data`. \
+Edit it in the Console's Page Composer, not by hand.\n\n\
 ## Data\n\n\
 Open a declared datasource by name (the swappable BDE alias, ADR 0024):\n\n\
 ```ts\n\
@@ -1751,6 +1761,45 @@ to run the parsed JSON through a DMN decision as *rails*. Provider `env` targets
 any OpenAI-compatible endpoint via `NANO_APP_LLM_BASE_URL` (default \
 `http://localhost:11434/v1`, Ollama), `NANO_APP_LLM_API_KEY` (optional) and \
 `NANO_APP_LLM_MODEL` — so the same app runs fully offline against a local model.\n"
+    )
+}
+
+/// The starter composed screen (ADR 0042). Authored form of `pages/home.page.json`
+/// — a titled heading, an intro line and an `actionForm` that starts the scaffold's
+/// process. It is served (no hand-written frontend) by the `@nanobpm/app` runtime.
+/// Reopen and edit it in the Console Page Composer.
+fn urban_home_page(name: &str) -> String {
+    let pid = format!("{name}-process");
+    format!(
+        r#"{{
+  "schemaVersion": "1.0",
+  "title": "{name}",
+  "nodes": [
+    {{
+      "type": "text",
+      "id": "home-title",
+      "props": {{ "text": "{name}", "variant": "heading" }}
+    }},
+    {{
+      "type": "text",
+      "id": "home-intro",
+      "props": {{ "text": "This screen was composed in the Console Page Composer \u2014 no hand-written frontend. Edit pages/home.page.json to change it.", "variant": "body" }}
+    }},
+    {{
+      "type": "actionForm",
+      "id": "home-start",
+      "props": {{
+        "title": "Start a run",
+        "submitLabel": "Start",
+        "action": {{ "kind": "startProcess", "process": "{pid}" }},
+        "fields": [
+          {{ "key": "note", "label": "Note", "type": "text" }}
+        ]
+      }}
+    }}
+  ]
+}}
+"#
     )
 }
 
@@ -1783,6 +1832,7 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     let nano = dir.join(GEN_DIR);
     std::fs::create_dir_all(&nano)?;
     std::fs::write(nano.join("data-sdk.ts"), DATA_SDK_TS)?;
+    std::fs::write(nano.join("app-pages.ts"), APP_PAGES_TS)?;
     std::fs::write(nano.join("data-cli.ts"), DATA_CLI_TS)?;
     std::fs::write(nano.join("domain-types.ts"), DOMAIN_TYPES_TS)?;
     // Seed the typed data-object accessor only when absent, so a reified,
@@ -2124,6 +2174,7 @@ pub fn create_project(
     w(dir.join("tsconfig.json"), &gendir(PROJECT_TSCONFIG_JSON))?;
     w(dir.join("package.json"), &project_package_json(name))?;
     w(dir.join(GEN_DIR).join("data-sdk.ts"), DATA_SDK_TS)?;
+    w(dir.join(GEN_DIR).join("app-pages.ts"), APP_PAGES_TS)?;
     w(dir.join(GEN_DIR).join("data-cli.ts"), DATA_CLI_TS)?;
     w(dir.join(GEN_DIR).join("domain-types.ts"), DOMAIN_TYPES_TS)?;
     w(dir.join(GEN_DIR).join("domain.ts"), DOMAIN_TS_STUB)?;
@@ -2185,12 +2236,17 @@ pub fn create_project(
         cfg_app = "deno-gui";
     } else if template == "urban-starter" {
         mk(dir.join("public"))?;
+        mk(dir.join("pages"))?;
         mk(dir.join("db").join("migrations"))?;
         let app_id = slugify_app_id(name);
         w(dir.join("deno.json"), &gendir(URBAN_DENO_JSON))?;
         w(dir.join("main.ts"), URBAN_MAIN_TS)?;
         w(dir.join("nano.app.json"), &urban_manifest(&app_id, name))?;
         w(dir.join("public").join("index.html"), URBAN_INDEX_HTML)?;
+        w(
+            dir.join("pages").join("home.page.json"),
+            &urban_home_page(name),
+        )?;
         w(dir.join("README.md"), &urban_readme(name))?;
         w(
             dir.join("resources")
@@ -4188,7 +4244,27 @@ mod tests {
         assert!(dir.join("db/migrations").is_dir());
         assert!(dir.join("public/index.html").is_file());
         assert!(dir.join("main.ts").is_file());
-        // The manifest is valid JSON with a slugged id derived from the name.
+        // ADR 0042: the app's composed screen is scaffolded and the Urban
+        // entrypoint serves it via the generic `@nanobpm/app` runtime — no
+        // hand-written frontend or JSON API.
+        assert!(
+            dir.join("pages/home.page.json").is_file(),
+            "pages/home.page.json must be scaffolded"
+        );
+        let page: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("pages/home.page.json")).unwrap(),
+        )
+        .expect("home.page.json parses");
+        assert_eq!(page["schemaVersion"], "1.0");
+        assert_eq!(
+            page["nodes"][2]["props"]["action"]["process"], "Home_Heating-process",
+            "the starter actionForm binds to the scaffold's process"
+        );
+        let main_ts = std::fs::read_to_string(dir.join("main.ts")).unwrap();
+        assert!(
+            main_ts.contains("servePages("),
+            "the Urban entrypoint serves its composed pages via @nanobpm/app"
+        );
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
                 .expect("manifest parses");
@@ -4916,6 +4992,7 @@ mod tests {
         assert!(dir.join("nano-generated/worker-sdk.ts").is_file());
         assert!(dir.join("nano-generated/llm-worker.ts").is_file());
         assert!(dir.join("nano-generated/data-sdk.ts").is_file());
+        assert!(dir.join("nano-generated/app-pages.ts").is_file());
         // The default entrypoint boots handler + llm workers (ADR 0022 §E).
         let main_ts = std::fs::read_to_string(dir.join("main.ts")).unwrap();
         assert!(main_ts.contains("startLlmWorkers()"));

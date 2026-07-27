@@ -10,6 +10,7 @@ import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
 import FormPreview from "../components/FormPreview";
 import ShapeComposer, { type ShapePreview } from "../components/ShapeComposer";
+import PageComposer, { type PageComposerHandle } from "../components/PageComposer";
 import type { MetaEntry, ShapeDecl } from "../lib/shapeCarrier";
 import type { ComposerEntity } from "../lib/shapeComposer";
 import AppManifestEditor, { isAppManifestPath } from "../components/AppManifestEditor";
@@ -737,9 +738,16 @@ const NEW_FILE_KINDS = [
     dir: "resources/forms",
     ext: ".form",
   },
+  {
+    id: "page" as const,
+    label: "Page",
+    hint: "App screen (Page Composer)",
+    dir: "pages",
+    ext: ".page.json",
+  },
 ];
 
-type NewFileKindId = "model" | "decision" | "form" | "source";
+type NewFileKindId = "model" | "decision" | "form" | "page" | "source";
 
 const extnameOf = (p: string): string => {
   const base = p.split("/").pop() ?? "";
@@ -1040,6 +1048,7 @@ function EditorPane({
   const bpmnRef = useRef<BpmnModelerHandle>(null);
   const dmnRef = useRef<DmnModelerHandle>(null);
   const formRef = useRef<FormEditorHandle>(null);
+  const pageRef = useRef<PageComposerHandle>(null);
   const [testXml, setTestXml] = useState<string | null>(null);
   // Markdown files open in a rendered Preview tab; the user can switch to Edit.
   const [mdView, setMdView] = useState<"preview" | "edit">("preview");
@@ -1068,16 +1077,18 @@ function EditorPane({
   const [startModalOpen, setStartModalOpen] = useState(false);
 
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  const kind: "bpmn" | "dmn" | "form" | "md" | "code" =
-    ext === "bpmn"
-      ? "bpmn"
-      : ext === "dmn"
-        ? "dmn"
-        : ext === "form"
-          ? "form"
-          : ext === "md" || ext === "markdown"
-            ? "md"
-            : "code";
+  const kind: "bpmn" | "dmn" | "form" | "page" | "md" | "code" =
+    path.toLowerCase().endsWith(".page.json")
+      ? "page"
+      : ext === "bpmn"
+        ? "bpmn"
+        : ext === "dmn"
+          ? "dmn"
+          : ext === "form"
+            ? "form"
+            : ext === "md" || ext === "markdown"
+              ? "md"
+              : "code";
 
   // Parse process ids client-side. Multi-process files are rare and use the
   // first as the primary (matches the server's deploy_status_of contract).
@@ -1441,6 +1452,8 @@ function EditorPane({
       void (isEmpty ? ed.createBlank().then(seeded) : ed.importSchema(content)).catch(
         () => void 0,
       );
+    } else if (kind === "page" && pageRef.current) {
+      pageRef.current.setPageJson(content);
     }
     // Only when the document first arrives for this path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1455,6 +1468,7 @@ function EditorPane({
       else if (kind === "dmn" && dmnRef.current) body = await dmnRef.current.getXml();
       else if (kind === "form" && (formView === "json" || formView === "preview")) body = formJson;
       else if (kind === "form" && formRef.current) body = await formRef.current.getSchema();
+      else if (kind === "page" && pageRef.current) body = pageRef.current.getPageJson();
       await saveProjectFile({ path: { name }, query: { path }, body, throwOnError: true });
       setContent(body);
       setDirty(false);
@@ -1843,6 +1857,14 @@ function EditorPane({
         )}
         {kind === "dmn" && (
           <DmnModeler ref={dmnRef} onChange={() => setDirty(true)} getVariables={dmnGetVariables} />
+        )}
+        {kind === "page" && (
+          <PageComposer
+            ref={pageRef}
+            onChange={() => setDirty(true)}
+            entities={composerEntities}
+            processes={[]}
+          />
         )}
         {kind === "form" && (
           <div className="relative h-full">
