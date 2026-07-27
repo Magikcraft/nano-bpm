@@ -29,9 +29,39 @@ use nanobpmn_engine_core::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// Bumped whenever the schema or projection changes; a stored database with a
-/// different version is dropped and rebuilt from the journal.
-const SCHEMA_VERSION: i64 = 7;
+/// The read store is a *derived* projection, so its on-disk schema needs no
+/// hand-maintained version number to bump — and that number was exactly the
+/// thing that drifted: columns were added to [`SCHEMA`] without incrementing it,
+/// so a live database kept a "matching" version yet lacked the new columns, and
+/// the first query for one panicked (poisoning the connection mutex, which
+/// bricked every subsequent read — metrics, explorer, everything).
+///
+/// Instead the schema *identity* is **derived** from [`SCHEMA`]: a stable
+/// content fingerprint. Any edit to `SCHEMA` — a new column, table, or type —
+/// changes the fingerprint, so [`ReadStore::ensure_schema`] recreates the
+/// projection automatically on the next open. There is nothing to remember to
+/// bump and nothing to keep in sync, so this drift class cannot recur.
+///
+/// FNV-1a (64-bit) is used because it is dependency-free and deterministic
+/// across runs, Rust versions, and architectures — unlike `DefaultHasher`,
+/// whose algorithm may change between toolchains and would then spuriously
+/// rebuild every store on a compiler upgrade.
+fn schema_fingerprint() -> i64 {
+    fnv1a_64(SCHEMA.as_bytes())
+}
+
+/// FNV-1a (64-bit). Split out from [`schema_fingerprint`] so the hash itself is
+/// unit-testable against known vectors and can't silently change behaviour.
+fn fnv1a_64(bytes: &[u8]) -> i64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash as i64
+}
 
 const SCHEMA: &str = "
 CREATE TABLE process_definitions (
@@ -681,35 +711,56 @@ impl ReadStore {
     /// both file and directory permissions.
     fn check_writable(&self) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("read store poisoned");
-        conn.execute("UPDATE meta SET v = v WHERE k = 'schema_version'", [])?;
+        conn.execute("UPDATE meta SET v = v WHERE k = 'schema_fingerprint'", [])?;
         Ok(())
     }
 
     fn ensure_schema(&self) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("read store poisoned");
-        let version: Option<i64> = conn
-            .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |r| {
-                r.get(0)
-            })
+        let want = schema_fingerprint();
+        let current: Option<i64> = conn
+            .query_row(
+                "SELECT v FROM meta WHERE k = 'schema_fingerprint'",
+                [],
+                |r| r.get(0),
+            )
             .optional()
             .unwrap_or(None);
-        if version == Some(SCHEMA_VERSION) {
+        if current == Some(want) {
             return Ok(());
         }
-        // Fresh, or a stale/foreign schema: (re)create from scratch.
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS process_definitions;
-             DROP TABLE IF EXISTS process_instances;
-             DROP TABLE IF EXISTS jobs;
-             DROP TABLE IF EXISTS incidents;
-             DROP TABLE IF EXISTS user_tasks;
-             DROP TABLE IF EXISTS variables;
-             DROP TABLE IF EXISTS meta;",
-        )?;
+        // Fresh, or a stale/foreign schema: (re)create from scratch. The read
+        // store is a derived projection rebuilt from the journal, so wiping it is
+        // always safe. We drop *every* existing user table discovered in
+        // `sqlite_master` rather than a hand-maintained list: a static list
+        // silently drifts as `SCHEMA` gains tables (it previously omitted the
+        // `decision_*` tables), and a missed drop makes the subsequent
+        // `CREATE TABLE` fail with "table already exists", bricking startup. This
+        // is the durable structural guard against that drift class — the drop set
+        // is derived from the live database, so it can never fall behind `SCHEMA`.
+        let existing_tables: Vec<String> = {
+            let mut stmt = conn.prepare(
+                "SELECT name FROM sqlite_master \
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?;
+            let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            names.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut drop_sql = String::new();
+        for name in &existing_tables {
+            // Names come from sqlite_master (our own tables); quote defensively.
+            drop_sql.push_str(&format!(
+                "DROP TABLE IF EXISTS \"{}\";",
+                name.replace('"', "\"\"")
+            ));
+        }
+        if !drop_sql.is_empty() {
+            conn.execute_batch(&drop_sql)?;
+        }
         conn.execute_batch(SCHEMA)?;
         conn.execute(
-            "INSERT INTO meta (k, v) VALUES ('schema_version', ?1)",
-            params![SCHEMA_VERSION],
+            "INSERT INTO meta (k, v) VALUES ('schema_fingerprint', ?1)",
+            params![want],
         )?;
         conn.execute(
             "INSERT INTO meta (k, v) VALUES ('exported_position', 0)",
@@ -2782,6 +2833,117 @@ mod writability_tests {
         perms.set_mode(0o644);
         std::fs::set_permissions(&path, perms).unwrap();
         std::fs::remove_file(&path).ok();
+    }
+
+    // --- schema drift guards (the "derive, don't duplicate" invariant) ---------
+
+    #[test]
+    fn fnv1a_is_deterministic_and_content_sensitive() {
+        use super::fnv1a_64;
+        // Known FNV-1a/64 vectors (offset basis for empty input; a canonical
+        // "hello" vector) pin the algorithm so a refactor can't silently change
+        // the fingerprint of every existing database.
+        assert_eq!(fnv1a_64(b"") as u64, 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"hello") as u64, 0xa430_d846_80aa_bd0b);
+        // Any change to the hashed bytes must change the digest (this is the
+        // property `ensure_schema` relies on to notice a SCHEMA edit).
+        assert_ne!(fnv1a_64(b"jobs(a,b)"), fnv1a_64(b"jobs(a,b,c)"));
+    }
+
+    #[test]
+    fn schema_fingerprint_is_stable_within_a_build() {
+        // Derived purely from SCHEMA, so it is constant across calls and never
+        // hand-maintained.
+        assert_eq!(super::schema_fingerprint(), super::schema_fingerprint());
+    }
+
+    #[test]
+    fn stale_on_disk_schema_is_rebuilt() {
+        // Reproduces the production incident: a database left behind by an older
+        // build whose `jobs` table lacks the `job_kind`/`listener_event_type`
+        // columns, yet whose stored identity looks "current". Opening it must
+        // rebuild the projection (SCHEMA drift is detected via the derived
+        // fingerprint), NOT leave a half-shaped table that panics — and poisons
+        // the connection — on the first query for a missing column.
+        let path = scratch_db();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+                 INSERT INTO meta (k, v) VALUES ('schema_fingerprint', 1);
+                 INSERT INTO meta (k, v) VALUES ('exported_position', 42);
+                 CREATE TABLE jobs (
+                     key INTEGER PRIMARY KEY,
+                     job_type TEXT NOT NULL
+                 );
+                 INSERT INTO jobs (key, job_type) VALUES (1, 'stale');",
+            )
+            .unwrap();
+        }
+
+        let store = ReadStore::open(Some(&path)).expect("stale schema self-heals on open");
+
+        // The rebuilt `jobs` table carries the current columns...
+        let cols: Vec<String> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(jobs)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            cols.iter().any(|c| c == "job_kind"),
+            "rebuilt jobs table must have job_kind, got {cols:?}"
+        );
+        assert!(cols.iter().any(|c| c == "listener_event_type"));
+
+        // ...the reads that used to panic on the missing column now succeed...
+        assert_eq!(store.active_instance_count(), 0);
+        // ...the stale projection state was reset for a clean journal re-replay...
+        assert_eq!(store.exported_position(), 0);
+        // ...and the stored identity now equals the derived fingerprint, so a
+        // second open is a no-op (no rebuild).
+        drop(store);
+        let store2 = ReadStore::open(Some(&path)).unwrap();
+        let stored: Option<i64> = {
+            let conn = store2.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT v FROM meta WHERE k = 'schema_fingerprint'",
+                [],
+                |r| r.get(0),
+            )
+            .ok()
+        };
+        assert_eq!(stored, Some(super::schema_fingerprint()));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn matching_fingerprint_does_not_rebuild() {
+        // When the stored fingerprint already matches, open must NOT drop the
+        // projection: durable derived state (e.g. exported_position) has to
+        // survive a restart, or every boot would needlessly re-replay the journal.
+        let path = scratch_db();
+        let store = ReadStore::open(Some(&path)).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE meta SET v = 99 WHERE k = 'exported_position'", [])
+                .unwrap();
+        }
+        drop(store);
+
+        let store2 = ReadStore::open(Some(&path)).unwrap();
+        assert_eq!(
+            store2.exported_position(),
+            99,
+            "a schema that already matches must not be rebuilt"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 }
 
