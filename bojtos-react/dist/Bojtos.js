@@ -73,7 +73,12 @@ export function Bojtos({ bpmn, workers, seed, autoplay, stepDelayMs = 700, proce
         const target = processId ?? processIds[0];
         if (!target)
             return false;
-        createInstance(target, JSON.stringify(seedRef.current ?? {}));
+        // Only latch once the instance actually started — a failed createInstance
+        // (returns null, e.g. an engine error) must stay retryable rather than
+        // wedging the demo in a non-started state.
+        if (!createInstance(target, JSON.stringify(seedRef.current ?? {}))) {
+            return false;
+        }
         startedRef.current = true;
         return true;
     }, [createInstance, processId, processIds]);
@@ -128,12 +133,15 @@ export function Bojtos({ bpmn, workers, seed, autoplay, stepDelayMs = 700, proce
     const ready = phase === "ready";
     const instance = snapshot?.instances[0];
     const variables = instance?.variables ?? {};
-    return (_jsxs("div", { className: className, style: { display: "flex", flexDirection: "column", gap: 8, minHeight: 320 }, children: [_jsx("style", { children: MARKER_CSS }), _jsxs("div", { style: { display: "flex", alignItems: "center", gap: 8 }, children: [_jsx("button", { type: "button", onClick: play, disabled: !ready || playing, children: "\u25B6 Play" }), _jsx("button", { type: "button", onClick: pause, disabled: !playing, children: "\u23F8 Pause" }), _jsx("button", { type: "button", onClick: step, disabled: !ready || playing, children: "\u23ED Step" }), _jsx("button", { type: "button", onClick: restart, disabled: !ready, children: "\u21BA Reset" }), _jsxs("span", { style: { marginLeft: "auto", fontSize: 12, opacity: 0.7 }, children: [phase === "loading" && "loading engine…", phase === "error" && `error: ${error ?? "unknown"}`, ready &&
-                                (instance
+    return (_jsxs("div", { className: className, style: { display: "flex", flexDirection: "column", gap: 8, minHeight: 320 }, children: [_jsx("style", { children: MARKER_CSS }), _jsxs("div", { style: { display: "flex", alignItems: "center", gap: 8 }, children: [_jsx("button", { type: "button", onClick: play, disabled: !ready || playing, children: "\u25B6 Play" }), _jsx("button", { type: "button", onClick: pause, disabled: !playing, children: "\u23F8 Pause" }), _jsx("button", { type: "button", onClick: step, disabled: !ready || playing, children: "\u23ED Step" }), _jsx("button", { type: "button", onClick: restart, disabled: !ready, children: "\u21BA Reset" }), _jsx("span", { style: { marginLeft: "auto", fontSize: 12, opacity: 0.7 }, children: error
+                            ? `error: ${error}`
+                            : phase === "loading"
+                                ? "loading engine…"
+                                : instance
                                     ? instance.completed
                                         ? "completed"
                                         : "running"
-                                    : "ready")] })] }), _jsxs("div", { style: { display: "flex", gap: 8, flex: 1, minHeight: 280 }, children: [_jsx("div", { className: "bojtos-diagram", style: { flex: 2, border: "1px solid #e5e7eb", borderRadius: 6 }, children: _jsx(BpmnRuntimeView, { xml: bpmn, activeIds: snapshot?.activeElementIds ?? [], incidentIds: snapshot?.incidentElementIds ?? [] }) }), _jsxs("div", { style: {
+                                    : "ready" })] }), _jsxs("div", { style: { display: "flex", gap: 8, flex: 1, minHeight: 280 }, children: [_jsx("div", { className: "bojtos-diagram", style: { flex: 2, border: "1px solid #e5e7eb", borderRadius: 6 }, children: _jsx(BpmnRuntimeView, { xml: bpmn, activeIds: snapshot?.activeElementIds ?? [], incidentIds: snapshot?.incidentElementIds ?? [] }) }), _jsxs("div", { style: {
                             flex: 1,
                             minWidth: 200,
                             border: "1px solid #e5e7eb",

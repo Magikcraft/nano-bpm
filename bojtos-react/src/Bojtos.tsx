@@ -139,7 +139,12 @@ export function Bojtos({
     if (startedRef.current) return true;
     const target = processId ?? processIds[0];
     if (!target) return false;
-    createInstance(target, JSON.stringify(seedRef.current ?? {}));
+    // Only latch once the instance actually started — a failed createInstance
+    // (returns null, e.g. an engine error) must stay retryable rather than
+    // wedging the demo in a non-started state.
+    if (!createInstance(target, JSON.stringify(seedRef.current ?? {}))) {
+      return false;
+    }
     startedRef.current = true;
     return true;
   }, [createInstance, processId, processIds]);
@@ -213,14 +218,15 @@ export function Bojtos({
           ↺ Reset
         </button>
         <span style={{ marginLeft: "auto", fontSize: 12, opacity: 0.7 }}>
-          {phase === "loading" && "loading engine…"}
-          {phase === "error" && `error: ${error ?? "unknown"}`}
-          {ready &&
-            (instance
-              ? instance.completed
-                ? "completed"
-                : "running"
-              : "ready")}
+          {error
+            ? `error: ${error}`
+            : phase === "loading"
+              ? "loading engine…"
+              : instance
+                ? instance.completed
+                  ? "completed"
+                  : "running"
+                : "ready"}
         </span>
       </div>
       <div style={{ display: "flex", gap: 8, flex: 1, minHeight: 280 }}>

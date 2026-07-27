@@ -8,6 +8,10 @@ export interface UseBojtosOptions {
      * Optional engine wasm source. Pass a `URL` / bytes / `WebAssembly.Module`
      * when the default `import.meta.url` loader can't resolve the binary (the
      * external-`.wasm` "wasmUrl" mode, or a non-Vite bundler — ADR 0043 §3).
+     *
+     * Init-time only: the wasm module loads once per page (see `ensureWasm`), so
+     * changing `wasm` after the first successful init has no effect — it will not
+     * reload the module.
      */
     wasm?: WasmSource;
 }
