@@ -11,7 +11,10 @@ real `nanobpmn-engine-core`; `engine-wasm/pkg/nanobpmn_engine.d.ts` — the `Tes
 package's public surface after step 1), the build seam (`Makefile` `console-wasm` = `wasm-pack build
 --target web` output, historically synced into `console/src/wasm` and relocated to `engine-wasm/pkg` by
 this ADR's step 1), and the internal-package precedent (`spec-app/package.json` — `@nanobpm/*` consumed
-by the console via a `file:` dependency; ADR 0027).
+by the console via a `file:` dependency; ADR 0027). Also ADR 0033 (`0033-urban-element-templates-first-class-components.md`,
+§6 — the **data envelope**: a task's input/output type carried by reference on the element) and ADR 0040
+(`0040-fused-domain-model.md`, homing that typing in the model), which together give the editable worker
+boxes (§5) typed completion from the model; `console/src/lib/dataEnvelope.ts` is the read/write carrier.
 
 ## Context
 
@@ -143,6 +146,15 @@ Design:
 - **Each source worker renders in a Monaco box.** The console already ships `monaco-editor`
   (`console/package.json`), so `@nanobpm/bojtos-react` reuses it for a `<WorkerEditor jobType>` per worker,
   with the JS/TS language services the console already configures.
+- **The boxes get *typed* completion, for free, from the model.** Because the **data envelope** (ADR 0033
+  §6 / ADR 0040) carries each service task's input/output type *reference in the model itself*
+  (`io.nanobpm.dataEnvelope.in`/`.out` on the element → a domain type in the manifest `types` registry,
+  read by `console/src/lib/dataEnvelope.ts`), Bojtos can resolve, for a given `jobType`, the shape of the
+  `job.variables` a handler receives and the result it must return — and hand Monaco a generated
+  `.d.ts` so the worker box offers **autocomplete on `job.variables.*`** and type-checks the returned
+  payload. Homing the typing on the model rather than out-of-band (the ADR 0040 fusion) is what makes this
+  possible: the type travels with the diagram the demo carries, so the completion is available wherever the
+  scenario is embedded, with no extra wiring. This is the concrete win of the envelope-in-model decision.
 - **Edits re-register the handler live.** `@nanobpm/bojtos-kit` compiles the edited source to a
   `JobHandler` and swaps it in the **worker registry** (the same registry the dispatch loop reads on each
   `activateJobs`). No engine restart, no re-deploy: the loop simply picks up the new handler on the next
