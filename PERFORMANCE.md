@@ -69,6 +69,47 @@ metered on the Prometheus `/metrics` surface via
 
 ---
 
+## 2026-07-27 — Current-main baseline (console build): 50KB + negligible payload soaks
+
+Two clean 30-minute soaks on current `main` (`4ff70d4`; #311 throughput fix + #314
+seglog recovery-test write-durability fix + #315 build-dep vendor all merged) to establish a fresh baseline on
+the **standard console build**. GCP 3-node RF3 Raft-ON cluster, 12 partitions,
+leader-durable/sync, `MAXPAR=112`, open-loop (`MI=50000`, `rate=14000/prod`,
+1 loadgen/node, 128 prod conns). Journal wiped between arms (clean A/B).
+
+> **Build note.** Both binaries are the standard soak build — `build-tagged.sh
+> 4ff70d4 --stage` with the embedded console (`--features console` + built
+> `console/dist` SPA), binsha `c526fd156f7c0774`. This is the first apples-to-apples
+> **console-build** baseline; `--no-console` bisect binaries are not comparable.
+> Aggregate throughput = SUM of the 3 per-node `tput` values (one loadgen/node).
+
+| payload | agg tput | per-node tput | job latency p50 / p99 | create-accept p50 / p99 | RSS under load → idle | var-spill.sqlite |
+|---|---|---|---|---|---|---|
+| **50KB** (VB=51200) | **~4,987/s** | 1657 / 1665 / 1665 | 41 / 383 µs | 51.8 / 411 ms | 24–29 GB → **7.8–8.2 GB** | flat **1 MB** |
+| **negligible** (VB=0) | **~25,368/s** | 8434 / 8439 / 8495 | 12 / 38 µs | 14.2 / 42.7 ms | ~**1.2 GB** (no spill) | flat **1 MB** |
+
+**Stability.** `NRestarts=0` on all 3 nodes, 0 panics, both ran the full 1800 s.
+
+**Memory.** 50KB: RSS oscillates 24–29 GB under load and reclaims to ~7.8–8.2 GB idle
+(jemalloc idle-purge working). neg: ~1.2 GB throughout (nothing to spill).
+
+**Disk.** `var-spill.sqlite` stays pinned at 1 MB during and after both runs — the
+#287/#311 WAL-checkpoint + cold-reclaim fixes hold; no unbounded growth.
+
+**Verdict.** 50KB ~4,987/s aggregate is healthy — comfortably above both the
+#287-regressed arm (1,534/s) and its pre-#287 parent (3,396/s) documented in the
+2026-07-24 entry below, confirming the #287/#311 WAL-checkpoint + cold-reclaim
+fixes hold. negligible ~25,368/s is the open-loop pure-engine ceiling. No
+regression on current main. One create-accept latency outlier on the neg run (a
+single ~3.5 s max sample) but the create-accept p99.9 held at ~100 ms — a
+momentary blip, not sustained.
+
+**Reference config for future comparison:** standard console build, GCP 3-node RF3
+Raft-ON 12-partition leader-durable, `MAXPAR=112`, open-loop `MI=50000`, journal
+wiped per arm.
+
+---
+
 ## 2026-07-24 — 50KB-payload throughput regression (PR #287) root-caused + fixed: var-spill WAL-checkpoint disk contention
 
 **Regression.** PR #287 added a cold-tier retirement sweep (`ColdIndex::retire_below`)
