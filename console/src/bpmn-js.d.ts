@@ -64,6 +64,11 @@ declare module "zeebe-bpmn-moddle/resources/zeebe.json" {
   export default value;
 }
 
+declare module "@nanobpm/nano-app-schema/schema" {
+  const value: Record<string, unknown>;
+  export default value;
+}
+
 declare module "bpmn-js-element-templates" {
   /** ElementTemplates service (didi id `elementTemplates`). */
   export interface ElementTemplatesService {

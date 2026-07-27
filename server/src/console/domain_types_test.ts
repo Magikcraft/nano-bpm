@@ -1,11 +1,13 @@
-// Deno unit tests for the Urban domain-type reifier (ADR 0029 §4.1 spike).
+// Deno unit tests for the Urban domain-type reifier (ADR 0029 §4.1) and the Fused
+// Domain Model emitters (ADR 0040 §1/§5).
 //
-// CI cannot run Deno, so these are run locally with:
-//   deno test --allow-read --allow-write --allow-env server/src/console/domain_types_test.ts
+// Run in CI by the `console-deno` job (`deno test` type-checks its whole import
+// graph, so this also type-checks domain_types.ts), and locally with:
+//   deno test --allow-read --allow-write --allow-env server/src/console/
 //
 // They cover the SQLite-affinity → TS mapping, interface-name sanitising, the
-// `domain-rows.d.ts` emitter, and a full schema() → emit → write roundtrip against a
-// temp manifest + SQLite db.
+// `domain-rows.d.ts` emitter, a full schema() → emit → write roundtrip against a
+// temp manifest + SQLite db, and the model-metadata / domain.json fuse emitters.
 
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import type { TableMeta } from "./data_sdk.ts";
@@ -16,9 +18,12 @@ import {
   emitDomainDts,
   emitDomainDtsForSources,
   emitDomainModel,
+  emitDomainModelJson,
   emitDomainTypeRegistry,
+  emitMeta,
   emitWorkerBindings,
   emitWorkerBindingsRuntime,
+  foldMeta,
   interfaceName,
   sqliteAffinityToTs,
   WORKER_BINDINGS_DTS,
@@ -438,4 +443,114 @@ Deno.test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrap
   // File basenames are stable.
   assertEquals(WORKER_BINDINGS_TS, "workers.ts");
   assertEquals(WORKER_BINDINGS_DTS, "worker-io.d.ts");
+});
+
+// --- model-level metadata: foldMeta / emitMeta (ADR 0040 §5) -----------------
+
+Deno.test("foldMeta is last-wins over duplicate keys and skips empty keys", () => {
+  const folded = foldMeta([
+    { key: "owner", value: "ops" },
+    { key: "owner", value: "sre" }, // later declaration wins
+    { key: "  ", value: "ignored" }, // blank key skipped
+    { key: " region ", value: " eu " }, // key trimmed; value carried as-authored
+  ]);
+  assertEquals(folded["owner"], "sre");
+  assertEquals(folded["region"], " eu ");
+  assertEquals(Object.keys(folded).sort(), ["owner", "region"]);
+});
+
+Deno.test("foldMeta uses a null-prototype dict so a __proto__ key round-trips", () => {
+  const folded = foldMeta([{ key: "__proto__", value: "polluted" }]);
+  // A plain `{}` would route this through Object.prototype's setter and create no
+  // own property; the null-proto dict makes it a real, enumerable own key.
+  assertEquals(Object.getPrototypeOf(folded), null);
+  assertEquals(Object.keys(folded), ["__proto__"]);
+  assertEquals(folded["__proto__"], "polluted");
+  // Inherited keys are absent (no prototype chain), so a lookup misses cleanly.
+  assertEquals(folded["toString"] as unknown, undefined);
+});
+
+Deno.test("emitMeta builds the AppMeta interface + a null-prototype accessor dict", () => {
+  const out = emitMeta([
+    { key: "classification", value: "internal" },
+    { key: "owner", value: "sre" },
+  ]);
+  assertStringIncludes(out, "classification: string;");
+  assertStringIncludes(out, "owner: string;");
+  // Null-prototype construction + bracket assignment (never an object literal).
+  assertStringIncludes(out, "const m: Record<string, string> = Object.create(null);");
+  assertStringIncludes(out, `m["classification"] = "internal";`);
+  assertStringIncludes(out, `m["owner"] = "sre";`);
+  // Node strip-only safety (ADR 0036): no enums, plain JS + erased annotations.
+  assertEquals(out.includes("enum "), false);
+});
+
+Deno.test("emitMeta emits an empty null-prototype accessor when no metadata is declared", () => {
+  const out = emitMeta([]);
+  assertStringIncludes(out, "export interface AppMeta {}");
+  assertStringIncludes(out, "export const appMeta: AppMeta = Object.create(null) as AppMeta;");
+});
+
+Deno.test("emitMeta assigns a user-authored __proto__ key by bracket notation, not bare", () => {
+  const out = emitMeta([{ key: "__proto__", value: "polluted" }]);
+  // Bracket assignment on the null-proto dict makes __proto__ an own data property;
+  // a bare `__proto__: "…"` in an object literal would instead set the prototype.
+  assertStringIncludes(out, `m["__proto__"] = "polluted";`);
+  assertEquals(out.includes(`__proto__: "polluted"`), false);
+});
+
+// --- the structured fused domain model: domain.json (ADR 0040 §1) ------------
+
+Deno.test("emitDomainModelJson fuses tables, manifest types, shapes, and metadata", () => {
+  const json = emitDomainModelJson({
+    sources: [{
+      source: "app",
+      tables: [{
+        name: "orders",
+        columns: [{ name: "id", type: "INTEGER", notNull: true, primaryKey: true }],
+        indexes: [],
+        foreignKeys: [],
+      }],
+    }],
+    default: "app",
+    manifestTypes: { Order: { fields: { item: { type: "string" } } } },
+    shapes: [{
+      decl: { id: "ApprovedOrder", process: "orders", ops: [] },
+      def: { fields: { item: { type: "string" }, approved: { type: "boolean" } } },
+    }],
+    meta: [{ process: "orders", key: "classification", value: "internal" }],
+    diagnostics: [],
+  });
+  const model = JSON.parse(json);
+  assertEquals(model.version, 1);
+  assertEquals(model.default, "app");
+  assertEquals(typeof model.inputsHash, "string");
+  assertEquals(model.inputsHash.length > 0, true);
+  const byId = new Map<string, { kind: string; provenance: string }>(
+    model.entities.map((e: { id: string; kind: string; provenance: string }) => [e.id, e]),
+  );
+  assertEquals(byId.get("app.orders")!.kind, "table");
+  assertEquals(byId.get("app.orders")!.provenance, "db:app.orders");
+  assertEquals(byId.get("Order")!.kind, "type");
+  assertEquals(byId.get("Order")!.provenance, "manifest:Order");
+  assertEquals(byId.get("ApprovedOrder")!.kind, "shape");
+  assertEquals(byId.get("ApprovedOrder")!.provenance, "model:orders");
+  assertEquals(model.meta, [{ process: "orders", key: "classification", value: "internal" }]);
+});
+
+Deno.test("emitDomainModelJson inputsHash is stable across calls and shifts on any change", () => {
+  const base = {
+    sources: [],
+    manifestTypes: { Order: { fields: { item: { type: "string" } } } },
+    shapes: [],
+    meta: [{ key: "owner", value: "sre" }],
+    diagnostics: [],
+  };
+  const a = JSON.parse(emitDomainModelJson({ ...base }));
+  const b = JSON.parse(emitDomainModelJson({ ...base }));
+  assertEquals(a.inputsHash, b.inputsHash); // deterministic
+  const changed = JSON.parse(
+    emitDomainModelJson({ ...base, meta: [{ key: "owner", value: "ops" }] }),
+  );
+  assertEquals(changed.inputsHash !== a.inputsHash, true); // staleness detectable
 });
