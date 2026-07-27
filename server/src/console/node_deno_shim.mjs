@@ -81,16 +81,23 @@ if (globalThis.Deno === undefined) {
         });
         const cookies = webRes.headers.getSetCookie?.() ?? [];
         if (cookies.length) nodeRes.setHeader("set-cookie", cookies);
+        // Honour backpressure: when `write` returns false the socket buffer is
+        // full, so await `drain` before writing more — otherwise a large
+        // response accumulates in memory and stalls the event loop.
+        const writeChunk = (chunk) =>
+          nodeRes.write(chunk)
+            ? Promise.resolve()
+            : new Promise((resolve) => nodeRes.once("drain", resolve));
         if (webRes.body) {
           const reader = webRes.body.getReader();
           for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
-            if (value) nodeRes.write(value);
+            if (value) await writeChunk(value);
           }
         } else {
           const buf = Buffer.from(await webRes.arrayBuffer());
-          if (buf.length) nodeRes.write(buf);
+          if (buf.length) await writeChunk(buf);
         }
         nodeRes.end();
       } catch (err) {
