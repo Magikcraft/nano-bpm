@@ -48,11 +48,14 @@ export default function DirectoryPicker({
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="directory-picker-title"
         className="flex max-h-[80vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-edge-strong bg-raised shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-edge px-4 py-3">
-          <h2 className="text-sm font-semibold text-fg">
+          <h2 id="directory-picker-title" className="text-sm font-semibold text-fg">
             Choose an app folder
           </h2>
           <button
