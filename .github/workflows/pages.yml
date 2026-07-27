@@ -1,0 +1,60 @@
+# Publishes the schema/namespace site to https://nanobpm.io on merge to main.
+#
+# The site is *generated from the in-repo sources of truth* by website/build.mjs
+# (the schema $id and the moddle descriptor uri), so a deploy can never ship a
+# URL that drifts from the artifact it names. PR-time validation of the same
+# build (drift guard + identity asserts) lives in ci.yml (the `schemas` job).
+#
+# One-time setup: Settings -> Pages -> Source = "GitHub Actions", and point the
+# nanobpm.io DNS at GitHub Pages (see website/README.md).
+
+name: Publish schemas (nanobpm.io)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'website/**'
+      - 'spec-app/nano-app.schema.json'
+      - 'console/src/moddle/nanoShapes.ts'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize deploys; never cancel an in-flight publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build _site
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          # build.mjs imports the .ts moddle descriptor directly, so it needs a
+          # Node with TypeScript type-stripping on by default (>= 23.6). Matches
+          # the spec-app / console CI jobs.
+          node-version: '24'
+      - name: Build site
+        run: node website/build.mjs
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: website/_site
+
+  deploy:
+    name: deploy to Pages
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

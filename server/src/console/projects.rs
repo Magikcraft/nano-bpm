@@ -1540,7 +1540,7 @@ const URBAN_COMPONENT_CLASSIFY_LLM: &str = r#"{
 fn urban_manifest(app_id: &str, display_name: &str) -> String {
     format!(
         r#"{{
-  "$schema": "https://nanobpm.dev/spec-app/nano-app.schema.json",
+  "$schema": "https://nanobpm.io/spec-app/nano-app.schema.json",
   "schemaVersion": 1,
   "id": "{app_id}",
   "name": "{display_name}",
@@ -4877,7 +4877,7 @@ mod tests {
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                   xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
-                  xmlns:nano="http://nanobpm.io/schema/shapes/1.0" id="d">
+                  xmlns:nano="https://nanobpm.io/schema/shapes/1.0" id="d">
   <bpmn:process id="p" isExecutable="true">
     <bpmn:extensionElements>
       <nano:shapes>{shapes_xml}</nano:shapes>

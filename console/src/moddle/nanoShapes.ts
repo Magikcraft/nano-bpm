@@ -16,7 +16,7 @@
 /** The nano-shapes moddle descriptor, shaped for bpmn-js `moddleExtensions`. */
 export const nanoShapesModdle = {
   name: "Nano",
-  uri: "http://nanobpm.io/schema/shapes/1.0",
+  uri: "https://nanobpm.io/schema/shapes/1.0",
   prefix: "nano",
   xml: { tagAlias: "lowerCase" },
   types: [

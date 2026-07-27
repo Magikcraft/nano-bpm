@@ -35,3 +35,6 @@ nanobpm-workspace/
 
 .processos-nano-data/
 nohup.out
+
+# Generated nanobpm.io Pages site (built by website/build.mjs)
+website/_site/
