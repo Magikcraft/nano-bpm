@@ -800,7 +800,7 @@ export type DataMigrateResult = {
 
 export type DomainTypesResult = {
     /**
-     * The file written (relative to the project root), or null when the op only returned the text without writing.
+     * The file written (relative to the project root), or null when the op only returned the text without writing (e.g. the preview endpoint, which resolves with `write:false`).
      *
      */
     path?: string | null;
@@ -812,6 +812,55 @@ export type DomainTypesResult = {
      * Number of tables reified into interfaces.
      */
     tables: number;
+    /**
+     * Resolve-time problems with the composed `nano:shape` declarations (ADR 0040 §10). Always present (empty when every shape resolved); the preview endpoint surfaces these live for the in-editor shapes.
+     *
+     */
+    shapeDiagnostics: Array<ShapeDiagnostic>;
+};
+
+/**
+ * One composition operation of a composed motion-shape, in author order (ADR 0040 §9). Which fields apply depends on `op`: `carry`/`project`/ `reference` name a source entity in `ref`; `project` adds the `fields` subset (and an optional `via` FK path); `extend`/`reference` add a `name`; `extend` adds a scalar/entity `type`.
+ *
+ */
+export type ShapeOpSpec = {
+    op: 'carry' | 'project' | 'extend' | 'reference';
+    ref?: string;
+    fields?: Array<string>;
+    via?: string;
+    name?: string;
+    type?: string;
+    optional?: boolean;
+    list?: boolean;
+    spread?: boolean;
+};
+
+/**
+ * A composed motion-shape the modeller is editing (ADR 0040 §9).
+ */
+export type ShapeDeclSpec = {
+    id: string;
+    name?: string;
+    ops: Array<ShapeOpSpec>;
+};
+
+export type DomainTypesPreviewRequest = {
+    /**
+     * The composed shapes currently in the editor, resolved instead of the saved-model scan so the preview reflects unsaved edits.
+     *
+     */
+    shapes: Array<ShapeDeclSpec>;
+};
+
+/**
+ * A resolve-time problem with a composed shape, surfaced like the `workers[]` drift warning (ADR 0040 §10). A shape with any `error` diagnostic is omitted from the fuse; a `warning` still resolves.
+ *
+ */
+export type ShapeDiagnostic = {
+    shape: string;
+    kind: 'unresolved-reference' | 'reference-cycle' | 'field-conflict' | 'unknown-field' | 'duplicate-id' | 'ambiguous-reference' | 'nominal-table-ref' | 'same-id-collision';
+    severity: 'error' | 'warning';
+    message: string;
 };
 
 export type TriggerEnqueueRequest = {
@@ -2520,6 +2569,41 @@ export type RegenerateDomainTypesResponses = {
 };
 
 export type RegenerateDomainTypesResponse = RegenerateDomainTypesResponses[keyof RegenerateDomainTypesResponses];
+
+export type PreviewDomainTypesData = {
+    body: DomainTypesPreviewRequest;
+    path: {
+        name: string;
+        /**
+         * The datasource name from the App manifest's `data.sources`.
+         */
+        source: string;
+    };
+    query?: never;
+    url: '/projects/{name}/data/{source}/domaintypes/preview';
+};
+
+export type PreviewDomainTypesErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type PreviewDomainTypesError = PreviewDomainTypesErrors[keyof PreviewDomainTypesErrors];
+
+export type PreviewDomainTypesResponses = {
+    /**
+     * The resolved domain text and per-shape diagnostics
+     */
+    200: DomainTypesResult;
+};
+
+export type PreviewDomainTypesResponse = PreviewDomainTypesResponses[keyof PreviewDomainTypesResponses];
 
 export type GetServerUpdateData = {
     body?: never;
