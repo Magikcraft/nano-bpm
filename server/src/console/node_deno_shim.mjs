@@ -133,6 +133,10 @@ if (globalThis.Deno === undefined) {
     if (typeof handler !== "function") {
       throw new TypeError("Deno.serve requires a handler function");
     }
+    // The actually-bound port; with `port: 0` Node picks an ephemeral one, so
+    // resolve it from `server.address()` after listen (Deno reports the real
+    // port, not the requested 0).
+    let boundPort = port;
     const server = createServer(bridge(handler, hostname));
     // A Server-level `error` is a bind failure (e.g. AddrInUse); Deno.serve
     // treats that as fatal. Surface it cleanly instead of crashing on an
@@ -143,7 +147,9 @@ if (globalThis.Deno === undefined) {
     });
     const finished = new Promise((resolve) => server.once("close", resolve));
     server.listen(port, hostname, () => {
-      const addr = { hostname, port, transport: "tcp" };
+      const bound = server.address();
+      if (bound && typeof bound === "object") boundPort = bound.port;
+      const addr = { hostname, port: boundPort, transport: "tcp" };
       if (typeof options.onListen === "function") options.onListen(addr);
     });
     const shutdown = () =>
@@ -157,7 +163,7 @@ if (globalThis.Deno === undefined) {
       ref: () => server.ref(),
       unref: () => server.unref(),
       get addr() {
-        return { hostname, port, transport: "tcp" };
+        return { hostname, port: boundPort, transport: "tcp" };
       },
     };
   }
