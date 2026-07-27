@@ -274,3 +274,14 @@ test("writeMeta: drops entries with a blank key", () => {
   const ext = modeling.calls[0].props.extensionElements as ShapeModdleElement;
   assert.deepEqual(readMeta({ ...bo, extensionElements: ext }), [{ key: "keep", value: "y" }]);
 });
+
+test("writeMeta: trims the value so a round-trip is stable (symmetric with readMeta)", () => {
+  const bo: ShapeModdleElement = { $type: "bpmn:Process" };
+  const modeling = recordingModeling();
+  writeMeta(moddle, modeling, {}, bo, [{ key: "owner", value: "  ops  " }]);
+  const ext = modeling.calls[0].props.extensionElements as ShapeModdleElement;
+  // The persisted value is trimmed at write time, so re-reading yields the same
+  // value (no silent strip on the next read).
+  assert.equal((ext.values?.[0] as ShapeModdleElement).value, "ops");
+  assert.deepEqual(readMeta({ ...bo, extensionElements: ext }), [{ key: "owner", value: "ops" }]);
+});

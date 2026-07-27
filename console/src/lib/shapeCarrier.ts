@@ -290,7 +290,9 @@ export function writeMeta(
   processBo: ShapeModdleElement,
   meta: MetaEntry[],
 ): void {
-  const clean = meta.filter((m) => m.key.trim().length > 0).map((m) => ({ key: m.key.trim(), value: m.value }));
+  const clean = meta
+    .filter((m) => m.key.trim().length > 0)
+    .map((m) => ({ key: m.key.trim(), value: m.value.trim() }));
   const ext = processBo.extensionElements;
   const existing = ext?.values ?? [];
   const nonMeta = existing.filter((v) => localType(v.$type) !== "Meta");
