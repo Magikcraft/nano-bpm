@@ -150,13 +150,17 @@ export default function Projects() {
     }
   };
 
-  const remove = async (name: string) => {
-    if (
-      !confirm(
-        `Delete project “${name}” and all its files? This cannot be undone.`,
-      )
-    )
-      return;
+  const remove = async (project: ProjectSummary) => {
+    const { name, source } = project;
+    // A linked (imported-by-reference) project owns only a pointer file — the
+    // backend deletes the reference and leaves the external checkout on disk
+    // untouched (ADR 0041). Only a workspace project's files are actually
+    // removed, so don't warn about deleting files we won't touch.
+    const message =
+      source === "path"
+        ? `Remove the link to “${name}”? The files on disk won’t be deleted.`
+        : `Delete project “${name}” and all its files? This cannot be undone.`;
+    if (!confirm(message)) return;
     try {
       await deleteProject({ path: { name }, throwOnError: true });
       await reload();
@@ -395,7 +399,7 @@ export default function Projects() {
               project={p}
               lang={langMeta[p.lang]}
               onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)}
-              onDelete={() => void remove(p.name)}
+              onDelete={() => void remove(p)}
               onRename={() => void rename(p.name)}
             />
           ))}
@@ -431,7 +435,7 @@ function ProjectTile({
         </button>
         <button
           onClick={onDelete}
-          title="Delete project"
+          title={project.source === "path" ? "Remove link" : "Delete project"}
           className="rounded px-1.5 py-0.5 text-xs text-fg-faint hover:bg-danger/10 hover:text-danger"
         >
           ✕
