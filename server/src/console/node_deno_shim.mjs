@@ -83,9 +83,13 @@ if (globalThis.Deno === undefined) {
         }
         nodeRes.end();
       } catch (err) {
+        // Match Deno's default: log the handler error server-side and return a
+        // generic 500 body, never the stack trace — leaking internals over the
+        // wire is both an info-disclosure risk and a divergence from Deno.
+        console.error(err);
         if (!nodeRes.headersSent) nodeRes.statusCode = 500;
         try {
-          nodeRes.end(String(err?.stack ?? err));
+          nodeRes.end("Internal Server Error");
         } catch {
           // response already destroyed — nothing more to do
         }
