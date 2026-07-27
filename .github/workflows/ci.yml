@@ -257,6 +257,23 @@ jobs:
         # build (the maker forgot `npm run build` / `make generate-app-manifest`).
         run: git diff --exit-code -- dist
 
+  schemas:
+    name: schemas (nanobpm.io publish build)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          # website/build.mjs imports the .ts moddle descriptor directly, so it
+          # needs a Node with TypeScript type-stripping on by default (>= 23.6).
+          node-version: '24'
+      - name: Build publish site (drift guard + identity asserts)
+        # Zero-dep build: fails if any tracked file still references the legacy
+        # schema domain, or if a published $id/uri no longer resolves to
+        # nanobpm.io. This is the same build pages.yml deploys on merge, so a
+        # green PR here guarantees the site publishes cleanly.
+        run: node website/build.mjs
+
   processos:
     name: processos (clippy + test)
     runs-on: ubuntu-24.04

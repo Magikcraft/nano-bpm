@@ -159,7 +159,7 @@ PRM's rest/face projections (0031).
 model representation the scan reads and the Modeller writes.
 
 **Namespace.** Composed shapes are carried in a dedicated nano namespace —
-`xmlns:nano="http://nanobpm.io/schema/shapes/1.0"` — registered as a bpmn-js **moddle extension**
+`xmlns:nano="https://nanobpm.io/schema/shapes/1.0"` — registered as a bpmn-js **moddle extension**
 (a descriptor JSON) alongside the existing Zeebe descriptors, so bpmn-js parses/serialises the
 elements and the properties panel can edit them as first-class moddle objects. The reserved
 `zeebe:property` envelope keys (`io.nanobpm.dataEnvelope.in`/`.out`, ADR 0033 §6) are **unchanged** —
@@ -278,7 +278,7 @@ is omitted from `DomainTypes` (so a broken shape degrades to untyped, it does no
   as `db:<source>.<table>`. The model does not become a fourth seed for rest.
 - **Shape-carrier representation fixed (§9–§10).** Composed shapes are named `nano:shape` declarations
   in a `nano:shapes` container on the process's `bpmn:extensionElements`, in a dedicated
-  `http://nanobpm.io/schema/shapes/1.0` moddle namespace; the existing `dataEnvelope.in/out` reference
+  `https://nanobpm.io/schema/shapes/1.0` moddle namespace; the existing `dataEnvelope.in/out` reference
   is unchanged and may now name a composed shape. This resolves **OQ3** for the shape-level `extend`
   vocabulary (scalar keywords ∪ fused ids) and model-level metadata (`nano:meta`).
 - **Structural vs nominal within composition (OQ2).** Resolved: a composed shape resolves to a flat
@@ -308,7 +308,7 @@ is omitted from `DomainTypes` (so a broken shape degrades to untyped, it does no
     (not trimmed). The received (`in`) type keys `publishMessage`; the `out` side is scanned but reserved
     for future correlate-response typing.
 - **2 — shape carrier in the model + full-algebra resolution** *(§9–§10)*: the headless engine layer.
-  - a **nano moddle descriptor** (`http://nanobpm.io/schema/shapes/1.0`) registered with bpmn-js so
+  - a **nano moddle descriptor** (`https://nanobpm.io/schema/shapes/1.0`) registered with bpmn-js so
     `nano:shapes`/`nano:shape`/`nano:carry`/`nano:project`/`nano:extend`/`nano:reference`/`nano:meta`
     parse and serialise;
   - pure **read/write carrier helpers** (a `shapeCarrier.ts` sibling of `dataEnvelope.ts`, unit-tested)

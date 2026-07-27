@@ -792,7 +792,7 @@ mod tests {
         format!(
             r#"<?xml version="1.0"?>
             <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                              xmlns:nano="http://nanobpm.io/schema/shapes/1.0">
+                              xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
               <bpmn:process id="orders" isExecutable="true">
                 <bpmn:extensionElements>
                   <nano:shapes>{shapes_body}</nano:shapes>
@@ -966,7 +966,7 @@ mod tests {
             r#"<?xml version="1.0"?>
             <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                               xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
-                              xmlns:nano="http://nanobpm.io/schema/shapes/1.0">
+                              xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
               <bpmn:process id="orders" isExecutable="true">
                 <bpmn:extensionElements>
                   <nano:shapes><nano:shape id="S"><nano:carry ref="Order" /></nano:shape></nano:shapes>
