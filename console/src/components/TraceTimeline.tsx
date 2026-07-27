@@ -91,11 +91,13 @@ export function TraceTimeline({
           <table className="w-full border-collapse text-sm">
             <thead>
               <tr className="border-b border-edge text-left text-fg-faint">
-                {["Element", "Kind", "Reason", "Raised", "Resolved"].map((h) => (
-                  <th key={h} className="py-2 pr-4 font-medium">
-                    {h}
-                  </th>
-                ))}
+                {["Element", "Kind", "Reason", "Raised", "Resolved"].map(
+                  (h) => (
+                    <th key={h} className="py-2 pr-4 font-medium">
+                      {h}
+                    </th>
+                  ),
+                )}
               </tr>
             </thead>
             <tbody>
@@ -131,14 +133,18 @@ function ElementRow({
 }) {
   const job = el.job;
   const start = el.enteredAt;
-  const end = el.exitedAt ?? Math.max(el.enteredAt, job?.completedAt ?? el.enteredAt);
+  const end =
+    el.exitedAt ?? Math.max(el.enteredAt, job?.completedAt ?? el.enteredAt);
 
   const left = pct(start);
   const width = Math.max(pct(end) - left, 0.6);
 
   return (
     <div className="flex items-center gap-3">
-      <div className="w-44 shrink-0 truncate font-mono text-xs text-fg-muted" title={el.elementId}>
+      <div
+        className="w-44 shrink-0 truncate font-mono text-xs text-fg-muted"
+        title={el.elementId}
+      >
         {el.elementId}
         {el.incidents > 0 && <span className="ml-1 text-danger">⚠</span>}
       </div>
@@ -224,7 +230,13 @@ function Legend() {
   );
 }
 
-function Swatch({ className, children }: { className: string; children: ReactNode }) {
+function Swatch({
+  className,
+  children,
+}: {
+  className: string;
+  children: ReactNode;
+}) {
   return (
     <span className="flex items-center gap-1.5">
       <span className={`inline-block h-3 w-3 rounded-sm ${className}`} />

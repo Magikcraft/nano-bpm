@@ -48,7 +48,12 @@ export default function Explorer() {
   const { data, isLoading, error } = useQuery({
     queryKey: ["instances", page],
     queryFn: async () =>
-      (await listInstances({ query: { page, pageSize: PAGE_SIZE }, throwOnError: true })).data,
+      (
+        await listInstances({
+          query: { page, pageSize: PAGE_SIZE },
+          throwOnError: true,
+        })
+      ).data,
     // Keep the current page visible while the next one loads, so paging and the
     // live SSE refetch don't flash an empty list.
     placeholderData: keepPreviousData,
@@ -57,7 +62,10 @@ export default function Explorer() {
   const total = data?.total ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const rangeStart = total === 0 ? 0 : page * PAGE_SIZE + 1;
-  const rangeEnd = Math.min(total, page * PAGE_SIZE + (data?.items.length ?? 0));
+  const rangeEnd = Math.min(
+    total,
+    page * PAGE_SIZE + (data?.items.length ?? 0),
+  );
 
   // Clamp the page if the dataset shrinks (e.g. retention prune) below it.
   useEffect(() => {
@@ -97,7 +105,9 @@ export default function Explorer() {
                   }`}
                 >
                   <div className="flex items-center justify-between">
-                    <span className="font-medium text-fg">{inst.process_id}</span>
+                    <span className="font-medium text-fg">
+                      {inst.process_id}
+                    </span>
                     <Badge tone={stateTone(inst.state, inst.has_incident)}>
                       {inst.has_incident ? "Incident" : inst.state}
                     </Badge>

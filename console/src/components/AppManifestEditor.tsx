@@ -69,7 +69,10 @@ export default function AppManifestEditor({
     setLoadError(null);
     projectFileEx(name, path)
       .then((f) => alive && setContent(f.binary ? "" : f.text))
-      .catch((e) => alive && setLoadError(e instanceof Error ? e.message : String(e)));
+      .catch(
+        (e) =>
+          alive && setLoadError(e instanceof Error ? e.message : String(e)),
+      );
     return () => {
       alive = false;
     };
@@ -96,7 +99,10 @@ export default function AppManifestEditor({
       const index = await buildSymbolIndex(models);
       setIdx({ status: "ready", index });
     } catch (e) {
-      setIdx({ status: "error", message: e instanceof Error ? e.message : String(e) });
+      setIdx({
+        status: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
     }
   }, [name, modelPaths]);
 
@@ -129,13 +135,19 @@ export default function AppManifestEditor({
       };
     }
     const index = idx.status === "ready" ? idx.index : undefined;
-    return { diagnostics: validateManifest(value, index).diagnostics, parsed: value };
+    return {
+      diagnostics: validateManifest(value, index).diagnostics,
+      parsed: value,
+    };
   }, [content, idx]);
 
   // Keep the manifest IntelliSense provider (ADR 0029 §2) fed with the latest
   // parsed manifest + symbol index. A ref-cell means the provider reads fresh
   // state on each completion request without re-registering per keystroke.
-  const sourceRef = useRef<{ manifest: unknown; index: SymbolIndex | undefined }>({
+  const sourceRef = useRef<{
+    manifest: unknown;
+    index: SymbolIndex | undefined;
+  }>({
     manifest: undefined,
     index: undefined,
   });
@@ -149,7 +161,12 @@ export default function AppManifestEditor({
     if (content == null) return;
     setSaving(true);
     try {
-      await saveProjectFile({ path: { name }, query: { path }, body: content, throwOnError: true });
+      await saveProjectFile({
+        path: { name },
+        query: { path },
+        body: content,
+        throwOnError: true,
+      });
       setDirty(false);
     } catch (e) {
       setLoadError(e instanceof Error ? e.message : String(e));
@@ -185,14 +202,25 @@ export default function AppManifestEditor({
           <Badge tone="ok">valid</Badge>
         ) : (
           <Badge tone="danger">
-            {diagnostics.length} {diagnostics.length === 1 ? "problem" : "problems"}
+            {diagnostics.length}{" "}
+            {diagnostics.length === 1 ? "problem" : "problems"}
           </Badge>
         )}
         <div className="ml-auto flex items-center gap-2">
-          <Button variant="ghost" size="sm" onClick={() => void buildIndex()} title="Re-read the project models and rebuild the symbol index">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => void buildIndex()}
+            title="Re-read the project models and rebuild the symbol index"
+          >
             Rescan models
           </Button>
-          <Button variant="primary" size="sm" disabled={!dirty || saving} onClick={() => void save()}>
+          <Button
+            variant="primary"
+            size="sm"
+            disabled={!dirty || saving}
+            onClick={() => void save()}
+          >
             {saving ? "Saving…" : "Save"}
           </Button>
         </div>
@@ -226,7 +254,10 @@ export default function AppManifestEditor({
             ) : (
               <ul className="space-y-2">
                 {diagnostics.map((d, i) => (
-                  <li key={`${d.pointer}-${i}`} className="rounded-md border border-danger/30 bg-danger/5 p-2 text-sm">
+                  <li
+                    key={`${d.pointer}-${i}`}
+                    className="rounded-md border border-danger/30 bg-danger/5 p-2 text-sm"
+                  >
                     <div className="text-danger">{d.message}</div>
                     <div className="mt-0.5 flex items-center gap-2 text-xs text-fg-faint">
                       <code>{d.pointer}</code>
@@ -264,7 +295,8 @@ function ManifestInspector({
   }
   const { index } = idx;
   const dataSources = Object.keys(
-    (parsed as { data?: { sources?: Record<string, unknown> } } | undefined)?.data?.sources ?? {},
+    (parsed as { data?: { sources?: Record<string, unknown> } } | undefined)
+      ?.data?.sources ?? {},
   );
   const domain = resolveDomainTypes(parsed, index);
   return (
@@ -286,24 +318,34 @@ function ManifestInspector({
         <section>
           <SectionLabel>
             Domain types ({domain.declared.length}
-            {domain.inferred.length > 0 ? ` +${domain.inferred.length} inferred` : ""})
+            {domain.inferred.length > 0
+              ? ` +${domain.inferred.length} inferred`
+              : ""}
+            )
           </SectionLabel>
           {domain.declared.length === 0 && (
             <p className="text-sm text-fg-faint">
-              No types declared yet. The candidates below are inferred from forms — promote one into{" "}
-              <code>types</code> to reference it.
+              No types declared yet. The candidates below are inferred from
+              forms — promote one into <code>types</code> to reference it.
             </p>
           )}
           <ul className="space-y-2 text-sm">
             {domain.declared.map((t) => (
               <li key={t.id}>
                 <code className="text-accent">{t.id}</code>
-                {t.name ? <span className="text-fg-muted"> — {t.name}</span> : null}
-                {t.table ? <span className="text-fg-faint"> · table {t.table}</span> : null}
+                {t.name ? (
+                  <span className="text-fg-muted"> — {t.name}</span>
+                ) : null}
+                {t.table ? (
+                  <span className="text-fg-faint"> · table {t.table}</span>
+                ) : null}
                 {t.fields.length > 0 && (
                   <div className="ml-3 text-xs text-fg-faint">
                     {t.fields
-                      .map((f) => `${f.key}: ${f.type}${f.list ? "[]" : ""}${f.optional ? "?" : ""}`)
+                      .map(
+                        (f) =>
+                          `${f.key}: ${f.type}${f.list ? "[]" : ""}${f.optional ? "?" : ""}`,
+                      )
                       .join(", ")}
                   </div>
                 )}
@@ -331,7 +373,9 @@ function ManifestInspector({
             {index.processes.map((p) => (
               <li key={p.id}>
                 <code className="text-accent">{p.id}</code>
-                {p.name ? <span className="text-fg-muted"> — {p.name}</span> : null}
+                {p.name ? (
+                  <span className="text-fg-muted"> — {p.name}</span>
+                ) : null}
                 {p.messageStartEvents.length > 0 && (
                   <div className="ml-3 text-xs text-fg-faint">
                     starts on: {p.messageStartEvents.join(", ")}
@@ -368,7 +412,9 @@ function ManifestInspector({
             {index.decisions.map((d) => (
               <li key={d.id}>
                 <code className="text-accent">{d.id}</code>
-                {d.name ? <span className="text-fg-muted"> — {d.name}</span> : null}
+                {d.name ? (
+                  <span className="text-fg-muted"> — {d.name}</span>
+                ) : null}
               </li>
             ))}
           </ul>

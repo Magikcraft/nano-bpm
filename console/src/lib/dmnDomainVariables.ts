@@ -14,7 +14,10 @@ export type { FeelVariable };
  * its `bindings[]` domain type (ADR 0029 §5). Empty when the decision has no
  * bound type — the maker then sees only dmn-js's own inferred variables.
  */
-export function decisionFeelVariables(manifest: unknown, decisionId: string | undefined): FeelVariable[] {
+export function decisionFeelVariables(
+  manifest: unknown,
+  decisionId: string | undefined,
+): FeelVariable[] {
   const scope = decisionScope(manifest, decisionId);
   return scope ? toFeelVariables(scope) : [];
 }

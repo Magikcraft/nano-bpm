@@ -6,7 +6,11 @@
 // package (tested); this only translates its neutral scope tree and keeps the
 // BpmnModeler wiring thin.
 
-import { processScope, componentOutputScope, type ComponentOutput } from "@nanobpm/nano-app-schema";
+import {
+  processScope,
+  componentOutputScope,
+  type ComponentOutput,
+} from "@nanobpm/nano-app-schema";
 import { toFeelVariables, type FeelVariable } from "./feelVariables";
 
 export type { ComponentOutput };
@@ -16,7 +20,10 @@ export type { ComponentOutput };
  * `bindings[]` domain type (ADR 0030). Empty when the process has no bound type
  * — the maker then sees only bpmn-js's own extracted process variables.
  */
-export function processFeelVariables(manifest: unknown, processId: string | undefined): FeelVariable[] {
+export function processFeelVariables(
+  manifest: unknown,
+  processId: string | undefined,
+): FeelVariable[] {
   const scope = processScope(manifest, processId);
   return scope ? toFeelVariables(scope) : [];
 }
@@ -28,6 +35,9 @@ export function processFeelVariables(manifest: unknown, processId: string | unde
  * pairs the BpmnModeler extracts from service-task output mappings. Empty when no
  * output maps to a worker with a declared `outputType`.
  */
-export function componentOutputFeelVariables(manifest: unknown, outputs: readonly ComponentOutput[]): FeelVariable[] {
+export function componentOutputFeelVariables(
+  manifest: unknown,
+  outputs: readonly ComponentOutput[],
+): FeelVariable[] {
   return toFeelVariables(componentOutputScope(manifest, outputs));
 }

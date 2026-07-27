@@ -18,13 +18,21 @@ import {
 // A minimal moddle stand-in: create() returns a tagged plain object.
 const moddle: EnvModdle = {
   create(type, attrs) {
-    return { $type: type, ...(attrs as Record<string, unknown>) } as EnvModdleElement;
+    return {
+      $type: type,
+      ...(attrs as Record<string, unknown>),
+    } as EnvModdleElement;
   },
 };
 
 // Records the last updateModdleProperties call so tests can assert the shape.
-function recordingModeling(): EnvModeling & { calls: Array<{ moddleElement: unknown; props: Record<string, unknown> }> } {
-  const calls: Array<{ moddleElement: unknown; props: Record<string, unknown> }> = [];
+function recordingModeling(): EnvModeling & {
+  calls: Array<{ moddleElement: unknown; props: Record<string, unknown> }>;
+} {
+  const calls: Array<{
+    moddleElement: unknown;
+    props: Record<string, unknown>;
+  }> = [];
   return {
     calls,
     updateModdleProperties(_element, moddleElement, props) {
@@ -33,10 +41,17 @@ function recordingModeling(): EnvModeling & { calls: Array<{ moddleElement: unkn
   };
 }
 
-function serviceTask(taskType?: string, extraExt: EnvModdleElement[] = []): EnvModdleElement {
+function serviceTask(
+  taskType?: string,
+  extraExt: EnvModdleElement[] = [],
+): EnvModdleElement {
   const values: EnvModdleElement[] = [...extraExt];
-  if (taskType !== undefined) values.unshift({ $type: "zeebe:TaskDefinition", type: taskType });
-  return { $type: "bpmn:ServiceTask", extensionElements: { $type: "bpmn:ExtensionElements", values } };
+  if (taskType !== undefined)
+    values.unshift({ $type: "zeebe:TaskDefinition", type: taskType });
+  return {
+    $type: "bpmn:ServiceTask",
+    extensionElements: { $type: "bpmn:ExtensionElements", values },
+  };
 }
 
 test("envelopeContext: service task with a literal worker type targets the element", () => {
@@ -48,19 +63,28 @@ test("envelopeContext: service task with a literal worker type targets the eleme
 });
 
 test("envelopeContext: service task with a FEEL (=expr) type has no envelope", () => {
-  const ctx = envelopeContext({ type: "bpmn:ServiceTask", businessObject: serviceTask("=taskTypeVar") });
+  const ctx = envelopeContext({
+    type: "bpmn:ServiceTask",
+    businessObject: serviceTask("=taskTypeVar"),
+  });
   assert.equal(ctx, undefined);
 });
 
 test("envelopeContext: service task with no worker type has no envelope", () => {
-  const ctx = envelopeContext({ type: "bpmn:ServiceTask", businessObject: serviceTask() });
+  const ctx = envelopeContext({
+    type: "bpmn:ServiceTask",
+    businessObject: serviceTask(),
+  });
   assert.equal(ctx, undefined);
 });
 
 test("envelopeContext: user task targets the element and exposes its linked form id", () => {
   const bo: EnvModdleElement = {
     $type: "bpmn:UserTask",
-    extensionElements: { $type: "bpmn:ExtensionElements", values: [{ $type: "zeebe:FormDefinition", formId: "order-form" }] },
+    extensionElements: {
+      $type: "bpmn:ExtensionElements",
+      values: [{ $type: "zeebe:FormDefinition", formId: "order-form" }],
+    },
   };
   const ctx = envelopeContext({ type: "bpmn:UserTask", businessObject: bo });
   assert.ok(ctx);
@@ -71,33 +95,66 @@ test("envelopeContext: user task targets the element and exposes its linked form
 
 test("userTaskFormId: reads zeebe:FormDefinition formId, undefined when absent/embedded", () => {
   const withForm: EnvModdleElement = {
-    extensionElements: { values: [{ $type: "zeebe:FormDefinition", formId: "f1" }] },
+    extensionElements: {
+      values: [{ $type: "zeebe:FormDefinition", formId: "f1" }],
+    },
   };
   assert.equal(userTaskFormId(withForm), "f1");
-  assert.equal(userTaskFormId({ extensionElements: { values: [{ $type: "zeebe:FormDefinition", formId: "" }] } }), undefined);
+  assert.equal(
+    userTaskFormId({
+      extensionElements: {
+        values: [{ $type: "zeebe:FormDefinition", formId: "" }],
+      },
+    }),
+    undefined,
+  );
   assert.equal(userTaskFormId({}), undefined);
 });
 
 test("envelopeContext: message-bearing element targets the shared bpmn:Message", () => {
-  const msg: EnvModdleElement = { $type: "bpmn:Message", id: "Msg_1", name: "OrderPlaced" };
+  const msg: EnvModdleElement = {
+    $type: "bpmn:Message",
+    id: "Msg_1",
+    name: "OrderPlaced",
+  };
   const bo: EnvModdleElement = {
     $type: "bpmn:IntermediateCatchEvent",
-    eventDefinitions: [{ $type: "bpmn:MessageEventDefinition", messageRef: msg }],
+    eventDefinitions: [
+      { $type: "bpmn:MessageEventDefinition", messageRef: msg },
+    ],
   };
-  const ctx = envelopeContext({ type: "bpmn:IntermediateCatchEvent", businessObject: bo });
+  const ctx = envelopeContext({
+    type: "bpmn:IntermediateCatchEvent",
+    businessObject: bo,
+  });
   assert.ok(ctx);
   assert.equal(ctx.target, msg);
 });
 
 test("envelopeContext: a plain gateway/task with no boundary has no envelope", () => {
-  assert.equal(envelopeContext({ type: "bpmn:ExclusiveGateway", businessObject: { $type: "bpmn:ExclusiveGateway" } }), undefined);
+  assert.equal(
+    envelopeContext({
+      type: "bpmn:ExclusiveGateway",
+      businessObject: { $type: "bpmn:ExclusiveGateway" },
+    }),
+    undefined,
+  );
   assert.equal(envelopeContext(undefined), undefined);
 });
 
 test("referencedMessage: receiveTask uses messageRef, non-message events return undefined", () => {
   const msg: EnvModdleElement = { $type: "bpmn:Message", id: "M" };
-  assert.equal(referencedMessage({ $type: "bpmn:ReceiveTask", messageRef: msg }), msg);
-  assert.equal(referencedMessage({ $type: "bpmn:StartEvent", eventDefinitions: [{ $type: "bpmn:TimerEventDefinition" }] }), undefined);
+  assert.equal(
+    referencedMessage({ $type: "bpmn:ReceiveTask", messageRef: msg }),
+    msg,
+  );
+  assert.equal(
+    referencedMessage({
+      $type: "bpmn:StartEvent",
+      eventDefinitions: [{ $type: "bpmn:TimerEventDefinition" }],
+    }),
+    undefined,
+  );
 });
 
 test("readEnvelope: reads the reserved in/out property values, defaults to empty", () => {
@@ -135,8 +192,14 @@ test("writeEnvelope: creates extensionElements + zeebe:Properties when absent", 
 
 test("writeEnvelope: appends a new zeebe:Properties into an existing extensionElements", () => {
   const modeling = recordingModeling();
-  const ext: EnvModdleElement = { $type: "bpmn:ExtensionElements", values: [{ $type: "zeebe:TaskDefinition", type: "t" }] };
-  const target: EnvModdleElement = { $type: "bpmn:ServiceTask", extensionElements: ext };
+  const ext: EnvModdleElement = {
+    $type: "bpmn:ExtensionElements",
+    values: [{ $type: "zeebe:TaskDefinition", type: "t" }],
+  };
+  const target: EnvModdleElement = {
+    $type: "bpmn:ServiceTask",
+    extensionElements: ext,
+  };
   writeEnvelope(moddle, modeling, {}, target, "outputType", "Receipt");
   assert.equal(modeling.calls.length, 1);
   assert.equal(modeling.calls[0].moddleElement, ext);
@@ -181,5 +244,8 @@ test("writeEnvelope: clearing removes only the reserved property", () => {
   };
   writeEnvelope(moddle, modeling, {}, target, "inputType", "");
   const propsOut = modeling.calls[0].props.properties as EnvModdleElement[];
-  assert.deepEqual(propsOut.map((p) => p.name), ["other"]);
+  assert.deepEqual(
+    propsOut.map((p) => p.name),
+    ["other"],
+  );
 });

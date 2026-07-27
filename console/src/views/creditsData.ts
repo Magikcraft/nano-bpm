@@ -3,98 +3,103 @@
 // bpmn-io/{bpmn-js,diagram-js,bpmn-moddle,dmn-js,form-js}, camunda/camunda-modeler.
 // Deduped by display name; bots removed. Regenerate rather than hand-edit.
 
-export interface CreditLine { name: string; area?: string; subsystem?: string; role?: string }
+export interface CreditLine {
+  name: string;
+  area?: string;
+  subsystem?: string;
+  role?: string;
+}
 
 export const credits = {
-  "producer": {
-    "name": "Joshua Wulf",
-    "role": "Nano Producer"
+  producer: {
+    name: "Joshua Wulf",
+    role: "Nano Producer",
   },
-  "signed": [
+  signed: [
     {
-      "subsystem": "Falcon Protocol",
-      "area": "Command-stream protocol",
-      "name": "Falko Menge"
+      subsystem: "Falcon Protocol",
+      area: "Command-stream protocol",
+      name: "Falko Menge",
     },
     {
-      "subsystem": "Deepthi",
-      "area": "Single-writer engine actor",
-      "name": "Deepthi Devaki Akkoorath"
+      subsystem: "Deepthi",
+      area: "Single-writer engine actor",
+      name: "Deepthi Devaki Akkoorath",
     },
     {
-      "subsystem": "FEEL",
-      "area": "Expression language",
-      "name": "Philipp Ossler"
+      subsystem: "FEEL",
+      area: "Expression language",
+      name: "Philipp Ossler",
     },
     {
-      "subsystem": "DMN (reserved)",
-      "area": "Decision engine",
-      "name": "Sebastian Menski"
-    }
+      subsystem: "DMN (reserved)",
+      area: "Decision engine",
+      name: "Sebastian Menski",
+    },
   ],
-  "founders": [
+  founders: [
     {
-      "name": "Daniel Meyer",
-      "area": "Camunda · Zeebe origin"
+      name: "Daniel Meyer",
+      area: "Camunda · Zeebe origin",
     },
     {
-      "name": "Thorben Lindhauer",
-      "area": "Camunda · Zeebe origin"
+      name: "Thorben Lindhauer",
+      area: "Camunda · Zeebe origin",
     },
     {
-      "name": "Nico Rehwaldt",
-      "area": "bpmn-io · modeling toolkit"
-    }
+      name: "Nico Rehwaldt",
+      area: "bpmn-io · modeling toolkit",
+    },
   ],
-  "principals": [
+  principals: [
     {
-      "name": "Christopher Kujawa (Zell)",
-      "area": "Stream processor · storage · logstreams · performance & monitoring"
+      name: "Christopher Kujawa (Zell)",
+      area: "Stream processor · storage · logstreams · performance & monitoring",
     },
     {
-      "name": "Nicolas Pepin-Perreault",
-      "area": "Actor scheduler · exporters · performance"
+      name: "Nicolas Pepin-Perreault",
+      area: "Actor scheduler · exporters · performance",
     },
     {
-      "name": "Lena Schönburg",
-      "area": "Raft replication · journal"
+      name: "Lena Schönburg",
+      area: "Raft replication · journal",
     },
     {
-      "name": "Deepthi Devaki Akkoorath",
-      "area": "Distributed log · Raft · snapshots · actor scheduler"
+      name: "Deepthi Devaki Akkoorath",
+      area: "Distributed log · Raft · snapshots · actor scheduler",
     },
     {
-      "name": "Remco Westerhoud",
-      "area": "Process engine"
+      name: "Remco Westerhoud",
+      area: "Process engine",
     },
     {
-      "name": "Nico Korthout",
-      "area": "Process engine · DMN"
+      name: "Nico Korthout",
+      area: "Process engine · DMN",
     },
     {
-      "name": "Philipp Ossler",
-      "area": "FEEL expression language"
+      name: "Philipp Ossler",
+      area: "FEEL expression language",
     },
     {
-      "name": "Sebastian Menski",
-      "area": "Broker · transport · DMN"
-    }
+      name: "Sebastian Menski",
+      area: "Broker · transport · DMN",
+    },
   ],
-  "modeling": [
+  modeling: [
     {
-      "name": "Nico Rehwaldt",
-      "area": "bpmn-js · diagram-js"
+      name: "Nico Rehwaldt",
+      area: "bpmn-js · diagram-js",
     },
     {
-      "name": "Philipp Fromme",
-      "area": "Modeling toolkit"
+      name: "Philipp Fromme",
+      area: "Modeling toolkit",
     },
     {
-      "name": "Maciej Barełkowski",
-      "area": "Modeling toolkit"
-    }
+      name: "Maciej Barełkowski",
+      area: "Modeling toolkit",
+    },
   ],
-  "cast": [
+  cast: [
     "Abbas Adel Ibraim",
     "Abdul Ahad",
     "Abdul Rehaman",
@@ -604,11 +609,11 @@ export const credits = {
     "zHd4",
     "zlh",
     "Zoltan Kalmar",
-    "李 銍"
+    "李 銍",
   ],
-  "counts": {
-    "total": 510,
-    "engine": 411,
-    "modeling": 135
-  }
+  counts: {
+    total: 510,
+    engine: 411,
+    modeling: 135,
+  },
 } as const;

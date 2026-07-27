@@ -72,7 +72,11 @@ export interface DataGridNode {
 export type PageNode = TextNode | ActionFormNode | DataGridNode;
 export type PageNodeType = PageNode["type"];
 
-export const PAGE_NODE_TYPES: PageNodeType[] = ["text", "actionForm", "dataGrid"];
+export const PAGE_NODE_TYPES: PageNodeType[] = [
+  "text",
+  "actionForm",
+  "dataGrid",
+];
 
 export interface PageDoc {
   schemaVersion: typeof PAGE_SCHEMA_VERSION;
@@ -98,7 +102,11 @@ export function defaultProps(type: PageNodeType): PageNode["props"] {
         fields: [{ key: "input", label: "Input", type: "text" }],
       };
     case "dataGrid":
-      return { title: "Data", data: { kind: "datasource", source: "app", table: "" }, columns: [] };
+      return {
+        title: "Data",
+        data: { kind: "datasource", source: "app", table: "" },
+        columns: [],
+      };
   }
 }
 
@@ -113,9 +121,12 @@ function isRecord(x: unknown): x is Record<string, unknown> {
  * rendering half a screen. (The App-side runtime renderer trusts the persisted
  * `page.json` and does not re-validate.)
  */
-export function parsePageDoc(value: unknown): { ok: true; doc: PageDoc } | { ok: false; errors: string[] } {
+export function parsePageDoc(
+  value: unknown,
+): { ok: true; doc: PageDoc } | { ok: false; errors: string[] } {
   const errors: string[] = [];
-  if (!isRecord(value)) return { ok: false, errors: ["page.json must be an object"] };
+  if (!isRecord(value))
+    return { ok: false, errors: ["page.json must be an object"] };
   if (value.schemaVersion !== PAGE_SCHEMA_VERSION) {
     errors.push(`schemaVersion must be "${PAGE_SCHEMA_VERSION}"`);
   }
@@ -144,7 +155,10 @@ export function parsePageDoc(value: unknown): { ok: true; doc: PageDoc } | { ok:
           id,
           props: {
             text: typeof props.text === "string" ? props.text : "",
-            variant: (props.variant === "heading" || props.variant === "sub" ? props.variant : "body"),
+            variant:
+              props.variant === "heading" || props.variant === "sub"
+                ? props.variant
+                : "body",
           },
         });
         break;
@@ -156,13 +170,22 @@ export function parsePageDoc(value: unknown): { ok: true; doc: PageDoc } | { ok:
           id,
           props: {
             title: typeof props.title === "string" ? props.title : "",
-            submitLabel: typeof props.submitLabel === "string" ? props.submitLabel : "Submit",
-            action: { kind: "startProcess", process: typeof action.process === "string" ? action.process : "" },
-            fields: fields.filter(isRecord).map((f) => ({
-              key: typeof f.key === "string" ? f.key : "",
-              label: typeof f.label === "string" ? f.label : "",
-              type: "text" as const,
-            })).filter((f) => f.key !== ""),
+            submitLabel:
+              typeof props.submitLabel === "string"
+                ? props.submitLabel
+                : "Submit",
+            action: {
+              kind: "startProcess",
+              process: typeof action.process === "string" ? action.process : "",
+            },
+            fields: fields
+              .filter(isRecord)
+              .map((f) => ({
+                key: typeof f.key === "string" ? f.key : "",
+                label: typeof f.label === "string" ? f.label : "",
+                type: "text" as const,
+              }))
+              .filter((f) => f.key !== ""),
           },
         });
         break;
@@ -189,10 +212,15 @@ export function parsePageDoc(value: unknown): { ok: true; doc: PageDoc } | { ok:
         break;
       }
       default:
-        errors.push(`nodes[${i}].type "${String(type)}" is not a known node type`);
+        errors.push(
+          `nodes[${i}].type "${String(type)}" is not a known node type`,
+        );
     }
   }
 
   if (errors.length) return { ok: false, errors };
-  return { ok: true, doc: { schemaVersion: PAGE_SCHEMA_VERSION, title, nodes } };
+  return {
+    ok: true,
+    doc: { schemaVersion: PAGE_SCHEMA_VERSION, title, nodes },
+  };
 }

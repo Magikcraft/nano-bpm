@@ -74,12 +74,22 @@ declare module "bpmn-js-element-templates" {
   export interface ElementTemplatesService {
     set(templates: unknown[]): void;
     get(): unknown[];
-    createElement(template: unknown, options?: Record<string, unknown>): unknown;
-    applyTemplate(element: unknown, template: unknown, options?: Record<string, unknown>): unknown;
+    createElement(
+      template: unknown,
+      options?: Record<string, unknown>,
+    ): unknown;
+    applyTemplate(
+      element: unknown,
+      template: unknown,
+      options?: Record<string, unknown>,
+    ): unknown;
   }
   const CloudElementTemplatesCoreModule: unknown;
   const CloudElementTemplatesPropertiesProviderModule: unknown;
-  export { CloudElementTemplatesCoreModule, CloudElementTemplatesPropertiesProviderModule };
+  export {
+    CloudElementTemplatesCoreModule,
+    CloudElementTemplatesPropertiesProviderModule,
+  };
 }
 
 declare module "camunda-bpmn-js-behaviors/lib/camunda-cloud" {

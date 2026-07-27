@@ -1,4 +1,11 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ComponentType } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type ComponentType,
+} from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   createLibFile,
@@ -42,19 +49,37 @@ type CodeEditorProps = {
 // bundles) from that build during transform. The `() => null` fallback keeps the
 // type honest and can never render (its call sites live behind IS_STUDIO).
 const CodeEditor: ComponentType<CodeEditorProps> = __STUDIO__
-  ? (lazy(() => import("../components/CodeEditor")) as ComponentType<CodeEditorProps>)
+  ? (lazy(
+      () => import("../components/CodeEditor"),
+    ) as ComponentType<CodeEditorProps>)
   : () => null;
 
-function phaseBadge(phase: WorkerPhase): { label: string; cls: string; dot: string } {
+function phaseBadge(phase: WorkerPhase): {
+  label: string;
+  cls: string;
+  dot: string;
+} {
   switch (phase) {
     case "running":
       return { label: "Running", cls: "bg-ok/10 text-ok", dot: "bg-ok" };
     case "starting":
-      return { label: "Starting", cls: "bg-info/10 text-info", dot: "bg-info animate-pulse" };
+      return {
+        label: "Starting",
+        cls: "bg-info/10 text-info",
+        dot: "bg-info animate-pulse",
+      };
     case "crashed":
-      return { label: "Crashed", cls: "bg-danger/10 text-danger", dot: "bg-danger" };
+      return {
+        label: "Crashed",
+        cls: "bg-danger/10 text-danger",
+        dot: "bg-danger",
+      };
     case "stopped":
-      return { label: "Stopped", cls: "bg-hover text-fg-muted", dot: "bg-fg-faint" };
+      return {
+        label: "Stopped",
+        cls: "bg-hover text-fg-muted",
+        dot: "bg-fg-faint",
+      };
   }
 }
 
@@ -77,7 +102,10 @@ export default function Workers() {
   // When true, the editor pane shows the shared `@lib/` library instead of a worker.
   const [showLib, setShowLib] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<{ kind: "ok" | "err"; text: string } | null>(null);
+  const [message, setMessage] = useState<{
+    kind: "ok" | "err";
+    text: string;
+  } | null>(null);
   // Standalone-app export: which workers to bundle (modal is open when non-null).
   const [exportSel, setExportSel] = useState<Set<string> | null>(null);
 
@@ -92,7 +120,8 @@ export default function Workers() {
   const nodeAvailable = data?.nodeAvailable ?? true;
   const current = workers.find((w) => w.name === selected);
 
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ["workers"] });
+  const refresh = () =>
+    queryClient.invalidateQueries({ queryKey: ["workers"] });
   const flash = (kind: "ok" | "err", text: string) => {
     setMessage({ kind, text });
     if (kind === "ok") setTimeout(() => setMessage(null), 3000);
@@ -101,7 +130,8 @@ export default function Workers() {
   async function newWorker() {
     const name = prompt("New worker name (letters, digits, - and _):")?.trim();
     if (!name) return;
-    const jobType = prompt("BPMN job type this worker handles:", name)?.trim() || name;
+    const jobType =
+      prompt("BPMN job type this worker handles:", name)?.trim() || name;
     setBusy(true);
     try {
       await createWorker({ body: { name, jobType }, throwOnError: true });
@@ -116,7 +146,12 @@ export default function Workers() {
   }
 
   async function removeWorker(name: string) {
-    if (!confirm(`Delete worker '${name}'? Its code will be removed from the workspace.`)) return;
+    if (
+      !confirm(
+        `Delete worker '${name}'? Its code will be removed from the workspace.`,
+      )
+    )
+      return;
     setBusy(true);
     try {
       await deleteWorker({ path: { name }, throwOnError: true });
@@ -177,7 +212,10 @@ export default function Workers() {
     try {
       await exportWorkersApp(names);
       setExportSel(null);
-      flash("ok", `Exported ${names.length} worker${names.length === 1 ? "" : "s"} as a standalone app.`);
+      flash(
+        "ok",
+        `Exported ${names.length} worker${names.length === 1 ? "" : "s"} as a standalone app.`,
+      );
     } catch (e) {
       flash("err", e instanceof Error ? e.message : String(e));
     } finally {
@@ -220,8 +258,9 @@ export default function Workers() {
 
       {!nodeAvailable && !denoAvailable && (
         <div className="border-b border-warn/30 bg-warn/10 px-6 py-2 text-xs text-warn">
-          No JavaScript runtime found — you can author workers, but starting them needs Node ≥ 22.6
-          (the npm launcher provides one) or Deno. Install Node from https://nodejs.org.
+          No JavaScript runtime found — you can author workers, but starting
+          them needs Node ≥ 22.6 (the npm launcher provides one) or Deno.
+          Install Node from https://nodejs.org.
         </div>
       )}
       {message && (
@@ -237,7 +276,12 @@ export default function Workers() {
       )}
 
       {tab === "running" ? (
-        <RunningTab workers={workers} onStart={start} onStop={stop} busy={busy} />
+        <RunningTab
+          workers={workers}
+          onStart={start}
+          onStop={stop}
+          busy={busy}
+        />
       ) : (
         <div className="flex min-h-0 flex-1">
           {/* Worker library */}
@@ -266,7 +310,9 @@ export default function Workers() {
             </div>
             <ul className="min-h-0 flex-1 overflow-auto">
               {workers.length === 0 && (
-                <li className="px-3 py-2 text-xs text-fg-faint">No workers yet.</li>
+                <li className="px-3 py-2 text-xs text-fg-faint">
+                  No workers yet.
+                </li>
               )}
               {workers.map((w) => {
                 const b = phaseBadge(w.runtime.status);
@@ -283,7 +329,9 @@ export default function Workers() {
                           : "hover:bg-hover"
                       }`}
                     >
-                      <span className={`h-2 w-2 shrink-0 rounded-full ${b.dot}`} />
+                      <span
+                        className={`h-2 w-2 shrink-0 rounded-full ${b.dot}`}
+                      />
                       <span className="min-w-0 flex-1 truncate">{w.name}</span>
                     </button>
                   </li>
@@ -295,12 +343,16 @@ export default function Workers() {
               <button
                 onClick={() => setShowLib(true)}
                 className={`flex w-full items-center gap-2 px-3 py-2 text-left text-sm ${
-                  showLib ? "bg-accent/10 font-medium text-accent-strong" : "hover:bg-hover"
+                  showLib
+                    ? "bg-accent/10 font-medium text-accent-strong"
+                    : "hover:bg-hover"
                 }`}
               >
                 <span className="text-fg-faint">📚</span>
                 <span className="min-w-0 flex-1 truncate">Shared library</span>
-                <span className="font-mono text-[10px] text-fg-faint">@lib/</span>
+                <span className="font-mono text-[10px] text-fg-faint">
+                  @lib/
+                </span>
               </button>
             </div>
           </aside>
@@ -339,11 +391,14 @@ export default function Workers() {
             onClick={(e) => e.stopPropagation()}
           >
             <div className="border-b border-edge px-5 py-3">
-              <h2 className="text-sm font-semibold text-fg">Export workers as an application</h2>
+              <h2 className="text-sm font-semibold text-fg">
+                Export workers as an application
+              </h2>
               <p className="mt-1 text-xs text-fg-faint">
-                Bundle the selected workers into a self-contained Deno app. The downloaded
-                zip deploys every model in its <code>resources/</code> folder on startup,
-                then runs the workers. Requires Deno to run.
+                Bundle the selected workers into a self-contained Deno app. The
+                downloaded zip deploys every model in its{" "}
+                <code>resources/</code> folder on startup, then runs the
+                workers. Requires Deno to run.
               </p>
             </div>
             <ul className="max-h-64 overflow-auto px-5 py-3">
@@ -361,7 +416,9 @@ export default function Workers() {
               ))}
             </ul>
             <div className="flex items-center justify-between gap-2 border-t border-edge px-5 py-3">
-              <span className="text-xs text-fg-faint">{exportSel.size} selected</span>
+              <span className="text-xs text-fg-faint">
+                {exportSel.size} selected
+              </span>
               <div className="flex gap-2">
                 <Button size="sm" onClick={() => setExportSel(null)}>
                   Cancel
@@ -421,17 +478,22 @@ function RunningTab({
           {workers.map((w) => {
             const b = phaseBadge(w.runtime.status);
             const m = w.runtime.metrics;
-            const active = w.runtime.status === "running" || w.runtime.status === "starting";
+            const active =
+              w.runtime.status === "running" || w.runtime.status === "starting";
             return (
               <tr key={w.name} className="border-b border-edge/60">
                 <td className="py-2 pr-4 font-medium">{w.name}</td>
                 <td className="py-2 pr-4">
-                  <span className={`rounded px-1.5 py-0.5 text-xs ${b.cls}`}>{b.label}</span>
+                  <span className={`rounded px-1.5 py-0.5 text-xs ${b.cls}`}>
+                    {b.label}
+                  </span>
                 </td>
                 <td className="py-2 pr-4 tabular-nums">{m.completed}</td>
                 <td className="py-2 pr-4 tabular-nums">{m.failed}</td>
                 <td className="py-2 pr-4 tabular-nums">{m.inFlight}</td>
-                <td className="py-2 pr-4 tabular-nums">{m.throughput.toFixed(1)}/s</td>
+                <td className="py-2 pr-4 tabular-nums">
+                  {m.throughput.toFixed(1)}/s
+                </td>
                 <td className="py-2 pr-4 tabular-nums">
                   {active ? fmtUptime(m.uptimeMs) : "—"}
                 </td>
@@ -466,7 +528,8 @@ function RunningTab({
             .filter((w) => w.runtime.lastError)
             .map((w) => (
               <div key={w.name}>
-                <span className="text-fg-faint">{w.name}:</span> {w.runtime.lastError}
+                <span className="text-fg-faint">{w.name}:</span>{" "}
+                {w.runtime.lastError}
               </div>
             ))}
         </div>
@@ -509,8 +572,17 @@ function WorkerEditor({
       await Promise.all(
         worker.files.map(async (f) => {
           try {
-            const text = (await getWorkerFile({ path: { name: worker.name }, query: { path: f }, throwOnError: true })).data;
-            models.push({ path: `file:///workers/${worker.name}/${f}`, content: text });
+            const text = (
+              await getWorkerFile({
+                path: { name: worker.name },
+                query: { path: f },
+                throwOnError: true,
+              })
+            ).data;
+            models.push({
+              path: `file:///workers/${worker.name}/${f}`,
+              content: text,
+            });
           } catch {
             /* ignore unreadable sibling */
           }
@@ -522,7 +594,9 @@ function WorkerEditor({
         await Promise.all(
           files.map(async (f) => {
             try {
-              const text = (await getLibFile({ query: { path: f }, throwOnError: true })).data;
+              const text = (
+                await getLibFile({ query: { path: f }, throwOnError: true })
+              ).data;
               models.push({ path: `file:///lib/${f}`, content: text });
             } catch {
               /* ignore */
@@ -544,7 +618,11 @@ function WorkerEditor({
   useEffect(() => {
     let cancelled = false;
     setLoadedFile(null);
-    getWorkerFile({ path: { name: worker.name }, query: { path: file }, throwOnError: true })
+    getWorkerFile({
+      path: { name: worker.name },
+      query: { path: file },
+      throwOnError: true,
+    })
       .then(({ data: text }) => {
         if (!cancelled) {
           setContent(text);
@@ -552,7 +630,11 @@ function WorkerEditor({
           setDirty(false);
         }
       })
-      .catch((e) => !cancelled && flash("err", e instanceof Error ? e.message : String(e)));
+      .catch(
+        (e) =>
+          !cancelled &&
+          flash("err", e instanceof Error ? e.message : String(e)),
+      );
     return () => {
       cancelled = true;
     };
@@ -561,7 +643,12 @@ function WorkerEditor({
 
   async function save() {
     try {
-      await saveWorkerFile({ path: { name: worker.name }, query: { path: file }, body: content, throwOnError: true });
+      await saveWorkerFile({
+        path: { name: worker.name },
+        query: { path: file },
+        body: content,
+        throwOnError: true,
+      });
       setDirty(false);
       flash("ok", `Saved ${file}.`);
     } catch (e) {
@@ -573,7 +660,11 @@ function WorkerEditor({
     const path = prompt("New file name (e.g. helper.ts):")?.trim();
     if (!path) return;
     try {
-      await createWorkerFile({ path: { name: worker.name }, body: { path }, throwOnError: true });
+      await createWorkerFile({
+        path: { name: worker.name },
+        body: { path },
+        throwOnError: true,
+      });
       onChanged();
       setFile(path);
       flash("ok", `Created ${path}.`);
@@ -585,7 +676,11 @@ function WorkerEditor({
   async function deleteFile() {
     if (!confirm(`Delete file '${file}'?`)) return;
     try {
-      await deleteWorkerFile({ path: { name: worker.name }, query: { path: file }, throwOnError: true });
+      await deleteWorkerFile({
+        path: { name: worker.name },
+        query: { path: file },
+        throwOnError: true,
+      });
       onChanged();
       setFile(worker.files.find((f) => f !== file) ?? "worker.ts");
       flash("ok", `Deleted ${file}.`);
@@ -596,14 +691,17 @@ function WorkerEditor({
 
   const b = phaseBadge(worker.runtime.status);
   const m = worker.runtime.metrics;
-  const active = worker.runtime.status === "running" || worker.runtime.status === "starting";
+  const active =
+    worker.runtime.status === "running" || worker.runtime.status === "starting";
 
   return (
     <>
       {/* Toolbar */}
       <div className="flex flex-wrap items-center gap-2 border-b border-edge px-4 py-2">
         <span className="font-medium text-fg">{worker.name}</span>
-        <span className={`rounded px-1.5 py-0.5 text-xs ${b.cls}`}>{b.label}</span>
+        <span className={`rounded px-1.5 py-0.5 text-xs ${b.cls}`}>
+          {b.label}
+        </span>
         <div className="flex-1" />
         <span className="text-xs text-fg-faint">
           {m.completed} done · {m.failed} failed · {m.throughput.toFixed(1)}/s
@@ -651,7 +749,10 @@ function WorkerEditor({
             {f}
           </button>
         ))}
-        <button onClick={newFile} className="ml-1 rounded px-2 py-1 text-fg-faint hover:text-fg">
+        <button
+          onClick={newFile}
+          className="ml-1 rounded px-2 py-1 text-fg-faint hover:text-fg"
+        >
           + file
         </button>
         <div className="flex-1" />
@@ -673,7 +774,9 @@ function WorkerEditor({
       {/* Code editor (Monaco) */}
       <div className="min-h-0 flex-1 bg-[#1e1e1e]">
         <Suspense
-          fallback={<div className="p-4 text-sm text-fg-faint">Loading editor…</div>}
+          fallback={
+            <div className="p-4 text-sm text-fg-faint">Loading editor…</div>
+          }
         >
           <CodeEditor
             value={loadedFile === file ? content : ""}
@@ -699,7 +802,11 @@ function WorkerEditor({
 
 // Shared library editor — CRUD for reusable `@lib/…` modules that every worker
 // can import. Mirrors the worker file editor but without runtime controls.
-function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) => void }) {
+function LibraryEditor({
+  flash,
+}: {
+  flash: (kind: "ok" | "err", text: string) => void;
+}) {
   const [files, setFiles] = useState<string[]>([]);
   const [file, setFile] = useState<string | null>(null);
   const [content, setContent] = useState<string>("");
@@ -716,7 +823,12 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
       await Promise.all(
         files.map(async (f) => {
           try {
-            models.push({ path: `file:///lib/${f}`, content: (await getLibFile({ query: { path: f }, throwOnError: true })).data });
+            models.push({
+              path: `file:///lib/${f}`,
+              content: (
+                await getLibFile({ query: { path: f }, throwOnError: true })
+              ).data,
+            });
           } catch {
             /* ignore */
           }
@@ -752,7 +864,11 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
           setDirty(false);
         }
       })
-      .catch((e) => !cancelled && flash("err", e instanceof Error ? e.message : String(e)));
+      .catch(
+        (e) =>
+          !cancelled &&
+          flash("err", e instanceof Error ? e.message : String(e)),
+      );
     return () => {
       cancelled = true;
     };
@@ -762,7 +878,11 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
   async function save() {
     if (!file) return;
     try {
-      await saveLibFile({ query: { path: file }, body: content, throwOnError: true });
+      await saveLibFile({
+        query: { path: file },
+        body: content,
+        throwOnError: true,
+      });
       setDirty(false);
       flash("ok", `Saved @lib/${file}.`);
       void loadList(file);
@@ -804,7 +924,9 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
           import … from "@lib/…"
         </span>
         <div className="flex-1" />
-        <span className="text-xs text-fg-faint">Reusable across every worker.</span>
+        <span className="text-xs text-fg-faint">
+          Reusable across every worker.
+        </span>
       </div>
 
       <div className="flex items-center gap-1 border-b border-edge px-3 py-1.5 text-xs">
@@ -821,7 +943,10 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
             {f}
           </button>
         ))}
-        <button onClick={newFile} className="ml-1 rounded px-2 py-1 text-fg-faint hover:text-fg">
+        <button
+          onClick={newFile}
+          className="ml-1 rounded px-2 py-1 text-fg-faint hover:text-fg"
+        >
           + file
         </button>
         <div className="flex-1" />
@@ -845,7 +970,9 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
       <div className="min-h-0 flex-1 bg-[#1e1e1e]">
         {file ? (
           <Suspense
-            fallback={<div className="p-4 text-sm text-fg-faint">Loading editor…</div>}
+            fallback={
+              <div className="p-4 text-sm text-fg-faint">Loading editor…</div>
+            }
           >
             <CodeEditor
               value={loadedFile === file ? content : ""}
@@ -870,7 +997,10 @@ function LibraryEditor({ flash }: { flash: (kind: "ok" | "err", text: string) =>
             </Button>
             <p className="max-w-sm text-center text-xs text-fg-faint">
               Drop a module here and import it from any worker with{" "}
-              <span className="font-mono">import {"{ … }"} from "@lib/your-file.ts"</span>.
+              <span className="font-mono">
+                import {"{ … }"} from "@lib/your-file.ts"
+              </span>
+              .
             </p>
           </div>
         )}
@@ -885,7 +1015,9 @@ function LogPanel({ worker }: { worker: string }) {
 
   useEffect(() => {
     setLines([]);
-    const src = new EventSource(`/console/api/workers/${encodeURIComponent(worker)}/logs`);
+    const src = new EventSource(
+      `/console/api/workers/${encodeURIComponent(worker)}/logs`,
+    );
     src.addEventListener("log", (ev) => {
       try {
         const line = JSON.parse((ev as MessageEvent).data) as WorkerLogLine;
@@ -906,7 +1038,9 @@ function LogPanel({ worker }: { worker: string }) {
 
   return (
     <div className="h-44 shrink-0 overflow-auto border-t border-edge bg-inset p-2 font-mono text-xs">
-      {lines.length === 0 && <div className="text-fg-faint">No log output yet.</div>}
+      {lines.length === 0 && (
+        <div className="text-fg-faint">No log output yet.</div>
+      )}
       {lines.map((l, i) => (
         <div
           key={i}

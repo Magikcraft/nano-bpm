@@ -32,7 +32,11 @@ export interface EnvModdle {
 }
 
 export interface EnvModeling {
-  updateModdleProperties(element: unknown, moddleElement: unknown, props: Record<string, unknown>): void;
+  updateModdleProperties(
+    element: unknown,
+    moddleElement: unknown,
+    props: Record<string, unknown>,
+  ): void;
 }
 
 export type EnvelopeField = "inputType" | "outputType";
@@ -65,17 +69,25 @@ export interface EnvelopeContext {
 }
 
 // The `bpmn:Message` a message-bearing element references, if any.
-export function referencedMessage(bo: EnvModdleElement | undefined): EnvModdleElement | undefined {
+export function referencedMessage(
+  bo: EnvModdleElement | undefined,
+): EnvModdleElement | undefined {
   if (!bo) return undefined;
   if (bo.$type === "bpmn:ReceiveTask") return bo.messageRef;
-  const evd = (bo.eventDefinitions ?? []).find((d) => d.$type === "bpmn:MessageEventDefinition");
+  const evd = (bo.eventDefinitions ?? []).find(
+    (d) => d.$type === "bpmn:MessageEventDefinition",
+  );
   return evd?.messageRef;
 }
 
 // The linked form id a user task references via `zeebe:FormDefinition:formId`
 // (a Camunda "linked form"), if any. An inline `formKey`/embedded form has no id.
-export function userTaskFormId(bo: EnvModdleElement | undefined): string | undefined {
-  const fd = (bo?.extensionElements?.values ?? []).find((v) => v.$type === "zeebe:FormDefinition");
+export function userTaskFormId(
+  bo: EnvModdleElement | undefined,
+): string | undefined {
+  const fd = (bo?.extensionElements?.values ?? []).find(
+    (v) => v.$type === "zeebe:FormDefinition",
+  );
   const id = fd?.formId;
   return typeof id === "string" && id ? id : undefined;
 }
@@ -91,23 +103,35 @@ export function envelopeContext(
   const msg = referencedMessage(bo);
   if (msg) return { target: msg };
   if (SERVICE_TASK_TYPES.has(element.type)) {
-    const td = (bo.extensionElements?.values ?? []).find((v) => v.$type === "zeebe:TaskDefinition");
+    const td = (bo.extensionElements?.values ?? []).find(
+      (v) => v.$type === "zeebe:TaskDefinition",
+    );
     const t = td?.type;
     // Only a literal (non-FEEL) task type keys a worker; skip `=expr` types.
     if (typeof t !== "string" || !t || t.startsWith("=")) return undefined;
     return { target: bo, taskType: t };
   }
-  if (element.type === "bpmn:UserTask") return { target: bo, formId: userTaskFormId(bo) };
+  if (element.type === "bpmn:UserTask")
+    return { target: bo, formId: userTaskFormId(bo) };
   return undefined;
 }
 
-export function zeebePropsContainer(bo: EnvModdleElement | undefined): EnvModdleElement | undefined {
-  return (bo?.extensionElements?.values ?? []).find((v) => v.$type === "zeebe:Properties");
+export function zeebePropsContainer(
+  bo: EnvModdleElement | undefined,
+): EnvModdleElement | undefined {
+  return (bo?.extensionElements?.values ?? []).find(
+    (v) => v.$type === "zeebe:Properties",
+  );
 }
 
 // Read the envelope ref currently on `target` (or "" when unset).
-export function readEnvelope(target: EnvModdleElement | undefined, field: EnvelopeField): string {
-  const p = (zeebePropsContainer(target)?.properties ?? []).find((x) => x.name === ENVELOPE_KEY[field]);
+export function readEnvelope(
+  target: EnvModdleElement | undefined,
+  field: EnvelopeField,
+): string {
+  const p = (zeebePropsContainer(target)?.properties ?? []).find(
+    (x) => x.name === ENVELOPE_KEY[field],
+  );
   return p && typeof p.value === "string" ? p.value : "";
 }
 
@@ -125,7 +149,9 @@ export function writeEnvelope(
   const name = ENVELOPE_KEY[field];
   const container = zeebePropsContainer(target);
   const kept = (container?.properties ?? []).filter((p) => p.name !== name);
-  const props = value ? [...kept, moddle.create("zeebe:Property", { name, value })] : kept;
+  const props = value
+    ? [...kept, moddle.create("zeebe:Property", { name, value })]
+    : kept;
   if (container) {
     for (const p of props) p.$parent = container;
     modeling.updateModdleProperties(element, container, { properties: props });
@@ -136,11 +162,17 @@ export function writeEnvelope(
   const ext = target.extensionElements;
   if (ext) {
     newContainer.$parent = ext;
-    modeling.updateModdleProperties(element, ext, { values: [...(ext.values ?? []), newContainer] });
+    modeling.updateModdleProperties(element, ext, {
+      values: [...(ext.values ?? []), newContainer],
+    });
   } else {
-    const newExt = moddle.create("bpmn:ExtensionElements", { values: [newContainer] });
+    const newExt = moddle.create("bpmn:ExtensionElements", {
+      values: [newContainer],
+    });
     newContainer.$parent = newExt;
     newExt.$parent = target;
-    modeling.updateModdleProperties(element, target, { extensionElements: newExt });
+    modeling.updateModdleProperties(element, target, {
+      extensionElements: newExt,
+    });
   }
 }

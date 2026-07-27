@@ -18,9 +18,7 @@ import {
 } from "./manifestSchema.ts";
 
 test("registers the bundled schema without remote requests", () => {
-  const opts = buildManifestSchemaOptions(
-    appSchema as Record<string, unknown>,
-  );
+  const opts = buildManifestSchemaOptions(appSchema as Record<string, unknown>);
   // Validation on…
   assert.equal(opts.validate, true);
   // …but never over the network — this is the property whose default (true)
@@ -30,9 +28,7 @@ test("registers the bundled schema without remote requests", () => {
 });
 
 test("keys the schema under the canonical + legacy-alias URLs", () => {
-  const opts = buildManifestSchemaOptions(
-    appSchema as Record<string, unknown>,
-  );
+  const opts = buildManifestSchemaOptions(appSchema as Record<string, unknown>);
   const uris = new Set((opts.schemas ?? []).map((s) => s.uri));
   for (const u of APP_SCHEMA_URIS) assert.ok(uris.has(u), `missing ${u}`);
   // Canonical `nanobpm.io` host.
@@ -57,9 +53,7 @@ test("the schema's own $id is one of the registered URLs", () => {
 });
 
 test("associates by file name for missing/stale $schema", () => {
-  const opts = buildManifestSchemaOptions(
-    appSchema as Record<string, unknown>,
-  );
+  const opts = buildManifestSchemaOptions(appSchema as Record<string, unknown>);
   for (const entry of opts.schemas ?? []) {
     assert.deepEqual(entry.fileMatch, [...APP_MANIFEST_FILE_MATCH]);
   }
@@ -69,9 +63,7 @@ test("associates by file name for missing/stale $schema", () => {
 });
 
 test("passes the bundled schema object through verbatim", () => {
-  const opts = buildManifestSchemaOptions(
-    appSchema as Record<string, unknown>,
-  );
+  const opts = buildManifestSchemaOptions(appSchema as Record<string, unknown>);
   for (const entry of opts.schemas ?? []) {
     assert.equal(entry.schema, appSchema);
   }

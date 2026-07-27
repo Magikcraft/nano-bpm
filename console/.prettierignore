@@ -1,0 +1,16 @@
+# Build output and precompressed assets.
+dist
+dist-observe
+
+# Generated API client — owned by `npm run gen:api` (openapi-ts), not authored.
+src/gen
+
+# Generated in-browser engine (wasm-pack output).
+src/wasm
+
+# Vendored / copied third-party assets and docs bundles produced by build scripts.
+public
+node_modules
+
+# Lockfile and machine-generated data.
+package-lock.json

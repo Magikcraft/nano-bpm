@@ -23,9 +23,7 @@ export const nanoShapesModdle = {
     {
       name: "Shapes",
       superClass: ["Element"],
-      properties: [
-        { name: "shapes", type: "Shape", isMany: true },
-      ],
+      properties: [{ name: "shapes", type: "Shape", isMany: true }],
     },
     {
       name: "Shape",
@@ -42,9 +40,7 @@ export const nanoShapesModdle = {
     {
       name: "Carry",
       superClass: ["ShapeOp"],
-      properties: [
-        { name: "ref", type: "String", isAttr: true },
-      ],
+      properties: [{ name: "ref", type: "String", isAttr: true }],
     },
     {
       name: "Project",

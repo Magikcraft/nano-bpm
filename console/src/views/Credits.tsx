@@ -265,8 +265,8 @@ export default function Credits() {
           <Section title="The Camunda Engineering Community">
             <p className="mb-6 max-w-lg text-sm leading-relaxed text-fg-faint">
               {credits.counts.total} contributors across the Camunda platform,
-              Zeebe, FEEL, and the bpmn-io modeling toolkit — everyone whose work
-              Nano stands on.
+              Zeebe, FEEL, and the bpmn-io modeling toolkit — everyone whose
+              work Nano stands on.
             </p>
             <div className="grid grid-cols-2 gap-x-10 gap-y-2 text-lg text-fg-muted sm:grid-cols-3">
               {credits.cast.map((n) => (

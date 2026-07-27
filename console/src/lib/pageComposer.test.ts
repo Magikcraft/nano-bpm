@@ -21,7 +21,11 @@ const witness: PageDoc = {
   schemaVersion: PAGE_SCHEMA_VERSION,
   title: "PR Review Convergence",
   nodes: [
-    { type: "text", id: "h1", props: { text: "PR Review Convergence", variant: "heading" } },
+    {
+      type: "text",
+      id: "h1",
+      props: { text: "PR Review Convergence", variant: "heading" },
+    },
     {
       type: "actionForm",
       id: "submit",
@@ -29,7 +33,9 @@ const witness: PageDoc = {
         title: "Submit PR",
         submitLabel: "Submit PR",
         action: { kind: "startProcess", process: "convergence-loop" },
-        fields: [{ key: "pr", label: "owner/repo#123 or PR URL", type: "text" }],
+        fields: [
+          { key: "pr", label: "owner/repo#123 or PR URL", type: "text" },
+        ],
       },
     },
     {
@@ -66,7 +72,10 @@ test("parsePageDoc rejects an unknown node type", () => {
     nodes: [{ type: "chart", id: "c1", props: {} }],
   });
   assert.ok(!r.ok);
-  assert.match((r as { errors: string[] }).errors.join(" "), /not a known node type/);
+  assert.match(
+    (r as { errors: string[] }).errors.join(" "),
+    /not a known node type/,
+  );
 });
 
 test("parsePageDoc rejects a duplicate node id", () => {
@@ -89,7 +98,11 @@ test("parsePageDoc coerces missing/bad props to canonical defaults", () => {
     nodes: [{ type: "text", id: "t", props: { variant: "nope" } }],
   });
   assert.ok(r.ok);
-  assert.deepEqual(r.ok && r.doc.nodes[0], { type: "text", id: "t", props: { text: "", variant: "body" } });
+  assert.deepEqual(r.ok && r.doc.nodes[0], {
+    type: "text",
+    id: "t",
+    props: { text: "", variant: "body" },
+  });
 });
 
 test("wrong schemaVersion is an error", () => {
@@ -113,18 +126,31 @@ test("toPageDoc skips unknown Craft components + preserves child order", () => {
       isCanvas: true,
       nodes: ["a", "ghost", "b"],
     },
-    a: { type: { resolvedName: "TextNode" }, props: { text: "A", variant: "body" } },
+    a: {
+      type: { resolvedName: "TextNode" },
+      props: { text: "A", variant: "body" },
+    },
     ghost: { type: { resolvedName: "UnknownWidget" }, props: {} },
-    b: { type: { resolvedName: "TextNode" }, props: { text: "B", variant: "sub" } },
+    b: {
+      type: { resolvedName: "TextNode" },
+      props: { text: "B", variant: "sub" },
+    },
   };
   const doc = toPageDoc(state, "T");
-  assert.deepEqual(doc.nodes.map((n) => n.id), ["a", "b"]);
+  assert.deepEqual(
+    doc.nodes.map((n) => n.id),
+    ["a", "b"],
+  );
 });
 
 test("makeNode produces a validatable node of the requested type", () => {
   for (const type of ["text", "actionForm", "dataGrid"] as const) {
     const n = makeNode(type);
-    const r = parsePageDoc({ schemaVersion: PAGE_SCHEMA_VERSION, title: "x", nodes: [n] });
+    const r = parsePageDoc({
+      schemaVersion: PAGE_SCHEMA_VERSION,
+      title: "x",
+      nodes: [n],
+    });
     assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
     assert.equal(n.type, type);
   }

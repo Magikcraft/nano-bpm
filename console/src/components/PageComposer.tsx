@@ -51,22 +51,35 @@ interface PageComposerProps {
 
 const useSelectableRef = () => {
   // Attach the drag/select connectors so a node is clickable on the canvas.
-  const { connectors: { connect, drag } } = useNode();
+  const {
+    connectors: { connect, drag },
+  } = useNode();
   return (el: HTMLElement | null) => {
     if (el) connect(drag(el));
   };
 };
 
-const TextNode: UserComponent<{ text: string; variant: TextVariant }> = ({ text, variant }) => {
+const TextNode: UserComponent<{ text: string; variant: TextVariant }> = ({
+  text,
+  variant,
+}) => {
   const ref = useSelectableRef();
-  const cls = variant === "heading" ? "pc-heading" : variant === "sub" ? "pc-sub" : "pc-body";
+  const cls =
+    variant === "heading"
+      ? "pc-heading"
+      : variant === "sub"
+        ? "pc-sub"
+        : "pc-body";
   return (
     <div ref={ref} className={`pc-node ${cls}`}>
       {text || <span className="opacity-40">Text</span>}
     </div>
   );
 };
-TextNode.craft = { displayName: "TextNode", props: { text: "Text", variant: "body" } };
+TextNode.craft = {
+  displayName: "TextNode",
+  props: { text: "Text", variant: "body" },
+};
 
 const ActionFormNode: UserComponent<{
   title: string;
@@ -84,8 +97,12 @@ const ActionFormNode: UserComponent<{
           <input disabled placeholder={f.label || f.key} />
         </div>
       ))}
-      <button className="pc-btn" disabled>{submitLabel || "Submit"}</button>
-      <div className="pc-bind">→ start <code>{action?.process || "(pick a process)"}</code></div>
+      <button className="pc-btn" disabled>
+        {submitLabel || "Submit"}
+      </button>
+      <div className="pc-bind">
+        → start <code>{action?.process || "(pick a process)"}</code>
+      </div>
     </div>
   );
 };
@@ -110,10 +127,21 @@ const DataGridNode: UserComponent<{
       {title && <div className="pc-card-title">{title}</div>}
       <table className="pc-grid">
         <thead>
-          <tr>{(columns ?? []).map((c) => <th key={c.field}>{c.header || c.field}</th>)}</tr>
+          <tr>
+            {(columns ?? []).map((c) => (
+              <th key={c.field}>{c.header || c.field}</th>
+            ))}
+          </tr>
         </thead>
         <tbody>
-          <tr><td colSpan={Math.max(columns?.length ?? 1, 1)} className="opacity-40">rows from {data?.table || "(pick a table)"}</td></tr>
+          <tr>
+            <td
+              colSpan={Math.max(columns?.length ?? 1, 1)}
+              className="opacity-40"
+            >
+              rows from {data?.table || "(pick a table)"}
+            </td>
+          </tr>
         </tbody>
       </table>
     </div>
@@ -121,14 +149,27 @@ const DataGridNode: UserComponent<{
 };
 DataGridNode.craft = {
   displayName: "DataGridNode",
-  props: { title: "Data", data: { kind: "datasource", source: "app", table: "" }, columns: [] },
+  props: {
+    title: "Data",
+    data: { kind: "datasource", source: "app", table: "" },
+    columns: [],
+  },
 };
 
 // The root canvas that hosts the ordered node list.
-const PageCanvas: UserComponent<{ children?: React.ReactNode }> = ({ children }) => {
-  const { connectors: { connect } } = useNode();
+const PageCanvas: UserComponent<{ children?: React.ReactNode }> = ({
+  children,
+}) => {
+  const {
+    connectors: { connect },
+  } = useNode();
   return (
-    <div ref={(el) => { if (el) connect(el); }} className="pc-canvas">
+    <div
+      ref={(el) => {
+        if (el) connect(el);
+      }}
+      className="pc-canvas"
+    >
       {children}
     </div>
   );
@@ -148,9 +189,45 @@ function Palette(): ReactElement {
   return (
     <div className="pc-palette">
       <div className="pc-palette-title">Components</div>
-      <button className="pc-palette-item" onClick={() => add(<Element is={TextNode} text="Text" variant="body" />)}>+ Text</button>
-      <button className="pc-palette-item" onClick={() => add(<Element is={ActionFormNode} title="Action" submitLabel="Submit" action={{ kind: "startProcess", process: "" }} fields={[{ key: "input", label: "Input", type: "text" }]} />)}>+ Action form</button>
-      <button className="pc-palette-item" onClick={() => add(<Element is={DataGridNode} title="Data" data={{ kind: "datasource", source: "app", table: "" }} columns={[]} />)}>+ Data grid</button>
+      <button
+        className="pc-palette-item"
+        onClick={() =>
+          add(<Element is={TextNode} text="Text" variant="body" />)
+        }
+      >
+        + Text
+      </button>
+      <button
+        className="pc-palette-item"
+        onClick={() =>
+          add(
+            <Element
+              is={ActionFormNode}
+              title="Action"
+              submitLabel="Submit"
+              action={{ kind: "startProcess", process: "" }}
+              fields={[{ key: "input", label: "Input", type: "text" }]}
+            />,
+          )
+        }
+      >
+        + Action form
+      </button>
+      <button
+        className="pc-palette-item"
+        onClick={() =>
+          add(
+            <Element
+              is={DataGridNode}
+              title="Data"
+              data={{ kind: "datasource", source: "app", table: "" }}
+              columns={[]}
+            />,
+          )
+        }
+      >
+        + Data grid
+      </button>
     </div>
   );
 }
@@ -173,23 +250,38 @@ function splitQualifiedTable(value: string): { source: string; table: string } {
   return { source: value.slice(0, dot), table: value.slice(dot + 1) };
 }
 
-function Settings({ entities, processes }: { entities: ComposerEntity[]; processes: string[] }): ReactElement {
+function Settings({
+  entities,
+  processes,
+}: {
+  entities: ComposerEntity[];
+  processes: string[];
+}): ReactElement {
   const { selectedId, name, props, actions } = useEditor((state, query) => {
     const id = Array.from(state.events.selected)[0];
     return {
       selectedId: id,
       name: id ? query.node(id).get().data.displayName : undefined,
-      props: id ? (query.node(id).get().data.props as Record<string, unknown>) : undefined,
+      props: id
+        ? (query.node(id).get().data.props as Record<string, unknown>)
+        : undefined,
     };
   });
   if (!selectedId || !props) {
-    return <div className="pc-settings"><div className="pc-empty">Select a component to edit it.</div></div>;
+    return (
+      <div className="pc-settings">
+        <div className="pc-empty">Select a component to edit it.</div>
+      </div>
+    );
   }
   const set = (key: string, value: unknown) =>
-    actions.setProp(selectedId, (p: Record<string, unknown>) => { p[key] = value; });
+    actions.setProp(selectedId, (p: Record<string, unknown>) => {
+      p[key] = value;
+    });
 
   const tables = entities.filter((e) => e.kind === "table");
-  const tableFields = (table: string) => tables.find((t) => t.id === table)?.fields ?? [];
+  const tableFields = (table: string) =>
+    tables.find((t) => t.id === table)?.fields ?? [];
 
   return (
     <div className="pc-settings">
@@ -198,10 +290,16 @@ function Settings({ entities, processes }: { entities: ComposerEntity[]; process
       {name === "TextNode" && (
         <>
           <Row label="Text">
-            <input value={String(props.text ?? "")} onChange={(e) => set("text", e.target.value)} />
+            <input
+              value={String(props.text ?? "")}
+              onChange={(e) => set("text", e.target.value)}
+            />
           </Row>
           <Row label="Variant">
-            <select value={String(props.variant ?? "body")} onChange={(e) => set("variant", e.target.value)}>
+            <select
+              value={String(props.variant ?? "body")}
+              onChange={(e) => set("variant", e.target.value)}
+            >
               <option value="heading">heading</option>
               <option value="body">body</option>
               <option value="sub">sub</option>
@@ -213,26 +311,55 @@ function Settings({ entities, processes }: { entities: ComposerEntity[]; process
       {name === "ActionFormNode" && (
         <>
           <Row label="Title">
-            <input value={String(props.title ?? "")} onChange={(e) => set("title", e.target.value)} />
+            <input
+              value={String(props.title ?? "")}
+              onChange={(e) => set("title", e.target.value)}
+            />
           </Row>
           <Row label="Submit label">
-            <input value={String(props.submitLabel ?? "")} onChange={(e) => set("submitLabel", e.target.value)} />
+            <input
+              value={String(props.submitLabel ?? "")}
+              onChange={(e) => set("submitLabel", e.target.value)}
+            />
           </Row>
           <Row label="Start process">
             <input
               list="pc-processes"
-              value={String((props.action as { process?: string })?.process ?? "")}
-              onChange={(e) => set("action", { kind: "startProcess", process: e.target.value })}
+              value={String(
+                (props.action as { process?: string })?.process ?? "",
+              )}
+              onChange={(e) =>
+                set("action", { kind: "startProcess", process: e.target.value })
+              }
             />
             <datalist id="pc-processes">
-              {processes.map((p) => <option key={p} value={p} />)}
+              {processes.map((p) => (
+                <option key={p} value={p} />
+              ))}
             </datalist>
           </Row>
           <ListEditor
             label="Fields"
-            rows={((props.fields as ActionFormField[]) ?? []) as unknown as Record<string, string>[]}
-            columns={[{ key: "key", label: "key" }, { key: "label", label: "label" }]}
-            onChange={(rows) => set("fields", rows.map((r) => ({ key: r.key ?? "", label: r.label ?? "", type: "text" })))}
+            rows={
+              ((props.fields as ActionFormField[]) ?? []) as unknown as Record<
+                string,
+                string
+              >[]
+            }
+            columns={[
+              { key: "key", label: "key" },
+              { key: "label", label: "label" },
+            ]}
+            onChange={(rows) =>
+              set(
+                "fields",
+                rows.map((r) => ({
+                  key: r.key ?? "",
+                  label: r.label ?? "",
+                  type: "text",
+                })),
+              )
+            }
           />
         </>
       )}
@@ -240,40 +367,90 @@ function Settings({ entities, processes }: { entities: ComposerEntity[]; process
       {name === "DataGridNode" && (
         <>
           <Row label="Title">
-            <input value={String(props.title ?? "")} onChange={(e) => set("title", e.target.value)} />
+            <input
+              value={String(props.title ?? "")}
+              onChange={(e) => set("title", e.target.value)}
+            />
           </Row>
           <Row label="Table">
             <input
               list="pc-tables"
-              value={qualifyTable(props.data as { source?: string; table?: string })}
-              onChange={(e) => set("data", { kind: "datasource", ...splitQualifiedTable(e.target.value) })}
+              value={qualifyTable(
+                props.data as { source?: string; table?: string },
+              )}
+              onChange={(e) =>
+                set("data", {
+                  kind: "datasource",
+                  ...splitQualifiedTable(e.target.value),
+                })
+              }
             />
             <datalist id="pc-tables">
-              {tables.map((t) => <option key={t.id} value={t.id} />)}
+              {tables.map((t) => (
+                <option key={t.id} value={t.id} />
+              ))}
             </datalist>
           </Row>
           <ListEditor
             label="Columns"
-            rows={((props.columns as GridColumn[]) ?? []) as unknown as Record<string, string>[]}
-            columns={[{ key: "field", label: "field" }, { key: "header", label: "header" }]}
-            suggestions={tableFields(qualifyTable(props.data as { source?: string; table?: string }))}
-            onChange={(rows) => set("columns", rows.map((r) => ({ field: r.field ?? "", header: r.header ?? "" })))}
+            rows={
+              ((props.columns as GridColumn[]) ?? []) as unknown as Record<
+                string,
+                string
+              >[]
+            }
+            columns={[
+              { key: "field", label: "field" },
+              { key: "header", label: "header" },
+            ]}
+            suggestions={tableFields(
+              qualifyTable(props.data as { source?: string; table?: string }),
+            )}
+            onChange={(rows) =>
+              set(
+                "columns",
+                rows.map((r) => ({
+                  field: r.field ?? "",
+                  header: r.header ?? "",
+                })),
+              )
+            }
           />
         </>
       )}
 
-      <button className="pc-btn-danger" onClick={() => actions.delete(selectedId)}>Remove component</button>
+      <button
+        className="pc-btn-danger"
+        onClick={() => actions.delete(selectedId)}
+      >
+        Remove component
+      </button>
     </div>
   );
 }
 
-function Row({ label, children }: { label: string; children: React.ReactNode }): ReactElement {
-  return <label className="pc-row"><span>{label}</span>{children}</label>;
+function Row({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}): ReactElement {
+  return (
+    <label className="pc-row">
+      <span>{label}</span>
+      {children}
+    </label>
+  );
 }
 
 /** A tiny repeated-row editor for `fields`/`columns`. */
 function ListEditor({
-  label, rows, columns, suggestions, onChange,
+  label,
+  rows,
+  columns,
+  suggestions,
+  onChange,
 }: {
   label: string;
   rows: Record<string, string>[];
@@ -288,7 +465,9 @@ function ListEditor({
   const listId = `pc-sugg-${label}`;
   return (
     <div className="pc-list">
-      <div className="pc-row"><span>{label}</span></div>
+      <div className="pc-row">
+        <span>{label}</span>
+      </div>
       {rows.map((r, i) => (
         <div key={i} className="pc-list-row">
           {columns.map((c) => (
@@ -300,21 +479,46 @@ function ListEditor({
               onChange={(e) => update(i, c.key, e.target.value)}
             />
           ))}
-          <button className="pc-btn-danger" onClick={() => onChange(rows.filter((_, j) => j !== i))}>×</button>
+          <button
+            className="pc-btn-danger"
+            onClick={() => onChange(rows.filter((_, j) => j !== i))}
+          >
+            ×
+          </button>
         </div>
       ))}
-      {suggestions && <datalist id={listId}>{suggestions.map((s) => <option key={s} value={s} />)}</datalist>}
-      <button className="pc-palette-item" onClick={() => onChange([...rows, Object.fromEntries(columns.map((c) => [c.key, ""]))])}>+ add</button>
+      {suggestions && (
+        <datalist id={listId}>
+          {suggestions.map((s) => (
+            <option key={s} value={s} />
+          ))}
+        </datalist>
+      )}
+      <button
+        className="pc-palette-item"
+        onClick={() =>
+          onChange([
+            ...rows,
+            Object.fromEntries(columns.map((c) => [c.key, ""])),
+          ])
+        }
+      >
+        + add
+      </button>
     </div>
   );
 }
 
 // ── the imperative bridge (get/set page.json from inside <Editor>) ───────────
 
-const Bridge = forwardRef<PageComposerHandle, { title: string; onTitleChange: (t: string) => void }>(
-  function Bridge({ title, onTitleChange }, ref) {
-    const { query, actions } = useEditor();
-    useImperativeHandle(ref, () => ({
+const Bridge = forwardRef<
+  PageComposerHandle,
+  { title: string; onTitleChange: (t: string) => void }
+>(function Bridge({ title, onTitleChange }, ref) {
+  const { query, actions } = useEditor();
+  useImperativeHandle(
+    ref,
+    () => ({
       getPageJson(): string {
         const state = JSON.parse(query.serialize()) as CraftState;
         const doc = toPageDoc(state, title);
@@ -336,10 +540,11 @@ const Bridge = forwardRef<PageComposerHandle, { title: string; onTitleChange: (t
         onTitleChange(doc.title);
         actions.deserialize(JSON.stringify(fromPageDoc(doc)));
       },
-    }), [query, actions, title, onTitleChange]);
-    return null;
-  },
-);
+    }),
+    [query, actions, title, onTitleChange],
+  );
+  return null;
+});
 
 // ── the exported surface ─────────────────────────────────────────────────────
 
@@ -357,7 +562,10 @@ const PageComposer = forwardRef<PageComposerHandle, PageComposerProps>(
               <input
                 className="pc-title-input"
                 value={title}
-                onChange={(e) => { setTitle(e.target.value); onChange?.(); }}
+                onChange={(e) => {
+                  setTitle(e.target.value);
+                  onChange?.();
+                }}
               />
             </label>
           </div>

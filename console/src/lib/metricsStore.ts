@@ -1,4 +1,9 @@
-import { getClusterMetrics, getMetrics, type ClusterMetrics, type MetricsSnapshot } from "../gen";
+import {
+  getClusterMetrics,
+  getMetrics,
+  type ClusterMetrics,
+  type MetricsSnapshot,
+} from "../gen";
 
 /// Module-level metrics collector. It polls continuously for the lifetime of the
 /// app (not just while the Metrics view is mounted) so users can navigate away
@@ -39,7 +44,8 @@ let state: MetricsState = {
 };
 
 let prev: MetricsSnapshot | null = null;
-let clusterPrev: { t: number; creates: number; completions: number } | null = null;
+let clusterPrev: { t: number; creates: number; completions: number } | null =
+  null;
 let localTimer: ReturnType<typeof setInterval> | null = null;
 let clusterTimer: ReturnType<typeof setInterval> | null = null;
 const listeners = new Set<() => void>();

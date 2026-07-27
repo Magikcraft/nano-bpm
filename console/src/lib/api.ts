@@ -61,13 +61,53 @@ async function getProjectFile(path: string): Promise<ProjectFile> {
 
 /// Reads a project file, surfacing the binary/text distinction (see
 /// `ProjectFile`). Used by the project workspace editor.
-export function projectFileEx(name: string, path: string): Promise<ProjectFile> {
+export function projectFileEx(
+  name: string,
+  path: string,
+): Promise<ProjectFile> {
   return getProjectFile(
     `/projects/${encodeURIComponent(name)}/file?path=${encodeURIComponent(path)}`,
   );
 }
 
-// --- Worker log stream (SSE) -----------------------------------------------
+// --- Import-by-reference filesystem browser (loopback only) ----------------
+
+/// One sub-directory returned by the host filesystem browser.
+export interface BrowseEntry {
+  name: string;
+  path: string;
+  isNanoApp: boolean;
+}
+
+/// A single level of the host filesystem, for the Import-by-reference picker.
+export interface BrowseResult {
+  path: string;
+  parent: string | null;
+  isNanoApp: boolean;
+  entries: BrowseEntry[];
+}
+
+/// True when the console is being viewed over a loopback origin, in which case
+/// the server's filesystem browser (`browseFilesystem`) is reachable. Off
+/// localhost the Import panel keeps the plain typed-path field only.
+export function isLocalhost(): boolean {
+  const h = window.location.hostname;
+  return h === "localhost" || h === "127.0.0.1" || h === "::1" || h === "[::1]";
+}
+
+/// Lists the immediate sub-directories of an absolute host path so the
+/// Import-by-reference dialog can browse to a checked-out app. Omit `path` to
+/// open on the server's home directory. Loopback-only server-side; throws with
+/// the server's error text (e.g. a bad path, or 403 off localhost).
+export async function browseFilesystem(path?: string): Promise<BrowseResult> {
+  const qs = path ? `?path=${encodeURIComponent(path)}` : "";
+  const res = await fetch(`/console/api/fs/browse${qs}`);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `browse → HTTP ${res.status}`);
+  }
+  return (await res.json()) as BrowseResult;
+}
 
 /// A single line of a worker's run log stream, delivered over SSE.
 export interface WorkerLogLine {
@@ -329,12 +369,10 @@ export async function fetchDeployedXmlByProcessId(
     }
     const xml = await xmlRes.text();
     const ms = Math.round(performance.now() - started);
-    debug(
-      "probe",
-      "ok",
-      `deployed XML loaded (${xml.length} bytes, ${ms}ms)`,
-      { processId, processDefinitionKey: key },
-    );
+    debug("probe", "ok", `deployed XML loaded (${xml.length} bytes, ${ms}ms)`, {
+      processId,
+      processDefinitionKey: key,
+    });
     return xml;
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

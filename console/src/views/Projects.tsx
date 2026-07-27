@@ -9,7 +9,16 @@ import {
   type ProjectSummary,
   type ProjectTemplate,
 } from "../gen";
-import { Button, Card, EmptyState, Input, PageHeader, inputClass } from "../components/ui";
+import {
+  Button,
+  Card,
+  EmptyState,
+  Input,
+  PageHeader,
+  inputClass,
+} from "../components/ui";
+import DirectoryPicker from "../components/DirectoryPicker";
+import { isLocalhost } from "../lib/api";
 
 /// Resolved language-pack presentation for a project card: the pack's icon
 /// (inline SVG markup or a data:/http: URL) and its human-facing name.
@@ -39,7 +48,8 @@ function validateProjectName(
     return "Cannot be “.” or contain “..”.";
   if (/\s/.test(name)) return "No spaces — use dashes or underscores instead.";
   const bad = [...name].find((c) => !/[A-Za-z0-9_.-]/.test(c));
-  if (bad) return `Invalid character “${bad}”. Use letters, digits, dashes, underscores or dots.`;
+  if (bad)
+    return `Invalid character “${bad}”. Use letters, digits, dashes, underscores or dots.`;
   if (existing.some((p) => p.name.toLowerCase() === name.toLowerCase()))
     return "A project with that name already exists.";
   return null;
@@ -63,6 +73,8 @@ export default function Projects() {
   const [importing, setImporting] = useState(false);
   const [importName, setImportName] = useState("");
   const [importPath, setImportPath] = useState("");
+  const [browsing, setBrowsing] = useState(false);
+  const canBrowse = useMemo(() => isLocalhost(), []);
   const [busy, setBusy] = useState(false);
 
   const reload = useCallback(async () => {
@@ -74,7 +86,8 @@ export default function Projects() {
       setTemplates(res.templates ?? []);
       const meta: Record<string, LangMeta> = {};
       for (const e of res.extensions?.extensions ?? []) {
-        if (e.kind === "lang") meta[e.id] = { icon: e.icon, displayName: e.displayName };
+        if (e.kind === "lang")
+          meta[e.id] = { icon: e.icon, displayName: e.displayName };
       }
       setLangMeta(meta);
       setError(null);
@@ -138,7 +151,12 @@ export default function Projects() {
   };
 
   const remove = async (name: string) => {
-    if (!confirm(`Delete project “${name}” and all its files? This cannot be undone.`)) return;
+    if (
+      !confirm(
+        `Delete project “${name}” and all its files? This cannot be undone.`,
+      )
+    )
+      return;
     try {
       await deleteProject({ path: { name }, throwOnError: true });
       await reload();
@@ -151,7 +169,11 @@ export default function Projects() {
     const next = prompt(`Rename “${name}” to:`, name)?.trim();
     if (!next || next === name) return;
     try {
-      await renameProject({ path: { name }, body: { newName: next }, throwOnError: true });
+      await renameProject({
+        path: { name },
+        body: { newName: next },
+        throwOnError: true,
+      });
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -189,9 +211,9 @@ export default function Projects() {
 
       {!nodeAvailable && !denoAvailable && (
         <div className="mb-4 rounded-md border border-warn/40 bg-warn/10 px-4 py-2 text-sm text-warn">
-          No JavaScript runtime detected — you can author projects, but Run needs
-          Node ≥ 22.6 (the npm launcher provides one) or Deno. Compile to a standalone
-          binary additionally requires Deno.
+          No JavaScript runtime detected — you can author projects, but Run
+          needs Node ≥ 22.6 (the npm launcher provides one) or Deno. Compile to
+          a standalone binary additionally requires Deno.
         </div>
       )}
       {nodeAvailable && !denoAvailable && (
@@ -222,7 +244,9 @@ export default function Projects() {
                     ? "border-danger/70 focus:border-danger"
                     : "border-edge-strong focus:border-accent"
                 }`}
-                onKeyDown={(e) => e.key === "Enter" && nameValid && void create()}
+                onKeyDown={(e) =>
+                  e.key === "Enter" && nameValid && void create()
+                }
               />
               <p
                 className={`mt-1 text-xs ${
@@ -243,7 +267,9 @@ export default function Projects() {
           </div>
           {templates.length > 0 && (
             <div className="mt-3">
-              <label className="mb-1 block text-xs text-fg-faint">Template</label>
+              <label className="mb-1 block text-xs text-fg-faint">
+                Template
+              </label>
               <select
                 value={newTemplate}
                 onChange={(e) => setNewTemplate(e.target.value)}
@@ -287,7 +313,9 @@ export default function Projects() {
                     ? "border-danger/70 focus:border-danger"
                     : "border-edge-strong focus:border-accent"
                 }`}
-                onKeyDown={(e) => e.key === "Enter" && importValid && void importRef()}
+                onKeyDown={(e) =>
+                  e.key === "Enter" && importValid && void importRef()
+                }
               />
               <p
                 className={`mt-1 text-xs ${
@@ -298,17 +326,30 @@ export default function Projects() {
               </p>
             </div>
             <div>
-              <Input
-                value={importPath}
-                onChange={(e) => setImportPath(e.target.value)}
-                placeholder="/absolute/path/to/checked-out/app"
-                className="h-fit"
-                onKeyDown={(e) => e.key === "Enter" && importValid && void importRef()}
-              />
+              <div className="flex gap-2">
+                <Input
+                  value={importPath}
+                  onChange={(e) => setImportPath(e.target.value)}
+                  placeholder="/absolute/path/to/checked-out/app"
+                  className="h-fit flex-1"
+                  onKeyDown={(e) =>
+                    e.key === "Enter" && importValid && void importRef()
+                  }
+                />
+                {canBrowse && (
+                  <Button
+                    variant="secondary"
+                    onClick={() => setBrowsing(true)}
+                    title="Browse the server's filesystem"
+                  >
+                    Browse…
+                  </Button>
+                )}
+              </div>
               <p className="mt-1 text-xs text-fg-faint">
-                Absolute path to a checked-out Urban app directory
-                (contains <code>nano.app.json</code> or{" "}
-                <code>nanobpm.project.json</code>). Read live — no copy.
+                Absolute path to a checked-out Urban app directory (contains{" "}
+                <code>nano.app.json</code> or <code>nanobpm.project.json</code>
+                ). Read live — no copy.
               </p>
             </div>
           </div>
@@ -328,14 +369,35 @@ export default function Projects() {
         </Card>
       )}
 
+      {browsing && (
+        <DirectoryPicker
+          initialPath={importPath.trim() || undefined}
+          onPick={(path) => {
+            setImportPath(path);
+            setBrowsing(false);
+          }}
+          onClose={() => setBrowsing(false)}
+        />
+      )}
+
       {loading ? (
         <div className="py-16 text-center text-sm text-fg-faint">Loading…</div>
       ) : projects.length === 0 ? (
-        <EmptyState title="No projects yet." hint="Create one to get started." />
+        <EmptyState
+          title="No projects yet."
+          hint="Create one to get started."
+        />
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {projects.map((p) => (
-            <ProjectTile key={p.name} project={p} lang={langMeta[p.lang]} onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)} onDelete={() => void remove(p.name)} onRename={() => void rename(p.name)} />
+            <ProjectTile
+              key={p.name}
+              project={p}
+              lang={langMeta[p.lang]}
+              onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)}
+              onDelete={() => void remove(p.name)}
+              onRename={() => void rename(p.name)}
+            />
           ))}
         </div>
       )}
@@ -392,7 +454,9 @@ function ProjectTile({
               {(project.lang || "?").slice(0, 2)}
             </span>
           )}
-          <span className="truncate text-base font-semibold text-fg">{project.name}</span>
+          <span className="truncate text-base font-semibold text-fg">
+            {project.name}
+          </span>
           {project.source === "path" && (
             <span
               title="Imported by reference — runs live from an external checked-out directory (ADR 0041)"
@@ -417,7 +481,9 @@ function ProjectTile({
           <Stat label="workers" value={project.workers} />
         </div>
         <TemplateProvenance project={project} />
-        <div className="mt-2 truncate text-[11px] text-fg-faint">→ {project.deployTarget}</div>
+        <div className="mt-2 truncate text-[11px] text-fg-faint">
+          → {project.deployTarget}
+        </div>
       </button>
     </Card>
   );

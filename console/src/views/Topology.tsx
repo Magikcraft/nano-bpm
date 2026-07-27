@@ -2,7 +2,13 @@ import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { getClusterHealth, getTopology, type NodeHealth } from "../gen";
 import { nodeConsoleUrl } from "../lib/api";
-import { Badge, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
+import {
+  Badge,
+  Card,
+  ErrorText,
+  PageHeader,
+  SectionLabel,
+} from "../components/ui";
 
 export default function Topology() {
   const { data, isLoading, error } = useQuery({
@@ -43,10 +49,7 @@ export default function Topology() {
             <Stat label="Nodes" value={data.num_nodes} />
             <Stat label="Partitions" value={data.num_partitions} />
             <Stat label="Replication factor" value={data.replication_factor} />
-            <Stat
-              label="Raft"
-              value={data.raft_enabled ? "enabled" : "off"}
-            />
+            <Stat label="Raft" value={data.raft_enabled ? "enabled" : "off"} />
           </section>
 
           <section>
@@ -108,10 +111,7 @@ export default function Topology() {
                       {n.is_self && <Badge tone="ok">this</Badge>}
                       {recovering && <Badge tone="warn">catching up</Badge>}
                       {href && (
-                        <span
-                          className="ml-auto text-xs text-info"
-                          aria-hidden
-                        >
+                        <span className="ml-auto text-xs text-info" aria-hidden>
                           open ↗
                         </span>
                       )}
@@ -126,14 +126,18 @@ export default function Topology() {
                             <span className="text-fg-muted">v{h.version}</span>
                           )}
                           {h.latencyMs != null && !n.is_self && (
-                            <span className="text-fg-faint">{h.latencyMs} ms</span>
+                            <span className="text-fg-faint">
+                              {h.latencyMs} ms
+                            </span>
                           )}
                           {recovering ? (
                             <span className="text-warn">
                               reclaiming leadership
                             </span>
                           ) : (
-                            n.is_self && <span className="text-ok">healthy</span>
+                            n.is_self && (
+                              <span className="text-ok">healthy</span>
+                            )
                           )}
                         </>
                       ) : h ? (

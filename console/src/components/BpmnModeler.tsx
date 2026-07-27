@@ -5,7 +5,11 @@ import {
   BpmnPropertiesProviderModule,
   ZeebePropertiesProviderModule,
 } from "bpmn-js-properties-panel";
-import { SelectEntry, Group, isSelectEntryEdited } from "@bpmn-io/properties-panel";
+import {
+  SelectEntry,
+  Group,
+  isSelectEntryEdited,
+} from "@bpmn-io/properties-panel";
 import ZeebeModdle from "zeebe-bpmn-moddle/resources/zeebe.json";
 import { nanoShapesModdle } from "../moddle/nanoShapes";
 import {
@@ -52,7 +56,11 @@ interface Canvas {
 }
 interface Modeling {
   updateProperties(element: unknown, props: Record<string, unknown>): void;
-  updateModdleProperties(element: unknown, moddleElement: unknown, props: Record<string, unknown>): void;
+  updateModdleProperties(
+    element: unknown,
+    moddleElement: unknown,
+    props: Record<string, unknown>,
+  ): void;
 }
 interface Moddle {
   create(type: string, attrs?: Record<string, unknown>): ModdleElement;
@@ -65,7 +73,8 @@ interface Moddle {
 // registry). These helpers locate the process business object(s) in the model.
 
 /** The local (namespace-stripped) name of a moddle `$type`. */
-const shapeLocalType = (t: string | undefined): string => (t ?? "").split(":").pop() ?? "";
+const shapeLocalType = (t: string | undefined): string =>
+  (t ?? "").split(":").pop() ?? "";
 
 interface DefinitionsBo extends ShapeModdleElement {
   rootElements?: ShapeModdleElement[];
@@ -76,10 +85,14 @@ function allProcessBos(modeler: Modeler): ShapeModdleElement[] {
   try {
     const rootBo = modeler.get<Canvas>("canvas").getRootElement()
       .businessObject as unknown as ShapeModdleElement;
-    const defs = (shapeLocalType(rootBo?.$type) === "Definitions"
-      ? rootBo
-      : (rootBo?.$parent as DefinitionsBo | undefined)) as DefinitionsBo | undefined;
-    return (defs?.rootElements ?? []).filter((e) => shapeLocalType(e?.$type) === "Process");
+    const defs = (
+      shapeLocalType(rootBo?.$type) === "Definitions"
+        ? rootBo
+        : (rootBo?.$parent as DefinitionsBo | undefined)
+    ) as DefinitionsBo | undefined;
+    return (defs?.rootElements ?? []).filter(
+      (e) => shapeLocalType(e?.$type) === "Process",
+    );
   } catch {
     return [];
   }
@@ -94,7 +107,8 @@ function primaryProcess(
   try {
     const rootEl = modeler.get<Canvas>("canvas").getRootElement();
     const rootBo = rootEl.businessObject as unknown as ShapeModdleElement;
-    if (shapeLocalType(rootBo?.$type) === "Process") return { element: rootEl, processBo: rootBo };
+    if (shapeLocalType(rootBo?.$type) === "Process")
+      return { element: rootEl, processBo: rootBo };
     const procs = allProcessBos(modeler);
     return procs.length ? { element: rootEl, processBo: procs[0] } : null;
   } catch {
@@ -137,11 +151,13 @@ function collectComponentOutputs(registry: ElementRegistry): ComponentOutput[] {
     if (!el.type || !SERVICE_TASK_TYPES.has(el.type)) continue;
     const ext = el.businessObject?.extensionElements?.values ?? [];
     const taskDef = ext.find((v) => v.$type === "zeebe:TaskDefinition");
-    const taskType = typeof taskDef?.type === "string" ? taskDef.type : undefined;
+    const taskType =
+      typeof taskDef?.type === "string" ? taskDef.type : undefined;
     if (!taskType) continue;
     const io = ext.find((v) => v.$type === "zeebe:IoMapping");
     for (const p of io?.outputParameters ?? []) {
-      if (typeof p.target === "string" && p.target) outputs.push({ taskType, target: p.target });
+      if (typeof p.target === "string" && p.target)
+        outputs.push({ taskType, target: p.target });
     }
   }
   return outputs;
@@ -258,7 +274,10 @@ export interface DomainTypeBinding {
 }
 
 const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
-  function BpmnModeler({ onChange, onReady, getVariables, components, domainTypeBinding }, ref) {
+  function BpmnModeler(
+    { onChange, onReady, getVariables, components, domainTypeBinding },
+    ref,
+  ) {
     const containerRef = useRef<HTMLDivElement>(null);
     const panelRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
@@ -287,7 +306,9 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     // The manifest domain-type binding, read live by the domain-type properties
     // provider so type edits + manifest reloads reflect without recreating the
     // modeler.
-    const domainTypeBindingRef = useRef<DomainTypeBinding | undefined>(domainTypeBinding);
+    const domainTypeBindingRef = useRef<DomainTypeBinding | undefined>(
+      domainTypeBinding,
+    );
     domainTypeBindingRef.current = domainTypeBinding;
 
     // Queues a load on a single chain so imports can't race each other or the
@@ -371,7 +392,11 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         static $inject = ["palette", "create", "elementTemplates"];
         private readonly create: CreateService;
         private readonly elementTemplates: ElementTemplatesService;
-        constructor(palette: PaletteService, create: CreateService, elementTemplates: ElementTemplatesService) {
+        constructor(
+          palette: PaletteService,
+          create: CreateService,
+          elementTemplates: ElementTemplatesService,
+        ) {
           this.create = create;
           this.elementTemplates = elementTemplates;
           palette.registerProvider(this);
@@ -395,7 +420,10 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       }
       const urbanComponentsPaletteModule = {
         __init__: ["urbanComponentsPaletteProvider"],
-        urbanComponentsPaletteProvider: ["type", UrbanComponentsPaletteProvider],
+        urbanComponentsPaletteProvider: [
+          "type",
+          UrbanComponentsPaletteProvider,
+        ],
       };
       // Properties provider (the Object Inspector): a "Data envelope" group on
       // every element with a typed data boundary — service-ish tasks (job I/O),
@@ -449,7 +477,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           // Projection (service tasks only): keep the worker-IO map that types
           // `defineWorker` in sync with the model (ADR 0033 §6, until the
           // server-side derivation of increment 12 retires this cache).
-          if (ctx.taskType) domainTypeBindingRef.current?.set(ctx.taskType, field, v);
+          if (ctx.taskType)
+            domainTypeBindingRef.current?.set(ctx.taskType, field, v);
         };
         const getOptions = () => {
           const modeler = modelerRef.current;
@@ -472,7 +501,12 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           return [
             // With a form default, clearing (this option) reverts to the inherited
             // type rather than "no type", so name it accordingly.
-            { value: "", label: formDefault ? `Inherit from form (${formDefault})` : "<none>" },
+            {
+              value: "",
+              label: formDefault
+                ? `Inherit from form (${formDefault})`
+                : "<none>",
+            },
             ...typeIds.map((id) => ({ value: id, label: id })),
             ...shapeIds.map((id) => ({ value: id, label: `${id} (shape)` })),
             ...(domainTypeBindingRef.current?.createType
@@ -541,7 +575,10 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       }
       const urbanDomainTypePropertiesModule = {
         __init__: ["urbanDomainTypePropertiesProvider"],
-        urbanDomainTypePropertiesProvider: ["type", UrbanDomainTypePropertiesProvider],
+        urbanDomainTypePropertiesProvider: [
+          "type",
+          UrbanDomainTypePropertiesProvider,
+        ],
       };
       const modeler = new Modeler({
         container: containerRef.current,
@@ -569,7 +606,9 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       // mount; the `[components]` effect below re-installs + refreshes the
       // palette once it arrives or changes.
       try {
-        modeler.get<ElementTemplatesService>("elementTemplates").set(componentsRef.current);
+        modeler
+          .get<ElementTemplatesService>("elementTemplates")
+          .set(componentsRef.current);
       } catch {
         // Non-fatal: without the core module the palette simply shows nothing.
       }
@@ -600,7 +639,9 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       const modeler = modelerRef.current;
       if (!modeler || disposedRef.current) return;
       try {
-        modeler.get<ElementTemplatesService>("elementTemplates").set(componentsRef.current);
+        modeler
+          .get<ElementTemplatesService>("elementTemplates")
+          .set(componentsRef.current);
         modeler.get<PaletteService>("palette")._update?.();
       } catch {
         // Non-fatal: core/palette absent, or modeler torn down mid-flight.
@@ -620,7 +661,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         const modeler = modelerRef.current;
         if (!modeler || disposedRef.current) return null;
         try {
-          return modeler.get<Canvas>("canvas").getRootElement().businessObject.id;
+          return modeler.get<Canvas>("canvas").getRootElement().businessObject
+            .id;
         } catch {
           return null;
         }

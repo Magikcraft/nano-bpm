@@ -250,6 +250,14 @@ fmt-check: ## Verify formatting with the pinned nightly rustfmt (CI gate; fails 
 		(cd $$d && rustup run $(FMT_TOOLCHAIN) cargo fmt -- --check) || exit 1; \
 	done
 
+.PHONY: console-fmt
+console-fmt: ## Format the web console TypeScript/CSS with Prettier (console/)
+	cd $(CONSOLE_DIR) && npm run format
+
+.PHONY: console-fmt-check
+console-fmt-check: ## Verify console Prettier formatting (CI gate; fails on drift)
+	cd $(CONSOLE_DIR) && npm run format:check
+
 .PHONY: install-hooks
 install-hooks: ## Activate the tracked git hooks (.githooks) — adds a pre-push rustfmt gate
 	git config core.hooksPath .githooks

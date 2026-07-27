@@ -6,7 +6,11 @@ interface PlaceholderProps {
 
 // A consistent "coming soon" panel for console views that are scaffolded but not
 // yet implemented. Keeps the navigation/layout real while the feature is built.
-export default function Placeholder({ title, blurb, planned }: PlaceholderProps) {
+export default function Placeholder({
+  title,
+  blurb,
+  planned,
+}: PlaceholderProps) {
   return (
     <div className="p-8">
       <header className="mb-6">

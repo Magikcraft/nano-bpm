@@ -39,7 +39,9 @@ export function ensureBundledJsonSchemas(): void {
     enableSchemaRequest: false,
     schemas: [
       ...manifestSchemaEntries(appSchema as Record<string, unknown>),
-      ...elementTemplateSchemaEntries(elementTemplateSchema as Record<string, unknown>),
+      ...elementTemplateSchemaEntries(
+        elementTemplateSchema as Record<string, unknown>,
+      ),
     ],
   });
   registered = true;

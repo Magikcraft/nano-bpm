@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import CodeEditor from "./CodeEditor";
 import { Button, Input, inputClass } from "./ui";
@@ -53,7 +60,15 @@ function quoteIdent(id: string): string {
 // --- New-table DDL model ----------------------------------------------------
 
 /** Common SQLite column affinities offered in the New Table dialog. */
-const COLUMN_TYPES = ["INTEGER", "TEXT", "REAL", "NUMERIC", "BLOB", "BOOLEAN", "TIMESTAMP"];
+const COLUMN_TYPES = [
+  "INTEGER",
+  "TEXT",
+  "REAL",
+  "NUMERIC",
+  "BLOB",
+  "BOOLEAN",
+  "TIMESTAMP",
+];
 
 /** `ON DELETE` referential actions offered for a foreign key ("" = omit). */
 const ON_DELETE_ACTIONS = ["", "CASCADE", "SET NULL", "RESTRICT", "NO ACTION"];
@@ -100,7 +115,9 @@ function buildCreateTable(table: string, cols: NewColumn[]): string {
       return s;
     });
   if (pkCols.length > 1) {
-    defs.push(`  PRIMARY KEY (${pkCols.map((c) => quoteIdent(c.name.trim())).join(", ")})`);
+    defs.push(
+      `  PRIMARY KEY (${pkCols.map((c) => quoteIdent(c.name.trim())).join(", ")})`,
+    );
   }
   // Foreign keys are emitted as table-level constraints (SQLite requires them
   // after all column defs). `PRAGMA foreign_keys = ON` is set by the datasource,
@@ -148,7 +165,10 @@ interface EditColumn {
 }
 
 /** Seed the structure editor from a live table's columns + foreign keys. */
-function editColumnsFrom(columns: DataColumnMeta[], foreignKeys: DataForeignKey[]): EditColumn[] {
+function editColumnsFrom(
+  columns: DataColumnMeta[],
+  foreignKeys: DataForeignKey[],
+): EditColumn[] {
   const fkByColumn = new Map(foreignKeys.map((f) => [f.column, f]));
   return columns.map((c) => {
     const fk = fkByColumn.get(c.name);
@@ -229,13 +249,17 @@ function buildStructureStatements(
     ]),
   );
   const fkChanged = kept.some((c) => {
-    const before = c.originalName ? origRefByColumn.get(c.originalName) ?? null : null;
+    const before = c.originalName
+      ? (origRefByColumn.get(c.originalName) ?? null)
+      : null;
     return refKey(before) !== refKey(c.references);
   });
-  const rebuild = fkChanged || kept.some((c) => {
-    const o = c.originalName ? byOriginal.get(c.originalName) : undefined;
-    return o ? needsRebuild(o, c) : false;
-  });
+  const rebuild =
+    fkChanged ||
+    kept.some((c) => {
+      const o = c.originalName ? byOriginal.get(c.originalName) : undefined;
+      return o ? needsRebuild(o, c) : false;
+    });
 
   if (rebuild) {
     // SQLite 12-step rebuild: create a new table, copy data by (old→new) column
@@ -245,7 +269,12 @@ function buildStructureStatements(
     const pkCount = kept.filter((c) => c.primaryKey).length;
     const defs = kept.map((c) => `  ${columnDef(c, pkCount === 1)}`);
     if (pkCount > 1) {
-      defs.push(`  PRIMARY KEY (${kept.filter((c) => c.primaryKey).map((c) => quoteIdent(c.name.trim())).join(", ")})`);
+      defs.push(
+        `  PRIMARY KEY (${kept
+          .filter((c) => c.primaryKey)
+          .map((c) => quoteIdent(c.name.trim()))
+          .join(", ")})`,
+      );
     }
     // Re-emit each kept column's foreign key as a table-level constraint so the
     // rebuild preserves (and applies newly added) FKs. A self-reference targets
@@ -270,7 +299,9 @@ function buildStructureStatements(
     const statements = [create];
     if (insert) statements.push(insert);
     statements.push(`DROP TABLE ${quoteIdent(oldName)}`);
-    statements.push(`ALTER TABLE ${quoteIdent(tmp)} RENAME TO ${quoteIdent(newName.trim())}`);
+    statements.push(
+      `ALTER TABLE ${quoteIdent(tmp)} RENAME TO ${quoteIdent(newName.trim())}`,
+    );
     return { statements, rebuild: true };
   }
 
@@ -279,11 +310,18 @@ function buildStructureStatements(
   const statements: string[] = [];
   for (const c of cols) {
     if (c.originalName && c.drop) {
-      statements.push(`ALTER TABLE ${quoteIdent(oldName)} DROP COLUMN ${quoteIdent(c.originalName)}`);
+      statements.push(
+        `ALTER TABLE ${quoteIdent(oldName)} DROP COLUMN ${quoteIdent(c.originalName)}`,
+      );
     }
   }
   for (const c of cols) {
-    if (c.originalName && !c.drop && c.name.trim() && c.name.trim() !== c.originalName) {
+    if (
+      c.originalName &&
+      !c.drop &&
+      c.name.trim() &&
+      c.name.trim() !== c.originalName
+    ) {
       statements.push(
         `ALTER TABLE ${quoteIdent(oldName)} RENAME COLUMN ${quoteIdent(c.originalName)} TO ${quoteIdent(c.name.trim())}`,
       );
@@ -291,17 +329,24 @@ function buildStructureStatements(
   }
   for (const c of cols) {
     if (!c.originalName && !c.drop && c.name.trim()) {
-      statements.push(`ALTER TABLE ${quoteIdent(oldName)} ADD COLUMN ${columnDef(c, false)}`);
+      statements.push(
+        `ALTER TABLE ${quoteIdent(oldName)} ADD COLUMN ${columnDef(c, false)}`,
+      );
     }
   }
   if (newName.trim() && newName.trim() !== oldName) {
-    statements.push(`ALTER TABLE ${quoteIdent(oldName)} RENAME TO ${quoteIdent(newName.trim())}`);
+    statements.push(
+      `ALTER TABLE ${quoteIdent(oldName)} RENAME TO ${quoteIdent(newName.trim())}`,
+    );
   }
   return { statements, rebuild: false };
 }
 
 /** Next ordered migration filename, e.g. `003_create_orders.sql`. */
-function nextMigrationName(existing: DataMigrationEntry[], table: string): string {
+function nextMigrationName(
+  existing: DataMigrationEntry[],
+  table: string,
+): string {
   const max = existing.reduce((m, e) => {
     const n = parseInt(e.name, 10);
     return Number.isNaN(n) ? m : Math.max(m, n);
@@ -321,7 +366,8 @@ function cell(v: unknown): { text: string; muted: boolean } {
   if (v === null || v === undefined) return { text: "NULL", muted: true };
   if (typeof v === "object") {
     const o = v as { $blob?: number };
-    if (typeof o.$blob === "number") return { text: `‹blob ${o.$blob}B›`, muted: true };
+    if (typeof o.$blob === "number")
+      return { text: `‹blob ${o.$blob}B›`, muted: true };
     return { text: JSON.stringify(v), muted: false };
   }
   return { text: String(v), muted: false };
@@ -352,10 +398,15 @@ export default function DataPanel({ name }: { name: string }) {
     };
   }, [name]);
 
-  const active = useMemo(() => sources.find((s) => s.name === source), [sources, source]);
+  const active = useMemo(
+    () => sources.find((s) => s.name === source),
+    [sources, source],
+  );
 
   if (loading) {
-    return <div className="p-8 text-sm text-fg-faint">Loading datasources…</div>;
+    return (
+      <div className="p-8 text-sm text-fg-faint">Loading datasources…</div>
+    );
   }
   if (loadError) {
     return (
@@ -371,7 +422,8 @@ export default function DataPanel({ name }: { name: string }) {
           <p className="font-medium text-fg-muted">No datasources declared.</p>
           <p className="mt-1">
             Add a <code className="text-fg-muted">data.sources</code> block to{" "}
-            <code className="text-fg-muted">nano.app.json</code> (ADR 0024) to use the DB Manager.
+            <code className="text-fg-muted">nano.app.json</code> (ADR 0024) to
+            use the DB Manager.
           </p>
         </div>
       </div>
@@ -407,7 +459,9 @@ export default function DataPanel({ name }: { name: string }) {
               key={t}
               onClick={() => setTab(t)}
               className={`rounded-md px-2.5 py-1 capitalize ${
-                tab === t ? "bg-accent/15 font-semibold text-accent" : "text-fg-faint hover:bg-hover"
+                tab === t
+                  ? "bg-accent/15 font-semibold text-accent"
+                  : "text-fg-faint hover:bg-hover"
               }`}
             >
               {t}
@@ -417,8 +471,12 @@ export default function DataPanel({ name }: { name: string }) {
       </div>
 
       <div className="min-h-0 flex-1 overflow-hidden">
-        {source && tab === "tables" && <TablesTab key={`t-${source}`} name={name} source={source} />}
-        {source && tab === "sql" && <SqlTab key={`s-${source}`} name={name} source={source} />}
+        {source && tab === "tables" && (
+          <TablesTab key={`t-${source}`} name={name} source={source} />
+        )}
+        {source && tab === "sql" && (
+          <SqlTab key={`s-${source}`} name={name} source={source} />
+        )}
         {source && tab === "migrations" && (
           <MigrationsTab key={`m-${source}`} name={name} source={source} />
         )}
@@ -446,7 +504,10 @@ function TablesTab({ name, source }: { name: string; source: string }) {
   const loadSchema = useCallback(async () => {
     setError(null);
     try {
-      const r = await getDataSchema({ path: { name, source }, throwOnError: true });
+      const r = await getDataSchema({
+        path: { name, source },
+        throwOnError: true,
+      });
       setTables(r.data.tables ?? []);
       setSelected((cur) => cur ?? r.data.tables?.[0]?.name ?? null);
     } catch (e) {
@@ -501,14 +562,19 @@ function TablesTab({ name, source }: { name: string; source: string }) {
     setRegenBusy(true);
     setRegenNote(null);
     try {
-      const r = await regenerateDomainTypes({ path: { name, source }, throwOnError: true });
+      const r = await regenerateDomainTypes({
+        path: { name, source },
+        throwOnError: true,
+      });
       const n = r.data.tables;
       // The reify rewrote `nano-generated/*` — drop the editor's cached SDK typings so
       // the next code file opened picks up the regenerated `job.variables`/domain
       // types without a reload.
       const { invalidateProjectSdkLibs } = await import("./CodeEditor");
       invalidateProjectSdkLibs();
-      setRegenNote(`Generated ${r.data.path ?? "domain-rows.d.ts"} — ${n} ${n === 1 ? "table" : "tables"} across all datasources.`);
+      setRegenNote(
+        `Generated ${r.data.path ?? "domain-rows.d.ts"} — ${n} ${n === 1 ? "table" : "tables"} across all datasources.`,
+      );
     } catch (e) {
       setRegenNote(errMsg(e));
     } finally {
@@ -522,7 +588,10 @@ function TablesTab({ name, source }: { name: string; source: string }) {
       try {
         await execData({
           path: { name, source },
-          body: { sql: `DELETE FROM ${quoteIdent(selected)} WHERE rowid = ?`, params: [rowid] },
+          body: {
+            sql: `DELETE FROM ${quoteIdent(selected)} WHERE rowid = ?`,
+            params: [rowid],
+          },
           throwOnError: true,
         });
         await loadRows();
@@ -571,7 +640,9 @@ function TablesTab({ name, source }: { name: string; source: string }) {
             key={t.name}
             onClick={() => setSelected(t.name)}
             className={`block w-full truncate px-3 py-1.5 text-left text-sm ${
-              selected === t.name ? "bg-accent/15 font-medium text-accent" : "text-fg-muted hover:bg-hover"
+              selected === t.name
+                ? "bg-accent/15 font-medium text-accent"
+                : "text-fg-muted hover:bg-hover"
             }`}
             title={`${t.name} — ${t.columns.length} columns`}
           >
@@ -591,7 +662,11 @@ function TablesTab({ name, source }: { name: string; source: string }) {
               onClick={() => setShowAddRow(true)}
               disabled={!editable}
               className="rounded px-1.5 py-0.5 text-xs font-medium text-accent hover:bg-accent/10 disabled:opacity-40"
-              title={editable ? "Insert a row" : "This table has no rowid — add rows from the SQL tab"}
+              title={
+                editable
+                  ? "Insert a row"
+                  : "This table has no rowid — add rows from the SQL tab"
+              }
             >
               ＋ Add row
             </button>
@@ -620,7 +695,9 @@ function TablesTab({ name, source }: { name: string; source: string }) {
               result={rows}
               rowKey={editable ? ROWID_COL : undefined}
               onEditRow={editable ? (row) => setEditRow(row) : undefined}
-              onDeleteRow={editable ? (rowid) => void deleteRow(rowid) : undefined}
+              onDeleteRow={
+                editable ? (rowid) => void deleteRow(rowid) : undefined
+              }
             />
           ) : (
             <div className="p-6 text-sm text-fg-faint">Select a table.</div>
@@ -714,8 +791,16 @@ function ColumnStrip({
           <span key={c.name} className="text-fg-muted">
             <span className="font-medium text-fg">{c.name}</span>
             <span className="text-fg-faint"> {c.type || "?"}</span>
-            {c.primaryKey && <span className="ml-0.5 text-accent" title="primary key">🔑</span>}
-            {c.notNull && !c.primaryKey && <span className="ml-0.5 text-fg-faint" title="NOT NULL">*</span>}
+            {c.primaryKey && (
+              <span className="ml-0.5 text-accent" title="primary key">
+                🔑
+              </span>
+            )}
+            {c.notNull && !c.primaryKey && (
+              <span className="ml-0.5 text-fg-faint" title="NOT NULL">
+                *
+              </span>
+            )}
             {fk && (
               <span
                 className="ml-0.5 text-accent"
@@ -765,7 +850,11 @@ function Modal({
       >
         <div className="flex items-center justify-between border-b border-edge px-4 py-2.5">
           <h2 className="text-sm font-semibold text-fg">{title}</h2>
-          <button onClick={onClose} className="rounded p-1 text-fg-faint hover:bg-hover" title="Close">
+          <button
+            onClick={onClose}
+            className="rounded p-1 text-fg-faint hover:bg-hover"
+            title="Close"
+          >
             ✕
           </button>
         </div>
@@ -819,12 +908,14 @@ function NewTableDialog({
   const setCol = (i: number, patch: Partial<NewColumn>) =>
     setCols((cs) => cs.map((c, j) => (j === i ? { ...c, ...patch } : c)));
   const addCol = () => setCols((cs) => [...cs, blankColumn()]);
-  const removeCol = (i: number) => setCols((cs) => cs.filter((_, j) => j !== i));
+  const removeCol = (i: number) =>
+    setCols((cs) => cs.filter((_, j) => j !== i));
 
   // FK targets: existing tables in this datasource (the new table can't yet
   // reference itself since it doesn't exist). Columns come from the picked table.
   const fkTables = tables.map((t) => t.name);
-  const columnsOf = (t: string) => tables.find((x) => x.name === t)?.columns.map((c) => c.name) ?? [];
+  const columnsOf = (t: string) =>
+    tables.find((x) => x.name === t)?.columns.map((c) => c.name) ?? [];
   const toggleFk = (i: number, on: boolean) =>
     setCol(i, {
       references: on
@@ -834,7 +925,9 @@ function NewTableDialog({
   const setRef = (i: number, patch: Partial<ColumnRef>) =>
     setCols((cs) =>
       cs.map((c, j) =>
-        j === i && c.references ? { ...c, references: { ...c.references, ...patch } } : c,
+        j === i && c.references
+          ? { ...c, references: { ...c.references, ...patch } }
+          : c,
       ),
     );
 
@@ -843,7 +936,11 @@ function NewTableDialog({
     setError(null);
     setNote(null);
     try {
-      await execData({ path: { name, source }, body: { sql }, throwOnError: true });
+      await execData({
+        path: { name, source },
+        body: { sql },
+        throwOnError: true,
+      });
       onCreated(table.trim());
     } catch (e) {
       setError(errMsg(e));
@@ -857,11 +954,19 @@ function NewTableDialog({
     setError(null);
     setNote(null);
     try {
-      const r = await getDataMigrations({ path: { name, source }, throwOnError: true });
+      const r = await getDataMigrations({
+        path: { name, source },
+        throwOnError: true,
+      });
       const dir = r.data.dir || "db/migrations";
       const file = nextMigrationName(r.data.entries ?? [], table);
       const path = `${dir}/${file}`;
-      await saveProjectFile({ path: { name }, query: { path }, body: `${sql}\n`, throwOnError: true });
+      await saveProjectFile({
+        path: { name },
+        query: { path },
+        body: `${sql}\n`,
+        throwOnError: true,
+      });
       setNote(`Wrote ${path}. Apply it from the Migrations tab.`);
     } catch (e) {
       setError(errMsg(e));
@@ -877,22 +982,38 @@ function NewTableDialog({
       wide
       footer={
         <>
-          {note && <span className="mr-auto truncate text-xs text-ok">{note}</span>}
-          {error && <span className="mr-auto truncate text-xs text-danger">{error}</span>}
+          {note && (
+            <span className="mr-auto truncate text-xs text-ok">{note}</span>
+          )}
+          {error && (
+            <span className="mr-auto truncate text-xs text-danger">
+              {error}
+            </span>
+          )}
           <Button variant="secondary" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
-          <Button variant="secondary" onClick={() => void saveMigration()} disabled={!valid || busy}>
+          <Button
+            variant="secondary"
+            onClick={() => void saveMigration()}
+            disabled={!valid || busy}
+          >
             Save as migration
           </Button>
-          <Button variant="primary" onClick={() => void runNow()} disabled={!valid || busy}>
+          <Button
+            variant="primary"
+            onClick={() => void runNow()}
+            disabled={!valid || busy}
+          >
             {busy ? "Working…" : "Create now"}
           </Button>
         </>
       }
     >
       <label className="mb-3 block">
-        <span className="mb-1 block text-xs font-medium text-fg-muted">Table name</span>
+        <span className="mb-1 block text-xs font-medium text-fg-muted">
+          Table name
+        </span>
         <Input
           value={table}
           onChange={(e) => setTable(e.target.value)}
@@ -903,7 +1024,10 @@ function NewTableDialog({
 
       <div className="mb-1 flex items-center justify-between">
         <span className="text-xs font-medium text-fg-muted">Columns</span>
-        <button onClick={addCol} className="text-xs font-medium text-accent hover:underline">
+        <button
+          onClick={addCol}
+          className="text-xs font-medium text-accent hover:underline"
+        >
           ＋ Add column
         </button>
       </div>
@@ -992,7 +1116,9 @@ function NewTableDialog({
                 <select
                   className={`${inputClass} w-40`}
                   value={c.references.table}
-                  onChange={(e) => setRef(i, { table: e.target.value, column: "" })}
+                  onChange={(e) =>
+                    setRef(i, { table: e.target.value, column: "" })
+                  }
                 >
                   {fkTables.map((t) => (
                     <option key={t} value={t}>
@@ -1085,7 +1211,9 @@ function RowDialog({
   const [fields, setFields] = useState<Record<string, FieldState>>(() => {
     const out: Record<string, FieldState> = {};
     for (const c of columns) {
-      out[c.name] = editing ? seedField(existing?.[c.name]) : { raw: "", isNull: false };
+      out[c.name] = editing
+        ? seedField(existing?.[c.name])
+        : { raw: "", isNull: false };
     }
     return out;
   });
@@ -1108,11 +1236,16 @@ function RowDialog({
         sql = `UPDATE ${quoteIdent(table)} SET ${cols
           .map((c) => `${quoteIdent(c.name)} = ?`)
           .join(", ")} WHERE rowid = ?`;
-        params = [...cols.map((c) => paramFor(fields[c.name])), existing?.[ROWID_COL]];
+        params = [
+          ...cols.map((c) => paramFor(fields[c.name])),
+          existing?.[ROWID_COL],
+        ];
       } else {
         // Include a column only if the user set NULL or typed a value; blank
         // untouched fields are omitted so DEFAULT / autoincrement apply.
-        const provided = columns.filter((c) => fields[c.name].isNull || fields[c.name].raw !== "");
+        const provided = columns.filter(
+          (c) => fields[c.name].isNull || fields[c.name].raw !== "",
+        );
         if (provided.length === 0) {
           sql = `INSERT INTO ${quoteIdent(table)} DEFAULT VALUES`;
           params = [];
@@ -1123,7 +1256,11 @@ function RowDialog({
           params = provided.map((c) => paramFor(fields[c.name]));
         }
       }
-      await execData({ path: { name, source }, body: { sql, params }, throwOnError: true });
+      await execData({
+        path: { name, source },
+        body: { sql, params },
+        throwOnError: true,
+      });
       onSaved();
     } catch (e) {
       setError(errMsg(e));
@@ -1138,7 +1275,11 @@ function RowDialog({
       onClose={onClose}
       footer={
         <>
-          {error && <span className="mr-auto truncate text-xs text-danger">{error}</span>}
+          {error && (
+            <span className="mr-auto truncate text-xs text-danger">
+              {error}
+            </span>
+          )}
           <Button variant="secondary" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
@@ -1156,8 +1297,16 @@ function RowDialog({
               <span className="mb-1 flex items-center gap-1.5 text-xs font-medium text-fg-muted">
                 {c.name}
                 <span className="text-fg-faint">{c.type || "?"}</span>
-                {c.primaryKey && <span className="text-accent" title="primary key">🔑</span>}
-                {c.notNull && !c.primaryKey && <span className="text-fg-faint" title="NOT NULL">*</span>}
+                {c.primaryKey && (
+                  <span className="text-accent" title="primary key">
+                    🔑
+                  </span>
+                )}
+                {c.notNull && !c.primaryKey && (
+                  <span className="text-fg-faint" title="NOT NULL">
+                    *
+                  </span>
+                )}
               </span>
               <div className="flex items-center gap-2">
                 <Input
@@ -1168,11 +1317,16 @@ function RowDialog({
                   onChange={(e) => setField(c.name, { raw: e.target.value })}
                 />
                 {!c.notNull && (
-                  <label className="flex items-center gap-1 text-xs text-fg-faint" title="Store NULL">
+                  <label
+                    className="flex items-center gap-1 text-xs text-fg-faint"
+                    title="Store NULL"
+                  >
                     <input
                       type="checkbox"
                       checked={f.isNull}
-                      onChange={(e) => setField(c.name, { isNull: e.target.checked })}
+                      onChange={(e) =>
+                        setField(c.name, { isNull: e.target.checked })
+                      }
                     />
                     NULL
                   </label>
@@ -1214,7 +1368,9 @@ function EditStructureDialog({
   onSaved: (newName: string) => void;
 }) {
   const [newName, setNewName] = useState(table);
-  const [cols, setCols] = useState<EditColumn[]>(() => editColumnsFrom(columns, foreignKeys));
+  const [cols, setCols] = useState<EditColumn[]>(() =>
+    editColumnsFrom(columns, foreignKeys),
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -1229,15 +1385,19 @@ function EditStructureDialog({
   const columnsOf = (t: string): string[] =>
     t === table
       ? cols.filter((c) => !c.drop && c.name.trim()).map((c) => c.name.trim())
-      : tables.find((x) => x.name === t)?.columns.map((c) => c.name) ?? [];
+      : (tables.find((x) => x.name === t)?.columns.map((c) => c.name) ?? []);
   const toggleFk = (i: number, on: boolean) =>
     setCol(i, {
-      references: on ? { table: fkTables[0] ?? "", column: "", onDelete: "" } : null,
+      references: on
+        ? { table: fkTables[0] ?? "", column: "", onDelete: "" }
+        : null,
     });
   const setRef = (i: number, patch: Partial<ColumnRef>) =>
     setCols((cs) =>
       cs.map((c, j) =>
-        j === i && c.references ? { ...c, references: { ...c.references, ...patch } } : c,
+        j === i && c.references
+          ? { ...c, references: { ...c.references, ...patch } }
+          : c,
       ),
     );
 
@@ -1246,13 +1406,18 @@ function EditStructureDialog({
     [table, newName, columns, foreignKeys, cols],
   );
   const kept = cols.filter((c) => !c.drop && c.name.trim());
-  const valid = newName.trim().length > 0 && kept.length > 0 && statements.length > 0;
+  const valid =
+    newName.trim().length > 0 && kept.length > 0 && statements.length > 0;
 
   const apply = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
-      await execDataScript({ path: { name, source }, body: { statements }, throwOnError: true });
+      await execDataScript({
+        path: { name, source },
+        body: { statements },
+        throwOnError: true,
+      });
       onSaved(newName.trim());
     } catch (e) {
       setError(errMsg(e));
@@ -1268,24 +1433,37 @@ function EditStructureDialog({
       wide
       footer={
         <>
-          {error && <span className="mr-auto truncate text-xs text-danger">{error}</span>}
+          {error && (
+            <span className="mr-auto truncate text-xs text-danger">
+              {error}
+            </span>
+          )}
           <Button variant="secondary" onClick={onClose} disabled={busy}>
             Cancel
           </Button>
-          <Button variant="primary" onClick={() => void apply()} disabled={!valid || busy}>
+          <Button
+            variant="primary"
+            onClick={() => void apply()}
+            disabled={!valid || busy}
+          >
             {busy ? "Applying…" : "Apply changes"}
           </Button>
         </>
       }
     >
       <label className="mb-3 block">
-        <span className="mb-1 block text-xs font-medium text-fg-muted">Table name</span>
+        <span className="mb-1 block text-xs font-medium text-fg-muted">
+          Table name
+        </span>
         <Input value={newName} onChange={(e) => setNewName(e.target.value)} />
       </label>
 
       <div className="mb-1 flex items-center justify-between">
         <span className="text-xs font-medium text-fg-muted">Columns</span>
-        <button onClick={addCol} className="text-xs font-medium text-accent hover:underline">
+        <button
+          onClick={addCol}
+          className="text-xs font-medium text-accent hover:underline"
+        >
           ＋ Add column
         </button>
       </div>
@@ -1294,10 +1472,18 @@ function EditStructureDialog({
           <span className="flex-1">Name</span>
           <span className="w-28">Type</span>
           <span className="w-24">Default</span>
-          <span className="w-8 text-center" title="Primary key">PK</span>
-          <span className="w-10 text-center" title="NOT NULL">Req</span>
-          <span className="w-8 text-center" title="Foreign key">FK</span>
-          <span className="w-8 text-center" title="Drop column">Del</span>
+          <span className="w-8 text-center" title="Primary key">
+            PK
+          </span>
+          <span className="w-10 text-center" title="NOT NULL">
+            Req
+          </span>
+          <span className="w-8 text-center" title="Foreign key">
+            FK
+          </span>
+          <span className="w-8 text-center" title="Drop column">
+            Del
+          </span>
         </div>
         {cols.map((c, i) => (
           <div key={i} className="flex flex-col gap-1.5">
@@ -1369,7 +1555,9 @@ function EditStructureDialog({
                 <select
                   className={`${inputClass} w-40`}
                   value={c.references.table}
-                  onChange={(e) => setRef(i, { table: e.target.value, column: "" })}
+                  onChange={(e) =>
+                    setRef(i, { table: e.target.value, column: "" })
+                  }
                 >
                   {fkTables.map((t) => (
                     <option key={t} value={t}>
@@ -1410,9 +1598,9 @@ function EditStructureDialog({
 
       {rebuild && (
         <p className="mt-3 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn">
-          A type, constraint or foreign-key change requires rebuilding the table.
-          Foreign keys are re-created, but indexes and CHECK constraints are not
-          carried over — add those back via a migration if needed.
+          A type, constraint or foreign-key change requires rebuilding the
+          table. Foreign keys are re-created, but indexes and CHECK constraints
+          are not carried over — add those back via a migration if needed.
         </p>
       )}
 
@@ -1421,7 +1609,9 @@ function EditStructureDialog({
           Generated SQL {rebuild ? "(rebuild)" : "(ALTER)"}
         </span>
         <pre className="max-h-40 overflow-auto rounded-md border border-edge bg-inset p-3 font-mono text-xs text-fg-muted">
-          {statements.length ? statements.map((s) => `${s};`).join("\n") : "— no changes —"}
+          {statements.length
+            ? statements.map((s) => `${s};`).join("\n")
+            : "— no changes —"}
         </pre>
       </div>
     </Modal>
@@ -1456,7 +1646,9 @@ function SqlTab({ name, source }: { name: string; source: string }) {
           throwOnError: true,
         });
         setResult(r.data);
-        setStatus(`${r.data.rows.length} row${r.data.rows.length === 1 ? "" : "s"}`);
+        setStatus(
+          `${r.data.rows.length} row${r.data.rows.length === 1 ? "" : "s"}`,
+        );
       } else {
         const r = await execData({
           path: { name, source },
@@ -1466,7 +1658,9 @@ function SqlTab({ name, source }: { name: string; source: string }) {
         setResult(null);
         setStatus(
           `${r.data.changed} row${r.data.changed === 1 ? "" : "s"} changed` +
-            (r.data.lastInsertId != null ? ` · last id ${r.data.lastInsertId}` : ""),
+            (r.data.lastInsertId != null
+              ? ` · last id ${r.data.lastInsertId}`
+              : ""),
         );
       }
     } catch (e) {
@@ -1499,7 +1693,8 @@ function SqlTab({ name, source }: { name: string; source: string }) {
           <ResultGrid result={result} />
         ) : (
           <div className="p-6 text-sm text-fg-faint">
-            Run a statement to see results. SELECT/WITH/PRAGMA return rows; anything else reports rows changed.
+            Run a statement to see results. SELECT/WITH/PRAGMA return rows;
+            anything else reports rows changed.
           </div>
         )}
       </div>
@@ -1519,7 +1714,10 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
   const load = useCallback(async () => {
     setError(null);
     try {
-      const r = await getDataMigrations({ path: { name, source }, throwOnError: true });
+      const r = await getDataMigrations({
+        path: { name, source },
+        throwOnError: true,
+      });
       setEntries(r.data.entries ?? []);
       setDir(r.data.dir);
     } catch (e) {
@@ -1538,7 +1736,10 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
     setError(null);
     setNote(null);
     try {
-      const r = await migrateData({ path: { name, source }, throwOnError: true });
+      const r = await migrateData({
+        path: { name, source },
+        throwOnError: true,
+      });
       setNote(
         r.data.applied.length
           ? `Applied ${r.data.applied.length}: ${r.data.applied.join(", ")}`
@@ -1556,10 +1757,15 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex items-center gap-3 border-b border-edge bg-panel px-4 py-2">
         <Button onClick={() => void apply()} disabled={busy || pending === 0}>
-          {busy ? "Applying…" : pending > 0 ? `Apply ${pending} pending` : "Up to date"}
+          {busy
+            ? "Applying…"
+            : pending > 0
+              ? `Apply ${pending} pending`
+              : "Up to date"}
         </Button>
         <span className="text-xs text-fg-faint">
-          {dir || "db/migrations"} · {entries.length} file{entries.length === 1 ? "" : "s"}
+          {dir || "db/migrations"} · {entries.length} file
+          {entries.length === 1 ? "" : "s"}
         </span>
         {note && <span className="text-xs text-ok">{note}</span>}
         {error && <span className="truncate text-xs text-danger">{error}</span>}
@@ -1577,14 +1783,19 @@ function MigrationsTab({ name, source }: { name: string; source: string }) {
                 <tr key={e.name} className="border-b border-edge/50">
                   <td className="px-4 py-1.5">
                     {e.applied ? (
-                      <span className="text-ok" title={e.appliedAt ?? undefined}>
+                      <span
+                        className="text-ok"
+                        title={e.appliedAt ?? undefined}
+                      >
                         ✓ applied
                       </span>
                     ) : (
                       <span className="text-warn">• pending</span>
                     )}
                   </td>
-                  <td className="px-4 py-1.5 font-mono text-fg-muted">{e.name}</td>
+                  <td className="px-4 py-1.5 font-mono text-fg-muted">
+                    {e.name}
+                  </td>
                   <td className="px-4 py-1.5 text-xs text-fg-faint">
                     {e.appliedAt ? new Date(e.appliedAt).toLocaleString() : ""}
                   </td>
@@ -1615,7 +1826,9 @@ function ResultGrid({
   if (result.columns.length === 0 && result.rows.length === 0) {
     return <div className="p-6 text-sm text-fg-faint">No rows.</div>;
   }
-  const cols = rowKey ? result.columns.filter((c) => c !== rowKey) : result.columns;
+  const cols = rowKey
+    ? result.columns.filter((c) => c !== rowKey)
+    : result.columns;
   const actions = Boolean(rowKey && (onEditRow || onDeleteRow));
   return (
     <table className="min-w-full border-collapse text-sm">
@@ -1663,7 +1876,8 @@ function ResultGrid({
                   {onDeleteRow && (
                     <button
                       onClick={() => {
-                        if (confirm("Delete this row?")) onDeleteRow(row[rowKey as string]);
+                        if (confirm("Delete this row?"))
+                          onDeleteRow(row[rowKey as string]);
                       }}
                       className="text-fg-faint hover:text-danger"
                       title="Delete row"

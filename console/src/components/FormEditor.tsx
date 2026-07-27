@@ -110,7 +110,9 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
       const editor = new FormJsEditor({
         container: containerRef.current,
         additionalModules: [
-          createFormDataBindingModule(() => getDataSourcesRef.current?.() ?? []),
+          createFormDataBindingModule(
+            () => getDataSourcesRef.current?.() ?? [],
+          ),
         ],
       });
       editorRef.current = editor;

@@ -38,7 +38,8 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [selection, setSelection] = useState<ThemeSelection>(loadSelection);
   const [packThemes, setPackThemes] = useState<ThemeSpec[]>([]);
-  const [importedThemes, setImportedThemes] = useState<ThemeSpec[]>(loadImportedThemes);
+  const [importedThemes, setImportedThemes] =
+    useState<ThemeSpec[]>(loadImportedThemes);
   const [appearance, setAppearance] = useState<"light" | "dark">(
     document.documentElement.dataset.appearance === "light" ? "light" : "dark",
   );
@@ -47,14 +48,18 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     getExtensions({ throwOnError: true })
       .then(({ data }) =>
-        setPackThemes(data.extensions.flatMap((e) => (e.themes ?? []).filter(isThemeSpec))),
+        setPackThemes(
+          data.extensions.flatMap((e) => (e.themes ?? []).filter(isThemeSpec)),
+        ),
       )
       .catch(() => {}); // offline/dev — built-ins and imports still work
   }, []);
 
   const resolveTheme = useCallback(
     (id: string) =>
-      packThemes.find((t) => t.id === id) ?? importedThemes.find((t) => t.id === id) ?? null,
+      packThemes.find((t) => t.id === id) ??
+      importedThemes.find((t) => t.id === id) ??
+      null,
     [packThemes, importedThemes],
   );
 
@@ -63,7 +68,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
     setAppearance(applySelection(selection, resolveTheme));
     if (selection.mode !== "system") return;
     const mq = window.matchMedia("(prefers-color-scheme: light)");
-    const onChange = () => setAppearance(applySelection(selection, resolveTheme));
+    const onChange = () =>
+      setAppearance(applySelection(selection, resolveTheme));
     mq.addEventListener("change", onChange);
     return () => mq.removeEventListener("change", onChange);
   }, [selection, resolveTheme]);
@@ -98,7 +104,8 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       const next = importedThemes.filter((t) => t.id !== id);
       saveImportedThemes(next);
       setImportedThemes(next);
-      if (selection.mode === "theme" && selection.id === id) select({ mode: "system" });
+      if (selection.mode === "theme" && selection.id === id)
+        select({ mode: "system" });
     },
     [importedThemes, selection, select],
   );
@@ -113,10 +120,20 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
       importTheme,
       removeImportedTheme,
     }),
-    [selection, appearance, packThemes, importedThemes, select, importTheme, removeImportedTheme],
+    [
+      selection,
+      appearance,
+      packThemes,
+      importedThemes,
+      select,
+      importTheme,
+      removeImportedTheme,
+    ],
   );
 
-  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
+  return (
+    <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>
+  );
 }
 
 export function useTheme(): ThemeContextValue {

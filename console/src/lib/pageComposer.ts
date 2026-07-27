@@ -66,11 +66,17 @@ export function toPageDoc(state: CraftState, title: string): PageDoc {
     if (!cn) continue;
     const type = TYPE_BY_CRAFT[resolvedName(cn.type)];
     if (!type) continue;
-    nodes.push({ type, id, props: (cn.props ?? {}) } as PageNode);
+    nodes.push({ type, id, props: cn.props ?? {} } as PageNode);
   }
   // Round-trip through the validator so persisted pages are always canonical.
-  const parsed = parsePageDoc({ schemaVersion: PAGE_SCHEMA_VERSION, title, nodes });
-  return parsed.ok ? parsed.doc : { schemaVersion: PAGE_SCHEMA_VERSION, title, nodes };
+  const parsed = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title,
+    nodes,
+  });
+  return parsed.ok
+    ? parsed.doc
+    : { schemaVersion: PAGE_SCHEMA_VERSION, title, nodes };
 }
 
 /**

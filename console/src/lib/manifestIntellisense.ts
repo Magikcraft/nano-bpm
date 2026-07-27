@@ -76,7 +76,12 @@ function ensureProvider(): void {
       const src = cell.get();
       const text = model.getValue();
       const offset = model.getOffsetAt(position);
-      const result = manifestCompletionAt(text, offset, src.manifest, src.index);
+      const result = manifestCompletionAt(
+        text,
+        offset,
+        src.manifest,
+        src.index,
+      );
       if (!result || result.candidates.length === 0) return { suggestions: [] };
 
       const start = model.getPositionAt(result.range.start);
@@ -106,7 +111,10 @@ function ensureProvider(): void {
  * disposer that removes it. `get` is called on each completion request so the
  * provider always sees the latest parsed manifest + index.
  */
-export function setManifestSource(uri: string, get: () => ManifestSource): () => void {
+export function setManifestSource(
+  uri: string,
+  get: () => ManifestSource,
+): () => void {
   ensureProvider();
   ensureBundledJsonSchemas();
   sources.set(uri, { get });

@@ -20,14 +20,20 @@ import {
 // A minimal moddle stand-in: create() returns a tagged plain object.
 const moddle: ShapeModdle = {
   create(type, attrs) {
-    return { $type: type, ...(attrs as Record<string, unknown>) } as ShapeModdleElement;
+    return {
+      $type: type,
+      ...(attrs as Record<string, unknown>),
+    } as ShapeModdleElement;
   },
 };
 
 function recordingModeling(): ShapeModeling & {
   calls: Array<{ moddleElement: unknown; props: Record<string, unknown> }>;
 } {
-  const calls: Array<{ moddleElement: unknown; props: Record<string, unknown> }> = [];
+  const calls: Array<{
+    moddleElement: unknown;
+    props: Record<string, unknown>;
+  }> = [];
   return {
     calls,
     updateModdleProperties(_element, moddleElement, props) {
@@ -54,7 +60,12 @@ const sample: ShapeDecl[] = [
     name: "Approved order",
     ops: [
       { op: "carry", ref: "Order" },
-      { op: "project", ref: "Customer", fields: ["tier", "region"], via: "Order.customerId" },
+      {
+        op: "project",
+        ref: "Customer",
+        fields: ["tier", "region"],
+        via: "Order.customerId",
+      },
       { op: "extend", name: "approved", type: "boolean" },
       { op: "extend", name: "reviewedBy", type: "string", optional: true },
       { op: "reference", name: "lines", ref: "OrderLine", list: true },
@@ -77,35 +88,46 @@ test("readShapes: drops a shape with no id and malformed ops", () => {
     $type: "bpmn:Process",
     extensionElements: {
       $type: "bpmn:ExtensionElements",
-      values: [{
-        $type: "nano:Shapes",
-        shapes: [
-          {
-            $type: "nano:Shape",
-            id: "  Ok  ",
-            name: "  ",
-            ops: [
-              { $type: "nano:Carry" }, // no ref → dropped
-              { $type: "nano:Extend", name: "approved" }, // no type → dropped
-              { $type: "nano:Project", ref: "Customer" }, // no fields → dropped
-              { $type: "nano:Project", ref: "Customer", fields: "  " }, // empty fields → dropped
-              { $type: "nano:Carry", ref: "Order" },
-            ],
-          },
-          { $type: "nano:Shape", ops: [{ $type: "nano:Carry", ref: "Order" }] }, // no id → skipped
-        ],
-      }],
+      values: [
+        {
+          $type: "nano:Shapes",
+          shapes: [
+            {
+              $type: "nano:Shape",
+              id: "  Ok  ",
+              name: "  ",
+              ops: [
+                { $type: "nano:Carry" }, // no ref → dropped
+                { $type: "nano:Extend", name: "approved" }, // no type → dropped
+                { $type: "nano:Project", ref: "Customer" }, // no fields → dropped
+                { $type: "nano:Project", ref: "Customer", fields: "  " }, // empty fields → dropped
+                { $type: "nano:Carry", ref: "Order" },
+              ],
+            },
+            {
+              $type: "nano:Shape",
+              ops: [{ $type: "nano:Carry", ref: "Order" }],
+            }, // no id → skipped
+          ],
+        },
+      ],
     },
   };
-  assert.deepEqual(readShapes(bo), [{ id: "Ok", ops: [{ op: "carry", ref: "Order" }] }]);
+  assert.deepEqual(readShapes(bo), [
+    { id: "Ok", ops: [{ op: "carry", ref: "Order" }] },
+  ]);
 });
 
 test("buildShapesContainer: serialises project fields as a comma list and omits false flags", () => {
   const container = buildShapesContainer(moddle, sample);
-  const project = container.shapes?.[0].ops?.find((o) => o.$type === "nano:Project");
+  const project = container.shapes?.[0].ops?.find(
+    (o) => o.$type === "nano:Project",
+  );
   assert.equal(project?.fields, "tier, region");
   assert.equal(project?.via, "Order.customerId");
-  const carry = container.shapes?.[0].ops?.find((o) => o.$type === "nano:Carry");
+  const carry = container.shapes?.[0].ops?.find(
+    (o) => o.$type === "nano:Carry",
+  );
   assert.equal(carry?.spread, undefined);
   const optionalExtend = container.shapes?.[0].ops?.find(
     (o) => o.$type === "nano:Extend" && o.name === "reviewedBy",
@@ -130,7 +152,11 @@ test("writeShapes: creates the extensionElements + shapes container in one comma
 });
 
 test("writeShapes: preserves other extension elements and swaps only the shapes container", () => {
-  const meta: ShapeModdleElement = { $type: "nano:Meta", key: "classification", value: "internal" };
+  const meta: ShapeModdleElement = {
+    $type: "nano:Meta",
+    key: "classification",
+    value: "internal",
+  };
   const bo: ShapeModdleElement = {
     $type: "bpmn:Process",
     extensionElements: {
@@ -144,7 +170,10 @@ test("writeShapes: preserves other extension elements and swaps only the shapes 
   assert.equal(values.length, 2);
   assert.equal(values[0], meta); // meta preserved
   assert.equal(values[1].$type, "nano:Shapes");
-  const nextExt: ShapeModdleElement = { $type: "bpmn:ExtensionElements", values };
+  const nextExt: ShapeModdleElement = {
+    $type: "bpmn:ExtensionElements",
+    values,
+  };
   assert.deepEqual(readShapes({ ...bo, extensionElements: nextExt }), sample);
 });
 
@@ -181,7 +210,10 @@ test("writeShapes: an empty shape list removes the container but keeps meta", ()
   const values = modeling.calls[0].props.values as ShapeModdleElement[];
   assert.deepEqual(values, [meta]);
   // The rebuilt extension elements carry no shapes container, so it reads back empty.
-  const nextExt: ShapeModdleElement = { $type: "bpmn:ExtensionElements", values };
+  const nextExt: ShapeModdleElement = {
+    $type: "bpmn:ExtensionElements",
+    values,
+  };
   assert.deepEqual(readShapes({ ...bo, extensionElements: nextExt }), []);
 });
 
@@ -193,10 +225,20 @@ const sampleMeta: MetaEntry[] = [
 ];
 
 /** A process businessObject carrying `nano:meta` siblings of a shapes container. */
-function processWithMeta(meta: MetaEntry[], shapes: ShapeDecl[] = []): ShapeModdleElement {
+function processWithMeta(
+  meta: MetaEntry[],
+  shapes: ShapeDecl[] = [],
+): ShapeModdleElement {
   const values: ShapeModdleElement[] = [
     ...(shapes.length ? [buildShapesContainer(moddle, shapes)] : []),
-    ...meta.map((m) => ({ $type: "nano:Meta", key: m.key, value: m.value }) as ShapeModdleElement),
+    ...meta.map(
+      (m) =>
+        ({
+          $type: "nano:Meta",
+          key: m.key,
+          value: m.value,
+        }) as ShapeModdleElement,
+    ),
   ];
   return {
     $type: "bpmn:Process",
@@ -220,7 +262,10 @@ test("readMeta: returns [] when the process declares no meta", () => {
 });
 
 test("readMeta: skips an entry with a blank key", () => {
-  const bo = processWithMeta([{ key: "  ", value: "x" }, { key: "keep", value: "y" }]);
+  const bo = processWithMeta([
+    { key: "  ", value: "x" },
+    { key: "keep", value: "y" },
+  ]);
   assert.deepEqual(readMeta(bo), [{ key: "keep", value: "y" }]);
 });
 
@@ -247,9 +292,14 @@ test("writeMeta: preserves the shapes container and swaps only the meta run in p
   writeMeta(moddle, modeling, {}, bo, sampleMeta);
   const values = modeling.calls[0].props.values as ShapeModdleElement[];
   assert.equal(values[0], shapes); // shapes container preserved, still first
-  const nextExt: ShapeModdleElement = { $type: "bpmn:ExtensionElements", values };
+  const nextExt: ShapeModdleElement = {
+    $type: "bpmn:ExtensionElements",
+    values,
+  };
   assert.deepEqual(readMeta({ ...bo, extensionElements: nextExt }), sampleMeta);
-  assert.deepEqual(readShapes({ ...bo, extensionElements: nextExt }), [{ id: "Old", ops: [] }]);
+  assert.deepEqual(readShapes({ ...bo, extensionElements: nextExt }), [
+    { id: "Old", ops: [] },
+  ]);
 });
 
 test("writeMeta: an empty list removes every meta but keeps the shapes container", () => {
@@ -270,9 +320,14 @@ test("writeMeta: an empty list removes every meta but keeps the shapes container
 test("writeMeta: drops entries with a blank key", () => {
   const bo: ShapeModdleElement = { $type: "bpmn:Process" };
   const modeling = recordingModeling();
-  writeMeta(moddle, modeling, {}, bo, [{ key: "  ", value: "x" }, { key: "keep", value: "y" }]);
+  writeMeta(moddle, modeling, {}, bo, [
+    { key: "  ", value: "x" },
+    { key: "keep", value: "y" },
+  ]);
   const ext = modeling.calls[0].props.extensionElements as ShapeModdleElement;
-  assert.deepEqual(readMeta({ ...bo, extensionElements: ext }), [{ key: "keep", value: "y" }]);
+  assert.deepEqual(readMeta({ ...bo, extensionElements: ext }), [
+    { key: "keep", value: "y" },
+  ]);
 });
 
 test("writeMeta: trims the value so a round-trip is stable (symmetric with readMeta)", () => {
@@ -283,5 +338,7 @@ test("writeMeta: trims the value so a round-trip is stable (symmetric with readM
   // The persisted value is trimmed at write time, so re-reading yields the same
   // value (no silent strip on the next read).
   assert.equal((ext.values?.[0] as ShapeModdleElement).value, "ops");
-  assert.deepEqual(readMeta({ ...bo, extensionElements: ext }), [{ key: "owner", value: "ops" }]);
+  assert.deepEqual(readMeta({ ...bo, extensionElements: ext }), [
+    { key: "owner", value: "ops" },
+  ]);
 });

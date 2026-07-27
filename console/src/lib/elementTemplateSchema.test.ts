@@ -26,7 +26,8 @@ test("keys the schema under the published $schema URL + canonical $id alias", ()
     elementTemplateSchema as Record<string, unknown>,
   );
   const uris = new Set(entries.map((e) => e.uri));
-  for (const u of ELEMENT_TEMPLATE_SCHEMA_URIS) assert.ok(uris.has(u), `missing ${u}`);
+  for (const u of ELEMENT_TEMPLATE_SCHEMA_URIS)
+    assert.ok(uris.has(u), `missing ${u}`);
   // Primary: the unpkg URL our templates' `$schema` points at.
   assert.equal(ELEMENT_TEMPLATE_SCHEMA_URIS[0], ELEMENT_TEMPLATE_SCHEMA_URL);
   assert.ok(uris.has(ELEMENT_TEMPLATE_SCHEMA_URL));
@@ -52,7 +53,9 @@ test("associates by component-dir file globs for missing/stale $schema", () => {
   }
   assert.ok(ELEMENT_TEMPLATE_FILE_MATCH.includes("**/components/**/*.json"));
   assert.ok(
-    ELEMENT_TEMPLATE_FILE_MATCH.includes("**/.camunda/element-templates/**/*.json"),
+    ELEMENT_TEMPLATE_FILE_MATCH.includes(
+      "**/.camunda/element-templates/**/*.json",
+    ),
   );
 });
 
@@ -60,7 +63,8 @@ test("passes the bundled schema object through verbatim", () => {
   const entries = elementTemplateSchemaEntries(
     elementTemplateSchema as Record<string, unknown>,
   );
-  for (const entry of entries) assert.equal(entry.schema, elementTemplateSchema);
+  for (const entry of entries)
+    assert.equal(entry.schema, elementTemplateSchema);
 });
 
 test("the bundled URL version matches the pinned dependency version", () => {

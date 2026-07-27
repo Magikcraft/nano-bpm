@@ -33,7 +33,8 @@ export const ELEMENT_TEMPLATE_SCHEMA_URL = `https://unpkg.com/@camunda/zeebe-ele
 // The schema document's own `$id`. Registered as a resolution alias so a
 // template that points its `$schema` at the canonical Camunda id (rather than
 // the unpkg mirror) resolves offline too.
-export const ELEMENT_TEMPLATE_SCHEMA_ID = "http://camunda.org/schema/zeebe-element-templates/1.0";
+export const ELEMENT_TEMPLATE_SCHEMA_ID =
+  "http://camunda.org/schema/zeebe-element-templates/1.0";
 
 // Keep the first entry equal to the published `$schema` our templates carry
 // (guarded by the unit test); the canonical `$id` alias follows.

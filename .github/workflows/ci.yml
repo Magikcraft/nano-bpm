@@ -404,6 +404,11 @@ jobs:
           node-version: '24'
       - name: Install (locked)
         run: npm ci
+      - name: Format check (prettier)
+        # Fails if any app source (src/**/*.{ts,tsx,css}) isn't Prettier-clean.
+        # Fix locally with `npm run format`. Generated code (src/gen, src/wasm)
+        # and build output are excluded via .prettierignore.
+        run: npm run format:check
       - name: Typecheck (regen API client + app + tests)
         # `typecheck` runs `gen:api` (regenerating src/gen from the console spec),
         # then type-checks the browser app (tsconfig.json) and the node-runtime
