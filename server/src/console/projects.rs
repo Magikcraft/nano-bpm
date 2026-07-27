@@ -5115,6 +5115,66 @@ mod tests {
         assert_eq!(dm_disk, dt["domainModel"].as_str().unwrap());
     }
 
+    /// A user-authored metadata key of `__proto__` must round-trip: `foldMeta` and the
+    /// emitted accessor are null-prototype dicts, so `__proto__` becomes an own data
+    /// property (not a silently-dropped prototype-setter write) in both `meta.ts` and
+    /// `domain.json`. Guards the prototype-pollution hardening (ADR 0040 §5).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn domaintypes_meta_round_trips_a_proto_key() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "meta-proto";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } } }"#,
+        )
+        .unwrap();
+        let procs = dir.join("resources").join("processes");
+        std::fs::create_dir_all(&procs).unwrap();
+        std::fs::write(
+            procs.join("p.bpmn"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:nano="https://nanobpm.io/schema/shapes/1.0" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:extensionElements>
+      <nano:meta key="__proto__" value="polluted" />
+    </bpmn:extensionElements>
+  </bpmn:process>
+</bpmn:definitions>"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        // The dangerous key survives the fold and is assigned via bracket notation.
+        let meta_ts = dt["meta"].as_str().unwrap();
+        assert!(
+            meta_ts.contains(r#"m["__proto__"] = "polluted";"#),
+            "__proto__ must round-trip as an own property: {meta_ts}"
+        );
+        // …and appears in the structured cache exactly once.
+        let dm: serde_json::Value =
+            serde_json::from_str(dt["domainModel"].as_str().unwrap()).unwrap();
+        let hits = dm["meta"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["key"] == "__proto__" && m["value"] == "polluted")
+            .count();
+        assert_eq!(hits, 1, "domain.json meta: {}", dm["meta"]);
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn domaintypes_op_meta_accessor_matches_the_stub_when_no_meta() {

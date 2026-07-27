@@ -1,6 +1,6 @@
 // Deno unit tests for the Urban LLM-as-job-worker runtime (ADR 0022 §E role 1).
 //
-// CI cannot run Deno, so these are run locally with:
+// Run in CI by the `console-deno` job, and locally with:
 //   deno test --allow-read --allow-env server/src/console/llm_worker_test.ts
 //
 // They cover provider resolution, prompt construction, the chat-completions call

@@ -416,3 +416,26 @@ jobs:
         run: git diff --exit-code -- src/gen
       - name: Test (node:test unit tests)
         run: npm test
+
+  console-deno:
+    name: console (deno typecheck + test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Typecheck + unit-test the server console TS (ADR 0040)
+        # server/src/console/*.ts is the JS half of the console gateway — the fuse
+        # composition algebra (`resolveShapes`), the typed model-metadata accessor
+        # (`emitMeta`), and the structured Fused Domain Model emitter
+        # (`emitDomainModelJson`) — embedded into the Rust binary via `include_str!`
+        # and run under Deno/Node at runtime. The `server` job only exercises it
+        # end-to-end through slow integration tests; this gate type-checks it and
+        # runs the fast pure-function unit tests directly. `deno test` type-checks
+        # its whole import graph by default, so this also guards `domain_types.ts`
+        # (imported by the `*_test.ts` files). The materialisation entrypoint
+        # `data_cli.ts` is intentionally excluded: it imports the SDK's hyphenated
+        # emit-time filenames (`./domain-types.ts`) that only exist post-render, so
+        # it is not type-checkable in-tree and no test imports it.
+        run: deno test --allow-read --allow-write --allow-env server/src/console/

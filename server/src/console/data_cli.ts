@@ -26,6 +26,7 @@ import {
   DOMAIN_BINDINGS,
   DOMAIN_DTS,
   DOMAIN_MODEL_JSON,
+  type DomainTypeDef,
   type DomainTypeRegistry,
   emitDomainBindings,
   emitDomainModel,

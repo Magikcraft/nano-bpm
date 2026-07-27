@@ -1021,8 +1021,7 @@ mod tests {
     fn scans_model_level_meta_siblings_tagged_with_the_process() {
         // Two `nano:meta` siblings of the shapes container are lifted, in document
         // order, each tagged with the enclosing process id (ADR 0040 §5).
-        let xml = format!(
-            r#"<?xml version="1.0"?>
+        let xml = r#"<?xml version="1.0"?>
             <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                               xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
               <bpmn:process id="orders" isExecutable="true">
@@ -1032,9 +1031,8 @@ mod tests {
                   <nano:meta key="owner" value="ops" />
                 </bpmn:extensionElements>
               </bpmn:process>
-            </bpmn:definitions>"#
-        );
-        let scan = scan_bpmn(&xml);
+            </bpmn:definitions>"#;
+        let scan = scan_bpmn(xml);
         assert_eq!(
             scan.meta,
             vec![

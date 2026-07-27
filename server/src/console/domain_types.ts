@@ -1074,10 +1074,11 @@ function validateVia(
     });
     return;
   }
+  let cursor: FuseEntity = entity;
   for (let i = start; i < parts.length; i++) {
     const col = parts[i];
-    const hasField = Object.prototype.hasOwnProperty.call(entity.fields, col);
-    const fkTarget = entity.fks?.[col];
+    const hasField = Object.prototype.hasOwnProperty.call(cursor.fields, col);
+    const fkTarget: string | undefined = cursor.fks?.[col];
     if (!hasField && !fkTarget) {
       diagnostics.push({
         shape,
@@ -1088,9 +1089,9 @@ function validateVia(
       return;
     }
     // Follow the FK to the next entity when we can; otherwise stop (lenient).
-    const next = fkTarget ? index.get(fkTarget) : undefined;
+    const next: FuseEntity | undefined = fkTarget ? index.get(fkTarget) : undefined;
     if (!next) return;
-    entity = next;
+    cursor = next;
   }
 }
 
@@ -1120,9 +1121,13 @@ export interface MetaDecl {
  * models declare the same key the last (scan order) wins — the fold is a flat
  * app-wide view where a later declaration overrides an earlier one (matching the
  * editor's "last write wins" affordance and JS object semantics). Empty keys are
- * ignored. */
+ * ignored. The accumulator is a **null-prototype** dict: keys are user-authored, so
+ * a plain `{}` would route a `__proto__` key through the `Object.prototype` setter
+ * (creating no own property → silently dropped from `Object.keys`) and let inherited
+ * members shadow real ones. `Object.create(null)` makes every assignment an own data
+ * property, so all keys (including `__proto__`) round-trip deterministically. */
 export function foldMeta(metas: MetaDecl[]): Record<string, string> {
-  const out: Record<string, string> = {};
+  const out: Record<string, string> = Object.create(null);
   for (const m of metas) {
     const key = (m?.key ?? "").trim();
     if (!key) continue;
