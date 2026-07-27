@@ -37,6 +37,24 @@ export const APP_SCHEMA_URIS: readonly string[] = [
 export const APP_MANIFEST_FILE_MATCH = ["*.nano.app.json", "nano.app.json"];
 
 /**
+ * The Monaco JSON schema-registration entries for the bundled manifest schema,
+ * keyed by the canonical + legacy-alias URLs and scoped by `fileMatch`. Returned
+ * as entries (not full `DiagnosticsOptions`) so `bundledJsonSchemas.ts` can merge
+ * them with the element-template schema into a single `setDiagnosticsOptions`
+ * call — Monaco's JSON diagnostics options are process-wide and replace, not
+ * merge.
+ */
+export function manifestSchemaEntries(
+  schema: Record<string, unknown>,
+): NonNullable<monaco.languages.json.DiagnosticsOptions["schemas"]> {
+  return APP_SCHEMA_URIS.map((uri) => ({
+    uri,
+    fileMatch: [...APP_MANIFEST_FILE_MATCH],
+    schema,
+  }));
+}
+
+/**
  * Build the Monaco JSON diagnostics options that register the bundled Urban App
  * manifest schema locally. `enableSchemaRequest: false` guarantees Monaco never
  * reaches the network for a `$schema` URL — the schema is resolved from the
@@ -48,10 +66,6 @@ export function buildManifestSchemaOptions(
   return {
     validate: true,
     enableSchemaRequest: false,
-    schemas: APP_SCHEMA_URIS.map((uri) => ({
-      uri,
-      fileMatch: [...APP_MANIFEST_FILE_MATCH],
-      schema,
-    })),
+    schemas: manifestSchemaEntries(schema),
   };
 }
