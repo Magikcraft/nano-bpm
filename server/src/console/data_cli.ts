@@ -36,6 +36,8 @@ import {
   MESSAGE_BINDINGS_DTS,
   MESSAGE_BINDINGS_TS,
   type MessageBindingDecl,
+  resolveShapes,
+  type ShapeDecl,
   type SourceSchema,
   WORKER_BINDINGS_DTS,
   WORKER_BINDINGS_TS,
@@ -66,6 +68,14 @@ interface Request {
    * so it is emitted directly. Absent → no message registry is derived.
    */
   derivedMessages?: MessageBindingDecl[];
+  /**
+   * `domaintypes`: the model-derived composed shapes (`nano:shape` declarations),
+   * scanned from the process models by the server (ADR 0040 §9/§10). Each is
+   * resolved through the fuse into a flat domain type and folded into the manifest
+   * `types` registry, so a composed shape becomes a first-class `DomainTypes` entry
+   * every consumer types against. Absent → no shapes are resolved.
+   */
+  derivedShapes?: ShapeDecl[];
 }
 
 /**
@@ -365,6 +375,15 @@ async function run(req: Request): Promise<unknown> {
         }
       }
       const types = await manifestTypes() as DomainTypeRegistry;
+      // Composed motion shapes (ADR 0040 §9/§10): resolve each `nano:shape` scanned
+      // from the model against the leaf fuse (DB tables + manifest types) into a flat
+      // domain type, and fold the resolved shapes into the registry *before* it feeds
+      // the domain model and the worker/message bindings. A composed shape thus becomes
+      // a first-class `DomainTypes` entry, so envelopes/workers/messages can reference
+      // it with no extra codegen path. Broken shapes are omitted; their diagnostics are
+      // returned so the panel can surface them like the `workers[]` drift warning.
+      const shapeResolution = resolveShapes(req.derivedShapes ?? [], types, schemas);
+      for (const [id, def] of Object.entries(shapeResolution.types)) types[id] = def;
       const text = emitDomainModel(schemas, def, types);
       // The typed data-object accessor (`db.orders.insert(...)`, ADR 0029 §6) is
       // generated alongside the `.d.ts` spine so workers get both the row types
@@ -418,6 +437,7 @@ async function run(req: Request): Promise<unknown> {
         workerBindings,
         messageBindingsPath,
         messageBindings,
+        shapeDiagnostics: shapeResolution.diagnostics,
       };
     }
     default:

@@ -7,6 +7,7 @@ import {
 } from "bpmn-js-properties-panel";
 import { SelectEntry, Group, isSelectEntryEdited } from "@bpmn-io/properties-panel";
 import ZeebeModdle from "zeebe-bpmn-moddle/resources/zeebe.json";
+import { nanoShapesModdle } from "../moddle/nanoShapes";
 import {
   CloudElementTemplatesCoreModule,
   CloudElementTemplatesPropertiesProviderModule,
@@ -470,7 +471,7 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           urbanDomainTypePropertiesModule,
           domainVariableResolverModule,
         ],
-        moddleExtensions: { zeebe: ZeebeModdle },
+        moddleExtensions: { zeebe: ZeebeModdle, nano: nanoShapesModdle },
       });
       modelerRef.current = modeler;
       // Install the project's components so the palette + template chooser
