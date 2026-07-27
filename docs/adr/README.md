@@ -53,6 +53,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0038](0038-node-first-runtime.md) | Node-first runtime: Deno optional, only for `deno compile` | Accepted | 2026-07-24 |
 | [0039](0039-falcon-client-cluster-channel-split.md) | Splitting Falcon: a public client channel vs an authenticated cluster channel | Proposed | 2026-07-24 |
 | [0040](0040-fused-domain-model.md) | The Fused Domain Model: the registry is derived, not authored (three sources → one fuse) | Proposed | 2026-07-27 |
+| [0041](0041-urban-app-import-registry.md) | Importing an Urban App by reference: external project pointers + headless run | Proposed | 2026-07-27 |
 
 ## Reading paths
 
