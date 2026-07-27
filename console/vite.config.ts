@@ -43,14 +43,29 @@ export default defineConfig({
   // in both dev (optimizeDeps) and the production build (Rollup).
   resolve: {
     dedupe: ["preact"],
+    // Match the console tsconfig's `preserveSymlinks`: the `@nanobpm/*` file:
+    // deps are symlinked into `node_modules` and re-export each other
+    // transitively (bojtos-react → bojtos-kit → engine-wasm), but only the
+    // console installs deps, so the shared packages are hoisted here in
+    // `console/node_modules/@nanobpm/*` with no per-package `node_modules`.
+    // Resolving via each package's realpath (Rollup's default) misses that
+    // hoisted tree — `Rollup failed to resolve import "@nanobpm/bojtos-kit"
+    // from bojtos-react` — so follow the symlink path rooted here instead.
+    preserveSymlinks: true,
   },
   // `@nanobpm/engine-wasm` (the wasm-pack `--target web` output) resolves its
   // binary via `new URL('nanobpmn_engine_bg.wasm', import.meta.url)`. Excluding
   // it from esbuild's dependency pre-bundling keeps that asset reference intact
   // so Vite emits the `.wasm` as a hashed asset instead of esbuild rewriting the
-  // `import.meta.url` and losing the binary.
+  // `import.meta.url` and losing the binary. The Bojtos packages
+  // (`@nanobpm/bojtos-kit` / `-react`) load the engine through that same loader,
+  // so they are excluded too to keep the wasm asset reference intact end to end.
   optimizeDeps: {
-    exclude: ["@nanobpm/engine-wasm"],
+    exclude: [
+      "@nanobpm/engine-wasm",
+      "@nanobpm/bojtos-kit",
+      "@nanobpm/bojtos-react",
+    ],
   },
   build: {
     outDir: "dist",

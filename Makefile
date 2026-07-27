@@ -163,8 +163,13 @@ release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimize
 	@echo "Built API-only gateway: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 
 .PHONY: console-frontend
-console-frontend: console-wasm ## Build the web console SPA (console/ -> console/dist)
+console-frontend: console-wasm bojtos ## Build the web console SPA (console/ -> console/dist)
 	cd $(CONSOLE_DIR) && npm install && npm run build
+
+.PHONY: bojtos
+bojtos: console-wasm ## Rebuild the Bojtos packages (@nanobpm/bojtos-kit + @nanobpm/bojtos-react) from source into their committed dist/ (ADR 0043 §8 step 2). The kit is built first; bojtos-react depends on its dist via a file: link.
+	cd $(PROJECT_ROOT)/bojtos-kit && npm install && npm run build
+	cd $(PROJECT_ROOT)/bojtos-react && npm install && npm run build
 
 .PHONY: console-wasm
 console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine-wasm/pkg, the @nanobpm/engine-wasm package). Needs wasm-pack; falls back to the committed artifacts if absent.
