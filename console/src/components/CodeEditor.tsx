@@ -224,6 +224,7 @@ function acquireTypes(code: string): void {
 import { languageForFile } from "../lib/editorLang";
 export { languageForFile };
 import { initMonacoIntellisense } from "../lib/monacoIntellisense";
+import { ensureBundledJsonSchemas } from "../lib/jsonSchemas";
 
 // --- Cross-file IntelliSense: sibling + shared-library models --------------
 // A worker is a folder of files, and shared logic lives under `@lib/…`. For the
@@ -256,6 +257,14 @@ function registerModels(models: ExtraModel[], activePath?: string): void {
 // editor chunk — and reads the shared store live so later pack installs take
 // effect without a reload.
 initMonacoIntellisense();
+
+// Register the bundled JSON schemas (Urban App manifest + Camunda element
+// template) with Monaco eagerly, as soon as this lazily-loaded editor chunk
+// loads. Unlike manifest completion (which the manifest editor opts a model into
+// via `setManifestSource`), an element template is a plain `components/*.json`
+// edited through this generic editor with no manifest necessarily open — so its
+// `$schema` must resolve offline regardless. Idempotent; see `jsonSchemas.ts`.
+ensureBundledJsonSchemas();
 
 export default function CodeEditor({
   value,

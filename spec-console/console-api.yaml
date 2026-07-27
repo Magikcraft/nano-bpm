@@ -2334,7 +2334,7 @@ components:
         pending: { type: integer, format: int64 }
     DomainTypesResult:
       type: object
-      required: [text, tables, shapeDiagnostics]
+      required: [text, tables, shapeDiagnostics, migrated]
       properties:
         path:
           type: string
@@ -2357,6 +2357,17 @@ components:
             (ADR 0040 §10). Always present (empty when every shape resolved);
             the preview endpoint surfaces these live for the in-editor shapes.
           items: { $ref: '#/components/schemas/ShapeDiagnostic' }
+        migrated:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+          description: >
+            Pending schema migrations applied *before* introspecting each
+            datasource (ADR 0029 §4.1/§6), keyed by source name → the applied
+            migration filenames in order. Always present; empty on the preview
+            endpoint (`write:false` never mutates the DB) and whenever no
+            migration was outstanding.
         metaPath:
           type: string
           nullable: true

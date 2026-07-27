@@ -18,8 +18,12 @@ import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
 import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
 import FormPreview from "../components/FormPreview";
 import ShapeComposer, { type ShapePreview } from "../components/ShapeComposer";
+import PageComposer, {
+  type PageComposerHandle,
+} from "../components/PageComposer";
 import type { MetaEntry, ShapeDecl } from "../lib/shapeCarrier";
 import type { ComposerEntity } from "../lib/shapeComposer";
+import { SCALAR_KEYWORDS } from "../lib/shapeComposer";
 import AppManifestEditor, {
   isAppManifestPath,
 } from "../components/AppManifestEditor";
@@ -850,9 +854,16 @@ const NEW_FILE_KINDS = [
     dir: "resources/forms",
     ext: ".form",
   },
+  {
+    id: "page" as const,
+    label: "Page",
+    hint: "App screen (Page Composer)",
+    dir: "pages",
+    ext: ".page.json",
+  },
 ];
 
-type NewFileKindId = "model" | "decision" | "form" | "source";
+type NewFileKindId = "model" | "decision" | "form" | "page" | "source";
 
 const extnameOf = (p: string): string => {
   const base = p.split("/").pop() ?? "";
@@ -1167,6 +1178,7 @@ function EditorPane({
   const bpmnRef = useRef<BpmnModelerHandle>(null);
   const dmnRef = useRef<DmnModelerHandle>(null);
   const formRef = useRef<FormEditorHandle>(null);
+  const pageRef = useRef<PageComposerHandle>(null);
   const [testXml, setTestXml] = useState<string | null>(null);
   // Markdown files open in a rendered Preview tab; the user can switch to Edit.
   const [mdView, setMdView] = useState<"preview" | "edit">("preview");
@@ -1197,8 +1209,11 @@ function EditorPane({
   const [startModalOpen, setStartModalOpen] = useState(false);
 
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  const kind: "bpmn" | "dmn" | "form" | "md" | "code" =
-    ext === "bpmn"
+  const kind: "bpmn" | "dmn" | "form" | "page" | "md" | "code" = path
+    .toLowerCase()
+    .endsWith(".page.json")
+    ? "page"
+    : ext === "bpmn"
       ? "bpmn"
       : ext === "dmn"
         ? "dmn"
@@ -1301,13 +1316,16 @@ function EditorPane({
     if (!types || typeof types !== "object") return [];
     return Object.keys(types as Record<string, unknown>);
   }, [manifest]);
-  // Creates a new transient domain type in the manifest `types` registry (the
-  // "Create new envelope…" affordance, ADR 0033 §6) and persists `nano.app.json`,
-  // so a maker can declare + pick an envelope in one gesture. Seeds a stub field
-  // (schema requires ≥1) the maker fleshes out in the types editor. Throws on a
-  // failed save so the modeler aborts selecting a type that was never persisted.
-  const createDomainType = useCallback(
-    async (id: string): Promise<void> => {
+  // Persists a new (transient) domain type into the manifest `types` registry
+  // (the "Create new envelope…" affordance, ADR 0033 §6) with the maker-authored
+  // fields, and saves `nano.app.json`. A manifest `types` entry is a *pure-motion*
+  // shape — a data contract with no backing table (ADR 0040 §10). Throws on a
+  // failed save so the caller can abort. Existing ids are left untouched.
+  const writeDomainType = useCallback(
+    async (
+      id: string,
+      fields: { name: string; type: string }[],
+    ): Promise<void> => {
       const prev = manifestTextRef.current;
       if (prev == null) return;
       let obj: Record<string, unknown>;
@@ -1322,7 +1340,13 @@ function EditorPane({
         obj.types && typeof obj.types === "object"
           ? (obj.types as Record<string, unknown>)
           : ((obj.types = {}) as Record<string, unknown>);
-      if (!types[id]) types[id] = { fields: { value: { type: "string" } } };
+      if (!types[id]) {
+        const fieldDefs: Record<string, { type: string }> = {};
+        for (const f of fields) {
+          if (f.name.trim()) fieldDefs[f.name.trim()] = { type: f.type };
+        }
+        types[id] = { fields: fieldDefs };
+      }
       const next = `${JSON.stringify(obj, null, 2)}\n`;
       setManifestText(next);
       await saveProjectFile({
@@ -1334,6 +1358,45 @@ function EditorPane({
     },
     [name],
   );
+  // Bridges the modeler's "Create new envelope…" action (bpmn-js land) to a React
+  // modal: `createDomainType()` opens the field editor and returns a promise that
+  // resolves with the new type id once it is authored + persisted, or `undefined`
+  // if the maker cancelled. The resolver is stashed so the modal's save/close
+  // handlers can settle the awaiting modeler.
+  const [envelopeEditorOpen, setEnvelopeEditorOpen] = useState(false);
+  const envelopeResolverRef = useRef<((id: string | undefined) => void) | null>(
+    null,
+  );
+  // The single in-flight open request. Re-entrant calls (double-click, a second
+  // envelope picker) return this same promise instead of overwriting the
+  // resolver — otherwise the first awaiter would hang forever.
+  const envelopePromiseRef = useRef<Promise<string | undefined> | null>(null);
+  // Composed-shape ids (`nano:shape`) share the fused-entity namespace with
+  // manifest `types` server-side (ADR 0040 §10 / `resolveShapes` same-id
+  // collision), and the modeler also surfaces them as selectable envelope
+  // types. A new manifest type whose id collides with a shape id would drop
+  // that shape from the picker (de-dupe) and break shape resolution, so the
+  // editor must reject those ids up front too. `composerShapes` is only synced
+  // while the shapes drawer is open, so read the ids fresh from the model at
+  // open time — independent of the drawer.
+  const [envelopeShapeIds, setEnvelopeShapeIds] = useState<string[]>([]);
+  const createDomainType = useCallback((): Promise<string | undefined> => {
+    if (envelopePromiseRef.current) return envelopePromiseRef.current;
+    setEnvelopeShapeIds((bpmnRef.current?.getShapes() ?? []).map((s) => s.id));
+    const p = new Promise<string | undefined>((resolve) => {
+      envelopeResolverRef.current = resolve;
+      setEnvelopeEditorOpen(true);
+    });
+    envelopePromiseRef.current = p;
+    return p;
+  }, []);
+  const closeEnvelopeEditor = useCallback((id: string | undefined) => {
+    setEnvelopeEditorOpen(false);
+    const resolve = envelopeResolverRef.current;
+    envelopeResolverRef.current = null;
+    envelopePromiseRef.current = null;
+    resolve?.(id);
+  }, []);
   // Projects a service task's chosen envelope onto its `workers[]` entry (creating
   // it if absent, clearing on ""), so the reifier keeps `defineWorker` typed while
   // the model stays the source of truth (ADR 0033 §6). Optimistic — updates the
@@ -1423,6 +1486,9 @@ function EditorPane({
   const [composerEntities, setComposerEntities] = useState<ComposerEntity[]>(
     [],
   );
+  // Process ids the `actionForm` picker offers — enumerated from the app's BPMN
+  // files (ADR 0042 fuse-typed action binding). Loaded when a page is edited.
+  const [pageProcessIds, setPageProcessIds] = useState<string[]>([]);
 
   // The fuse leaf entities the composer's pickers offer: every DB table (across
   // datasources) as a `carry`/`project` source with its columns + FK paths, and
@@ -1473,6 +1539,50 @@ function EditorPane({
     }));
     setComposerEntities([...tableEntities, ...typeEntities]);
   }, [name, domainTypeIds]);
+
+  // Editing a page: the composer's pickers are fed by the fuse, not by the
+  // currently-open file. Load the datasource table entities (for the dataGrid
+  // picker) and enumerate the app's process ids (for the actionForm picker) by
+  // scanning every BPMN file — once, when a page opens.
+  useEffect(() => {
+    if (kind !== "page") return;
+    let alive = true;
+    void loadComposerEntities();
+    void (async () => {
+      try {
+        const proj = (await getProject({ path: { name }, throwOnError: true }))
+          .data;
+        const bpmnPaths: string[] = [];
+        const walk = (nodes: FileNode[] | undefined) => {
+          for (const n of nodes ?? []) {
+            if (n.kind === "dir") walk(n.children);
+            else if (n.path.endsWith(".bpmn")) bpmnPaths.push(n.path);
+          }
+        };
+        walk(proj.files);
+        const ids = new Set<string>();
+        for (const p of bpmnPaths) {
+          try {
+            const f = await projectFileEx(name, p);
+            if (f.binary || !f.text) continue;
+            for (const m of f.text.matchAll(
+              /<(?:bpmn2?:)?process\b[^>]*\bid=["']([^"']+)["']/g,
+            )) {
+              ids.add(m[1]);
+            }
+          } catch {
+            // A file that fails to read just contributes no process ids.
+          }
+        }
+        if (alive) setPageProcessIds([...ids]);
+      } catch {
+        // No project/files — the picker degrades to a free-text field.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [kind, name, loadComposerEntities]);
 
   // Resolve the in-editor shapes server-side (the preview endpoint bypasses the
   // saved-model scan, so unsaved edits are reflected). `source` is nominal — the
@@ -1593,6 +1703,8 @@ function EditorPane({
       void (
         isEmpty ? ed.createBlank().then(seeded) : ed.importSchema(content)
       ).catch(() => void 0);
+    } else if (kind === "page" && pageRef.current) {
+      pageRef.current.setPageJson(content);
     }
     // Only when the document first arrives for this path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1614,6 +1726,8 @@ function EditorPane({
         body = formJson;
       else if (kind === "form" && formRef.current)
         body = await formRef.current.getSchema();
+      else if (kind === "page" && pageRef.current)
+        body = pageRef.current.getPageJson();
       await saveProjectFile({
         path: { name },
         query: { path },
@@ -2032,6 +2146,18 @@ function EditorPane({
                 onClose={() => setStartModalOpen(false)}
               />
             )}
+            {envelopeEditorOpen && (
+              <EnvelopeEditorModal
+                existingIds={[
+                  ...new Set([...domainTypeIds, ...envelopeShapeIds]),
+                ]}
+                onCancel={() => closeEnvelopeEditor(undefined)}
+                onSave={async (id, fields) => {
+                  await writeDomainType(id, fields);
+                  closeEnvelopeEditor(id);
+                }}
+              />
+            )}
           </div>
         )}
         {kind === "dmn" && (
@@ -2039,6 +2165,14 @@ function EditorPane({
             ref={dmnRef}
             onChange={() => setDirty(true)}
             getVariables={dmnGetVariables}
+          />
+        )}
+        {kind === "page" && (
+          <PageComposer
+            ref={pageRef}
+            onChange={() => setDirty(true)}
+            entities={composerEntities}
+            processes={pageProcessIds}
           />
         )}
         {kind === "form" && (
@@ -2539,6 +2673,179 @@ function PlatformPicker({
         </label>
       ))}
     </div>
+  );
+}
+
+const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/// Field-authoring surface for a transient domain type (an "envelope"): the maker
+/// names the type and declares its fields (name + scalar type), which are written
+/// into the manifest `types` registry (a *pure-motion* data contract with no
+/// backing table, ADR 0040 §10). Opened from the modeler's "Create new envelope…"
+/// affordance; on save the parent persists `nano.app.json` and the modeler picks
+/// the new id in one gesture. Field `type` is restricted to `SCALAR_KEYWORDS` here
+/// — nominal references to other registry types stay an escape hatch for the raw
+/// JSON editor.
+function EnvelopeEditorModal({
+  existingIds,
+  onSave,
+  onCancel,
+}: {
+  existingIds: string[];
+  onSave: (
+    id: string,
+    fields: { name: string; type: string }[],
+  ) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [id, setId] = useState("");
+  const [fields, setFields] = useState<
+    { key: number; name: string; type: string }[]
+  >([{ key: 0, name: "", type: "string" }]);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Monotonic id source so each row keeps a stable React key across
+  // removals/reorders (index keys would make edited values appear to jump rows).
+  const nextFieldKey = useRef(1);
+
+  const setField = (
+    i: number,
+    patch: Partial<{ name: string; type: string }>,
+  ) =>
+    setFields((prev) => prev.map((f, j) => (j === i ? { ...f, ...patch } : f)));
+  const addField = () =>
+    setFields((prev) => [
+      ...prev,
+      { key: nextFieldKey.current++, name: "", type: "string" },
+    ]);
+  const removeField = (i: number) =>
+    setFields((prev) =>
+      prev.length > 1 ? prev.filter((_, j) => j !== i) : prev,
+    );
+
+  const validate = (): string | null => {
+    const tid = id.trim();
+    if (!tid) return "Enter a type id.";
+    if (!IDENT_RE.test(tid))
+      return "Type id must be a valid identifier (letters, digits, _ or $; not starting with a digit).";
+    if (existingIds.includes(tid)) return `Type "${tid}" already exists.`;
+    const named = fields
+      .map((f) => ({ ...f, name: f.name.trim() }))
+      .filter((f) => f.name);
+    if (named.length === 0) return "Add at least one field.";
+    for (const f of named) {
+      if (!IDENT_RE.test(f.name))
+        return `Field "${f.name}" is not a valid identifier.`;
+    }
+    const seen = new Set<string>();
+    for (const f of named) {
+      if (seen.has(f.name)) return `Duplicate field name "${f.name}".`;
+      seen.add(f.name);
+    }
+    return null;
+  };
+
+  const save = async () => {
+    const problem = validate();
+    if (problem) {
+      setError(problem);
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const named = fields
+        .map((f) => ({ name: f.name.trim(), type: f.type }))
+        .filter((f) => f.name);
+      await onSave(id.trim(), named);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="New envelope" onClose={busy ? () => {} : onCancel}>
+      <div className="space-y-4">
+        <label className="block">
+          <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-fg-faint">
+            Type id
+          </span>
+          <input
+            autoFocus
+            value={id}
+            onChange={(e) => setId(e.target.value)}
+            className={`${inputClass} w-full`}
+            placeholder="orderPlaced"
+          />
+        </label>
+        <div>
+          <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-fg-faint">
+            Fields
+          </span>
+          <div className="space-y-2">
+            {fields.map((f, i) => (
+              <div
+                key={f.key}
+                className="grid grid-cols-[1fr_auto_auto] items-center gap-2"
+              >
+                <input
+                  value={f.name}
+                  onChange={(e) => setField(i, { name: e.target.value })}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void save();
+                  }}
+                  className={`${inputClass} w-full`}
+                  placeholder="fieldName"
+                />
+                <select
+                  value={f.type}
+                  onChange={(e) => setField(i, { type: e.target.value })}
+                  className={`${inputClass} w-32`}
+                >
+                  {SCALAR_KEYWORDS.map((k) => (
+                    <option key={k} value={k}>
+                      {k}
+                    </option>
+                  ))}
+                </select>
+                <Button
+                  variant="secondary"
+                  onClick={() => removeField(i)}
+                  disabled={fields.length <= 1}
+                  aria-label="Remove field"
+                  title="Remove field"
+                >
+                  ✕
+                </Button>
+              </div>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={addField}
+            className="mt-2 text-sm text-accent hover:underline"
+          >
+            + Add field
+          </button>
+        </div>
+        <p className="text-xs text-fg-muted">
+          Declares a transient domain type in{" "}
+          <code className="text-fg">nano.app.json</code>{" "}
+          <code className="text-fg">types</code> — a data contract carried by an
+          envelope, with no backing table.
+        </p>
+        {error && <p className="text-sm text-danger">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button variant="secondary" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+          <Button variant="primary" onClick={() => void save()} disabled={busy}>
+            {busy ? "Creating…" : "Create"}
+          </Button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

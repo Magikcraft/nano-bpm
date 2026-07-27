@@ -42,6 +42,10 @@ use super::{triggers, worker_export, workers, workspace};
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 const LLM_WORKER_TS: &str = include_str!("llm_worker.ts");
 const DATA_SDK_TS: &str = include_str!("data_sdk.ts");
+/// The Urban App page runtime (ADR 0042 §3): the generic `servePages` helper + the
+/// schema-driven browser renderer that turns a composed `page.json` into a served,
+/// data-bound screen. Materialised as `nano-generated/app-pages.ts` (`@nanobpm/app`).
+const APP_PAGES_TS: &str = include_str!("app_pages.ts");
 const DATA_CLI_TS: &str = include_str!("data_cli.ts");
 const DOMAIN_TYPES_TS: &str = include_str!("domain_types.ts");
 /// Seed `nano-generated/domain.ts` — the typed data-object accessor (ADR 0029 §6). It
@@ -216,6 +220,7 @@ export function meta(key: string): string | undefined {
 /// SDK so `deno.json` import maps resolve under Node (no Deno build required).
 const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
 const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
+const NODE_DENO_SHIM_MJS: &str = include_str!("node_deno_shim.mjs");
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
 const LOG_RING_CAP: usize = 1000;
@@ -942,6 +947,7 @@ const PROJECT_DENO_JSON: &str = r#"{
     "@nanobpm/llm": "./{GEN}/llm-worker.ts",
     "@nanobpm/data": "./{GEN}/data-sdk.ts",
     "@nanobpm/domain": "./{GEN}/domain.ts",
+    "@nanobpm/app": "./{GEN}/app-pages.ts",
     "@lib/": "./lib/"
   },
   "tasks": {
@@ -974,6 +980,7 @@ const PROJECT_TSCONFIG_JSON: &str = r#"{
       "@nanobpm/llm": ["./{GEN}/llm-worker.ts"],
       "@nanobpm/data": ["./{GEN}/data-sdk.ts"],
       "@nanobpm/domain": ["./{GEN}/domain.ts"],
+      "@nanobpm/app": ["./{GEN}/app-pages.ts"],
       "@lib/*": ["./lib/*"]
     }
   },
@@ -1695,55 +1702,44 @@ for a self-contained engine+UI binary.\n"
 // and surfaces; a Deno binary serves the generated UI and boots the App. The
 // scaffold lays down the manifest + the resource dirs the Console's model
 // editors read from (`resources/processes|decisions|forms`) + `db/migrations`
-// for the sqlite datasource + `public/` for static assets.
+// for the sqlite datasource + `pages/` for the composed screens (ADR 0042).
 
 const URBAN_DENO_JSON: &str = r#"{
-  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/worker": "./{GEN}/workers.ts", "@nanobpm/messages": "./{GEN}/messages.ts", "@nanobpm/meta": "./{GEN}/meta.ts", "@nanobpm/llm": "./{GEN}/llm-worker.ts", "@nanobpm/data": "./{GEN}/data-sdk.ts", "@nanobpm/domain": "./{GEN}/domain.ts", "@lib/": "./lib/" },
+  "imports": { "@nanobpm/nano-sdk": "npm:@nanobpm/nano-sdk@^1", "@nanobpm/worker": "./{GEN}/workers.ts", "@nanobpm/messages": "./{GEN}/messages.ts", "@nanobpm/meta": "./{GEN}/meta.ts", "@nanobpm/llm": "./{GEN}/llm-worker.ts", "@nanobpm/data": "./{GEN}/data-sdk.ts", "@nanobpm/domain": "./{GEN}/domain.ts", "@nanobpm/app": "./{GEN}/app-pages.ts", "@lib/": "./lib/" },
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-write --allow-env main.ts"
   }
 }
 "#;
 
-// The Urban App loader entrypoint. It reads `nano.app.json` (the manifest is the
-// source of truth), deploys the declared models, and serves the App. The full
-// manifest-driven UI/trigger runtime lands in a later slice (ADR 0026); for now
-// this boots the engine resources and serves `public/` + a start endpoint.
+// The Urban App loader entrypoint. It reads the declared models from
+// `nano.app.json` (the source of truth), deploys them, boots the workers, and
+// serves the app's composed screen (`pages/home.page.json`) via the generic
+// `@nanobpm/app` runtime (ADR 0042) — no hand-written frontend or JSON API.
 const URBAN_MAIN_TS: &str = r#"// Urban App entrypoint. The `nano.app.json` manifest is the source of truth for
 // this application (models, datasources, triggers, surfaces). `deno compile
-// --include nano.app.json --include public` bundles it into a single binary.
+// --include nano.app.json --include pages` bundles it into a single binary.
+//
+// The UI is a composed screen: `pages/home.page.json` is authored in the Console
+// Page Composer (ADR 0042) and served by the generic `@nanobpm/app` runtime — no
+// hand-written frontend or JSON API. `servePages` binds its data-aware controls to
+// the datasource (`@nanobpm/data`) and the engine (`@nanobpm/nano-sdk`).
 import { deployAllResources, startLlmWorkers, startWorkers } from "@lib/nano.ts";
+import { servePages } from "@nanobpm/app";
+import { openDataSource } from "@nanobpm/data";
+import { createCamundaClient } from "@nanobpm/nano-sdk";
 
-const manifest = JSON.parse(await Deno.readTextFile("./nano.app.json"));
 const PORT = Number(Deno.env.get("PORT") ?? 8090);
 
 await deployAllResources();
 await startWorkers();
 await startLlmWorkers();
 
-Deno.serve({ port: PORT }, async (req) => {
-  const url = new URL(req.url);
-  if (url.pathname === "/api/app") {
-    return Response.json({ id: manifest.id, name: manifest.name });
-  }
-  const path = url.pathname === "/" ? "/index.html" : url.pathname;
-  try {
-    return new Response(await Deno.readTextFile(`./public${path}`), {
-      headers: { "content-type": path.endsWith(".html") ? "text/html" : "text/plain" },
-    });
-  } catch {
-    return new Response("not found", { status: 404 });
-  }
-});
-console.log(`Urban App "${manifest.id}" serving on :${PORT}`);
-"#;
+const db = await openDataSource();
+const nano = createCamundaClient();
 
-const URBAN_INDEX_HTML: &str = r#"<!doctype html><html><head><meta charset="utf-8"><title>Urban App</title>
-<style>body{font:16px system-ui;margin:3rem;max-width:40rem}</style></head>
-<body><h1 id="title">Urban App</h1><p>A Nano RAD application. Design its models, data,
-triggers and surfaces in the Console, then run or compile it to a binary.</p>
-<script>fetch('/api/app').then(r=>r.json()).then(a=>{title.textContent=a.name})</script>
-</body></html>
+servePages({ db, nano, port: PORT });
+console.log(`Urban App serving its composed pages on :${PORT}`);
 "#;
 
 // Sample components (Zeebe element templates) the scaffold drops into the
@@ -1832,8 +1828,15 @@ fn urban_readme(name: &str) -> String {
 A Nano RAD application (ADR 0022). `nano.app.json` is the source of truth: it \
 declares the app's **models** (`resources/processes|decisions|forms`), \
 **data** (a sqlite datasource with migrations under `db/`), **triggers** and \
-**surfaces**. Design them in the Console's App panels, then **Run** the Deno \
-binary or **Compile** it (`deno compile --include nano.app.json --include public`).\n\n\
+**surfaces**, and compose its **screen** (`pages/home.page.json`) in the Console \
+Page Composer. Then **Run** the Deno binary or **Compile** it \
+(`deno compile --include nano.app.json --include pages`).\n\n\
+## Screen\n\n\
+`pages/home.page.json` is the app's composed UI (ADR 0042) — a titled, ordered \
+list of controls (`text`, `actionForm`, `dataGrid`). The `@nanobpm/app` runtime \
+serves it with **no hand-written frontend**: an `actionForm` starts a process via \
+`@nanobpm/nano-sdk`, a `dataGrid` reads a datasource table via `@nanobpm/data`. \
+Edit it in the Console's Page Composer, not by hand.\n\n\
 ## Data\n\n\
 Open a declared datasource by name (the swappable BDE alias, ADR 0024):\n\n\
 ```ts\n\
@@ -1861,6 +1864,45 @@ to run the parsed JSON through a DMN decision as *rails*. Provider `env` targets
 any OpenAI-compatible endpoint via `NANO_APP_LLM_BASE_URL` (default \
 `http://localhost:11434/v1`, Ollama), `NANO_APP_LLM_API_KEY` (optional) and \
 `NANO_APP_LLM_MODEL` — so the same app runs fully offline against a local model.\n"
+    )
+}
+
+/// The starter composed screen (ADR 0042). Authored form of `pages/home.page.json`
+/// — a titled heading, an intro line and an `actionForm` that starts the scaffold's
+/// process. It is served (no hand-written frontend) by the `@nanobpm/app` runtime.
+/// Reopen and edit it in the Console Page Composer.
+fn urban_home_page(name: &str) -> String {
+    let pid = format!("{name}-process");
+    format!(
+        r#"{{
+  "schemaVersion": "1.0",
+  "title": "{name}",
+  "nodes": [
+    {{
+      "type": "text",
+      "id": "home-title",
+      "props": {{ "text": "{name}", "variant": "heading" }}
+    }},
+    {{
+      "type": "text",
+      "id": "home-intro",
+      "props": {{ "text": "This screen was composed in the Console Page Composer \u2014 no hand-written frontend. Edit pages/home.page.json to change it.", "variant": "body" }}
+    }},
+    {{
+      "type": "actionForm",
+      "id": "home-start",
+      "props": {{
+        "title": "Start a run",
+        "submitLabel": "Start",
+        "action": {{ "kind": "startProcess", "process": "{pid}" }},
+        "fields": [
+          {{ "key": "note", "label": "Note", "type": "text" }}
+        ]
+      }}
+    }}
+  ]
+}}
+"#
     )
 }
 
@@ -1893,6 +1935,7 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     let nano = dir.join(GEN_DIR);
     std::fs::create_dir_all(&nano)?;
     std::fs::write(nano.join("data-sdk.ts"), DATA_SDK_TS)?;
+    std::fs::write(nano.join("app-pages.ts"), APP_PAGES_TS)?;
     std::fs::write(nano.join("data-cli.ts"), DATA_CLI_TS)?;
     std::fs::write(nano.join("domain-types.ts"), DOMAIN_TYPES_TS)?;
     // Seed the typed data-object accessor only when absent, so a reified,
@@ -1928,6 +1971,7 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     }
     std::fs::write(nano.join("node-loader.mjs"), NODE_LOADER_MJS)?;
     std::fs::write(nano.join("node-register.mjs"), NODE_REGISTER_MJS)?;
+    std::fs::write(nano.join("node-deno-shim.mjs"), NODE_DENO_SHIM_MJS)?;
     std::fs::write(nano.join("llm-worker.ts"), LLM_WORKER_TS)?;
     std::fs::write(nano.join("worker-sdk.ts"), WORKER_SDK_TS)?;
     // Seed the standard-tooling config (VS Code / `tsc`) and the Node-first
@@ -2234,6 +2278,7 @@ pub fn create_project(
     w(dir.join("tsconfig.json"), &gendir(PROJECT_TSCONFIG_JSON))?;
     w(dir.join("package.json"), &project_package_json(name))?;
     w(dir.join(GEN_DIR).join("data-sdk.ts"), DATA_SDK_TS)?;
+    w(dir.join(GEN_DIR).join("app-pages.ts"), APP_PAGES_TS)?;
     w(dir.join(GEN_DIR).join("data-cli.ts"), DATA_CLI_TS)?;
     w(dir.join(GEN_DIR).join("domain-types.ts"), DOMAIN_TYPES_TS)?;
     w(dir.join(GEN_DIR).join("domain.ts"), DOMAIN_TS_STUB)?;
@@ -2246,6 +2291,10 @@ pub fn create_project(
     w(
         dir.join(GEN_DIR).join("node-register.mjs"),
         NODE_REGISTER_MJS,
+    )?;
+    w(
+        dir.join(GEN_DIR).join("node-deno-shim.mjs"),
+        NODE_DENO_SHIM_MJS,
     )?;
     w(dir.join(GEN_DIR).join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join(GEN_DIR).join("llm-worker.ts"), LLM_WORKER_TS)?;
@@ -2294,13 +2343,16 @@ pub fn create_project(
         )?;
         cfg_app = "deno-gui";
     } else if template == "urban-starter" {
-        mk(dir.join("public"))?;
+        mk(dir.join("pages"))?;
         mk(dir.join("db").join("migrations"))?;
         let app_id = slugify_app_id(name);
         w(dir.join("deno.json"), &gendir(URBAN_DENO_JSON))?;
         w(dir.join("main.ts"), URBAN_MAIN_TS)?;
         w(dir.join("nano.app.json"), &urban_manifest(&app_id, name))?;
-        w(dir.join("public").join("index.html"), URBAN_INDEX_HTML)?;
+        w(
+            dir.join("pages").join("home.page.json"),
+            &urban_home_page(name),
+        )?;
         w(dir.join("README.md"), &urban_readme(name))?;
         w(
             dir.join("resources")
@@ -2778,6 +2830,39 @@ impl ProjectInner {
             ring.push_back(line.clone());
         }
         let _ = self.logs_tx.send(line);
+    }
+
+    /// Interpret one line of a run's stdout. Swallows the per-worker `METRIC`
+    /// telemetry the embedded SDK emits every second, unwraps `STATUS` control
+    /// lines into human-readable `sys` log entries, and passes everything else
+    /// through as `out`. Shared by both run paths (`run` built-in and
+    /// `run_toolchain`) so their consoles surface identical output.
+    async fn ingest_stdout_line(&self, line: String) {
+        // `BufReader::lines()` strips `\n` but leaves a trailing `\r` on CRLF
+        // producers; drop it so STATUS JSON still parses and logs carry no stray
+        // carriage return.
+        let line = match line.strip_suffix('\r') {
+            Some(trimmed) => trimmed.to_string(),
+            None => line,
+        };
+        if line.starts_with(METRIC_PREFIX) {
+            return; // per-worker metric telemetry — not shown
+        }
+        if let Some(rest) = line.strip_prefix(STATUS_PREFIX) {
+            let msg = serde_json::from_str::<serde_json::Value>(rest)
+                .ok()
+                .map(|v| {
+                    format!(
+                        "{}: {}",
+                        v.get("state").and_then(|s| s.as_str()).unwrap_or("status"),
+                        v.get("message").and_then(|s| s.as_str()).unwrap_or("")
+                    )
+                })
+                .unwrap_or_else(|| rest.to_string());
+            self.push_log("sys", msg).await;
+        } else {
+            self.push_log("out", line).await;
+        }
     }
 
     async fn dto(&self) -> RunStateDto {
@@ -3348,23 +3433,7 @@ impl ProjectSupervisor {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if line.starts_with(METRIC_PREFIX) {
-                        continue; // per-worker metric telemetry — not shown
-                    } else if let Some(rest) = line.strip_prefix(STATUS_PREFIX) {
-                        let msg = serde_json::from_str::<serde_json::Value>(rest)
-                            .ok()
-                            .map(|v| {
-                                format!(
-                                    "{}: {}",
-                                    v.get("state").and_then(|s| s.as_str()).unwrap_or("status"),
-                                    v.get("message").and_then(|s| s.as_str()).unwrap_or("")
-                                )
-                            })
-                            .unwrap_or_else(|| rest.to_string());
-                        inner.push_log("sys", msg).await;
-                    } else {
-                        inner.push_log("out", line).await;
-                    }
+                    inner.ingest_stdout_line(line).await;
                 }
             });
         }
@@ -3484,7 +3553,7 @@ impl ProjectSupervisor {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    inner.push_log("out", line).await;
+                    inner.ingest_stdout_line(line).await;
                 }
             });
         }
@@ -4301,6 +4370,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_stdout_line_filters_metrics_and_unwraps_status() {
+        let inner = ProjectInner::new();
+        // A metric line is swallowed entirely (no log entry).
+        inner
+            .ingest_stdout_line(format!("{METRIC_PREFIX}{{\"m\":1}}"))
+            .await;
+        // A status control line becomes a `sys` "state: message" entry.
+        inner
+            .ingest_stdout_line(format!(
+                "{STATUS_PREFIX}{{\"state\":\"deploying\",\"message\":\"onboarding.bpmn\"}}"
+            ))
+            .await;
+        // A status line with invalid JSON falls back to the raw remainder.
+        inner
+            .ingest_stdout_line(format!("{STATUS_PREFIX}not-json"))
+            .await;
+        // A CRLF-terminated status line still parses (trailing \r stripped).
+        inner
+            .ingest_stdout_line(format!(
+                "{STATUS_PREFIX}{{\"state\":\"ready\",\"message\":\"up\"}}\r"
+            ))
+            .await;
+        // Anything else passes through verbatim as `out`.
+        inner.ingest_stdout_line("hello world".to_string()).await;
+
+        let ring = inner.log_ring.lock().await;
+        let seen: Vec<(String, String)> = ring
+            .iter()
+            .map(|l| (l.stream.clone(), l.text.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("sys".to_string(), "deploying: onboarding.bpmn".to_string()),
+                ("sys".to_string(), "not-json".to_string()),
+                ("sys".to_string(), "ready: up".to_string()),
+                ("out".to_string(), "hello world".to_string()),
+            ],
+            "metrics swallowed, status unwrapped to sys (incl. CRLF), rest passed through as out"
+        );
+    }
+
+    #[tokio::test]
     async fn discover_rejects_dotdot_traversal() {
         let sandbox = scratch_dir("dotdot").join("sandbox");
         std::fs::create_dir_all(&sandbox).unwrap();
@@ -4378,9 +4490,35 @@ mod tests {
         assert!(dir.join("resources/decisions").is_dir());
         assert!(dir.join("resources/forms").is_dir());
         assert!(dir.join("db/migrations").is_dir());
-        assert!(dir.join("public/index.html").is_file());
+        // The Urban entrypoint serves its composed pages via `@nanobpm/app`, so
+        // the scaffold no longer ships a static `public/index.html` (which used to
+        // reference a `/api/app` endpoint that no longer exists).
+        assert!(
+            !dir.join("public/index.html").exists(),
+            "no vestigial public/index.html"
+        );
         assert!(dir.join("main.ts").is_file());
-        // The manifest is valid JSON with a slugged id derived from the name.
+        // ADR 0042: the app's composed screen is scaffolded and the Urban
+        // entrypoint serves it via the generic `@nanobpm/app` runtime — no
+        // hand-written frontend or JSON API.
+        assert!(
+            dir.join("pages/home.page.json").is_file(),
+            "pages/home.page.json must be scaffolded"
+        );
+        let page: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("pages/home.page.json")).unwrap(),
+        )
+        .expect("home.page.json parses");
+        assert_eq!(page["schemaVersion"], "1.0");
+        assert_eq!(
+            page["nodes"][2]["props"]["action"]["process"], "Home_Heating-process",
+            "the starter actionForm binds to the scaffold's process"
+        );
+        let main_ts = std::fs::read_to_string(dir.join("main.ts")).unwrap();
+        assert!(
+            main_ts.contains("servePages("),
+            "the Urban entrypoint serves its composed pages via @nanobpm/app"
+        );
         let manifest: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap())
                 .expect("manifest parses");
@@ -5108,6 +5246,7 @@ mod tests {
         assert!(dir.join("nano-generated/worker-sdk.ts").is_file());
         assert!(dir.join("nano-generated/llm-worker.ts").is_file());
         assert!(dir.join("nano-generated/data-sdk.ts").is_file());
+        assert!(dir.join("nano-generated/app-pages.ts").is_file());
         // The default entrypoint boots handler + llm workers (ADR 0022 §E).
         let main_ts = std::fs::read_to_string(dir.join("main.ts")).unwrap();
         assert!(main_ts.contains("startLlmWorkers()"));

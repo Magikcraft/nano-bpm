@@ -260,10 +260,12 @@ export interface DomainTypeBinding {
   /// (`inputType`/`outputType`, keyed by task type), creating it if absent and
   /// clearing on "". A cache for the reifier until server-side derivation lands.
   set(taskType: string, field: "inputType" | "outputType", value: string): void;
-  /// Creates a new (transient) domain type `id` in the manifest `types` registry
-  /// and refreshes `typeIds`, so a maker can declare + pick an envelope in one
-  /// gesture (the "Create new envelope…" affordance). Absent → no create option.
-  createType?(id: string): Promise<void> | void;
+  /// Opens the envelope field-authoring surface so a maker can declare a new
+  /// (transient) domain type — an id plus its fields — in the manifest `types`
+  /// registry, then pick it in one gesture (the "Create new envelope…"
+  /// affordance). Resolves with the new type id, or `undefined` if the maker
+  /// cancelled. Absent → no create option.
+  createType?(): Promise<string | undefined>;
   /// The declared domain type bound to a form in the manifest `bindings[]`
   /// (ADR 0029 §5), or undefined. A user task whose linked form is typed defaults
   /// its envelope to this (ADR 0033 §6) — the form binding stays the single source
@@ -436,17 +438,16 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       const createEnvelope = async (apply: (value: string) => void) => {
         const binding = domainTypeBindingRef.current;
         if (!binding?.createType) return;
-        const id = (
-          globalThis.prompt?.("New domain type id (e.g. orderPlaced):") ?? ""
-        ).trim();
-        if (!id) return;
+        let id: string | undefined;
         try {
-          await binding.createType(id);
+          // Opens the field-authoring modal in the parent; resolves with the new
+          // type id once declared + persisted, or undefined if cancelled.
+          id = await binding.createType();
         } catch {
           // Surfaced by the parent's manifest-save error handling.
           return;
         }
-        apply(id);
+        if (id) apply(id);
       };
       const DataEnvelopeEntry = (props: {
         element: { type?: string; businessObject?: ModdleElement };

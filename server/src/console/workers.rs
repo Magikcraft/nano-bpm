@@ -31,6 +31,7 @@ const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 /// SDK so `deno.json` import maps resolve under Node when no Deno build exists.
 const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
 const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
+const NODE_DENO_SHIM_MJS: &str = include_str!("node_deno_shim.mjs");
 
 /// Control-line prefixes emitted by the SDK on stdout (see `worker_sdk.ts`).
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
@@ -193,6 +194,7 @@ fn ensure_sdk_written() -> std::io::Result<()> {
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("node-loader.mjs"), NODE_LOADER_MJS)?;
     std::fs::write(dir.join("node-register.mjs"), NODE_REGISTER_MJS)?;
+    std::fs::write(dir.join("node-deno-shim.mjs"), NODE_DENO_SHIM_MJS)?;
     std::fs::write(workspace::sdk_path(), WORKER_SDK_TS)
 }
 

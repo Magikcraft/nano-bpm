@@ -9,23 +9,25 @@
 // only acts on models a manifest editor has registered via `setManifestSource`,
 // so every other JSON file keeps Monaco's default *completion* behaviour.
 //
-// `setManifestSource` additionally registers the app-manifest JSON *schema* via
-// `ensureManifestSchema()`. Unlike the completion provider, that call
-// (`jsonDefaults.setDiagnosticsOptions`) is process-wide for ALL JSON models: it
-// disables remote `$schema` fetching (`enableSchemaRequest: false`) and adds the
-// bundled schema, scoped to manifests by `fileMatch`. Other JSON files are only
-// affected in that Monaco no longer fetches their `$schema` over the network —
-// intentional (offline-first). A future change adding another JSON schema
-// provider must merge into these defaults rather than assume Monaco's originals.
+// `setManifestSource` additionally registers the bundled JSON *schemas* via
+// `ensureBundledJsonSchemas()` (in `jsonSchemas.ts`). Unlike the completion
+// provider, that call (`jsonDefaults.setDiagnosticsOptions`) is process-wide for
+// ALL JSON models: it disables remote `$schema` fetching
+// (`enableSchemaRequest: false`) and adds the bundled schemas (manifest +
+// Camunda element template), each scoped by `fileMatch`. Other JSON files are
+// only affected in that Monaco no longer fetches their `$schema` over the network
+// — intentional (offline-first). Because those diagnostics options *replace*
+// (not merge), all bundled schemas are registered together in that one call; a
+// future schema must be added to `jsonSchemas.ts`, not via a second
+// `setDiagnosticsOptions`.
 
 import * as monaco from "monaco-editor";
-import appSchema from "@nanobpm/nano-app-schema/schema";
 import {
   manifestCompletionAt,
   type CandidateKind,
   type CompletionIndex,
 } from "@nanobpm/nano-app-schema";
-import { buildManifestSchemaOptions } from "./manifestSchema";
+import { ensureBundledJsonSchemas } from "./jsonSchemas";
 
 /** The live state a registered manifest model exposes to the provider. */
 export interface ManifestSource {
@@ -39,32 +41,15 @@ export interface ManifestSource {
 // reading fresh state without re-registering on every keystroke.
 const sources = new Map<string, { get: () => ManifestSource }>();
 let registered = false;
-let schemaRegistered = false;
 
-// The manifest's `$schema` points at the published schema URL. Rather than let
-// Monaco's JSON worker try to *fetch* it (there is no schema-request service
-// wired up, and the console is offline-first — the fetch fails with "No schema
-// request service available"), we register the bundled schema content locally,
-// keyed by that same URL, so `$schema` resolves in-process with no network.
-// The URI list + options shape live in `manifestSchema.ts` (pure, unit-tested).
-/**
- * Register the Urban App manifest JSON Schema with Monaco's JSON language
- * service as bundled, in-process content, and disable remote schema requests.
- * Idempotent. This is what makes `nano.app.json` validate + autocomplete against
- * the schema offline, and is the fix for the "No schema request service
- * available" error raised when the manifest's `$schema` URL would otherwise be
- * fetched.
- */
-function ensureManifestSchema(): void {
-  if (schemaRegistered) return;
-  // Mark registered only after the call succeeds, so a transient failure (e.g.
-  // Monaco JSON defaults not yet initialized) doesn't permanently prevent a
-  // later retry from registering the schema for the session.
-  monaco.languages.json.jsonDefaults.setDiagnosticsOptions(
-    buildManifestSchemaOptions(appSchema as Record<string, unknown>),
-  );
-  schemaRegistered = true;
-}
+// The manifest's `$schema` (and an element template's `$schema`) point at a
+// published schema URL. Rather than let Monaco's JSON worker try to *fetch* it
+// (there is no schema-request service wired up, and the console is offline-first
+// — the fetch fails with "No schema request service available"), we register the
+// bundled schema content locally, keyed by that same URL, so `$schema` resolves
+// in-process with no network. The registration lives in `jsonSchemas.ts`
+// (`ensureBundledJsonSchemas`, idempotent + process-wide) and covers both the
+// manifest and the element-template schema in one `setDiagnosticsOptions` call.
 
 const KIND_ICON: Record<CandidateKind, monaco.languages.CompletionItemKind> = {
   process: monaco.languages.CompletionItemKind.Class,
@@ -131,7 +116,7 @@ export function setManifestSource(
   get: () => ManifestSource,
 ): () => void {
   ensureProvider();
-  ensureManifestSchema();
+  ensureBundledJsonSchemas();
   sources.set(uri, { get });
   return () => {
     sources.delete(uri);
