@@ -93,6 +93,17 @@ export function Bojtos({
   const [playing, setPlaying] = useState(false);
   const playingRef = useRef(false);
   const startedRef = useRef(false);
+  // Tracks whether the component is still mounted, so the async play loop (which
+  // can outlive an unmount while awaiting `stepWorkers()` / `delay()`) neither
+  // sets state on an unmounted component nor keeps driving a freed session.
+  const mountedRef = useRef(true);
+  useEffect(
+    () => () => {
+      mountedRef.current = false;
+      playingRef.current = false;
+    },
+    [],
+  );
 
   // Keep the object/function props in refs so the play loop and the autoplay
   // effect don't churn (or re-fire) when a parent re-renders with fresh
@@ -152,7 +163,7 @@ export function Bojtos({
       }
     } finally {
       playingRef.current = false;
-      setPlaying(false);
+      if (mountedRef.current) setPlaying(false);
     }
   }, [phase, ensureStarted, stepWorkers, stepDelayMs]);
 

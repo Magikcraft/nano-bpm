@@ -16,15 +16,25 @@ export type WasmSource = InitInput;
 
 /**
  * Initialise the wasm engine module (idempotent; safe to call repeatedly). The
- * first call wins: a `source` passed to a later call is ignored once the module
- * is already loading. Pass a `source` in environments where the default
- * `import.meta.url` fetch can't resolve the binary (Node/Jest/webpack).
+ * first successful call wins: a `source` passed to a later call is ignored once
+ * the module is already loading or loaded. Pass a `source` in environments where
+ * the default `import.meta.url` fetch can't resolve the binary
+ * (Node/Jest/webpack).
+ *
+ * If a load *fails*, the cached promise is cleared so a later call — e.g. one
+ * that supplies a working `WasmSource` after the default loader couldn't resolve
+ * the binary — can retry rather than being stuck on the first rejection.
  */
 export function ensureWasm(source?: WasmSource): Promise<void> {
   if (!wasmReady) {
     wasmReady = init(
       source === undefined ? undefined : { module_or_path: source },
-    ).then(() => undefined);
+    )
+      .then(() => undefined)
+      .catch((e) => {
+        wasmReady = null;
+        throw e;
+      });
   }
   return wasmReady;
 }

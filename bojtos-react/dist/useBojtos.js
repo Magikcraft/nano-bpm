@@ -100,12 +100,18 @@ export function useBojtos({ bpmn, wasm }) {
             return null;
         try {
             const { snapshot: settled } = await dispatchWorkers(session, workers, opts);
+            // The session may have been torn down/replaced (bpmn change, unmount)
+            // while we awaited — don't publish stale state or read a freed session.
+            if (sessionRef.current !== session)
+                return null;
             setSnapshot(settled);
             setEvents(session.events());
             setError(null);
             return settled;
         }
         catch (e) {
+            if (sessionRef.current !== session)
+                return null;
             // Reflect whatever state the engine reached before the drain aborted
             // (e.g. the maxRounds guard) so the view isn't left stale.
             setSnapshot(session.snapshot());
@@ -120,12 +126,17 @@ export function useBojtos({ bpmn, wasm }) {
             return null;
         try {
             const round = await dispatchRound(session, workers, opts);
+            // Bail if the session was replaced/freed while we awaited the round.
+            if (sessionRef.current !== session)
+                return null;
             setSnapshot(round.snapshot);
             setEvents(session.events());
             setError(null);
             return round;
         }
         catch (e) {
+            if (sessionRef.current !== session)
+                return null;
             setSnapshot(session.snapshot());
             setEvents(session.events());
             setError(String(e));
