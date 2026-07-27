@@ -851,8 +851,13 @@ pub struct MarketEntry {
     pub name: String,
     pub version: String,
     pub description: String,
-    /// "lang" | "app" | "example" | "other", from keywords.
+    /// "lang" | "app" | "example" | "theme" | "trigger" | "agentic-sdlc" |
+    /// "other", from keywords.
     pub category: String,
+    /// True when the package is first-party: its npm name is scoped
+    /// `@nanobpm/`. Non-official packages carrying the marketplace keyword are
+    /// surfaced under the console's "Community extensions" section.
+    pub official: bool,
     pub installed: bool,
     /// The locally-installed version, when this pack is installed (else `None`).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -860,6 +865,35 @@ pub struct MarketEntry {
     /// True when the pack is installed and its version differs from the latest
     /// on npm — i.e. an update can be pulled.
     pub update_available: bool,
+}
+
+/// Marketplace category derived from a pack's npm keywords. Categories are
+/// tested in a fixed priority order (lang → app → example → theme → trigger →
+/// agentic-sdlc): if a pack carries keywords for several categories, the first
+/// one in that chain wins regardless of keyword order. Falls back to `"other"`
+/// when no category keyword is present.
+fn classify_category(keywords: &[String]) -> &'static str {
+    if keywords.iter().any(|k| k == "nano-ide-lang") {
+        "lang"
+    } else if keywords.iter().any(|k| k == "nano-ide-app") {
+        "app"
+    } else if keywords.iter().any(|k| k == "nano-ide-example") {
+        "example"
+    } else if keywords.iter().any(|k| k == "nano-ide-theme") {
+        "theme"
+    } else if keywords.iter().any(|k| k == "nano-ide-trigger") {
+        "trigger"
+    } else if keywords.iter().any(|k| k == "nano-ide-agentic-sdlc") {
+        "agentic-sdlc"
+    } else {
+        "other"
+    }
+}
+
+/// A pack is first-party ("official") when published under the `@nanobpm/` npm
+/// scope. Anything else carrying the marketplace keyword is a community pack.
+fn is_official(name: &str) -> bool {
+    name.starts_with("@nanobpm/")
 }
 
 /// Browse npm for packs tagged `nano-ide-ext`. Shells out to `npm search`
@@ -893,20 +927,11 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                         .collect()
                 })
                 .unwrap_or_default();
-            let category = if kws.iter().any(|k| k == "nano-ide-lang") {
-                "lang"
-            } else if kws.iter().any(|k| k == "nano-ide-app") {
-                "app"
-            } else if kws.iter().any(|k| k == "nano-ide-example") {
-                "example"
-            } else if kws.iter().any(|k| k == "nano-ide-theme") {
-                "theme"
-            } else if kws.iter().any(|k| k == "nano-ide-trigger") {
-                "trigger"
-            } else {
-                "other"
-            };
+            let category = classify_category(&kws);
             let name = p["name"].as_str().unwrap_or_default().to_string();
+            // First-party packs live under the `@nanobpm/` npm scope; anything
+            // else carrying the marketplace keyword is a community extension.
+            let official = is_official(&name);
             let latest = p["version"].as_str().unwrap_or_default().to_string();
             let inst_ver = installed_version(&name);
             let installed =
@@ -922,6 +947,7 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                 version: latest,
                 description: p["description"].as_str().unwrap_or_default().to_string(),
                 category: category.to_string(),
+                official,
                 installed_version: inst_ver,
                 update_available,
                 name,
@@ -1111,6 +1137,35 @@ mod tests {
         let p = safe_pkg_dir("@nanobpm/nano-ide-lang-rust").unwrap();
         assert!(p.ends_with("nanobpm__nano-ide-lang-rust"));
         assert!(safe_pkg_dir("../evil").is_none());
+    }
+
+    #[test]
+    fn classify_category_maps_keywords() {
+        let kw = |s: &str| vec![MARKETPLACE_KEYWORD.to_string(), s.to_string()];
+        assert_eq!(classify_category(&kw("nano-ide-lang")), "lang");
+        assert_eq!(classify_category(&kw("nano-ide-app")), "app");
+        assert_eq!(classify_category(&kw("nano-ide-example")), "example");
+        assert_eq!(classify_category(&kw("nano-ide-theme")), "theme");
+        assert_eq!(classify_category(&kw("nano-ide-trigger")), "trigger");
+        assert_eq!(
+            classify_category(&kw("nano-ide-agentic-sdlc")),
+            "agentic-sdlc"
+        );
+        // No recognised category keyword -> "other".
+        assert_eq!(
+            classify_category(&[MARKETPLACE_KEYWORD.to_string()]),
+            "other"
+        );
+    }
+
+    #[test]
+    fn official_is_the_nanobpm_scope() {
+        assert!(is_official("@nanobpm/urban-pr-review"));
+        assert!(is_official("@nanobpm/nano-ide-lang-rust"));
+        // Community packs (any other name, incl. other scopes) are not official.
+        assert!(!is_official("urban-pr-review"));
+        assert!(!is_official("@someoneelse/nano-ide-cool-thing"));
+        assert!(!is_official("nano-ide-community-pack"));
     }
 
     #[test]

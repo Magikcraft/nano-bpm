@@ -660,7 +660,11 @@ export type MarketEntry = {
     name: string;
     version: string;
     description: string;
-    category: 'lang' | 'app' | 'example' | 'theme' | 'trigger' | 'other';
+    category: 'lang' | 'app' | 'example' | 'theme' | 'trigger' | 'agentic-sdlc' | 'other';
+    /**
+     * True when the package is first-party (npm name scoped `@nanobpm/`). Non-official packages carrying the marketplace keyword are grouped under the "Community extensions" section.
+     */
+    official: boolean;
     installed: boolean;
     installedVersion?: string;
     updateAvailable: boolean;
