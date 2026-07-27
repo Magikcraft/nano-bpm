@@ -1117,14 +1117,15 @@ export interface MetaDecl {
 }
 
 /** Fold the scanned model-level metadata into a single key→value record. When two
- * models declare the same key the first (scan order) wins — the fold is a flat
- * app-wide view, so a duplicate is dropped rather than silently overwritten. Empty
- * keys are ignored. */
+ * models declare the same key the last (scan order) wins — the fold is a flat
+ * app-wide view where a later declaration overrides an earlier one (matching the
+ * editor's "last write wins" affordance and JS object semantics). Empty keys are
+ * ignored. */
 export function foldMeta(metas: MetaDecl[]): Record<string, string> {
   const out: Record<string, string> = {};
   for (const m of metas) {
     const key = (m?.key ?? "").trim();
-    if (!key || Object.prototype.hasOwnProperty.call(out, key)) continue;
+    if (!key) continue;
     out[key] = m.value ?? "";
   }
   return out;
@@ -1219,7 +1220,8 @@ function fieldsJson(fields: Record<string, DomainFieldDef>): FusedFieldJson[] {
 /**
  * Emit `domain.json`: the structured Fused Domain Model (ADR 0040 §1). Assembles
  * every fused entity — DB tables (`db:` provenance), manifest `types` (`manifest:`),
- * and composed motion shapes (`model:<processId>`) — with its resolved fields, plus
+ * and composed motion shapes (`model:<processId>`, or bare `model` for an unsaved
+ * editor shape with no process) — with its resolved fields, plus
  * the model-level metadata and the shape diagnostics. An `inputsHash` over the
  * assembled content (excluding the hash itself) tags the cache for staleness.
  */
@@ -1258,7 +1260,7 @@ export function emitDomainModelJson(input: {
     entities.push({
       id: decl.id,
       kind: "shape",
-      provenance: `model:${decl.process ?? ""}`,
+      provenance: decl.process ? `model:${decl.process}` : "model",
       ...(def.name ?? decl.name ? { name: def.name ?? decl.name } : {}),
       fields: fieldsJson(def.fields),
     });

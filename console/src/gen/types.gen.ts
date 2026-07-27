@@ -827,6 +827,16 @@ export type DomainTypesResult = {
      *
      */
     domainModelPath?: string | null;
+    /**
+     * The emitted typed model-metadata accessor (`meta.ts`, `@nanobpm/meta`, ADR 0040 §5) contents. Present whenever the op resolved (including the preview endpoint under `write:false`, which returns it without writing).
+     *
+     */
+    meta?: string | null;
+    /**
+     * The emitted structured Fused Domain Model (`domain.json`, ADR 0040 §1) contents. Present whenever the op resolved (including the preview endpoint under `write:false`, which returns it without writing).
+     *
+     */
+    domainModel?: string | null;
 };
 
 /**

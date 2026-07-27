@@ -2318,6 +2318,20 @@ components:
             The structured Fused Domain Model cache written
             (`nano-generated/domain.json`, ADR 0040 §1), or null under
             `write:false`.
+        meta:
+          type: string
+          nullable: true
+          description: >
+            The emitted typed model-metadata accessor (`meta.ts`, `@nanobpm/meta`,
+            ADR 0040 §5) contents. Present whenever the op resolved (including the
+            preview endpoint under `write:false`, which returns it without writing).
+        domainModel:
+          type: string
+          nullable: true
+          description: >
+            The emitted structured Fused Domain Model (`domain.json`, ADR 0040 §1)
+            contents. Present whenever the op resolved (including the preview
+            endpoint under `write:false`, which returns it without writing).
     MetaDeclSpec:
       type: object
       required: [key, value]

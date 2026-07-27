@@ -5056,6 +5056,7 @@ mod tests {
       <nano:shapes><nano:shape id="ApprovedOrder"><nano:carry ref="Order" /></nano:shape></nano:shapes>
       <nano:meta key="classification" value="internal" />
       <nano:meta key="owner" value="ops" />
+      <nano:meta key="owner" value="sre" />
     </bpmn:extensionElements>
   </bpmn:process>
 </bpmn:definitions>"#,
@@ -5075,7 +5076,12 @@ mod tests {
             "meta.ts: {meta_ts}"
         );
         assert!(meta_ts.contains(r#"classification: "internal","#));
-        assert!(meta_ts.contains(r#"owner: "ops","#));
+        // Duplicate key: the last declaration wins in the folded accessor.
+        assert!(
+            meta_ts.contains(r#"owner: "sre","#),
+            "last-wins fold: {meta_ts}"
+        );
+        assert!(!meta_ts.contains(r#"owner: "ops","#));
         assert!(meta_ts.contains("export function meta<K extends keyof AppMeta>"));
         let meta_disk = std::fs::read_to_string(dir.join("nano-generated/meta.ts")).unwrap();
         assert_eq!(meta_disk, meta_ts);
