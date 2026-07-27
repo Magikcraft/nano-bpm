@@ -2682,6 +2682,13 @@ impl ProjectInner {
     /// through as `out`. Shared by both run paths (`run` built-in and
     /// `run_toolchain`) so their consoles surface identical output.
     async fn ingest_stdout_line(&self, line: String) {
+        // `BufReader::lines()` strips `\n` but leaves a trailing `\r` on CRLF
+        // producers; drop it so STATUS JSON still parses and logs carry no stray
+        // carriage return.
+        let line = match line.strip_suffix('\r') {
+            Some(trimmed) => trimmed.to_string(),
+            None => line,
+        };
         if line.starts_with(METRIC_PREFIX) {
             return; // per-worker metric telemetry — not shown
         }
@@ -4141,6 +4148,12 @@ mod tests {
         inner
             .ingest_stdout_line(format!("{STATUS_PREFIX}not-json"))
             .await;
+        // A CRLF-terminated status line still parses (trailing \r stripped).
+        inner
+            .ingest_stdout_line(format!(
+                "{STATUS_PREFIX}{{\"state\":\"ready\",\"message\":\"up\"}}\r"
+            ))
+            .await;
         // Anything else passes through verbatim as `out`.
         inner.ingest_stdout_line("hello world".to_string()).await;
 
@@ -4154,9 +4167,10 @@ mod tests {
             vec![
                 ("sys".to_string(), "deploying: onboarding.bpmn".to_string()),
                 ("sys".to_string(), "not-json".to_string()),
+                ("sys".to_string(), "ready: up".to_string()),
                 ("out".to_string(), "hello world".to_string()),
             ],
-            "metrics swallowed, status unwrapped to sys, rest passed through as out"
+            "metrics swallowed, status unwrapped to sys (incl. CRLF), rest passed through as out"
         );
     }
 
