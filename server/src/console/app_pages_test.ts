@@ -121,3 +121,27 @@ Deno.test("unknown route is 404", async () => {
   const res = await createPagesHandler(ctx())(new Request("http://x/nope"));
   assertEquals(res.status, 404);
 });
+
+Deno.test("GET /app/data retries schema introspection after a transient failure", async () => {
+  let calls = 0;
+  const handle = createPagesHandler(
+    ctx({
+      db: {
+        schema: () => {
+          calls += 1;
+          return calls === 1
+            ? Promise.reject(new Error("database is locked"))
+            : Promise.resolve([{ name: "pull_requests" }]);
+        },
+        query: (_sql: string) => Promise.resolve([{ pr_key: "o/r#1" }]),
+      },
+    }),
+  );
+  // First hit: introspection rejects → surfaced as an error, NOT cached.
+  const first = await handle(new Request("http://x/app/data/app/pull_requests"));
+  assertEquals(first.status, 500);
+  // Second hit: the datasource has recovered → introspection retried, succeeds.
+  const second = await handle(new Request("http://x/app/data/app/pull_requests"));
+  assertEquals(second.status, 200);
+  assertEquals(calls, 2);
+});

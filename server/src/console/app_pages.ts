@@ -64,10 +64,18 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
   // boot (before `servePages`), so the schema is stable for the process lifetime,
   // and the renderer refreshes grids repeatedly — re-introspecting the sqlite
   // schema (multiple PRAGMAs per table) on every `/app/data` hit would be a hot
-  // path. Introspect once, lazily, and reuse.
+  // path. Introspect once, lazily, and reuse. A rejected introspection is NOT
+  // cached (the in-flight promise is cleared on failure) so a transient error
+  // (locked/unavailable datasource) doesn't wedge every future request.
   let tableNames: Promise<Set<string>> | null = null;
   const knownTables = (): Promise<Set<string>> =>
-    (tableNames ??= ctx.db.schema().then((t) => new Set(t.map((x) => x.name))));
+    (tableNames ??= ctx.db.schema().then(
+      (t) => new Set(t.map((x) => x.name)),
+      (err) => {
+        tableNames = null;
+        throw err;
+      },
+    ));
 
   return async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -108,7 +116,14 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
         return json({ error: `unknown datasource "${source}"` }, 404);
       }
       if (!IDENT.test(table)) return json({ error: "invalid table name" }, 400);
-      const tables = await knownTables();
+      let tables: Set<string>;
+      try {
+        tables = await knownTables();
+      } catch {
+        // A transient introspection failure isn't cached (see knownTables) — the
+        // next request retries. Surface it as a 500 so the renderer can retry too.
+        return json({ error: "schema introspection failed" }, 500);
+      }
       if (!tables.has(table)) {
         return json({ error: `unknown table "${table}"` }, 404);
       }
