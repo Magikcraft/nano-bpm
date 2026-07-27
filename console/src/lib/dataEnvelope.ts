@@ -116,6 +116,30 @@ export function envelopeContext(
   return undefined;
 }
 
+// Every domain-type id referenced by an envelope (input or output) across a set
+// of elements. The model is the authoritative carrier of the data contract (the
+// reserved `zeebe:property`), so a type can be *referenced* by an envelope without
+// being declared in the manifest `types` registry — e.g. a hand-authored or
+// drifted model. Deriving the referenced ids lets the picker surface (and keep
+// selectable) those types rather than rendering a set envelope as blank because
+// its id is absent from the authored registry. Deduped; order is insertion order.
+export function collectEnvelopeTypeRefs(
+  elements: (
+    { type?: string; businessObject?: EnvModdleElement } | undefined
+  )[],
+): string[] {
+  const ids = new Set<string>();
+  for (const el of elements) {
+    const ctx = envelopeContext(el);
+    if (!ctx) continue;
+    for (const field of ["inputType", "outputType"] as EnvelopeField[]) {
+      const v = readEnvelope(ctx.target, field);
+      if (v) ids.add(v);
+    }
+  }
+  return [...ids];
+}
+
 export function zeebePropsContainer(
   bo: EnvModdleElement | undefined,
 ): EnvModdleElement | undefined {
