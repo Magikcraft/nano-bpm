@@ -189,11 +189,27 @@ if (globalThis.Deno === undefined) {
     },
     stdout: {
       writeSync: (data) => fsWriteSync(1, toBytes(data)),
-      write: async (data) => fsWriteSync(1, toBytes(data)),
+      // Deno's async `write` resolves to the byte count; use the non-blocking
+      // stream write so heavy telemetry doesn't stall the event loop.
+      write: (data) => {
+        const bytes = toBytes(data);
+        return new Promise((resolve, reject) =>
+          process.stdout.write(bytes, (err) =>
+            err ? reject(err) : resolve(bytes.length),
+          ),
+        );
+      },
     },
     stderr: {
       writeSync: (data) => fsWriteSync(2, toBytes(data)),
-      write: async (data) => fsWriteSync(2, toBytes(data)),
+      write: (data) => {
+        const bytes = toBytes(data);
+        return new Promise((resolve, reject) =>
+          process.stderr.write(bytes, (err) =>
+            err ? reject(err) : resolve(bytes.length),
+          ),
+        );
+      },
     },
     stdin: {
       get readable() {
