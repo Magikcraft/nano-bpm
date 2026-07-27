@@ -525,6 +525,30 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '409': { $ref: '#/components/responses/Conflict' }
 
+  /projects/import:
+    post:
+      operationId: importProject
+      tags: [projects]
+      summary: Import an Urban app by reference (external project pointer)
+      description: >-
+        Register an external checked-out directory as a project pointer, read
+        live, without copying it (ADR 0041). The path must resolve to a Nano
+        app/project directory (containing nano.app.json or nanobpm.project.json)
+        and the name must not shadow an existing workspace project.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportProjectRequest' }
+      responses:
+        '200':
+          description: Project reference registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ProjectReference' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
   /projects/{name}:
     get:
       operationId: getProject
@@ -1706,7 +1730,7 @@ components:
     # ---- Projects (camelCase wire fields) --------------------------------
     ProjectSummary:
       type: object
-      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running, lang]
+      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running, source, lang]
       properties:
         name: { type: string }
         description: { type: string }
@@ -1717,6 +1741,14 @@ components:
         forms: { type: integer, format: int32 }
         workers: { type: integer, format: int32 }
         running: { type: boolean }
+        source:
+          type: string
+          enum: [workspace, path]
+          default: workspace
+          description: >-
+            Where the project lives: "workspace" (a directory under the projects
+            root) or "path" (an external checked-out directory imported by
+            reference, ADR 0041, read live).
         lang:
           type: string
           description: >-
@@ -1918,6 +1950,27 @@ components:
         name: { type: string }
         description: { type: string }
         template: { type: string, nullable: true }
+    ImportProjectRequest:
+      type: object
+      required: [name, path]
+      properties:
+        name: { type: string }
+        path:
+          type: string
+          description: >-
+            Absolute host filesystem path to a checked-out Urban app/project
+            directory (containing nano.app.json or nanobpm.project.json).
+    ProjectReference:
+      type: object
+      required: [source, path]
+      properties:
+        source:
+          type: string
+          enum: [path]
+          description: Reference source kind (currently only "path").
+        path:
+          type: string
+          description: Canonical absolute directory the project resolves to.
     RenameProjectRequest:
       type: object
       required: [newName]

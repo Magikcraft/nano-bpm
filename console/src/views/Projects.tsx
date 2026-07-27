@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import {
   createProject,
   deleteProject,
+  importProject,
   listProjects,
   renameProject,
   type ProjectSummary,
@@ -59,6 +60,9 @@ export default function Projects() {
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
   const [newDesc, setNewDesc] = useState("");
+  const [importing, setImporting] = useState(false);
+  const [importName, setImportName] = useState("");
+  const [importPath, setImportPath] = useState("");
   const [busy, setBusy] = useState(false);
 
   const reload = useCallback(async () => {
@@ -107,6 +111,32 @@ export default function Projects() {
   );
   const nameValid = newName.trim().length > 0 && !nameError;
 
+  const importNameError = useMemo(
+    () => validateProjectName(importName, projects),
+    [importName, projects],
+  );
+  const importValid =
+    importName.trim().length > 0 &&
+    importPath.trim().length > 0 &&
+    !importNameError;
+
+  /// Import an existing checked-out Urban app by reference (ADR 0041): point a
+  /// name at an external directory, read live. The server validates the path is
+  /// a Nano app/project and that the name is free.
+  const importRef = async () => {
+    const name = importName.trim();
+    const path = importPath.trim();
+    if (!importValid) return;
+    setBusy(true);
+    try {
+      await importProject({ body: { name, path }, throwOnError: true });
+      navigate(`/projects/${encodeURIComponent(name)}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setBusy(false);
+    }
+  };
+
   const remove = async (name: string) => {
     if (!confirm(`Delete project “${name}” and all its files? This cannot be undone.`)) return;
     try {
@@ -134,9 +164,26 @@ export default function Projects() {
         title="Projects"
         subtitle="Self-contained applications — processes, decisions, forms, workers and shared libraries. Author, run, compile and export from one place."
         actions={
-          <Button variant="primary" onClick={() => setCreating((v) => !v)}>
-            {creating ? "Cancel" : "+ New project"}
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setImporting((v) => !v);
+                setCreating(false);
+              }}
+            >
+              {importing ? "Cancel" : "Import by reference"}
+            </Button>
+            <Button
+              variant="primary"
+              onClick={() => {
+                setCreating((v) => !v);
+                setImporting(false);
+              }}
+            >
+              {creating ? "Cancel" : "+ New project"}
+            </Button>
+          </div>
         }
       />
 
@@ -225,6 +272,62 @@ export default function Projects() {
         </Card>
       )}
 
+      {importing && (
+        <Card className="mb-6 p-4">
+          <div className="grid gap-3 sm:grid-cols-[1fr_2fr]">
+            <div>
+              <input
+                autoFocus
+                value={importName}
+                onChange={(e) => setImportName(e.target.value)}
+                placeholder="project-name"
+                aria-invalid={!!importNameError}
+                className={`w-full rounded-md border bg-inset px-3 py-2 text-sm text-fg placeholder:text-fg-faint outline-none ${
+                  importNameError
+                    ? "border-danger/70 focus:border-danger"
+                    : "border-edge-strong focus:border-accent"
+                }`}
+                onKeyDown={(e) => e.key === "Enter" && importValid && void importRef()}
+              />
+              <p
+                className={`mt-1 text-xs ${
+                  importNameError ? "text-danger" : "text-fg-faint"
+                }`}
+              >
+                {importNameError ?? "The name this app is registered under."}
+              </p>
+            </div>
+            <div>
+              <Input
+                value={importPath}
+                onChange={(e) => setImportPath(e.target.value)}
+                placeholder="/absolute/path/to/checked-out/app"
+                className="h-fit"
+                onKeyDown={(e) => e.key === "Enter" && importValid && void importRef()}
+              />
+              <p className="mt-1 text-xs text-fg-faint">
+                Absolute path to a checked-out Urban app directory
+                (contains <code>nano.app.json</code> or{" "}
+                <code>nanobpm.project.json</code>). Read live — no copy.
+              </p>
+            </div>
+          </div>
+          <div className="mt-3 flex items-center gap-3">
+            <Button
+              variant="primary"
+              onClick={() => void importRef()}
+              disabled={busy || !importValid}
+            >
+              {busy ? "Importing…" : "Import project"}
+            </Button>
+            <span className="text-xs text-fg-faint">
+              The app runs from its source directory, so edits show up on the
+              next Run.
+            </span>
+          </div>
+        </Card>
+      )}
+
       {loading ? (
         <div className="py-16 text-center text-sm text-fg-faint">Loading…</div>
       ) : projects.length === 0 ? (
@@ -290,6 +393,14 @@ function ProjectTile({
             </span>
           )}
           <span className="truncate text-base font-semibold text-fg">{project.name}</span>
+          {project.source === "path" && (
+            <span
+              title="Imported by reference — runs live from an external checked-out directory (ADR 0041)"
+              className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent"
+            >
+              ⧉ linked
+            </span>
+          )}
           {project.running && (
             <span className="inline-flex items-center gap-1 rounded-full bg-ok/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ok">
               <span className="h-1.5 w-1.5 rounded-full bg-ok" /> running

@@ -799,6 +799,35 @@ impl apis::projects::Projects for ServerImpl {
         }
     }
 
+    async fn import_project(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        body: &models::ImportProjectRequest,
+    ) -> Result<apis::projects::ImportProjectResponse, ()> {
+        let name = body.name.trim().to_string();
+        let path = body.path.trim().to_string();
+        let out =
+            tokio::task::spawn_blocking(move || super::projects::import_project_ref(&name, &path))
+                .await
+                .unwrap_or_else(|e| Err(format!("import task panicked: {e}")));
+        match out {
+            Ok(r) => Ok(
+                apis::projects::ImportProjectResponse::Status200_ProjectReferenceRegistered(
+                    from_dto(r),
+                ),
+            ),
+            // The only 409 `import_project_ref` produces is the workspace-name
+            // conflict, whose message starts with this exact phrase — match it
+            // precisely so an unrelated error can't be misclassified as 409.
+            Err(e) if e.starts_with("a workspace project named") => {
+                Ok(apis::projects::ImportProjectResponse::Status409_AlreadyExists(e))
+            }
+            Err(e) => Ok(apis::projects::ImportProjectResponse::Status400_InvalidRequest(e)),
+        }
+    }
+
     async fn create_project_path(
         &self,
         _method: &Method,
