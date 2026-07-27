@@ -11,6 +11,8 @@
 // this constant — it loads the installed set from the open project (ADR 0033
 // increment 2, `projectComponents.ts`); packs (ADR 0007) layer on in increment 6.
 
+import { ELEMENT_TEMPLATE_SCHEMA_URL } from "./elementTemplateSchema";
+
 /** The Zeebe (Camunda 8 / "Cloud") element-template JSON shape. Typed loosely —
  *  the authoritative schema is `@camunda/zeebe-element-templates-json-schema`,
  *  which the modeler's validator enforces at `elementTemplates.set()`. */
@@ -24,8 +26,10 @@ export interface ElementTemplate {
   properties: Array<Record<string, unknown>>;
 }
 
-const SCHEMA =
-  "https://unpkg.com/@camunda/zeebe-element-templates-json-schema@0.44.0/resources/schema.json";
+// The `$schema` the seed templates carry. Imported from the schema-registration
+// module so the URL written into these files can never drift from the version
+// whose content Monaco bundles for offline resolution (`elementTemplateSchema.ts`).
+const SCHEMA = ELEMENT_TEMPLATE_SCHEMA_URL;
 
 /**
  * Read Thermostat — mirrors ADR 0022's `read-thermostat` worker. A service task
