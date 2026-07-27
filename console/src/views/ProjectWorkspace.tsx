@@ -1625,6 +1625,23 @@ function EditorPane({
           return op;
         });
       const next: ShapeDecl[] = [...existing, { id, ops }];
+      // Server-fuse pre-check: the up-front editor guard only knows model shapes
+      // and manifest `types`, but a new id can also collide with a *fused leaf
+      // entity* (e.g. a datasource table). `resolveShapes` reports that as an
+      // `error`-severity `same-id-collision` and omits the shape, which would
+      // leave the model referencing a payload type that never reifies into
+      // `DomainTypes`. Reject with the server's diagnostic before committing.
+      // A preview transport failure is non-fatal — fall through to the write +
+      // verify below (no worse than the prior behaviour).
+      const preview = await previewShapes(next, bpmn.getMeta()).catch(
+        () => null,
+      );
+      const blocking = preview?.diagnostics.find(
+        (d) => d.shape === id && d.severity === "error",
+      );
+      if (blocking) {
+        throw new Error(blocking.message);
+      }
       composerWriteRef.current = true;
       bpmn.setShapes(next);
       // Verify the undoable write actually landed (setShapes swallows a
@@ -1640,7 +1657,7 @@ function EditorPane({
       if (shapesOpen) setComposerShapes(next);
       setDirty(true);
     },
-    [shapesOpen],
+    [shapesOpen, previewShapes],
   );
 
   // Persist edited model-level metadata to the model (one undoable command),
