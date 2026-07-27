@@ -434,8 +434,8 @@ function emitKeyedDomainBindings(
     `export async function openDomain<K extends DomainSource = ${JSON.stringify(def)}>(\n` +
     `  source?: K,\n` +
     `): Promise<Domain<DomainSources[K]>> {\n` +
-    `  const raw = await openDataSource(source as string | undefined);\n` +
     `  const key = (source ?? DEFAULT_SOURCE) as string;\n` +
+    `  const raw = await openDataSource(key);\n` +
     `  const db: Record<string, unknown> = { raw, close: () => raw.close() };\n` +
     `  for (const t of DOMAIN_TABLES[key] ?? []) db[t.name] = raw.table(t.name, t.pk);\n` +
     `  return db as Domain<DomainSources[K]>;\n}`;
