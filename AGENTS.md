@@ -38,9 +38,22 @@ This repository does **not** auto-merge pull requests. Opening a PR is *not* the
 same as committing to `main` — a PR sits open until a human or agent deliberately
 merges it:
 
-- Merge is a manual act: click **Merge** in the GitHub UI once the required CI
-  checks are green, or enqueue with a `@mergifyio queue` comment to get the
-  always-green rebase-and-retest queue. Nothing merges on its own.
+- Merge is a manual act. CI runs **once when the PR is opened**; follow-up pushes
+  (review-fix commits) deliberately do **not** re-run CI, to keep review cycles
+  cheap. So the recommended flow is: **open the PR as a draft** (`gh pr create
+  --draft`) — the `opened` run gives early breakage signal — converge Copilot
+  review, then **mark it ready at convergence** (`gh pr ready <n>`). Marking ready
+  fires a fresh `pull_request` (`ready_for_review`) CI run on the head, and that
+  run is what GitHub branch protection counts to allow the merge. Once those head
+  checks are green (and review threads are resolved), merge via the UI **Merge**
+  button or a **`@mergifyio queue`** comment.
+- **Do not use `workflow_dispatch` as the merge finalizer** — its runs do NOT
+  satisfy branch-protection required status checks (GitHub only counts the PR's
+  own push/pull_request check suite). If a PR wasn't opened as a draft, produce
+  the head run instead by **closing and reopening it** (`gh pr close <n> && gh pr
+  reopen <n>` → `reopened` event). Symptom of getting this wrong: Mergify enters
+  the queue, validates the batch, then dequeues with "N of N required status
+  checks are expected". Nothing merges on its own.
 - Because a PR stays open until merged, it is **safe to push follow-up commits**
   to an open PR (address review feedback, fix CI, iterate) before you merge it.
 - Still keep each PR focused: land unrelated scope in its own PR rather than
@@ -63,8 +76,10 @@ Every PR must be driven to **review convergence** before it is merged — use th
   `COMMENTED`, never `APPROVED`, so the summary body is the verdict) — or the
   Copilot review is **exhausted** (it reiterates a point already addressed or
   pushed back on; two rounds of the same substantive point = converged).
-- At convergence, **rebase the PR if it is behind `main`, resolve any conflicts**,
-  ensure checks are green, and **merge** (UI merge or `@mergifyio queue`).
+- At convergence, **rebase the PR if it is behind `main`, resolve any conflicts
+  and review threads**, then produce a fresh head CI run via a `pull_request`
+  event — **mark a draft PR ready** (`gh pr ready <n>`) or **close+reopen** it —
+  wait for green, and **merge** (UI button or `@mergifyio queue`).
 - Stop early and sync with the user only if a comment genuinely **needs their
   input** (a design/product tradeoff you can't decide) — after resolving
   everything else in the round.
