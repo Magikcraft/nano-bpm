@@ -14997,7 +14997,11 @@ impl axum::serve::Listener for NoDelayListener {
 /// loopback-only). A local newtype is required because the orphan rule forbids
 /// implementing axum's `Connected` for the foreign `SocketAddr` directly.
 #[derive(Clone, Copy)]
-pub(crate) struct PeerAddr(pub(crate) SocketAddr);
+pub(crate) struct PeerAddr(
+    // Read only by the console's loopback-gated filesystem browser; a server
+    // built without the `console` feature still carries it but never inspects it.
+    #[cfg_attr(not(feature = "console"), allow(dead_code))] pub(crate) SocketAddr,
+);
 
 /// Enables `ConnectInfo<PeerAddr>` extraction when the app is served over the
 /// custom [`NoDelayListener`]; axum ships a `Connected` impl for the stock
