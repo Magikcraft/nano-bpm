@@ -1222,8 +1222,10 @@ function fieldsJson(fields: Record<string, DomainFieldDef>): FusedFieldJson[] {
  * every fused entity — DB tables (`db:` provenance), manifest `types` (`manifest:`),
  * and composed motion shapes (`model:<processId>`, or bare `model` for an unsaved
  * editor shape with no process) — with its resolved fields, plus
- * the model-level metadata and the shape diagnostics. An `inputsHash` over the
- * assembled content (excluding the hash itself) tags the cache for staleness.
+ * the model-level metadata and the shape diagnostics. An `inputsHash` — FNV-1a
+ * (hex) over the compact `JSON.stringify` of the model object with `inputsHash`
+ * omitted (property-insertion order, not the pretty-printed bytes) — tags the
+ * cache for staleness.
  */
 export function emitDomainModelJson(input: {
   sources: SourceSchema[];

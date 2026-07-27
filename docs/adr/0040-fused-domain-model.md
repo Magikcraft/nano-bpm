@@ -295,8 +295,12 @@ is omitted from `DomainTypes` (so a broken shape degrades to untyped, it does no
    git-ignored `nano-generated/domain.json`** — the maker's manifest stays a pure *source*, and the
    `domaintypes` op regenerates the cache write-through on every run alongside the TS artifacts. It is a
    structured, queryable index: provenance-tagged entities (`db:`/`manifest:`/`model:<processId>`), the
-   folded model-level metadata (§5), diagnostics, and an `inputsHash` (FNV-1a over the emitted content,
-   minus the hash field) for staleness detection. An input change that produces identical output keeps
+   folded model-level metadata (§5), diagnostics, and an `inputsHash` for staleness detection. The hash
+   is **FNV-1a (hex) over `JSON.stringify` of the domain-model object with the `inputsHash` field omitted**
+   — i.e. the compact JSON in property-insertion order (`$generated`, `version`, `default?`, `sources`,
+   `entities`, `meta`, `diagnostics`), *not* the pretty-printed file bytes — so a consumer recomputes it
+   by re-serialising the parsed object without `inputsHash`, not by hashing the file. An input change that
+   produces identical output keeps
    the hash — acceptable for a cache whose only job is fast reads. It is never hand-authored; deleting it
    is harmless (the next op rebuilds it).
 2. **Reference/cycle grain** — do we allow a motion shape to carry another motion shape from a *different*
