@@ -83,7 +83,7 @@ leader-durable/sync, `MAXPAR=112`, open-loop (`maxInflight=50000`, `rate=14000/p
 > **console-build** baseline; `--no-console` bisect binaries are not comparable.
 > Aggregate throughput = SUM of the 3 per-node `tput` values (one loadgen/node).
 
-| payload | agg tput | per-node tput | n p50 / p99 | create-accept p50 / p99 | RSS under load → idle | var-spill.sqlite |
+| payload | agg tput | per-node tput | job latency p50 / p99 | create-accept p50 / p99 | RSS under load → idle | var-spill.sqlite |
 |---|---|---|---|---|---|---|
 | **50KB** (VB=51200) | **~4,987/s** | 1657 / 1665 / 1665 | 41 / 383 µs | 51.8 / 411 ms | 24–29 GB → **7.8–8.2 GB** | flat **1 MB** |
 | **neg** (VB=0) | **~25,368/s** | 8434 / 8439 / 8495 | 12 / 38 µs | 14.2 / 42.7 ms | ~**1.2 GB** (no spill) | flat **1 MB** |
