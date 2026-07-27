@@ -5031,6 +5031,105 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_rejects_a_nominal_reference_to_a_table() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesnom";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } } }"#,
+        )
+        .unwrap();
+        // A non-spread reference to a DB table cannot be expressed as a DomainTypes
+        // ref (it would emit `unknown`), so the shape is rejected and omitted.
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="Bad"><nano:reference name="cust" ref="customers" /></nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT NOT NULL)" }),
+        )
+        .await
+        .expect("create table");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        assert!(!text.contains("\"Bad\""), "rejected shape leaked: {text}");
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["kind"], "nominal-table-ref");
+        assert_eq!(diags[0]["shape"], "Bad");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_op_warns_on_a_type_table_name_collision_and_prefers_the_type() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "shapesambig";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Both a manifest type "Order" (field `total`) and a table "order" (column
+        // `note`) exist. carry ref="order" resolves to the *type* (which wins the
+        // bare id) with an `ambiguous-reference` warning, so the shape carries
+        // `total`, not `note`.
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{
+                "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } },
+                "types": { "order": { "fields": { "total": { "type": "number" } } } }
+            }"#,
+        )
+        .unwrap();
+        write_shape_model(
+            &dir,
+            r#"<nano:shape id="Composed"><nano:carry ref="order" /></nano:shape>"#,
+        );
+        ensure_project_sdk(name).unwrap();
+        run_data_op(
+            name,
+            serde_json::json!({ "op": "exec",
+                "sql": "CREATE TABLE \"order\" (id INTEGER PRIMARY KEY, note TEXT)" }),
+        )
+        .await
+        .expect("create table");
+
+        let dt = run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+        let text = dt["text"].as_str().unwrap();
+        assert!(text.contains("\"Composed\": {"), "shape missing: {text}");
+        // The type won the bare id: Composed carries `total` (the type's field), not
+        // the table's `note`/`id`. (`note` still appears in the table's own interface.)
+        assert!(
+            text.contains("total: number;"),
+            "type fields expected: {text}"
+        );
+        let diags = dt["shapeDiagnostics"].as_array().unwrap();
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0]["kind"], "ambiguous-reference");
+        assert_eq!(diags[0]["severity"], "warning");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_derives_message_payload_from_the_model() {
         let _g = lock();
         if workers::usable_node().is_none() && workers::find_deno().is_none() {

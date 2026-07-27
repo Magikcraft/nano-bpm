@@ -678,6 +678,8 @@ export interface ShapeDiagnostic {
     | "field-conflict"
     | "unknown-field"
     | "duplicate-id"
+    | "ambiguous-reference"
+    | "nominal-table-ref"
     | "same-id-collision";
   severity: "error" | "warning";
   message: string;
@@ -715,12 +717,20 @@ function columnToField(col: ColumnMeta): DomainFieldDef {
  * datasource table (by raw wire name, and by `source.table` to disambiguate a
  * name shared across sources) and every manifest `type` (by id). A raw table name
  * shared across sources keeps the first (default-source-first) binding; the
- * qualified `source.table` alias is always unambiguous. */
+ * qualified `source.table` alias is always unambiguous.
+ *
+ * When a manifest `type` id collides with a bare table name, the **type wins** the
+ * unqualified id (it is the more first-class, `DomainTypes`-visible entity) and the
+ * collision is surfaced via `ambiguousIds` so resolution can warn; the table stays
+ * reachable through its `source.table` alias. `tableIds` records every id (bare +
+ * qualified) that resolves to a DB table, so a nominal reference (which the emitter
+ * can only express against `DomainTypes` keys) can be rejected. */
 function leafEntityIndex(
   sources: SourceSchema[],
   types: DomainTypeRegistry,
-): Map<string, FuseEntity> {
+): { index: Map<string, FuseEntity>; tableIds: Set<string>; ambiguousIds: Set<string> } {
   const index = new Map<string, FuseEntity>();
+  const tableIds = new Set<string>();
   for (const s of sources) {
     for (const t of s.tables) {
       const fields: Record<string, DomainFieldDef> = {};
@@ -729,13 +739,21 @@ function leafEntityIndex(
       for (const fk of t.foreignKeys ?? []) fks[fk.column] = fk.refTable;
       const entity: FuseEntity = { fields, fks };
       index.set(`${s.source}.${t.name}`, entity);
-      if (!index.has(t.name)) index.set(t.name, entity);
+      tableIds.add(`${s.source}.${t.name}`);
+      if (!index.has(t.name)) {
+        index.set(t.name, entity);
+        tableIds.add(t.name);
+      }
     }
   }
+  const ambiguousIds = new Set<string>();
   for (const [id, def] of Object.entries(types)) {
-    if (!index.has(id)) index.set(id, { fields: { ...def.fields } });
+    // The manifest type wins an unqualified id that also names a table; the table
+    // remains reachable by its `source.table` alias.
+    if (tableIds.has(id)) ambiguousIds.add(id);
+    index.set(id, { fields: { ...def.fields } });
   }
-  return index;
+  return { index, tableIds, ambiguousIds };
 }
 
 /** Whether a manifest field keyword resolves to a primitive (vs a nominal ref). */
@@ -784,7 +802,12 @@ export function resolveShapes(
   const resolved: DomainTypeRegistry = {};
   if (shapes.length === 0) return { types: resolved, diagnostics };
 
-  const index = leafEntityIndex(sources, types);
+  const { index, tableIds, ambiguousIds } = leafEntityIndex(sources, types);
+  // A nominal reference (an `extend` type or a non-spread `reference`) must resolve
+  // to a `DomainTypes` key at emit time — a manifest type or a resolved shape id.
+  // DB tables are spread-only (their fields flatten via carry/project); nominally
+  // referencing one would degrade to `unknown` in the emitted `.d.ts`, so we reject.
+  const nominalIds = new Set<string>(Object.keys(types));
   // Duplicate shape ids are fuse-identity collisions: since resolution keys by id,
   // a later declaration would silently shadow an earlier one. Report every id that
   // appears more than once and omit all of its declarations from resolution.
@@ -873,18 +896,46 @@ export function resolveShapes(
         message: `shape "${shape.id}" references unknown entity "${ref}"`,
       });
     };
+    // A bare id that names both a manifest type and a table resolves to the type;
+    // warn so the (silent) precedence is visible and the maker can qualify.
+    const noteAmbiguity = (ref: string): void => {
+      if (ambiguousIds.has(ref)) {
+        diagnostics.push({
+          shape: shape.id,
+          kind: "ambiguous-reference",
+          severity: "warning",
+          message:
+            `"${ref}" names both a manifest type and a table; resolved to the type — qualify as "<source>.${ref}" to target the table`,
+        });
+      }
+    };
+    // Report a nominal reference (extend type / non-spread reference) that targets a
+    // DB table, which cannot be expressed as a `DomainTypes` ref (it would degrade to
+    // `unknown`); the maker should spread it instead (carry/project or spread=true).
+    const nominalTableRef = (kind: string, ref: string): void => {
+      broken = true;
+      diagnostics.push({
+        shape: shape.id,
+        kind: "nominal-table-ref",
+        severity: "error",
+        message:
+          `${kind} nominally references table "${ref}", which is not a DomainTypes entity; spread its fields (carry/project or reference spread="true") instead`,
+      });
+    };
 
     for (const op of shape.ops) {
       switch (op.op) {
         case "carry": {
           const e = lookup(op.ref);
           if (!e) { unresolved(op.ref); break; }
+          noteAmbiguity(op.ref);
           for (const [k, f] of Object.entries(e.fields)) addField(k, f);
           break;
         }
         case "project": {
           const e = lookup(op.ref);
           if (!e) { unresolved(op.ref); break; }
+          noteAmbiguity(op.ref);
           for (const fname of op.fields) {
             const f = e.fields[fname];
             if (!f) {
@@ -903,16 +954,23 @@ export function resolveShapes(
           break;
         }
         case "extend": {
-          if (!isPrimitiveKeyword(op.type) && !index.has(op.type)) {
-            broken = true;
-            diagnostics.push({
-              shape: shape.id,
-              kind: "unresolved-reference",
-              severity: "error",
-              message:
-                `extend field "${op.name}" has type "${op.type}", which is neither a scalar keyword nor a fused entity`,
-            });
-            break;
+          if (!isPrimitiveKeyword(op.type)) {
+            if (nominalIds.has(op.type)) {
+              // ok — a manifest type or an already-resolved shape id
+            } else if (tableIds.has(op.type)) {
+              nominalTableRef(`extend field "${op.name}"`, op.type);
+              break;
+            } else {
+              broken = true;
+              diagnostics.push({
+                shape: shape.id,
+                kind: "unresolved-reference",
+                severity: "error",
+                message:
+                  `extend field "${op.name}" has type "${op.type}", which is neither a scalar keyword nor a fused entity`,
+              });
+              break;
+            }
           }
           const field: DomainFieldDef = { type: op.type };
           if (op.optional) field.optional = true;
@@ -924,7 +982,11 @@ export function resolveShapes(
           const e = lookup(op.ref);
           if (!e) { unresolved(op.ref); break; }
           if (op.spread) {
+            noteAmbiguity(op.ref);
             for (const [k, f] of Object.entries(e.fields)) addField(k, f);
+          } else if (!nominalIds.has(op.ref)) {
+            // `e` exists but the id is not a DomainTypes key — it is a DB table.
+            nominalTableRef(`reference "${op.name}"`, op.ref);
           } else {
             const field: DomainFieldDef = { type: op.ref };
             if (op.list) field.list = true;
@@ -957,8 +1019,10 @@ export function resolveShapes(
     }
     const def: DomainTypeDef = { name: shape.name, fields };
     resolved[shape.id] = def;
-    // Later shapes may carry this one; expose its resolved fields to the index.
+    // Later shapes may carry this one; expose its resolved fields to the index and
+    // mark it nominal-referenceable (it will be a `DomainTypes` key).
     index.set(shape.id, { fields });
+    nominalIds.add(shape.id);
   };
   for (const s of shapes) if (s.id && !duplicated.has(s.id)) resolveOne(s);
 

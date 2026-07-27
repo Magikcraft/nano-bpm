@@ -233,6 +233,15 @@ another shape regardless of file/declaration order.
 - **field conflict** — two composition steps contribute the same field name with **different** types
   (same type is an idempotent no-op; a deliberate shadow is a warning, not an error).
 - **unknown project field / FK path** — a `project` names a field or `via` hop the source entity lacks.
+- **duplicate shape id** — two `nano:shape` declarations share an id (ids are fuse identities); every
+  colliding declaration is omitted so resolution never silently picks a scan-order winner.
+- **ambiguous reference** — a bare id names **both** a manifest type and a table. The type wins (it is
+  the more first-class, `DomainTypes`-visible entity); the table stays reachable via its `source.table`
+  alias. A warning, not an error — the shape resolves against the type.
+- **nominal reference to a table** — an `extend` type or a **non-spread** `reference` names a DB table.
+  A nominal reference must resolve to a `DomainTypes` key (a manifest type or a resolved shape); a table
+  would degrade to `unknown` in the emitted `.d.ts`, so it is rejected — spread the table's fields
+  instead (`carry`/`project`, or `reference spread="true"`).
 - **same-id across independent sources** — a shape id collides with a leaf entity that it does *not*
   declare as a source (projection is not conflict, §6).
 
