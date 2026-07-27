@@ -1,9 +1,9 @@
-# Test + clippy gate. Runs on every push to main, once when a PR is opened, and
-# on the merge queue's batch branch so a red build is caught BEFORE it reaches
-# `main` (and before a release tag is cut). Follow-up pushes to an open PR do
-# NOT re-run CI (see the `on:` block) — the queue is the pre-merge gate. Each
-# crate is independent (no root workspace), so it gets its own job with a scoped
-# cache.
+# Test + clippy gate. Runs on every push to main and once when a PR is opened so
+# a red build is caught early. Follow-up pushes to an open PR do NOT re-run CI
+# (see the `on:` block) — instead CI is run once more on the PR head at
+# convergence (via workflow_dispatch / ready_for_review) to produce the required
+# check contexts before merge. Each crate is independent (no root workspace), so
+# it gets its own job with a scoped cache.
 #
 # Scope: clippy (-D warnings) + cargo test per crate, plus a formatting gate.
 # Formatting uses a PINNED NIGHTLY rustfmt (see the `fmt` job and rustfmt.toml):
@@ -19,25 +19,22 @@ on:
   # early, before review cycles are spent), but NOT on every follow-up push
   # (`synchronize`). Review-convergence loops push a commit per Copilot comment;
   # re-running the full per-crate suite on each round is the dominant CI-minutes
-  # cost. The pre-merge gate is Mergify's queue (see below), NOT per-push PR
-  # validation. `ready_for_review` gives an on-demand re-run lever: open/convert
-  # a PR to draft while iterating, mark it ready to run CI once. `opened` runs
-  # even on draft PRs (no draft guard on the jobs), so the initial run always
-  # fires. `workflow_dispatch` is the manual escape hatch to run CI on a PR head
-  # (e.g. to refresh checks for the UI "Merge" button instead of the queue).
+  # cost. Instead, at convergence run CI ONCE more on the PR head — via
+  # `workflow_dispatch` (`gh workflow run ci.yml --ref <branch>`) or by toggling
+  # the PR ready (`ready_for_review`) — to produce the required check contexts on
+  # the head SHA, then merge. `opened` runs even on draft PRs (no draft guard on
+  # the jobs), so the initial run always fires.
   pull_request:
     types: [opened, reopened, ready_for_review]
-  # THE PRE-MERGE GATE. This repo merges via Mergify (Team plan can't use
-  # GitHub's native merge queue), so Mergify validates each batch by opening a
-  # throwaway PR on a fresh `mergify/merge-queue/<hash>` branch — a `pull_request`
-  # `opened` event (covered above), one CI run per batch, retested against
-  # current `main`. That run — not the human PR's head checks — is the
-  # authoritative pre-merge validation, so reviewed PRs merge via
-  # `@mergifyio queue` (the UI button's head checks are intentionally not
-  # refreshed on review pushes; use `workflow_dispatch` if you need them).
-  # `merge_group` fires only under GitHub's *native* merge queue (unused here);
-  # it is retained solely to keep this workflow correct if the repo ever upgrades
-  # to native — it is a no-op today (zero `merge_group` runs in history).
+  # Why a head run is still needed at merge time: this repo merges via Mergify
+  # (Team plan can't use GitHub's native merge queue — zero `merge_group` runs in
+  # history). Mergify enforces the 7 branch-protection required checks *on the PR
+  # head* as an ENTRY condition before a PR can enter the queue, so a
+  # review-pushed head with no checks would deadlock. The convergence-time head
+  # run above satisfies that; then merge via the UI button or `@mergifyio queue`.
+  # `merge_group` fires only under GitHub's *native* merge queue (unused here); it
+  # is retained solely to keep this workflow correct if the repo ever upgrades to
+  # native — it is a no-op today.
   merge_group:
   workflow_dispatch:
 
