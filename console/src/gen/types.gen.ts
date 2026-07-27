@@ -845,6 +845,13 @@ export type DomainTypesResult = {
      */
     shapeDiagnostics: Array<ShapeDiagnostic>;
     /**
+     * Pending schema migrations applied *before* introspecting each datasource (ADR 0029 §4.1/§6), keyed by source name → the applied migration filenames in order. Always present; empty on the preview endpoint (`write:false` never mutates the DB) and whenever no migration was outstanding.
+     *
+     */
+    migrated: {
+        [key: string]: Array<string>;
+    };
+    /**
      * The generated typed model-metadata accessor written (`nano-generated/meta.ts`, `@nanobpm/meta`, ADR 0040 §5), or null when the op ran with `write:false` (e.g. the preview endpoint).
      *
      */

@@ -867,8 +867,11 @@ pub struct MarketEntry {
     pub update_available: bool,
 }
 
-/// Marketplace category derived from a pack's npm keywords. First keyword match
-/// wins, in declaration order; falls back to `"other"` when none is present.
+/// Marketplace category derived from a pack's npm keywords. Categories are
+/// tested in a fixed priority order (lang → app → example → theme → trigger →
+/// agentic-sdlc): if a pack carries keywords for several categories, the first
+/// one in that chain wins regardless of keyword order. Falls back to `"other"`
+/// when no category keyword is present.
 fn classify_category(keywords: &[String]) -> &'static str {
     if keywords.iter().any(|k| k == "nano-ide-lang") {
         "lang"

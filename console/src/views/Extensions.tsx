@@ -284,6 +284,13 @@ export default function Extensions() {
   // scope (official === false), regardless of category.
   const community = filtered.filter((m) => !m.official);
 
+  // Official packs whose classified category has no dedicated section above
+  // (e.g. an unrecognised/`other` category) — surfaced under "Other" so a
+  // first-party pack is never silently dropped from the marketplace view.
+  const officialOther = filtered.filter(
+    (m) => m.official && !CATEGORIES.some((c) => c.id === m.category),
+  );
+
   return (
     <div className="mx-auto max-w-4xl p-6">
       <PageHeader
@@ -338,6 +345,16 @@ export default function Extensions() {
           </CollapsibleSection>
         );
       })}
+
+      {officialOther.length > 0 && (
+        <CollapsibleSection
+          id="other"
+          label="Other"
+          count={officialOther.length}
+        >
+          <div className="grid gap-2">{officialOther.map(marketCard)}</div>
+        </CollapsibleSection>
+      )}
 
       {community.length > 0 && (
         <CollapsibleSection
