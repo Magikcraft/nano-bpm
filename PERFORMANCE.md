@@ -86,7 +86,7 @@ leader-durable/sync, `MAXPAR=112`, open-loop (`MI=50000`, `rate=14000/prod`,
 | payload | agg tput | per-node tput | job latency p50 / p99 | create-accept p50 / p99 | RSS under load → idle | var-spill.sqlite |
 |---|---|---|---|---|---|---|
 | **50KB** (VB=51200) | **~4,987/s** | 1657 / 1665 / 1665 | 41 / 383 µs | 51.8 / 411 ms | 24–29 GB → **7.8–8.2 GB** | flat **1 MB** |
-| **neg** (VB=0) | **~25,368/s** | 8434 / 8439 / 8495 | 12 / 38 µs | 14.2 / 42.7 ms | ~**1.2 GB** (no spill) | flat **1 MB** |
+| **negligible** (VB=0) | **~25,368/s** | 8434 / 8439 / 8495 | 12 / 38 µs | 14.2 / 42.7 ms | ~**1.2 GB** (no spill) | flat **1 MB** |
 
 **Stability.** `NRestarts=0` on all 3 nodes, 0 panics, both ran the full 1800 s.
 
@@ -96,12 +96,13 @@ leader-durable/sync, `MAXPAR=112`, open-loop (`MI=50000`, `rate=14000/prod`,
 **Disk.** `var-spill.sqlite` stays pinned at 1 MB during and after both runs — the
 #287/#311 WAL-checkpoint + cold-reclaim fixes hold; no unbounded growth.
 
-**Verdict.** 50KB ~4,987/s aggregate is on par with the pre-console reference
-(~4,954/s) and well above the #311-fix soak (~3,479/s) and the earlier regressed
-~1,836/s. neg ~25,368/s is the open-loop pure-engine ceiling. No regression on
-current main. One create-accept latency outlier on the neg run (a single ~3.5 s
-max sample) but the create-accept p99.9 held at ~100 ms — a momentary blip, not
-sustained.
+**Verdict.** 50KB ~4,987/s aggregate is healthy — comfortably above both the
+#287-regressed arm (1,534/s) and its pre-#287 parent (3,396/s) documented in the
+2026-07-24 entry below, confirming the #287/#311 WAL-checkpoint + cold-reclaim
+fixes hold. negligible ~25,368/s is the open-loop pure-engine ceiling. No
+regression on current main. One create-accept latency outlier on the neg run (a
+single ~3.5 s max sample) but the create-accept p99.9 held at ~100 ms — a
+momentary blip, not sustained.
 
 **Reference config for future comparison:** standard console build, GCP 3-node RF3
 Raft-ON 12-partition leader-durable, `MAXPAR=112`, open-loop `MI=50000`, journal
