@@ -1221,8 +1221,18 @@ function EditorPane({
   // envelope picker) return this same promise instead of overwriting the
   // resolver — otherwise the first awaiter would hang forever.
   const envelopePromiseRef = useRef<Promise<string | undefined> | null>(null);
+  // Composed-shape ids (`nano:shape`) share the fused-entity namespace with
+  // manifest `types` server-side (ADR 0040 §10 / `resolveShapes` same-id
+  // collision), and the modeler also surfaces them as selectable envelope
+  // types. A new manifest type whose id collides with a shape id would drop
+  // that shape from the picker (de-dupe) and break shape resolution, so the
+  // editor must reject those ids up front too. `composerShapes` is only synced
+  // while the shapes drawer is open, so read the ids fresh from the model at
+  // open time — independent of the drawer.
+  const [envelopeShapeIds, setEnvelopeShapeIds] = useState<string[]>([]);
   const createDomainType = useCallback((): Promise<string | undefined> => {
     if (envelopePromiseRef.current) return envelopePromiseRef.current;
+    setEnvelopeShapeIds((bpmnRef.current?.getShapes() ?? []).map((s) => s.id));
     const p = new Promise<string | undefined>((resolve) => {
       envelopeResolverRef.current = resolve;
       setEnvelopeEditorOpen(true);
@@ -1880,7 +1890,7 @@ function EditorPane({
             )}
             {envelopeEditorOpen && (
               <EnvelopeEditorModal
-                existingIds={domainTypeIds}
+                existingIds={[...new Set([...domainTypeIds, ...envelopeShapeIds])]}
                 onCancel={() => closeEnvelopeEditor(undefined)}
                 onSave={async (id, fields) => {
                   await writeDomainType(id, fields);
