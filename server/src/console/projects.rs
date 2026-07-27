@@ -5214,6 +5214,78 @@ mod tests {
         assert!(!dir.join("nano-generated/domain-rows.d.ts").exists());
     }
 
+    /// The preview `derivedMeta` contract (ADR 0040 §5): an *absent* `derivedMeta`
+    /// falls back to the saved-model `nano:meta` scan, while an explicit empty
+    /// `derivedMeta: []` previews an emptied in-editor list. This is what lets the
+    /// preview handler map an omitted request `meta` to the saved-model metadata.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
+    async fn domaintypes_preview_meta_absent_falls_back_but_empty_previews_empty() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "metaprev";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                    "app": { "driver": "sqlite", "url": "file:./app.db" } } } }"#,
+        )
+        .unwrap();
+        // The saved model carries one model-level `nano:meta`.
+        let procs = dir.join("resources").join("processes");
+        std::fs::create_dir_all(&procs).unwrap();
+        std::fs::write(
+            procs.join("m.bpmn"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:nano="https://nanobpm.io/schema/shapes/1.0" id="d">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:extensionElements>
+      <nano:shapes/>
+      <nano:meta key="classification" value="internal" />
+    </bpmn:extensionElements>
+  </bpmn:process>
+</bpmn:definitions>"#,
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        // `derivedMeta` absent (the handler's "meta omitted" mapping): the saved
+        // model's `nano:meta` is scanned and folded into the previewed accessor.
+        let absent = run_data_op(
+            name,
+            serde_json::json!({ "op": "domaintypes", "write": false, "derivedShapes": [] }),
+        )
+        .await
+        .expect("preview meta-absent");
+        assert!(
+            absent["meta"]
+                .as_str()
+                .unwrap()
+                .contains(r#"classification: "internal","#),
+            "absent derivedMeta should fall back to the saved scan: {}",
+            absent["meta"]
+        );
+
+        // Explicit empty `derivedMeta: []`: the in-editor list wins, so no metadata.
+        let empty = run_data_op(
+            name,
+            serde_json::json!({
+                "op": "domaintypes", "write": false,
+                "derivedShapes": [], "derivedWorkers": [], "derivedMessages": [],
+                "derivedMeta": []
+            }),
+        )
+        .await
+        .expect("preview meta-empty");
+        assert_eq!(empty["meta"].as_str().unwrap(), META_TS_STUB);
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op await
     async fn domaintypes_op_reports_a_shape_with_an_unresolved_reference() {

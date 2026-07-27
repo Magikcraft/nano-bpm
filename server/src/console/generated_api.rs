@@ -1231,8 +1231,13 @@ impl apis::data::Data for ServerImpl {
     ) -> Result<apis::data::PreviewDomainTypesResponse, ()> {
         use apis::data::PreviewDomainTypesResponse as R;
         let shapes = serde_json::to_value(&body.shapes).unwrap_or(serde_json::Value::Null);
-        let meta = serde_json::to_value(body.meta.as_deref().unwrap_or(&[]))
-            .unwrap_or(serde_json::Value::Null);
+        // Preserve "meta omitted" as `None` (vs an explicit empty `meta: []`): an
+        // omitted field lets `run_data_op` fall back to the saved-model `nano:meta`
+        // scan, while `meta: []` explicitly previews an emptied in-editor list.
+        let meta = body
+            .meta
+            .as_ref()
+            .map(|m| serde_json::to_value(m).unwrap_or(serde_json::Value::Null));
         data_ok_or!(
             super::project_data_preview_domaintypes(
                 &path_params.name,
