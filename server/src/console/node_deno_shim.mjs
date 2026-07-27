@@ -105,6 +105,12 @@ if (globalThis.Deno === undefined) {
     }
     const port = options.port ?? 8000;
     const hostname = options.hostname ?? "0.0.0.0";
+    // Real `Deno.serve` rejects a missing/invalid handler synchronously with a
+    // TypeError; match that so misuse surfaces at call time, not on the first
+    // request (where an undefined handler would otherwise 500 late).
+    if (typeof handler !== "function") {
+      throw new TypeError("Deno.serve requires a handler function");
+    }
     const server = createServer(bridge(handler, hostname));
     // A Server-level `error` is a bind failure (e.g. AddrInUse); Deno.serve
     // treats that as fatal. Surface it cleanly instead of crashing on an
@@ -159,7 +165,19 @@ if (globalThis.Deno === undefined) {
     readFile: async (path) => new Uint8Array(await fsReadFile(path)),
     writeFile: (path, data) => fsWriteFile(path, data),
     mkdir: (path, opts) => fsMkdir(path, opts ?? {}),
-    remove: (path, opts) => fsRm(path, { recursive: !!opts?.recursive, force: true }),
+    // Real `Deno.remove` throws `NotFound` on a missing path (no `force`), so
+    // map Node's ENOENT to it rather than silently succeeding — otherwise
+    // `Deno.errors.NotFound` would be unreachable and mask app bugs.
+    remove: async (path, opts) => {
+      try {
+        await fsRm(path, { recursive: !!opts?.recursive });
+      } catch (err) {
+        if (err && err.code === "ENOENT") {
+          throw new NotFound(`No such file or directory: remove '${path}'`);
+        }
+        throw err;
+      }
+    },
     readDir,
     stat: async (path) => {
       const s = await fsStat(path);

@@ -4125,6 +4125,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingest_stdout_line_filters_metrics_and_unwraps_status() {
+        let inner = ProjectInner::new();
+        // A metric line is swallowed entirely (no log entry).
+        inner
+            .ingest_stdout_line(format!("{METRIC_PREFIX}{{\"m\":1}}"))
+            .await;
+        // A status control line becomes a `sys` "state: message" entry.
+        inner
+            .ingest_stdout_line(format!(
+                "{STATUS_PREFIX}{{\"state\":\"deploying\",\"message\":\"onboarding.bpmn\"}}"
+            ))
+            .await;
+        // A status line with invalid JSON falls back to the raw remainder.
+        inner
+            .ingest_stdout_line(format!("{STATUS_PREFIX}not-json"))
+            .await;
+        // Anything else passes through verbatim as `out`.
+        inner.ingest_stdout_line("hello world".to_string()).await;
+
+        let ring = inner.log_ring.lock().await;
+        let seen: Vec<(String, String)> = ring
+            .iter()
+            .map(|l| (l.stream.clone(), l.text.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("sys".to_string(), "deploying: onboarding.bpmn".to_string()),
+                ("sys".to_string(), "not-json".to_string()),
+                ("out".to_string(), "hello world".to_string()),
+            ],
+            "metrics swallowed, status unwrapped to sys, rest passed through as out"
+        );
+    }
+
+    #[tokio::test]
     async fn discover_rejects_dotdot_traversal() {
         let sandbox = scratch_dir("dotdot").join("sandbox");
         std::fs::create_dir_all(&sandbox).unwrap();
