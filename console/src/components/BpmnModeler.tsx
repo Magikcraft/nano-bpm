@@ -28,6 +28,7 @@ import {
   envelopeContext,
   readEnvelope,
   writeEnvelope,
+  collectEnvelopeTypeRefs,
   type EnvelopeField,
 } from "../lib/dataEnvelope";
 import {
@@ -498,6 +499,26 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
                 ),
               ]
             : [];
+          // Types the *model* already references via an envelope but that are
+          // neither a declared manifest type nor a composed shape — e.g. a
+          // hand-authored or drifted `.bpmn`. The model is the authoritative
+          // carrier of the data contract (ADR 0033 §6 / ADR 0040), so surface
+          // these as selectable options; otherwise a set envelope renders blank
+          // (its id is absent from the authored registry) and looks unset. Always
+          // include the currently-set value so the picker reflects the model.
+          const shapeKnown = new Set([...known, ...shapeIds]);
+          const undeclaredIds = modeler
+            ? collectEnvelopeTypeRefs(
+                modeler.get<ElementRegistry>("elementRegistry").getAll(),
+              ).filter((id) => !shapeKnown.has(id))
+            : [];
+          const current = getValue();
+          if (
+            current &&
+            !shapeKnown.has(current) &&
+            !undeclaredIds.includes(current)
+          )
+            undeclaredIds.push(current);
           return [
             // With a form default, clearing (this option) reverts to the inherited
             // type rather than "no type", so name it accordingly.
@@ -509,6 +530,12 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             },
             ...typeIds.map((id) => ({ value: id, label: id })),
             ...shapeIds.map((id) => ({ value: id, label: `${id} (shape)` })),
+            // Flagged so the maker sees the type is referenced but not declared
+            // in the registry (define its fields via "Create new envelope…").
+            ...undeclaredIds.map((id) => ({
+              value: id,
+              label: `${id} (undeclared)`,
+            })),
             ...(domainTypeBindingRef.current?.createType
               ? [{ value: CREATE_ENVELOPE, label: "➕ Create new envelope…" }]
               : []),
