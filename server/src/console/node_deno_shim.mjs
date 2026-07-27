@@ -73,7 +73,14 @@ if (globalThis.Deno === undefined) {
         };
         const webRes = await handler(new Request(url, init), { remoteAddr });
         nodeRes.statusCode = webRes.status;
-        webRes.headers.forEach((value, key) => nodeRes.setHeader(key, value));
+        // `Headers.forEach` comma-joins duplicates, which is invalid for
+        // `Set-Cookie` (Node wants an array). Set those separately from
+        // `getSetCookie()` and skip the joined value in the general copy.
+        webRes.headers.forEach((value, key) => {
+          if (key.toLowerCase() !== "set-cookie") nodeRes.setHeader(key, value);
+        });
+        const cookies = webRes.headers.getSetCookie?.() ?? [];
+        if (cookies.length) nodeRes.setHeader("set-cookie", cookies);
         if (webRes.body) {
           const reader = webRes.body.getReader();
           for (;;) {
