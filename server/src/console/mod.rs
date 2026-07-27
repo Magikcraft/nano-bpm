@@ -2798,11 +2798,14 @@ async fn fs_browse(
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
-        .to_ascii_lowercase();
-    let host_is_loopback = host.starts_with("localhost")
-        || host.starts_with("127.0.0.1")
-        || host.starts_with("[::1]")
-        || host.starts_with("::1");
+    let host_name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if host.matches(':').count() > 1 {
+        host.as_str()
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    let host_is_loopback = matches!(host_name, "localhost" | "127.0.0.1" | "::1");
 
     if !peer.0.ip().is_loopback() || !host_is_loopback {
         return (
