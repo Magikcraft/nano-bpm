@@ -186,8 +186,12 @@ if (globalThis.Deno === undefined) {
     },
     cwd: () => process.cwd(),
     exit: (code) => process.exit(code),
-    addSignalListener: (sig, handler) => process.on(sig, handler),
-    removeSignalListener: (sig, handler) => process.off(sig, handler),
+    addSignalListener: (sig, handler) => {
+      process.on(sig, handler);
+    },
+    removeSignalListener: (sig, handler) => {
+      process.off(sig, handler);
+    },
     readTextFile: (path) => fsReadFile(path, "utf8"),
     writeTextFile: (path, data) => fsWriteFile(path, data),
     readFile: async (path) => new Uint8Array(await fsReadFile(path)),
