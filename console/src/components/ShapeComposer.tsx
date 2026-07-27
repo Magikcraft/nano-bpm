@@ -13,6 +13,7 @@ import {
   OP_KINDS,
   removeOp,
   removeShape,
+  replaceOp,
   SCALAR_KEYWORDS,
   shapeEntities,
   toggleProjectField,
@@ -240,7 +241,7 @@ export default function ShapeComposer({
                     nominalEntities={nominalEntities}
                     entities={allEntities}
                     onChange={(patch) => setOps(updateOp(shape.ops, i, patch))}
-                    onRetype={(kind) => setOps(updateOp(shape.ops, i, changeOpKind(op, kind)))}
+                    onRetype={(kind) => setOps(replaceOp(shape.ops, i, changeOpKind(op, kind)))}
                     onToggleField={(f) => setOps(toggleProjectField(shape.ops, i, f))}
                     onMove={(dir) => setOps(moveOp(shape.ops, i, dir))}
                     onRemove={() => setOps(removeOp(shape.ops, i))}

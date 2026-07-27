@@ -88,6 +88,17 @@ export function addOp(ops: ShapeOp[], op: ShapeOp): ShapeOp[] {
   return [...ops, op];
 }
 
+/** Replace op `i` outright. Used when retyping: `changeOpKind` returns a complete
+ * fresh op, so a shallow merge (`updateOp`) would leave stale kind-incompatible
+ * fields behind (e.g. `fields`/`via` lingering on a `carry`), which then leak into
+ * the preview request body. */
+export function replaceOp(ops: ShapeOp[], i: number, op: ShapeOp): ShapeOp[] {
+  if (i < 0 || i >= ops.length) return ops;
+  const next = ops.slice();
+  next[i] = op;
+  return next;
+}
+
 export function removeOp(ops: ShapeOp[], i: number): ShapeOp[] {
   return ops.filter((_, k) => k !== i);
 }

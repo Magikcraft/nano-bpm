@@ -1348,18 +1348,28 @@ function EditorPane({
   }, [loadComposerEntities]);
 
   // Persist an edited shape set to the model (one undoable command) and mirror it
-  // into local state so the drawer reflects the edit immediately.
+  // into local state so the drawer reflects the edit immediately. The write fires
+  // `commandStack.changed`, so `composerWriteRef` marks it as self-inflicted for
+  // `onBpmnChange` to skip the resync (the controlled React state is already
+  // authoritative — a resync would `readShapes` and drop a mid-rename blank id).
+  const composerWriteRef = useRef(false);
   const onShapesChange = useCallback((next: ShapeDecl[]) => {
+    composerWriteRef.current = true;
     bpmnRef.current?.setShapes(next);
     setComposerShapes(next);
     setDirty(true);
   }, []);
 
-  // Re-read shapes from the model on any diagram change while the drawer is open,
-  // so undo/redo and XML-tab round-trips keep the composer in sync. Idempotent
-  // with `onShapesChange` (setShapes → commandStack.changed → this → re-read).
+  // Re-read shapes from the model on any *external* diagram change while the drawer
+  // is open, so undo/redo and XML-tab round-trips keep the composer in sync. A
+  // change from our own `setShapes` is skipped (controlled state already holds it),
+  // so clearing the Id input mid-rename can't momentarily drop the shape.
   const onBpmnChange = useCallback(() => {
     setDirty(true);
+    if (composerWriteRef.current) {
+      composerWriteRef.current = false;
+      return;
+    }
     if (shapesOpen) setComposerShapes(bpmnRef.current?.getShapes() ?? []);
   }, [shapesOpen]);
 

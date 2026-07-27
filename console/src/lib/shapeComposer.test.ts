@@ -12,6 +12,7 @@ import {
   newOp,
   removeOp,
   removeShape,
+  replaceOp,
   shapeEntities,
   toggleProjectField,
   uniqueShapeId,
@@ -153,4 +154,14 @@ test("shapeEntities exposes each shape's preview-resolved fields", () => {
     { id: "ApprovedOrder", kind: "shape", fields: [] },
     { id: "Pending", kind: "shape", fields: [] },
   ]);
+});
+
+test("replaceOp swaps an op outright, leaving no stale fields (retype)", () => {
+  const ops: ShapeOp[] = [{ op: "project", ref: "Order", fields: ["a"], via: "fk" }];
+  // Retyping project -> carry must not leave `fields`/`via` behind.
+  const next = replaceOp(ops, 0, changeOpKind(ops[0], "carry"));
+  assert.deepEqual(next, [{ op: "carry", ref: "Order" }]);
+  assert.notEqual(next, ops);
+  // Out-of-range is a no-op returning the same array.
+  assert.equal(replaceOp(ops, 5, newOp("carry")), ops);
 });
