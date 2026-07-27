@@ -1,4 +1,4 @@
-# ADR 0042 — Bojtos: a publishable in-browser BPMN demo framework
+# ADR 0043 — Bojtos: a publishable in-browser BPMN demo framework
 
 Status: **Proposed.**
 Date: 2026-07-28.
@@ -7,9 +7,10 @@ ADR 0005 (`0005-embedded-u-nano.md`, Bernd — the embedded engine this wraps), 
 test-run substrate (`console/src/components/TestRunPanel.tsx` — loads the wasm `TestEngine`, deploys
 BPMN, highlights active/incident elements on a bpmn-js viewer, renders the trace timeline;
 `console/src/lib/simTrace.ts` — the trace fold), the wasm-bindgen wrapper (`engine-wasm/` around the
-real `nanobpmn-engine-core`; `console/src/wasm/nanobpmn_engine.d.ts` — the `TestEngine` API contract),
-the build seam (`Makefile:170-176` `console-wasm` = `wasm-pack build --target web` synced into
-`console/src/wasm`), and the internal-package precedent (`spec-app/package.json` — `@nanobpm/*` consumed
+real `nanobpmn-engine-core`; `engine-wasm/pkg/nanobpmn_engine.d.ts` — the `TestEngine` API contract, this
+package's public surface after step 1), the build seam (`Makefile` `console-wasm` = `wasm-pack build
+--target web` output, historically synced into `console/src/wasm` and relocated to `engine-wasm/pkg` by
+this ADR's step 1), and the internal-package precedent (`spec-app/package.json` — `@nanobpm/*` consumed
 by the console via a `file:` dependency; ADR 0027).
 
 ## Context

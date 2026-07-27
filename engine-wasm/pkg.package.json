@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "The nanobpmn engine (engine-core) compiled to WebAssembly for in-browser BPMN execution: deploy a diagram, start instances, activate/complete jobs, and read live snapshots/traces. The substrate for the Bojtos demo framework (ADR 0042) and the console test-run panel.",
   "type": "module",
-  "license": "SEE LICENSE IN LICENSE",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/jwulf/nano-bpm",
