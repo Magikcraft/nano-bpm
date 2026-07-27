@@ -72,7 +72,7 @@ metered on the Prometheus `/metrics` surface via
 ## 2026-07-27 — Current-main baseline (console build): 50KB + negligible payload soaks
 
 Two clean 30-minute soaks on current `main` (`4ff70d4`; #311 throughput fix + #314
-seglog-deflake + #315 build-dep vendor all merged) to establish a fresh baseline on
+seglog recovery-test write-durability fix + #315 build-dep vendor all merged) to establish a fresh baseline on
 the **standard console build**. GCP 3-node RF3 Raft-ON cluster, 12 partitions,
 leader-durable/sync, `MAXPAR=112`, open-loop (`maxInflight=50000`, `rate=14000/prod`,
 1 loadgen/node, 128 prod conns). Journal wiped between arms (clean A/B).
