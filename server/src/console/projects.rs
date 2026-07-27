@@ -220,6 +220,7 @@ export function meta(key: string): string | undefined {
 /// SDK so `deno.json` import maps resolve under Node (no Deno build required).
 const NODE_LOADER_MJS: &str = include_str!("node_loader.mjs");
 const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
+const NODE_DENO_SHIM_MJS: &str = include_str!("node_deno_shim.mjs");
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
 const LOG_RING_CAP: usize = 1000;
@@ -1860,6 +1861,7 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     }
     std::fs::write(nano.join("node-loader.mjs"), NODE_LOADER_MJS)?;
     std::fs::write(nano.join("node-register.mjs"), NODE_REGISTER_MJS)?;
+    std::fs::write(nano.join("node-deno-shim.mjs"), NODE_DENO_SHIM_MJS)?;
     std::fs::write(nano.join("llm-worker.ts"), LLM_WORKER_TS)?;
     std::fs::write(nano.join("worker-sdk.ts"), WORKER_SDK_TS)?;
     // Seed the standard-tooling config (VS Code / `tsc`) and the Node-first
@@ -2179,6 +2181,10 @@ pub fn create_project(
     w(
         dir.join(GEN_DIR).join("node-register.mjs"),
         NODE_REGISTER_MJS,
+    )?;
+    w(
+        dir.join(GEN_DIR).join("node-deno-shim.mjs"),
+        NODE_DENO_SHIM_MJS,
     )?;
     w(dir.join(GEN_DIR).join("worker-sdk.ts"), WORKER_SDK_TS)?;
     w(dir.join(GEN_DIR).join("llm-worker.ts"), LLM_WORKER_TS)?;
@@ -2714,6 +2720,39 @@ impl ProjectInner {
             ring.push_back(line.clone());
         }
         let _ = self.logs_tx.send(line);
+    }
+
+    /// Interpret one line of a run's stdout. Swallows the per-worker `METRIC`
+    /// telemetry the embedded SDK emits every second, unwraps `STATUS` control
+    /// lines into human-readable `sys` log entries, and passes everything else
+    /// through as `out`. Shared by both run paths (`run` built-in and
+    /// `run_toolchain`) so their consoles surface identical output.
+    async fn ingest_stdout_line(&self, line: String) {
+        // `BufReader::lines()` strips `\n` but leaves a trailing `\r` on CRLF
+        // producers; drop it so STATUS JSON still parses and logs carry no stray
+        // carriage return.
+        let line = match line.strip_suffix('\r') {
+            Some(trimmed) => trimmed.to_string(),
+            None => line,
+        };
+        if line.starts_with(METRIC_PREFIX) {
+            return; // per-worker metric telemetry — not shown
+        }
+        if let Some(rest) = line.strip_prefix(STATUS_PREFIX) {
+            let msg = serde_json::from_str::<serde_json::Value>(rest)
+                .ok()
+                .map(|v| {
+                    format!(
+                        "{}: {}",
+                        v.get("state").and_then(|s| s.as_str()).unwrap_or("status"),
+                        v.get("message").and_then(|s| s.as_str()).unwrap_or("")
+                    )
+                })
+                .unwrap_or_else(|| rest.to_string());
+            self.push_log("sys", msg).await;
+        } else {
+            self.push_log("out", line).await;
+        }
     }
 
     async fn dto(&self) -> RunStateDto {
@@ -3284,23 +3323,7 @@ impl ProjectSupervisor {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    if line.starts_with(METRIC_PREFIX) {
-                        continue; // per-worker metric telemetry — not shown
-                    } else if let Some(rest) = line.strip_prefix(STATUS_PREFIX) {
-                        let msg = serde_json::from_str::<serde_json::Value>(rest)
-                            .ok()
-                            .map(|v| {
-                                format!(
-                                    "{}: {}",
-                                    v.get("state").and_then(|s| s.as_str()).unwrap_or("status"),
-                                    v.get("message").and_then(|s| s.as_str()).unwrap_or("")
-                                )
-                            })
-                            .unwrap_or_else(|| rest.to_string());
-                        inner.push_log("sys", msg).await;
-                    } else {
-                        inner.push_log("out", line).await;
-                    }
+                    inner.ingest_stdout_line(line).await;
                 }
             });
         }
@@ -3420,7 +3443,7 @@ impl ProjectSupervisor {
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stdout).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    inner.push_log("out", line).await;
+                    inner.ingest_stdout_line(line).await;
                 }
             });
         }
@@ -4152,6 +4175,49 @@ mod tests {
         touch(&root.join("models/x.bpmn"), "<x/>");
         let files = ProjectSupervisor::discover_deployables(&root, &[]).await;
         assert!(files.is_empty(), "autoDeploy: [] must skip discovery");
+    }
+
+    #[tokio::test]
+    async fn ingest_stdout_line_filters_metrics_and_unwraps_status() {
+        let inner = ProjectInner::new();
+        // A metric line is swallowed entirely (no log entry).
+        inner
+            .ingest_stdout_line(format!("{METRIC_PREFIX}{{\"m\":1}}"))
+            .await;
+        // A status control line becomes a `sys` "state: message" entry.
+        inner
+            .ingest_stdout_line(format!(
+                "{STATUS_PREFIX}{{\"state\":\"deploying\",\"message\":\"onboarding.bpmn\"}}"
+            ))
+            .await;
+        // A status line with invalid JSON falls back to the raw remainder.
+        inner
+            .ingest_stdout_line(format!("{STATUS_PREFIX}not-json"))
+            .await;
+        // A CRLF-terminated status line still parses (trailing \r stripped).
+        inner
+            .ingest_stdout_line(format!(
+                "{STATUS_PREFIX}{{\"state\":\"ready\",\"message\":\"up\"}}\r"
+            ))
+            .await;
+        // Anything else passes through verbatim as `out`.
+        inner.ingest_stdout_line("hello world".to_string()).await;
+
+        let ring = inner.log_ring.lock().await;
+        let seen: Vec<(String, String)> = ring
+            .iter()
+            .map(|l| (l.stream.clone(), l.text.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("sys".to_string(), "deploying: onboarding.bpmn".to_string()),
+                ("sys".to_string(), "not-json".to_string()),
+                ("sys".to_string(), "ready: up".to_string()),
+                ("out".to_string(), "hello world".to_string()),
+            ],
+            "metrics swallowed, status unwrapped to sys (incl. CRLF), rest passed through as out"
+        );
     }
 
     #[tokio::test]
