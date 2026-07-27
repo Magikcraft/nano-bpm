@@ -429,9 +429,12 @@ class SqliteDataSource implements DataSource {
   }
 
   schema(): Promise<TableMeta[]> {
+    // Exclude SQLite internals (`sqlite_%`) and Nano's own bookkeeping tables
+    // (`_nano_%`, e.g. the `_nano_migrations` ledger): neither is a user/domain
+    // table, so they must never surface in the domain model, DB Manager, or forms.
     const tables = this.#db
       .prepare(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '\\_nano\\_%' ESCAPE '\\' ORDER BY name",
       )
       .all() as Array<{ name: string }>;
     const out: TableMeta[] = [];
