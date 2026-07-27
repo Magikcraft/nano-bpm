@@ -396,12 +396,18 @@ pub fn project_dir(name: &str) -> Option<PathBuf> {
 
 /// Register a project reference (ADR 0041, `path` source): point `name` at an
 /// external directory, read live, without copying it. Fails closed when the name
-/// is unsafe, a real workspace project already owns the name, the path does not
-/// resolve to a directory, or that directory is not a Nano app/project (has
-/// neither `nano.app.json` nor `nanobpm.project.json`).
+/// is unsafe, the path is not absolute, a real workspace project already owns the
+/// name, the path does not resolve to a directory, or that directory is not a
+/// Nano app/project (has neither `nano.app.json` nor `nanobpm.project.json`).
 pub fn import_project_ref(name: &str, path: &str) -> Result<ProjectRef, String> {
     if !workspace::is_safe_name(name) {
         return Err(format!("invalid project name \"{name}\""));
+    }
+    // The API contract documents `path` as an absolute host path. Reject a
+    // relative path up front so an import never depends on the server's CWD
+    // (canonicalize would otherwise resolve it against the working directory).
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(format!("path \"{path}\" must be an absolute path"));
     }
     let root = ensure_projects_root().map_err(|e| format!("projects root: {e}"))?;
     if root.join(name).is_dir() {
@@ -2333,6 +2339,12 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         if !workspace::is_safe_name(name) {
             continue;
         }
+        // A real workspace directory shadows a reference of the same name
+        // (matching `project_dir`), so don't emit a duplicate `path` tile for a
+        // ref that the resolver ignores.
+        if root.join(name).is_dir() {
+            continue;
+        }
         let Some(dir) = project_dir(name) else {
             continue;
         };
@@ -3853,10 +3865,30 @@ mod tests {
     fn import_project_ref_rejects_a_relative_path() {
         let _g = lock();
         let _root = temp_root();
-        // canonicalize resolves relative paths against the CWD, so a bare
-        // relative non-existent path fails to resolve rather than sneaking in.
+        // The API contract documents `path` as absolute; a relative path is
+        // rejected up front (before canonicalize, which would resolve it against
+        // the server CWD).
         let err = import_project_ref("rel", "some/relative/dir").unwrap_err();
-        assert!(err.contains("cannot resolve path"), "got: {err}");
+        assert!(err.contains("must be an absolute path"), "got: {err}");
+    }
+
+    #[test]
+    fn list_projects_does_not_duplicate_a_ref_shadowed_by_a_workspace_dir() {
+        let _g = lock();
+        let root = temp_root();
+        // A workspace dir and a same-named ref file coexist (e.g. the workspace
+        // project was created after the ref, or hand-placed state). project_dir
+        // prefers the workspace dir; the listing must not also emit a `path` tile.
+        std::fs::create_dir_all(root.join("dup")).unwrap();
+        std::fs::write(
+            projects_root().join("dup.project-ref.json"),
+            r#"{"source":"path","path":"/somewhere/else"}"#,
+        )
+        .unwrap();
+        let list = list_projects().unwrap();
+        let dups: Vec<_> = list.iter().filter(|p| p.name == "dup").collect();
+        assert_eq!(dups.len(), 1, "exactly one tile for a shadowed ref");
+        assert_eq!(dups[0].source, "workspace");
     }
 
     // --- discover_deployables --------------------------------------------
