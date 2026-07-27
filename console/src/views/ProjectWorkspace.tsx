@@ -2404,7 +2404,7 @@ function EnvelopeEditorModal({
   };
 
   return (
-    <Modal title="New envelope" onClose={onCancel}>
+    <Modal title="New envelope" onClose={busy ? () => {} : onCancel}>
       <div className="space-y-4">
         <label className="block">
           <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-fg-faint">
@@ -2472,7 +2472,7 @@ function EnvelopeEditorModal({
         </p>
         {error && <p className="text-sm text-danger">{error}</p>}
         <div className="flex justify-end gap-2">
-          <Button variant="secondary" onClick={onCancel}>
+          <Button variant="secondary" onClick={onCancel} disabled={busy}>
             Cancel
           </Button>
           <Button variant="primary" onClick={() => void save()} disabled={busy}>
