@@ -1,9 +1,9 @@
 # Test + clippy gate. Runs on every push to main and once when a PR is opened so
 # a red build is caught early. Follow-up pushes to an open PR do NOT re-run CI
-# (see the `on:` block) — instead CI is run once more on the PR head at
-# convergence (via workflow_dispatch / ready_for_review) to produce the required
-# check contexts before merge. Each crate is independent (no root workspace), so
-# it gets its own job with a scoped cache.
+# (see the `on:` block) — instead, at convergence a fresh `pull_request` run is
+# produced on the head (mark a draft PR ready, or close+reopen) to satisfy the
+# branch-protection required checks before merge. Each crate is independent (no
+# root workspace), so it gets its own job with a scoped cache.
 #
 # Scope: clippy (-D warnings) + cargo test per crate, plus a formatting gate.
 # Formatting uses a PINNED NIGHTLY rustfmt (see the `fmt` job and rustfmt.toml):
@@ -19,22 +19,29 @@ on:
   # early, before review cycles are spent), but NOT on every follow-up push
   # (`synchronize`). Review-convergence loops push a commit per Copilot comment;
   # re-running the full per-crate suite on each round is the dominant CI-minutes
-  # cost. Instead, at convergence run CI ONCE more on the PR head — via
-  # `workflow_dispatch` (`gh workflow run ci.yml --ref <branch>`) or by toggling
-  # the PR ready (`ready_for_review`) — to produce the required check contexts on
-  # the head SHA, then merge. `opened` runs even on draft PRs (no draft guard on
-  # the jobs), so the initial run always fires.
+  # cost. Recommended flow: open the PR as a DRAFT (fires `opened` → one early CI
+  # run), converge Copilot review (review pushes are `synchronize` → no CI), then
+  # mark it READY at convergence (`gh pr ready <n>`) — `ready_for_review` fires a
+  # fresh `pull_request` run on the head, and THAT is what GitHub branch
+  # protection counts to allow the merge. (A close+reopen `reopened` run works
+  # equally.) `opened` runs even on draft PRs (no draft guard on the jobs).
+  #
+  # IMPORTANT: `workflow_dispatch` runs do NOT satisfy branch-protection required
+  # status checks at merge time — GitHub only counts checks produced by the PR's
+  # own push/pull_request check suite. So `workflow_dispatch` (below) is only a
+  # manual smoke-test lever, NOT the merge finalizer; use `ready_for_review` /
+  # `reopened` to produce the head checks that actually unblock the merge.
   pull_request:
     types: [opened, reopened, ready_for_review]
-  # Why a head run is still needed at merge time: this repo merges via Mergify
-  # (Team plan can't use GitHub's native merge queue — zero `merge_group` runs in
-  # history). Mergify enforces the 7 branch-protection required checks *on the PR
-  # head* as an ENTRY condition before a PR can enter the queue, so a
-  # review-pushed head with no checks would deadlock. The convergence-time head
-  # run above satisfies that; then merge via the UI button or `@mergifyio queue`.
-  # `merge_group` fires only under GitHub's *native* merge queue (unused here); it
-  # is retained solely to keep this workflow correct if the repo ever upgrades to
-  # native — it is a no-op today.
+  # This repo merges via Mergify (Team plan can't use GitHub's native merge queue
+  # — zero `merge_group` runs in history). Mergify validates a batch on a throwaway
+  # `mergify/merge-queue/*` draft PR, but the final GitHub merge of THIS PR still
+  # requires the 7 branch-protection checks to be green on this PR's head via a
+  # pull_request run (see the finalizer note above) — otherwise GitHub reports
+  # "N of N required status checks are expected" and Mergify dequeues after
+  # retrying. `merge_group` fires only under GitHub's *native* merge queue (unused
+  # here); it is retained solely to keep this workflow correct if the repo ever
+  # upgrades to native — it is a no-op today.
   merge_group:
   workflow_dispatch:
 
