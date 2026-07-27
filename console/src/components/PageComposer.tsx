@@ -157,6 +157,22 @@ function Palette(): ReactElement {
 
 // ── settings panel (edits the selected node's props) ─────────────────────────
 
+/** The composer's table pickers offer entity ids qualified as `source.table`
+ * (see ProjectWorkspace's entity loader), but the persisted `dataGrid` binding —
+ * and the runtime route `/app/data/<source>/<table>` — needs them split into a
+ * bare `source` and a bare `table`. These two helpers keep the picker's display
+ * value (qualified) and the stored binding (split) in sync. */
+function qualifyTable(data?: { source?: string; table?: string }): string {
+  if (!data?.table) return "";
+  return data.source ? `${data.source}.${data.table}` : data.table;
+}
+
+function splitQualifiedTable(value: string): { source: string; table: string } {
+  const dot = value.indexOf(".");
+  if (dot <= 0) return { source: "app", table: value };
+  return { source: value.slice(0, dot), table: value.slice(dot + 1) };
+}
+
 function Settings({ entities, processes }: { entities: ComposerEntity[]; processes: string[] }): ReactElement {
   const { selectedId, name, props, actions } = useEditor((state, query) => {
     const id = Array.from(state.events.selected)[0];
@@ -229,8 +245,8 @@ function Settings({ entities, processes }: { entities: ComposerEntity[]; process
           <Row label="Table">
             <input
               list="pc-tables"
-              value={String((props.data as { table?: string })?.table ?? "")}
-              onChange={(e) => set("data", { kind: "datasource", source: "app", table: e.target.value })}
+              value={qualifyTable(props.data as { source?: string; table?: string })}
+              onChange={(e) => set("data", { kind: "datasource", ...splitQualifiedTable(e.target.value) })}
             />
             <datalist id="pc-tables">
               {tables.map((t) => <option key={t.id} value={t.id} />)}
@@ -240,7 +256,7 @@ function Settings({ entities, processes }: { entities: ComposerEntity[]; process
             label="Columns"
             rows={((props.columns as GridColumn[]) ?? []) as unknown as Record<string, string>[]}
             columns={[{ key: "field", label: "field" }, { key: "header", label: "header" }]}
-            suggestions={tableFields(String((props.data as { table?: string })?.table ?? ""))}
+            suggestions={tableFields(qualifyTable(props.data as { source?: string; table?: string }))}
             onChange={(rows) => set("columns", rows.map((r) => ({ field: r.field ?? "", header: r.header ?? "" })))}
           />
         </>

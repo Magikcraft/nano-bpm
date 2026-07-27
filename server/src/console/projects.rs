@@ -1601,10 +1601,10 @@ const URBAN_DENO_JSON: &str = r#"{
 }
 "#;
 
-// The Urban App loader entrypoint. It reads `nano.app.json` (the manifest is the
-// source of truth), deploys the declared models, and serves the App. The full
-// manifest-driven UI/trigger runtime lands in a later slice (ADR 0026); for now
-// this boots the engine resources and serves `public/` + a start endpoint.
+// The Urban App loader entrypoint. It reads the declared models from
+// `nano.app.json` (the source of truth), deploys them, boots the workers, and
+// serves the app's composed screen (`pages/home.page.json`) via the generic
+// `@nanobpm/app` runtime (ADR 0042) — no hand-written frontend or JSON API.
 const URBAN_MAIN_TS: &str = r#"// Urban App entrypoint. The `nano.app.json` manifest is the source of truth for
 // this application (models, datasources, triggers, surfaces). `deno compile
 // --include nano.app.json --include pages` bundles it into a single binary.

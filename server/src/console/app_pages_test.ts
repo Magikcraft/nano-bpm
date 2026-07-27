@@ -53,6 +53,12 @@ Deno.test("GET /app/data rejects an unknown table (no SQL injection surface)", a
   assertEquals(res.status, 404);
 });
 
+Deno.test("GET /app/data rejects a source other than the injected default", async () => {
+  const res = await createPagesHandler(ctx())(new Request("http://x/app/data/other/pull_requests"));
+  assertEquals(res.status, 404);
+  assertEquals((await res.json()).error, 'unknown datasource "other"');
+});
+
 Deno.test("POST /app/actions/start starts a process with the posted variables", async () => {
   let seen: unknown = null;
   const c = ctx({
@@ -73,6 +79,27 @@ Deno.test("POST /app/actions/start starts a process with the posted variables", 
   assertEquals(res.status, 200);
   assertEquals((await res.json()).processInstanceKey, 7);
   assertEquals(seen, { processDefinitionId: "convergence-loop", variables: { pr: "o/r#1" } });
+});
+
+Deno.test("POST /app/actions/start defaults a non-object `variables` to {}", async () => {
+  let seen: unknown = null;
+  const c = ctx({
+    nano: {
+      createProcessInstance: (i) => {
+        seen = i;
+        return Promise.resolve({ processInstanceKey: 9 });
+      },
+    },
+  });
+  const res = await createPagesHandler(c)(
+    new Request("http://x/app/actions/start/p", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ variables: ["not", "an", "object"] }),
+    }),
+  );
+  assertEquals(res.status, 200);
+  assertEquals(seen, { processDefinitionId: "p", variables: {} });
 });
 
 Deno.test("POST /app/actions/start surfaces an engine error as 502", async () => {

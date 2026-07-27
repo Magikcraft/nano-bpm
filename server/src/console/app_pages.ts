@@ -36,6 +36,8 @@ export interface PagesContext {
   homePage?: string;
   /** Max rows a `dataGrid` fetch returns. Default 200. */
   rowLimit?: number;
+  /** The name of the injected default datasource (the alias apps bind to). Default `app`. */
+  sourceName?: string;
   /** Read a page file; injectable for tests. Defaults to `Deno.readTextFile`. */
   readPage?: (path: string) => Promise<string>;
 }
@@ -55,6 +57,7 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
   const pagesDir = ctx.pagesDir ?? "pages";
   const homePage = ctx.homePage ?? "home";
   const rowLimit = ctx.rowLimit ?? 200;
+  const sourceName = ctx.sourceName ?? "app";
   const readPage = ctx.readPage ?? ((p: string) => Deno.readTextFile(p));
 
   return async function handle(req: Request): Promise<Response> {
@@ -88,7 +91,13 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
     // ── GET /app/data/<source>/<table> ────────────────────────────────────
     const dataMatch = pathname.match(/^\/app\/data\/([A-Za-z0-9_-]+)\/([A-Za-z0-9_]+)$/);
     if (req.method === "GET" && dataMatch) {
+      const source = dataMatch[1];
       const table = dataMatch[2];
+      // v1 exposes only the injected default datasource; a request naming any
+      // other source is rejected rather than silently served off the default.
+      if (source !== sourceName) {
+        return json({ error: `unknown datasource "${source}"` }, 404);
+      }
       if (!IDENT.test(table)) return json({ error: "invalid table name" }, 400);
       const tables = await ctx.db.schema();
       if (!tables.some((t) => t.name === table)) {
@@ -106,7 +115,12 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
       try {
         const body = await req.json();
         if (body && typeof body === "object") {
-          variables = (body as { variables?: Record<string, unknown> }).variables ?? {};
+          const v = (body as { variables?: unknown }).variables;
+          // Only a plain object is a valid variable map — reject arrays/scalars/null
+          // so a malformed body can't reach the engine as bad `variables`.
+          if (v && typeof v === "object" && !Array.isArray(v)) {
+            variables = v as Record<string, unknown>;
+          }
         }
       } catch {
         return json({ error: "body must be JSON" }, 400);
