@@ -281,6 +281,47 @@ async function listMigrationFiles(dir: string): Promise<string[]> {
   return names;
 }
 
+/// Apply a source's not-yet-applied `*.sql` migrations, in filename order, each
+/// in its own transaction, recording every applied file in the migrations
+/// table. Returns the names applied (empty when already up to date). Idempotent.
+///
+/// Shared by the `migrate` op and the `domaintypes` regen: the latter introspects
+/// the *live* schema (`db.schema()`), so on a fresh DB a regen that runs before
+/// `migrate` would introspect zero tables and emit an empty `Domain` (only
+/// `raw`+`close`). Ensuring the schema is migrated first keeps codegen and the DB
+/// in step.
+async function applyPendingMigrations(source: string | undefined): Promise<string[]> {
+  const dir = await migrationDir(source ?? "");
+  const files = await listMigrationFiles(dir);
+  const db = await openDataSource(source);
+  try {
+    await db.exec(
+      `CREATE TABLE IF NOT EXISTS ${MIGRATIONS_TABLE} (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`,
+    );
+    const done = new Set(
+      (await db.query(`SELECT name FROM ${MIGRATIONS_TABLE}`)).map((r) =>
+        String(r.name)
+      ),
+    );
+    const applied: string[] = [];
+    for (const name of files) {
+      if (done.has(name)) continue;
+      const sql = await RT.readTextFile(`${dir}/${name}`);
+      await db.tx(async (t) => {
+        for (const stmt of splitStatements(sql)) await t.exec(stmt);
+        await t.exec(
+          `INSERT INTO ${MIGRATIONS_TABLE} (name, applied_at) VALUES (?, ?)`,
+          [name, new Date().toISOString()],
+        );
+      });
+      applied.push(name);
+    }
+    return applied;
+  } finally {
+    db.close();
+  }
+}
+
 async function run(req: Request): Promise<unknown> {
   switch (req.op) {
     case "sources": {
@@ -344,30 +385,7 @@ async function run(req: Request): Promise<unknown> {
       };
     }
     case "migrate": {
-      const dir = await migrationDir(req.source ?? "");
-      const files = await listMigrationFiles(dir);
-      const db = await openDataSource(req.source);
-      await db.exec(
-        `CREATE TABLE IF NOT EXISTS ${MIGRATIONS_TABLE} (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)`,
-      );
-      const done = new Set(
-        (await db.query(`SELECT name FROM ${MIGRATIONS_TABLE}`)).map((r) =>
-          String(r.name)
-        ),
-      );
-      const applied: string[] = [];
-      for (const name of files) {
-        if (done.has(name)) continue;
-        const sql = await RT.readTextFile(`${dir}/${name}`);
-        await db.tx(async (t) => {
-          for (const stmt of splitStatements(sql)) await t.exec(stmt);
-          await t.exec(
-            `INSERT INTO ${MIGRATIONS_TABLE} (name, applied_at) VALUES (?, ?)`,
-            [name, new Date().toISOString()],
-          );
-        });
-        applied.push(name);
-      }
+      const applied = await applyPendingMigrations(req.source);
       return { applied, pending: 0 };
     }
     case "domaintypes": {
@@ -379,6 +397,19 @@ async function run(req: Request): Promise<unknown> {
       // `nano-generated/domain-rows.d.ts` next to the SDK so workers type against the live
       // DBs. cwd is the project root, so the relative path lands in the project.
       const { default: def, sources } = await listSources();
+      // Ensure every source's schema is migrated *before* introspecting it — the
+      // domain model is derived from the live `db.schema()`, so a regen that
+      // races ahead of `migrate` on a fresh DB would emit an empty `Domain`.
+      // Gated on a real (persisting) regen: the `write:false` composer preview is
+      // latency-sensitive and must stay read-only (no DB side-effects per
+      // keystroke).
+      const migrated: Record<string, string[]> = {};
+      if (req.write !== false) {
+        for (const s of sources) {
+          const applied = await applyPendingMigrations(s.name);
+          if (applied.length) migrated[s.name] = applied;
+        }
+      }
       const schemas: SourceSchema[] = [];
       for (const s of sources) {
         const db = await openDataSource(s.name);
@@ -489,6 +520,7 @@ async function run(req: Request): Promise<unknown> {
         meta: metaAccessor,
         domainModelPath,
         domainModel: domainModelJson,
+        migrated,
         shapeDiagnostics: shapeResolution.diagnostics,
       };
     }
