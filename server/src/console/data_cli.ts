@@ -25,17 +25,22 @@ import { listSources, manifestTypes, manifestWorkers, openDataSource, type Worke
 import {
   DOMAIN_BINDINGS,
   DOMAIN_DTS,
+  DOMAIN_MODEL_JSON,
   type DomainTypeRegistry,
   emitDomainBindings,
   emitDomainModel,
+  emitDomainModelJson,
   emitMessageBindings,
   emitMessageBindingsRuntime,
+  emitMeta,
   emitWorkerBindings,
   emitWorkerBindingsRuntime,
   GEN_DIR,
   MESSAGE_BINDINGS_DTS,
   MESSAGE_BINDINGS_TS,
   type MessageBindingDecl,
+  META_TS,
+  type MetaDecl,
   resolveShapes,
   type ShapeDecl,
   type SourceSchema,
@@ -76,6 +81,14 @@ interface Request {
    * every consumer types against. Absent → no shapes are resolved.
    */
   derivedShapes?: ShapeDecl[];
+  /**
+   * `domaintypes`: the model-derived model-level metadata (`nano:meta` key/value
+   * siblings of `nano:shapes`), scanned from the process models by the server (ADR
+   * 0040 §5). Folded into the typed `meta.ts` accessor (`@nanobpm/meta`) and the
+   * structured fuse (`domain.json`), tagged with `model:<processId>` provenance.
+   * Absent → no metadata is derived.
+   */
+  derivedMeta?: MetaDecl[];
 }
 
 /**
@@ -383,12 +396,35 @@ async function run(req: Request): Promise<unknown> {
       // it with no extra codegen path. Broken shapes are omitted; their diagnostics are
       // returned so the panel can surface them like the `workers[]` drift warning.
       const shapeResolution = resolveShapes(req.derivedShapes ?? [], types, schemas);
-      for (const [id, def] of Object.entries(shapeResolution.types)) types[id] = def;
+      // Snapshot the manifest `types` *before* folding the resolved shapes, so
+      // `domain.json` can tag each entity with its true provenance (manifest vs
+      // model) — once folded they are indistinguishable in `types`.
+      const manifestTypesSnapshot: DomainTypeRegistry = { ...types };
+      const shapeEntities: { decl: ShapeDecl; def: DomainTypeDef }[] = [];
+      const shapeDeclById = new Map((req.derivedShapes ?? []).map((s) => [s.id, s]));
+      for (const [id, def] of Object.entries(shapeResolution.types)) {
+        types[id] = def;
+        shapeEntities.push({ decl: shapeDeclById.get(id) ?? { id, ops: [] }, def });
+      }
       const text = emitDomainModel(schemas, def, types);
       // The typed data-object accessor (`db.orders.insert(...)`, ADR 0029 §6) is
       // generated alongside the `.d.ts` spine so workers get both the row types
       // and the runtime gateway from one op.
       const bindings = emitDomainBindings(schemas, def);
+      // The model-level metadata accessor (`@nanobpm/meta`, ADR 0040 §5): the
+      // `nano:meta` key/values the models declare, folded into a typed `meta.ts`.
+      const derivedMeta = req.derivedMeta ?? [];
+      const metaAccessor = emitMeta(derivedMeta);
+      // The structured Fused Domain Model (`domain.json`, ADR 0040 §1): a fast-read
+      // cache of every fused entity + metadata + diagnostics for the IDE/codegen.
+      const domainModelJson = emitDomainModelJson({
+        sources: schemas,
+        default: def,
+        manifestTypes: manifestTypesSnapshot,
+        shapes: shapeEntities,
+        meta: derivedMeta,
+        diagnostics: shapeResolution.diagnostics,
+      });
       // The worker-IO map (ADR 0033 §3): `taskType → {in,out}`. The model is the
       // source of truth for the envelope, so when the server injected the
       // model-derived map (`derivedWorkers`) it is overlaid on the manifest
@@ -413,6 +449,8 @@ async function run(req: Request): Promise<unknown> {
       let bindingsPath: string | null = null;
       let workerBindingsPath: string | null = null;
       let messageBindingsPath: string | null = null;
+      let metaPath: string | null = null;
+      let domainModelPath: string | null = null;
       if (req.write !== false) {
         await RT.mkdir(GEN_DIR);
         path = `${GEN_DIR}/${DOMAIN_DTS}`;
@@ -425,6 +463,10 @@ async function run(req: Request): Promise<unknown> {
         messageBindingsPath = `${GEN_DIR}/${MESSAGE_BINDINGS_DTS}`;
         await RT.writeTextFile(messageBindingsPath, messageBindings);
         await RT.writeTextFile(`${GEN_DIR}/${MESSAGE_BINDINGS_TS}`, messageRuntime);
+        metaPath = `${GEN_DIR}/${META_TS}`;
+        await RT.writeTextFile(metaPath, metaAccessor);
+        domainModelPath = `${GEN_DIR}/${DOMAIN_MODEL_JSON}`;
+        await RT.writeTextFile(domainModelPath, domainModelJson);
       }
       const tables = schemas.reduce((n, s) => n + s.tables.length, 0);
       return {
@@ -437,6 +479,10 @@ async function run(req: Request): Promise<unknown> {
         workerBindings,
         messageBindingsPath,
         messageBindings,
+        metaPath,
+        meta: metaAccessor,
+        domainModelPath,
+        domainModel: domainModelJson,
         shapeDiagnostics: shapeResolution.diagnostics,
       };
     }

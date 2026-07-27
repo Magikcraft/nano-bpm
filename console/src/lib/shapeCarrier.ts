@@ -61,6 +61,15 @@ export interface ShapeDecl {
 export const SHAPES_TYPE = "nano:Shapes";
 /** The moddle `$type` for one `nano:shape`. */
 export const SHAPE_TYPE = "nano:Shape";
+/** The moddle `$type` for one model-level `nano:meta` entry (ADR 0040 §5). */
+export const META_TYPE = "nano:Meta";
+
+/** One model-level metadata entry carried as a `nano:meta` sibling of the
+ * `nano:shapes` container on a process's extension elements (ADR 0040 §5). */
+export interface MetaEntry {
+  key: string;
+  value: string;
+}
 
 const OP_TYPE: Record<ShapeOp["op"], string> = {
   carry: "nano:Carry",
@@ -232,6 +241,72 @@ export function writeShapes(
     else next.splice(idx, 1);
   } else {
     next = container ? [...existing, container] : existing.slice();
+  }
+  if (ext) {
+    for (const v of next) v.$parent = ext;
+    modeling.updateModdleProperties(element, ext, { values: next });
+    return;
+  }
+  if (next.length === 0) return;
+  const newExt = moddle.create("bpmn:ExtensionElements", { values: next });
+  for (const v of next) v.$parent = newExt;
+  newExt.$parent = processBo;
+  modeling.updateModdleProperties(element, processBo, { extensionElements: newExt });
+}
+
+/** Read the model-level `nano:meta` entries carried on a process (empty when
+ * none). Entries missing a `key` are skipped; the last write wins per key on the
+ * server, so duplicates are preserved here in author order. */
+export function readMeta(processBo: ShapeModdleElement | undefined): MetaEntry[] {
+  const values = processBo?.extensionElements?.values ?? [];
+  const out: MetaEntry[] = [];
+  for (const v of values) {
+    if (localType(v.$type) !== "Meta") continue;
+    const key = v.key?.trim();
+    if (!key) continue;
+    out.push({ key, value: (v.value ?? "").trim() });
+  }
+  return out;
+}
+
+/** Build a `nano:Meta` moddle element from a `MetaEntry`. */
+function buildMeta(moddle: ShapeModdle, entry: MetaEntry, parent: ShapeModdleElement): ShapeModdleElement {
+  const el = moddle.create(META_TYPE, { key: entry.key, value: entry.value });
+  el.$parent = parent;
+  return el;
+}
+
+/**
+ * Replace the process's model-level metadata with `meta`, as a single undoable
+ * command. Swaps the `nano:meta` siblings *in place* (preserving the position and
+ * the `nano:Shapes` container). Entries with a blank key are dropped. An empty
+ * `meta` list removes every `nano:meta`, and if that empties the extension
+ * elements entirely they are left as an empty container (bpmn-js prunes on save).
+ */
+export function writeMeta(
+  moddle: ShapeModdle,
+  modeling: ShapeModeling,
+  element: unknown,
+  processBo: ShapeModdleElement,
+  meta: MetaEntry[],
+): void {
+  const clean = meta.filter((m) => m.key.trim().length > 0).map((m) => ({ key: m.key.trim(), value: m.value }));
+  const ext = processBo.extensionElements;
+  const existing = ext?.values ?? [];
+  const nonMeta = existing.filter((v) => localType(v.$type) !== "Meta");
+  // Preserve position: splice the fresh `nano:meta` run in where the first one was
+  // (or append after the existing siblings when the process had none).
+  const at = existing.findIndex((v) => localType(v.$type) === "Meta");
+  const built = clean.map((m) => buildMeta(moddle, m, ext ?? processBo));
+  let next: ShapeModdleElement[];
+  if (at >= 0) {
+    // Rebuild by keeping non-meta order and inserting the meta run at `at`, counted
+    // against the non-meta list so the container's relative order is stable.
+    const before = existing.slice(0, at).filter((v) => localType(v.$type) !== "Meta");
+    const after = existing.slice(at).filter((v) => localType(v.$type) !== "Meta");
+    next = [...before, ...built, ...after];
+  } else {
+    next = [...nonMeta, ...built];
   }
   if (ext) {
     for (const v of next) v.$parent = ext;

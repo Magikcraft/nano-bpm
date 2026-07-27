@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { ShapeDiagnostic } from "../gen";
-import type { ShapeDecl, ShapeOp } from "../lib/shapeCarrier";
+import type { MetaEntry, ShapeDecl, ShapeOp } from "../lib/shapeCarrier";
 import {
   addOp,
   addShape,
@@ -34,13 +34,18 @@ export interface ShapePreview {
 export interface ShapeComposerProps {
   /// The process's composed shapes, read from the model (undoable source of truth).
   shapes: ShapeDecl[];
+  /// The process's model-level metadata (`nano:meta`), read from the model (ADR
+  /// 0040 §5) — the undoable source of truth for the metadata editor.
+  meta: MetaEntry[];
   /// The fuse leaf entities available as `ref`/`type` targets (tables + manifest
   /// types + the *other* composed shapes), for the pickers.
   entities: ComposerEntity[];
   /// Persist an edited shape set back to the model (writeShapes — one undoable command).
   onShapesChange: (shapes: ShapeDecl[]) => void;
-  /// Resolve `shapes` server-side for the live field preview + diagnostics.
-  preview: (shapes: ShapeDecl[]) => Promise<ShapePreview>;
+  /// Persist edited model-level metadata back to the model (writeMeta — one undoable command).
+  onMetaChange: (meta: MetaEntry[]) => void;
+  /// Resolve `shapes` + `meta` server-side for the live field preview + diagnostics.
+  preview: (shapes: ShapeDecl[], meta: MetaEntry[]) => Promise<ShapePreview>;
   /// Dismiss the composer.
   onClose: () => void;
 }
@@ -70,8 +75,10 @@ const OP_HINT: Record<OpKind, string> = {
  */
 export default function ShapeComposer({
   shapes,
+  meta,
   entities,
   onShapesChange,
+  onMetaChange,
   preview,
   onClose,
 }: ShapeComposerProps) {
@@ -87,6 +94,7 @@ export default function ShapeComposer({
   // stale response (superseded by a newer edit) is dropped via the request id.
   const reqId = useRef(0);
   const shapesKey = JSON.stringify(shapes);
+  const metaKey = JSON.stringify(meta);
   useEffect(() => {
     if (shapes.length === 0) {
       // Advance the request id so any preview already in flight fails its
@@ -100,7 +108,7 @@ export default function ShapeComposer({
     const id = ++reqId.current;
     setPreviewing(true);
     const t = setTimeout(() => {
-      preview(shapes)
+      preview(shapes, meta)
         .then((r) => {
           if (id === reqId.current) setResult(r);
         })
@@ -113,7 +121,7 @@ export default function ShapeComposer({
     }, 350);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [shapesKey]);
+  }, [shapesKey, metaKey]);
 
   // Entities offerable as a `ref` (any entity but the shape itself, to avoid a
   // trivially circular reference) and as a nominal `extend` type (manifest types +
@@ -311,6 +319,77 @@ export default function ShapeComposer({
           )}
         </div>
       </div>
+
+      <MetaEditor meta={meta} onChange={onMetaChange} />
+    </div>
+  );
+}
+
+/**
+ * The model-level metadata editor (ADR 0040 §5): a flat key/value list carried on
+ * the process as `nano:meta` siblings of the shapes container, folded into the
+ * fuse (`domain.json`) and the typed `@nanobpm/meta` accessor. Each edit is one
+ * undoable modeling command; last write wins per key on the server.
+ */
+function MetaEditor({
+  meta,
+  onChange,
+}: {
+  meta: MetaEntry[];
+  onChange: (meta: MetaEntry[]) => void;
+}) {
+  const setAt = (i: number, patch: Partial<MetaEntry>) =>
+    onChange(meta.map((m, j) => (j === i ? { ...m, ...patch } : m)));
+  const dupKey = (key: string, self: number) =>
+    key.trim().length > 0 && meta.some((m, j) => j !== self && m.key.trim() === key.trim());
+
+  return (
+    <div className="max-h-56 shrink-0 overflow-y-auto border-t border-edge px-3 py-2">
+      <div className="mb-1 flex items-center justify-between">
+        <div>
+          <h4 className="text-xs font-semibold">Model metadata</h4>
+          <p className="text-[11px] text-fg-faint">
+            Key/value metadata carried on the process (ADR 0040 §5), typed via{" "}
+            <span className="font-mono">@nanobpm/meta</span>.
+          </p>
+        </div>
+        <button
+          onClick={() => onChange([...meta, { key: "", value: "" }])}
+          className="rounded border border-dashed border-edge-strong px-2 py-0.5 text-xs font-medium text-accent hover:bg-accent/10"
+        >
+          + Add entry
+        </button>
+      </div>
+      {meta.length === 0 ? (
+        <p className="px-1 py-1 text-[11px] text-fg-faint">No metadata.</p>
+      ) : (
+        <div className="flex flex-col gap-1">
+          {meta.map((m, i) => (
+            <div key={i} className="flex items-center gap-1.5">
+              <input
+                className={`${INPUT_CLASS} w-40 ${dupKey(m.key, i) ? "border-danger" : ""}`}
+                value={m.key}
+                onChange={(e) => setAt(i, { key: e.target.value })}
+                placeholder="key"
+                title={dupKey(m.key, i) ? "Duplicate key — last write wins" : "Metadata key"}
+              />
+              <input
+                className={`${INPUT_CLASS} flex-1`}
+                value={m.value}
+                onChange={(e) => setAt(i, { value: e.target.value })}
+                placeholder="value"
+              />
+              <button
+                className={`${ICON_BTN} text-danger`}
+                onClick={() => onChange(meta.filter((_, j) => j !== i))}
+                title="Remove entry"
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

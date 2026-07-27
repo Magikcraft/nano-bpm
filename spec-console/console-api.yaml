@@ -2304,6 +2304,31 @@ components:
             (ADR 0040 §10). Always present (empty when every shape resolved);
             the preview endpoint surfaces these live for the in-editor shapes.
           items: { $ref: '#/components/schemas/ShapeDiagnostic' }
+        metaPath:
+          type: string
+          nullable: true
+          description: >
+            The generated typed model-metadata accessor written
+            (`nano-generated/meta.ts`, `@nanobpm/meta`, ADR 0040 §5), or null when
+            the op ran with `write:false` (e.g. the preview endpoint).
+        domainModelPath:
+          type: string
+          nullable: true
+          description: >
+            The structured Fused Domain Model cache written
+            (`nano-generated/domain.json`, ADR 0040 §1), or null under
+            `write:false`.
+    MetaDeclSpec:
+      type: object
+      required: [key, value]
+      description: >
+        One model-level metadata entry (`nano:meta`) the modeller is editing (ADR
+        0040 §5), tagged with its defining process for `model:<processId>`
+        provenance.
+      properties:
+        process: { type: string }
+        key: { type: string }
+        value: { type: string }
     ShapeOpSpec:
       type: object
       required: [op]
@@ -2347,6 +2372,13 @@ components:
             The composed shapes currently in the editor, resolved instead of the
             saved-model scan so the preview reflects unsaved edits.
           items: { $ref: '#/components/schemas/ShapeDeclSpec' }
+        meta:
+          type: array
+          description: >
+            The model-level metadata (`nano:meta`) currently in the editor,
+            previewed instead of the saved-model scan so the fuse/accessor reflect
+            unsaved edits (ADR 0040 §5).
+          items: { $ref: '#/components/schemas/MetaDeclSpec' }
     ShapeDiagnostic:
       type: object
       required: [shape, kind, severity, message]

@@ -68,14 +68,27 @@ pub struct MessageIo {
     pub output_type: Option<String>,
 }
 
+/// A model-level metadata entry (`nano:meta`), lifted from a `nano:meta` key/value
+/// sibling of the `nano:shapes` container on a `bpmn:process` (ADR 0040 §5).
+/// Serializes to `{ process?, key, value }` — the `MetaDecl` the reifier folds into
+/// the typed `meta.ts` accessor and the structured fuse (`domain.json`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MetaDecl {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process: Option<String>,
+    pub key: String,
+    pub value: String,
+}
+
 /// Everything one model scan lifts from a BPMN document: the service-task worker
-/// I/O map (slice 1), the message payload map (slice 2), and the composed motion
-/// shapes (§9/§10).
+/// I/O map (slice 1), the message payload map (slice 2), the composed motion
+/// shapes (§9/§10), and the model-level metadata (§5).
 #[derive(Default)]
 pub struct BpmnScan {
     pub workers: Vec<WorkerIo>,
     pub messages: Vec<MessageIo>,
     pub shapes: Vec<ShapeDecl>,
+    pub meta: Vec<MetaDecl>,
 }
 
 /// One composition operation of a `nano:shape`, in author (XML) order. Serializes
@@ -216,6 +229,10 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
     let mut process_id: Option<String> = None;
     let mut shapes: Vec<ShapeDecl> = Vec::new();
     let mut cur_shape: Option<(usize, ShapeDecl)> = None;
+    // Model-level metadata (ADR 0040 §5): `nano:meta` key/value elements that sit
+    // as siblings of the `nano:shapes` container under a process's extension
+    // elements (never inside a `nano:shape`), tagged with the enclosing process.
+    let mut meta: Vec<MetaDecl> = Vec::new();
 
     for tok in &tokens {
         match tok {
@@ -287,6 +304,17 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                         } else {
                             cur_shape = Some((depth, decl));
                         }
+                    } else if ln == "meta"
+                        && let Some(key) = shape_attr(attrs, "key")
+                    {
+                        // A model-level `nano:meta` sibling of `nano:shapes`. Only
+                        // recognised outside a shape carrier (an `extend` op is a
+                        // different vocabulary), keyed to the enclosing process.
+                        meta.push(MetaDecl {
+                            process: process_id.clone(),
+                            key,
+                            value: attr(attrs, "value").unwrap_or_default().to_string(),
+                        });
                     }
                 } else if let Some((_, decl)) = cur_shape.as_mut()
                     && let Some(op) = parse_shape_op(ln, attrs)
@@ -324,6 +352,7 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
         workers: workers.into_values().collect(),
         messages: messages.into_values().collect(),
         shapes,
+        meta,
     }
 }
 
@@ -452,6 +481,7 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
     let mut workers: BTreeMap<String, WorkerIo> = BTreeMap::new();
     let mut messages: BTreeMap<String, MessageIo> = BTreeMap::new();
     let mut shapes: Vec<ShapeDecl> = Vec::new();
+    let mut meta: Vec<MetaDecl> = Vec::new();
     let mut files: Vec<std::path::PathBuf> = entries
         .flatten()
         .map(|e| e.path())
@@ -490,11 +520,15 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
         // the combined set (ADR 0040 §10 second pass). Deterministic file order
         // (files are sorted) keeps the merged list stable.
         shapes.extend(scan.shapes);
+        // Model-level metadata is likewise model-scoped; gather it across every
+        // model, tagged with its process, in deterministic file order.
+        meta.extend(scan.meta);
     }
     BpmnScan {
         workers: workers.into_values().collect(),
         messages: messages.into_values().collect(),
         shapes,
+        meta,
     }
 }
 
@@ -981,5 +1015,57 @@ mod tests {
         assert_eq!(scan.workers[0].task_type, "charge");
         assert_eq!(scan.shapes.len(), 1);
         assert_eq!(scan.shapes[0].id, "S");
+    }
+
+    #[test]
+    fn scans_model_level_meta_siblings_tagged_with_the_process() {
+        // Two `nano:meta` siblings of the shapes container are lifted, in document
+        // order, each tagged with the enclosing process id (ADR 0040 §5).
+        let xml = format!(
+            r#"<?xml version="1.0"?>
+            <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                              xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
+              <bpmn:process id="orders" isExecutable="true">
+                <bpmn:extensionElements>
+                  <nano:shapes><nano:shape id="S"><nano:carry ref="Order" /></nano:shape></nano:shapes>
+                  <nano:meta key="classification" value="internal" />
+                  <nano:meta key="owner" value="ops" />
+                </bpmn:extensionElements>
+              </bpmn:process>
+            </bpmn:definitions>"#
+        );
+        let scan = scan_bpmn(&xml);
+        assert_eq!(
+            scan.meta,
+            vec![
+                MetaDecl {
+                    process: Some("orders".to_string()),
+                    key: "classification".to_string(),
+                    value: "internal".to_string(),
+                },
+                MetaDecl {
+                    process: Some("orders".to_string()),
+                    key: "owner".to_string(),
+                    value: "ops".to_string(),
+                },
+            ]
+        );
+        // The shape still resolves, and its `extend` op is not mistaken for meta.
+        assert_eq!(scan.shapes.len(), 1);
+    }
+
+    #[test]
+    fn an_extend_op_inside_a_shape_is_not_scanned_as_model_meta() {
+        // `nano:extend` shares no vocabulary with `nano:meta`; an extend inside a
+        // shape must never leak into the model-level meta list.
+        let xml = shape_doc(
+            r#"<nano:shape id="S">
+                 <nano:carry ref="Order" />
+                 <nano:extend name="approved" type="boolean" />
+               </nano:shape>"#,
+        );
+        let scan = scan_bpmn(&xml);
+        assert!(scan.meta.is_empty());
+        assert_eq!(scan.shapes.len(), 1);
     }
 }
