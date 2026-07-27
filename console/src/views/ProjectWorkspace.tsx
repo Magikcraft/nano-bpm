@@ -1592,14 +1592,27 @@ function EditorPane({
   // The write is one undoable model command (via `setShapes`) and marks the buffer
   // dirty — the new type and the envelope selection that follows it persist
   // together on the next Save, exactly like the composer. Existing shape ids are
-  // left untouched (a collision is rejected by the editor up front).
+  // left untouched: a collision is rejected by the editor up front and, defensively,
+  // re-checked here so a stale id set can't clobber an existing shape.
   const writeModelEnvelopeType = useCallback(
     async (
       id: string,
       fields: { name: string; type: string; optional?: boolean }[],
     ): Promise<void> => {
-      const existing = bpmnRef.current?.getShapes() ?? [];
-      if (existing.some((s) => s.id === id)) return;
+      // Fail fast rather than silently no-op: the modal closes and the envelope
+      // selection references this id the moment this resolves, so a swallowed
+      // write would leave the UI claiming a type the model never gained. The
+      // modal's onSave catches a throw, surfaces it, and keeps itself open.
+      const bpmn = bpmnRef.current;
+      if (!bpmn) {
+        throw new Error(
+          "The BPMN modeler isn't ready yet — reopen the diagram and try again.",
+        );
+      }
+      const existing = bpmn.getShapes();
+      if (existing.some((s) => s.id === id)) {
+        throw new Error(`Type "${id}" already exists in the model.`);
+      }
       const ops: ShapeOp[] = fields
         .filter((f) => f.name.trim())
         .map((f) => {
@@ -1613,7 +1626,17 @@ function EditorPane({
         });
       const next: ShapeDecl[] = [...existing, { id, ops }];
       composerWriteRef.current = true;
-      bpmnRef.current?.setShapes(next);
+      bpmn.setShapes(next);
+      // Verify the undoable write actually landed (setShapes swallows a
+      // not-ready/disposed modeler and a moddle failure). Re-clear the
+      // self-inflicted-change guard on the failure path so a later genuine
+      // external change isn't wrongly skipped.
+      if (!bpmn.getShapes().some((s) => s.id === id)) {
+        composerWriteRef.current = false;
+        throw new Error(
+          `Couldn't write type "${id}" to the model — the diagram may still be loading.`,
+        );
+      }
       if (shapesOpen) setComposerShapes(next);
       setDirty(true);
     },
