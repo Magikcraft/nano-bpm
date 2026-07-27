@@ -1,0 +1,34 @@
+{
+  "name": "@nanobpm/engine-wasm",
+  "version": "0.1.0",
+  "description": "The nanobpmn engine (engine-core) compiled to WebAssembly for in-browser BPMN execution: deploy a diagram, start instances, activate/complete jobs, and read live snapshots/traces. The substrate for the Bojtos demo framework (ADR 0042) and the console test-run panel.",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jwulf/nano-bpm",
+    "directory": "engine-wasm/pkg"
+  },
+  "main": "./nanobpmn_engine.js",
+  "module": "./nanobpmn_engine.js",
+  "types": "./nanobpmn_engine.d.ts",
+  "exports": {
+    ".": {
+      "types": "./nanobpmn_engine.d.ts",
+      "default": "./nanobpmn_engine.js"
+    },
+    "./nanobpmn_engine_bg.wasm": "./nanobpmn_engine_bg.wasm"
+  },
+  "files": [
+    "nanobpmn_engine.js",
+    "nanobpmn_engine.d.ts",
+    "nanobpmn_engine_bg.wasm",
+    "nanobpmn_engine_bg.wasm.d.ts"
+  ],
+  "sideEffects": [
+    "./snippets/*"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}

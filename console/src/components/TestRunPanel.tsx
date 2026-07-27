@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import NavigatedViewer from "bpmn-js/lib/NavigatedViewer";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
-import init, { TestEngine } from "../wasm/nanobpmn_engine";
+import init, { TestEngine } from "@nanobpm/engine-wasm";
 import { TraceTimeline } from "./TraceTimeline";
 import { foldSimTrace, stepFmt, type WasmEvent } from "../lib/simTrace";
 import { Badge, Button, ErrorText, SectionLabel } from "./ui";

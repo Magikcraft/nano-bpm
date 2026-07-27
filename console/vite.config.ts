@@ -44,6 +44,14 @@ export default defineConfig({
   resolve: {
     dedupe: ["preact"],
   },
+  // `@nanobpm/engine-wasm` (the wasm-pack `--target web` output) resolves its
+  // binary via `new URL('nanobpmn_engine_bg.wasm', import.meta.url)`. Excluding
+  // it from esbuild's dependency pre-bundling keeps that asset reference intact
+  // so Vite emits the `.wasm` as a hashed asset instead of esbuild rewriting the
+  // `import.meta.url` and losing the binary.
+  optimizeDeps: {
+    exclude: ["@nanobpm/engine-wasm"],
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

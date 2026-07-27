@@ -122,17 +122,17 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 6. wasm-pack (optional; committed console/src/wasm artifacts are the fallback)
+# 6. wasm-pack (optional; committed engine-wasm/pkg artifacts are the fallback)
 # ---------------------------------------------------------------------------
 if [ "$WANT_WASM_PACK" = 1 ]; then
   if have wasm-pack; then
     log "wasm-pack present: $(wasm-pack --version)"
   else
     log "installing wasm-pack (cargo install)"
-    cargo install wasm-pack >/dev/null 2>&1 || echo "warning: wasm-pack install failed; committed console/src/wasm artifacts will be used"
+    cargo install wasm-pack >/dev/null 2>&1 || echo "warning: wasm-pack install failed; committed engine-wasm/pkg artifacts will be used"
   fi
 else
-  log "skipping wasm-pack (--no-wasm-pack); committed console/src/wasm artifacts will be used"
+  log "skipping wasm-pack (--no-wasm-pack); committed engine-wasm/pkg artifacts will be used"
 fi
 
 # ---------------------------------------------------------------------------
