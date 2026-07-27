@@ -6,6 +6,17 @@
     "module": "ESNext",
     "skipLibCheck": true,
     "moduleResolution": "bundler",
+    // The `@nanobpm/*` file: deps (bojtos-kit / bojtos-react / engine-wasm) are
+    // symlinked into `node_modules` and re-export each other transitively
+    // (bojtos-react → bojtos-kit → engine-wasm). Only the console runs `npm ci`
+    // (CI installs nothing inside the package dirs), so the packages have no
+    // own `node_modules`; the shared deps live hoisted here in
+    // `console/node_modules/@nanobpm/*`. `preserveSymlinks` makes resolution
+    // follow the symlink path (rooted here) instead of each package's realpath,
+    // so a transitive `@nanobpm/*` import resolves against this hoisted tree.
+    // Without it, resolving `@nanobpm/bojtos-kit` from bojtos-react's realpath
+    // misses the hoisted copy and its types silently degrade to `any`.
+    "preserveSymlinks": true,
     "allowImportingTsExtensions": true,
     "isolatedModules": true,
     "moduleDetection": "force",

@@ -43,6 +43,15 @@ export default defineConfig({
   // in both dev (optimizeDeps) and the production build (Rollup).
   resolve: {
     dedupe: ["preact"],
+    // Match the console tsconfig's `preserveSymlinks`: the `@nanobpm/*` file:
+    // deps are symlinked into `node_modules` and re-export each other
+    // transitively (bojtos-react → bojtos-kit → engine-wasm), but only the
+    // console installs deps, so the shared packages are hoisted here in
+    // `console/node_modules/@nanobpm/*` with no per-package `node_modules`.
+    // Resolving via each package's realpath (Rollup's default) misses that
+    // hoisted tree — `Rollup failed to resolve import "@nanobpm/bojtos-kit"
+    // from bojtos-react` — so follow the symlink path rooted here instead.
+    preserveSymlinks: true,
   },
   // `@nanobpm/engine-wasm` (the wasm-pack `--target web` output) resolves its
   // binary via `new URL('nanobpmn_engine_bg.wasm', import.meta.url)`. Excluding
