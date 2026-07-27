@@ -40,15 +40,31 @@ export interface ShapeModdle {
 }
 
 export interface ShapeModeling {
-  updateModdleProperties(element: unknown, moddleElement: unknown, props: Record<string, unknown>): void;
+  updateModdleProperties(
+    element: unknown,
+    moddleElement: unknown,
+    props: Record<string, unknown>,
+  ): void;
 }
 
 /** One composition op of a shape, in author (XML) order (mirrors the reifier). */
 export type ShapeOp =
   | { op: "carry"; ref: string }
   | { op: "project"; ref: string; fields: string[]; via?: string }
-  | { op: "extend"; name: string; type: string; optional?: boolean; list?: boolean }
-  | { op: "reference"; name: string; ref: string; spread?: boolean; list?: boolean };
+  | {
+      op: "extend";
+      name: string;
+      type: string;
+      optional?: boolean;
+      list?: boolean;
+    }
+  | {
+      op: "reference";
+      name: string;
+      ref: string;
+      spread?: boolean;
+      list?: boolean;
+    };
 
 /** A composed motion-shape declaration carried on the process (mirrors the reifier). */
 export interface ShapeDecl {
@@ -87,7 +103,9 @@ function localType(t: string | undefined): string {
 export function shapesContainer(
   processBo: ShapeModdleElement | undefined,
 ): ShapeModdleElement | undefined {
-  return (processBo?.extensionElements?.values ?? []).find((v) => localType(v.$type) === "Shapes");
+  return (processBo?.extensionElements?.values ?? []).find(
+    (v) => localType(v.$type) === "Shapes",
+  );
 }
 
 /** Split a `nano:project fields="a, b"` attribute into trimmed, non-empty names. */
@@ -141,7 +159,9 @@ function readOp(el: ShapeModdleElement): ShapeOp | undefined {
 
 /** Read the composed shapes declared on a process (empty when none). Malformed
  * ops are dropped and a shape with no `id` is skipped, mirroring the Rust scan. */
-export function readShapes(processBo: ShapeModdleElement | undefined): ShapeDecl[] {
+export function readShapes(
+  processBo: ShapeModdleElement | undefined,
+): ShapeDecl[] {
   const container = shapesContainer(processBo);
   const out: ShapeDecl[] = [];
   for (const s of container?.shapes ?? []) {
@@ -162,14 +182,21 @@ export function readShapes(processBo: ShapeModdleElement | undefined): ShapeDecl
 
 /** Build a moddle op element for a `ShapeOp`, attaching `$parent` for a clean
  * serialisation. Undefined/false flags are omitted so the `.bpmn` stays minimal. */
-function buildOp(moddle: ShapeModdle, op: ShapeOp, parent: ShapeModdleElement): ShapeModdleElement {
+function buildOp(
+  moddle: ShapeModdle,
+  op: ShapeOp,
+  parent: ShapeModdleElement,
+): ShapeModdleElement {
   let el: ShapeModdleElement;
   switch (op.op) {
     case "carry":
       el = moddle.create(OP_TYPE.carry, { ref: op.ref });
       break;
     case "project": {
-      const attrs: Record<string, unknown> = { ref: op.ref, fields: op.fields.join(", ") };
+      const attrs: Record<string, unknown> = {
+        ref: op.ref,
+        fields: op.fields.join(", "),
+      };
       if (op.via) attrs.via = op.via;
       el = moddle.create(OP_TYPE.project, attrs);
       break;
@@ -208,7 +235,10 @@ function buildShape(
 }
 
 /** Build a `nano:Shapes` container moddle element from a list of shapes. */
-export function buildShapesContainer(moddle: ShapeModdle, shapes: ShapeDecl[]): ShapeModdleElement {
+export function buildShapesContainer(
+  moddle: ShapeModdle,
+  shapes: ShapeDecl[],
+): ShapeModdleElement {
   const container = moddle.create(SHAPES_TYPE, {});
   container.shapes = shapes.map((s) => buildShape(moddle, s, container));
   return container;
@@ -230,7 +260,8 @@ export function writeShapes(
 ): void {
   const ext = processBo.extensionElements;
   const existing = ext?.values ?? [];
-  const container = shapes.length > 0 ? buildShapesContainer(moddle, shapes) : undefined;
+  const container =
+    shapes.length > 0 ? buildShapesContainer(moddle, shapes) : undefined;
   // Replace the `nano:Shapes` container *in place* (preserving the order of sibling
   // extension elements like `nano:meta`); only append when none existed.
   const idx = existing.findIndex((v) => localType(v.$type) === "Shapes");
@@ -251,13 +282,17 @@ export function writeShapes(
   const newExt = moddle.create("bpmn:ExtensionElements", { values: next });
   for (const v of next) v.$parent = newExt;
   newExt.$parent = processBo;
-  modeling.updateModdleProperties(element, processBo, { extensionElements: newExt });
+  modeling.updateModdleProperties(element, processBo, {
+    extensionElements: newExt,
+  });
 }
 
 /** Read the model-level `nano:meta` entries carried on a process (empty when
  * none). Entries missing a `key` are skipped; the last write wins per key on the
  * server, so duplicates are preserved here in author order. */
-export function readMeta(processBo: ShapeModdleElement | undefined): MetaEntry[] {
+export function readMeta(
+  processBo: ShapeModdleElement | undefined,
+): MetaEntry[] {
   const values = processBo?.extensionElements?.values ?? [];
   const out: MetaEntry[] = [];
   for (const v of values) {
@@ -270,7 +305,11 @@ export function readMeta(processBo: ShapeModdleElement | undefined): MetaEntry[]
 }
 
 /** Build a `nano:Meta` moddle element from a `MetaEntry`. */
-function buildMeta(moddle: ShapeModdle, entry: MetaEntry, parent: ShapeModdleElement): ShapeModdleElement {
+function buildMeta(
+  moddle: ShapeModdle,
+  entry: MetaEntry,
+  parent: ShapeModdleElement,
+): ShapeModdleElement {
   const el = moddle.create(META_TYPE, { key: entry.key, value: entry.value });
   el.$parent = parent;
   return el;
@@ -304,8 +343,12 @@ export function writeMeta(
   if (at >= 0) {
     // Rebuild by keeping non-meta order and inserting the meta run at `at`, counted
     // against the non-meta list so the container's relative order is stable.
-    const before = existing.slice(0, at).filter((v) => localType(v.$type) !== "Meta");
-    const after = existing.slice(at).filter((v) => localType(v.$type) !== "Meta");
+    const before = existing
+      .slice(0, at)
+      .filter((v) => localType(v.$type) !== "Meta");
+    const after = existing
+      .slice(at)
+      .filter((v) => localType(v.$type) !== "Meta");
     next = [...before, ...built, ...after];
   } else {
     next = [...nonMeta, ...built];
@@ -319,5 +362,7 @@ export function writeMeta(
   const newExt = moddle.create("bpmn:ExtensionElements", { values: next });
   for (const v of next) v.$parent = newExt;
   newExt.$parent = processBo;
-  modeling.updateModdleProperties(element, processBo, { extensionElements: newExt });
+  modeling.updateModdleProperties(element, processBo, {
+    extensionElements: newExt,
+  });
 }

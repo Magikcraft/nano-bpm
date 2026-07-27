@@ -1,10 +1,20 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { nodeConsoleUrl } from "../lib/api";
 import { metricsStore } from "../lib/metricsStore";
-import { Badge, Button, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
+import {
+  Badge,
+  Button,
+  Card,
+  ErrorText,
+  PageHeader,
+  SectionLabel,
+} from "../components/ui";
 
 export default function Metrics() {
-  const state = useSyncExternalStore(metricsStore.subscribe, metricsStore.getSnapshot);
+  const state = useSyncExternalStore(
+    metricsStore.subscribe,
+    metricsStore.getSnapshot,
+  );
   const { samples, latest: data, cluster, clusterRates, paused, error } = state;
   const isLoading = !data;
   const reset = () => metricsStore.clear();
@@ -19,7 +29,8 @@ export default function Metrics() {
         title="Metrics"
         subtitle={
           <>
-            Live throughput &amp; durability, sourced from the Prometheus surface
+            Live throughput &amp; durability, sourced from the Prometheus
+            surface
             {" · "}
             <a className="underline hover:text-fg" href="/metrics">
               /metrics
@@ -55,8 +66,14 @@ export default function Metrics() {
               value={fmt(latest?.jobsPerSec ?? 0, 0)}
               accent="sky"
             />
-            <Stat label="Active processes" value={data.activeInstances.toLocaleString()} />
-            <Stat label="Connected clients" value={data.connectionsActive.toLocaleString()} />
+            <Stat
+              label="Active processes"
+              value={data.activeInstances.toLocaleString()}
+            />
+            <Stat
+              label="Connected clients"
+              value={data.connectionsActive.toLocaleString()}
+            />
           </section>
 
           {/* Capacity ceiling — the clipping LEDs (ADR 0013) */}
@@ -118,7 +135,9 @@ export default function Metrics() {
               <Stat
                 label="Admissions shed"
                 value={data.admissionShedTotal.toLocaleString()}
-                sub={data.admissionShedTotal > 0 ? "load being shed" : undefined}
+                sub={
+                  data.admissionShedTotal > 0 ? "load being shed" : undefined
+                }
               />
             </div>
           </section>
@@ -151,12 +170,30 @@ export default function Metrics() {
           <section>
             <SectionLabel>Totals</SectionLabel>
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-              <Stat label="Instances created" value={data.createsTotal.toLocaleString()} sub={`rest ${data.createsRest.toLocaleString()} · stream ${data.createsStream.toLocaleString()}`} />
-              <Stat label="Jobs completed" value={data.completionsTotal.toLocaleString()} sub={`rest ${data.completionsRest.toLocaleString()} · stream ${data.completionsStream.toLocaleString()}`} />
-              <Stat label="Journal written" value={fmtBytes(data.bytesTotal)} sub={`${data.writesTotal.toLocaleString()} writes`} />
-              <Stat label="Group commits" value={data.commitsTotal.toLocaleString()} />
+              <Stat
+                label="Instances created"
+                value={data.createsTotal.toLocaleString()}
+                sub={`rest ${data.createsRest.toLocaleString()} · stream ${data.createsStream.toLocaleString()}`}
+              />
+              <Stat
+                label="Jobs completed"
+                value={data.completionsTotal.toLocaleString()}
+                sub={`rest ${data.completionsRest.toLocaleString()} · stream ${data.completionsStream.toLocaleString()}`}
+              />
+              <Stat
+                label="Journal written"
+                value={fmtBytes(data.bytesTotal)}
+                sub={`${data.writesTotal.toLocaleString()} writes`}
+              />
+              <Stat
+                label="Group commits"
+                value={data.commitsTotal.toLocaleString()}
+              />
               {data.residentBytes != null && (
-                <Stat label="Memory (resident)" value={fmtBytes(data.residentBytes)} />
+                <Stat
+                  label="Memory (resident)"
+                  value={fmtBytes(data.residentBytes)}
+                />
               )}
             </div>
           </section>
@@ -167,23 +204,44 @@ export default function Metrics() {
               <div className="mb-1 flex items-baseline justify-between">
                 <SectionLabel>Cluster</SectionLabel>
                 <span className="text-xs text-fg-faint">
-                  {cluster.aggregate.reachableNodes}/{cluster.aggregate.totalNodes} nodes up
+                  {cluster.aggregate.reachableNodes}/
+                  {cluster.aggregate.totalNodes} nodes up
                   {(() => {
                     const recovering = cluster.nodes.filter(
                       (n) => n.metrics?.recovery?.recovering,
                     ).length;
                     return recovering > 0 ? (
-                      <span className="text-warn"> · {recovering} catching up</span>
+                      <span className="text-warn">
+                        {" "}
+                        · {recovering} catching up
+                      </span>
                     ) : null;
                   })()}
                 </span>
               </div>
               <div className="mb-4 grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-5">
-                <Stat label="Cluster starts/s" value={fmt(clusterRates?.starts ?? 0, 0)} accent="emerald" />
-                <Stat label="Cluster jobs/s" value={fmt(clusterRates?.jobs ?? 0, 0)} accent="sky" />
-                <Stat label="Active (cluster)" value={cluster.aggregate.activeInstances.toLocaleString()} />
-                <Stat label="Clients (cluster)" value={cluster.aggregate.connectionsActive.toLocaleString()} />
-                <Stat label="Memory (cluster)" value={fmtBytes(cluster.aggregate.residentBytes)} />
+                <Stat
+                  label="Cluster starts/s"
+                  value={fmt(clusterRates?.starts ?? 0, 0)}
+                  accent="emerald"
+                />
+                <Stat
+                  label="Cluster jobs/s"
+                  value={fmt(clusterRates?.jobs ?? 0, 0)}
+                  accent="sky"
+                />
+                <Stat
+                  label="Active (cluster)"
+                  value={cluster.aggregate.activeInstances.toLocaleString()}
+                />
+                <Stat
+                  label="Clients (cluster)"
+                  value={cluster.aggregate.connectionsActive.toLocaleString()}
+                />
+                <Stat
+                  label="Memory (cluster)"
+                  value={fmtBytes(cluster.aggregate.residentBytes)}
+                />
               </div>
               <div className="overflow-x-auto rounded-lg border border-edge">
                 <table className="w-full text-sm">
@@ -192,12 +250,24 @@ export default function Metrics() {
                       <th className="px-3 py-2 font-medium">Node</th>
                       <th className="px-3 py-2 font-medium">Status</th>
                       <th className="px-3 py-2 font-medium">SLA</th>
-                      <th className="px-3 py-2 text-right font-medium">Active</th>
-                      <th className="px-3 py-2 text-right font-medium">Created</th>
-                      <th className="px-3 py-2 text-right font-medium">Completed</th>
-                      <th className="px-3 py-2 text-right font-medium">Clients</th>
-                      <th className="px-3 py-2 text-right font-medium">In-flight</th>
-                      <th className="px-3 py-2 text-right font-medium">Memory</th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Active
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Created
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Completed
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Clients
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        In-flight
+                      </th>
+                      <th className="px-3 py-2 text-right font-medium">
+                        Memory
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
@@ -206,75 +276,99 @@ export default function Metrics() {
                         ? null
                         : nodeConsoleUrl(n.address, "/metrics");
                       return (
-                      <tr key={n.nodeId} className="border-b border-edge last:border-0">
-                        <td className="px-3 py-2">
-                          <div className="flex items-center gap-2">
-                            {href ? (
-                              <a
-                                href={href}
-                                target="_blank"
-                                rel="noreferrer"
-                                title={`Open node ${n.nodeId} console (${n.address})`}
-                                className="font-medium text-info hover:underline"
-                              >
-                                node {n.nodeId} ↗
-                              </a>
-                            ) : (
-                              <span className="font-medium">node {n.nodeId}</span>
-                            )}
-                            {n.isSelf && <Badge tone="ok">this</Badge>}
-                          </div>
-                          {n.address && (
-                            <div className="mt-0.5 text-xs text-fg-faint">
-                              {n.address}
+                        <tr
+                          key={n.nodeId}
+                          className="border-b border-edge last:border-0"
+                        >
+                          <td className="px-3 py-2">
+                            <div className="flex items-center gap-2">
+                              {href ? (
+                                <a
+                                  href={href}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  title={`Open node ${n.nodeId} console (${n.address})`}
+                                  className="font-medium text-info hover:underline"
+                                >
+                                  node {n.nodeId} ↗
+                                </a>
+                              ) : (
+                                <span className="font-medium">
+                                  node {n.nodeId}
+                                </span>
+                              )}
+                              {n.isSelf && <Badge tone="ok">this</Badge>}
                             </div>
-                          )}
-                        </td>
-                        <td className="px-3 py-2">
-                          {n.reachable ? (
-                            n.metrics?.recovery?.recovering ? (
-                              <span
-                                className="text-warn"
-                                title={
-                                  n.metrics.recovery.detail ||
-                                  "catching up after restart"
-                                }
-                              >
-                                ● up · catching up
-                              </span>
-                            ) : (n.metrics?.recovery?.handingOff ?? 0) > 0 ? (
-                              <span
-                                className="text-info"
-                                title={
-                                  n.metrics?.recovery?.detail ||
-                                  "handing leadership back to a recovering owner"
-                                }
-                              >
-                                ● up · handing back
-                              </span>
+                            {n.address && (
+                              <div className="mt-0.5 text-xs text-fg-faint">
+                                {n.address}
+                              </div>
+                            )}
+                          </td>
+                          <td className="px-3 py-2">
+                            {n.reachable ? (
+                              n.metrics?.recovery?.recovering ? (
+                                <span
+                                  className="text-warn"
+                                  title={
+                                    n.metrics.recovery.detail ||
+                                    "catching up after restart"
+                                  }
+                                >
+                                  ● up · catching up
+                                </span>
+                              ) : (n.metrics?.recovery?.handingOff ?? 0) > 0 ? (
+                                <span
+                                  className="text-info"
+                                  title={
+                                    n.metrics?.recovery?.detail ||
+                                    "handing leadership back to a recovering owner"
+                                  }
+                                >
+                                  ● up · handing back
+                                </span>
+                              ) : (
+                                <span className="text-ok">● up</span>
+                              )
                             ) : (
-                              <span className="text-ok">● up</span>
-                            )
-                          ) : (
-                            <span className="text-danger" title={n.error ?? ""}>
-                              ● {n.error ?? "down"}
-                            </span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2">
-                          {n.metrics ? (
-                            <SlaBadge mode={n.metrics.slaMode} />
-                          ) : (
-                            <span className="text-fg-faint">—</span>
-                          )}
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.activeInstances.toLocaleString() ?? "—"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.createsTotal.toLocaleString() ?? "—"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.completionsTotal.toLocaleString() ?? "—"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.connectionsActive.toLocaleString() ?? "—"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.commitInflight.toLocaleString() ?? "—"}</td>
-                        <td className="px-3 py-2 text-right tabular-nums">{n.metrics?.residentBytes != null ? fmtBytes(n.metrics.residentBytes) : "—"}</td>
-                      </tr>
+                              <span
+                                className="text-danger"
+                                title={n.error ?? ""}
+                              >
+                                ● {n.error ?? "down"}
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2">
+                            {n.metrics ? (
+                              <SlaBadge mode={n.metrics.slaMode} />
+                            ) : (
+                              <span className="text-fg-faint">—</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {n.metrics?.activeInstances.toLocaleString() ?? "—"}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {n.metrics?.createsTotal.toLocaleString() ?? "—"}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {n.metrics?.completionsTotal.toLocaleString() ??
+                              "—"}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {n.metrics?.connectionsActive.toLocaleString() ??
+                              "—"}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {n.metrics?.commitInflight.toLocaleString() ?? "—"}
+                          </td>
+                          <td className="px-3 py-2 text-right tabular-nums">
+                            {n.metrics?.residentBytes != null
+                              ? fmtBytes(n.metrics.residentBytes)
+                              : "—"}
+                          </td>
+                        </tr>
                       );
                     })}
                   </tbody>
@@ -286,12 +380,33 @@ export default function Metrics() {
           <section>
             <SectionLabel>Durability &amp; latency (means)</SectionLabel>
             <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-              <Stat label="fsync mean" value={`${fmt(data.fsyncMeanMs, 2)} ms`} />
-              <Stat label="Commit wait mean" value={`${fmt(data.commitWaitMeanMs, 2)} ms`} />
-              <Stat label="Commit batch mean" value={fmt(data.commitBatchMean, 1)} />
-              <Stat label="Frame proc mean" value={`${fmt(data.frameProcessingMeanMs, 3)} ms`} />
-              <Stat label="Writer busy" value={`${fmt(data.writerBusyRatio * 100, 1)} %`} sub={data.writerBusyRatio > 0.9 ? "writer saturated" : undefined} />
-              <Stat label="Credit stalls" value={data.creditStallsTotal.toLocaleString()} />
+              <Stat
+                label="fsync mean"
+                value={`${fmt(data.fsyncMeanMs, 2)} ms`}
+              />
+              <Stat
+                label="Commit wait mean"
+                value={`${fmt(data.commitWaitMeanMs, 2)} ms`}
+              />
+              <Stat
+                label="Commit batch mean"
+                value={fmt(data.commitBatchMean, 1)}
+              />
+              <Stat
+                label="Frame proc mean"
+                value={`${fmt(data.frameProcessingMeanMs, 3)} ms`}
+              />
+              <Stat
+                label="Writer busy"
+                value={`${fmt(data.writerBusyRatio * 100, 1)} %`}
+                sub={
+                  data.writerBusyRatio > 0.9 ? "writer saturated" : undefined
+                }
+              />
+              <Stat
+                label="Credit stalls"
+                value={data.creditStallsTotal.toLocaleString()}
+              />
             </div>
           </section>
         </div>
@@ -328,7 +443,9 @@ function CeilingLed({
             active ? "bg-danger animate-pulse" : "bg-ok"
           }`}
         />
-        <span className={`text-lg font-semibold ${active ? "text-danger" : "text-ok"}`}>
+        <span
+          className={`text-lg font-semibold ${active ? "text-danger" : "text-ok"}`}
+        >
           {active ? "CLIPPING" : "clear"}
         </span>
       </div>
@@ -347,7 +464,8 @@ function InfoPopover({ text }: { text: string }) {
   useEffect(() => {
     if (!open) return;
     const onDocClick = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+      if (ref.current && !ref.current.contains(e.target as Node))
+        setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") setOpen(false);
@@ -464,8 +582,12 @@ function Stat({
 }) {
   return (
     <Card className="px-4 py-3">
-      <div className="text-xs uppercase tracking-wide text-fg-faint">{label}</div>
-      <div className={`mt-1 text-2xl font-semibold tabular-nums ${accent ? ACCENTS[accent] : ""}`}>
+      <div className="text-xs uppercase tracking-wide text-fg-faint">
+        {label}
+      </div>
+      <div
+        className={`mt-1 text-2xl font-semibold tabular-nums ${accent ? ACCENTS[accent] : ""}`}
+      >
         {value}
       </div>
       {sub && <div className="mt-0.5 text-xs text-fg-faint">{sub}</div>}
@@ -503,7 +625,13 @@ function Chart({
   const yOf = (v: number) => H - pad - ((v - min) / span) * (H - 2 * pad);
 
   let body: React.ReactNode = (
-    <text x={W / 2} y={H / 2} fill="var(--nano-text-faint)" fontSize="13" textAnchor="middle">
+    <text
+      x={W / 2}
+      y={H / 2}
+      fill="var(--nano-text-faint)"
+      fontSize="13"
+      textAnchor="middle"
+    >
       collecting…
     </text>
   );
@@ -562,8 +690,7 @@ function Chart({
     setHoverIdx(idx);
   };
 
-  const secondsAgo =
-    hoverIdx != null && hasSeries ? n - 1 - hoverIdx : null;
+  const secondsAgo = hoverIdx != null && hasSeries ? n - 1 - hoverIdx : null;
   const hoverValue = hoverIdx != null ? values[hoverIdx] : null;
 
   // Tooltip left offset in %, clamped so it stays inside the plot at the edges.

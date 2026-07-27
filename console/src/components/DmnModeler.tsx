@@ -92,7 +92,9 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
     getVariablesRef.current = getVariables;
     const activeDecisionIdRef = useRef<string | undefined>(undefined);
     const activeEventBusRef = useRef<EventBus | null>(null);
-    const activeHandlerRef = useRef<((...args: unknown[]) => void) | null>(null);
+    const activeHandlerRef = useRef<((...args: unknown[]) => void) | null>(
+      null,
+    );
 
     const clearSuppressTimer = () => {
       if (suppressTimerRef.current === null) return;
@@ -100,7 +102,9 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
       suppressTimerRef.current = null;
     };
 
-    const runLoad = (loader: (m: Modeler) => Promise<unknown>): Promise<void> => {
+    const runLoad = (
+      loader: (m: Modeler) => Promise<unknown>,
+    ): Promise<void> => {
       const modeler = modelerRef.current;
       if (!modeler) return Promise.resolve();
       const run = opChainRef.current.then(async () => {
@@ -133,11 +137,15 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
       // appends the bound domain type's fields (ADR 0029 §5) to dmn-js's own
       // inferred variables, reading the live source + active decision each call.
       function DomainVariableProvider(injector: Injector) {
-        const variableResolver = injector.get<VariableResolver>("variableResolver", false);
+        const variableResolver = injector.get<VariableResolver>(
+          "variableResolver",
+          false,
+        );
         if (!variableResolver) return;
         variableResolver.registerProvider({
           getVariables(variables) {
-            const extra = getVariablesRef.current?.(activeDecisionIdRef.current) ?? [];
+            const extra =
+              getVariablesRef.current?.(activeDecisionIdRef.current) ?? [];
             return extra.length > 0 ? [...variables, ...extra] : variables;
           },
         });
@@ -168,7 +176,10 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
 
       const attachActiveViewerChangeListener = () => {
         if (activeEventBusRef.current && activeHandlerRef.current) {
-          activeEventBusRef.current.off("commandStack.changed", activeHandlerRef.current);
+          activeEventBusRef.current.off(
+            "commandStack.changed",
+            activeHandlerRef.current,
+          );
           activeEventBusRef.current = null;
           activeHandlerRef.current = null;
         }
@@ -206,7 +217,10 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
         disposedRef.current = true;
         clearSuppressTimer();
         if (activeEventBusRef.current && activeHandlerRef.current) {
-          activeEventBusRef.current.off("commandStack.changed", activeHandlerRef.current);
+          activeEventBusRef.current.off(
+            "commandStack.changed",
+            activeHandlerRef.current,
+          );
         }
         activeEventBusRef.current = null;
         activeHandlerRef.current = null;

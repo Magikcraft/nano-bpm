@@ -1,4 +1,11 @@
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   NavLink,
   Navigate,
@@ -125,9 +132,19 @@ const icons = {
   ),
 } as const;
 
-const navItems: { to: string; label: string; icon: ReactNode; studio?: boolean }[] = [
+const navItems: {
+  to: string;
+  label: string;
+  icon: ReactNode;
+  studio?: boolean;
+}[] = [
   { to: "/projects", label: "Projects", icon: icons.projects, studio: true },
-  { to: "/extensions", label: "Extensions", icon: icons.extensions, studio: true },
+  {
+    to: "/extensions",
+    label: "Extensions",
+    icon: icons.extensions,
+    studio: true,
+  },
   { to: "/topology", label: "Topology", icon: icons.topology },
   { to: "/metrics", label: "Metrics", icon: icons.metrics },
   { to: "/explorer", label: "Explorer", icon: icons.explorer },
@@ -178,7 +195,9 @@ function ThemeToggle() {
             }
             onClick={() => select({ mode: m.mode })}
             className={`flex flex-1 items-center justify-center rounded-md py-1.5 transition-colors ${
-              active ? "bg-raised text-accent-strong shadow-sm" : "text-fg-faint hover:text-fg"
+              active
+                ? "bg-raised text-accent-strong shadow-sm"
+                : "text-fg-faint hover:text-fg"
             }`}
           >
             {m.icon}
@@ -334,12 +353,20 @@ export default function App() {
           })}
         </nav>
 
-        <a href="/docs" className={`mt-auto mx-3 ${railItemClass(false)}`} title="Documentation">
+        <a
+          href="/docs"
+          className={`mt-auto mx-3 ${railItemClass(false)}`}
+          title="Documentation"
+        >
           {icons.docs}
           Documentation
         </a>
 
-        <a href="/whitepaper" className={`mx-3 ${railItemClass(false)}`} title="Whitepaper">
+        <a
+          href="/whitepaper"
+          className={`mx-3 ${railItemClass(false)}`}
+          title="Whitepaper"
+        >
           {icons.whitepaper}
           Whitepaper
         </a>
@@ -383,12 +410,17 @@ export default function App() {
             {ProjectWorkspace && (
               <Route path="/projects/:name" element={<ProjectWorkspace />} />
             )}
-            {Extensions && <Route path="/extensions" element={<Extensions />} />}
+            {Extensions && (
+              <Route path="/extensions" element={<Extensions />} />
+            )}
             <Route path="/config" element={<Config />} />
             <Route path="/credits" element={<Credits />} />
             <Route path="/topology" element={<Topology />} />
             <Route path="/metrics" element={<Metrics />} />
-            <Route path="/modeler" element={<Navigate to={HOME_ROUTE} replace />} />
+            <Route
+              path="/modeler"
+              element={<Navigate to={HOME_ROUTE} replace />}
+            />
             <Route path="/explorer" element={<Explorer />} />
             <Route path="/traces" element={<Traces />} />
             <Route path="/workers" element={<Workers />} />

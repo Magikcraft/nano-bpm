@@ -14,7 +14,15 @@ import { registerFileTypesFromOverview } from "../lib/editorLang";
 import { setIntellisenseFromOverview } from "../lib/langIntellisense";
 import { useTheme } from "../theme/ThemeProvider";
 import { isThemeSpec } from "../theme/themes";
-import { Badge, Button, Card, ErrorText, Input, PageHeader, SectionLabel } from "../components/ui";
+import {
+  Badge,
+  Button,
+  Card,
+  ErrorText,
+  Input,
+  PageHeader,
+  SectionLabel,
+} from "../components/ui";
 
 const CATEGORIES = [
   { id: "lang", label: "Languages" },
@@ -50,10 +58,16 @@ export default function Extensions() {
   };
   const loadMarket = async () => {
     setMarketErr(null);
-    try { setMarket((await getMarketplace({ throwOnError: true })).data.entries); }
-    catch (e) { setMarketErr(String(e)); }
+    try {
+      setMarket((await getMarketplace({ throwOnError: true })).data.entries);
+    } catch (e) {
+      setMarketErr(String(e));
+    }
   };
-  useEffect(() => { void load(); void loadMarket(); }, []);
+  useEffect(() => {
+    void load();
+    void loadMarket();
+  }, []);
 
   // Poll the marketplace every 30s while this view is mounted so freshly
   // published pack versions (and thus the "Update" affordance next to each
@@ -74,19 +88,38 @@ export default function Extensions() {
   }, []);
 
   const install = async (pkg: string) => {
-    setBusy(pkg); setErr(null);
-    try { await installExtension({ body: { pkg }, throwOnError: true }); await load(); await loadMarket(); }
-    catch (e) { setErr(String(e)); }
-    finally { setBusy(null); }
+    setBusy(pkg);
+    setErr(null);
+    try {
+      await installExtension({ body: { pkg }, throwOnError: true });
+      await load();
+      await loadMarket();
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(null);
+    }
   };
   const toggleYolo = async () =>
-    setOv((await trustExtension({ body: { yolo: !ov?.yolo }, throwOnError: true })).data);
+    setOv(
+      (await trustExtension({ body: { yolo: !ov?.yolo }, throwOnError: true }))
+        .data,
+    );
   const approve = async (id: string, on: boolean) =>
     setOv(
-      (await trustExtension({ body: on ? { approve: id } : { revoke: id }, throwOnError: true })).data,
+      (
+        await trustExtension({
+          body: on ? { approve: id } : { revoke: id },
+          throwOnError: true,
+        })
+      ).data,
     );
   const remove = async (id: string, label: string) => {
-    if (!window.confirm(`Uninstall extension "${label}"?\n\nProjects scaffolded from it will keep their files but lose their toolchain (Run/Compile may fall back to Deno).`)) {
+    if (
+      !window.confirm(
+        `Uninstall extension "${label}"?\n\nProjects scaffolded from it will keep their files but lose their toolchain (Run/Compile may fall back to Deno).`,
+      )
+    ) {
       return;
     }
     setErr(null);
@@ -101,7 +134,9 @@ export default function Extensions() {
 
   const filtered = useMemo(() => {
     const t = q.trim().toLowerCase();
-    return (market ?? []).filter((m) => !t || `${m.name} ${m.description}`.toLowerCase().includes(t));
+    return (market ?? []).filter(
+      (m) => !t || `${m.name} ${m.description}`.toLowerCase().includes(t),
+    );
   }, [market, q]);
 
   // Open the pack-detail drawer and lazily fetch its README markdown (from the
@@ -111,7 +146,14 @@ export default function Extensions() {
     setReadmeMd(null);
     setReadmeErr(null);
     try {
-      setReadmeMd((await getExtensionReadme({ query: { pkg: m.name }, throwOnError: true })).data.readme);
+      setReadmeMd(
+        (
+          await getExtensionReadme({
+            query: { pkg: m.name },
+            throwOnError: true,
+          })
+        ).data.readme,
+      );
     } catch {
       setReadmeErr("No README available for this pack.");
     }
@@ -130,18 +172,29 @@ export default function Extensions() {
         placeholder="Search the marketplace…"
         className="mb-3 w-full"
       />
-      {err && <div className="mb-3"><ErrorText>{err}</ErrorText></div>}
+      {err && (
+        <div className="mb-3">
+          <ErrorText>{err}</ErrorText>
+        </div>
+      )}
       <label className="mb-4 flex items-center gap-2 text-sm text-fg-muted">
-        <input type="checkbox" checked={!!ov?.yolo} onChange={() => void toggleYolo()} />
+        <input
+          type="checkbox"
+          checked={!!ov?.yolo}
+          onChange={() => void toggleYolo()}
+        />
         Yolo mode — run any extension toolchain without prompting
       </label>
 
       {marketErr && (
         <div className="mb-4 text-sm text-warn">
-          Marketplace unavailable (offline?). Installed + built-in packs still shown below.
+          Marketplace unavailable (offline?). Installed + built-in packs still
+          shown below.
         </div>
       )}
-      {market === null && !marketErr && <div className="mb-4 text-sm text-fg-faint">Loading marketplace…</div>}
+      {market === null && !marketErr && (
+        <div className="mb-4 text-sm text-fg-faint">Loading marketplace…</div>
+      )}
 
       {CATEGORIES.map((cat) => {
         const items = filtered.filter((m) => m.category === cat.id);
@@ -151,7 +204,10 @@ export default function Extensions() {
             <SectionLabel>{cat.label}</SectionLabel>
             <div className="grid gap-2">
               {items.map((m) => (
-                <Card key={m.name} className="group flex items-start justify-between gap-3 p-3">
+                <Card
+                  key={m.name}
+                  className="group flex items-start justify-between gap-3 p-3"
+                >
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-baseline gap-x-2">
                       <button
@@ -163,7 +219,9 @@ export default function Extensions() {
                         {m.name}
                       </button>
                       <span className="text-xs text-fg-faint">
-                        {m.installed && m.installedVersion && m.installedVersion !== m.version
+                        {m.installed &&
+                        m.installedVersion &&
+                        m.installedVersion !== m.version
                           ? `${m.installedVersion} → ${m.version}`
                           : m.version}
                       </span>
@@ -229,11 +287,15 @@ export default function Extensions() {
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
-                  <span className="break-all font-medium text-fg">{e.displayName}</span>
+                  <span className="break-all font-medium text-fg">
+                    {e.displayName}
+                  </span>
                   <Badge tone={e.kind === "theme" ? "accent" : "neutral"}>
                     {e.kind}
                   </Badge>
-                  {e.builtin && <span className="text-xs text-fg-faint">built-in</span>}
+                  {e.builtin && (
+                    <span className="text-xs text-fg-faint">built-in</span>
+                  )}
                   {e.kind !== "theme" && !e.toolchainAvailable && (
                     <span className="text-xs text-warn">toolchain missing</span>
                   )}
@@ -242,7 +304,11 @@ export default function Extensions() {
               <div className="flex flex-wrap items-center gap-3 text-xs">
                 {!e.builtin && (
                   <label className="flex items-center gap-1 text-fg-muted">
-                    <input type="checkbox" checked={e.trusted} onChange={(c) => void approve(e.id, c.target.checked)} />
+                    <input
+                      type="checkbox"
+                      checked={e.trusted}
+                      onChange={(c) => void approve(e.id, c.target.checked)}
+                    />
                     approve
                   </label>
                 )}
@@ -250,13 +316,15 @@ export default function Extensions() {
             </div>
             {(e.fileTypes.length > 0 || e.templates.length > 0) && (
               <div className="mt-1 whitespace-normal break-words text-xs text-fg-faint">
-                {e.fileTypes.map((f) => f.ext).join(" ")} {e.templates.map((t) => t.id).join(", ")}
+                {e.fileTypes.map((f) => f.ext).join(" ")}{" "}
+                {e.templates.map((t) => t.id).join(", ")}
               </div>
             )}
             {(e.themes ?? []).filter(isThemeSpec).length > 0 && (
               <div className="mt-2 flex flex-wrap gap-2">
                 {(e.themes ?? []).filter(isThemeSpec).map((t) => {
-                  const active = selection.mode === "theme" && selection.id === t.id;
+                  const active =
+                    selection.mode === "theme" && selection.id === t.id;
                   return (
                     <Button
                       key={t.id}
@@ -285,7 +353,9 @@ export default function Extensions() {
           >
             <div className="flex items-start justify-between gap-3 border-b border-edge px-5 py-3">
               <div className="min-w-0">
-                <h2 className="break-all text-sm font-semibold text-fg">{readmePkg.name}</h2>
+                <h2 className="break-all text-sm font-semibold text-fg">
+                  {readmePkg.name}
+                </h2>
                 <p className="mt-0.5 text-xs text-fg-faint">
                   {readmePkg.version}
                   {readmePkg.installed ? " · installed" : ""}
@@ -313,9 +383,13 @@ export default function Extensions() {
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
               {readmeErr ? (
-                <div className="px-6 py-5 text-sm text-fg-faint">{readmeErr}</div>
+                <div className="px-6 py-5 text-sm text-fg-faint">
+                  {readmeErr}
+                </div>
               ) : readmeMd === null ? (
-                <div className="px-6 py-5 text-sm text-fg-faint">Loading README…</div>
+                <div className="px-6 py-5 text-sm text-fg-faint">
+                  Loading README…
+                </div>
               ) : (
                 <MarkdownPreview source={readmeMd} />
               )}

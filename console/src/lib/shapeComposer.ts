@@ -77,7 +77,11 @@ export function changeOpKind(op: ShapeOp, kind: OpKind): ShapeOp {
 }
 
 /** Shallow-merge `patch` onto op `i` (call sites keep the union consistent). */
-export function updateOp(ops: ShapeOp[], i: number, patch: Record<string, unknown>): ShapeOp[] {
+export function updateOp(
+  ops: ShapeOp[],
+  i: number,
+  patch: Record<string, unknown>,
+): ShapeOp[] {
   if (i < 0 || i >= ops.length) return ops;
   const next = ops.slice();
   next[i] = { ...ops[i], ...patch } as ShapeOp;
@@ -115,11 +119,17 @@ export function moveOp(ops: ShapeOp[], i: number, dir: -1 | 1): ShapeOp[] {
 }
 
 /** Toggle a projected field name on `project` op `i` (no-op on other kinds). */
-export function toggleProjectField(ops: ShapeOp[], i: number, field: string): ShapeOp[] {
+export function toggleProjectField(
+  ops: ShapeOp[],
+  i: number,
+  field: string,
+): ShapeOp[] {
   const op = ops[i];
   if (!op || op.op !== "project") return ops;
   const has = op.fields.includes(field);
-  const fields = has ? op.fields.filter((f) => f !== field) : [...op.fields, field];
+  const fields = has
+    ? op.fields.filter((f) => f !== field)
+    : [...op.fields, field];
   return updateOp(ops, i, { fields });
 }
 
@@ -131,7 +141,11 @@ export function removeShape(shapes: ShapeDecl[], i: number): ShapeDecl[] {
   return shapes.filter((_, k) => k !== i);
 }
 
-export function updateShape(shapes: ShapeDecl[], i: number, patch: Partial<ShapeDecl>): ShapeDecl[] {
+export function updateShape(
+  shapes: ShapeDecl[],
+  i: number,
+  patch: Partial<ShapeDecl>,
+): ShapeDecl[] {
   if (i < 0 || i >= shapes.length) return shapes;
   const next = shapes.slice();
   next[i] = { ...shapes[i], ...patch };
@@ -139,7 +153,10 @@ export function updateShape(shapes: ShapeDecl[], i: number, patch: Partial<Shape
 }
 
 /** A collision-free shape id derived from `base` given the ids already in use. */
-export function uniqueShapeId(existing: Iterable<string>, base = "Shape"): string {
+export function uniqueShapeId(
+  existing: Iterable<string>,
+  base = "Shape",
+): string {
   const used = new Set(existing);
   if (!used.has(base)) return base;
   for (let n = 2; ; n++) {
@@ -148,7 +165,10 @@ export function uniqueShapeId(existing: Iterable<string>, base = "Shape"): strin
   }
 }
 
-export function entityById(entities: ComposerEntity[], id: string): ComposerEntity | undefined {
+export function entityById(
+  entities: ComposerEntity[],
+  id: string,
+): ComposerEntity | undefined {
   return entities.find((e) => e.id === id);
 }
 
@@ -161,13 +181,18 @@ export function fieldsOf(entities: ComposerEntity[], id: string): string[] {
  * `reference` can target another composed shape and see its (preview-resolved)
  * fields. `text` is the preview's emitted domain block; a shape absent from it
  * (unresolved) still appears, with no fields. */
-export function shapeEntities(shapes: ShapeDecl[], text: string | undefined): ComposerEntity[] {
+export function shapeEntities(
+  shapes: ShapeDecl[],
+  text: string | undefined,
+): ComposerEntity[] {
   return shapes
     .filter((s) => s.id)
     .map((s) => ({
       id: s.id,
       kind: "shape" as const,
-      fields: (text ? extractShapeFields(text, s.id) : null)?.map((f) => f.name) ?? [],
+      fields:
+        (text ? extractShapeFields(text, s.id) : null)?.map((f) => f.name) ??
+        [],
     }));
 }
 
@@ -183,7 +208,10 @@ export interface ResolvedField {
  * when the shape is absent (e.g. omitted for an `error` diagnostic), so the UI can
  * distinguish "no fields" from "did not resolve". Best-effort brace matching over
  * the generator's stable emit — the preview is authoring-time only. */
-export function extractShapeFields(text: string, shapeId: string): ResolvedField[] | null {
+export function extractShapeFields(
+  text: string,
+  shapeId: string,
+): ResolvedField[] | null {
   const marker = `${JSON.stringify(shapeId)}:`;
   const at = text.indexOf(marker);
   if (at < 0) return null;

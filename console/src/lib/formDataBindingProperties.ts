@@ -42,7 +42,9 @@ interface SelectOption {
 const UNBOUND = "";
 
 function description(text?: string) {
-  return text ? h("div", { class: "bio-properties-panel-description" }, text) : null;
+  return text
+    ? h("div", { class: "bio-properties-panel-description" }, text)
+    : null;
 }
 
 function selectEntry(
@@ -59,16 +61,23 @@ function selectEntry(
     h(
       "div",
       { class: "bio-properties-panel-select" },
-      h("label", { class: "bio-properties-panel-label", for: `${id}-input` }, label),
+      h(
+        "label",
+        { class: "bio-properties-panel-label", for: `${id}-input` },
+        label,
+      ),
       h(
         "select",
         {
           id: `${id}-input`,
           class: "bio-properties-panel-input",
           value,
-          onInput: (e: Event) => onChange((e.currentTarget as HTMLSelectElement).value),
+          onInput: (e: Event) =>
+            onChange((e.currentTarget as HTMLSelectElement).value),
         },
-        options.map((o) => h("option", { value: o.value, key: o.value }, o.label)),
+        options.map((o) =>
+          h("option", { value: o.value, key: o.value }, o.label),
+        ),
       ),
     ),
     description(desc),
@@ -88,15 +97,21 @@ function textAreaEntry(
     h(
       "div",
       { class: "bio-properties-panel-textarea" },
-      h("label", { class: "bio-properties-panel-label", for: `${id}-input` }, label),
+      h(
+        "label",
+        { class: "bio-properties-panel-label", for: `${id}-input` },
+        label,
+      ),
       h("textarea", {
         id: `${id}-input`,
-        class: "bio-properties-panel-input bio-properties-panel-input-monospace",
+        class:
+          "bio-properties-panel-input bio-properties-panel-input-monospace",
         spellcheck: false,
         rows: 4,
         value,
         "data-gramm": "false",
-        onInput: (e: Event) => onChange((e.currentTarget as HTMLTextAreaElement).value),
+        onInput: (e: Event) =>
+          onChange((e.currentTarget as HTMLTextAreaElement).value),
       }),
     ),
     description(desc),
@@ -116,14 +131,19 @@ function textFieldEntry(
     h(
       "div",
       { class: "bio-properties-panel-textfield" },
-      h("label", { class: "bio-properties-panel-label", for: `${id}-input` }, label),
+      h(
+        "label",
+        { class: "bio-properties-panel-label", for: `${id}-input` },
+        label,
+      ),
       h("input", {
         id: `${id}-input`,
         type: "text",
         class: "bio-properties-panel-input",
         spellcheck: false,
         value,
-        onInput: (e: Event) => onChange((e.currentTarget as HTMLInputElement).value),
+        onInput: (e: Event) =>
+          onChange((e.currentTarget as HTMLInputElement).value),
       }),
     ),
     description(desc),
@@ -225,7 +245,8 @@ function DataSourceGroup(props: GroupProps) {
           {
             type: "button",
             title: "Toggle section",
-            class: "bio-properties-panel-group-header-button bio-properties-panel-arrow",
+            class:
+              "bio-properties-panel-group-header-button bio-properties-panel-arrow",
           },
           h(
             "svg",
@@ -233,14 +254,20 @@ function DataSourceGroup(props: GroupProps) {
               width: 16,
               height: 16,
               xmlns: "http://www.w3.org/2000/svg",
-              class: open ? "bio-properties-panel-arrow-down" : "bio-properties-panel-arrow-right",
+              class: open
+                ? "bio-properties-panel-arrow-down"
+                : "bio-properties-panel-arrow-right",
             },
             h("path", { "fill-rule": "evenodd", d: ARROW_PATH }),
           ),
         ),
       ),
     ),
-    h("div", { class: `bio-properties-panel-group-entries ${open ? "open" : ""}` }, entries),
+    h(
+      "div",
+      { class: `bio-properties-panel-group-entries ${open ? "open" : ""}` },
+      entries,
+    ),
   );
 }
 
@@ -263,7 +290,11 @@ export function createFormDataBindingModule(getSources: () => string[]) {
 
     getGroups(field: FormField, editField: EditField) {
       return (groups: Array<unknown>) => {
-        if (field && typeof field.type === "string" && CHOICE_FIELD_TYPES.has(field.type)) {
+        if (
+          field &&
+          typeof field.type === "string" &&
+          CHOICE_FIELD_TYPES.has(field.type)
+        ) {
           groups.push({
             id: "nanoDataSource",
             label: "Data source (Urban)",

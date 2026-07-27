@@ -239,7 +239,8 @@ export default function TestRunPanel({
 
   const effectiveTraceKey = traceKey ?? snapshot?.instances[0]?.key ?? null;
   const simProcessId =
-    snapshot?.instances.find((i) => i.key === effectiveTraceKey)?.processId ?? process;
+    snapshot?.instances.find((i) => i.key === effectiveTraceKey)?.processId ??
+    process;
   const simTrace = useMemo(
     () =>
       effectiveTraceKey
@@ -288,19 +289,21 @@ export default function TestRunPanel({
           <Badge tone="accent" className="uppercase tracking-wide">
             Simulation
           </Badge>
-          {leftView === "trace" && started && snapshot!.instances.length > 1 && (
-            <select
-              value={effectiveTraceKey ?? ""}
-              onChange={(e) => setTraceKey(e.target.value)}
-              className="ml-auto rounded border border-edge-strong bg-inset px-2 py-0.5 font-mono text-xs text-fg"
-            >
-              {snapshot!.instances.map((i) => (
-                <option key={i.key} value={i.key}>
-                  #{i.key}
-                </option>
-              ))}
-            </select>
-          )}
+          {leftView === "trace" &&
+            started &&
+            snapshot!.instances.length > 1 && (
+              <select
+                value={effectiveTraceKey ?? ""}
+                onChange={(e) => setTraceKey(e.target.value)}
+                className="ml-auto rounded border border-edge-strong bg-inset px-2 py-0.5 font-mono text-xs text-fg"
+              >
+                {snapshot!.instances.map((i) => (
+                  <option key={i.key} value={i.key}>
+                    #{i.key}
+                  </option>
+                ))}
+              </select>
+            )}
         </div>
         <div className="relative min-h-0 flex-1">
           {!started ? (
@@ -310,14 +313,18 @@ export default function TestRunPanel({
                 : "Start an instance to simulate this process."}
             </div>
           ) : leftView === "diagram" ? (
-            <SimDiagram xml={xml} activeIds={activeIds} incidentIds={incidentIds} />
+            <SimDiagram
+              xml={xml}
+              activeIds={activeIds}
+              incidentIds={incidentIds}
+            />
           ) : simTrace ? (
             <div className="h-full overflow-auto p-6">
               <p className="mb-4 text-xs text-fg-faint">
                 Folded from the in-browser engine's event log. The simulation's
-                virtual clock only advances on “Advance time”, so the axis is the
-                logical step (event) index, not wall-clock time. This trace is
-                never journaled, exported, or sent to the gateway.
+                virtual clock only advances on “Advance time”, so the axis is
+                the logical step (event) index, not wall-clock time. This trace
+                is never journaled, exported, or sent to the gateway.
               </p>
               <TraceTimeline trace={simTrace} fmt={stepFmt} />
             </div>
@@ -339,7 +346,9 @@ export default function TestRunPanel({
         <header className="flex items-center justify-between border-b border-edge px-4 py-2">
           <div>
             <h2 className="text-sm font-semibold text-fg">Test run</h2>
-            <p className="text-xs text-fg-faint">In-browser simulation (not deployed)</p>
+            <p className="text-xs text-fg-faint">
+              In-browser simulation (not deployed)
+            </p>
           </div>
           <Button size="sm" onClick={onClose}>
             Close
@@ -413,7 +422,9 @@ export default function TestRunPanel({
             <>
               {/* Waiting jobs */}
               <section className="space-y-2">
-                <SectionLabel>Waiting jobs ({snapshot!.jobs.length})</SectionLabel>
+                <SectionLabel>
+                  Waiting jobs ({snapshot!.jobs.length})
+                </SectionLabel>
                 {snapshot!.jobs.length === 0 ? (
                   <p className="text-xs text-fg-faint">No jobs are waiting.</p>
                 ) : (
@@ -433,7 +444,10 @@ export default function TestRunPanel({
                       <textarea
                         value={jobVars[job.key] ?? "{}"}
                         onChange={(e) =>
-                          setJobVars((m) => ({ ...m, [job.key]: e.target.value }))
+                          setJobVars((m) => ({
+                            ...m,
+                            [job.key]: e.target.value,
+                          }))
                         }
                         rows={2}
                         spellCheck={false}
@@ -462,13 +476,17 @@ export default function TestRunPanel({
               {/* Timers */}
               {snapshot!.timers.length > 0 && (
                 <section className="space-y-2">
-                  <SectionLabel>Timers ({snapshot!.timers.length})</SectionLabel>
+                  <SectionLabel>
+                    Timers ({snapshot!.timers.length})
+                  </SectionLabel>
                   {snapshot!.timers.map((t) => (
                     <div
                       key={t.key}
                       className="flex items-center justify-between rounded border border-edge bg-raised px-2 py-1 text-xs"
                     >
-                      <span className="font-mono text-fg-muted">{t.elementId}</span>
+                      <span className="font-mono text-fg-muted">
+                        {t.elementId}
+                      </span>
                       <span className="text-fg-faint">
                         due in {t.dueInMs} ms
                       </span>
@@ -500,7 +518,9 @@ export default function TestRunPanel({
               {/* Clock */}
               <section className="space-y-1.5">
                 <SectionLabel>Virtual clock</SectionLabel>
-                <div className="text-xs text-fg-faint">now = {snapshot!.now} ms</div>
+                <div className="text-xs text-fg-faint">
+                  now = {snapshot!.now} ms
+                </div>
                 <div className="flex gap-1.5">
                   <input
                     value={advanceMs}
@@ -519,7 +539,8 @@ export default function TestRunPanel({
               {/* Variables */}
               <section className="space-y-2">
                 <SectionLabel>
-                  Instances ({snapshot!.completedInstances}/{snapshot!.totalInstances} done)
+                  Instances ({snapshot!.completedInstances}/
+                  {snapshot!.totalInstances} done)
                 </SectionLabel>
                 {snapshot!.instances.map((inst) => (
                   <div
@@ -527,7 +548,9 @@ export default function TestRunPanel({
                     className="rounded border border-edge bg-raised p-2 text-xs"
                   >
                     <div className="flex items-center justify-between">
-                      <span className="font-mono text-fg-muted">#{inst.key}</span>
+                      <span className="font-mono text-fg-muted">
+                        #{inst.key}
+                      </span>
                       <span
                         className={
                           inst.state === "Completed"

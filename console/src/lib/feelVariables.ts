@@ -23,7 +23,8 @@ export function toFeelVariables(vars: ScopeVar[]): FeelVariable[] {
     const out: FeelVariable = { name: v.name };
     if (v.type) out.detail = v.type;
     if (v.list) out.isList = true;
-    if (v.entries && v.entries.length > 0) out.entries = toFeelVariables(v.entries);
+    if (v.entries && v.entries.length > 0)
+      out.entries = toFeelVariables(v.entries);
     return out;
   });
 }

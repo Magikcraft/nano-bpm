@@ -11,7 +11,13 @@ import {
 } from "../gen";
 import { useTheme } from "../theme/ThemeProvider";
 import { TOKEN_KEYS, type ThemeSpec } from "../theme/themes";
-import { Button, Card, ErrorText, PageHeader, SectionLabel } from "../components/ui";
+import {
+  Button,
+  Card,
+  ErrorText,
+  PageHeader,
+  SectionLabel,
+} from "../components/ui";
 
 type Tab = "server" | "ide" | "appearance";
 
@@ -46,7 +52,13 @@ export default function Config() {
         ))}
       </div>
 
-      {tab === "server" ? <ServerPane /> : tab === "ide" ? <IdePane /> : <AppearancePane />}
+      {tab === "server" ? (
+        <ServerPane />
+      ) : tab === "ide" ? (
+        <IdePane />
+      ) : (
+        <AppearancePane />
+      )}
     </div>
   );
 }
@@ -59,8 +71,18 @@ export default function Config() {
 function ThemeSwatch({ spec }: { spec: ThemeSpec }) {
   const base =
     spec.appearance === "dark"
-      ? { app: "#0b0b10", raised: "#16161f", text: "#f2f2f7", accent: "#8b5cf6" }
-      : { app: "#f5f5f9", raised: "#ffffff", text: "#1a1a22", accent: "#7c3aed" };
+      ? {
+          app: "#0b0b10",
+          raised: "#16161f",
+          text: "#f2f2f7",
+          accent: "#8b5cf6",
+        }
+      : {
+          app: "#f5f5f9",
+          raised: "#ffffff",
+          text: "#1a1a22",
+          accent: "#7c3aed",
+        };
   const t = { ...base, ...spec.tokens };
   return (
     <span
@@ -69,7 +91,11 @@ function ThemeSwatch({ spec }: { spec: ThemeSpec }) {
       aria-hidden="true"
     >
       {[t.raised, t.text, t.accent].map((c, i) => (
-        <span key={i} className="h-3.5 w-3.5 rounded-full" style={{ background: c }} />
+        <span
+          key={i}
+          className="h-3.5 w-3.5 rounded-full"
+          style={{ background: c }}
+        />
       ))}
     </span>
   );
@@ -128,9 +154,17 @@ function AppearancePane() {
           </span>
         </button>
         <div className="flex shrink-0 items-center gap-2">
-          {active && <span className="text-xs font-medium text-accent-strong">active</span>}
+          {active && (
+            <span className="text-xs font-medium text-accent-strong">
+              active
+            </span>
+          )}
           {removable && (
-            <Button variant="ghost" size="sm" onClick={() => removeImportedTheme(t.id)}>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => removeImportedTheme(t.id)}
+            >
               remove
             </Button>
           )}
@@ -156,7 +190,9 @@ function AppearancePane() {
                     : "border-edge bg-raised hover:bg-hover"
                 }`}
               >
-                <div className={`text-sm font-medium ${active ? "text-accent-strong" : "text-fg"}`}>
+                <div
+                  className={`text-sm font-medium ${active ? "text-accent-strong" : "text-fg"}`}
+                >
                   {m.label}
                 </div>
                 <div className="mt-0.5 text-xs text-fg-faint">{m.blurb}</div>
@@ -169,15 +205,20 @@ function AppearancePane() {
       <section>
         <SectionLabel>Theme packs</SectionLabel>
         {packThemes.length > 0 ? (
-          <div className="grid gap-2">{packThemes.map((t) => themeCard(t, false))}</div>
+          <div className="grid gap-2">
+            {packThemes.map((t) => themeCard(t, false))}
+          </div>
         ) : (
           <p className="text-sm text-fg-faint">
             No theme packs installed. Browse the{" "}
-            <a href="/console/extensions" className="text-accent-strong hover:underline">
+            <a
+              href="/console/extensions"
+              className="text-accent-strong hover:underline"
+            >
               extension marketplace
             </a>{" "}
-            for <code className="font-mono text-xs">nano-ide-theme-*</code> packs, or import a
-            theme below.
+            for <code className="font-mono text-xs">nano-ide-theme-*</code>{" "}
+            packs, or import a theme below.
           </p>
         )}
       </section>
@@ -185,12 +226,17 @@ function AppearancePane() {
       <section>
         <SectionLabel>Imported themes</SectionLabel>
         {importedThemes.length > 0 && (
-          <div className="mb-3 grid gap-2">{importedThemes.map((t) => themeCard(t, true))}</div>
+          <div className="mb-3 grid gap-2">
+            {importedThemes.map((t) => themeCard(t, true))}
+          </div>
         )}
         <Card className="p-3">
           <div className="mb-2 text-xs text-fg-muted">
-            Paste a theme JSON (or load a <code className="font-mono">.json</code> file). Tokens:{" "}
-            <code className="font-mono text-[11px] text-fg-faint">{TOKEN_KEYS.join(" ")}</code>
+            Paste a theme JSON (or load a{" "}
+            <code className="font-mono">.json</code> file). Tokens:{" "}
+            <code className="font-mono text-[11px] text-fg-faint">
+              {TOKEN_KEYS.join(" ")}
+            </code>
           </div>
           <textarea
             value={json}
@@ -200,12 +246,25 @@ function AppearancePane() {
             spellCheck={false}
             className="mb-2 w-full rounded-md border border-edge bg-inset px-3 py-2 font-mono text-xs text-fg placeholder:text-fg-faint outline-none focus:border-accent"
           />
-          {importErr && <div className="mb-2"><ErrorText>{importErr}</ErrorText></div>}
+          {importErr && (
+            <div className="mb-2">
+              <ErrorText>{importErr}</ErrorText>
+            </div>
+          )}
           <div className="flex items-center gap-2">
-            <Button variant="primary" size="sm" disabled={!json.trim()} onClick={() => doImport(json)}>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={!json.trim()}
+              onClick={() => doImport(json)}
+            >
               Import & apply
             </Button>
-            <Button variant="secondary" size="sm" onClick={() => fileRef.current?.click()}>
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => fileRef.current?.click()}
+            >
               Load file…
             </Button>
             <input
@@ -258,7 +317,9 @@ function ServerPane() {
               key={m}
               onClick={() => setMode(m)}
               className={`rounded px-3 py-1 capitalize transition-colors ${
-                mode === m ? "bg-accent/10 font-medium text-accent-strong" : "text-fg-muted hover:text-fg"
+                mode === m
+                  ? "bg-accent/10 font-medium text-accent-strong"
+                  : "text-fg-muted hover:text-fg"
               }`}
             >
               {m}
@@ -418,7 +479,10 @@ function SlaPedal({
                 knob (inset-0) so it pivots around the knob's exact centre */}
             <div
               className="absolute inset-0 transition-transform duration-300"
-              style={{ transform: `rotate(${angle}deg)`, transformOrigin: "50% 50%" }}
+              style={{
+                transform: `rotate(${angle}deg)`,
+                transformOrigin: "50% 50%",
+              }}
             >
               <div
                 className="absolute left-1/2 top-2 h-4 w-1 -translate-x-1/2 rounded-full"
@@ -433,10 +497,16 @@ function SlaPedal({
 
         {/* detent labels */}
         <div className="mt-2 flex justify-between text-[9px] uppercase tracking-wider text-[#a1a1aa]">
-          <button className="hover:text-amber-300" onClick={() => select(sla.options[0].id)}>
+          <button
+            className="hover:text-amber-300"
+            onClick={() => select(sla.options[0].id)}
+          >
             ◄ reject
           </button>
-          <button className="hover:text-cyan-300" onClick={() => select(sla.options[1].id)}>
+          <button
+            className="hover:text-cyan-300"
+            onClick={() => select(sla.options[1].id)}
+          >
             accept ►
           </button>
         </div>
@@ -444,16 +514,19 @@ function SlaPedal({
 
       {/* Explanation + apply hint */}
       <div className="flex-1">
-        <div className="mb-1 text-sm font-semibold text-fg">{selected.label}</div>
+        <div className="mb-1 text-sm font-semibold text-fg">
+          {selected.label}
+        </div>
         <div className="mb-3 text-xs uppercase tracking-wider text-accent-strong/80">
           {selected.tagline}
         </div>
-        <p className="mb-4 text-sm leading-relaxed text-fg-muted">{selected.description}</p>
+        <p className="mb-4 text-sm leading-relaxed text-fg-muted">
+          {selected.description}
+        </p>
 
         <div className="rounded-lg border border-edge bg-raised p-3 text-xs text-fg-muted">
           <div className="mb-1">
-            Current:{" "}
-            <span className="font-mono text-fg">{sla.current}</span>{" "}
+            Current: <span className="font-mono text-fg">{sla.current}</span>{" "}
             <span className="text-fg-faint">
               (source: {sla.source === "default" ? "default" : "environment"})
             </span>
@@ -462,11 +535,13 @@ function SlaPedal({
             applyErr ? (
               <div className="text-danger">Switch failed: {applyErr}</div>
             ) : applying ? (
-              <div className="text-info">Applying {preview} across the cluster…</div>
+              <div className="text-info">
+                Applying {preview} across the cluster…
+              </div>
             ) : (
               <div className="text-ok">
-                Live. Turning the knob switches the mode immediately and propagates
-                it cluster-wide. On restart it reseeds from{" "}
+                Live. Turning the knob switches the mode immediately and
+                propagates it cluster-wide. On restart it reseeds from{" "}
                 <code className="rounded bg-inset px-1 py-0.5 font-mono text-ok">
                   NANOBPMN_SLA_MODE
                 </code>
@@ -483,7 +558,8 @@ function SlaPedal({
             </div>
           ) : (
             <div className="text-fg-faint">
-              Turn the knob to preview the other mode; the mode is set on startup.
+              Turn the knob to preview the other mode; the mode is set on
+              startup.
             </div>
           )}
         </div>
@@ -517,7 +593,9 @@ function AdvancedParams({ cfg }: { cfg: ServerConfig }) {
                   >
                     <td className="w-1/3 border-b border-edge/60 px-3 py-2 align-top">
                       <div className="text-fg">{p.label}</div>
-                      <div className="font-mono text-[11px] text-fg-faint">{p.key}</div>
+                      <div className="font-mono text-[11px] text-fg-faint">
+                        {p.key}
+                      </div>
                     </td>
                     <td className="border-b border-edge/60 px-3 py-2 align-top">
                       <div className="mb-0.5 flex items-center gap-2">
@@ -531,7 +609,9 @@ function AdvancedParams({ cfg }: { cfg: ServerConfig }) {
                           </span>
                         )}
                       </div>
-                      <div className="text-xs text-fg-faint">{p.description}</div>
+                      <div className="text-xs text-fg-faint">
+                        {p.description}
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -601,7 +681,9 @@ function DepCard({ d }: { d: ConfigDependency }) {
   return (
     <div className="rounded-lg border border-warn/30 bg-warn/5 p-3">
       <div className="text-sm">
-        <span className="font-semibold text-warn">{d.name} is not installed.</span>{" "}
+        <span className="font-semibold text-warn">
+          {d.name} is not installed.
+        </span>{" "}
         <span className="text-fg-muted">{d.purpose}</span>
       </div>
       <div className="mt-1 text-xs text-fg-muted">{d.hint}</div>
@@ -630,7 +712,7 @@ function ToolchainRow({ d }: { d: ConfigDependency }) {
           <span className="text-sm text-fg">{d.name}</span>
         </div>
         <div className="truncate font-mono text-[11px] text-fg-faint">
-          {d.present ? d.version ?? d.bin : d.bin}
+          {d.present ? (d.version ?? d.bin) : d.bin}
         </div>
       </div>
       {d.present ? (
@@ -665,9 +747,7 @@ function LangPackCard({ p }: { p: LangPackConfig }) {
         </div>
         <span
           className={`rounded px-2 py-0.5 text-xs ${
-            p.available
-              ? "bg-ok/10 text-ok"
-              : "bg-warn/10 text-warn"
+            p.available ? "bg-ok/10 text-ok" : "bg-warn/10 text-warn"
           }`}
         >
           {p.available ? "ready" : "toolchain missing"}
@@ -696,7 +776,9 @@ function LangPackCard({ p }: { p: LangPackConfig }) {
                   </span>
                 )}
                 {f.env && (
-                  <span className="font-mono text-[10px] text-fg-faint">{f.env}</span>
+                  <span className="font-mono text-[10px] text-fg-faint">
+                    {f.env}
+                  </span>
                 )}
               </div>
               {f.description && (

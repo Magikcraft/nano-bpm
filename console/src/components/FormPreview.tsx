@@ -67,7 +67,10 @@ async function resolveBindings(
         const rows = await rowsPromise;
         resolved.set(fieldRef, rowsToOptions(rows, b.binding));
       } catch (e) {
-        errors.push({ field: b.fieldKey ?? b.fieldId ?? b.path, message: errMsg(e) });
+        errors.push({
+          field: b.fieldKey ?? b.fieldId ?? b.path,
+          message: errMsg(e),
+        });
       }
     }),
   );
@@ -119,7 +122,9 @@ export default function FormPreview({
       const runDataQuery: DataQueryResolver = async (source, sql) => {
         const src = source ?? defaultSource;
         if (!src) {
-          throw new Error("data.query() names no source and the app declares no data.default");
+          throw new Error(
+            "data.query() names no source and the app declares no data.default",
+          );
         }
         const r = await queryData({
           path: { name, source: src },
@@ -163,11 +168,16 @@ export default function FormPreview({
     <div className="flex h-full flex-col bg-white">
       {(error || bindingErrors.length > 0 || resolving) && (
         <div className="shrink-0 border-b border-edge bg-panel px-4 py-1.5 text-xs">
-          {resolving && <span className="text-fg-faint">Resolving datasource bindings…</span>}
+          {resolving && (
+            <span className="text-fg-faint">
+              Resolving datasource bindings…
+            </span>
+          )}
           {error && <span className="text-danger">{error}</span>}
           {bindingErrors.map((be) => (
             <div key={be.field} className="text-warn">
-              Field <code className="text-fg-muted">{be.field}</code>: {be.message}
+              Field <code className="text-fg-muted">{be.field}</code>:{" "}
+              {be.message}
             </div>
           ))}
         </div>

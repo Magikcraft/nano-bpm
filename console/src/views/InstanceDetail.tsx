@@ -16,7 +16,8 @@ export default function InstanceDetail({
   const { data, isLoading, error } = useQuery({
     queryKey: ["instance", instanceKey],
     queryFn: async () =>
-      (await getInstance({ path: { key: instanceKey }, throwOnError: true })).data,
+      (await getInstance({ path: { key: instanceKey }, throwOnError: true }))
+        .data,
   });
 
   const defKey = data?.instance.process_definition_key;
@@ -45,7 +46,9 @@ export default function InstanceDetail({
     <div className="flex h-full flex-col">
       <header className="border-b border-edge px-8 py-4">
         <div className="flex items-center gap-3">
-          <h1 className="text-xl font-semibold text-fg">{instance.process_id}</h1>
+          <h1 className="text-xl font-semibold text-fg">
+            {instance.process_id}
+          </h1>
           <Badge tone="neutral">{instance.state}</Badge>
           {instance.has_incident && <Badge tone="danger">Incident</Badge>}
         </div>
@@ -87,7 +90,10 @@ export default function InstanceDetail({
           ) : (
             <Table head={["Name", "Value", "Scope"]}>
               {variables.map((v) => (
-                <tr key={`${v.scope_key}:${v.name}`} className="border-b border-edge">
+                <tr
+                  key={`${v.scope_key}:${v.name}`}
+                  className="border-b border-edge"
+                >
                   <Td className="font-medium">{v.name}</Td>
                   <Td className="font-mono text-fg-muted">{v.value}</Td>
                   <Td className="font-mono text-fg-faint">{v.scope_key}</Td>
@@ -119,13 +125,7 @@ export default function InstanceDetail({
   );
 }
 
-function Section({
-  title,
-  children,
-}: {
-  title: string;
-  children: ReactNode;
-}) {
+function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="mb-8">
       <SectionLabel>{title}</SectionLabel>
@@ -134,13 +134,7 @@ function Section({
   );
 }
 
-function Table({
-  head,
-  children,
-}: {
-  head: string[];
-  children: ReactNode;
-}) {
+function Table({ head, children }: { head: string[]; children: ReactNode }) {
   return (
     <table className="w-full border-collapse text-sm">
       <thead>

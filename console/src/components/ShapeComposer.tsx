@@ -62,7 +62,8 @@ const OP_HINT: Record<OpKind, string> = {
   carry: "Spread every field of the entity into the shape.",
   project: "Spread only the picked fields (optionally reached via a FK path).",
   extend: "Add a new field with a scalar type or a nominal entity type.",
-  reference: "Embed the entity under a name (spread its fields, or keep it nominal).",
+  reference:
+    "Embed the entity under a name (spread its fields, or keep it nominal).",
 };
 
 /**
@@ -141,7 +142,8 @@ export default function ShapeComposer({
     [refEntities],
   );
 
-  const setOps = (ops: ShapeOp[]) => onShapesChange(updateShape(shapes, sel, { ops }));
+  const setOps = (ops: ShapeOp[]) =>
+    onShapesChange(updateShape(shapes, sel, { ops }));
 
   const diagnostics = result?.diagnostics ?? [];
   const shapeDiags = diagnostics.filter((d) => d.shape === shape?.id);
@@ -159,7 +161,11 @@ export default function ShapeComposer({
             Author a motion shape by composing fused entities (ADR 0040).
           </p>
         </div>
-        <button onClick={onClose} className="rounded p-1 text-fg-faint hover:bg-hover" title="Close">
+        <button
+          onClick={onClose}
+          className="rounded p-1 text-fg-faint hover:bg-hover"
+          title="Close"
+        >
           ✕
         </button>
       </div>
@@ -169,17 +175,23 @@ export default function ShapeComposer({
         <aside className="flex w-44 shrink-0 flex-col border-r border-edge">
           <div className="min-h-0 flex-1 overflow-y-auto p-1.5">
             {shapes.length === 0 && (
-              <p className="px-1 py-2 text-[11px] text-fg-faint">No shapes yet.</p>
+              <p className="px-1 py-2 text-[11px] text-fg-faint">
+                No shapes yet.
+              </p>
             )}
             {shapes.map((s, i) => (
               <button
                 key={i}
                 onClick={() => setSelected(i)}
                 className={`flex w-full items-center justify-between rounded px-2 py-1 text-left text-xs ${
-                  i === sel ? "bg-accent/10 text-accent-strong" : "text-fg-muted hover:bg-hover"
+                  i === sel
+                    ? "bg-accent/10 text-accent-strong"
+                    : "text-fg-muted hover:bg-hover"
                 }`}
               >
-                <span className="truncate">{s.name || s.id || "(unnamed)"}</span>
+                <span className="truncate">
+                  {s.name || s.id || "(unnamed)"}
+                </span>
                 {hasError(s.id) && (
                   <span className="text-danger" title="Has an error diagnostic">
                     ●
@@ -203,7 +215,9 @@ export default function ShapeComposer({
         {/* Selected shape editor + preview */}
         <div className="min-w-0 flex-1 overflow-y-auto">
           {!shape ? (
-            <div className="p-6 text-xs text-fg-faint">Add a shape to start composing.</div>
+            <div className="p-6 text-xs text-fg-faint">
+              Add a shape to start composing.
+            </div>
           ) : (
             <div className="flex flex-col gap-3 p-3">
               {/* Identity */}
@@ -212,7 +226,11 @@ export default function ShapeComposer({
                 <input
                   className={INPUT_CLASS}
                   value={shape.id}
-                  onChange={(e) => onShapesChange(updateShape(shapes, sel, { id: e.target.value }))}
+                  onChange={(e) =>
+                    onShapesChange(
+                      updateShape(shapes, sel, { id: e.target.value }),
+                    )
+                  }
                   placeholder="ApprovedOrder"
                 />
                 <label className="text-[11px] text-fg-faint">Name</label>
@@ -221,7 +239,9 @@ export default function ShapeComposer({
                   value={shape.name ?? ""}
                   onChange={(e) =>
                     onShapesChange(
-                      updateShape(shapes, sel, { name: e.target.value || undefined }),
+                      updateShape(shapes, sel, {
+                        name: e.target.value || undefined,
+                      }),
                     )
                   }
                   placeholder="Approved order"
@@ -249,8 +269,12 @@ export default function ShapeComposer({
                     nominalEntities={nominalEntities}
                     entities={allEntities}
                     onChange={(patch) => setOps(updateOp(shape.ops, i, patch))}
-                    onRetype={(kind) => setOps(replaceOp(shape.ops, i, changeOpKind(op, kind)))}
-                    onToggleField={(f) => setOps(toggleProjectField(shape.ops, i, f))}
+                    onRetype={(kind) =>
+                      setOps(replaceOp(shape.ops, i, changeOpKind(op, kind)))
+                    }
+                    onToggleField={(f) =>
+                      setOps(toggleProjectField(shape.ops, i, f))
+                    }
                     onMove={(dir) => setOps(moveOp(shape.ops, i, dir))}
                     onRemove={() => setOps(removeOp(shape.ops, i))}
                   />
@@ -287,13 +311,16 @@ export default function ShapeComposer({
                         : "No preview yet."}
                   </p>
                 ) : resolvedFields.length === 0 ? (
-                  <p className="text-[11px] text-fg-faint">Resolves to an empty shape.</p>
+                  <p className="text-[11px] text-fg-faint">
+                    Resolves to an empty shape.
+                  </p>
                 ) : (
                   <ul className="font-mono text-[11px] text-fg-muted">
                     {resolvedFields.map((f) => (
                       <li key={f.name}>
                         {f.name}
-                        {f.optional ? "?" : ""}: <span className="text-accent">{f.type}</span>
+                        {f.optional ? "?" : ""}:{" "}
+                        <span className="text-accent">{f.type}</span>
                       </li>
                     ))}
                   </ul>
@@ -309,7 +336,8 @@ export default function ShapeComposer({
                             : "bg-warn/10 text-warn"
                         }`}
                       >
-                        <span className="font-medium">{d.kind}</span>: {d.message}
+                        <span className="font-medium">{d.kind}</span>:{" "}
+                        {d.message}
                       </li>
                     ))}
                   </ul>
@@ -341,7 +369,8 @@ function MetaEditor({
   const setAt = (i: number, patch: Partial<MetaEntry>) =>
     onChange(meta.map((m, j) => (j === i ? { ...m, ...patch } : m)));
   const dupKey = (key: string, self: number) =>
-    key.trim().length > 0 && meta.some((m, j) => j !== self && m.key.trim() === key.trim());
+    key.trim().length > 0 &&
+    meta.some((m, j) => j !== self && m.key.trim() === key.trim());
 
   return (
     <div className="max-h-56 shrink-0 overflow-y-auto border-t border-edge px-3 py-2">
@@ -371,7 +400,11 @@ function MetaEditor({
                 value={m.key}
                 onChange={(e) => setAt(i, { key: e.target.value })}
                 placeholder="key"
-                title={dupKey(m.key, i) ? "Duplicate key — last write wins" : "Metadata key"}
+                title={
+                  dupKey(m.key, i)
+                    ? "Duplicate key — last write wins"
+                    : "Metadata key"
+                }
               />
               <input
                 className={`${INPUT_CLASS} flex-1`}
@@ -497,8 +530,16 @@ function OpRow({
                 </optgroup>
               )}
             </select>
-            <Toggle label="opt" on={!!op.optional} onClick={() => onChange({ optional: !op.optional })} />
-            <Toggle label="list" on={!!op.list} onClick={() => onChange({ list: !op.list })} />
+            <Toggle
+              label="opt"
+              on={!!op.optional}
+              onClick={() => onChange({ optional: !op.optional })}
+            />
+            <Toggle
+              label="list"
+              on={!!op.list}
+              onClick={() => onChange({ list: !op.list })}
+            />
           </>
         )}
 
@@ -516,7 +557,11 @@ function OpRow({
               on={!!op.spread}
               onClick={() => onChange({ spread: !op.spread })}
             />
-            <Toggle label="list" on={!!op.list} onClick={() => onChange({ list: !op.list })} />
+            <Toggle
+              label="list"
+              on={!!op.list}
+              onClick={() => onChange({ list: !op.list })}
+            />
           </>
         )}
 
@@ -572,7 +617,9 @@ function ProjectFields({
 }) {
   if (fields.length === 0) {
     return (
-      <p className="mt-1 text-[11px] text-fg-faint">Pick an entity to choose fields.</p>
+      <p className="mt-1 text-[11px] text-fg-faint">
+        Pick an entity to choose fields.
+      </p>
     );
   }
   return (
@@ -597,12 +644,22 @@ function ProjectFields({
   );
 }
 
-function Toggle({ label, on, onClick }: { label: string; on: boolean; onClick: () => void }) {
+function Toggle({
+  label,
+  on,
+  onClick,
+}: {
+  label: string;
+  on: boolean;
+  onClick: () => void;
+}) {
   return (
     <button
       onClick={onClick}
       className={`rounded px-1.5 py-0.5 text-[11px] ${
-        on ? "bg-accent/15 text-accent-strong" : "border border-edge-strong text-fg-faint hover:bg-hover"
+        on
+          ? "bg-accent/15 text-accent-strong"
+          : "border border-edge-strong text-fg-faint hover:bg-hover"
       }`}
       title={label}
     >

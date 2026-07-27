@@ -23,7 +23,10 @@ export type { ElementTemplate } from "./urbanComponents";
 
 /** Project-relative directories scanned for component element templates, in
  *  increasing precedence (later dirs override earlier on an id collision). */
-export const COMPONENT_DIRS = [".camunda/element-templates", "components"] as const;
+export const COMPONENT_DIRS = [
+  ".camunda/element-templates",
+  "components",
+] as const;
 
 /** Whether a parsed JSON value looks like a Zeebe element template: a string
  *  `id` and a non-empty `appliesTo` array. Loose on purpose — the modeler's
@@ -66,7 +69,10 @@ function componentFilePaths(files: FileNode[]): string[][] {
       }
       if (!node.path.endsWith(".json")) continue;
       COMPONENT_DIRS.forEach((dir, i) => {
-        if (node.path === `${dir}/${node.name}` || node.path.startsWith(`${dir}/`)) {
+        if (
+          node.path === `${dir}/${node.name}` ||
+          node.path.startsWith(`${dir}/`)
+        ) {
           byDir[i].push(node.path);
         }
       });
@@ -80,7 +86,9 @@ function componentFilePaths(files: FileNode[]): string[][] {
 /** Merges templates by `id` in `COMPONENT_DIRS` precedence order: a later dir's
  *  template (and, within a dir, a later file's) overrides an earlier one sharing
  *  the same id. Preserves first-seen insertion order for the palette. */
-export function mergeComponentsById(byDir: ElementTemplate[][]): ElementTemplate[] {
+export function mergeComponentsById(
+  byDir: ElementTemplate[][],
+): ElementTemplate[] {
   const byId = new Map<string, ElementTemplate>();
   for (const dir of byDir) {
     for (const tpl of dir) byId.set(tpl.id, tpl);

@@ -1,4 +1,8 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode } from "react";
+import type {
+  ButtonHTMLAttributes,
+  InputHTMLAttributes,
+  ReactNode,
+} from "react";
 
 // Shared UI primitives — the building blocks every view composes so the
 // console reads as one product. All colours come from theme tokens
@@ -17,10 +21,16 @@ export function PageHeader({
   return (
     <header className="mb-6 flex flex-wrap items-start justify-between gap-3">
       <div>
-        <h1 className="text-xl font-semibold tracking-tight text-fg">{title}</h1>
-        {subtitle && <p className="mt-1 max-w-2xl text-sm text-fg-muted">{subtitle}</p>}
+        <h1 className="text-xl font-semibold tracking-tight text-fg">
+          {title}
+        </h1>
+        {subtitle && (
+          <p className="mt-1 max-w-2xl text-sm text-fg-muted">{subtitle}</p>
+        )}
       </div>
-      {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+      {actions && (
+        <div className="flex shrink-0 items-center gap-2">{actions}</div>
+      )}
     </header>
   );
 }
@@ -57,8 +67,7 @@ const buttonVariants: Record<ButtonVariant, string> = {
     "bg-accent text-on-accent hover:bg-accent-strong border border-transparent shadow-sm",
   secondary:
     "border border-edge-strong bg-raised text-fg hover:bg-hover shadow-sm",
-  danger:
-    "bg-danger/10 text-danger border border-danger/30 hover:bg-danger/20",
+  danger: "bg-danger/10 text-danger border border-danger/30 hover:bg-danger/20",
   ghost: "border border-transparent text-fg-muted hover:bg-hover hover:text-fg",
 };
 

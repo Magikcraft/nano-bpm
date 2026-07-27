@@ -42,12 +42,24 @@ test("newOp defaults each kind's required fields", () => {
 test("changeOpKind carries ref across ref-bearing kinds and name across name-bearing kinds", () => {
   const carry: ShapeOp = { op: "carry", ref: "Order" };
   // carry → project keeps the ref, adds an empty field set.
-  assert.deepEqual(changeOpKind(carry, "project"), { op: "project", ref: "Order", fields: [] });
+  assert.deepEqual(changeOpKind(carry, "project"), {
+    op: "project",
+    ref: "Order",
+    fields: [],
+  });
   // carry → extend drops the ref (extend has no ref) and defaults.
-  assert.deepEqual(changeOpKind(carry, "extend"), { op: "extend", name: "", type: "string" });
+  assert.deepEqual(changeOpKind(carry, "extend"), {
+    op: "extend",
+    name: "",
+    type: "string",
+  });
   const ext: ShapeOp = { op: "extend", name: "approved", type: "boolean" };
   // extend → reference keeps the name, adds an empty ref.
-  assert.deepEqual(changeOpKind(ext, "reference"), { op: "reference", name: "approved", ref: "" });
+  assert.deepEqual(changeOpKind(ext, "reference"), {
+    op: "reference",
+    name: "approved",
+    ref: "",
+  });
   // same kind is identity.
   assert.equal(changeOpKind(carry, "carry"), carry);
 });
@@ -157,7 +169,9 @@ test("shapeEntities exposes each shape's preview-resolved fields", () => {
 });
 
 test("replaceOp swaps an op outright, leaving no stale fields (retype)", () => {
-  const ops: ShapeOp[] = [{ op: "project", ref: "Order", fields: ["a"], via: "fk" }];
+  const ops: ShapeOp[] = [
+    { op: "project", ref: "Order", fields: ["a"], via: "fk" },
+  ];
   // Retyping project -> carry must not leave `fields`/`via` behind.
   const next = replaceOp(ops, 0, changeOpKind(ops[0], "carry"));
   assert.deepEqual(next, [{ op: "carry", ref: "Order" }]);

@@ -40,8 +40,7 @@ export interface ThemeSpec {
 
 /** What the user picked: a built-in mode or a loadable theme by id. */
 export type ThemeSelection =
-  | { mode: "light" | "dark" | "system" }
-  | { mode: "theme"; id: string };
+  { mode: "light" | "dark" | "system" } | { mode: "theme"; id: string };
 
 const SELECTION_KEY = "nano.theme";
 /** Full spec of the active loadable theme, cached so the boot script can
@@ -57,13 +56,18 @@ export function cssVar(key: TokenKey): string {
 
 export function loadSelection(): ThemeSelection {
   const raw = localStorage.getItem(SELECTION_KEY);
-  if (raw === "light" || raw === "dark" || raw === "system") return { mode: raw };
-  if (raw?.startsWith("theme:")) return { mode: "theme", id: raw.slice("theme:".length) };
+  if (raw === "light" || raw === "dark" || raw === "system")
+    return { mode: raw };
+  if (raw?.startsWith("theme:"))
+    return { mode: "theme", id: raw.slice("theme:".length) };
   return { mode: "system" };
 }
 
 export function saveSelection(sel: ThemeSelection): void {
-  localStorage.setItem(SELECTION_KEY, sel.mode === "theme" ? `theme:${sel.id}` : sel.mode);
+  localStorage.setItem(
+    SELECTION_KEY,
+    sel.mode === "theme" ? `theme:${sel.id}` : sel.mode,
+  );
 }
 
 export function loadImportedThemes(): ThemeSpec[] {
@@ -104,7 +108,9 @@ export function isThemeSpec(v: unknown): v is ThemeSpec {
 }
 
 export function systemAppearance(): "light" | "dark" {
-  return window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  return window.matchMedia("(prefers-color-scheme: light)").matches
+    ? "light"
+    : "dark";
 }
 
 /**

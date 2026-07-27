@@ -1,4 +1,11 @@
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { Badge, Button, Input, inputClass } from "./ui";
 import {
@@ -70,7 +77,11 @@ export default function TriggersPanel({ name }: { name: string }) {
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto">
-        {tab === "triggers" ? <TriggersTab name={name} /> : <InboxTab name={name} />}
+        {tab === "triggers" ? (
+          <TriggersTab name={name} />
+        ) : (
+          <InboxTab name={name} />
+        )}
       </div>
     </div>
   );
@@ -104,7 +115,11 @@ function TriggersTab({ name }: { name: string }) {
     return <div className="p-8 text-sm text-fg-faint">Loading triggers…</div>;
   }
   if (loadError) {
-    return <div className="p-8 text-sm text-danger">Couldn’t load triggers: {loadError}</div>;
+    return (
+      <div className="p-8 text-sm text-danger">
+        Couldn’t load triggers: {loadError}
+      </div>
+    );
   }
   if (!data) return null;
 
@@ -128,10 +143,12 @@ function TriggersTab({ name }: { name: string }) {
           <div>
             <p className="font-medium text-fg-muted">No triggers declared.</p>
             <p className="mt-1">
-              Click <span className="font-medium text-fg-muted">Add trigger</span> to wire this App
-              to a schedule, a webhook, or a file change — or add a{" "}
-              <code className="text-fg-muted">triggers</code> block to{" "}
-              <code className="text-fg-muted">nano.app.json</code> by hand (ADR 0025).
+              Click{" "}
+              <span className="font-medium text-fg-muted">Add trigger</span> to
+              wire this App to a schedule, a webhook, or a file change — or add
+              a <code className="text-fg-muted">triggers</code> block to{" "}
+              <code className="text-fg-muted">nano.app.json</code> by hand (ADR
+              0025).
             </p>
           </div>
         </div>
@@ -164,7 +181,10 @@ function TriggersTab({ name }: { name: string }) {
             </tbody>
           </table>
 
-          <SourceRegistry sources={data.sources} onRefresh={() => void load()} />
+          <SourceRegistry
+            sources={data.sources}
+            onRefresh={() => void load()}
+          />
         </div>
       )}
 
@@ -242,9 +262,15 @@ function TriggerRow({ name, trigger }: { name: string; trigger: TriggerInfo }) {
             </span>
           )}
         </td>
-        <td className="px-2 py-2 text-xs text-fg-muted">{actionSummary(trigger.action)}</td>
+        <td className="px-2 py-2 text-xs text-fg-muted">
+          {actionSummary(trigger.action)}
+        </td>
         <td className="px-2 py-2 text-right">
-          <Button size="sm" variant="secondary" onClick={() => setOpen((v) => !v)}>
+          <Button
+            size="sm"
+            variant="secondary"
+            onClick={() => setOpen((v) => !v)}
+          >
             {open ? "Cancel" : "Run now"}
           </Button>
         </td>
@@ -265,7 +291,12 @@ function TriggerRow({ name, trigger }: { name: string; trigger: TriggerInfo }) {
                 className="w-full rounded-md border border-edge-strong bg-bg px-2 py-1.5 font-mono text-xs text-fg outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
               />
               <div className="flex items-center gap-2">
-                <Button size="sm" variant="primary" onClick={() => void run()} disabled={busy}>
+                <Button
+                  size="sm"
+                  variant="primary"
+                  onClick={() => void run()}
+                  disabled={busy}
+                >
                   {busy ? "Enqueuing…" : "Enqueue event"}
                 </Button>
                 {result && <span className="text-xs text-ok">{result}</span>}
@@ -320,8 +351,12 @@ function SourceRegistry({
               title={s.builtin ? "Compiled-in core source" : "Pack source"}
             >
               <span className="font-mono text-fg">{s.kind}</span>
-              {s.displayName && <span className="text-fg-faint">{s.displayName}</span>}
-              <Badge tone={s.builtin ? "accent" : "info"}>{s.builtin ? "core" : "pack"}</Badge>
+              {s.displayName && (
+                <span className="text-fg-faint">{s.displayName}</span>
+              )}
+              <Badge tone={s.builtin ? "accent" : "info"}>
+                {s.builtin ? "core" : "pack"}
+              </Badge>
             </span>
           ))}
         </div>
@@ -402,7 +437,10 @@ function AddTriggerDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const source = useMemo(() => sources.find((s) => s.kind === kind), [sources, kind]);
+  const source = useMemo(
+    () => sources.find((s) => s.kind === kind),
+    [sources, kind],
+  );
   const fields = source?.configFields ?? [];
 
   const setField = (key: string, value: string) =>
@@ -413,7 +451,11 @@ function AddTriggerDialog({
     (f) => f.required && !(config[f.key] ?? "").trim(),
   );
   const canSubmit =
-    id.trim() !== "" && !idTaken && kind !== "" && actionValue.trim() !== "" && !missingRequired;
+    id.trim() !== "" &&
+    !idTaken &&
+    kind !== "" &&
+    actionValue.trim() !== "" &&
+    !missingRequired;
 
   const submit = useCallback(async () => {
     setBusy(true);
@@ -441,7 +483,17 @@ function AddTriggerDialog({
     } finally {
       setBusy(false);
     }
-  }, [fields, config, name, id, kind, connection, actionKind, actionValue, onAdded]);
+  }, [
+    fields,
+    config,
+    name,
+    id,
+    kind,
+    connection,
+    actionKind,
+    actionValue,
+    onAdded,
+  ]);
 
   return (
     <Modal
@@ -449,7 +501,9 @@ function AddTriggerDialog({
       onClose={onClose}
       footer={
         <>
-          {error && <span className="mr-auto text-xs text-danger">{error}</span>}
+          {error && (
+            <span className="mr-auto text-xs text-danger">{error}</span>
+          )}
           <Button size="sm" variant="secondary" onClick={onClose}>
             Cancel
           </Button>
@@ -473,7 +527,11 @@ function AddTriggerDialog({
             placeholder="e.g. nightly-report"
             spellCheck={false}
           />
-          {idTaken && <span className="text-danger">A trigger with this id already exists.</span>}
+          {idTaken && (
+            <span className="text-danger">
+              A trigger with this id already exists.
+            </span>
+          )}
         </label>
 
         <label className="flex flex-col gap-1 text-xs text-fg-faint">
@@ -497,7 +555,10 @@ function AddTriggerDialog({
         </label>
 
         {fields.map((f) => (
-          <label key={f.key} className="flex flex-col gap-1 text-xs text-fg-faint">
+          <label
+            key={f.key}
+            className="flex flex-col gap-1 text-xs text-fg-faint"
+          >
             <span>
               {f.label}
               {f.required && <span className="text-danger"> *</span>}
@@ -508,7 +569,9 @@ function AddTriggerDialog({
               placeholder={f.default ?? ""}
               spellCheck={false}
             />
-            {f.description && <span className="text-fg-faint/80">{f.description}</span>}
+            {f.description && (
+              <span className="text-fg-faint/80">{f.description}</span>
+            )}
           </label>
         ))}
 
@@ -538,7 +601,9 @@ function AddTriggerDialog({
             <Input
               value={actionValue}
               onChange={(e) => setActionValue(e.target.value)}
-              placeholder={actionKind === "start" ? "process id" : "message name"}
+              placeholder={
+                actionKind === "start" ? "process id" : "message name"
+              }
               spellCheck={false}
               className="flex-1"
             />
@@ -596,7 +661,8 @@ function InboxTab({ name }: { name: string }) {
         <div className="rounded-md border border-warn/30 bg-warn/10 px-3 py-2 text-xs text-warn">
           Inbox unavailable: {loadError}
           <p className="mt-1 text-fg-faint">
-            The inbox is created on first event — run a trigger, or Run the App, to initialise it.
+            The inbox is created on first event — run a trigger, or Run the App,
+            to initialise it.
           </p>
         </div>
       </div>
@@ -612,7 +678,11 @@ function InboxTab({ name }: { name: string }) {
         <Badge tone="danger">failed {data.failed}</Badge>
         <div className="flex-1" />
         <label className="flex items-center gap-1.5 text-xs text-fg-faint">
-          <input type="checkbox" checked={auto} onChange={(e) => setAuto(e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={auto}
+            onChange={(e) => setAuto(e.target.checked)}
+          />
           Auto-refresh
         </label>
         <Button size="sm" variant="secondary" onClick={() => void load()}>
@@ -637,12 +707,20 @@ function InboxTab({ name }: { name: string }) {
           <tbody>
             {data.recent.map((r) => (
               <tr key={r.id} className="border-b border-edge/50">
-                <td className="px-2 py-1.5 font-mono text-xs text-fg-faint">{r.id}</td>
-                <td className="px-2 py-1.5 font-mono text-xs text-fg">{r.triggerId}</td>
+                <td className="px-2 py-1.5 font-mono text-xs text-fg-faint">
+                  {r.id}
+                </td>
+                <td className="px-2 py-1.5 font-mono text-xs text-fg">
+                  {r.triggerId}
+                </td>
                 <td className="px-2 py-1.5">
                   <Badge
                     tone={
-                      r.status === "done" ? "ok" : r.status === "failed" ? "danger" : "warn"
+                      r.status === "done"
+                        ? "ok"
+                        : r.status === "failed"
+                          ? "danger"
+                          : "warn"
                     }
                   >
                     {r.status}

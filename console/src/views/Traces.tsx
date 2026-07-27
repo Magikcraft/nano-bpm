@@ -9,7 +9,11 @@ import {
   type TraceSummary,
 } from "../gen";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
-import { TraceTimeline, fmtClock, fmtDuration } from "../components/TraceTimeline";
+import {
+  TraceTimeline,
+  fmtClock,
+  fmtDuration,
+} from "../components/TraceTimeline";
 import { Badge, ErrorText } from "../components/ui";
 
 function outcomeTone(outcome: TraceOutcome): "info" | "ok" | "neutral" {
@@ -146,7 +150,10 @@ function TraceDetail({ traceKey }: { traceKey: string }) {
           </div>
         )}
         <div className="mt-3 flex gap-1">
-          <TabButton active={tab === "timeline"} onClick={() => setTab("timeline")}>
+          <TabButton
+            active={tab === "timeline"}
+            onClick={() => setTab("timeline")}
+          >
             Timeline
           </TabButton>
           <TabButton active={tab === "data"} onClick={() => setTab("data")}>
@@ -166,7 +173,13 @@ function TraceDetail({ traceKey }: { traceKey: string }) {
   );
 }
 
-function DataView({ trace, traceKey }: { trace: InstanceTrace; traceKey: string }) {
+function DataView({
+  trace,
+  traceKey,
+}: {
+  trace: InstanceTrace;
+  traceKey: string;
+}) {
   return (
     <div className="space-y-4">
       <div className="flex items-center gap-3 text-sm">

@@ -87,7 +87,9 @@ export function registerFileTypes(
 /// at App boot and again after any install/remove in the Extensions view so
 /// newly contributed file types take effect without a full page reload.
 export function registerFileTypesFromOverview(ov: {
-  extensions: ReadonlyArray<{ fileTypes?: ReadonlyArray<{ ext: string; monacoLang: string }> }>;
+  extensions: ReadonlyArray<{
+    fileTypes?: ReadonlyArray<{ ext: string; monacoLang: string }>;
+  }>;
 }): void {
   for (const e of ov.extensions) {
     if (e.fileTypes?.length) registerFileTypes(e.fileTypes);

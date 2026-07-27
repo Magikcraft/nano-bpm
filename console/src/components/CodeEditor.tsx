@@ -11,7 +11,9 @@ import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";
 import jsonWorker from "monaco-editor/esm/vs/language/json/json.worker?worker";
 import tsWorker from "monaco-editor/esm/vs/language/typescript/ts.worker?worker";
 
-(self as unknown as { MonacoEnvironment: monaco.Environment }).MonacoEnvironment = {
+(
+  self as unknown as { MonacoEnvironment: monaco.Environment }
+).MonacoEnvironment = {
   getWorker(_workerId, label) {
     if (label === "json") return new jsonWorker();
     if (label === "typescript" || label === "javascript") return new tsWorker();
@@ -118,7 +120,9 @@ async function ensureSdkLib(): Promise<void> {
 let projectSdkLoaded = "";
 /** Per-project generated-SDK directory (mirror of `domain_types.ts::GEN_DIR`). */
 const GEN_DIR = "nano-generated";
-export async function ensureProjectSdkLibs(project: string | undefined): Promise<void> {
+export async function ensureProjectSdkLibs(
+  project: string | undefined,
+): Promise<void> {
   if (!project || projectSdkLoaded === project) return;
   const read = async (p: string): Promise<string | null> => {
     try {
@@ -253,7 +257,6 @@ function registerModels(models: ExtraModel[], activePath?: string): void {
 // effect without a reload.
 initMonacoIntellisense();
 
-
 export default function CodeEditor({
   value,
   language,
@@ -330,7 +333,9 @@ export default function CodeEditor({
         scheduleAta(next);
       }}
       onMount={(editor) => {
-        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => saveRef.current?.());
+        editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () =>
+          saveRef.current?.(),
+        );
       }}
       loading={<div className="p-4 text-sm text-fg-faint">Loading editor…</div>}
       options={{

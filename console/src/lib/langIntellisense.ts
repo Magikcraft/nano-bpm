@@ -68,7 +68,9 @@ function emptyMerged(): MergedIntellisense {
 /// Rebuild the store from a fresh extensions overview, merging every pack's
 /// `intellisense[]` by `monacoLang`, then notify subscribers so the Monaco
 /// providers can pick up any newly contributed languages. Idempotent.
-export function setIntellisenseFromOverview(ov: OverviewLike | undefined): void {
+export function setIntellisenseFromOverview(
+  ov: OverviewLike | undefined,
+): void {
   store.clear();
   for (const ext of ov?.extensions ?? []) {
     for (const block of ext.intellisense ?? []) {

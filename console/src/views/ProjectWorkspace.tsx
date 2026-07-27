@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  lazy,
+  Suspense,
+} from "react";
 import { Link, useParams } from "react-router-dom";
 import CodeEditor, { languageForFile } from "../components/CodeEditor";
 import MarkdownPreview from "../components/MarkdownPreview";
@@ -12,7 +20,9 @@ import FormPreview from "../components/FormPreview";
 import ShapeComposer, { type ShapePreview } from "../components/ShapeComposer";
 import type { MetaEntry, ShapeDecl } from "../lib/shapeCarrier";
 import type { ComposerEntity } from "../lib/shapeComposer";
-import AppManifestEditor, { isAppManifestPath } from "../components/AppManifestEditor";
+import AppManifestEditor, {
+  isAppManifestPath,
+} from "../components/AppManifestEditor";
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 const DataPanel = lazy(() => import("../components/DataPanel"));
 const TriggersPanel = lazy(() => import("../components/TriggersPanel"));
@@ -47,9 +57,18 @@ import {
 } from "../lib/api";
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
-import { processFeelVariables, componentOutputFeelVariables, type ComponentOutput } from "../lib/bpmnDomainVariables";
+import {
+  processFeelVariables,
+  componentOutputFeelVariables,
+  type ComponentOutput,
+} from "../lib/bpmnDomainVariables";
 import { formTypeId } from "@nanobpm/nano-app-schema";
-import { loadProjectComponents, loadPackComponents, combineComponents, type ElementTemplate } from "../lib/projectComponents";
+import {
+  loadProjectComponents,
+  loadPackComponents,
+  combineComponents,
+  type ElementTemplate,
+} from "../lib/projectComponents";
 import {
   subscribe as subscribeDebug,
   snapshot as debugSnapshot,
@@ -67,8 +86,8 @@ export default function ProjectWorkspace() {
   // Remember the open file per project so leaving the workspace (e.g. to peek
   // at Metrics) and coming back restores the same editor tab.
   const selectedKey = `nano.project.${name}.openFile`;
-  const [selected, setSelectedState] = useState<string | null>(
-    () => localStorage.getItem(selectedKey),
+  const [selected, setSelectedState] = useState<string | null>(() =>
+    localStorage.getItem(selectedKey),
   );
   const setSelected = useCallback(
     (path: string | null) => {
@@ -95,12 +114,18 @@ export default function ProjectWorkspace() {
     dragging.current = true;
     const onMove = (ev: MouseEvent) => {
       if (!dragging.current) return;
-      const next = Math.min(Math.max(window.innerHeight - ev.clientY, 80), 1200);
+      const next = Math.min(
+        Math.max(window.innerHeight - ev.clientY, 80),
+        1200,
+      );
       setConsoleHeight(next);
     };
     const onUp = () => {
       dragging.current = false;
-      localStorage.setItem("nano.consoleHeight", String(consoleHeightRef.current));
+      localStorage.setItem(
+        "nano.consoleHeight",
+        String(consoleHeightRef.current),
+      );
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
@@ -112,7 +137,9 @@ export default function ProjectWorkspace() {
 
   const reloadFiles = useCallback(async () => {
     try {
-      const res = (await listProjectFiles({ path: { name }, throwOnError: true })).data;
+      const res = (
+        await listProjectFiles({ path: { name }, throwOnError: true })
+      ).data;
       setDetail((d) => (d ? { ...d, files: res.files } : d));
     } catch {
       /* ignore */
@@ -140,8 +167,7 @@ export default function ProjectWorkspace() {
     if (!detail || !selected) return;
     const exists = (nodes: FileNode[]): boolean =>
       nodes.some(
-        (n) =>
-          n.path === selected || (n.children ? exists(n.children) : false),
+        (n) => n.path === selected || (n.children ? exists(n.children) : false),
       );
     if (!exists(detail.files)) setSelected(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -152,7 +178,8 @@ export default function ProjectWorkspace() {
     if (!name) return;
     const src = projectLogs(name, (line) => {
       setLogs((prev) => {
-        const next = prev.length > 2000 ? prev.slice(prev.length - 2000) : prev.slice();
+        const next =
+          prev.length > 2000 ? prev.slice(prev.length - 2000) : prev.slice();
         next.push(line);
         return next;
       });
@@ -167,7 +194,8 @@ export default function ProjectWorkspace() {
     if (!active) return;
     const t = setInterval(async () => {
       try {
-        const d = (await getProject({ path: { name }, throwOnError: true })).data;
+        const d = (await getProject({ path: { name }, throwOnError: true }))
+          .data;
         setRunState(d.runState);
       } catch {
         /* ignore */
@@ -182,7 +210,8 @@ export default function ProjectWorkspace() {
 
   const runnable = detail?.runnable ?? false;
   const lang = detail?.config.lang ?? "deno";
-  const running = runState?.status === "running" || runState?.status === "starting";
+  const running =
+    runState?.status === "running" || runState?.status === "starting";
   const compiling = runState?.compiling ?? false;
   const runConfigs = detail?.config.toolchain?.runConfigs ?? [];
   // The server resolves the same fallback (pinned → default:true → first) at
@@ -200,7 +229,11 @@ export default function ProjectWorkspace() {
 
   const changeRunConfig = async (id: string | null) => {
     try {
-      await setActiveRunConfig({ path: { name }, body: { id }, throwOnError: true });
+      await setActiveRunConfig({
+        path: { name },
+        body: { id },
+        throwOnError: true,
+      });
       void load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -210,14 +243,18 @@ export default function ProjectWorkspace() {
   const run = async () => {
     setLogs([]);
     try {
-      setRunState((await runProject({ path: { name }, throwOnError: true })).data);
+      setRunState(
+        (await runProject({ path: { name }, throwOnError: true })).data,
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
   };
   const stop = async () => {
     try {
-      setRunState((await stopProject({ path: { name }, throwOnError: true })).data);
+      setRunState(
+        (await stopProject({ path: { name }, throwOnError: true })).data,
+      );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -234,16 +271,20 @@ export default function ProjectWorkspace() {
     // (flat `compile` or any runConfig with compile argv) nor its lang pack
     // drives compile — i.e. lang == "deno" and no argv override. Anything
     // else has a canonical compile and skips the cross-compile modal.
-    const hasRunConfigCompile = (detail?.config.toolchain?.runConfigs ?? []).some(
-      (c) => (c.compile?.length ?? 0) > 0,
-    );
+    const hasRunConfigCompile = (
+      detail?.config.toolchain?.runConfigs ?? []
+    ).some((c) => (c.compile?.length ?? 0) > 0);
     const isDenoProject =
       !detail?.config.toolchain?.compile?.length &&
       !hasRunConfigCompile &&
       (!detail?.config.lang || detail.config.lang === "deno");
     if (!isDenoProject) {
       try {
-        await compileProject({ path: { name }, body: { targets: [] }, throwOnError: true });
+        await compileProject({
+          path: { name },
+          body: { targets: [] },
+          throwOnError: true,
+        });
         void load();
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -256,7 +297,10 @@ export default function ProjectWorkspace() {
   if (error) {
     return (
       <div className="p-8">
-        <Link to="/projects" className="text-sm text-accent-strong hover:underline">
+        <Link
+          to="/projects"
+          className="text-sm text-accent-strong hover:underline"
+        >
           ← Projects
         </Link>
         <div className="mt-4 rounded-md border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger">
@@ -280,7 +324,10 @@ export default function ProjectWorkspace() {
     <div className="flex h-full flex-col">
       {/* Toolbar */}
       <div className="flex items-center gap-2 border-b border-edge bg-panel px-4 py-2">
-        <nav className="flex items-center gap-1.5 text-sm" aria-label="Breadcrumb">
+        <nav
+          className="flex items-center gap-1.5 text-sm"
+          aria-label="Breadcrumb"
+        >
           <Link to="/projects" className="text-fg-faint hover:text-fg-muted">
             Projects
           </Link>
@@ -323,7 +370,11 @@ export default function ProjectWorkspace() {
             ■ Stop
           </ToolbarButton>
         ) : (
-          <ToolbarButton onClick={() => void run()} kind="primary" disabled={!runnable}>
+          <ToolbarButton
+            onClick={() => void run()}
+            kind="primary"
+            disabled={!runnable}
+          >
             ▶ Run
           </ToolbarButton>
         )}
@@ -355,8 +406,12 @@ export default function ProjectWorkspace() {
             Triggers
           </ToolbarButton>
         )}
-        <ToolbarButton onClick={() => setShowConfig(true)}>Configure</ToolbarButton>
-        <ToolbarButton onClick={() => void exportProject(name, false)}>Export</ToolbarButton>
+        <ToolbarButton onClick={() => setShowConfig(true)}>
+          Configure
+        </ToolbarButton>
+        <ToolbarButton onClick={() => void exportProject(name, false)}>
+          Export
+        </ToolbarButton>
       </div>
 
       {!runnable && (
@@ -370,13 +425,15 @@ export default function ProjectWorkspace() {
                     .map((p) => `\u201C${p}\u201D`)
                     .join(" or ")} on your PATH.`
                 : "";
-            const who = mt?.displayName ?? (lang === "deno" ? "Deno or Node" : lang);
+            const who =
+              mt?.displayName ?? (lang === "deno" ? "Deno or Node" : lang);
             return (
               <>
-                No {who} toolchain detected — Run and Compile for this project need it.
+                No {who} toolchain detected — Run and Compile for this project
+                need it.
                 {looked}
-                {mt?.installHint ? ` ${mt.installHint}` : ""} Authoring and Export
-                still work.
+                {mt?.installHint ? ` ${mt.installHint}` : ""} Authoring and
+                Export still work.
                 {mt?.installUrl && (
                   <>
                     {" "}
@@ -412,7 +469,11 @@ export default function ProjectWorkspace() {
         {showData ? (
           <div className="flex min-w-0 flex-1 flex-col">
             <Suspense
-              fallback={<div className="p-8 text-sm text-fg-faint">Loading Data panel…</div>}
+              fallback={
+                <div className="p-8 text-sm text-fg-faint">
+                  Loading Data panel…
+                </div>
+              }
             >
               <DataPanel name={name} />
             </Suspense>
@@ -420,7 +481,11 @@ export default function ProjectWorkspace() {
         ) : showTriggers ? (
           <div className="flex min-w-0 flex-1 flex-col">
             <Suspense
-              fallback={<div className="p-8 text-sm text-fg-faint">Loading Triggers panel…</div>}
+              fallback={
+                <div className="p-8 text-sm text-fg-faint">
+                  Loading Triggers panel…
+                </div>
+              }
             >
               <TriggersPanel name={name} />
             </Suspense>
@@ -455,7 +520,12 @@ export default function ProjectWorkspace() {
               className="h-1.5 shrink-0 cursor-row-resize bg-hover transition-colors hover:bg-accent"
               title="Drag to resize console"
             />
-            <RunConsole logs={logs} forwardRef={logRef} onClear={() => setLogs([])} height={consoleHeight} />
+            <RunConsole
+              logs={logs}
+              forwardRef={logRef}
+              onClear={() => setLogs([])}
+              height={consoleHeight}
+            />
           </div>
         )}
       </div>
@@ -540,7 +610,11 @@ function FileBrowser({
     const base = prompt("New folder path (project-relative):", "resources/");
     if (!base) return;
     try {
-      await createProjectPath({ path: { name }, body: { path: base, dir: true }, throwOnError: true });
+      await createProjectPath({
+        path: { name },
+        body: { path: base, dir: true },
+        throwOnError: true,
+      });
       onChanged();
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
@@ -549,7 +623,11 @@ function FileBrowser({
   const del = async (path: string) => {
     if (!confirm(`Delete ${path}?`)) return;
     try {
-      await deleteProjectPath({ path: { name }, query: { path }, throwOnError: true });
+      await deleteProjectPath({
+        path: { name },
+        query: { path },
+        throwOnError: true,
+      });
       onChanged();
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
@@ -559,7 +637,11 @@ function FileBrowser({
   // Right-click "copy path" menu. rootPath is the project dir on the host; the
   // path separator is inferred from it so absolute paths look native on Windows
   // (backslashes) as well as POSIX hosts.
-  const [menu, setMenu] = useState<{ x: number; y: number; node: FileNode } | null>(null);
+  const [menu, setMenu] = useState<{
+    x: number;
+    y: number;
+    node: FileNode;
+  } | null>(null);
   const sep = rootPath.includes("\\") && !rootPath.includes("/") ? "\\" : "/";
   const absPathOf = (rel: string) => rootPath + sep + rel.split("/").join(sep);
   const openMenu = (e: React.MouseEvent, node: FileNode) => {
@@ -572,16 +654,31 @@ function FileBrowser({
       <div className="flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-fg-faint">
         <span>Files</span>
         <div className="flex gap-1">
-          <button title="New file" onClick={() => setNewFileOpen(true)} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg">
+          <button
+            title="New file"
+            onClick={() => setNewFileOpen(true)}
+            className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg"
+          >
             ＋
           </button>
-          <button title="New folder" onClick={() => void newFolder()} className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg">
+          <button
+            title="New folder"
+            onClick={() => void newFolder()}
+            className="rounded px-1.5 py-0.5 hover:bg-hover hover:text-fg"
+          >
             ⊞
           </button>
         </div>
       </div>
       <div className="min-h-0 flex-1 overflow-auto px-1 pb-2">
-        <FileTree nodes={files} depth={0} selected={selected} onSelect={onSelect} onDelete={del} onContextMenu={openMenu} />
+        <FileTree
+          nodes={files}
+          depth={0}
+          selected={selected}
+          onSelect={onSelect}
+          onDelete={del}
+          onContextMenu={openMenu}
+        />
       </div>
       {/* On-disk location of the project. Lets users find their files outside
           the IDE; the copy button grabs the absolute path. */}
@@ -688,22 +785,38 @@ function PathContextMenu({
     onClose();
   };
   return (
-    <div className="fixed inset-0 z-50" onClick={onClose} onContextMenu={(e) => { e.preventDefault(); onClose(); }}>
+    <div
+      className="fixed inset-0 z-50"
+      onClick={onClose}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onClose();
+      }}
+    >
       <ul
         className="absolute min-w-44 rounded-md border border-edge bg-panel py-1 text-sm shadow-lg"
         style={{ left: x, top: y }}
         onClick={(e) => e.stopPropagation()}
       >
-        <li className="truncate px-3 py-1 text-[11px] uppercase tracking-wider text-fg-faint" title={node.path}>
+        <li
+          className="truncate px-3 py-1 text-[11px] uppercase tracking-wider text-fg-faint"
+          title={node.path}
+        >
           {node.name}
         </li>
         <li>
-          <button className="block w-full px-3 py-1.5 text-left text-fg-muted hover:bg-hover hover:text-fg" onClick={() => void act(absPath)}>
+          <button
+            className="block w-full px-3 py-1.5 text-left text-fg-muted hover:bg-hover hover:text-fg"
+            onClick={() => void act(absPath)}
+          >
             Copy path
           </button>
         </li>
         <li>
-          <button className="block w-full px-3 py-1.5 text-left text-fg-muted hover:bg-hover hover:text-fg" onClick={() => void act(node.path)}>
+          <button
+            className="block w-full px-3 py-1.5 text-left text-fg-muted hover:bg-hover hover:text-fg"
+            onClick={() => void act(node.path)}
+          >
             Copy relative path
           </button>
         </li>
@@ -790,15 +903,18 @@ function NewFileModal({
   const kindOf = useCallback(
     (id: NewFileKindId) =>
       id === "source"
-        ? { id, label: "Source", hint: `${config.lang} source (${sourceExt})`, dir: sourceDir, ext: sourceExt }
+        ? {
+            id,
+            label: "Source",
+            hint: `${config.lang} source (${sourceExt})`,
+            dir: sourceDir,
+            ext: sourceExt,
+          }
         : NEW_FILE_KINDS.find((k) => k.id === id)!,
     [config.lang, sourceDir, sourceExt],
   );
 
-  const kinds = useMemo(
-    () => [...NEW_FILE_KINDS, kindOf("source")],
-    [kindOf],
-  );
+  const kinds = useMemo(() => [...NEW_FILE_KINDS, kindOf("source")], [kindOf]);
 
   const [kindId, setKindId] = useState<NewFileKindId>("model");
   const [baseName, setBaseName] = useState("new");
@@ -868,7 +984,9 @@ function NewFileModal({
                 />
                 <span className="min-w-0">
                   <span className="block font-medium text-fg">{k.label}</span>
-                  <span className="block truncate text-xs text-fg-faint">{k.hint}</span>
+                  <span className="block truncate text-xs text-fg-faint">
+                    {k.hint}
+                  </span>
                 </span>
               </label>
             ))}
@@ -988,7 +1106,14 @@ function TreeNode({
           <span className="truncate">{node.name}</span>
         </div>
         {open && node.children && (
-          <FileTree nodes={node.children} depth={depth + 1} selected={selected} onSelect={onSelect} onDelete={onDelete} onContextMenu={onContextMenu} />
+          <FileTree
+            nodes={node.children}
+            depth={depth + 1}
+            selected={selected}
+            onSelect={onSelect}
+            onDelete={onDelete}
+            onContextMenu={onContextMenu}
+          />
         )}
       </li>
     );
@@ -999,7 +1124,9 @@ function TreeNode({
       <div
         style={pad}
         className={`group flex cursor-pointer items-center gap-1 rounded py-1 pr-2 text-sm ${
-          active ? "bg-accent/10 font-medium text-accent-strong" : "text-fg-muted hover:bg-hover hover:text-fg"
+          active
+            ? "bg-accent/10 font-medium text-accent-strong"
+            : "text-fg-muted hover:bg-hover hover:text-fg"
         }`}
         onClick={() => onSelect(node.path)}
         onContextMenu={(e) => onContextMenu(e, node)}
@@ -1055,7 +1182,9 @@ function EditorPane({
   // Form files open in the graphical form editor; the user can switch to a raw
   // JSON editor to inspect/tweak the underlying schema. The editor stays mounted
   // when the JSON tab is active so form state is preserved across toggles.
-  const [formView, setFormView] = useState<"visual" | "json" | "preview">("visual");
+  const [formView, setFormView] = useState<"visual" | "json" | "preview">(
+    "visual",
+  );
   const [formJson, setFormJson] = useState<string>("");
   // Mirrors bpmnXmlDirtyRef for the form JSON tab.
   const formJsonDirtyRef = useRef(false);
@@ -1144,14 +1273,18 @@ function EditorPane({
         loadProjectComponents(name, res.data.files),
       ),
     ])
-      .then(([pack, project]) => alive && setComponents(combineComponents(pack, project)))
+      .then(
+        ([pack, project]) =>
+          alive && setComponents(combineComponents(pack, project)),
+      )
       .catch(() => alive && setComponents([]));
     return () => {
       alive = false;
     };
   }, [name, kind, path]);
   const dmnGetVariables = useCallback(
-    (decisionId: string | undefined) => decisionFeelVariables(manifest, decisionId),
+    (decisionId: string | undefined) =>
+      decisionFeelVariables(manifest, decisionId),
     [manifest],
   );
   const bpmnGetVariables = useCallback(
@@ -1207,7 +1340,11 @@ function EditorPane({
   // in-memory manifest immediately so the modeler's FEEL scopes + the panel reflect
   // the change before the write lands.
   const setWorkerType = useCallback(
-    (taskType: string, field: "inputType" | "outputType", value: string): void => {
+    (
+      taskType: string,
+      field: "inputType" | "outputType",
+      value: string,
+    ): void => {
       const prev = manifestTextRef.current;
       if (prev == null) return;
       let obj: Record<string, unknown>;
@@ -1258,15 +1395,20 @@ function EditorPane({
   // form editor's "Data source" binding inspector (ADR 0024 §5). Recomputed when
   // the manifest reloads; the FormEditor reads it lazily via getDataSources.
   const dataSourceNames = useMemo<string[]>(() => {
-    const sources = (manifest as { data?: { sources?: unknown } } | undefined)?.data?.sources;
+    const sources = (manifest as { data?: { sources?: unknown } } | undefined)
+      ?.data?.sources;
     if (!sources || typeof sources !== "object") return [];
     return Object.keys(sources as Record<string, unknown>);
   }, [manifest]);
-  const formGetDataSources = useCallback(() => dataSourceNames, [dataSourceNames]);
+  const formGetDataSources = useCallback(
+    () => dataSourceNames,
+    [dataSourceNames],
+  );
   // The manifest's default datasource (`data.default`), used to resolve a
   // `data.query(sql)` call's default-source form in the form preview (ADR 0024 §5).
   const defaultDataSource = useMemo<string | undefined>(() => {
-    const d = (manifest as { data?: { default?: unknown } } | undefined)?.data?.default;
+    const d = (manifest as { data?: { default?: unknown } } | undefined)?.data
+      ?.default;
     return typeof d === "string" ? d : undefined;
   }, [manifest]);
 
@@ -1278,7 +1420,9 @@ function EditorPane({
   const [shapesOpen, setShapesOpen] = useState(false);
   const [composerShapes, setComposerShapes] = useState<ShapeDecl[]>([]);
   const [composerMeta, setComposerMeta] = useState<MetaEntry[]>([]);
-  const [composerEntities, setComposerEntities] = useState<ComposerEntity[]>([]);
+  const [composerEntities, setComposerEntities] = useState<ComposerEntity[]>(
+    [],
+  );
 
   // The fuse leaf entities the composer's pickers offer: every DB table (across
   // datasources) as a `carry`/`project` source with its columns + FK paths, and
@@ -1288,11 +1432,17 @@ function EditorPane({
   const loadComposerEntities = useCallback(async () => {
     const tableEntities: ComposerEntity[] = [];
     try {
-      const srcRes = await getDataSources({ path: { name }, throwOnError: true });
+      const srcRes = await getDataSources({
+        path: { name },
+        throwOnError: true,
+      });
       const sources = (srcRes.data.sources ?? []).map((s) => s.name);
       for (const source of sources) {
         try {
-          const schema = await getDataSchema({ path: { name, source }, throwOnError: true });
+          const schema = await getDataSchema({
+            path: { name, source },
+            throwOnError: true,
+          });
           for (const t of schema.data.tables ?? []) {
             // Qualify table ids as `source.table` — the server always indexes a
             // table under that unambiguous alias (and FK targets are stored
@@ -1392,7 +1542,6 @@ function EditorPane({
     if (kind !== "bpmn" || manifest == null) setShapesOpen(false);
   }, [kind, manifest, path]);
 
-
   useEffect(() => {
     let alive = true;
     setContent(null);
@@ -1412,7 +1561,10 @@ function EditorPane({
         setMeta(f);
         setContent(f.binary ? null : f.text);
       })
-      .catch((e) => alive && setLoadError(e instanceof Error ? e.message : String(e)));
+      .catch(
+        (e) =>
+          alive && setLoadError(e instanceof Error ? e.message : String(e)),
+      );
     return () => {
       alive = false;
     };
@@ -1428,19 +1580,19 @@ function EditorPane({
     const seeded = () => setDirty(true);
     if (kind === "bpmn" && bpmnRef.current) {
       const ed = bpmnRef.current;
-      void (isEmpty ? ed.createBlank().then(seeded) : ed.importXml(content)).catch(
-        () => void 0,
-      );
+      void (
+        isEmpty ? ed.createBlank().then(seeded) : ed.importXml(content)
+      ).catch(() => void 0);
     } else if (kind === "dmn" && dmnRef.current) {
       const ed = dmnRef.current;
-      void (isEmpty ? ed.createBlank().then(seeded) : ed.importXml(content)).catch(
-        () => void 0,
-      );
+      void (
+        isEmpty ? ed.createBlank().then(seeded) : ed.importXml(content)
+      ).catch(() => void 0);
     } else if (kind === "form" && formRef.current) {
       const ed = formRef.current;
-      void (isEmpty ? ed.createBlank().then(seeded) : ed.importSchema(content)).catch(
-        () => void 0,
-      );
+      void (
+        isEmpty ? ed.createBlank().then(seeded) : ed.importSchema(content)
+      ).catch(() => void 0);
     }
     // Only when the document first arrives for this path.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1451,11 +1603,23 @@ function EditorPane({
     try {
       let body = content ?? "";
       if (kind === "bpmn" && bpmnView === "xml") body = bpmnXml;
-      else if (kind === "bpmn" && bpmnRef.current) body = await bpmnRef.current.getXml();
-      else if (kind === "dmn" && dmnRef.current) body = await dmnRef.current.getXml();
-      else if (kind === "form" && (formView === "json" || formView === "preview")) body = formJson;
-      else if (kind === "form" && formRef.current) body = await formRef.current.getSchema();
-      await saveProjectFile({ path: { name }, query: { path }, body, throwOnError: true });
+      else if (kind === "bpmn" && bpmnRef.current)
+        body = await bpmnRef.current.getXml();
+      else if (kind === "dmn" && dmnRef.current)
+        body = await dmnRef.current.getXml();
+      else if (
+        kind === "form" &&
+        (formView === "json" || formView === "preview")
+      )
+        body = formJson;
+      else if (kind === "form" && formRef.current)
+        body = await formRef.current.getSchema();
+      await saveProjectFile({
+        path: { name },
+        query: { path },
+        body,
+        throwOnError: true,
+      });
       setContent(body);
       setDirty(false);
       if (kind === "bpmn") {
@@ -1481,7 +1645,10 @@ function EditorPane({
         // Persisted body is now authoritative in both surfaces (mirrors bpmn).
         setFormJson(body);
         formJsonDirtyRef.current = false;
-        if ((formView === "json" || formView === "preview") && formRef.current) {
+        if (
+          (formView === "json" || formView === "preview") &&
+          formRef.current
+        ) {
           try {
             await formRef.current.importSchema(body);
           } catch {
@@ -1534,7 +1701,11 @@ function EditorPane({
   const deploy = useCallback(async () => {
     if (content == null) return;
     setDeploying(true);
-    const modelName = path.split("/").pop()?.replace(/\.bpmn$/i, "") || name;
+    const modelName =
+      path
+        .split("/")
+        .pop()
+        ?.replace(/\.bpmn$/i, "") || name;
     debug("modeler", "info", `deploy '${modelName}' clicked`, {
       file: path,
       bytes: content.length,
@@ -1551,7 +1722,9 @@ function EditorPane({
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       debug("modeler", "error", `deploy failed: ${msg}`);
-      alert(`Deploy failed: ${msg}\n\nSee the Debug tab for the request URL and diagnostic hints.`);
+      alert(
+        `Deploy failed: ${msg}\n\nSee the Debug tab for the request URL and diagnostic hints.`,
+      );
     } finally {
       setDeploying(false);
     }
@@ -1576,7 +1749,9 @@ function EditorPane({
             await bpmnRef.current.importXml(bpmnXml);
             bpmnXmlDirtyRef.current = false;
           } catch (e) {
-            alert(`Could not import XML: ${e instanceof Error ? e.message : String(e)}`);
+            alert(
+              `Could not import XML: ${e instanceof Error ? e.message : String(e)}`,
+            );
             return;
           }
         }
@@ -1605,7 +1780,9 @@ function EditorPane({
             await formRef.current.importSchema(formJson);
             formJsonDirtyRef.current = false;
           } catch (e) {
-            alert(`Could not import form JSON: ${e instanceof Error ? e.message : String(e)}`);
+            alert(
+              `Could not import form JSON: ${e instanceof Error ? e.message : String(e)}`,
+            );
             return;
           }
         }
@@ -1639,11 +1816,14 @@ function EditorPane({
     return (
       <div className="flex h-full flex-col">
         <div className="flex items-center gap-3 border-b border-edge bg-panel px-3 py-1.5">
-          <span className="truncate font-mono text-xs text-fg-muted">{path}</span>
+          <span className="truncate font-mono text-xs text-fg-muted">
+            {path}
+          </span>
         </div>
         <div className="flex min-h-0 flex-1 items-center justify-center p-6">
           <p className="max-w-2xl break-words text-center font-mono text-sm leading-relaxed text-fg-muted">
-            Binary file. Path on disk: {meta.absPath}. Size: {meta.size} ({mb}MB)
+            Binary file. Path on disk: {meta.absPath}. Size: {meta.size} ({mb}
+            MB)
           </p>
         </div>
       </div>
@@ -1751,7 +1931,9 @@ function EditorPane({
             onClick={async () => {
               // Pull from whichever surface currently holds the latest doc.
               const xml =
-                bpmnView === "xml" ? bpmnXml : ((await bpmnRef.current?.getXml()) ?? "");
+                bpmnView === "xml"
+                  ? bpmnXml
+                  : ((await bpmnRef.current?.getXml()) ?? "");
               if (xml) setTestXml(xml);
             }}
             className="rounded-md border border-edge-strong px-3 py-1 text-xs font-medium text-fg transition-colors hover:border-ok hover:text-ok"
@@ -1788,8 +1970,16 @@ function EditorPane({
               state (selection, viewport, in-flight edits) survives toggling.
               The XML editor is layered above via absolute positioning.
             */}
-            <div className={bpmnView === "visual" ? "h-full" : "h-full invisible"}>
-              <BpmnModeler ref={bpmnRef} onChange={onBpmnChange} getVariables={bpmnGetVariables} components={components} domainTypeBinding={bpmnDomainTypeBinding} />
+            <div
+              className={bpmnView === "visual" ? "h-full" : "h-full invisible"}
+            >
+              <BpmnModeler
+                ref={bpmnRef}
+                onChange={onBpmnChange}
+                getVariables={bpmnGetVariables}
+                components={components}
+                domainTypeBinding={bpmnDomainTypeBinding}
+              />
             </div>
             {bpmnView === "xml" && (
               <div className="absolute inset-0 bg-app">
@@ -1815,7 +2005,10 @@ function EditorPane({
                     </div>
                   }
                 >
-                  <TestRunPanel xml={testXml} onClose={() => setTestXml(null)} />
+                  <TestRunPanel
+                    xml={testXml}
+                    onClose={() => setTestXml(null)}
+                  />
                 </Suspense>
               </div>
             )}
@@ -1842,7 +2035,11 @@ function EditorPane({
           </div>
         )}
         {kind === "dmn" && (
-          <DmnModeler ref={dmnRef} onChange={() => setDirty(true)} getVariables={dmnGetVariables} />
+          <DmnModeler
+            ref={dmnRef}
+            onChange={() => setDirty(true)}
+            getVariables={dmnGetVariables}
+          />
         )}
         {kind === "form" && (
           <div className="relative h-full">
@@ -1851,7 +2048,9 @@ function EditorPane({
               state survives toggling. The JSON editor is layered above via
               absolute positioning (mirrors the BPMN visual/xml split).
             */}
-            <div className={formView === "visual" ? "h-full" : "h-full invisible"}>
+            <div
+              className={formView === "visual" ? "h-full" : "h-full invisible"}
+            >
               <FormEditor
                 ref={formRef}
                 onChange={() => setDirty(true)}
@@ -1875,7 +2074,11 @@ function EditorPane({
             )}
             {formView === "preview" && (
               <div className="absolute inset-0 bg-app">
-                <FormPreview schema={formJson} name={name} defaultSource={defaultDataSource} />
+                <FormPreview
+                  schema={formJson}
+                  name={name}
+                  defaultSource={defaultDataSource}
+                />
               </div>
             )}
           </div>
@@ -1956,10 +2159,16 @@ function RunConsole({
     <div className="flex shrink-0 flex-col bg-inset" style={{ height }}>
       <div className="flex items-center justify-between border-b border-edge pr-3">
         <div className="flex">
-          <button className={tabCls(tab === "output")} onClick={() => setTab("output")}>
+          <button
+            className={tabCls(tab === "output")}
+            onClick={() => setTab("output")}
+          >
             Output
           </button>
-          <button className={tabCls(tab === "debug")} onClick={() => setTab("debug")}>
+          <button
+            className={tabCls(tab === "debug")}
+            onClick={() => setTab("debug")}
+          >
             Debug{debugLog.length ? ` · ${debugLog.length}` : ""}
           </button>
         </div>
@@ -2009,8 +2218,8 @@ function RunConsole({
         >
           {debugLog.length === 0 ? (
             <div className="text-fg-faint">
-              No debug traces yet. Deploy, Start Instance and probe requests
-              log their URL, response, and timing here.
+              No debug traces yet. Deploy, Start Instance and probe requests log
+              their URL, response, and timing here.
             </div>
           ) : (
             debugLog.map((e) => <DebugRow key={e.id} entry={e} />)
@@ -2046,7 +2255,7 @@ function DebugRow({ entry }: { entry: DebugEntry }) {
       </button>
       {open && hasDetail && (
         <pre className="ml-8 border-l-2 border-edge px-2 text-fg-muted">
-{JSON.stringify(entry.detail, null, 2)}
+          {JSON.stringify(entry.detail, null, 2)}
         </pre>
       )}
     </div>
@@ -2090,8 +2299,13 @@ function ConfigModal({
     setEnvRows((rows) => [...rows, { key: "", value: "" }]);
   const removeEnvRow = (idx: number) =>
     setEnvRows((rows) => rows.filter((_, i) => i !== idx));
-  const setEnvRow = (idx: number, patch: Partial<{ key: string; value: string }>) =>
-    setEnvRows((rows) => rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)));
+  const setEnvRow = (
+    idx: number,
+    patch: Partial<{ key: string; value: string }>,
+  ) =>
+    setEnvRows((rows) =>
+      rows.map((r, i) => (i === idx ? { ...r, ...patch } : r)),
+    );
 
   const save = async () => {
     setBusy(true);
@@ -2101,18 +2315,20 @@ function ConfigModal({
         const k = key.trim();
         if (k) env[k] = value;
       }
-      const cfg = (await saveProjectConfig({
-        path: { name },
-        body: {
-          ...config,
-          description: desc,
-          deployTarget,
-          main,
-          platforms: selected,
-          env,
-        },
-        throwOnError: true,
-      })).data;
+      const cfg = (
+        await saveProjectConfig({
+          path: { name },
+          body: {
+            ...config,
+            description: desc,
+            deployTarget,
+            main,
+            platforms: selected,
+            env,
+          },
+          throwOnError: true,
+        })
+      ).data;
       onSaved(cfg);
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
@@ -2122,15 +2338,39 @@ function ConfigModal({
 
   return (
     <Modal title="Configure project" onClose={onClose}>
-      <label className="block text-xs uppercase tracking-wider text-fg-faint">Description</label>
-      <input value={desc} onChange={(e) => setDesc(e.target.value)} className={inputCls} />
-      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">Deploy target</label>
-      <input value={deployTarget} onChange={(e) => setDeployTarget(e.target.value)} className={inputCls} placeholder="http://localhost:8080" />
-      <p className="mt-1 text-[11px] text-fg-faint">REST API at &lt;target&gt;/v2; the Falcon protocol is dialled here too.</p>
-      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">Entry point</label>
-      <input value={main} onChange={(e) => setMain(e.target.value)} className={inputCls} placeholder="main.ts" />
+      <label className="block text-xs uppercase tracking-wider text-fg-faint">
+        Description
+      </label>
+      <input
+        value={desc}
+        onChange={(e) => setDesc(e.target.value)}
+        className={inputCls}
+      />
+      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">
+        Deploy target
+      </label>
+      <input
+        value={deployTarget}
+        onChange={(e) => setDeployTarget(e.target.value)}
+        className={inputCls}
+        placeholder="http://localhost:8080"
+      />
+      <p className="mt-1 text-[11px] text-fg-faint">
+        REST API at &lt;target&gt;/v2; the Falcon protocol is dialled here too.
+      </p>
+      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">
+        Entry point
+      </label>
+      <input
+        value={main}
+        onChange={(e) => setMain(e.target.value)}
+        className={inputCls}
+        placeholder="main.ts"
+      />
       <div className="mt-3 flex items-center justify-between">
-        <label className="block text-xs uppercase tracking-wider text-fg-faint">Environment variables</label>
+        <label className="block text-xs uppercase tracking-wider text-fg-faint">
+          Environment variables
+        </label>
         <button
           type="button"
           onClick={addEnvRow}
@@ -2141,10 +2381,16 @@ function ConfigModal({
       </div>
       <p className="mt-1 text-[11px] text-fg-faint">
         Passed to every Run/Compile spawn. Run-config env overrides these.
-        Example: <span className="font-mono">CAMUNDA_REST_ADDRESS=http://localhost:8081</span>.
+        Example:{" "}
+        <span className="font-mono">
+          CAMUNDA_REST_ADDRESS=http://localhost:8081
+        </span>
+        .
       </p>
       {envRows.length === 0 ? (
-        <p className="mt-2 text-[11px] text-fg-faint italic">No env vars set.</p>
+        <p className="mt-2 text-[11px] text-fg-faint italic">
+          No env vars set.
+        </p>
       ) : (
         <div className="mt-2 space-y-1">
           {envRows.map((row, i) => (
@@ -2173,8 +2419,14 @@ function ConfigModal({
           ))}
         </div>
       )}
-      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">Export platforms</label>
-      <PlatformPicker platforms={platforms} selected={selected} onToggle={toggle} />
+      <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">
+        Export platforms
+      </label>
+      <PlatformPicker
+        platforms={platforms}
+        selected={selected}
+        onToggle={toggle}
+      />
       <div className="mt-5 flex justify-end gap-2">
         <Button onClick={onClose}>Cancel</Button>
         <Button variant="primary" onClick={() => void save()} disabled={busy}>
@@ -2210,7 +2462,11 @@ function CompileModal({
   const compile = async () => {
     setBusy(true);
     try {
-      await compileProject({ path: { name }, body: { targets: selected }, throwOnError: true });
+      await compileProject({
+        path: { name },
+        body: { targets: selected },
+        throwOnError: true,
+      });
       onStarted();
     } catch (e) {
       alert(e instanceof Error ? e.message : String(e));
@@ -2221,17 +2477,26 @@ function CompileModal({
   return (
     <Modal title="Compile application" onClose={onClose}>
       <p className="text-sm text-fg-muted">
-        Produces standalone binaries under <span className="font-mono text-fg">dist/</span>. Leave all
-        unchecked to compile for this host only. Cross-compiling downloads the
-        Deno runtime per target and may take a few minutes — progress streams to
-        the Output panel.
+        Produces standalone binaries under{" "}
+        <span className="font-mono text-fg">dist/</span>. Leave all unchecked to
+        compile for this host only. Cross-compiling downloads the Deno runtime
+        per target and may take a few minutes — progress streams to the Output
+        panel.
       </p>
       <div className="mt-3">
-        <PlatformPicker platforms={platforms} selected={selected} onToggle={toggle} />
+        <PlatformPicker
+          platforms={platforms}
+          selected={selected}
+          onToggle={toggle}
+        />
       </div>
       <div className="mt-5 flex justify-end gap-2">
         <Button onClick={onClose}>Cancel</Button>
-        <Button variant="primary" onClick={() => void compile()} disabled={busy}>
+        <Button
+          variant="primary"
+          onClick={() => void compile()}
+          disabled={busy}
+        >
           {busy ? "Starting…" : "Compile"}
         </Button>
       </div>
@@ -2260,7 +2525,10 @@ function PlatformPicker({
   return (
     <div className="mt-1 grid grid-cols-1 gap-1 sm:grid-cols-2">
       {platforms.map((t) => (
-        <label key={t} className="flex cursor-pointer items-center gap-2 rounded-md border border-edge px-3 py-2 text-sm text-fg-muted hover:border-edge-strong">
+        <label
+          key={t}
+          className="flex cursor-pointer items-center gap-2 rounded-md border border-edge px-3 py-2 text-sm text-fg-muted hover:border-edge-strong"
+        >
           <input
             type="checkbox"
             checked={selected.includes(t)}
@@ -2284,8 +2552,14 @@ function Modal({
   onClose: () => void;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={onClose}>
-      <div className="w-full max-w-lg rounded-lg border border-edge bg-raised p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="w-full max-w-lg rounded-lg border border-edge bg-raised p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
         <h2 className="mb-4 text-lg font-semibold text-fg">{title}</h2>
         {children}
       </div>
@@ -2318,7 +2592,11 @@ function StartInstanceModal({
     let variables: Record<string, unknown>;
     try {
       const parsed = json.trim() === "" ? {} : JSON.parse(json);
-      if (parsed == null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      if (
+        parsed == null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed)
+      ) {
         throw new Error("Variables must be a JSON object.");
       }
       variables = parsed as Record<string, unknown>;
@@ -2345,8 +2623,9 @@ function StartInstanceModal({
     <Modal title={`Start instance — ${processId}`} onClose={onClose}>
       <p className="text-sm text-fg-muted">
         Posted to{" "}
-        <span className="font-mono text-fg">{`${deployTarget.replace(/\/+$/, "")}/v2/process-instances`}</span>.
-        Variables must be a JSON object; leave <span className="font-mono">{"{}"}</span> for no vars.
+        <span className="font-mono text-fg">{`${deployTarget.replace(/\/+$/, "")}/v2/process-instances`}</span>
+        . Variables must be a JSON object; leave{" "}
+        <span className="font-mono">{"{}"}</span> for no vars.
       </p>
       <label className="mt-3 block text-xs uppercase tracking-wider text-fg-faint">
         Variables (JSON)
@@ -2365,7 +2644,8 @@ function StartInstanceModal({
       )}
       {result && (
         <p className="mt-2 rounded-md border border-ok/40 bg-ok/10 px-3 py-2 text-xs text-ok">
-          Started — processInstanceKey <span className="font-mono">{result}</span>
+          Started — processInstanceKey{" "}
+          <span className="font-mono">{result}</span>
         </p>
       )}
       <div className="mt-5 flex justify-end gap-2">
