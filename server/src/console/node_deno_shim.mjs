@@ -1,0 +1,184 @@
+// nanobpmn Deno global shim for the Node fallback runtime (ADR 0036).
+//
+// The Node-first Run path (ADR 0038) spawns app code with
+// `--experimental-strip-types` but no `Deno` global, so app/template sources
+// that call `Deno.serve`/`Deno.env`/`Deno.readTextFile` throw "Deno is not
+// defined". This module installs a minimal `globalThis.Deno` backed by Node
+// built-ins so Deno-authored apps — and the scaffolder's URBAN/GUI templates —
+// run unchanged under Node, honoring node-loader.mjs's stated intent.
+//
+// Scope: the surface the app tier + embedded SDK adapters actually use. The
+// portable SDK adapters (`globalThis.Deno ?? process`) branch on this global,
+// so it must satisfy every method they call (env/cwd/exit/readTextFile/
+// writeTextFile/mkdir/readDir/stdin/stdout/addSignalListener) as well as
+// `Deno.serve`. Loaded before app code via `--import node-register.mjs`.
+import { writeSync as fsWriteSync } from "node:fs";
+import {
+  mkdir as fsMkdir,
+  readdir as fsReaddir,
+  readFile as fsReadFile,
+  rm as fsRm,
+  stat as fsStat,
+  writeFile as fsWriteFile,
+} from "node:fs/promises";
+import { createServer } from "node:http";
+import { Readable } from "node:stream";
+
+// Real Deno (or an earlier shim) already present — leave it untouched.
+if (globalThis.Deno === undefined) {
+  const enc = new TextEncoder();
+
+  async function* readDir(path) {
+    const ents = await fsReaddir(path, { withFileTypes: true });
+    for (const e of ents) {
+      yield {
+        name: e.name,
+        isFile: e.isFile(),
+        isDirectory: e.isDirectory(),
+        isSymlink: e.isSymbolicLink(),
+      };
+    }
+  }
+
+  function toBytes(data) {
+    return typeof data === "string" ? enc.encode(data) : data;
+  }
+
+  // Bridge one Node request/response pair through a web-standard handler, the
+  // contract `Deno.serve` hands callers (Web `Request` in, `Response` out).
+  function bridge(handler, hostname) {
+    return async (nodeReq, nodeRes) => {
+      try {
+        const url = `http://${nodeReq.headers.host ?? hostname}${nodeReq.url}`;
+        const headers = new Headers();
+        for (const [k, v] of Object.entries(nodeReq.headers)) {
+          if (Array.isArray(v)) for (const vv of v) headers.append(k, vv);
+          else if (v != null) headers.set(k, v);
+        }
+        const hasBody = nodeReq.method !== "GET" && nodeReq.method !== "HEAD";
+        const init = { method: nodeReq.method, headers };
+        if (hasBody) {
+          const chunks = [];
+          for await (const c of nodeReq) chunks.push(c);
+          init.body = Buffer.concat(chunks);
+        }
+        const remoteAddr = {
+          transport: "tcp",
+          hostname: nodeReq.socket?.remoteAddress ?? "",
+          port: nodeReq.socket?.remotePort ?? 0,
+        };
+        const webRes = await handler(new Request(url, init), { remoteAddr });
+        nodeRes.statusCode = webRes.status;
+        webRes.headers.forEach((value, key) => nodeRes.setHeader(key, value));
+        if (webRes.body) {
+          const reader = webRes.body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) nodeRes.write(value);
+          }
+        } else {
+          const buf = Buffer.from(await webRes.arrayBuffer());
+          if (buf.length) nodeRes.write(buf);
+        }
+        nodeRes.end();
+      } catch (err) {
+        if (!nodeRes.headersSent) nodeRes.statusCode = 500;
+        try {
+          nodeRes.end(String(err?.stack ?? err));
+        } catch {
+          // response already destroyed — nothing more to do
+        }
+      }
+    };
+  }
+
+  // Deno.serve(handler) | Deno.serve(options, handler) | Deno.serve({...,handler})
+  function serve(arg1, arg2) {
+    let options = {};
+    let handler;
+    if (typeof arg1 === "function") {
+      handler = arg1;
+    } else {
+      options = arg1 ?? {};
+      handler = arg2 ?? options.handler;
+    }
+    const port = options.port ?? 8000;
+    const hostname = options.hostname ?? "0.0.0.0";
+    const server = createServer(bridge(handler, hostname));
+    // A Server-level `error` is a bind failure (e.g. AddrInUse); Deno.serve
+    // treats that as fatal. Surface it cleanly instead of crashing on an
+    // unhandled `error` event.
+    server.on("error", (err) => {
+      console.error(err);
+      process.exit(1);
+    });
+    const finished = new Promise((resolve) => server.once("close", resolve));
+    server.listen(port, hostname, () => {
+      const addr = { hostname, port, transport: "tcp" };
+      if (typeof options.onListen === "function") options.onListen(addr);
+    });
+    const shutdown = () =>
+      new Promise((resolve) => server.close(() => resolve()));
+    if (options.signal instanceof AbortSignal) {
+      options.signal.addEventListener("abort", () => void shutdown(), { once: true });
+    }
+    return {
+      finished,
+      shutdown,
+      ref: () => server.ref(),
+      unref: () => server.unref(),
+      get addr() {
+        return { hostname, port, transport: "tcp" };
+      },
+    };
+  }
+
+  class NotFound extends Error {}
+
+  globalThis.Deno = {
+    args: process.argv.slice(2),
+    pid: process.pid,
+    env: {
+      get: (k) => process.env[k],
+      set: (k, v) => {
+        process.env[k] = v;
+      },
+      has: (k) => Object.prototype.hasOwnProperty.call(process.env, k),
+      delete: (k) => {
+        delete process.env[k];
+      },
+      toObject: () => ({ ...process.env }),
+    },
+    cwd: () => process.cwd(),
+    exit: (code) => process.exit(code),
+    addSignalListener: (sig, handler) => process.on(sig, handler),
+    removeSignalListener: (sig, handler) => process.off(sig, handler),
+    readTextFile: (path) => fsReadFile(path, "utf8"),
+    writeTextFile: (path, data) => fsWriteFile(path, data),
+    readFile: async (path) => new Uint8Array(await fsReadFile(path)),
+    writeFile: (path, data) => fsWriteFile(path, data),
+    mkdir: (path, opts) => fsMkdir(path, opts ?? {}),
+    remove: (path, opts) => fsRm(path, { recursive: !!opts?.recursive, force: true }),
+    readDir,
+    stat: async (path) => {
+      const s = await fsStat(path);
+      return { isFile: s.isFile(), isDirectory: s.isDirectory(), size: s.size, mtime: s.mtime };
+    },
+    stdout: {
+      writeSync: (data) => fsWriteSync(1, toBytes(data)),
+      write: async (data) => fsWriteSync(1, toBytes(data)),
+    },
+    stderr: {
+      writeSync: (data) => fsWriteSync(2, toBytes(data)),
+      write: async (data) => fsWriteSync(2, toBytes(data)),
+    },
+    stdin: {
+      get readable() {
+        return Readable.toWeb(process.stdin);
+      },
+    },
+    errors: { NotFound },
+    serve,
+  };
+}

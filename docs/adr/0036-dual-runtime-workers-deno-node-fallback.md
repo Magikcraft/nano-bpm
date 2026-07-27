@@ -51,6 +51,19 @@ Make workers **runtime-agnostic**: **prefer Deno, fall back to Node ≥ 22.6.** 
 
 No other SDK code changes; the wire protocol and control-line format are identical on both runtimes.
 
+The `RT` adapter covers the SDKs, but **app/template code** (`main.ts`, the scaffolder's
+`URBAN_MAIN_TS`/`GUI_MAIN_TS`) calls `Deno.*` directly and cannot be rewritten around an adapter.
+So the Node bootstrap also installs a minimal **`Deno` global shim** (`node-deno-shim.mjs`, imported
+from `node-register.mjs` so it loads on the main thread before the entry). It backs the surface the
+app tier + SDK adapters actually use — `env`, `cwd`, `exit`, `args`, `readTextFile`/`writeTextFile`,
+`mkdir`/`readDir`/`remove`/`stat`, `stdin`/`stdout`, `addSignalListener`, and `serve` (a Web
+`Request`→`Response` bridge over `node:http`) — with Node built-ins. It no-ops when a real `Deno`
+global is present. This is what makes "code authored for Deno runs unchanged under Node" true for app
+code, not just the SDKs; without it `Deno.serve`/`Deno.env` throw "Deno is not defined".
+
+Since the SDK adapters branch on `globalThis.Deno`, the shim is deliberately complete enough that they
+take (and work on) their `Deno` arm under the fallback.
+
 ### 2. Node honours `deno.json` via a `module.register` loader
 
 Two files are materialised beside the SDK (`nano-generated/`):
