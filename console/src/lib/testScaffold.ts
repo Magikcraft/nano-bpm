@@ -176,9 +176,7 @@ export function scaffoldJobOutput(
  * otherwise the process input is not model-typed and we yield `"{}"`.
  */
 export function scaffoldStartVars(model: ModelEnvelopes): string {
-  const entryInputs = [...model.startTargets]
-    .map((id) => model.tasks.get(id)?.in)
-    .filter((t): t is string => !!t);
-  const unique = [...new Set(entryInputs)];
-  return unique.length === 1 ? scaffoldForType(model, unique[0]) : "{}";
+  const targets = [...model.startTargets];
+  if (targets.length !== 1) return "{}";
+  return scaffoldForType(model, model.tasks.get(targets[0])?.in);
 }

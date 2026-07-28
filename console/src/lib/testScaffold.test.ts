@@ -119,6 +119,19 @@ test("scaffoldStartVars yields {} when the entry is ambiguous", () => {
   assert.equal(scaffoldStartVars(parseModelEnvelopes(xml)), "{}");
 });
 
+test("scaffoldStartVars yields {} when the start fans out and only one target is typed", () => {
+  // Two start targets, but only `review` carries an input envelope. The start is
+  // still ambiguous (it fans out), so the process input is not model-typed.
+  const xml = XML.replace(
+    '<bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="review" />',
+    '<bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="review" />' +
+      '<bpmn:serviceTask id="other" /><bpmn:sequenceFlow id="f2" sourceRef="Start" targetRef="other" />',
+  );
+  const m = parseModelEnvelopes(xml);
+  assert.equal(m.startTargets.size, 2);
+  assert.equal(scaffoldStartVars(m), "{}");
+});
+
 test("parseModelEnvelopes tolerates a model with no shapes or envelopes", () => {
   const m = parseModelEnvelopes(
     '<bpmn:definitions><bpmn:process id="p"><bpmn:startEvent id="s" /></bpmn:process></bpmn:definitions>',
