@@ -181,11 +181,12 @@ code {
 .demo-grid {
   display: grid;
   grid-template-columns: 1.7fr 1fr;
-  min-height: 440px;
+  height: 520px;
 }
 @media (max-width: 900px) {
   .demo-grid {
     grid-template-columns: 1fr;
+    height: auto;
   }
 }
 
@@ -233,6 +234,8 @@ code {
 .panel.grow {
   flex: 1;
   min-height: 0;
+  display: flex;
+  flex-direction: column;
 }
 .panel-h {
   text-transform: uppercase;
@@ -279,6 +282,9 @@ code {
   gap: 8px;
   font-size: 13px;
   line-height: 1.4;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
 }
 .log li {
   padding-left: 14px;
@@ -328,41 +334,90 @@ code {
 .diagram .djs-shape .djs-visual > rect,
 .diagram .djs-shape .djs-visual > circle,
 .diagram .djs-shape .djs-visual > polygon {
-  fill: rgba(24, 27, 33, 0.92) !important;
-  stroke: rgba(170, 180, 200, 0.65) !important;
+  fill: #232a36 !important;
+  stroke: rgba(190, 200, 220, 0.7) !important;
+  stroke-width: 1.6px !important;
 }
 /* Shape glyphs (gateway markers, task-type + event icons). */
 .diagram .djs-shape .djs-visual > path {
-  fill: rgba(205, 213, 226, 0.9) !important;
-  stroke: rgba(170, 180, 200, 0.75) !important;
+  fill: rgba(210, 218, 232, 0.92) !important;
+  stroke: rgba(190, 200, 220, 0.8) !important;
 }
 .diagram .djs-visual text {
   fill: var(--ink) !important;
 }
 /* Sequence-flow lines + their arrowheads. */
 .diagram .djs-connection .djs-visual > path {
-  stroke: rgba(170, 180, 200, 0.7) !important;
+  stroke: rgba(160, 170, 190, 0.8) !important;
 }
 .diagram marker path {
-  fill: rgba(170, 180, 200, 0.8) !important;
-  stroke: rgba(170, 180, 200, 0.8) !important;
+  fill: rgba(160, 170, 190, 0.9) !important;
+  stroke: rgba(160, 170, 190, 0.9) !important;
 }
 
-/* Token / incident highlights layer on top of the dark base (declared after it
-   so the equal-specificity !important overrides win by source order). */
+/* Active (token) highlight — bold, glowing and pulsing so the moving frontier
+   is unmistakable. Declared after the base so the equal-specificity !important
+   overrides win by source order. */
 .nano-active .djs-visual > :nth-child(1) {
   stroke: var(--emerald) !important;
-  stroke-width: 3px !important;
+  stroke-width: 3.5px !important;
 }
 .nano-active .djs-visual > rect,
-.nano-active .djs-visual > circle {
-  fill: rgba(52, 211, 153, 0.16) !important;
+.nano-active .djs-visual > circle,
+.nano-active .djs-visual > polygon {
+  fill: rgba(52, 211, 153, 0.35) !important;
+}
+.nano-active .djs-visual text {
+  fill: #eafff6 !important;
+}
+.nano-active {
+  animation: nanoTokenPulse 1.3s ease-in-out infinite;
+}
+@keyframes nanoTokenPulse {
+  0%,
+  100% {
+    filter: drop-shadow(0 0 3px rgba(52, 211, 153, 0.55));
+  }
+  50% {
+    filter: drop-shadow(0 0 12px rgba(52, 211, 153, 1));
+  }
 }
 .nano-incident .djs-visual > :nth-child(1) {
   stroke: #f87171 !important;
-  stroke-width: 3px !important;
+  stroke-width: 3.5px !important;
 }
 .nano-incident .djs-visual > rect,
-.nano-incident .djs-visual > circle {
-  fill: rgba(248, 113, 113, 0.16) !important;
+.nano-incident .djs-visual > circle,
+.nano-incident .djs-visual > polygon {
+  fill: rgba(248, 113, 113, 0.32) !important;
+}
+
+/* The token badge overlaid on each active element (BpmnRuntimeView adds it via
+   the bpmn-js overlays API). A pulsing emerald puck = "the token is here". */
+.nano-token {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #6ee7b7, var(--emerald));
+  border: 2px solid #052e21;
+  box-shadow:
+    0 0 0 3px rgba(52, 211, 153, 0.28),
+    0 0 12px 2px rgba(52, 211, 153, 0.85);
+  animation: nanoTokenBadge 1.3s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes nanoTokenBadge {
+  0%,
+  100% {
+    transform: scale(0.9);
+    box-shadow:
+      0 0 0 3px rgba(52, 211, 153, 0.22),
+      0 0 8px 1px rgba(52, 211, 153, 0.7);
+  }
+  50% {
+    transform: scale(1.12);
+    box-shadow:
+      0 0 0 5px rgba(52, 211, 153, 0.12),
+      0 0 16px 3px rgba(52, 211, 153, 1);
+  }
 }

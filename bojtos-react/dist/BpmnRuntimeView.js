@@ -10,13 +10,15 @@ import NavigatedViewer from "bpmn-js/lib/NavigatedViewer";
  *
  * The consumer must load bpmn-js's diagram CSS (`bpmn-js/dist/assets/
  * diagram-js.css` and `.../bpmn-font/css/bpmn-embedded.css`) once in the app,
- * and provide the `.nano-active` / `.nano-incident` marker styles.
+ * and provide the `.nano-active` / `.nano-incident` marker styles plus a
+ * `.nano-token` style for the token badge overlaid on each active element.
  */
 export function BpmnRuntimeView({ xml, activeIds, incidentIds, className, }) {
     const containerRef = useRef(null);
     const viewerRef = useRef(null);
     const importedRef = useRef(false);
     const markedRef = useRef([]);
+    const tokenOverlaysRef = useRef([]);
     // Track the latest ids in a ref so the post-import `applyMarkers()` (fired from
     // the `[xml]` effect's async `.then`) uses current values, not the ids that
     // were current when the import started — otherwise ids changing mid-import
@@ -72,6 +74,32 @@ export function BpmnRuntimeView({ xml, activeIds, incidentIds, className, }) {
             }
         }
         markedRef.current = next;
+        // A visible token badge on each active element: an explicit "token is here"
+        // marker so movement reads clearly even when a class-only highlight is too
+        // subtle. Overlays are removed/re-added each update so the token hops with
+        // the frontier.
+        const overlays = viewer.get("overlays");
+        for (const id of tokenOverlaysRef.current) {
+            try {
+                overlays.remove(id);
+            }
+            catch {
+                /* ignore */
+            }
+        }
+        const nextOverlays = [];
+        for (const id of idsRef.current.activeIds) {
+            try {
+                nextOverlays.push(overlays.add(id, {
+                    position: { top: -12, left: -12 },
+                    html: '<div class="nano-token" aria-hidden="true"></div>',
+                }));
+            }
+            catch {
+                /* element not in this diagram */
+            }
+        }
+        tokenOverlaysRef.current = nextOverlays;
     }
     useEffect(() => {
         applyMarkers();
