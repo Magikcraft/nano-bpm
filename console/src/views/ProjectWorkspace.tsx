@@ -21,7 +21,7 @@ import ShapeComposer, { type ShapePreview } from "../components/ShapeComposer";
 import PageComposer, {
   type PageComposerHandle,
 } from "../components/PageComposer";
-import type { MetaEntry, ShapeDecl } from "../lib/shapeCarrier";
+import type { MetaEntry, ShapeDecl, ShapeOp } from "../lib/shapeCarrier";
 import type { ComposerEntity } from "../lib/shapeComposer";
 import { SCALAR_KEYWORDS } from "../lib/shapeComposer";
 import AppManifestEditor, {
@@ -1316,48 +1316,6 @@ function EditorPane({
     if (!types || typeof types !== "object") return [];
     return Object.keys(types as Record<string, unknown>);
   }, [manifest]);
-  // Persists a new (transient) domain type into the manifest `types` registry
-  // (the "Create new envelope…" affordance, ADR 0033 §6) with the maker-authored
-  // fields, and saves `nano.app.json`. A manifest `types` entry is a *pure-motion*
-  // shape — a data contract with no backing table (ADR 0040 §10). Throws on a
-  // failed save so the caller can abort. Existing ids are left untouched.
-  const writeDomainType = useCallback(
-    async (
-      id: string,
-      fields: { name: string; type: string }[],
-    ): Promise<void> => {
-      const prev = manifestTextRef.current;
-      if (prev == null) return;
-      let obj: Record<string, unknown>;
-      try {
-        const parsed = JSON.parse(prev);
-        if (!parsed || typeof parsed !== "object") return;
-        obj = parsed as Record<string, unknown>;
-      } catch {
-        return;
-      }
-      const types =
-        obj.types && typeof obj.types === "object"
-          ? (obj.types as Record<string, unknown>)
-          : ((obj.types = {}) as Record<string, unknown>);
-      if (!types[id]) {
-        const fieldDefs: Record<string, { type: string }> = {};
-        for (const f of fields) {
-          if (f.name.trim()) fieldDefs[f.name.trim()] = { type: f.type };
-        }
-        types[id] = { fields: fieldDefs };
-      }
-      const next = `${JSON.stringify(obj, null, 2)}\n`;
-      setManifestText(next);
-      await saveProjectFile({
-        path: { name },
-        query: { path: "nano.app.json" },
-        body: next,
-        throwOnError: true,
-      });
-    },
-    [name],
-  );
   // Bridges the modeler's "Create new envelope…" action (bpmn-js land) to a React
   // modal: `createDomainType()` opens the field editor and returns a promise that
   // resolves with the new type id once it is authored + persisted, or `undefined`
@@ -1621,6 +1579,86 @@ function EditorPane({
     setComposerShapes(next);
     setDirty(true);
   }, []);
+
+  // Persists a new pure-motion payload type *into the model* (the "Create new
+  // envelope…" affordance, ADR 0033 §6) as a composed `nano:shape` built entirely
+  // from `extend` ops — the degenerate "flat record" case of the shape algebra
+  // (ADR 0040 §9). Carrying the definition in the `.bpmn` (not the manifest) keeps
+  // it portable: move the model to another system and the payload schema travels
+  // with it, referenced nominally by the envelope. The fuse (`resolveShapes`)
+  // reifies it into `DomainTypes`, so codegen and the picker see it like any other
+  // registry type; `manifest.types` is a derived cache, not an authoring home.
+  //
+  // The write is one undoable model command (via `setShapes`) and marks the buffer
+  // dirty — the new type and the envelope selection that follows it persist
+  // together on the next Save, exactly like the composer. Existing shape ids are
+  // left untouched: a collision is rejected by the editor up front and, defensively,
+  // re-checked here so a stale id set can't clobber an existing shape.
+  const writeModelEnvelopeType = useCallback(
+    async (
+      id: string,
+      fields: { name: string; type: string; optional?: boolean }[],
+    ): Promise<void> => {
+      // Fail fast rather than silently no-op: the modal closes and the envelope
+      // selection references this id the moment this resolves, so a swallowed
+      // write would leave the UI claiming a type the model never gained. The
+      // modal's onSave catches a throw, surfaces it, and keeps itself open.
+      const bpmn = bpmnRef.current;
+      if (!bpmn) {
+        throw new Error(
+          "The BPMN modeler isn't ready yet — reopen the diagram and try again.",
+        );
+      }
+      const existing = bpmn.getShapes();
+      if (existing.some((s) => s.id === id)) {
+        throw new Error(`Type "${id}" already exists in the model.`);
+      }
+      const ops: ShapeOp[] = fields
+        .filter((f) => f.name.trim())
+        .map((f) => {
+          const op: ShapeOp = {
+            op: "extend",
+            name: f.name.trim(),
+            type: f.type,
+          };
+          if (f.optional) op.optional = true;
+          return op;
+        });
+      const next: ShapeDecl[] = [...existing, { id, ops }];
+      // Server-fuse pre-check: the up-front editor guard only knows model shapes
+      // and manifest `types`, but a new id can also collide with a *fused leaf
+      // entity* (e.g. a datasource table). `resolveShapes` reports that as an
+      // `error`-severity `same-id-collision` and omits the shape, which would
+      // leave the model referencing a payload type that never reifies into
+      // `DomainTypes`. Reject with the server's diagnostic before committing.
+      // A preview transport failure is non-fatal — fall through to the write +
+      // verify below (no worse than the prior behaviour).
+      const preview = await previewShapes(next, bpmn.getMeta()).catch(
+        () => null,
+      );
+      const blocking = preview?.diagnostics.find(
+        (d) => d.shape === id && d.severity === "error",
+      );
+      if (blocking) {
+        throw new Error(blocking.message);
+      }
+      composerWriteRef.current = true;
+      bpmn.setShapes(next);
+      // Verify the undoable write actually landed (setShapes swallows a
+      // not-ready/disposed modeler and a moddle failure). Re-clear the
+      // self-inflicted-change guard on the failure path so a later genuine
+      // external change isn't wrongly skipped.
+      if (!bpmn.getShapes().some((s) => s.id === id)) {
+        composerWriteRef.current = false;
+        throw new Error(
+          `Couldn't write type "${id}" to the model — the diagram may still be loading.`,
+        );
+      }
+      if (shapesOpen) setComposerShapes(next);
+      setDirty(true);
+    },
+    [shapesOpen, previewShapes],
+  );
 
   // Persist edited model-level metadata to the model (one undoable command),
   // mirrored into local state. Same self-inflicted-change guard as the shapes.
@@ -2153,7 +2191,7 @@ function EditorPane({
                 ]}
                 onCancel={() => closeEnvelopeEditor(undefined)}
                 onSave={async (id, fields) => {
-                  await writeDomainType(id, fields);
+                  await writeModelEnvelopeType(id, fields);
                   closeEnvelopeEditor(id);
                 }}
               />
@@ -2679,13 +2717,14 @@ function PlatformPicker({
 const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 
 /// Field-authoring surface for a transient domain type (an "envelope"): the maker
-/// names the type and declares its fields (name + scalar type), which are written
-/// into the manifest `types` registry (a *pure-motion* data contract with no
-/// backing table, ADR 0040 §10). Opened from the modeler's "Create new envelope…"
-/// affordance; on save the parent persists `nano.app.json` and the modeler picks
-/// the new id in one gesture. Field `type` is restricted to `SCALAR_KEYWORDS` here
-/// — nominal references to other registry types stay an escape hatch for the raw
-/// JSON editor.
+/// names the type and declares its fields (name + scalar type + optional), which
+/// are written *into the model* as a composed `nano:shape` (all-`extend` ops — the
+/// flat-record case of the shape algebra, ADR 0040 §9). Opened from the modeler's
+/// "Create new envelope…" affordance; on save the parent writes the shape to the
+/// `.bpmn` and the modeler picks the new id in one undoable gesture, so the payload
+/// schema travels with the model. Field `type` is restricted to `SCALAR_KEYWORDS`
+/// here — nominal references to other registry types stay an escape hatch for the
+/// shape composer / raw JSON editor.
 function EnvelopeEditorModal({
   existingIds,
   onSave,
@@ -2694,14 +2733,14 @@ function EnvelopeEditorModal({
   existingIds: string[];
   onSave: (
     id: string,
-    fields: { name: string; type: string }[],
+    fields: { name: string; type: string; optional?: boolean }[],
   ) => Promise<void>;
   onCancel: () => void;
 }) {
   const [id, setId] = useState("");
   const [fields, setFields] = useState<
-    { key: number; name: string; type: string }[]
-  >([{ key: 0, name: "", type: "string" }]);
+    { key: number; name: string; type: string; optional: boolean }[]
+  >([{ key: 0, name: "", type: "string", optional: false }]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Monotonic id source so each row keeps a stable React key across
@@ -2710,13 +2749,18 @@ function EnvelopeEditorModal({
 
   const setField = (
     i: number,
-    patch: Partial<{ name: string; type: string }>,
+    patch: Partial<{ name: string; type: string; optional: boolean }>,
   ) =>
     setFields((prev) => prev.map((f, j) => (j === i ? { ...f, ...patch } : f)));
   const addField = () =>
     setFields((prev) => [
       ...prev,
-      { key: nextFieldKey.current++, name: "", type: "string" },
+      {
+        key: nextFieldKey.current++,
+        name: "",
+        type: "string",
+        optional: false,
+      },
     ]);
   const removeField = (i: number) =>
     setFields((prev) =>
@@ -2755,7 +2799,11 @@ function EnvelopeEditorModal({
     setError(null);
     try {
       const named = fields
-        .map((f) => ({ name: f.name.trim(), type: f.type }))
+        .map((f) => ({
+          name: f.name.trim(),
+          type: f.type,
+          optional: f.optional,
+        }))
         .filter((f) => f.name);
       await onSave(id.trim(), named);
     } catch (e) {
@@ -2787,7 +2835,7 @@ function EnvelopeEditorModal({
             {fields.map((f, i) => (
               <div
                 key={f.key}
-                className="grid grid-cols-[1fr_auto_auto] items-center gap-2"
+                className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-2"
               >
                 <input
                   value={f.name}
@@ -2809,6 +2857,19 @@ function EnvelopeEditorModal({
                     </option>
                   ))}
                 </select>
+                <label
+                  className="flex items-center gap-1 text-xs text-fg-muted"
+                  title="Optional field"
+                >
+                  <input
+                    type="checkbox"
+                    checked={f.optional}
+                    onChange={(e) =>
+                      setField(i, { optional: e.target.checked })
+                    }
+                  />
+                  opt
+                </label>
                 <Button
                   variant="secondary"
                   onClick={() => removeField(i)}
@@ -2830,10 +2891,10 @@ function EnvelopeEditorModal({
           </button>
         </div>
         <p className="text-xs text-fg-muted">
-          Declares a transient domain type in{" "}
-          <code className="text-fg">nano.app.json</code>{" "}
-          <code className="text-fg">types</code> — a data contract carried by an
-          envelope, with no backing table.
+          Declares a payload type <em>in the model</em> as a{" "}
+          <code className="text-fg">nano:shape</code> — a data contract carried
+          by an envelope, with no backing table. It travels with the{" "}
+          <code className="text-fg">.bpmn</code> and is saved on the next Save.
         </p>
         {error && <p className="text-sm text-danger">{error}</p>}
         <div className="flex justify-end gap-2">

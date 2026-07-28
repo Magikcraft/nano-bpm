@@ -11,6 +11,7 @@
 
 import { assertEquals, assertStringIncludes } from "jsr:@std/assert@1";
 import type { TableMeta } from "./data_sdk.ts";
+import type { ShapeDecl } from "./domain_types.ts";
 import {
   DOMAIN_BINDINGS,
   DOMAIN_DTS,
@@ -25,6 +26,7 @@ import {
   emitWorkerBindingsRuntime,
   foldMeta,
   interfaceName,
+  resolveShapes,
   sqliteAffinityToTs,
   WORKER_BINDINGS_DTS,
   WORKER_BINDINGS_TS,
@@ -650,4 +652,85 @@ Deno.test("emitDomainModelJson inputsHash is stable across calls and shifts on a
     emitDomainModelJson({ ...base, meta: [{ key: "owner", value: "ops" }] }),
   );
   assertEquals(changed.inputsHash !== a.inputsHash, true); // staleness detectable
+});
+
+// --- resolveShapes: the composition fuse + its drift guards (ADR 0040 §9/§10) --
+//
+// The "envelope payload types live in the model" work (a `nano:shape` composed
+// purely of `extend` ops IS a flat payload record) leans on two behaviours of the
+// reifier that these tests lock against regression: (1) an all-`extend` shape
+// reifies field-for-field into a `DomainTypes` entry, and (2) a shape id that
+// duplicates an existing fused entity it does not compose is rejected as drift
+// rather than silently shadowing it ("derive, don't duplicate; drift-guard
+// anything that is not derived").
+
+Deno.test("resolveShapes reifies an all-extend shape into a flat domain type", () => {
+  const shapes: ShapeDecl[] = [{
+    id: "PrReviewRoundIn",
+    name: "PR review round — input",
+    ops: [
+      { op: "extend", name: "prUrl", type: "string" },
+      { op: "extend", name: "prNumber", type: "integer" },
+      { op: "extend", name: "answer", type: "string", optional: true },
+      { op: "extend", name: "labels", type: "string", list: true },
+    ],
+  }];
+  const { types, diagnostics } = resolveShapes(shapes, {}, []);
+  assertEquals(diagnostics, []);
+  assertEquals(types.PrReviewRoundIn, {
+    name: "PR review round — input",
+    fields: {
+      prUrl: { type: "string" },
+      prNumber: { type: "integer" },
+      answer: { type: "string", optional: true },
+      labels: { type: "string", list: true },
+    },
+  });
+});
+
+Deno.test("resolveShapes drift-guards a shape id colliding with a manifest type", () => {
+  // A pure-extend shape whose id also names a manifest type it does not compose is
+  // duplication, not a fuse: reject it (error) and omit it, leaving the manifest
+  // type as the single source of truth.
+  const shapes: ShapeDecl[] = [{
+    id: "Order",
+    ops: [{ op: "extend", name: "item", type: "string" }],
+  }];
+  const manifest = { Order: { fields: { item: { type: "string" } } } };
+  const { types, diagnostics } = resolveShapes(shapes, manifest, []);
+  assertEquals(Object.keys(types), []); // shape omitted — no silent shadow
+  assertEquals(diagnostics.length, 1);
+  assertEquals(diagnostics[0].kind, "same-id-collision");
+  assertEquals(diagnostics[0].severity, "error");
+  assertEquals(diagnostics[0].shape, "Order");
+});
+
+Deno.test("resolveShapes rejects a duplicate shape id as a fuse-identity collision", () => {
+  const shapes: ShapeDecl[] = [
+    { id: "Dup", ops: [{ op: "extend", name: "a", type: "string" }] },
+    { id: "Dup", ops: [{ op: "extend", name: "b", type: "string" }] },
+  ];
+  const { types, diagnostics } = resolveShapes(shapes, {}, []);
+  assertEquals(Object.keys(types), []); // both omitted
+  assertEquals(diagnostics.length, 1);
+  assertEquals(diagnostics[0].kind, "duplicate-id");
+  assertEquals(diagnostics[0].severity, "error");
+});
+
+Deno.test("resolveShapes flags an extend whose type is neither scalar nor a fused entity", () => {
+  const shapes: ShapeDecl[] = [{
+    id: "Bad",
+    ops: [{ op: "extend", name: "ref", type: "NoSuchType" }],
+  }];
+  const { types, diagnostics } = resolveShapes(shapes, {}, []);
+  assertEquals(Object.keys(types), []); // broken shape omitted
+  assertEquals(diagnostics.length, 1);
+  assertEquals(diagnostics[0].kind, "unresolved-reference");
+  assertEquals(diagnostics[0].severity, "error");
+});
+
+Deno.test("resolveShapes returns an empty resolution for no shapes", () => {
+  const { types, diagnostics } = resolveShapes([], { Order: { fields: { item: { type: "string" } } } }, []);
+  assertEquals(types, {});
+  assertEquals(diagnostics, []);
 });
