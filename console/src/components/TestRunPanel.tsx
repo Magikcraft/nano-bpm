@@ -5,6 +5,11 @@ import { useBojtos, BpmnRuntimeView } from "@nanobpm/bojtos-react";
 import { TraceTimeline } from "./TraceTimeline";
 import { foldSimTrace, stepFmt } from "../lib/simTrace";
 import { Badge, Button, ErrorText, SectionLabel } from "./ui";
+import {
+  parseModelEnvelopes,
+  scaffoldJobOutput,
+  scaffoldStartVars,
+} from "../lib/testScaffold.ts";
 
 export default function TestRunPanel({
   xml,
@@ -33,6 +38,11 @@ export default function TestRunPanel({
   const [leftView, setLeftView] = useState<"diagram" | "trace">("diagram");
   const [traceKey, setTraceKey] = useState<string | null>(null);
 
+  // The model's in-flight payload schemas (task envelopes → `nano:shape` field
+  // records, ADR 0040 §9/§10), parsed once per model, so the panel can scaffold
+  // typed start/completion payloads instead of leaving the maker to guess fields.
+  const model = useMemo(() => parseModelEnvelopes(xml), [xml]);
+
   // Each (re)deployment produces a fresh `processIds` array; when it changes,
   // default the process selection and clear the per-run UI state — matching the
   // original panel's `deployInto` reset.
@@ -42,12 +52,25 @@ export default function TestRunPanel({
     setTraceKey(null);
   }, [processIds]);
 
+  // Start variables are (re)seeded from the selected process's entry-task input
+  // envelope whenever the model or the selected process changes, so switching
+  // the Process selector re-scaffolds for that process (and never leaks a
+  // sibling process's input in a multi-process definition).
+  useEffect(() => {
+    setStartVars(scaffoldStartVars(model, process || undefined));
+  }, [model, process]);
+
   function start() {
     const snap = createInstance(process, startVars || "{}");
     if (snap?.created) setTraceKey(snap.created);
   }
-  function completeJob(key: string) {
-    const vars = jobVars[key]?.trim() || "{}";
+  // A waiting job's output payload defaults to its element's `out` envelope
+  // skeleton until the maker edits it (kept lazy so we never clobber an edit).
+  function jobValue(key: string, elementId: string): string {
+    return jobVars[key] ?? scaffoldJobOutput(model, elementId);
+  }
+  function completeJob(key: string, elementId: string) {
+    const vars = jobValue(key, elementId).trim() || "{}";
     completeJobCmd(key, vars);
   }
   function failJob(key: string) {
@@ -268,7 +291,7 @@ export default function TestRunPanel({
                         </span>
                       </div>
                       <textarea
-                        value={jobVars[job.key] ?? "{}"}
+                        value={jobValue(job.key, job.elementId)}
                         onChange={(e) =>
                           setJobVars((m) => ({
                             ...m,
@@ -282,7 +305,7 @@ export default function TestRunPanel({
                       />
                       <div className="mt-1.5 flex gap-1.5">
                         <button
-                          onClick={() => completeJob(job.key)}
+                          onClick={() => completeJob(job.key, job.elementId)}
                           className="flex-1 rounded border border-ok/30 bg-ok/10 px-2 py-1 text-[11px] font-medium text-ok hover:bg-ok/20"
                         >
                           Complete
