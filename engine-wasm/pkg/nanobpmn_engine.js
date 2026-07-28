@@ -314,6 +314,16 @@ export class TestEngine {
         return ret;
     }
     /**
+     * Discard all engine state (deployed definitions, instances, jobs, timers,
+     * the event log and the virtual clock), returning the engine to the same
+     * pristine state as a freshly constructed one. Callers redeploy afterwards
+     * to start a clean run — this is what makes a re-run start from zero
+     * completed instances rather than accumulating across runs.
+     */
+    reset() {
+        wasm.testengine_reset(this.__wbg_ptr);
+    }
+    /**
      * The current simulation state as a JSON [`Snapshot`].
      * @returns {string}
      */

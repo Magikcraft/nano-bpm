@@ -12,6 +12,7 @@ export const testengine_events: (a: number, b: number) => void;
 export const testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
 export const testengine_new: () => number;
 export const testengine_now: (a: number) => number;
+export const testengine_reset: (a: number) => void;
 export const testengine_snapshot: (a: number, b: number) => void;
 export const testengine_tickNow: (a: number, b: number, c: number) => void;
 export const __wbindgen_add_to_stack_pointer: (a: number) => number;

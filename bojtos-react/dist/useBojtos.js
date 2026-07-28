@@ -149,6 +149,10 @@ export function useBojtos({ bpmn, wasm }) {
         if (!session)
             return;
         try {
+            // Wipe the engine to its pristine state, then redeploy the diagram, so a
+            // re-run starts from zero instances/completions rather than accumulating
+            // across runs (a plain redeploy leaves prior instances resident).
+            session.reset();
             deployInto(session);
         }
         catch (e) {
