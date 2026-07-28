@@ -58,6 +58,14 @@ export interface BojtosSession {
     correlateMessage(messageName: string, correlationKey: string, variablesJson: string): Snapshot;
     /** Advance the virtual clock by `byMs`, firing due timers and lapsed locks. */
     advanceTime(byMs: number): Snapshot;
+    /**
+     * Discard all engine state (definitions, instances, jobs, timers, event log
+     * and clock), returning the underlying engine to its pristine state. The
+     * caller redeploys afterwards to begin a clean run — this is what lets a
+     * re-run start from zero completed instances instead of accumulating across
+     * runs.
+     */
+    reset(): void;
     /** The full ordered event log emitted so far. */
     events(): WasmEvent[];
     /** The current simulation state. */

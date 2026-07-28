@@ -16,8 +16,8 @@ const SEED = JSON.stringify({
 });
 
 /** Pace of the animation, ms per token beat. */
-const BEAT = 900;
-const RESTART_DELAY = 3200;
+const BEAT = 1400;
+const RESTART_DELAY = 4200;
 
 type LogKind = "submit" | "task" | "review" | "msg" | "done";
 interface LogEntry {
@@ -27,7 +27,7 @@ interface LogEntry {
 }
 
 export function App() {
-  const { phase, error, processIds, snapshot, createInstance, correlateMessage, stepWorkers } =
+  const { phase, error, processIds, snapshot, createInstance, correlateMessage, stepWorkers, reset } =
     useBojtos({ bpmn: convergenceLoopBpmn });
 
   const [running, setRunning] = useState(true);
@@ -73,6 +73,10 @@ export function App() {
 
         counterRef.current.i = 0;
         setLog([]);
+        // Wipe the engine before each run so `completedInstances` starts at 0 —
+        // otherwise prior runs' completed instances stay resident and a re-run
+        // reads `completedInstances >= 1` immediately and "converges" at once.
+        reset();
         pushLog("submit", `PR #${PR_NUMBER} submitted for review`);
         let snap = createInstance(processIdRef.current, SEED);
         await sleep(BEAT);

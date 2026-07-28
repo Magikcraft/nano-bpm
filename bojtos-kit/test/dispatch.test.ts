@@ -266,3 +266,28 @@ test("an unserializable handler result is translated to failJob, not bubbled", a
   assert.equal(calls.failed, true, "serialization failure fails the job");
   assert.equal(calls.completed, false, "the engine completion is never called");
 });
+
+test("reset wipes engine state so a re-run starts from zero completed instances", async () => {
+  // Drive one instance to completion, then reset + redeploy and start a second
+  // instance. Without reset the engine keeps the first (completed) instance
+  // resident, so `completedInstances` would read >= 1 immediately on the re-run.
+  const session = await newOrderSession("{}");
+  const first = await dispatchWorkers(session, {
+    payment: () => ({ charged: true }),
+    shipping: () => ({ shipped: true }),
+  });
+  assert.equal(first.snapshot.completedInstances, 1, "first run completed");
+
+  session.reset();
+  const afterReset = session.snapshot();
+  assert.equal(afterReset.totalInstances, 0, "reset clears resident instances");
+  assert.equal(afterReset.completedInstances, 0, "reset clears completions");
+
+  // Redeploy is required after a reset (definitions are wiped too), then the
+  // fresh instance starts from a clean slate.
+  session.deploy(ORDER_BPMN);
+  const created = session.createInstance("order", "{}");
+  assert.equal(created.completedInstances, 0, "re-run does not inherit completions");
+  assert.equal(created.totalInstances, 1);
+  session.free();
+});

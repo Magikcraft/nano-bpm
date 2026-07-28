@@ -54,6 +54,9 @@ class WasmBojtosSession {
     advanceTime(byMs) {
         return parseSnapshot(this.engine.advanceTime(byMs));
     }
+    reset() {
+        this.engine.reset();
+    }
     events() {
         return JSON.parse(this.engine.events());
     }

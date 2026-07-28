@@ -56,6 +56,18 @@ impl TestEngine {
         self.now as f64
     }
 
+    /// Discard all engine state (deployed definitions, instances, jobs, timers,
+    /// the event log and the virtual clock), returning the engine to the same
+    /// pristine state as a freshly constructed one. Callers redeploy afterwards
+    /// to start a clean run — this is what makes a re-run start from zero
+    /// completed instances rather than accumulating across runs.
+    pub fn reset(&mut self) {
+        self.engine = Engine::new();
+        self.now = 0;
+        self.seq = 0;
+        self.log.clear();
+    }
+
     /// Parse and deploy a BPMN resource. Returns a JSON object
     /// `{ "processIds": [...], "snapshot": {...} }` on success, or throws a
     /// JS error carrying the parse/deploy failure message.

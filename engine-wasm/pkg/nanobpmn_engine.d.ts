@@ -62,6 +62,14 @@ export class TestEngine {
      */
     constructor();
     /**
+     * Discard all engine state (deployed definitions, instances, jobs, timers,
+     * the event log and the virtual clock), returning the engine to the same
+     * pristine state as a freshly constructed one. Callers redeploy afterwards
+     * to start a clean run — this is what makes a re-run start from zero
+     * completed instances rather than accumulating across runs.
+     */
+    reset(): void;
+    /**
      * The current simulation state as a JSON [`Snapshot`].
      */
     snapshot(): string;
@@ -93,6 +101,7 @@ export interface InitOutput {
     readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_new: () => number;
     readonly testengine_now: (a: number) => number;
+    readonly testengine_reset: (a: number) => void;
     readonly testengine_snapshot: (a: number, b: number) => void;
     readonly testengine_tickNow: (a: number, b: number, c: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
