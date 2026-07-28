@@ -28,8 +28,14 @@ export interface ModelEnvelopes {
   tasks: Map<string, { in?: string; out?: string }>;
   /** Shape id → its ordered `extend` fields (empty for a non-flat shape). */
   shapes: Map<string, ScaffoldField[]>;
-  /** Element ids that a start event flows directly into. */
+  /** Element ids that a start event flows directly into (union across processes). */
   startTargets: Set<string>;
+  /**
+   * Per-`<bpmn:process>` start targets, keyed by process id. A multi-process
+   * definition keeps each process's entry points separate so `scaffoldStartVars`
+   * can scope to the selected process instead of conflating them.
+   */
+  startTargetsByProcess: Map<string, Set<string>>;
 }
 
 const TASK_TAGS = [
@@ -59,6 +65,7 @@ export function parseModelEnvelopes(xml: string): ModelEnvelopes {
   const tasks = new Map<string, { in?: string; out?: string }>();
   const shapes = new Map<string, ScaffoldField[]>();
   const startTargets = new Set<string>();
+  const startTargetsByProcess = new Map<string, Set<string>>();
 
   // Shapes: <…:shape id="X"> … <…:extend name=".." type=".." optional=".." /> …
   const shapeRe = /<[\w-]*:?shape\b([^>]*)>([\s\S]*?)<\/[\w-]*:?shape>/g;
@@ -99,21 +106,41 @@ export function parseModelEnvelopes(xml: string): ModelEnvelopes {
     }
   }
 
-  // Start entry targets: sequence flows whose source is a start event.
+  // Start entry targets, scoped per <bpmn:process> so a multi-process definition
+  // keeps each process's entry points separate. A start target always lives in
+  // the same process as its start event, so we scan each process body in
+  // isolation and also keep a union for callers that don't care about scoping.
+  const processRe = /<[\w-]*:?process\b([^>]*)>([\s\S]*?)<\/[\w-]*:?process>/g;
+  let sawProcess = false;
+  for (let pm = processRe.exec(xml); pm; pm = processRe.exec(xml)) {
+    sawProcess = true;
+    const pid = attr(pm[1], "id");
+    const targets = collectStartTargets(pm[2]);
+    for (const t of targets) startTargets.add(t);
+    if (pid) startTargetsByProcess.set(pid, targets);
+  }
+  // Fallback for a fragment with no <process> wrapper: scan the whole xml.
+  if (!sawProcess) for (const t of collectStartTargets(xml)) startTargets.add(t);
+
+  return { tasks, shapes, startTargets, startTargetsByProcess };
+}
+
+/** Element ids that a start event flows directly into, within a scope of xml. */
+function collectStartTargets(scope: string): Set<string> {
   const startIds = new Set<string>();
+  const targets = new Set<string>();
   const startRe = /<[\w-]*:?startEvent\b([^>]*)>/g;
-  for (let m = startRe.exec(xml); m; m = startRe.exec(xml)) {
+  for (let m = startRe.exec(scope); m; m = startRe.exec(scope)) {
     const id = attr(m[1], "id");
     if (id) startIds.add(id);
   }
   const flowRe = /<[\w-]*:?sequenceFlow\b([^>]*)\/?>/g;
-  for (let m = flowRe.exec(xml); m; m = flowRe.exec(xml)) {
+  for (let m = flowRe.exec(scope); m; m = flowRe.exec(scope)) {
     const source = attr(m[1], "sourceRef");
     const target = attr(m[1], "targetRef");
-    if (source && target && startIds.has(source)) startTargets.add(target);
+    if (source && target && startIds.has(source)) targets.add(target);
   }
-
-  return { tasks, shapes, startTargets };
+  return targets;
 }
 
 /** The value of a reserved `zeebe:property` (by its `name`) within an element body. */
@@ -174,9 +201,20 @@ export function scaffoldJobOutput(
  * The start-instance skeleton: the input envelope of the single service task the
  * start event flows into. Only a lone, unambiguous entry task is scaffolded —
  * otherwise the process input is not model-typed and we yield `"{}"`.
+ *
+ * When `processId` is given, scoping is restricted to that process's start
+ * targets, so a multi-process definition scaffolds the selected process only
+ * (and never conflates entry points across processes). With no `processId`, the
+ * union across all processes is used (single-process behaviour).
  */
-export function scaffoldStartVars(model: ModelEnvelopes): string {
-  const targets = [...model.startTargets];
+export function scaffoldStartVars(
+  model: ModelEnvelopes,
+  processId?: string,
+): string {
+  const scoped = processId
+    ? model.startTargetsByProcess.get(processId)
+    : undefined;
+  const targets = [...(scoped ?? model.startTargets)];
   if (targets.length !== 1) return "{}";
   return scaffoldForType(model, model.tasks.get(targets[0])?.in);
 }

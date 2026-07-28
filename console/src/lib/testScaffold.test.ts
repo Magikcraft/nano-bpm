@@ -132,6 +132,44 @@ test("scaffoldStartVars yields {} when the start fans out and only one target is
   assert.equal(scaffoldStartVars(m), "{}");
 });
 
+test("scaffoldStartVars scopes to the selected process in a multi-process model", () => {
+  // Two processes, each with its own start → entry task and distinct input
+  // envelope. Unscoped, the union of start targets is ambiguous → "{}"; scoped
+  // to a process id, each scaffolds its own entry input.
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+  xmlns:nano="https://nanobpm.io/schema/shapes/1.0">
+  <bpmn:process id="pa" isExecutable="true">
+    <bpmn:extensionElements><nano:shapes>
+      <nano:shape id="AIn"><nano:extend name="a" type="string" /></nano:shape>
+    </nano:shapes></bpmn:extensionElements>
+    <bpmn:startEvent id="sa"><bpmn:outgoing>fa</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="ta"><bpmn:extensionElements><zeebe:properties>
+      <zeebe:property name="io.nanobpm.dataEnvelope.in" value="AIn" />
+    </zeebe:properties></bpmn:extensionElements><bpmn:incoming>fa</bpmn:incoming></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="fa" sourceRef="sa" targetRef="ta" />
+  </bpmn:process>
+  <bpmn:process id="pb" isExecutable="true">
+    <bpmn:extensionElements><nano:shapes>
+      <nano:shape id="BIn"><nano:extend name="b" type="integer" /></nano:shape>
+    </nano:shapes></bpmn:extensionElements>
+    <bpmn:startEvent id="sb"><bpmn:outgoing>fb</bpmn:outgoing></bpmn:startEvent>
+    <bpmn:serviceTask id="tb"><bpmn:extensionElements><zeebe:properties>
+      <zeebe:property name="io.nanobpm.dataEnvelope.in" value="BIn" />
+    </zeebe:properties></bpmn:extensionElements><bpmn:incoming>fb</bpmn:incoming></bpmn:serviceTask>
+    <bpmn:sequenceFlow id="fb" sourceRef="sb" targetRef="tb" />
+  </bpmn:process>
+</bpmn:definitions>`;
+  const m = parseModelEnvelopes(xml);
+  assert.deepEqual([...(m.startTargetsByProcess.get("pa") ?? [])], ["ta"]);
+  assert.deepEqual([...(m.startTargetsByProcess.get("pb") ?? [])], ["tb"]);
+  // Unscoped union spans both processes → ambiguous.
+  assert.equal(scaffoldStartVars(m), "{}");
+  assert.deepEqual(JSON.parse(scaffoldStartVars(m, "pa")), { a: "" });
+  assert.deepEqual(JSON.parse(scaffoldStartVars(m, "pb")), { b: 0 });
+});
+
 test("parseModelEnvelopes tolerates a model with no shapes or envelopes", () => {
   const m = parseModelEnvelopes(
     '<bpmn:definitions><bpmn:process id="p"><bpmn:startEvent id="s" /></bpmn:process></bpmn:definitions>',

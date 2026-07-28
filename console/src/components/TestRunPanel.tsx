@@ -45,14 +45,20 @@ export default function TestRunPanel({
 
   // Each (re)deployment produces a fresh `processIds` array; when it changes,
   // default the process selection and clear the per-run UI state — matching the
-  // original panel's `deployInto` reset. Start variables are (re)seeded from the
-  // entry task's input envelope when the process input is model-typed.
+  // original panel's `deployInto` reset.
   useEffect(() => {
     setProcess(processIds[0] ?? "");
     setJobVars({});
     setTraceKey(null);
-    setStartVars(scaffoldStartVars(model));
-  }, [processIds, model]);
+  }, [processIds]);
+
+  // Start variables are (re)seeded from the selected process's entry-task input
+  // envelope whenever the model or the selected process changes, so switching
+  // the Process selector re-scaffolds for that process (and never leaks a
+  // sibling process's input in a multi-process definition).
+  useEffect(() => {
+    setStartVars(scaffoldStartVars(model, process || undefined));
+  }, [model, process]);
 
   function start() {
     const snap = createInstance(process, startVars || "{}");
