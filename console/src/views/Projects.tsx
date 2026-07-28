@@ -427,15 +427,23 @@ function ProjectTile({
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
       <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex">
         <button
+          type="button"
           onClick={onRename}
           title="Rename project"
+          aria-label={`Rename project ${project.name}`}
           className="rounded px-1.5 py-0.5 text-xs text-fg-faint hover:bg-hover hover:text-fg"
         >
           ✎
         </button>
         <button
+          type="button"
           onClick={onDelete}
           title={project.source === "path" ? "Remove link" : "Delete project"}
+          aria-label={
+            project.source === "path"
+              ? `Remove link to ${project.name}`
+              : `Delete project ${project.name}`
+          }
           className="rounded px-1.5 py-0.5 text-xs text-fg-faint hover:bg-danger/10 hover:text-danger"
         >
           ✕
