@@ -120,7 +120,8 @@ export function parseModelEnvelopes(xml: string): ModelEnvelopes {
     if (pid) startTargetsByProcess.set(pid, targets);
   }
   // Fallback for a fragment with no <process> wrapper: scan the whole xml.
-  if (!sawProcess) for (const t of collectStartTargets(xml)) startTargets.add(t);
+  if (!sawProcess)
+    for (const t of collectStartTargets(xml)) startTargets.add(t);
 
   return { tasks, shapes, startTargets, startTargetsByProcess };
 }
