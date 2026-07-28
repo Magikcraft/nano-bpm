@@ -135,6 +135,29 @@ impl TestEngine {
         to_json(&self.snapshot_value(None))
     }
 
+    /// Correlate a message to any instance waiting on it: publishes `message_name`
+    /// with the given `correlation_key` (the value the waiting subscription's
+    /// `correlationKey` expression resolved to) and merges `variables_json` (a
+    /// JSON object string) into each correlated instance. This unblocks a message
+    /// intermediate catch / receive task without an external broker — the
+    /// in-browser equivalent of an app publishing a message. Returns the snapshot.
+    #[wasm_bindgen(js_name = correlateMessage)]
+    pub fn correlate_message(
+        &mut self,
+        message_name: &str,
+        correlation_key: &str,
+        variables_json: &str,
+    ) -> Result<String, JsValue> {
+        let variables = parse_vars(variables_json)?;
+        self.apply(Command::CorrelateMessage {
+            message_name: message_name.to_string(),
+            correlation_key: correlation_key.to_string(),
+            variables,
+        })
+        .map_err(|e| js_err(&format!("correlate error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
     /// Advance the virtual clock by `by_ms` milliseconds, firing any timers that
     /// become due and expiring any lapsed job locks.
     #[wasm_bindgen(js_name = advanceTime)]

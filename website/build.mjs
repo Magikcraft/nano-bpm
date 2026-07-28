@@ -20,6 +20,8 @@ import {
   mkdirSync,
   writeFileSync,
   copyFileSync,
+  cpSync,
+  existsSync,
   rmSync,
   readFileSync,
 } from "node:fs";
@@ -117,7 +119,22 @@ const published = [];
 }
 
 // --- Landing + Pages plumbing -------------------------------------------------
-write(join(outDir, "index.html"), landingHtml(published));
+// The site root is the live in-browser demo (website/demo, an ADR 0043 Bojtos
+// app) when it has been built; the generated schema listing then moves to
+// /schemas/. When the demo dist is absent (the zero-dep `schemas` CI drift
+// check, or a standalone `node website/build.mjs`), the schema listing is the
+// root — so this build stays runnable without the demo's npm toolchain. The
+// published schema/namespace URLs are unaffected either way (own paths).
+const demoDist = join(here, "demo", "dist");
+const demoBuilt = existsSync(join(demoDist, "index.html"));
+if (demoBuilt) {
+  cpSync(demoDist, outDir, { recursive: true });
+  write(join(outDir, "schemas", "index.html"), landingHtml(published));
+  console.log("embedded live demo at / (schema listing -> /schemas/)");
+} else {
+  write(join(outDir, "index.html"), landingHtml(published));
+  console.log("demo dist not built -> schema listing at / (run demo build for the live landing)");
+}
 write(join(outDir, "CNAME"), `${DOMAIN}\n`);
 write(join(outDir, ".nojekyll"), ""); // serve paths verbatim, skip Jekyll
 

@@ -26,6 +26,15 @@ export class TestEngine {
      */
     completeJob(job_key: string, variables_json: string): string;
     /**
+     * Correlate a message to any instance waiting on it: publishes `message_name`
+     * with the given `correlation_key` (the value the waiting subscription's
+     * `correlationKey` expression resolved to) and merges `variables_json` (a
+     * JSON object string) into each correlated instance. This unblocks a message
+     * intermediate catch / receive task without an external broker — the
+     * in-browser equivalent of an app publishing a message. Returns the snapshot.
+     */
+    correlateMessage(message_name: string, correlation_key: string, variables_json: string): string;
+    /**
      * Start a new instance of `process_id`, seeding it with the given variables
      * (a JSON object string; pass `"{}"` or `""` for none). Returns the
      * post-run [`Snapshot`] with a top-level `created` field holding the new
@@ -77,6 +86,7 @@ export interface InitOutput {
     readonly testengine_activateJobs: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_advanceTime: (a: number, b: number, c: number) => void;
     readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_deploy: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_events: (a: number, b: number) => void;

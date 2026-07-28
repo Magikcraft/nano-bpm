@@ -94,6 +94,7 @@ export function useBojtos({ bpmn, wasm }) {
     const completeJob = useCallback((jobKey, variablesJson) => run((s) => s.completeJob(jobKey, variablesJson)), [run]);
     const failJob = useCallback((jobKey, retries, message) => run((s) => s.failJob(jobKey, retries, message)), [run]);
     const advanceTime = useCallback((byMs) => run((s) => s.advanceTime(byMs)), [run]);
+    const correlateMessage = useCallback((messageName, correlationKey, variablesJson) => run((s) => s.correlateMessage(messageName, correlationKey, variablesJson)), [run]);
     const runWorkers = useCallback(async (workers, opts) => {
         const session = sessionRef.current;
         if (!session)
@@ -164,6 +165,7 @@ export function useBojtos({ bpmn, wasm }) {
         completeJob,
         failJob,
         advanceTime,
+        correlateMessage,
         runWorkers,
         stepWorkers,
         reset,

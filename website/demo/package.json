@@ -1,0 +1,25 @@
+{
+  "name": "@nanobpm/nanobpm-io-demo",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "The nanobpm.io landing page: a live in-browser run of the urban-pr-review convergence loop, driven by the Bojtos framework (ADR 0043) over the real wasm engine.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit -p tsconfig.json && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@nanobpm/bojtos-react": "file:../../bojtos-react",
+    "bpmn-js": "^17.11.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^5.4.10"
+  }
+}
