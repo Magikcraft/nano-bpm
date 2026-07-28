@@ -17,6 +17,7 @@ export interface BpmnRuntimeViewProps {
  *
  * The consumer must load bpmn-js's diagram CSS (`bpmn-js/dist/assets/
  * diagram-js.css` and `.../bpmn-font/css/bpmn-embedded.css`) once in the app,
- * and provide the `.nano-active` / `.nano-incident` marker styles.
+ * and provide the `.nano-active` / `.nano-incident` marker styles plus a
+ * `.nano-token` style for the token badge overlaid on each active element.
  */
 export declare function BpmnRuntimeView({ xml, activeIds, incidentIds, className, }: BpmnRuntimeViewProps): import("react").JSX.Element;

@@ -7,6 +7,17 @@ interface Canvas {
   removeMarker(elementId: string, marker: string): void;
 }
 
+interface Overlays {
+  add(
+    elementId: string,
+    overlay: {
+      position: Record<string, number>;
+      html: string | HTMLElement;
+    },
+  ): string;
+  remove(id: string): void;
+}
+
 export interface BpmnRuntimeViewProps {
   /** The diagram XML to render. */
   xml: string;
@@ -27,7 +38,8 @@ export interface BpmnRuntimeViewProps {
  *
  * The consumer must load bpmn-js's diagram CSS (`bpmn-js/dist/assets/
  * diagram-js.css` and `.../bpmn-font/css/bpmn-embedded.css`) once in the app,
- * and provide the `.nano-active` / `.nano-incident` marker styles.
+ * and provide the `.nano-active` / `.nano-incident` marker styles plus a
+ * `.nano-token` style for the token badge overlaid on each active element.
  */
 export function BpmnRuntimeView({
   xml,
@@ -39,6 +51,7 @@ export function BpmnRuntimeView({
   const viewerRef = useRef<NavigatedViewer | null>(null);
   const importedRef = useRef(false);
   const markedRef = useRef<{ id: string; cls: string }[]>([]);
+  const tokenOverlaysRef = useRef<string[]>([]);
   // Track the latest ids in a ref so the post-import `applyMarkers()` (fired from
   // the `[xml]` effect's async `.then`) uses current values, not the ids that
   // were current when the import started — otherwise ids changing mid-import
@@ -91,6 +104,33 @@ export function BpmnRuntimeView({
       }
     }
     markedRef.current = next;
+
+    // A visible token badge on each active element: an explicit "token is here"
+    // marker so movement reads clearly even when a class-only highlight is too
+    // subtle. Overlays are removed/re-added each update so the token hops with
+    // the frontier.
+    const overlays = viewer.get<Overlays>("overlays");
+    for (const id of tokenOverlaysRef.current) {
+      try {
+        overlays.remove(id);
+      } catch {
+        /* ignore */
+      }
+    }
+    const nextOverlays: string[] = [];
+    for (const id of idsRef.current.activeIds) {
+      try {
+        nextOverlays.push(
+          overlays.add(id, {
+            position: { top: -12, left: -12 },
+            html: '<div class="nano-token" aria-hidden="true"></div>',
+          }),
+        );
+      } catch {
+        /* element not in this diagram */
+      }
+    }
+    tokenOverlaysRef.current = nextOverlays;
   }
 
   useEffect(() => {

@@ -40,6 +40,14 @@ export function App() {
 
   const logIdRef = useRef(0);
   const counterRef = useRef({ i: 0 });
+  const logRef = useRef<HTMLUListElement>(null);
+
+  // Keep the newest activity line in view as the (scrollable, fixed-height) log
+  // fills, so the closing "Converged" entry is always visible.
+  useEffect(() => {
+    const el = logRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [log]);
 
   const pushLog = (kind: LogKind, text: string) =>
     setLog((prev) => {
@@ -144,9 +152,9 @@ export function App() {
 
       <section className="hero">
         <h1>
-          A BPMN engine that runs
+          Automate anything
           <br />
-          <span className="grad">right here in your browser.</span>
+          <span className="grad">to Greatness.</span>
         </h1>
         <p className="sub">
           nanobpm is a from-scratch process orchestration engine in a single Rust binary.
@@ -206,7 +214,7 @@ export function App() {
 
             <div className="panel grow">
               <div className="panel-h">Activity</div>
-              <ul className="log">
+              <ul className="log" ref={logRef}>
                 {log.map((e) => (
                   <li key={e.id} className={`log-${e.kind}`}>
                     {e.text}
