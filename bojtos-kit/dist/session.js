@@ -48,6 +48,9 @@ class WasmBojtosSession {
     failJob(jobKey, retries, message) {
         return parseSnapshot(this.engine.failJob(jobKey, retries, message));
     }
+    correlateMessage(messageName, correlationKey, variablesJson) {
+        return parseSnapshot(this.engine.correlateMessage(messageName, correlationKey, variablesJson || "{}"));
+    }
     advanceTime(byMs) {
         return parseSnapshot(this.engine.advanceTime(byMs));
     }

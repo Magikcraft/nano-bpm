@@ -70,6 +70,18 @@ export interface BojtosSession {
   completeJob(jobKey: string, variablesJson: string): Snapshot;
   /** Fail a waiting job; with no retries left this raises an incident. */
   failJob(jobKey: string, retries: number, message: string): Snapshot;
+  /**
+   * Correlate a message to any instance waiting on it: publishes `messageName`
+   * with `correlationKey` (the value the waiting subscription's `correlationKey`
+   * expression resolved to) and merges `variablesJson` into each correlated
+   * instance. Unblocks a message intermediate-catch / receive task without an
+   * external broker — the in-browser equivalent of an app publishing a message.
+   */
+  correlateMessage(
+    messageName: string,
+    correlationKey: string,
+    variablesJson: string,
+  ): Snapshot;
   /** Advance the virtual clock by `byMs`, firing due timers and lapsed locks. */
   advanceTime(byMs: number): Snapshot;
   /** The full ordered event log emitted so far. */
@@ -119,6 +131,20 @@ class WasmBojtosSession implements BojtosSession {
 
   failJob(jobKey: string, retries: number, message: string): Snapshot {
     return parseSnapshot(this.engine.failJob(jobKey, retries, message));
+  }
+
+  correlateMessage(
+    messageName: string,
+    correlationKey: string,
+    variablesJson: string,
+  ): Snapshot {
+    return parseSnapshot(
+      this.engine.correlateMessage(
+        messageName,
+        correlationKey,
+        variablesJson || "{}",
+      ),
+    );
   }
 
   advanceTime(byMs: number): Snapshot {

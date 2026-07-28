@@ -5,6 +5,7 @@ export const __wbg_testengine_free: (a: number, b: number) => void;
 export const testengine_activateJobs: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const testengine_advanceTime: (a: number, b: number, c: number) => void;
 export const testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const testengine_deploy: (a: number, b: number, c: number, d: number) => void;
 export const testengine_events: (a: number, b: number) => void;

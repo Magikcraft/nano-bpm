@@ -129,6 +129,50 @@ test("dispatchRound advances the token frontier one step per round", async () =>
   session.free();
 });
 
+// A message intermediate-catch event parks the token until a matching message is
+// correlated. This is the loop-gating construct in the urban-pr-review model.
+const WAIT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:message id="Msg_go" name="go"><bpmn:extensionElements><zeebe:subscription correlationKey="=k" /></bpmn:extensionElements></bpmn:message>
+  <bpmn:process id="wait" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:serviceTask id="prep"><bpmn:extensionElements><zeebe:taskDefinition type="prep" /></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:intermediateCatchEvent id="hold"><bpmn:messageEventDefinition id="med" messageRef="Msg_go" /></bpmn:intermediateCatchEvent>
+    <bpmn:serviceTask id="after"><bpmn:extensionElements><zeebe:taskDefinition type="after" /></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="done" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="prep" />
+    <bpmn:sequenceFlow id="f2" sourceRef="prep" targetRef="hold" />
+    <bpmn:sequenceFlow id="f3" sourceRef="hold" targetRef="after" />
+    <bpmn:sequenceFlow id="f4" sourceRef="after" targetRef="done" />
+  </bpmn:process>
+</bpmn:definitions>`;
+
+test("correlateMessage unblocks a token parked at a message catch event", async () => {
+  const session = await createBojtosSession({ wasm: wasmBytes });
+  session.deploy(WAIT_BPMN);
+  session.createInstance("wait", JSON.stringify({ k: "key-1" }));
+
+  const r1 = await dispatchRound(session, { prep: () => ({}), after: () => ({}) });
+  assert.equal(r1.handled, 1, "only the prep job ran");
+  assert.deepEqual(
+    r1.snapshot.activeElementIds,
+    ["hold"],
+    "token is parked at the message catch, not past it",
+  );
+
+  // A non-matching correlation key must not release it.
+  const miss = session.correlateMessage("go", "other-key", "{}");
+  assert.deepEqual(miss.activeElementIds, ["hold"], "wrong key doesn't correlate");
+
+  // The matching key releases the token to the downstream `after` job.
+  const hit = session.correlateMessage("go", "key-1", "{}");
+  assert.deepEqual(hit.activeElementIds, ["after"], "matching key advances the token");
+
+  const r2 = await dispatchRound(session, { prep: () => ({}), after: () => ({}) });
+  assert.equal(r2.snapshot.completedInstances, 1, "instance completes after the catch");
+  session.free();
+});
+
 test("maxRounds guards against an unbounded drain", async () => {
   const session = await newOrderSession("{}");
   // The order process needs three rounds (payment, shipping, quiescent); cap at

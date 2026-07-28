@@ -120,6 +120,48 @@ export class TestEngine {
         }
     }
     /**
+     * Correlate a message to any instance waiting on it: publishes `message_name`
+     * with the given `correlation_key` (the value the waiting subscription's
+     * `correlationKey` expression resolved to) and merges `variables_json` (a
+     * JSON object string) into each correlated instance. This unblocks a message
+     * intermediate catch / receive task without an external broker — the
+     * in-browser equivalent of an app publishing a message. Returns the snapshot.
+     * @param {string} message_name
+     * @param {string} correlation_key
+     * @param {string} variables_json
+     * @returns {string}
+     */
+    correlateMessage(message_name, correlation_key, variables_json) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(message_name, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(correlation_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.testengine_correlateMessage(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
      * Start a new instance of `process_id`, seeding it with the given variables
      * (a JSON object string; pass `"{}"` or `""` for none). Returns the
      * post-run [`Snapshot`] with a top-level `created` field holding the new

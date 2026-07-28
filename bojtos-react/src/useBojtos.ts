@@ -45,6 +45,17 @@ export interface BojtosControls {
   completeJob(jobKey: string, variablesJson: string): Snapshot | null;
   /** Fail a waiting job (raises an incident with no retries left). */
   failJob(jobKey: string, retries: number, message: string): Snapshot | null;
+  /**
+   * Correlate a message to an instance parked at a message catch/receive:
+   * publishes `messageName` with `correlationKey` and merges `variablesJson`.
+   * The in-browser equivalent of an app publishing a message — used to unblock
+   * a waiting loop (e.g. urban-pr-review's `review-ready`).
+   */
+  correlateMessage(
+    messageName: string,
+    correlationKey: string,
+    variablesJson: string,
+  ): Snapshot | null;
   /** Advance the virtual clock. */
   advanceTime(byMs: number): Snapshot | null;
   /**
@@ -187,6 +198,11 @@ export function useBojtos({ bpmn, wasm }: UseBojtosOptions): BojtosControls {
     (byMs: number) => run((s) => s.advanceTime(byMs)),
     [run],
   );
+  const correlateMessage = useCallback(
+    (messageName: string, correlationKey: string, variablesJson: string) =>
+      run((s) => s.correlateMessage(messageName, correlationKey, variablesJson)),
+    [run],
+  );
 
   const runWorkers = useCallback(
     async (
@@ -267,6 +283,7 @@ export function useBojtos({ bpmn, wasm }: UseBojtosOptions): BojtosControls {
     completeJob,
     failJob,
     advanceTime,
+    correlateMessage,
     runWorkers,
     stepWorkers,
     reset,
