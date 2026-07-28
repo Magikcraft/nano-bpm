@@ -4,4 +4,7 @@
 // snapshot/event contract types are re-exported from @nanobpm/bojtos-kit for
 // convenience.
 export { useBojtos, } from "./useBojtos.js";
+export { Bojtos } from "./Bojtos.js";
+export { OrderFulfillmentDemo, ORDER_FULFILLMENT_BPMN, orderFulfillmentWorkers, } from "./examples/orderFulfillment.js";
 export { BpmnRuntimeView, } from "./BpmnRuntimeView.js";
+export { JobFailure, } from "@nanobpm/bojtos-kit";

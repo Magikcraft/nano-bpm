@@ -273,6 +273,14 @@ jobs:
       - name: Typecheck + build bojtos-kit
         working-directory: bojtos-kit
         run: npm run build
+      - name: Test bojtos-kit (worker dispatch loop)
+        # Runs the dispatch-loop e2e tests against the dist built by the previous
+        # step with the real wasm engine (Node loads the binary via the `wasm`
+        # source escape hatch). Uses `test:ci` (no rebuild) so tsc doesn't run
+        # twice — the build step above already produced the dist. Node 24
+        # type-strips the TS test sources.
+        working-directory: bojtos-kit
+        run: npm run test:ci
       - name: Install bojtos-react (locked)
         working-directory: bojtos-react
         run: npm ci

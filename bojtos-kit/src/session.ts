@@ -1,13 +1,41 @@
-import init, { TestEngine } from "@nanobpm/engine-wasm";
-import type { Snapshot, WasmEvent } from "./types.js";
+import init, { type InitInput, TestEngine } from "@nanobpm/engine-wasm";
+import type { ActivatedJob, Snapshot, WasmEvent } from "./types.js";
 
 // Lazily initialise the wasm module exactly once per page, no matter how many
 // sessions are created. Mirrors the console's original `ensureWasm`.
 let wasmReady: Promise<void> | null = null;
 
-/** Initialise the wasm engine module (idempotent; safe to call repeatedly). */
-export function ensureWasm(): Promise<void> {
-  if (!wasmReady) wasmReady = init().then(() => undefined);
+/**
+ * The source of the engine wasm binary. Under a bundler that understands
+ * `new URL(..., import.meta.url)` (e.g. Vite) the default loader needs no
+ * argument; pass an explicit `URL` / `Response` / bytes / `WebAssembly.Module`
+ * when the environment can't resolve it that way (Node, Jest, or the external-
+ * `.wasm` "wasmUrl" mode — ADR 0043 §3).
+ */
+export type WasmSource = InitInput;
+
+/**
+ * Initialise the wasm engine module (idempotent; safe to call repeatedly). The
+ * first successful call wins: a `source` passed to a later call is ignored once
+ * the module is already loading or loaded. Pass a `source` in environments where
+ * the default `import.meta.url` fetch can't resolve the binary
+ * (Node/Jest/webpack).
+ *
+ * If a load *fails*, the cached promise is cleared so a later call — e.g. one
+ * that supplies a working `WasmSource` after the default loader couldn't resolve
+ * the binary — can retry rather than being stuck on the first rejection.
+ */
+export function ensureWasm(source?: WasmSource): Promise<void> {
+  if (!wasmReady) {
+    wasmReady = init(
+      source === undefined ? undefined : { module_or_path: source },
+    )
+      .then(() => undefined)
+      .catch((e) => {
+        wasmReady = null;
+        throw e;
+      });
+  }
   return wasmReady;
 }
 
@@ -26,6 +54,18 @@ export interface BojtosSession {
   deploy(xml: string): { processIds: string[] };
   /** Start an instance of `processId`, seeding it with `variablesJson`. */
   createInstance(processId: string, variablesJson: string): Snapshot;
+  /**
+   * Activate up to `maxJobs` `Created` jobs of `jobType`, locking them to
+   * `worker` until `now + timeoutMs`. Returns the activated jobs (each carrying
+   * the instance's current variables) for a dispatch loop to hand to worker
+   * handlers. A job that is already activated is not re-returned.
+   */
+  activateJobs(
+    jobType: string,
+    maxJobs: number,
+    timeoutMs: number,
+    worker: string,
+  ): ActivatedJob[];
   /** Complete a waiting job, merging `variablesJson` into the instance. */
   completeJob(jobKey: string, variablesJson: string): Snapshot;
   /** Fail a waiting job; with no retries left this raises an incident. */
@@ -62,6 +102,17 @@ class WasmBojtosSession implements BojtosSession {
     );
   }
 
+  activateJobs(
+    jobType: string,
+    maxJobs: number,
+    timeoutMs: number,
+    worker: string,
+  ): ActivatedJob[] {
+    return JSON.parse(
+      this.engine.activateJobs(jobType, maxJobs, timeoutMs, worker),
+    ) as ActivatedJob[];
+  }
+
   completeJob(jobKey: string, variablesJson: string): Snapshot {
     return parseSnapshot(this.engine.completeJob(jobKey, variablesJson || "{}"));
   }
@@ -90,9 +141,13 @@ class WasmBojtosSession implements BojtosSession {
 /**
  * Create a fresh headless engine session. Ensures the wasm module is loaded
  * (once per page), then constructs a new {@link TestEngine}. The virtual clock
- * starts at 0; deploy a diagram before starting instances.
+ * starts at 0; deploy a diagram before starting instances. Pass a `wasm` source
+ * in environments where the default `import.meta.url` loader can't resolve the
+ * binary (Node/Jest, or the external-`.wasm` mode — ADR 0043 §3).
  */
-export async function createBojtosSession(): Promise<BojtosSession> {
-  await ensureWasm();
+export async function createBojtosSession(opts?: {
+  wasm?: WasmSource;
+}): Promise<BojtosSession> {
+  await ensureWasm(opts?.wasm);
   return new WasmBojtosSession(new TestEngine());
 }

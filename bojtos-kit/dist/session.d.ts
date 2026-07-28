@@ -1,6 +1,25 @@
-import type { Snapshot, WasmEvent } from "./types.js";
-/** Initialise the wasm engine module (idempotent; safe to call repeatedly). */
-export declare function ensureWasm(): Promise<void>;
+import { type InitInput } from "@nanobpm/engine-wasm";
+import type { ActivatedJob, Snapshot, WasmEvent } from "./types.js";
+/**
+ * The source of the engine wasm binary. Under a bundler that understands
+ * `new URL(..., import.meta.url)` (e.g. Vite) the default loader needs no
+ * argument; pass an explicit `URL` / `Response` / bytes / `WebAssembly.Module`
+ * when the environment can't resolve it that way (Node, Jest, or the external-
+ * `.wasm` "wasmUrl" mode — ADR 0043 §3).
+ */
+export type WasmSource = InitInput;
+/**
+ * Initialise the wasm engine module (idempotent; safe to call repeatedly). The
+ * first successful call wins: a `source` passed to a later call is ignored once
+ * the module is already loading or loaded. Pass a `source` in environments where
+ * the default `import.meta.url` fetch can't resolve the binary
+ * (Node/Jest/webpack).
+ *
+ * If a load *fails*, the cached promise is cleared so a later call — e.g. one
+ * that supplies a working `WasmSource` after the default loader couldn't resolve
+ * the binary — can retry rather than being stuck on the first rejection.
+ */
+export declare function ensureWasm(source?: WasmSource): Promise<void>;
 /**
  * A headless handle to one in-browser engine instance: deploy a diagram, start
  * instances, complete/fail jobs, advance the virtual clock, and read the event
@@ -18,6 +37,13 @@ export interface BojtosSession {
     };
     /** Start an instance of `processId`, seeding it with `variablesJson`. */
     createInstance(processId: string, variablesJson: string): Snapshot;
+    /**
+     * Activate up to `maxJobs` `Created` jobs of `jobType`, locking them to
+     * `worker` until `now + timeoutMs`. Returns the activated jobs (each carrying
+     * the instance's current variables) for a dispatch loop to hand to worker
+     * handlers. A job that is already activated is not re-returned.
+     */
+    activateJobs(jobType: string, maxJobs: number, timeoutMs: number, worker: string): ActivatedJob[];
     /** Complete a waiting job, merging `variablesJson` into the instance. */
     completeJob(jobKey: string, variablesJson: string): Snapshot;
     /** Fail a waiting job; with no retries left this raises an incident. */
@@ -34,6 +60,10 @@ export interface BojtosSession {
 /**
  * Create a fresh headless engine session. Ensures the wasm module is loaded
  * (once per page), then constructs a new {@link TestEngine}. The virtual clock
- * starts at 0; deploy a diagram before starting instances.
+ * starts at 0; deploy a diagram before starting instances. Pass a `wasm` source
+ * in environments where the default `import.meta.url` loader can't resolve the
+ * binary (Node/Jest, or the external-`.wasm` mode — ADR 0043 §3).
  */
-export declare function createBojtosSession(): Promise<BojtosSession>;
+export declare function createBojtosSession(opts?: {
+    wasm?: WasmSource;
+}): Promise<BojtosSession>;

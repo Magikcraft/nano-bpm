@@ -1,9 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  createBojtosSession,
   type BojtosSession,
+  createBojtosSession,
+  type DispatchOptions,
+  dispatchRound,
+  dispatchWorkers,
+  type JobHandler,
+  type RoundResult,
   type Snapshot,
   type WasmEvent,
+  type WasmSource,
 } from "@nanobpm/bojtos-kit";
 
 /** Lifecycle of the in-browser engine load. */
@@ -12,6 +18,16 @@ export type BojtosPhase = "loading" | "ready" | "error";
 export interface UseBojtosOptions {
   /** The BPMN diagram XML to deploy. Re-deploys on a fresh engine when it changes. */
   bpmn: string;
+  /**
+   * Optional engine wasm source. Pass a `URL` / bytes / `WebAssembly.Module`
+   * when the default `import.meta.url` loader can't resolve the binary (the
+   * external-`.wasm` "wasmUrl" mode, or a non-Vite bundler — ADR 0043 §3).
+   *
+   * Init-time only: the wasm module loads once per page (see `ensureWasm`), so
+   * changing `wasm` after the first successful init has no effect — it will not
+   * reload the module.
+   */
+  wasm?: WasmSource;
 }
 
 export interface BojtosControls {
@@ -31,6 +47,26 @@ export interface BojtosControls {
   failJob(jobKey: string, retries: number, message: string): Snapshot | null;
   /** Advance the virtual clock. */
   advanceTime(byMs: number): Snapshot | null;
+  /**
+   * Run the registered worker handlers until the process settles (activate →
+   * handler → complete/fail), then reflect the resulting snapshot/events.
+   * Resolves to the settled snapshot, or null if there is no live session.
+   */
+  runWorkers(
+    workers: Record<string, JobHandler>,
+    opts?: DispatchOptions,
+  ): Promise<Snapshot | null>;
+  /**
+   * Run a single activate-and-handle pass of the registered workers (one
+   * {@link dispatchRound}), reflecting the resulting snapshot/events. Returns
+   * how many jobs it handled (0 once the process is quiescent) plus the
+   * snapshot, or null if there is no live session — drive it on a timer to
+   * animate the token advancing one step at a time.
+   */
+  stepWorkers(
+    workers: Record<string, JobHandler>,
+    opts?: DispatchOptions,
+  ): Promise<RoundResult | null>;
   /** Re-deploy the diagram on the existing engine, clearing run state. */
   reset(): void;
 }
@@ -46,13 +82,19 @@ export interface BojtosControls {
  * test-run panel is its first consumer (§8 step 2 — dogfooding is the acceptance
  * test).
  */
-export function useBojtos({ bpmn }: UseBojtosOptions): BojtosControls {
+export function useBojtos({ bpmn, wasm }: UseBojtosOptions): BojtosControls {
   const sessionRef = useRef<BojtosSession | null>(null);
   const [phase, setPhase] = useState<BojtosPhase>("loading");
   const [error, setError] = useState<string | null>(null);
   const [processIds, setProcessIds] = useState<string[]>([]);
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<WasmEvent[]>([]);
+
+  // The wasm source is an init-time concern (the first `ensureWasm` wins), so
+  // keep it in a ref rather than the mount effect's deps — a fresh URL/bytes
+  // identity each render must not re-create the session.
+  const wasmRef = useRef(wasm);
+  wasmRef.current = wasm;
 
   const deployInto = useCallback(
     (session: BojtosSession) => {
@@ -76,7 +118,7 @@ export function useBojtos({ bpmn }: UseBojtosOptions): BojtosControls {
     setSnapshot(null);
     setEvents([]);
     setError(null);
-    createBojtosSession()
+    createBojtosSession({ wasm: wasmRef.current })
       .then((session) => {
         if (cancelled) {
           session.free();
@@ -146,6 +188,65 @@ export function useBojtos({ bpmn }: UseBojtosOptions): BojtosControls {
     [run],
   );
 
+  const runWorkers = useCallback(
+    async (
+      workers: Record<string, JobHandler>,
+      opts?: DispatchOptions,
+    ): Promise<Snapshot | null> => {
+      const session = sessionRef.current;
+      if (!session) return null;
+      try {
+        const { snapshot: settled } = await dispatchWorkers(
+          session,
+          workers,
+          opts,
+        );
+        // The session may have been torn down/replaced (bpmn change, unmount)
+        // while we awaited — don't publish stale state or read a freed session.
+        if (sessionRef.current !== session) return null;
+        setSnapshot(settled);
+        setEvents(session.events());
+        setError(null);
+        return settled;
+      } catch (e) {
+        if (sessionRef.current !== session) return null;
+        // Reflect whatever state the engine reached before the drain aborted
+        // (e.g. the maxRounds guard) so the view isn't left stale.
+        setSnapshot(session.snapshot());
+        setEvents(session.events());
+        setError(String(e));
+        return null;
+      }
+    },
+    [],
+  );
+
+  const stepWorkers = useCallback(
+    async (
+      workers: Record<string, JobHandler>,
+      opts?: DispatchOptions,
+    ): Promise<RoundResult | null> => {
+      const session = sessionRef.current;
+      if (!session) return null;
+      try {
+        const round = await dispatchRound(session, workers, opts);
+        // Bail if the session was replaced/freed while we awaited the round.
+        if (sessionRef.current !== session) return null;
+        setSnapshot(round.snapshot);
+        setEvents(session.events());
+        setError(null);
+        return round;
+      } catch (e) {
+        if (sessionRef.current !== session) return null;
+        setSnapshot(session.snapshot());
+        setEvents(session.events());
+        setError(String(e));
+        return null;
+      }
+    },
+    [],
+  );
+
   const reset = useCallback(() => {
     const session = sessionRef.current;
     if (!session) return;
@@ -166,6 +267,8 @@ export function useBojtos({ bpmn }: UseBojtosOptions): BojtosControls {
     completeJob,
     failJob,
     advanceTime,
+    runWorkers,
+    stepWorkers,
     reset,
   };
 }
