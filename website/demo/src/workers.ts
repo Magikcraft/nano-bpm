@@ -55,11 +55,15 @@ export function makeWorkers(
       const step = REVIEW_SCRIPT[Math.min(counter.i, REVIEW_SCRIPT.length - 1)];
       onReview(step, counter.i);
       counter.i += 1;
-      return {
+      // Only emit `question` when the step actually has one, so an "addressed"
+      // or "converged" round doesn't overwrite a prior escalation question with
+      // an empty string (it must stay distinguishable / preserved downstream).
+      const out: Record<string, unknown> = {
         status: step.status,
         summary: step.summary,
-        question: step.question ?? "",
       };
+      if (step.question) out.question = step.question;
+      return out;
     },
     "pr.persist-round": () => ({}),
     "pr.persist-escalation": () => ({}),

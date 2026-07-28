@@ -19,6 +19,10 @@ export default defineConfig({
     dedupe: ["react", "react-dom"],
   },
   optimizeDeps: {
-    exclude: ["@nanobpm/engine-wasm", "@nanobpm/bojtos-kit"],
+    exclude: [
+      "@nanobpm/engine-wasm",
+      "@nanobpm/bojtos-kit",
+      "@nanobpm/bojtos-react",
+    ],
   },
 });
