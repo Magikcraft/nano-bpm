@@ -73,9 +73,13 @@ async function runOne(
   handler: JobHandler,
   job: ActivatedJob,
 ): Promise<void> {
+  let payload: string;
   try {
+    // Only the handler and the serialization of its result are treated as a
+    // job failure: a handler that throws (or returns something unserializable)
+    // is the demo's own logic failing, so we translate it into `failJob`.
     const out = await handler(job);
-    session.completeJob(job.key, JSON.stringify(out ?? {}));
+    payload = JSON.stringify(out ?? {});
   } catch (e) {
     const retries =
       e instanceof JobFailure && e.retries !== undefined
@@ -83,7 +87,13 @@ async function runOne(
         : Math.max(0, job.retries - 1);
     const message = e instanceof Error ? e.message : String(e);
     session.failJob(job.key, retries, message);
+    return;
   }
+  // An engine command failure (invalid JSON the engine rejects, ABI mismatch,
+  // internal engine error) is a real problem, not a handler failure — masking
+  // it as `failJob` would hide the bug and mutate engine state incorrectly, so
+  // we let it bubble to the caller.
+  session.completeJob(job.key, payload);
 }
 
 /**

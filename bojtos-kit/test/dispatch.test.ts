@@ -63,7 +63,11 @@ test("drains a process: activate → handler → complete, merging variables dow
   assert.equal(result.handled, 2, "both jobs handled");
   assert.equal(result.snapshot.completedInstances, 1, "instance completed");
   assert.equal(result.snapshot.totalInstances, 1);
-  assert.deepEqual(result.snapshot.activeElementIds, [], "no token left active");
+  assert.deepEqual(
+    result.snapshot.activeElementIds,
+    [],
+    "no token left active",
+  );
   assert.deepEqual(shipSaw, { amount: 42, charged: true });
   session.free();
 });
@@ -138,4 +142,83 @@ test("maxRounds guards against an unbounded drain", async () => {
     /exceeded maxRounds/,
   );
   session.free();
+});
+
+// A minimal fake session that hands out exactly one `payment` job, so the
+// error-routing tests below are deterministic and don't need the wasm engine.
+// `completeJob`/`failJob` are stubbed to observe which one dispatch calls.
+function fakeSession(overrides: Partial<BojtosSession>): {
+  session: BojtosSession;
+  calls: { completed: boolean; failed: boolean };
+} {
+  const job = {
+    key: "job-1",
+    type: "payment",
+    instanceKey: "inst-1",
+    elementId: "charge",
+    retries: 3,
+    variables: {},
+  };
+  const calls = { completed: false, failed: false };
+  let activated = false;
+  const base = {
+    activateJobs: (jobType: string) => {
+      if (jobType === "payment" && !activated) {
+        activated = true;
+        return [job];
+      }
+      return [];
+    },
+    completeJob: () => {
+      calls.completed = true;
+      return {} as never;
+    },
+    failJob: () => {
+      calls.failed = true;
+      return {} as never;
+    },
+    snapshot: () => ({}) as never,
+    ...overrides,
+  };
+  return { session: base as unknown as BojtosSession, calls };
+}
+
+test("an engine completeJob failure bubbles, not masked as a job failure", async () => {
+  // If the engine rejects the completion (bad JSON, ABI mismatch, internal
+  // error) that's a real problem, not the demo's handler failing — it must
+  // surface, not get quietly turned into a failJob that mutates engine state.
+  const { session, calls } = fakeSession({
+    completeJob: () => {
+      throw new Error("engine boom");
+    },
+  });
+
+  await assert.rejects(
+    dispatchRound(session, { payment: () => ({ ok: true }) }),
+    /engine boom/,
+  );
+  assert.equal(
+    calls.failed,
+    false,
+    "an engine completeJob failure must not be swallowed into failJob",
+  );
+});
+
+test("an unserializable handler result is translated to failJob, not bubbled", async () => {
+  // A handler returning something JSON.stringify can't handle (a BigInt) is the
+  // demo's own logic failing — it should fail the job, never reach the engine's
+  // completeJob, and never bubble out of the round.
+  const { session, calls } = fakeSession({
+    completeJob: () => {
+      throw new Error("completeJob should never be reached");
+    },
+  });
+
+  const round = await dispatchRound(session, {
+    payment: () => ({ amount: 1n }) as unknown as Record<string, unknown>,
+  });
+
+  assert.equal(round.handled, 1, "the job still counts as handled");
+  assert.equal(calls.failed, true, "serialization failure fails the job");
+  assert.equal(calls.completed, false, "the engine completion is never called");
 });
