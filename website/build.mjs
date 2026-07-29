@@ -173,16 +173,15 @@ function page(title, body) {
 <body>
 ${body}
 <hr>
-<p class="muted">Served from <a href="/">nanobpm.io</a> · generated from source in
-<a href="https://github.com/Magikcraft/nano-bpm">Magikcraft/nano-bpm</a>.</p>
+<p class="muted">Served from <a href="/">nanobpm.io</a>.</p>
 </body>
 </html>
 `;
 }
 
 function homeHtml() {
-  // Defined as a quote-safe line array (no backticks / ${…}) so it can't collide
-  // with this module's own template literals; HTML-escaped at the interpolation.
+  // Quote-safe line array (no backticks / ${…}) so it can't collide with this
+  // module's own template literals; syntax-highlighted at build time by highlightTs().
   const heroCode = [
     'import { defineWorkflow } from "@nanobpm/workflow";',
     "",
@@ -194,32 +193,28 @@ function homeHtml() {
     "});",
   ].join("\n");
 
-  const GH = "https://github.com/Magikcraft/nano-bpm";
-
   const body = `<header class="nav">
   <a class="brand" href="/">nanobpm<span class="dim">.io</span></a>
   <nav>
     <a href="/demo/">Demo</a>
     <a href="/schemas/">Schemas</a>
-    <a href="${GH}">GitHub</a>
   </nav>
 </header>
 
 <section class="hero">
   <p class="eyebrow">Durable · Load-bearing · Agentic</p>
-  <h1>The load-bearing runtime<br>for agentic systems.</h1>
+  <h1>The load-bearing runtime<br><span class="grad">for agentic systems.</span></h1>
   <p class="lede">Orchestrate your coding agents in a runtime that survives crashes and
   forced reboots, resumes exactly where it left off, and scales from your laptop to your
   team's backbone. Author workflows as code — no diagram, no task-queue wiring.</p>
   <div class="cta">
     <a class="btn primary" href="/demo/">Try it in your browser →</a>
-    <a class="btn" href="${GH}">View on GitHub</a>
   </div>
   <div class="install"><code>npm install @nanobpm/workflow</code></div>
 
   <figure class="code">
     <figcaption>A durable agent workflow, authored as code.</figcaption>
-    <pre><code>${esc(heroCode)}</code></pre>
+    <pre><code>${highlightTs(heroCode)}</code></pre>
     <p class="code-note">Nano derives the model, the job types, the worker, and the
     human-approval wait. You write steps and handlers — nothing else.</p>
   </figure>
@@ -271,23 +266,49 @@ function homeHtml() {
 
 <section class="band backbone">
   <div class="wrap">
-    <h2>Starts on your laptop.<br>Becomes your backbone.</h2>
+    <h2>Starts on your laptop.<br>Becomes your <span class="grad">backbone.</span></h2>
     <div class="cta">
       <a class="btn primary" href="/demo/">Watch a run survive a crash →</a>
-      <a class="btn ghost" href="${GH}">Read the source</a>
     </div>
   </div>
 </section>
 
 <footer class="site-foot wrap">
-  <p><a href="/demo/">Browser demo</a> · <a href="/schemas/">Published schemas</a> ·
-  <a href="${GH}">GitHub</a></p>
-  <p class="muted">Nano / ProcessOS · this page and every published schema are generated from
-  in-repo sources of truth in <a href="${GH}">Magikcraft/nano-bpm</a>, so a URL can never drift
-  from the artifact it names.</p>
+  <p><a href="/demo/">Browser demo</a> · <a href="/schemas/">Published schemas</a></p>
 </footer>`;
 
   return homePage("nanobpm.io — the load-bearing runtime for agentic systems", body);
+}
+
+// Minimal, dependency-free TS/JS highlighter for the fixed hero snippet. Ordered
+// alternation, left-to-right; every emitted token is HTML-escaped via tok()/esc().
+// Kept in-repo so `node website/build.mjs` stays zero-dependency (CI schemas job).
+function highlightTs(src) {
+  const re =
+    /(\/\/[^\n]*)|("(?:[^"\\]|\\.)*")|\b(import|from|export|const|let|var|async|await|return|new|of|in|function)\b|(=>)|\b(\d+)\b|\.([A-Za-z_$][\w$]*)(?=\s*\()|([A-Za-z_$][\w$]*)(?=\s*\()|\.([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*)|([{}()[\];,:.])/g;
+  const dot = '<span class="tok-punc">.</span>';
+  let out = "";
+  let last = 0;
+  for (let m = re.exec(src); m !== null; m = re.exec(src)) {
+    out += esc(src.slice(last, m.index));
+    last = re.lastIndex;
+    if (m[1] !== undefined) out += tok("com", m[1]);
+    else if (m[2] !== undefined) out += tok("str", m[2]);
+    else if (m[3] !== undefined) out += tok("kw", m[3]);
+    else if (m[4] !== undefined) out += tok("arw", m[4]);
+    else if (m[5] !== undefined) out += tok("num", m[5]);
+    else if (m[6] !== undefined) out += dot + tok("fn", m[6]);
+    else if (m[7] !== undefined) out += tok("fn", m[7]);
+    else if (m[8] !== undefined) out += dot + tok("prop", m[8]);
+    else if (m[9] !== undefined) out += tok("id", m[9]);
+    else if (m[10] !== undefined) out += tok("punc", m[10]);
+  }
+  out += esc(src.slice(last));
+  return out;
+}
+
+function tok(cls, text) {
+  return `<span class="tok-${cls}">${esc(text)}</span>`;
 }
 
 function homePage(title, body) {
@@ -300,109 +321,213 @@ function homePage(title, body) {
 <meta name="description" content="Nano is the load-bearing runtime for agentic systems: durable, code-first workflow orchestration that survives crashes and reboots, resumes exactly where it left off, and runs anywhere from your laptop to a cluster.">
 <style>
   :root {
-    --bg: #ffffff; --soft: #f6f7f9; --ink: #0b1020; --muted: #5b6472;
-    --line: #e6e8ee; --accent: #4f46e5; --accent-ink: #3730a3;
-    --code-bg: #0d1117; --code-ink: #e6edf3; --code-dim: #8b98a5;
-    --radius: 12px; --wrap: 62rem;
+    --bg: #08080a; --panel: rgba(22,24,30,.55); --line: rgba(120,130,150,.16);
+    --ink: #e4e4e7; --muted: #a1a1aa; --emerald: #34d399; --sky: #38bdf8;
+    --accent: #7dd3fc; --code-bg: #0d1117; --radius: 12px; --wrap: 62rem;
   }
   * { box-sizing: border-box; }
   html { -webkit-text-size-adjust: 100%; }
   body {
-    margin: 0; background: var(--bg); color: var(--ink);
-    font: 17px/1.65 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    margin: 0; background: var(--bg); color: var(--ink); position: relative;
+    font: 17px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  a { color: var(--accent-ink); text-decoration: none; }
+  #field { position: fixed; inset: 0; z-index: 0; display: block; pointer-events: none; }
+  .glow {
+    position: fixed; inset: 0; z-index: 1; pointer-events: none;
+    background:
+      radial-gradient(60% 60% at 50% 18%, rgba(56,189,248,.12), transparent 70%),
+      radial-gradient(50% 50% at 78% 62%, rgba(52,211,153,.10), transparent 70%);
+  }
+  header, section, footer { position: relative; z-index: 2; }
+  a { color: var(--accent); text-decoration: none; }
   a:hover { text-decoration: underline; }
   code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   .wrap { max-width: var(--wrap); margin-inline: auto; padding-inline: 1.4rem; }
-  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; }
+  h1, h2, h3 { line-height: 1.12; letter-spacing: -0.02em; }
 
   .nav {
     display: flex; align-items: center; justify-content: space-between;
     max-width: var(--wrap); margin-inline: auto; padding: 1.1rem 1.4rem;
   }
   .brand { font-weight: 700; font-size: 1.1rem; color: var(--ink); letter-spacing: -0.02em; }
+  .brand:hover { text-decoration: none; }
   .brand .dim { color: var(--muted); font-weight: 500; }
   .nav nav a { color: var(--muted); margin-left: 1.4rem; font-size: .95rem; }
   .nav nav a:hover { color: var(--ink); text-decoration: none; }
 
-  .hero { max-width: var(--wrap); margin-inline: auto; padding: 3.4rem 1.4rem 1rem; text-align: center; }
+  .hero { max-width: var(--wrap); margin-inline: auto; padding: 4rem 1.4rem 1.5rem; text-align: center; }
   .eyebrow {
-    text-transform: uppercase; letter-spacing: 0.16em; font-size: .78rem; font-weight: 700;
-    color: var(--accent); margin: 0 0 1rem;
+    text-transform: uppercase; letter-spacing: 0.18em; font-size: .78rem; font-weight: 700;
+    color: var(--sky); margin: 0 0 1rem;
   }
-  .hero h1 { font-size: clamp(2.1rem, 5.4vw, 3.5rem); margin: 0 0 1.1rem; }
-  .lede { font-size: clamp(1.05rem, 2.2vw, 1.25rem); color: var(--muted); max-width: 40rem; margin: 0 auto 1.7rem; }
-  .cta { display: flex; gap: .75rem; justify-content: center; flex-wrap: wrap; }
+  .hero h1 { font-size: clamp(2.2rem, 5.6vw, 3.7rem); margin: 0 0 1.2rem; font-weight: 700; }
+  .grad {
+    background: linear-gradient(90deg, var(--emerald), var(--sky));
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .lede { font-size: clamp(1.05rem, 2.2vw, 1.25rem); color: var(--muted); max-width: 40rem; margin: 0 auto 1.8rem; }
+  .cta { display: flex; gap: .8rem; justify-content: center; flex-wrap: wrap; }
   .btn {
-    display: inline-block; padding: .7rem 1.15rem; border-radius: 9px; font-weight: 600;
-    font-size: .98rem; border: 1px solid var(--line); color: var(--ink); background: #fff;
+    display: inline-block; padding: .72rem 1.2rem; border-radius: 10px; font-weight: 600;
+    font-size: .98rem; border: 1px solid var(--line); color: var(--ink);
+    background: rgba(255,255,255,.05); transition: transform .12s ease, box-shadow .12s, background .12s;
   }
-  .btn:hover { text-decoration: none; border-color: #c7ccd8; }
-  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  .btn.primary:hover { background: var(--accent-ink); border-color: var(--accent-ink); }
-  .btn.ghost { background: transparent; color: #fff; border-color: rgba(255,255,255,.4); }
-  .btn.ghost:hover { border-color: #fff; }
-  .install { margin: 1.3rem auto 0; }
+  .btn:hover { text-decoration: none; transform: translateY(-2px); }
+  .btn.primary {
+    color: #052e1a; border-color: transparent;
+    background: linear-gradient(135deg, var(--emerald), var(--sky));
+    box-shadow: 0 8px 30px rgba(56,189,248,.3);
+  }
+  .btn.ghost { background: rgba(255,255,255,.05); color: var(--ink); }
+  .btn.ghost:hover { background: rgba(255,255,255,.09); }
+  .install { margin: 1.4rem auto 0; }
   .install code {
-    background: var(--soft); border: 1px solid var(--line); color: var(--ink);
+    background: rgba(255,255,255,.04); border: 1px solid var(--line); color: var(--ink);
     padding: .55rem .9rem; border-radius: 8px; font-size: .95rem; display: inline-block;
   }
   .install code::before { content: "$ "; color: var(--muted); }
 
-  figure.code { margin: 2.6rem auto 0; max-width: 52rem; text-align: left; }
+  figure.code { margin: 2.8rem auto 0; max-width: 52rem; text-align: left; }
   figure.code figcaption { font-size: .9rem; color: var(--muted); margin: 0 0 .5rem .2rem; }
   figure.code pre {
-    background: var(--code-bg); color: var(--code-ink); border-radius: var(--radius);
-    padding: 1.15rem 1.25rem; overflow-x: auto; font-size: .88rem; line-height: 1.6;
-    box-shadow: 0 18px 40px -22px rgba(16,20,40,.5); border: 1px solid #1b2230;
+    background: var(--code-bg); color: #c9d1d9; border-radius: var(--radius);
+    padding: 1.15rem 1.25rem; overflow-x: auto; font-size: .9rem; line-height: 1.65;
+    box-shadow: 0 24px 60px -24px rgba(0,0,0,.7); border: 1px solid rgba(120,130,150,.2);
   }
   .code-note { font-size: .92rem; color: var(--muted); margin: .7rem .2rem 0; }
 
-  .band { margin-top: 3.6rem; padding: 3rem 0; }
-  .band.problem { background: var(--soft); border-block: 1px solid var(--line); }
+  .tok-com { color: #8b949e; font-style: italic; }
+  .tok-str { color: #a5d6ff; }
+  .tok-kw { color: #ff7b72; }
+  .tok-fn { color: #d2a8ff; }
+  .tok-prop { color: #79c0ff; }
+  .tok-num { color: #79c0ff; }
+  .tok-arw { color: #ff7b72; }
+  .tok-id, .tok-punc { color: #c9d1d9; }
+
+  .band { margin-top: 4rem; padding: 3.2rem 0; }
+  .band.problem { background: var(--panel); border-block: 1px solid var(--line); backdrop-filter: blur(6px); }
   .band.problem h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); margin: 0 0 .8rem; max-width: 34rem; }
   .band.problem p { color: var(--muted); font-size: 1.08rem; max-width: 44rem; margin: 0; }
 
-  .pillars { padding: 3.4rem 1.4rem; display: grid; gap: 1.6rem; grid-template-columns: repeat(3, 1fr); }
+  .pillars { padding: 3.6rem 1.4rem; display: grid; gap: 1.6rem; grid-template-columns: repeat(3, 1fr); }
   .pillars article {
-    border: 1px solid var(--line); border-radius: var(--radius); padding: 1.5rem 1.4rem;
-    background: #fff;
+    border: 1px solid var(--line); border-radius: var(--radius); padding: 1.6rem 1.5rem;
+    background: var(--panel); backdrop-filter: blur(6px);
   }
   .pillars h3 { font-size: 1.2rem; margin: 0 0 .5rem; }
-  .pillars h3::before { content: ""; display: inline-block; width: .55rem; height: .55rem; border-radius: 2px; background: var(--accent); margin-right: .55rem; vertical-align: middle; }
+  .pillars h3::before { content: ""; display: inline-block; width: .55rem; height: .55rem; border-radius: 2px; background: linear-gradient(135deg, var(--emerald), var(--sky)); margin-right: .55rem; vertical-align: middle; }
   .pillars p { margin: 0 0 .7rem; color: var(--muted); font-size: .98rem; }
   .pillars .proof { color: var(--ink); font-weight: 600; font-size: .9rem; margin-bottom: 0; }
-  .pillars .proof code { background: var(--soft); padding: .08em .35em; border-radius: 5px; font-size: .85em; font-weight: 500; }
+  .pillars .proof code { background: rgba(255,255,255,.05); padding: .08em .35em; border-radius: 5px; font-size: .85em; font-weight: 500; color: var(--sky); }
 
-  .how { padding: 1rem 1.4rem 3.6rem; }
+  .how { padding: 1.5rem 1.4rem 3.8rem; }
   .how h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); margin: 0 0 1.6rem; }
   .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 1.1rem; max-width: 46rem; }
   .steps li { display: flex; gap: 1rem; align-items: flex-start; }
   .steps li span {
-    flex: none; width: 1.9rem; height: 1.9rem; border-radius: 50%; background: var(--soft);
-    border: 1px solid var(--line); color: var(--accent-ink); font-weight: 700;
+    flex: none; width: 1.9rem; height: 1.9rem; border-radius: 50%; background: rgba(255,255,255,.05);
+    border: 1px solid var(--line); color: var(--sky); font-weight: 700;
     display: grid; place-items: center; font-size: .95rem;
   }
   .steps li div { color: var(--muted); }
   .steps li b { color: var(--ink); }
-  .steps code { background: var(--soft); padding: .08em .35em; border-radius: 5px; font-size: .85em; }
+  .steps code { background: rgba(255,255,255,.05); padding: .08em .35em; border-radius: 5px; font-size: .85em; color: var(--sky); }
 
-  .band.backbone { background: var(--code-bg); color: #fff; text-align: center; padding: 3.6rem 0; margin-top: 0; }
+  .band.backbone {
+    background: linear-gradient(180deg, rgba(15,17,21,.55), rgba(8,8,10,.85));
+    border-block: 1px solid var(--line); text-align: center; padding: 3.8rem 0; margin-top: 0;
+    backdrop-filter: blur(6px);
+  }
   .band.backbone h2 { font-size: clamp(1.8rem, 4.4vw, 2.8rem); margin: 0 0 1.6rem; }
-  .band.backbone .cta { }
 
-  .site-foot { padding: 2.4rem 1.4rem 3rem; }
+  .site-foot { padding: 2.6rem 1.4rem 3.2rem; }
   .site-foot p { margin: .3rem 0; }
   .site-foot .muted, .muted { color: var(--muted); }
   .site-foot .muted { font-size: .9rem; max-width: 42rem; }
 
   @media (max-width: 800px) { .pillars { grid-template-columns: 1fr; } }
+  @media (prefers-reduced-motion: reduce) { #field { display: none; } }
 </style>
 </head>
 <body>
+<canvas id="field" aria-hidden="true"></canvas>
+<div class="glow" aria-hidden="true"></div>
 ${body}
+<script>
+// A rotating "constellation" particle field (ported from the Nano server's own
+// landing page): points drift, the whole field slowly rotates around the centre,
+// and nearby points are linked by lines whose opacity falls off with distance.
+// Pure canvas, no dependencies, so the page stays self-contained and works offline.
+(function () {
+  var canvas = document.getElementById("field");
+  if (!canvas) return;
+  var ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  // Respect prefers-reduced-motion: the canvas is CSS-hidden, but bail out here too
+  // so we never start the rAF loop or resize handler for users who disabled motion.
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
+  if (reduce && reduce.matches) return;
+  var w, h, cx, cy, points, dpr, rot = 0;
+  function resize() {
+    dpr = Math.min(window.devicePixelRatio || 1, 2);
+    w = canvas.width = Math.floor(innerWidth * dpr);
+    h = canvas.height = Math.floor(innerHeight * dpr);
+    canvas.style.width = innerWidth + "px";
+    canvas.style.height = innerHeight + "px";
+    cx = w / 2; cy = h / 2; seed();
+  }
+  function seed() {
+    var count = Math.min(140, Math.floor((w * h) / (22000 * dpr)));
+    points = [];
+    for (var i = 0; i < count; i++) {
+      points.push({
+        a: Math.random() * Math.PI * 2,
+        r: Math.pow(Math.random(), 0.6) * Math.min(w, h) * 0.55,
+        vx: (Math.random() - 0.5) * 0.25 * dpr,
+        vy: (Math.random() - 0.5) * 0.25 * dpr,
+        x: 0, y: 0, driftX: 0, driftY: 0,
+      });
+    }
+  }
+  var LINK = 130;
+  function frame() {
+    rot += 0.0006;
+    ctx.clearRect(0, 0, w, h);
+    var cosR = Math.cos(rot), sinR = Math.sin(rot), link = LINK * dpr, i, j, p, a, b;
+    for (i = 0; i < points.length; i++) {
+      p = points[i];
+      var bx = Math.cos(p.a) * p.r, by = Math.sin(p.a) * p.r;
+      p.driftX += p.vx; p.driftY += p.vy;
+      if (Math.abs(p.driftX) > 60 * dpr) p.vx *= -1;
+      if (Math.abs(p.driftY) > 60 * dpr) p.vy *= -1;
+      p.x = cx + (bx * cosR - by * sinR + p.driftX);
+      p.y = cy + (bx * sinR + by * cosR + p.driftY);
+    }
+    for (i = 0; i < points.length; i++) {
+      for (j = i + 1; j < points.length; j++) {
+        a = points[i]; b = points[j];
+        var d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (d < link) {
+          var t = 1 - d / link;
+          ctx.strokeStyle = "rgba(80, 200, 230, " + (0.18 * t) + ")";
+          ctx.lineWidth = dpr * 0.6;
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        }
+      }
+    }
+    for (i = 0; i < points.length; i++) {
+      p = points[i];
+      ctx.beginPath(); ctx.arc(p.x, p.y, dpr * 1.6, 0, Math.PI * 2);
+      ctx.fillStyle = "rgba(150, 230, 220, 0.85)"; ctx.fill();
+    }
+    requestAnimationFrame(frame);
+  }
+  addEventListener("resize", resize);
+  resize(); frame();
+})();
+</script>
 </body>
 </html>
 `;
@@ -423,9 +548,8 @@ function schemasHtml(items) {
     `<h1>Published schemas &amp; namespaces</h1>
 <p><a href="/">← nanobpm.io</a></p>
 <p>The canonical home for the schemas and namespaces published by
-<a href="https://github.com/Magikcraft/nano-bpm">nano-bpm</a> (Nano / ProcessOS).
-Every URL below is generated from its in-repo source of truth on each deploy, so it
-never drifts from the artifact it names.</p>
+Nano / ProcessOS. Every URL below is generated from its in-repo source of truth on
+each deploy, so it never drifts from the artifact it names.</p>
 <table>
 <tr><th>Identifier</th><th>Description</th></tr>
 ${rows}
