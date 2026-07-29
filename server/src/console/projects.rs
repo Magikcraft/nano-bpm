@@ -256,6 +256,10 @@ pub const TEMPLATES: &[(&str, &str)] = &[
         "urban-starter",
         "Urban App — a RAD application (nano.app.json) with models, data, triggers & surfaces",
     ),
+    (
+        "workflow-starter",
+        "Code-first workflow — durable orchestration authored as code (@nanobpm/workflow), model derived",
+    ),
 ];
 
 /// The scaffolder's full template menu: the offline built-ins from [`TEMPLATES`]
@@ -1318,6 +1322,182 @@ const WORKER_DENO_JSON: &str = r#"{
 "#;
 
 // ---------------------------------------------------------------------------
+// "Code-first workflow" template (ADR 0045) — the code-first dual of the
+// model-first Urban scaffold. There is NO authored BPMN and none of the
+// model-first `nano-generated/` machinery: the executable model is DERIVED from
+// the workflow code by @nanobpm/workflow (ADR 0044) at deploy time. So this
+// scaffold is a lean tree (see the early return in `create_project`).
+// ---------------------------------------------------------------------------
+
+/// Import map for a code-first project: the real published SDK (resolved via
+/// `npm:` under Deno / `node_modules` under Node) plus a `start` task that runs
+/// the entrypoint (which deploys the workflows and hosts a Worker).
+const WORKFLOW_DENO_JSON: &str = r#"{
+  "imports": {
+    "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.1.0"
+  },
+  "tasks": {
+    "start": "deno run --allow-net --allow-read --allow-env main.ts"
+  }
+}
+"#;
+
+/// Authoring-time TypeScript config for a code-first project. Types for
+/// `@nanobpm/workflow` resolve from `node_modules` after `npm install`.
+const WORKFLOW_TSCONFIG_JSON: &str = r#"{
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "lib": ["esnext", "dom"]
+  },
+  "include": ["main.ts", "workflows/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
+"#;
+
+/// `package.json` for a code-first project: node identity + the real
+/// `@nanobpm/workflow` dependency (so `npm install` + node/tsc resolve it).
+fn workflow_package_json(name: &str) -> String {
+    format!(
+        r#"{{
+  "name": "{}",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "main.ts",
+  "scripts": {{
+    "start": "deno task start"
+  }},
+  "dependencies": {{
+    "@nanobpm/workflow": "^0.1.0"
+  }},
+  "devDependencies": {{
+    "@types/node": "^22"
+  }}
+}}
+"#,
+        slugify_app_id(name)
+    )
+}
+
+/// Example imperative (replayed) workflow — the durable SDLC loop. Every side
+/// effect lives inside a `ctx.run(name, fn)` step: on resume, a completed step
+/// is replayed from the journal (its `fn` is NOT re-run) and only the frontier
+/// step executes, so the workflow survives an engine crash without repeating
+/// work. Handlers must be idempotent (ADR 0044).
+const WORKFLOW_EXAMPLE_TS: &str = r#"import { defineWorkflow } from "@nanobpm/workflow";
+
+// A durable "review a pull request" loop. Replace the step bodies with real
+// work (GitHub calls, an LLM review, a merge). Keep every side effect inside a
+// `ctx.run(...)` step and make it idempotent — a crash between a side effect and
+// its journal commit redelivers the step (at-least-once).
+export const prReview = defineWorkflow("pr-review", async (ctx) => {
+  const prId = ctx.input.prId as string;
+
+  const diff = await ctx.run("fetchDiff", async () => {
+    // Idempotent: reading a diff is a pure read.
+    return { prId, files: 3, additions: 42 };
+  });
+
+  const review = await ctx.run("review", async () => {
+    // e.g. hand `diff` to an LLM; deterministic key -> replayed on resume.
+    return { verdict: "approve", notes: `looks good (${diff.files} files)` };
+  });
+
+  await ctx.run("merge", async () => {
+    // Idempotent: keyed by prId; a redelivery re-merges the same PR.
+    return { merged: review.verdict === "approve", prId };
+  });
+});
+"#;
+
+/// Entrypoint: deploy the workflow(s), host a Worker, start one demo instance
+/// and exit when it completes. A production worker host omits the demo block and
+/// simply runs `worker.start()` forever.
+const WORKFLOW_MAIN_TS: &str = r#"// Code-first durable workflows on Nano (ADR 0044/0045). No diagram, no task-type
+// wiring, no correlation plumbing: @nanobpm/workflow derives the executable BPMN
+// model, the job types, and hosts a generic Worker.
+import { WorkflowClient, Worker } from "@nanobpm/workflow";
+import { prReview } from "./workflows/pr-review.ts";
+
+const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+const workflows = [prReview];
+
+const client = new WorkflowClient({ baseUrl });
+for (const wf of workflows) {
+  await client.deploy(wf);
+  console.log(`deployed ${wf.id}`);
+}
+
+// Demo-only: resolve once the workflow reports done, so this script can exit.
+let markDone: () => void;
+const done = new Promise<void>((resolve) => (markDone = resolve));
+
+const worker = new Worker({
+  baseUrl,
+  workflows,
+  onActivity: (e) => {
+    console.log(`  · ${e.workflowId}: ${e.step ?? e.elementId}`);
+    if (e.step === "__done") markDone();
+  },
+  onError: (err) => console.error("worker error:", err.message),
+});
+worker.start();
+
+const { processInstanceKey } = await client.start(prReview, { prId: "PR-1234" });
+console.log(`started pr-review instance ${processInstanceKey}`);
+
+// A production worker host removes everything below and runs forever.
+await done;
+console.log("workflow complete \u2714");
+await worker.stop();
+"#;
+
+/// README for a code-first project.
+fn workflow_readme(name: &str) -> String {
+    format!(
+        r#"# {name}
+
+A **code-first durable workflow** project (ADR 0044/0045). You write ordinary
+async code; [`@nanobpm/workflow`](https://www.npmjs.com/package/@nanobpm/workflow)
+derives the executable BPMN model, the job types and the wiring, and hosts a
+generic worker against a running Nano gateway.
+
+## Run
+
+```sh
+deno task start          # or: npm install && npm start
+```
+
+Point at a non-default gateway with `NANOBPMN_BASE_URL`.
+
+## Author
+
+- `workflows/pr-review.ts` — an example imperative workflow. Add more with
+  `defineWorkflow(id, async (ctx) => {{ ... }})` and list them in `main.ts`.
+- Every side effect goes inside a `ctx.run(name, fn)` step. On an engine crash a
+  completed step is **replayed from the journal** (its `fn` is not re-run) and
+  only the frontier step executes — so the workflow resumes without repeating
+  work. Jobs are **at-least-once**: keep step handlers idempotent.
+- For a human-in-the-loop wait, use the declarative surface (`defineFlow` with
+  `w.run` / `w.signal`) instead.
+
+## What gets derived
+
+`WorkflowClient.deploy(wf)` deploys the BPMN that `@nanobpm/workflow` emits from
+your code; the `Worker` routes the derived job types (`{{id}}:step`) back to your
+step bodies. Inspect the derived model with `toBpmn(wf)`.
+"#,
+        name = name
+    )
+}
+
+// ---------------------------------------------------------------------------
 // "Throughput Explorer" demo template — a 30-second ceiling finder
 // ---------------------------------------------------------------------------
 
@@ -2209,7 +2389,12 @@ pub fn create_project(
     // resources/processes/*.bpmn from the built-in fallthrough.
     let is_builtin_template = matches!(
         template,
-        "starter" | "throughput" | "throughput-stream" | "gui-starter" | "urban-starter"
+        "starter"
+            | "throughput"
+            | "throughput-stream"
+            | "gui-starter"
+            | "urban-starter"
+            | "workflow-starter"
     );
     if !is_builtin_template && let Some((m, src)) = super::extensions::template_source(template) {
         mk(dir.clone())?;
@@ -2261,6 +2446,34 @@ pub fn create_project(
             version: super::extensions::pack_version(&m.id),
         });
         cfg.template = Some(template.to_string());
+        write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
+        return Ok(cfg);
+    }
+
+    // ── Code-first workflow scaffold (ADR 0045) ───────────────────────────
+    // A code-first project has NO authored BPMN and none of the model-first
+    // `nano-generated/` machinery below: the executable model is DERIVED from
+    // the workflow code by @nanobpm/workflow at deploy time. Stamp a lean tree
+    // and return before the model-first built-ins.
+    if template == "workflow-starter" {
+        mk(dir.join("workflows"))?;
+        let w = |p: PathBuf, body: &str| {
+            std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"))
+        };
+        w(dir.join("deno.json"), WORKFLOW_DENO_JSON)?;
+        w(dir.join("tsconfig.json"), WORKFLOW_TSCONFIG_JSON)?;
+        w(dir.join("package.json"), &workflow_package_json(name))?;
+        w(dir.join("main.ts"), WORKFLOW_MAIN_TS)?;
+        w(
+            dir.join("workflows").join("pr-review.ts"),
+            WORKFLOW_EXAMPLE_TS,
+        )?;
+        w(dir.join("README.md"), &workflow_readme(name))?;
+        let mut cfg = ProjectConfig::new(name, description);
+        cfg.lang = "deno".to_string();
+        cfg.app = "console".to_string();
+        cfg.main = "main.ts".to_string();
+        cfg.template = Some("workflow-starter".to_string());
         write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
         return Ok(cfg);
     }
@@ -4641,6 +4854,60 @@ mod tests {
                 .expect("component template parses");
         assert_eq!(comp["id"], "io.nanobpm.urban.read-thermostat");
         assert_eq!(comp["appliesTo"][0], "bpmn:Task");
+    }
+
+    #[test]
+    fn workflow_template_scaffolds_a_lean_code_first_project() {
+        let _g = lock();
+        let root = temp_root();
+        let cfg = create_project("pr_bot", "", "workflow-starter").expect("create");
+        // Recorded as its own template; a Deno console app (the run supervisor
+        // drives it as `deno task start`).
+        assert_eq!(cfg.template.as_deref(), Some("workflow-starter"));
+        assert_eq!(cfg.lang, "deno");
+        assert_eq!(cfg.app, "console");
+        assert_eq!(cfg.main, "main.ts");
+        let dir = root.join("pr_bot");
+        // The lean code-first tree: an entrypoint, an example workflow, and the
+        // three manifests — nothing else.
+        assert!(dir.join("main.ts").is_file());
+        assert!(dir.join("workflows/pr-review.ts").is_file());
+        assert!(dir.join("README.md").is_file());
+        // Crucially: NONE of the model-first machinery leaks in — the model is
+        // derived from the code, so there is no authored BPMN and no
+        // `nano-generated/` tree (ADR 0045).
+        assert!(
+            !dir.join("nano-generated").exists(),
+            "code-first project must not carry the model-first nano-generated/ tree"
+        );
+        assert!(
+            !dir.join("resources").exists(),
+            "code-first project must not carry authored resources/ (model is derived)"
+        );
+        // The import map + package.json depend on the real published SDK, not a
+        // generated-file alias.
+        let deno_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("deno.json")).unwrap())
+                .expect("deno.json parses");
+        assert!(
+            deno_json["imports"]["@nanobpm/workflow"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("npm:@nanobpm/workflow"),
+            "@nanobpm/workflow must resolve to the published npm package"
+        );
+        assert!(deno_json["tasks"]["start"].is_string());
+        let package_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap())
+                .expect("package.json parses");
+        assert!(
+            package_json["dependencies"]["@nanobpm/workflow"].is_string(),
+            "package.json must depend on @nanobpm/workflow"
+        );
+        // The example uses the imperative surface with a durable step.
+        let example = std::fs::read_to_string(dir.join("workflows/pr-review.ts")).unwrap();
+        assert!(example.contains("defineWorkflow"));
+        assert!(example.contains("ctx.run("));
     }
 
     #[test]
