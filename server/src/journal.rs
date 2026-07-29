@@ -1399,6 +1399,13 @@ impl Journal {
                     targets.push(*instance_key);
                 }
             }
+            Command::ModifyInstance { instance_key, .. } => {
+                // Modify addresses a single instance (activating/terminating its
+                // element instances); page it in before the command applies.
+                if cold.index.contains(*instance_key) {
+                    targets.push(*instance_key);
+                }
+            }
             Command::CorrelateMessage {
                 message_name,
                 correlation_key,

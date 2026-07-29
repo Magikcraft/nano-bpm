@@ -20,11 +20,36 @@ export class TestEngine {
      */
     advanceTime(by_ms: number): string;
     /**
+     * Assign a user task to `assignee`. When `allow_override` is false and the
+     * task already has an assignee the command is rejected (it must be
+     * unassigned first). Returns the snapshot.
+     */
+    assignUserTask(user_task_key: string, assignee: string, allow_override: boolean): string;
+    /**
+     * Broadcast a signal by name to **every** open subscription that matches,
+     * across all instances, merging `variables_json` into each correlated
+     * instance. Signals correlate by name only and are not buffered. Returns
+     * the snapshot.
+     */
+    broadcastSignal(signal_name: string, variables_json: string): string;
+    /**
+     * Cancel (terminate) a running process instance by key. Every token is
+     * discarded, pending jobs are canceled, and the instance transitions to
+     * `Terminated`. Returns the snapshot.
+     */
+    cancelInstance(instance_key: string): string;
+    /**
      * Complete a waiting job by key, merging `variables_json` (a JSON object
      * string) into the instance. The job is activated first if it has not been
      * already, so the UI can complete a freshly-created job directly.
      */
     completeJob(job_key: string, variables_json: string): string;
+    /**
+     * Complete a waiting user task by key, merging `variables_json` into the
+     * instance before the parked token resumes. The task must be in the
+     * `Created` state. Returns the snapshot.
+     */
+    completeUserTask(user_task_key: string, variables_json: string): string;
     /**
      * Correlate a message to any instance waiting on it: publishes `message_name`
      * with the given `correlation_key` (the value the waiting subscription's
@@ -58,6 +83,17 @@ export class TestEngine {
      */
     failJob(job_key: string, retries: number, message: string): string;
     /**
+     * Modify a running process instance (Zeebe "modify process instance"): move
+     * tokens by terminating existing element instances and/or activating new
+     * ones. `activate_instructions_json` is a JSON array of
+     * `{ elementId: string, variables?: object }` (variables are merged into the
+     * instance's root scope before the token is placed);
+     * `terminate_instructions_json` is a JSON array of element-instance keys,
+     * each a decimal string or a `{ elementInstanceKey: string }` object.
+     * Activations run at the process root scope. Returns the snapshot.
+     */
+    modify(instance_key: string, activate_instructions_json: string, terminate_instructions_json: string): string;
+    /**
      * Create a fresh, empty simulated engine. The virtual clock starts at 0.
      */
     constructor();
@@ -70,9 +106,31 @@ export class TestEngine {
      */
     reset(): void;
     /**
+     * Resolve an open incident by key, retrying the work that failed (a job
+     * incident returns the parked job — which must have retries left — to the
+     * activatable pool; a gateway incident re-evaluates; an uncaught-error
+     * incident re-creates the service-task job). Returns the snapshot.
+     */
+    resolveIncident(incident_key: string): string;
+    /**
+     * Merge variables into a scope (a process-instance key or an element-instance
+     * key). When `local` is true the values are written strictly into the target
+     * scope; otherwise they propagate upward to the nearest ancestor scope that
+     * defines each name (Zeebe `SetVariables` semantics). Returns the snapshot.
+     */
+    setVariables(scope_key: string, variables_json: string, local: boolean): string;
+    /**
      * The current simulation state as a JSON [`Snapshot`].
      */
     snapshot(): string;
+    /**
+     * Throw a BPMN business error from a waiting job by key. If the job's
+     * activity has a matching error boundary/event-subprocess catch it is
+     * interrupted and the error-handling path runs; otherwise an incident is
+     * raised. The job is activated first if needed, so the UI can throw an
+     * error directly from a freshly-created job. Returns the snapshot.
+     */
+    throwError(job_key: string, error_code: string, error_message: string): string;
     /**
      * Set the engine clock to a wall-clock instant (ms), then trigger due timers
      * and expire lapsed job locks. The embedded host calls this with `Date.now()`
@@ -80,6 +138,25 @@ export class TestEngine {
      * clock never moves backwards. Returns the snapshot.
      */
     tickNow(now_ms: number): string;
+    /**
+     * Clear a user task's assignee. The task must be in the `Created` state.
+     * Returns the snapshot.
+     */
+    unassignUserTask(user_task_key: string): string;
+    /**
+     * Set a job's remaining retries by key. Used to recover a job parked on a
+     * no-retries incident before resolving that incident; does not by itself
+     * unblock the job. Returns the snapshot.
+     */
+    updateRetries(job_key: string, retries: number): string;
+    /**
+     * Update a user task's attributes from a JSON changeset object. Recognised
+     * keys (all optional): `candidateGroups` / `candidateUsers` (string arrays),
+     * `dueDate` / `followUpDate` (ISO-8601 string, or `null`/`""` to clear),
+     * `priority` (0..=100). Only present keys are changed. The task must be in
+     * the `Created` state. Returns the snapshot.
+     */
+    updateUserTask(user_task_key: string, changeset_json: string): string;
     /**
      * The current virtual clock (milliseconds).
      */
@@ -93,17 +170,28 @@ export interface InitOutput {
     readonly __wbg_testengine_free: (a: number, b: number) => void;
     readonly testengine_activateJobs: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_advanceTime: (a: number, b: number, c: number) => void;
+    readonly testengine_assignUserTask: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly testengine_broadcastSignal: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_cancelInstance: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_completeUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_deploy: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_events: (a: number, b: number) => void;
     readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly testengine_modify: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_new: () => number;
     readonly testengine_now: (a: number) => number;
     readonly testengine_reset: (a: number) => void;
+    readonly testengine_resolveIncident: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_setVariables: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_snapshot: (a: number, b: number) => void;
+    readonly testengine_throwError: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_tickNow: (a: number, b: number, c: number) => void;
+    readonly testengine_unassignUserTask: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_updateRetries: (a: number, b: number, c: number, d: number, e: number) => void;
+    readonly testengine_updateUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly __wbindgen_add_to_stack_pointer: (a: number) => number;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
