@@ -41,6 +41,18 @@ export declare class Worker {
     private loops;
     constructor(opts: WorkerOptions);
     private register;
+    /** Register a derived job type, failing fast on a collision. Two workflows can
+     *  resolve to the same job type (duplicate workflow ids, or a declarative step
+     *  name that collides with another workflow's); silently overwriting the route
+     *  would drop a handler, so we reject it at construction time. */
+    private addRoute;
+    /** Invoke the onError observer hook without letting it affect the poll loop —
+     *  a throwing observer must not permanently stop a route. */
+    private emitError;
+    /** Invoke the onActivity observer hook in isolation. It runs after the job has
+     *  already been completed, so a throwing observer must not fall into the
+     *  failure path and try to fail an already-completed job. */
+    private emitActivity;
     /** The derived job types this worker serves. */
     get servedTypes(): string[];
     /** Begin polling. Resolves once the loops are running (they run until stop()). */

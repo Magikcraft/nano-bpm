@@ -103,7 +103,7 @@ The proven v1 increment is a **declarative builder that compiles to a model** (S
 because it reuses the engine's durability directly with no replay/determinism discipline:
 
 ```js
-export const prReview = defineWorkflow("pr-review", (w) => {
+export const prReview = defineFlow("pr-review", (w) => {
   w.run("fetchDiff",  async (job) => ({ diff: await gh.diff(job.variables.prId) }));
   w.run("autoReview", async (job) => ({ findings: await llm.review(job.variables.diff) }));
   w.signal("humanApproval", { correlationKey: "prId" });   // durable wait
@@ -151,7 +151,7 @@ both, over one artifact.
 
 ### Strategy trajectory (what we build vs. describe)
 
-- **Strategy A — compile a declarative workflow to a model (BUILD NOW).** The `defineWorkflow`
+- **Strategy A — compile a declarative workflow to a model (BUILD NOW).** The `defineFlow`
   builder above. Cheap, reuses durability directly, no determinism discipline. **This is v1, and
   the spike proves it.**
 - **Strategy B — replayed imperative function = the true Temporal model (DESCRIBE, don't build

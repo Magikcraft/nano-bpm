@@ -4,7 +4,7 @@
 // tests skip themselves when one isn't found (so unit-only CI stays green).
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdirSync, rmSync, existsSync, openSync } from "node:fs";
+import { mkdirSync, rmSync, existsSync, openSync, closeSync } from "node:fs";
 import { createServer } from "node:net";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -69,11 +69,17 @@ export class Gateway {
   }
 
   async start(): Promise<void> {
+    // The child dups the fd for its stdio, so close our copy after spawn to
+    // avoid leaking a descriptor per restart (ENFILE/EMFILE on long runs).
     const fd = openSync(join(this.logDir, `server-${++this.restarts}.log`), "a");
-    this.proc = spawn(this.bin, [], {
-      env: { ...process.env, PORT: String(this.port), NANOBPMN_DATA_DIR: this.dataDir },
-      stdio: ["ignore", fd, fd],
-    });
+    try {
+      this.proc = spawn(this.bin, [], {
+        env: { ...process.env, PORT: String(this.port), NANOBPMN_DATA_DIR: this.dataDir },
+        stdio: ["ignore", fd, fd],
+      });
+    } finally {
+      closeSync(fd);
+    }
     await this.waitForTopology();
   }
 

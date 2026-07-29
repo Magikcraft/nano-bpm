@@ -8,6 +8,7 @@ import {
   defineFlow,
   toBpmn,
   replayOnce,
+  Worker,
   type ImperativeWorkflow,
   type Journal,
 } from "../dist/index.js";
@@ -125,4 +126,20 @@ test("replayOnce: input is available and stable across replays", async () => {
   });
   const step = await replayOnce(wf, { prId: "PR-1" }, {});
   assert.equal(step.done === false && (step.frontier.result as { prId: string }).prId, "PR-1");
+});
+
+test("worker: rejects two workflows that resolve to the same derived job type", () => {
+  const a = defineWorkflow("dup", async () => {});
+  const b = defineWorkflow("dup", async () => {});
+  assert.throws(
+    () => new Worker({ baseUrl: "http://localhost:0", workflows: [a, b] }),
+    /duplicate derived job type "dup:__orchestrate"/,
+  );
+});
+
+test("worker: distinct workflow ids register without collision", () => {
+  const a = defineFlow("wf-a", (w) => w.run("step", async () => ({})));
+  const b = defineFlow("wf-b", (w) => w.run("step", async () => ({})));
+  const worker = new Worker({ baseUrl: "http://localhost:0", workflows: [a, b] });
+  assert.deepEqual(worker.servedTypes.sort(), ["wf-a:step", "wf-b:step"]);
 });

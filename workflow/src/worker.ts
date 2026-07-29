@@ -73,7 +73,7 @@ export class Worker {
 
   private register(wf: Workflow): void {
     if (wf.kind === "imperative") {
-      this.routes.set(wf.orchestrateType, {
+      this.addRoute(wf.orchestrateType, {
         workflowId: wf.id,
         handle: async (job) => {
           const input = (job.variables.input as JsonObject) ?? {};
@@ -88,11 +88,47 @@ export class Worker {
       for (const s of wf.steps) {
         if (s.kind !== "run") continue;
         const handler = wf.handlers[s.name];
-        this.routes.set(jobType(wf.id, s.name), {
+        this.addRoute(jobType(wf.id, s.name), {
           workflowId: wf.id,
           handle: async (job) => ({ variables: ((await handler(job)) ?? {}) as JsonObject }),
         });
       }
+    }
+  }
+
+  /** Register a derived job type, failing fast on a collision. Two workflows can
+   *  resolve to the same job type (duplicate workflow ids, or a declarative step
+   *  name that collides with another workflow's); silently overwriting the route
+   *  would drop a handler, so we reject it at construction time. */
+  private addRoute(type: string, route: { workflowId: string; handle: Handler }): void {
+    const existing = this.routes.get(type);
+    if (existing) {
+      throw new Error(
+        `duplicate derived job type "${type}": workflows "${existing.workflowId}" and "${route.workflowId}" ` +
+          `resolve to the same job type (check for duplicate workflow ids or colliding step names)`,
+      );
+    }
+    this.routes.set(type, route);
+  }
+
+  /** Invoke the onError observer hook without letting it affect the poll loop —
+   *  a throwing observer must not permanently stop a route. */
+  private emitError(err: Error, type: string): void {
+    try {
+      this.onError?.(err, { type });
+    } catch {
+      /* observer hooks are purely observational; swallow their failures */
+    }
+  }
+
+  /** Invoke the onActivity observer hook in isolation. It runs after the job has
+   *  already been completed, so a throwing observer must not fall into the
+   *  failure path and try to fail an already-completed job. */
+  private async emitActivity(e: ActivityEvent): Promise<void> {
+    try {
+      await this.onActivity?.(e);
+    } catch {
+      /* observational only; swallow so it never triggers failJob */
     }
   }
 
@@ -127,7 +163,7 @@ export class Worker {
         });
       } catch (e) {
         // Transport/gateway error (e.g. engine restarting): back off, reconnect.
-        this.onError?.(e as Error, { type });
+        this.emitError(e as Error, type);
         await sleep(this.backoffMs);
         continue;
       }
@@ -136,7 +172,9 @@ export class Worker {
         try {
           const { variables, step } = await route.handle(job);
           await this.client.completeJob(job.jobKey, variables);
-          await this.onActivity?.({
+          // Job is now completed; the observer hook is isolated (emitActivity
+          // swallows its own errors) so it can never fall into the failure path.
+          await this.emitActivity({
             workflowId: route.workflowId,
             type,
             jobKey: job.jobKey,
@@ -147,7 +185,7 @@ export class Worker {
           // A handler or completion failed. Report; the engine will redeliver the
           // job after its lock times out (at-least-once → handlers must be
           // idempotent). Best-effort surface it as an incident-worthy failure.
-          this.onError?.(e as Error, { type });
+          this.emitError(e as Error, type);
           try {
             await this.client.failJob(job.jobKey, (e as Error).message, 0);
           } catch {
