@@ -1,6 +1,6 @@
 {
   "name": "@nanobpm/bojtos-kit",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Framework-agnostic core of the Bojtos in-browser BPMN demo framework (ADR 0043): a single scenario runner over the @nanobpm/engine-wasm engine (deploy, start instances, complete/fail jobs, advance the clock, read snapshots and the event log), plus the engine's snapshot/event contract types. Consumed by @nanobpm/bojtos-react and the console test-run panel.",
   "type": "module",
   "license": "Apache-2.0",
