@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jwulf/nano-bpm",
+    "url": "https://github.com/Magikcraft/nano-bpm",
     "directory": "bojtos-kit"
   },
   "main": "./dist/index.js",
