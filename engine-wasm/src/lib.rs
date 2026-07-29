@@ -17,8 +17,8 @@ use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
     bpmn::parse_bpmn, ActivateElementInstruction, Command, Engine, Event, IncidentState, JobState,
-    MessageSubscriptionState, ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState,
-    Value,
+    MessageSubscriptionKind, MessageSubscriptionState, ProcessInstanceState, TimerState,
+    UserTaskChangeset, UserTaskState, Value,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -30,6 +30,21 @@ pub struct TestEngine {
     now: u64,
     seq: u64,
     log: Vec<LogEntry>,
+    /// Cumulative history aggregates folded incrementally as events are applied,
+    /// so `snapshot` stays O(live state) instead of re-scanning the whole event
+    /// log on every (frequent) Play poll.
+    history: HistoryAggregates,
+}
+
+/// The log-derived, monotonically-growing parts of a snapshot, accumulated once
+/// per emitted event rather than recomputed per poll: cumulative per-element
+/// completion counts, the set of traversed sequence flows, and the evaluated
+/// decision instances.
+#[derive(Default)]
+struct HistoryAggregates {
+    completed_counts: HashMap<String, u64>,
+    taken_flows: std::collections::BTreeSet<(String, String)>,
+    decisions: Vec<DecisionInstanceDto>,
 }
 
 struct LogEntry {
@@ -48,6 +63,7 @@ impl TestEngine {
             now: 0,
             seq: 0,
             log: Vec::new(),
+            history: HistoryAggregates::default(),
         }
     }
 
@@ -67,6 +83,7 @@ impl TestEngine {
         self.now = 0;
         self.seq = 0;
         self.log.clear();
+        self.history = HistoryAggregates::default();
     }
 
     /// Parse and deploy a BPMN resource. Returns a JSON object
@@ -521,6 +538,7 @@ impl TestEngine {
         let events = self.engine.apply_command_at(command, now)?;
         for ev in &events {
             self.seq += 1;
+            self.fold_history(ev);
             self.log.push(LogEntry {
                 seq: self.seq,
                 now,
@@ -528,6 +546,43 @@ impl TestEngine {
             });
         }
         Ok(events)
+    }
+
+    /// Fold one emitted event into the cumulative history aggregates that back
+    /// the snapshot's `elementStats.completed`, `takenSequenceFlows` and
+    /// `decisionInstances` fields, so `snapshot` never re-scans the full log.
+    fn fold_history(&mut self, ev: &Event) {
+        match ev {
+            Event::ElementCompleted { element_id, .. } => {
+                *self
+                    .history
+                    .completed_counts
+                    .entry(element_id.clone())
+                    .or_default() += 1;
+            }
+            Event::SequenceFlowTaken { from, to, .. } => {
+                self.history.taken_flows.insert((from.clone(), to.clone()));
+            }
+            Event::DecisionEvaluated {
+                instance_key,
+                element_id,
+                decision_key,
+                decision_id,
+                decision_output,
+                evaluated_at,
+                ..
+            } => {
+                self.history.decisions.push(DecisionInstanceDto {
+                    instance_key: instance_key.to_string(),
+                    element_id: element_id.clone(),
+                    decision_key: decision_key.to_string(),
+                    decision_id: decision_id.clone(),
+                    output: value_to_json(decision_output),
+                    evaluated_at: *evaluated_at,
+                });
+            }
+            _ => {}
+        }
     }
 
     /// Activate the job's type so a `Created` job can be completed/failed. A job
@@ -666,7 +721,7 @@ impl TestEngine {
                 element_id: s.element_id.clone(),
                 message_name: s.message_name.clone(),
                 correlation_key: s.correlation_key.clone(),
-                kind: format!("{:?}", s.kind),
+                kind: subscription_kind_tag(&s.kind).to_string(),
             })
             .collect();
         message_subscriptions.sort_by(|a, b| a.key.cmp(&b.key));
@@ -687,39 +742,35 @@ impl TestEngine {
                 instance_key: s.instance_key.to_string(),
                 element_id: s.element_id.clone(),
                 signal_name: s.signal_name.clone(),
-                kind: format!("{:?}", s.kind),
+                kind: subscription_kind_tag(&s.kind).to_string(),
             })
             .collect();
         signal_subscriptions.sort_by(|a, b| a.key.cmp(&b.key));
 
         // Per-element token statistics for diagram overlays. `active` is the
         // current live token count (from instance active elements); `completed`
-        // and `incidents` are cumulative counts derived from the event log.
+        // and `incidents` are cumulative counts. `completed` comes from the
+        // incrementally-maintained history aggregate (no per-poll log scan).
         let mut stats: HashMap<String, ElementStat> = HashMap::new();
         for inst in &instances {
             for el in &inst.active_elements {
                 stats.entry(el.element_id.clone()).or_default().active += 1;
             }
         }
-        // Cumulative sequence flows taken, as (from, to) element-id pairs, for
-        // highlighting traversed connections (Play's `fetchSequenceFlows`).
-        let mut taken_pairs: Vec<(String, String)> = Vec::new();
-        for entry in &self.log {
-            match &entry.event {
-                Event::ElementCompleted { element_id, .. } => {
-                    stats.entry(element_id.clone()).or_default().completed += 1;
-                }
-                Event::SequenceFlowTaken { from, to, .. } => {
-                    taken_pairs.push((from.clone(), to.clone()));
-                }
-                _ => {}
-            }
+        for (element_id, count) in &self.history.completed_counts {
+            stats.entry(element_id.clone()).or_default().completed += *count;
         }
-        taken_pairs.sort();
-        taken_pairs.dedup();
-        let taken_sequence_flows: Vec<SequenceFlowDto> = taken_pairs
-            .into_iter()
-            .map(|(from, to)| SequenceFlowDto { from, to })
+        // Cumulative sequence flows taken, as (from, to) element-id pairs, for
+        // highlighting traversed connections (Play's `fetchSequenceFlows`). The
+        // set is maintained incrementally and already deduplicated + sorted.
+        let taken_sequence_flows: Vec<SequenceFlowDto> = self
+            .history
+            .taken_flows
+            .iter()
+            .map(|(from, to)| SequenceFlowDto {
+                from: from.clone(),
+                to: to.clone(),
+            })
             .collect();
         for inc in &incidents {
             stats.entry(inc.element_id.clone()).or_default().incidents += 1;
@@ -735,32 +786,10 @@ impl TestEngine {
             .collect();
         element_stats.sort_by(|a, b| a.element_id.cmp(&b.element_id));
 
-        // Evaluated decision instances (from `businessRuleTask`/DMN), derived from
-        // the `DecisionEvaluated` audit events in the log (Play's
+        // Evaluated decision instances (from `businessRuleTask`/DMN), collected
+        // incrementally from the `DecisionEvaluated` audit events (Play's
         // `fetchDecisionInstances`). Not part of live engine state.
-        let mut decision_instances: Vec<DecisionInstanceDto> = self
-            .log
-            .iter()
-            .filter_map(|entry| match &entry.event {
-                Event::DecisionEvaluated {
-                    instance_key,
-                    element_id,
-                    decision_key,
-                    decision_id,
-                    decision_output,
-                    evaluated_at,
-                    ..
-                } => Some(DecisionInstanceDto {
-                    instance_key: instance_key.to_string(),
-                    element_id: element_id.clone(),
-                    decision_key: decision_key.to_string(),
-                    decision_id: decision_id.clone(),
-                    output: value_to_json(decision_output),
-                    evaluated_at: *evaluated_at,
-                }),
-                _ => None,
-            })
-            .collect();
+        let mut decision_instances: Vec<DecisionInstanceDto> = self.history.decisions.clone();
         decision_instances.sort_by(|a, b| a.decision_key.cmp(&b.decision_key));
 
         // Unions for one-shot diagram highlighting.
@@ -937,7 +966,7 @@ struct SequenceFlowDto {
     to: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct DecisionInstanceDto {
     instance_key: String,
@@ -946,6 +975,18 @@ struct DecisionInstanceDto {
     decision_id: String,
     output: serde_json::Value,
     evaluated_at: u64,
+}
+
+/// A stable, camelCase discriminant string for a message/signal subscription
+/// kind, exposed to the UI instead of Rust `Debug` output (which is brittle and
+/// leaks struct fields). Play only distinguishes intermediate-catch from
+/// boundary subscriptions, so the boundary element id is intentionally omitted.
+fn subscription_kind_tag(kind: &MessageSubscriptionKind) -> &'static str {
+    match kind {
+        MessageSubscriptionKind::IntermediateCatch => "intermediateCatch",
+        MessageSubscriptionKind::InterruptingBoundary { .. } => "interruptingBoundary",
+        MessageSubscriptionKind::NonInterruptingBoundary { .. } => "nonInterruptingBoundary",
+    }
 }
 
 fn instance_state(s: &ProcessInstanceState) -> String {
@@ -1149,6 +1190,9 @@ fn parse_user_task_changeset(s: &str) -> Result<UserTaskChangeset, JsValue> {
         let p = v
             .as_i64()
             .ok_or_else(|| js_err("priority must be an integer"))?;
+        if !(0..=100).contains(&p) {
+            return Err(js_err("priority must be in the range 0..=100"));
+        }
         changeset.priority = Some(p as i32);
     }
     Ok(changeset)
