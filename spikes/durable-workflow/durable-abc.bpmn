@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Durable-workflow spike: a linear A -> B -> C sequence of service tasks.
+
+  Each service task is one durable "activity" (job type act-a / act-b / act-c).
+  The worker performs an observable side effect per activity and completes the
+  job; the engine advances the token durably. This is the minimal shape that
+  proves the durable-execution property we care about: once a step's completion
+  is committed, killing and restarting the engine must NOT re-run that step.
+
+  (The executable ad-hoc sub-process, ADR 0023, rides the exact same job/state
+  machinery, so it inherits this durability; a linear sequence just isolates the
+  durability question from agent-loop dynamics.)
+-->
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="Definitions_durable_spike" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:process id="durable-abc" name="Durable A-B-C" isExecutable="true">
+    <bpmn:startEvent id="Start">
+      <bpmn:outgoing>f0</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:sequenceFlow id="f0" sourceRef="Start" targetRef="A" />
+    <bpmn:serviceTask id="A" name="Activity A">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="act-a" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f0</bpmn:incoming>
+      <bpmn:outgoing>f1</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f1" sourceRef="A" targetRef="B" />
+    <bpmn:serviceTask id="B" name="Activity B">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="act-b" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f1</bpmn:incoming>
+      <bpmn:outgoing>f2</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f2" sourceRef="B" targetRef="C" />
+    <bpmn:serviceTask id="C" name="Activity C">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="act-c" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f2</bpmn:incoming>
+      <bpmn:outgoing>f3</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:sequenceFlow id="f3" sourceRef="C" targetRef="End" />
+    <bpmn:endEvent id="End">
+      <bpmn:incoming>f3</bpmn:incoming>
+    </bpmn:endEvent>
+  </bpmn:process>
+</bpmn:definitions>
