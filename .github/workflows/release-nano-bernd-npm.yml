@@ -3,11 +3,12 @@ name: release-nano-bernd-npm
 # Triggered by tags of the form `nano-bernd-npm-v0.2.0`. Builds & publishes
 # @nanobpm/nano-bernd to the npm registry.
 #
-# Prerequisites (documented in clients/nano-bernd/RELEASING.md):
-#   - Repository secret NPM_TOKEN — Automation token scoped to @nanobpm.
+# Authentication is npm OIDC trusted publishing — NO NPM_TOKEN. The package must
+# have a Trusted Publisher configured on npmjs.com pointing at this repo + this
+# workflow file (see clients/nano-bernd/RELEASING.md).
 #
-# Note: npm provenance is intentionally NOT used — it requires a public source
-# repository, and nano-bpm is private by design.
+# Note: npm provenance is intentionally disabled (NPM_CONFIG_PROVENANCE=false) —
+# it requires a public source repository, and nano-bpm is private by design.
 
 on:
   push:
@@ -20,14 +21,22 @@ jobs:
     name: Publish @nanobpm/nano-bernd
     runs-on: ubuntu-24.04
     permissions:
+      # id-token: write lets npm exchange the GitHub OIDC token for a
+      # short-lived publish token (trusted publishing).
+      id-token: write
       contents: read
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-node@v5
         with:
-          node-version: '20'
+          node-version: '24'
           registry-url: 'https://registry.npmjs.org'
+
+      # npm OIDC trusted publishing needs npm CLI >= 11.5.1; pin a known-good
+      # version (explicit, not @latest) so the publish pipeline is reproducible.
+      - name: Upgrade npm (OIDC-capable)
+        run: npm install -g npm@11.5.1
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -71,5 +80,5 @@ jobs:
       - name: Publish
         working-directory: clients/nano-bernd
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: 'false'
         run: npm publish --access public

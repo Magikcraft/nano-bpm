@@ -4,20 +4,41 @@ Publishes the npm counterpart to `io.github.jwulf:nano-bernd`. See [`../nano-ber
 
 ## One-time setup
 
-### 1. Create an Automation npm token
+Publishing uses **npm OIDC trusted publishing** — there is no `NPM_TOKEN`
+secret. Instead the package is bound to this repository + release workflow on
+npmjs.com, and the CI job mints a short-lived publish token via GitHub OIDC.
 
-- <https://www.npmjs.com/settings/{you}/tokens/new> → **Automation** token.
-- Scope: `@nanobpm` (or the org that owns the package).
+### 1. Publish the initial version once, locally
 
-### 2. Add the repository secret
+A Trusted Publisher can only be configured on a package that already exists, so
+the first publish is done by hand by a maintainer with `@nanobpm` publish
+rights:
 
-In <https://github.com/jwulf/nano-bpm/settings/secrets/actions>:
+```bash
+cd clients/nano-bernd
+make -C ../.. engine-wasm-ffi-dist
+npm ci
+npm run sync-wasm
+npm run build
+npm test
+npm login                 # if not already authenticated
+npm publish --access public
+```
 
-| Name        | Value                     |
-|-------------|---------------------------|
-| `NPM_TOKEN` | Automation token from #1  |
+### 2. Configure the Trusted Publisher on npmjs.com
 
-The only required secret is `NPM_TOKEN`. Provenance is intentionally not used — it requires a public source repository, and nano-bpm is private.
+On <https://www.npmjs.com/package/@nanobpm/nano-bernd> → **Settings** →
+**Trusted Publisher** → **GitHub Actions**, set:
+
+| Field                | Value                          |
+|----------------------|--------------------------------|
+| Organization / user  | `Magikcraft`                   |
+| Repository           | `nano-bpm`                     |
+| Workflow filename    | `release-nano-bernd-npm.yml`   |
+| Environment          | *(leave blank)*                |
+
+After this, every `nano-bernd-npm-v*` tag publishes automatically with no
+secret. Provenance stays disabled (it requires a public source repository).
 
 ## Cutting a release
 

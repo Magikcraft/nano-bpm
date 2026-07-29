@@ -1,0 +1,89 @@
+name: release-bojtos-npm
+
+# Triggered by tags of the form `bojtos-npm-v0.1.0`. Builds & publishes the
+# three Bojtos framework packages, in dependency order, to the npm registry:
+#
+#   @nanobpm/engine-wasm  →  @nanobpm/bojtos-kit  →  @nanobpm/bojtos-react
+#
+# Authentication is npm OIDC trusted publishing — NO NPM_TOKEN. Each package
+# must have a Trusted Publisher configured on npmjs.com pointing at this repo +
+# this workflow file (see docs/releasing-bojtos-npm.md). The very first publish
+# of each package is done locally by a maintainer (it creates the package so the
+# Trusted Publisher can be configured); thereafter this workflow publishes on tag.
+#
+# Note: npm provenance is intentionally disabled (NPM_CONFIG_PROVENANCE=false) —
+# provenance requires a public source repository, and nano-bpm is private.
+
+on:
+  push:
+    tags:
+      - 'bojtos-npm-v*'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    name: Publish Bojtos packages
+    runs-on: ubuntu-24.04
+    permissions:
+      # id-token: write is what lets npm exchange the GitHub OIDC token for a
+      # short-lived publish token (trusted publishing).
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # npm OIDC trusted publishing needs npm CLI >= 11.5.1; the bundled npm may
+      # be older, so pin a known-good version (kept explicit for reproducible
+      # release builds rather than tracking @latest).
+      - name: Upgrade npm (OIDC-capable)
+        run: npm install -g npm@11.5.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      - name: Install wasm-pack
+        run: cargo install wasm-pack --version 0.15.0 --locked
+
+      # Build the in-browser engine wasm from source so the published
+      # @nanobpm/engine-wasm tarball is provably built from the tag.
+      - name: Build engine-wasm (make console-wasm)
+        run: make console-wasm
+
+      - name: Build & test bojtos-kit
+        working-directory: bojtos-kit
+        run: |
+          npm ci
+          npm run build
+          npm run test:ci
+
+      - name: Build bojtos-react
+        working-directory: bojtos-react
+        run: |
+          npm ci
+          npm run build
+
+      - name: Verify tag matches package versions
+        run: |
+          tag_version="${GITHUB_REF_NAME#bojtos-npm-v}"
+          for dir in engine-wasm/pkg bojtos-kit bojtos-react; do
+            pkg_version=$(node -p "require('./$dir/package.json').version")
+            if [[ "$pkg_version" != "$tag_version" ]]; then
+              echo "::error::tag $tag_version does not match $dir version $pkg_version"
+              exit 1
+            fi
+          done
+          echo "releasing Bojtos packages $tag_version"
+
+      - name: Publish (dependency order, OIDC)
+        env:
+          NPM_CONFIG_PROVENANCE: 'false'
+        run: node scripts/bojtos-release.mjs

@@ -11,6 +11,19 @@ React binding for the **Bojtos** in-browser BPMN demo framework
   imports the XML once and updates token (`nano-active`) / incident
   (`nano-incident`) markers in place, so zoom/scroll survive stepping.
 
+## Install
+
+```bash
+npm install @nanobpm/bojtos-react react react-dom bpmn-js
+```
+
+`@nanobpm/bojtos-kit` and `@nanobpm/engine-wasm` (the wasm engine) are pulled in
+transitively — you only add the `react` / `bpmn-js` peers yourself. This is all
+you need to build your own Bojtos demo outside this repo; see the usage snippet
+below.
+
+## Usage
+
 ```tsx
 import { useBojtos, BpmnRuntimeView } from "@nanobpm/bojtos-react";
 import "bpmn-js/dist/assets/diagram-js.css";
