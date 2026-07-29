@@ -1,6 +1,10 @@
 # ADR 0044 — Code-first durable orchestration for the single-user SDLC (Camunda Nano)
 
-Status: **Proposed.**
+Status: **Proposed.** The authoring façade is now built and published-ready as the
+`@nanobpm/workflow` package (`workflow/`): both surfaces (`defineWorkflow` imperative
+replay + `defineFlow` declarative with signals), a `WorkflowClient` and generic
+`Worker` over REST v2, unit + integration tests (crash-resume + signal), CI gate, and
+OIDC publishing (`release-workflow-npm.yml`, `docs/releasing-workflow-npm.md`).
 Date: 2026-07-29.
 Relates to:
 ADR 0023 (`0023-adhoc-subprocess-execution-parity.md`, the executable ad-hoc sub-process — the

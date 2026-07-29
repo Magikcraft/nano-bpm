@@ -1,0 +1,45 @@
+{
+  "name": "@nanobpm/workflow",
+  "version": "0.1.0",
+  "description": "Code-first durable orchestration for nanobpmn (ADR 0044). Author durable workflows as ordinary async code — either an imperative function driven by engine replay (`defineWorkflow(id, async ctx => { await ctx.run(...) })`, the Temporal-style surface) or a declarative flow with human-in-the-loop signals (`defineFlow`) — and the SDK derives the executable BPMN model, the job types, and the message/correlation wiring, then hosts a generic worker. No diagram, no task-type wiring, no correlation plumbing authored by hand. Talks to a running nanobpmn gateway over the REST v2 API.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Magikcraft/nano-bpm",
+    "directory": "workflow"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./source": "./src/index.ts"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && npm run test:ci",
+    "test:ci": "node --experimental-strip-types --test test/*.test.ts",
+    "test:integration": "node --experimental-strip-types --test test/integration.test.ts",
+    "prepack": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^5.6.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

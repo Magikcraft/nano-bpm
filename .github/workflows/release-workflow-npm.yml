@@ -1,0 +1,67 @@
+name: release-workflow-npm
+
+# Triggered by tags of the form `workflow-npm-v0.1.0`. Builds, tests and
+# publishes the single @nanobpm/workflow package to the npm registry.
+#
+# Authentication is npm OIDC trusted publishing — NO NPM_TOKEN. The package must
+# have a Trusted Publisher configured on npmjs.com pointing at this repo + this
+# workflow file (see docs/releasing-workflow-npm.md). The very first publish is
+# done locally by a maintainer (it creates the package so the Trusted Publisher
+# can be configured); thereafter this workflow publishes on tag.
+#
+# npm provenance is intentionally disabled (NPM_CONFIG_PROVENANCE=false) —
+# provenance requires a public source repository, and nano-bpm is private.
+#
+# Unlike the Bojtos release, @nanobpm/workflow is pure TypeScript with no wasm
+# build and no internal @nanobpm/* dependencies, so there is no engine-wasm build
+# step and no file:-dep rewriting.
+
+on:
+  push:
+    tags:
+      - 'workflow-npm-v*'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    name: Publish @nanobpm/workflow
+    runs-on: ubuntu-24.04
+    permissions:
+      # id-token: write lets npm exchange the GitHub OIDC token for a short-lived
+      # publish token (trusted publishing).
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # npm OIDC trusted publishing needs npm CLI >= 11.5.1; pin a known-good
+      # version for reproducible release builds.
+      - name: Upgrade npm (OIDC-capable)
+        run: npm install -g npm@11.5.1
+
+      - name: Build & test workflow
+        working-directory: workflow
+        run: |
+          npm ci
+          npm run build
+          npm run test:ci
+
+      - name: Verify tag matches package version
+        run: |
+          tag_version="${GITHUB_REF_NAME#workflow-npm-v}"
+          pkg_version=$(node -p "require('./workflow/package.json').version")
+          if [[ "$pkg_version" != "$tag_version" ]]; then
+            echo "::error::tag $tag_version does not match workflow version $pkg_version"
+            exit 1
+          fi
+          echo "releasing @nanobpm/workflow $tag_version"
+
+      - name: Publish (OIDC)
+        env:
+          NPM_CONFIG_PROVENANCE: 'false'
+        run: node scripts/workflow-release.mjs
