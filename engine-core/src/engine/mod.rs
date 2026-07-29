@@ -2392,9 +2392,13 @@ impl Engine {
                 terminate.sort_unstable();
                 terminate.dedup();
                 for eik in terminate {
-                    let element_id = self
-                        .element_id_of_instance(instance_key, eik)
-                        .unwrap_or_default();
+                    // The eik was validated against `instance.active` above, so
+                    // its element id must resolve. Skip defensively rather than
+                    // emitting a termination with an empty element_id, which
+                    // would corrupt downstream element aggregates.
+                    let Some(element_id) = self.element_id_of_instance(instance_key, eik) else {
+                        continue;
+                    };
                     self.terminate_element_instance(&mut log, instance_key, eik, &element_id);
                 }
 

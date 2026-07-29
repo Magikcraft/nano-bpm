@@ -367,11 +367,16 @@ impl Command {
             | Command::DispatchStartInstance { variables, .. } => vars(variables),
             Command::ModifyInstance {
                 activate_instructions,
+                terminate_instructions,
                 ..
-            } => activate_instructions
-                .iter()
-                .map(|a| a.element_id.len() as u64 + vars(&a.variables))
-                .sum(),
+            } => {
+                let activate: u64 = activate_instructions
+                    .iter()
+                    .map(|a| a.element_id.len() as u64 + vars(&a.variables))
+                    .sum();
+                // Each terminate instruction is an 8-byte element-instance key.
+                activate + (terminate_instructions.len() as u64 * 8)
+            }
             _ => 0,
         };
         BASE + payload

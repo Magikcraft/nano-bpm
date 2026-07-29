@@ -626,7 +626,7 @@ impl TestEngine {
                         element_id: eid.clone(),
                     })
                     .collect();
-                active.sort_by(|a, b| a.key.cmp(&b.key));
+                active.sort_by(|a, b| cmp_key(&a.key, &b.key));
                 InstanceDto {
                     key: inst.key.to_string(),
                     process_id: inst.process_id.clone(),
@@ -637,7 +637,7 @@ impl TestEngine {
                 }
             })
             .collect();
-        instances.sort_by(|a, b| a.key.cmp(&b.key));
+        instances.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         let mut jobs: Vec<JobDto> = state
             .jobs
@@ -652,7 +652,7 @@ impl TestEngine {
                 retries: j.retries,
             })
             .collect();
-        jobs.sort_by(|a, b| a.key.cmp(&b.key));
+        jobs.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         let mut incidents: Vec<IncidentDto> = state
             .incidents
@@ -666,7 +666,7 @@ impl TestEngine {
                 reason: i.reason.clone(),
             })
             .collect();
-        incidents.sort_by(|a, b| a.key.cmp(&b.key));
+        incidents.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         let mut timers: Vec<TimerDto> = state
             .timers
@@ -702,7 +702,7 @@ impl TestEngine {
                 priority: t.priority,
             })
             .collect();
-        user_tasks.sort_by(|a, b| a.key.cmp(&b.key));
+        user_tasks.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         // Open message subscriptions (waiting catch/boundary events). Play's
         // message-correlation panel needs the name + resolved correlation key.
@@ -724,7 +724,7 @@ impl TestEngine {
                 kind: subscription_kind_tag(&s.kind).to_string(),
             })
             .collect();
-        message_subscriptions.sort_by(|a, b| a.key.cmp(&b.key));
+        message_subscriptions.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         // Open signal subscriptions (waiting signal catch/boundary events). Play's
         // signal-broadcast panel lists the signal names currently awaited.
@@ -745,7 +745,7 @@ impl TestEngine {
                 kind: subscription_kind_tag(&s.kind).to_string(),
             })
             .collect();
-        signal_subscriptions.sort_by(|a, b| a.key.cmp(&b.key));
+        signal_subscriptions.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         // Per-element token statistics for diagram overlays. `active` is the
         // current live token count (from instance active elements); `completed`
@@ -790,7 +790,7 @@ impl TestEngine {
         // incrementally from the `DecisionEvaluated` audit events (Play's
         // `fetchDecisionInstances`). Not part of live engine state.
         let mut decision_instances: Vec<DecisionInstanceDto> = self.history.decisions.clone();
-        decision_instances.sort_by(|a, b| a.decision_key.cmp(&b.decision_key));
+        decision_instances.sort_by(|a, b| cmp_key(&a.decision_key, &b.decision_key));
 
         // Unions for one-shot diagram highlighting.
         let mut active_element_ids: Vec<String> = instances
@@ -986,6 +986,16 @@ fn subscription_kind_tag(kind: &MessageSubscriptionKind) -> &'static str {
         MessageSubscriptionKind::IntermediateCatch => "intermediateCatch",
         MessageSubscriptionKind::InterruptingBoundary { .. } => "interruptingBoundary",
         MessageSubscriptionKind::NonInterruptingBoundary { .. } => "nonInterruptingBoundary",
+    }
+}
+
+/// Compare two decimal-string entity keys numerically (they are `u64` rendered
+/// as decimal), falling back to lexicographic order for any non-numeric key so
+/// snapshot ordering stays stable once keys grow past a single digit.
+fn cmp_key(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
     }
 }
 
