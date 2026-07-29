@@ -2344,6 +2344,97 @@ impl Engine {
                 }
             }
 
+            Command::ModifyInstance {
+                instance_key,
+                activate_instructions,
+                terminate_instructions,
+            } => {
+                // Only an active instance can be modified (Zeebe parity).
+                match self.state.instances.get(&instance_key) {
+                    Some(instance) if instance.state == ProcessInstanceState::Active => {}
+                    _ => return Err(EngineError::InstanceNotFound { instance_key }),
+                }
+
+                // Validate up front so the command is all-or-nothing: every
+                // activate element id must exist in the process definition and
+                // every terminate key must be a currently-active element instance.
+                for a in &activate_instructions {
+                    let exists = self
+                        .process_of_instance(instance_key)
+                        .map(|p| p.element(&a.element_id).is_some())
+                        .unwrap_or(false);
+                    if !exists {
+                        return Err(EngineError::ElementNotFound {
+                            instance_key,
+                            element_id: a.element_id.clone(),
+                        });
+                    }
+                }
+                for &eik in &terminate_instructions {
+                    let active = self
+                        .state
+                        .instances
+                        .get(&instance_key)
+                        .map(|i| i.active.contains_key(&eik))
+                        .unwrap_or(false);
+                    if !active {
+                        return Err(EngineError::ElementInstanceNotFound {
+                            instance_key,
+                            element_instance_key: eik,
+                        });
+                    }
+                }
+
+                // Apply terminations first (deterministic key order), then merge
+                // any global variables and queue the activations at the process
+                // root scope.
+                let mut terminate: Vec<Key> = terminate_instructions;
+                terminate.sort_unstable();
+                terminate.dedup();
+                for eik in terminate {
+                    // The eik was validated against `instance.active` above, so
+                    // its element id must resolve. Skip defensively rather than
+                    // emitting a termination with an empty element_id, which
+                    // would corrupt downstream element aggregates.
+                    let Some(element_id) = self.element_id_of_instance(instance_key, eik) else {
+                        continue;
+                    };
+                    self.terminate_element_instance(&mut log, instance_key, eik, &element_id);
+                }
+
+                for a in &activate_instructions {
+                    if !a.variables.is_empty() {
+                        for event in self.propagated_updates(
+                            instance_key,
+                            instance_key,
+                            a.variables.clone(),
+                            false,
+                        ) {
+                            self.emit(&mut log, event);
+                        }
+                    }
+                    queue.push_back(Step::Activate {
+                        instance_key,
+                        element_id: a.element_id.clone(),
+                        scope: 0,
+                    });
+                }
+
+                // If the terminations drained the last token and nothing was
+                // activated to replace it, the instance is terminated (Zeebe
+                // modify semantics) rather than being auto-completed by
+                // `complete_finished_instances`.
+                let drained = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .map(|i| i.active.is_empty())
+                    .unwrap_or(true);
+                if drained && activate_instructions.is_empty() {
+                    self.emit(&mut log, Event::ProcessInstanceTerminated { instance_key });
+                }
+            }
+
             Command::DispatchStartInstance {
                 process_id,
                 start_element_id,
@@ -5918,6 +6009,18 @@ pub enum EngineError {
     /// `CancelInstance` referenced a process instance that does not exist or is
     /// no longer active (already completed or terminated).
     InstanceNotFound { instance_key: Key },
+    /// A `ModifyInstance` activate instruction referenced an element id that is
+    /// not part of the instance's process definition.
+    ElementNotFound {
+        instance_key: Key,
+        element_id: String,
+    },
+    /// A `ModifyInstance` terminate instruction referenced a key that is not an
+    /// active element instance of the target process instance.
+    ElementInstanceNotFound {
+        instance_key: Key,
+        element_instance_key: Key,
+    },
     /// `AssignUserTask`/`CompleteUserTask` referenced a user-task key that does
     /// not exist.
     UserTaskNotFound { user_task_key: Key },
@@ -5977,6 +6080,24 @@ impl std::fmt::Display for EngineError {
             }
             EngineError::InstanceNotFound { instance_key } => {
                 write!(f, "no active process instance with key {instance_key}")
+            }
+            EngineError::ElementNotFound {
+                instance_key,
+                element_id,
+            } => {
+                write!(
+                    f,
+                    "instance {instance_key} has no element with id {element_id}"
+                )
+            }
+            EngineError::ElementInstanceNotFound {
+                instance_key,
+                element_instance_key,
+            } => {
+                write!(
+                    f,
+                    "instance {instance_key} has no active element instance {element_instance_key}"
+                )
             }
             EngineError::UserTaskNotFound { user_task_key } => {
                 write!(f, "no user task with key {user_task_key}")

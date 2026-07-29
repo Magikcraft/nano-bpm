@@ -63,10 +63,87 @@ export interface TimerDto {
   dueInMs: number;
 }
 
+/** A user task parked on a `userTask` element, awaiting a human. */
+export interface UserTaskDto {
+  key: string;
+  instanceKey: string;
+  elementInstanceKey: string;
+  elementId: string;
+  /** `Created` (waiting), `Completed`, or `Canceled`. */
+  state: string;
+  assignee?: string;
+  candidateGroups: string[];
+  candidateUsers: string[];
+  dueDate?: string;
+  followUpDate?: string;
+  priority: number;
+}
+
+/** An open message subscription (a waiting message catch/boundary event). */
+export interface MessageSubscriptionDto {
+  key: string;
+  instanceKey: string;
+  elementId: string;
+  messageName: string;
+  correlationKey: string;
+  /** What the subscription guards (intermediate/boundary, interrupting or not). */
+  kind: string;
+}
+
+/** An open signal subscription (a waiting signal catch/boundary event). */
+export interface SignalSubscriptionDto {
+  key: string;
+  instanceKey: string;
+  elementId: string;
+  signalName: string;
+  kind: string;
+}
+
+/**
+ * Per-element token statistics for diagram overlays: `active` live tokens,
+ * cumulative `completed` element instances, and current `incidents`.
+ */
+export interface ElementStatDto {
+  elementId: string;
+  active: number;
+  completed: number;
+  incidents: number;
+}
+
+/** A traversed connection, as source/target element ids. */
+export interface SequenceFlowDto {
+  from: string;
+  to: string;
+}
+
+/** An evaluated decision instance (from a `businessRuleTask` / DMN). */
+export interface DecisionInstanceDto {
+  instanceKey: string;
+  elementId: string;
+  decisionKey: string;
+  decisionId: string;
+  output: unknown;
+  evaluatedAt: number;
+}
+
+/**
+ * One activation instruction for {@link BojtosSession.modify}: place a new token
+ * at `elementId`, first merging `variables` into the instance's root scope.
+ * Mirrors Zeebe's process-instance-modification activate instruction (the token
+ * is activated in the process root scope).
+ */
+export interface ActivateInstruction {
+  elementId: string;
+  variables?: Record<string, unknown>;
+}
+
 /**
  * The full simulation state returned by every engine command. `activeElementIds`
  * / `incidentElementIds` drive the token/incident highlight (the visual
  * contract, ADR 0043 §4); `instances[].variables` is the live payload.
+ * `userTasks`, `messageSubscriptions`, `signalSubscriptions`, `elementStats`,
+ * `takenSequenceFlows` and `decisionInstances` back a Web-Modeler-Play-style UI
+ * (task panels, correlation/broadcast, overlays, DMN results).
  */
 export interface Snapshot {
   now: number;
@@ -79,6 +156,12 @@ export interface Snapshot {
   jobs: JobDto[];
   incidents: IncidentDto[];
   timers: TimerDto[];
+  userTasks: UserTaskDto[];
+  messageSubscriptions: MessageSubscriptionDto[];
+  signalSubscriptions: SignalSubscriptionDto[];
+  elementStats: ElementStatDto[];
+  takenSequenceFlows: SequenceFlowDto[];
+  decisionInstances: DecisionInstanceDto[];
   activeElementIds: string[];
   incidentElementIds: string[];
 }

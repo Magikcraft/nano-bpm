@@ -223,6 +223,27 @@ pub enum Command {
     /// `Terminated` (it does *not* complete). Only an active instance can be
     /// cancelled; an unknown or already-finished instance is rejected.
     CancelInstance { instance_key: Key },
+    /// Modify a running process instance (Zeebe process-instance modification):
+    /// spawn fresh tokens at elements and/or terminate specific active element
+    /// instances in one atomic command.
+    ///
+    /// Each *activate* instruction merges its `variables` into the instance's
+    /// root scope, then places a new token at `element_id` in the process root
+    /// scope — as if a flow had just arrived there. Each *terminate* instruction
+    /// (an element-instance key) discards the token resting on that element
+    /// instance: its job, user task, timers and subscriptions are cancelled and,
+    /// for a sub-process, its inner scope is torn down. If the modification
+    /// removes the instance's last token and activates nothing, the instance
+    /// terminates.
+    ///
+    /// Only an active instance can be modified. Activation of an element id that
+    /// is not in the process, or termination of a key that is not an active
+    /// element instance of the instance, is rejected.
+    ModifyInstance {
+        instance_key: Key,
+        activate_instructions: Vec<ActivateElementInstruction>,
+        terminate_instructions: Vec<Key>,
+    },
     /// Create a start-triggered instance on this partition, routed by the host
     /// from the deploy partition's [`crate::Event::StartInstanceDispatched`] so
     /// message-/timer-start instances spread across the cluster instead of all
@@ -235,6 +256,22 @@ pub enum Command {
         tags: Vec<String>,
         business_id: Option<String>,
     },
+}
+
+/// One activation instruction of a [`Command::ModifyInstance`]: place a new
+/// token at `element_id`, first merging `variables` into the instance's root
+/// scope. (Zeebe's activate instruction also carries an ancestor-scope selector
+/// and per-scope variable instructions; this engine activates in the process
+/// root scope, which covers the common "start a token here" modeler use.)
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ActivateElementInstruction {
+    /// The BPMN element id to activate a token at.
+    pub element_id: String,
+    /// Variables merged into the instance's root scope before the token is
+    /// placed (Zeebe's global variable instructions). Empty for none.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub variables: HashMap<String, Value>,
 }
 
 /// The attributes that an [`Command::UpdateUserTask`] may change. Each field is
@@ -297,6 +334,7 @@ impl Command {
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
             Command::CancelInstance { .. } => "cancel_instance",
+            Command::ModifyInstance { .. } => "modify_instance",
             Command::DispatchStartInstance { .. } => "dispatch_start_instance",
         }
     }
@@ -327,6 +365,18 @@ impl Command {
             | Command::BroadcastSignal { variables, .. }
             | Command::CorrelateMessageSubscription { variables, .. }
             | Command::DispatchStartInstance { variables, .. } => vars(variables),
+            Command::ModifyInstance {
+                activate_instructions,
+                terminate_instructions,
+                ..
+            } => {
+                let activate: u64 = activate_instructions
+                    .iter()
+                    .map(|a| a.element_id.len() as u64 + vars(&a.variables))
+                    .sum();
+                // Each terminate instruction is an 8-byte element-instance key.
+                activate + (terminate_instructions.len() as u64 * 8)
+            }
             _ => 0,
         };
         BASE + payload
@@ -572,6 +622,19 @@ impl Command {
     /// Convenience constructor for a `CancelInstance`.
     pub fn cancel_instance(instance_key: Key) -> Self {
         Command::CancelInstance { instance_key }
+    }
+
+    /// Convenience constructor for a `ModifyInstance`.
+    pub fn modify_instance(
+        instance_key: Key,
+        activate_instructions: Vec<ActivateElementInstruction>,
+        terminate_instructions: Vec<Key>,
+    ) -> Self {
+        Command::ModifyInstance {
+            instance_key,
+            activate_instructions,
+            terminate_instructions,
+        }
     }
 }
 

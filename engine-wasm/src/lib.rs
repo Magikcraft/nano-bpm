@@ -16,8 +16,9 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    bpmn::parse_bpmn, Command, Engine, Event, IncidentState, JobState, ProcessInstanceState,
-    TimerState, Value,
+    bpmn::parse_bpmn, ActivateElementInstruction, Command, Engine, Event, IncidentKind,
+    IncidentState, JobState, MessageSubscriptionKind, MessageSubscriptionState,
+    ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState, Value,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -29,6 +30,21 @@ pub struct TestEngine {
     now: u64,
     seq: u64,
     log: Vec<LogEntry>,
+    /// Cumulative history aggregates folded incrementally as events are applied,
+    /// so `snapshot` stays O(live state) instead of re-scanning the whole event
+    /// log on every (frequent) Play poll.
+    history: HistoryAggregates,
+}
+
+/// The log-derived, monotonically-growing parts of a snapshot, accumulated once
+/// per emitted event rather than recomputed per poll: cumulative per-element
+/// completion counts, the set of traversed sequence flows, and the evaluated
+/// decision instances.
+#[derive(Default)]
+struct HistoryAggregates {
+    completed_counts: HashMap<String, u64>,
+    taken_flows: std::collections::BTreeSet<(String, String)>,
+    decisions: Vec<DecisionInstanceDto>,
 }
 
 struct LogEntry {
@@ -47,6 +63,7 @@ impl TestEngine {
             now: 0,
             seq: 0,
             log: Vec::new(),
+            history: HistoryAggregates::default(),
         }
     }
 
@@ -66,6 +83,7 @@ impl TestEngine {
         self.now = 0;
         self.seq = 0;
         self.log.clear();
+        self.history = HistoryAggregates::default();
     }
 
     /// Parse and deploy a BPMN resource. Returns a JSON object
@@ -265,6 +283,207 @@ impl TestEngine {
         to_json(&serde_json::Value::Array(out))
     }
 
+    /// Throw a BPMN business error from a waiting job by key. If the job's
+    /// activity has a matching error boundary/event-subprocess catch it is
+    /// interrupted and the error-handling path runs; otherwise an incident is
+    /// raised. The job is activated first if needed, so the UI can throw an
+    /// error directly from a freshly-created job. Returns the snapshot.
+    #[wasm_bindgen(js_name = throwError)]
+    pub fn throw_error(
+        &mut self,
+        job_key: &str,
+        error_code: &str,
+        error_message: &str,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(job_key)?;
+        self.ensure_activated(key)?;
+        self.apply(Command::ThrowJobError {
+            job_key: key,
+            error_code: error_code.to_string(),
+            error_message: error_message.to_string(),
+        })
+        .map_err(|e| js_err(&format!("throw error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Set a job's remaining retries by key. Used to recover a job parked on a
+    /// no-retries incident before resolving that incident; does not by itself
+    /// unblock the job. Returns the snapshot.
+    #[wasm_bindgen(js_name = updateRetries)]
+    pub fn update_retries(&mut self, job_key: &str, retries: i32) -> Result<String, JsValue> {
+        let key = parse_key(job_key)?;
+        self.apply(Command::UpdateJobRetries {
+            job_key: key,
+            retries,
+        })
+        .map_err(|e| js_err(&format!("update retries error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Resolve an open incident by key, retrying the work that failed (a job
+    /// incident returns the parked job — which must have retries left — to the
+    /// activatable pool; a gateway incident re-evaluates; an uncaught-error
+    /// incident re-creates the service-task job). Returns the snapshot.
+    #[wasm_bindgen(js_name = resolveIncident)]
+    pub fn resolve_incident(&mut self, incident_key: &str) -> Result<String, JsValue> {
+        let key = parse_key(incident_key)?;
+        self.apply(Command::ResolveIncident {
+            incident_key: key,
+            operation_reference: None,
+        })
+        .map_err(|e| js_err(&format!("resolve incident error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Merge variables into a scope (a process-instance key or an element-instance
+    /// key). When `local` is true the values are written strictly into the target
+    /// scope; otherwise they propagate upward to the nearest ancestor scope that
+    /// defines each name (Zeebe `SetVariables` semantics). Returns the snapshot.
+    #[wasm_bindgen(js_name = setVariables)]
+    pub fn set_variables(
+        &mut self,
+        scope_key: &str,
+        variables_json: &str,
+        local: bool,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(scope_key)?;
+        let variables = parse_vars(variables_json)?;
+        self.apply(Command::SetVariables {
+            scope_key: key,
+            variables,
+            local,
+        })
+        .map_err(|e| js_err(&format!("set variables error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Broadcast a signal by name to **every** open subscription that matches,
+    /// across all instances, merging `variables_json` into each correlated
+    /// instance. Signals correlate by name only and are not buffered. Returns
+    /// the snapshot.
+    #[wasm_bindgen(js_name = broadcastSignal)]
+    pub fn broadcast_signal(
+        &mut self,
+        signal_name: &str,
+        variables_json: &str,
+    ) -> Result<String, JsValue> {
+        let variables = parse_vars(variables_json)?;
+        self.apply(Command::BroadcastSignal {
+            signal_name: signal_name.to_string(),
+            variables,
+        })
+        .map_err(|e| js_err(&format!("broadcast signal error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Cancel (terminate) a running process instance by key. Every token is
+    /// discarded, pending jobs are canceled, and the instance transitions to
+    /// `Terminated`. Returns the snapshot.
+    #[wasm_bindgen(js_name = cancelInstance)]
+    pub fn cancel_instance(&mut self, instance_key: &str) -> Result<String, JsValue> {
+        let key = parse_key(instance_key)?;
+        self.apply(Command::CancelInstance { instance_key: key })
+            .map_err(|e| js_err(&format!("cancel instance error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Modify a running process instance (Zeebe "modify process instance"): move
+    /// tokens by terminating existing element instances and/or activating new
+    /// ones. `activate_instructions_json` is a JSON array of
+    /// `{ elementId: string, variables?: object }` (variables are merged into the
+    /// instance's root scope before the token is placed);
+    /// `terminate_instructions_json` is a JSON array of element-instance keys,
+    /// each a decimal string or a `{ elementInstanceKey: string }` object.
+    /// Activations run at the process root scope. Returns the snapshot.
+    #[wasm_bindgen(js_name = modify)]
+    pub fn modify(
+        &mut self,
+        instance_key: &str,
+        activate_instructions_json: &str,
+        terminate_instructions_json: &str,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(instance_key)?;
+        let activate_instructions = parse_activate_instructions(activate_instructions_json)?;
+        let terminate_instructions = parse_terminate_instructions(terminate_instructions_json)?;
+        self.apply(Command::ModifyInstance {
+            instance_key: key,
+            activate_instructions,
+            terminate_instructions,
+        })
+        .map_err(|e| js_err(&format!("modify instance error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Complete a waiting user task by key, merging `variables_json` into the
+    /// instance before the parked token resumes. The task must be in the
+    /// `Created` state. Returns the snapshot.
+    #[wasm_bindgen(js_name = completeUserTask)]
+    pub fn complete_user_task(
+        &mut self,
+        user_task_key: &str,
+        variables_json: &str,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(user_task_key)?;
+        let variables = parse_vars(variables_json)?;
+        self.apply(Command::CompleteUserTask {
+            user_task_key: key,
+            variables,
+        })
+        .map_err(|e| js_err(&format!("complete user task error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Assign a user task to `assignee`. When `allow_override` is false and the
+    /// task already has an assignee the command is rejected (it must be
+    /// unassigned first). Returns the snapshot.
+    #[wasm_bindgen(js_name = assignUserTask)]
+    pub fn assign_user_task(
+        &mut self,
+        user_task_key: &str,
+        assignee: &str,
+        allow_override: bool,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(user_task_key)?;
+        self.apply(Command::AssignUserTask {
+            user_task_key: key,
+            assignee: assignee.to_string(),
+            allow_override,
+        })
+        .map_err(|e| js_err(&format!("assign user task error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Clear a user task's assignee. The task must be in the `Created` state.
+    /// Returns the snapshot.
+    #[wasm_bindgen(js_name = unassignUserTask)]
+    pub fn unassign_user_task(&mut self, user_task_key: &str) -> Result<String, JsValue> {
+        let key = parse_key(user_task_key)?;
+        self.apply(Command::UnassignUserTask { user_task_key: key })
+            .map_err(|e| js_err(&format!("unassign user task error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Update a user task's attributes from a JSON changeset object. Recognised
+    /// keys (all optional): `candidateGroups` / `candidateUsers` (string arrays),
+    /// `dueDate` / `followUpDate` (ISO-8601 string, or `null`/`""` to clear),
+    /// `priority` (0..=100). Only present keys are changed. The task must be in
+    /// the `Created` state. Returns the snapshot.
+    #[wasm_bindgen(js_name = updateUserTask)]
+    pub fn update_user_task(
+        &mut self,
+        user_task_key: &str,
+        changeset_json: &str,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(user_task_key)?;
+        let changeset = parse_user_task_changeset(changeset_json)?;
+        self.apply(Command::UpdateUserTask {
+            user_task_key: key,
+            changeset,
+        })
+        .map_err(|e| js_err(&format!("update user task error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
     /// The current simulation state as a JSON [`Snapshot`].
     pub fn snapshot(&self) -> Result<String, JsValue> {
         to_json(&self.snapshot_value(None))
@@ -319,6 +538,7 @@ impl TestEngine {
         let events = self.engine.apply_command_at(command, now)?;
         for ev in &events {
             self.seq += 1;
+            self.fold_history(ev);
             self.log.push(LogEntry {
                 seq: self.seq,
                 now,
@@ -326,6 +546,43 @@ impl TestEngine {
             });
         }
         Ok(events)
+    }
+
+    /// Fold one emitted event into the cumulative history aggregates that back
+    /// the snapshot's `elementStats.completed`, `takenSequenceFlows` and
+    /// `decisionInstances` fields, so `snapshot` never re-scans the full log.
+    fn fold_history(&mut self, ev: &Event) {
+        match ev {
+            Event::ElementCompleted { element_id, .. } => {
+                *self
+                    .history
+                    .completed_counts
+                    .entry(element_id.clone())
+                    .or_default() += 1;
+            }
+            Event::SequenceFlowTaken { from, to, .. } => {
+                self.history.taken_flows.insert((from.clone(), to.clone()));
+            }
+            Event::DecisionEvaluated {
+                instance_key,
+                element_id,
+                decision_key,
+                decision_id,
+                decision_output,
+                evaluated_at,
+                ..
+            } => {
+                self.history.decisions.push(DecisionInstanceDto {
+                    instance_key: instance_key.to_string(),
+                    element_id: element_id.clone(),
+                    decision_key: decision_key.to_string(),
+                    decision_id: decision_id.clone(),
+                    output: value_to_json(decision_output),
+                    evaluated_at: *evaluated_at,
+                });
+            }
+            _ => {}
+        }
     }
 
     /// Activate the job's type so a `Created` job can be completed/failed. A job
@@ -369,7 +626,7 @@ impl TestEngine {
                         element_id: eid.clone(),
                     })
                     .collect();
-                active.sort_by(|a, b| a.key.cmp(&b.key));
+                active.sort_by(|a, b| cmp_key(&a.key, &b.key));
                 InstanceDto {
                     key: inst.key.to_string(),
                     process_id: inst.process_id.clone(),
@@ -380,7 +637,7 @@ impl TestEngine {
                 }
             })
             .collect();
-        instances.sort_by(|a, b| a.key.cmp(&b.key));
+        instances.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         let mut jobs: Vec<JobDto> = state
             .jobs
@@ -395,7 +652,7 @@ impl TestEngine {
                 retries: j.retries,
             })
             .collect();
-        jobs.sort_by(|a, b| a.key.cmp(&b.key));
+        jobs.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         let mut incidents: Vec<IncidentDto> = state
             .incidents
@@ -405,11 +662,11 @@ impl TestEngine {
                 key: i.key.to_string(),
                 instance_key: i.instance_key.to_string(),
                 element_id: i.element_id.clone(),
-                kind: format!("{:?}", i.kind),
+                kind: incident_kind_tag(&i.kind).to_string(),
                 reason: i.reason.clone(),
             })
             .collect();
-        incidents.sort_by(|a, b| a.key.cmp(&b.key));
+        incidents.sort_by(|a, b| cmp_key(&a.key, &b.key));
 
         let mut timers: Vec<TimerDto> = state
             .timers
@@ -424,6 +681,116 @@ impl TestEngine {
             })
             .collect();
         timers.sort_by_key(|a| a.due_at);
+
+        // User tasks parked on `userTask` elements (Created = waiting for a human;
+        // Completed/Canceled retained for audit). Play renders Created tasks in
+        // its task panel and lets the user complete/assign them.
+        let mut user_tasks: Vec<UserTaskDto> = state
+            .user_tasks
+            .values()
+            .map(|t| UserTaskDto {
+                key: t.key.to_string(),
+                instance_key: t.instance_key.to_string(),
+                element_instance_key: t.element_instance_key.to_string(),
+                element_id: t.element_id.clone(),
+                state: user_task_state(&t.state),
+                assignee: t.assignee.clone(),
+                candidate_groups: t.candidate_groups.clone(),
+                candidate_users: t.candidate_users.clone(),
+                due_date: t.due_date.clone(),
+                follow_up_date: t.follow_up_date.clone(),
+                priority: t.priority,
+            })
+            .collect();
+        user_tasks.sort_by(|a, b| cmp_key(&a.key, &b.key));
+
+        // Open message subscriptions (waiting catch/boundary events). Play's
+        // message-correlation panel needs the name + resolved correlation key.
+        let mut message_subscriptions: Vec<MessageSubscriptionDto> = state
+            .message_subscriptions
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    MessageSubscriptionState::Open | MessageSubscriptionState::Opening
+                )
+            })
+            .map(|s| MessageSubscriptionDto {
+                key: s.key.to_string(),
+                instance_key: s.instance_key.to_string(),
+                element_id: s.element_id.clone(),
+                message_name: s.message_name.clone(),
+                correlation_key: s.correlation_key.clone(),
+                kind: subscription_kind_tag(&s.kind).to_string(),
+            })
+            .collect();
+        message_subscriptions.sort_by(|a, b| cmp_key(&a.key, &b.key));
+
+        // Open signal subscriptions (waiting signal catch/boundary events). Play's
+        // signal-broadcast panel lists the signal names currently awaited.
+        let mut signal_subscriptions: Vec<SignalSubscriptionDto> = state
+            .signal_subscriptions
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.state,
+                    MessageSubscriptionState::Open | MessageSubscriptionState::Opening
+                )
+            })
+            .map(|s| SignalSubscriptionDto {
+                key: s.key.to_string(),
+                instance_key: s.instance_key.to_string(),
+                element_id: s.element_id.clone(),
+                signal_name: s.signal_name.clone(),
+                kind: subscription_kind_tag(&s.kind).to_string(),
+            })
+            .collect();
+        signal_subscriptions.sort_by(|a, b| cmp_key(&a.key, &b.key));
+
+        // Per-element token statistics for diagram overlays. `active` is the
+        // current live token count (from instance active elements); `completed`
+        // and `incidents` are cumulative counts. `completed` comes from the
+        // incrementally-maintained history aggregate (no per-poll log scan).
+        let mut stats: HashMap<String, ElementStat> = HashMap::new();
+        for inst in &instances {
+            for el in &inst.active_elements {
+                stats.entry(el.element_id.clone()).or_default().active += 1;
+            }
+        }
+        for (element_id, count) in &self.history.completed_counts {
+            stats.entry(element_id.clone()).or_default().completed += *count;
+        }
+        // Cumulative sequence flows taken, as (from, to) element-id pairs, for
+        // highlighting traversed connections (Play's `fetchSequenceFlows`). The
+        // set is maintained incrementally and already deduplicated + sorted.
+        let taken_sequence_flows: Vec<SequenceFlowDto> = self
+            .history
+            .taken_flows
+            .iter()
+            .map(|(from, to)| SequenceFlowDto {
+                from: from.clone(),
+                to: to.clone(),
+            })
+            .collect();
+        for inc in &incidents {
+            stats.entry(inc.element_id.clone()).or_default().incidents += 1;
+        }
+        let mut element_stats: Vec<ElementStatDto> = stats
+            .into_iter()
+            .map(|(element_id, s)| ElementStatDto {
+                element_id,
+                active: s.active,
+                completed: s.completed,
+                incidents: s.incidents,
+            })
+            .collect();
+        element_stats.sort_by(|a, b| a.element_id.cmp(&b.element_id));
+
+        // Evaluated decision instances (from `businessRuleTask`/DMN), collected
+        // incrementally from the `DecisionEvaluated` audit events (Play's
+        // `fetchDecisionInstances`). Not part of live engine state.
+        let mut decision_instances: Vec<DecisionInstanceDto> = self.history.decisions.clone();
+        decision_instances.sort_by(|a, b| cmp_key(&a.decision_key, &b.decision_key));
 
         // Unions for one-shot diagram highlighting.
         let mut active_element_ids: Vec<String> = instances
@@ -450,6 +817,12 @@ impl TestEngine {
             jobs,
             incidents,
             timers,
+            user_tasks,
+            message_subscriptions,
+            signal_subscriptions,
+            element_stats,
+            taken_sequence_flows,
+            decision_instances,
             active_element_ids,
             incident_element_ids,
         };
@@ -470,6 +843,12 @@ struct Snapshot {
     jobs: Vec<JobDto>,
     incidents: Vec<IncidentDto>,
     timers: Vec<TimerDto>,
+    user_tasks: Vec<UserTaskDto>,
+    message_subscriptions: Vec<MessageSubscriptionDto>,
+    signal_subscriptions: Vec<SignalSubscriptionDto>,
+    element_stats: Vec<ElementStatDto>,
+    taken_sequence_flows: Vec<SequenceFlowDto>,
+    decision_instances: Vec<DecisionInstanceDto>,
     active_element_ids: Vec<String>,
     incident_element_ids: Vec<String>,
 }
@@ -523,6 +902,116 @@ struct TimerDto {
     due_in_ms: u64,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UserTaskDto {
+    key: String,
+    instance_key: String,
+    element_instance_key: String,
+    element_id: String,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assignee: Option<String>,
+    candidate_groups: Vec<String>,
+    candidate_users: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    due_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    follow_up_date: Option<String>,
+    priority: i32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MessageSubscriptionDto {
+    key: String,
+    instance_key: String,
+    element_id: String,
+    message_name: String,
+    correlation_key: String,
+    kind: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SignalSubscriptionDto {
+    key: String,
+    instance_key: String,
+    element_id: String,
+    signal_name: String,
+    kind: String,
+}
+
+/// Cumulative per-element counters accumulated while building a snapshot.
+#[derive(Default)]
+struct ElementStat {
+    active: u64,
+    completed: u64,
+    incidents: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ElementStatDto {
+    element_id: String,
+    active: u64,
+    completed: u64,
+    incidents: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SequenceFlowDto {
+    from: String,
+    to: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct DecisionInstanceDto {
+    instance_key: String,
+    element_id: String,
+    decision_key: String,
+    decision_id: String,
+    output: serde_json::Value,
+    evaluated_at: u64,
+}
+
+/// A stable camelCase discriminant for an incident kind, exposed to the UI
+/// instead of Rust `Debug` output so variant renames or formatting changes
+/// don't become breaking JSON-API changes.
+fn incident_kind_tag(kind: &IncidentKind) -> &'static str {
+    match kind {
+        IncidentKind::JobNoRetries => "jobNoRetries",
+        IncidentKind::NoMatchingSequenceFlow => "noMatchingSequenceFlow",
+        IncidentKind::ExpressionEvaluation => "expressionEvaluation",
+        IncidentKind::UnhandledError => "unhandledError",
+        IncidentKind::DecisionEvaluation => "decisionEvaluation",
+    }
+}
+
+/// A stable, camelCase discriminant string for a message/signal subscription
+/// kind, exposed to the UI instead of Rust `Debug` output (which is brittle and
+/// leaks struct fields). Play only distinguishes intermediate-catch from
+/// boundary subscriptions, so the boundary element id is intentionally omitted.
+fn subscription_kind_tag(kind: &MessageSubscriptionKind) -> &'static str {
+    match kind {
+        MessageSubscriptionKind::IntermediateCatch => "intermediateCatch",
+        MessageSubscriptionKind::InterruptingBoundary { .. } => "interruptingBoundary",
+        MessageSubscriptionKind::NonInterruptingBoundary { .. } => "nonInterruptingBoundary",
+    }
+}
+
+/// Compare two decimal-string entity keys numerically (they are `u64` rendered
+/// as decimal), falling back to lexicographic order for any non-numeric key so
+/// snapshot ordering stays stable once keys grow past a single digit.
+fn cmp_key(a: &str, b: &str) -> std::cmp::Ordering {
+    match (a.parse::<u64>(), b.parse::<u64>()) {
+        (Ok(x), Ok(y)) => x.cmp(&y),
+        _ => a.cmp(b),
+    }
+}
+
 fn instance_state(s: &ProcessInstanceState) -> String {
     match s {
         ProcessInstanceState::Active => "Active",
@@ -545,6 +1034,15 @@ fn job_state(s: &JobState) -> String {
     .to_string()
 }
 
+fn user_task_state(s: &UserTaskState) -> String {
+    match s {
+        UserTaskState::Created => "Created",
+        UserTaskState::Completed => "Completed",
+        UserTaskState::Canceled => "Canceled",
+    }
+    .to_string()
+}
+
 fn js_err(msg: &str) -> JsValue {
     JsValue::from_str(msg)
 }
@@ -558,6 +1056,88 @@ fn parse_key(s: &str) -> Result<u64, JsValue> {
     s.trim()
         .parse::<u64>()
         .map_err(|_| js_err(&format!("invalid key: {s}")))
+}
+
+/// Parse the `activate_instructions_json` argument of [`TestEngine::modify`]: a
+/// JSON array of `{ elementId: string, variables?: object }`. Empty/whitespace
+/// ⇒ no activations.
+fn parse_activate_instructions(s: &str) -> Result<Vec<ActivateElementInstruction>, JsValue> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json: serde_json::Value = serde_json::from_str(t)
+        .map_err(|e| js_err(&format!("invalid activate instructions JSON: {e}")))?;
+    let serde_json::Value::Array(items) = json else {
+        return Err(js_err("activate instructions must be a JSON array"));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let serde_json::Value::Object(map) = item else {
+            return Err(js_err("each activate instruction must be a JSON object"));
+        };
+        let element_id = match map.get("elementId") {
+            Some(serde_json::Value::String(id)) if !id.is_empty() => id.clone(),
+            _ => {
+                return Err(js_err(
+                    "activate instruction requires a non-empty elementId",
+                ))
+            }
+        };
+        let variables = match map.get("variables") {
+            None | Some(serde_json::Value::Null) => HashMap::new(),
+            Some(serde_json::Value::Object(vars)) => vars
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+            Some(_) => {
+                return Err(js_err(
+                    "activate instruction variables must be a JSON object",
+                ))
+            }
+        };
+        out.push(ActivateElementInstruction {
+            element_id,
+            variables,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse the `terminate_instructions_json` argument of [`TestEngine::modify`]: a
+/// JSON array of element-instance keys, each a decimal string, a number, or a
+/// `{ elementInstanceKey: string|number }` object. Empty/whitespace ⇒ none.
+fn parse_terminate_instructions(s: &str) -> Result<Vec<u64>, JsValue> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json: serde_json::Value = serde_json::from_str(t)
+        .map_err(|e| js_err(&format!("invalid terminate instructions JSON: {e}")))?;
+    let serde_json::Value::Array(items) = json else {
+        return Err(js_err("terminate instructions must be a JSON array"));
+    };
+    items.iter().map(json_to_element_instance_key).collect()
+}
+
+/// Coerce one terminate-instruction entry (string, number, or
+/// `{ elementInstanceKey }` object) into an element-instance key.
+fn json_to_element_instance_key(v: &serde_json::Value) -> Result<u64, JsValue> {
+    match v {
+        serde_json::Value::String(s) => parse_key(s),
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| js_err(&format!("invalid element instance key: {n}"))),
+        serde_json::Value::Object(map) => match map.get("elementInstanceKey") {
+            Some(inner) => json_to_element_instance_key(inner),
+            None => Err(js_err(
+                "terminate instruction requires an elementInstanceKey",
+            )),
+        },
+        _ => Err(js_err(
+            "terminate instruction must be a key string, number or object",
+        )),
+    }
 }
 
 /// Parse a JSON object string into engine variables. Empty/whitespace ⇒ none.
@@ -575,6 +1155,70 @@ fn parse_vars(s: &str) -> Result<HashMap<String, Value>, JsValue> {
             .collect()),
         _ => Err(js_err("variables must be a JSON object")),
     }
+}
+
+/// Parse a JSON changeset object for `updateUserTask` into a [`UserTaskChangeset`].
+/// Only keys present in the object become `Some`; absent keys leave that
+/// attribute unchanged. `dueDate`/`followUpDate` accept a string, or `null`/`""`
+/// to clear the attribute.
+fn parse_user_task_changeset(s: &str) -> Result<UserTaskChangeset, JsValue> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(UserTaskChangeset::default());
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(t).map_err(|e| js_err(&format!("invalid changeset JSON: {e}")))?;
+    let obj = match json {
+        serde_json::Value::Object(map) => map,
+        _ => return Err(js_err("changeset must be a JSON object")),
+    };
+
+    let string_list = |v: &serde_json::Value| -> Result<Vec<String>, JsValue> {
+        match v {
+            serde_json::Value::Array(items) => items
+                .iter()
+                .map(|i| {
+                    i.as_str()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| js_err("candidate list entries must be strings"))
+                })
+                .collect(),
+            _ => Err(js_err("candidate groups/users must be a JSON array")),
+        }
+    };
+    // A nullable date field: `Some(None)` clears, `Some(Some(s))` sets, absent leaves alone.
+    let opt_date = |v: &serde_json::Value| -> Result<Option<String>, JsValue> {
+        match v {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) if s.is_empty() => Ok(None),
+            serde_json::Value::String(s) => Ok(Some(s.clone())),
+            _ => Err(js_err("date fields must be a string or null")),
+        }
+    };
+
+    let mut changeset = UserTaskChangeset::default();
+    if let Some(v) = obj.get("candidateGroups") {
+        changeset.candidate_groups = Some(string_list(v)?);
+    }
+    if let Some(v) = obj.get("candidateUsers") {
+        changeset.candidate_users = Some(string_list(v)?);
+    }
+    if let Some(v) = obj.get("dueDate") {
+        changeset.due_date = Some(opt_date(v)?);
+    }
+    if let Some(v) = obj.get("followUpDate") {
+        changeset.follow_up_date = Some(opt_date(v)?);
+    }
+    if let Some(v) = obj.get("priority") {
+        let p = v
+            .as_i64()
+            .ok_or_else(|| js_err("priority must be an integer"))?;
+        if !(0..=100).contains(&p) {
+            return Err(js_err("priority must be in the range 0..=100"));
+        }
+        changeset.priority = Some(p as i32);
+    }
+    Ok(changeset)
 }
 
 /// Convert engine variables to a natural JSON object (not the tagged enum form).
@@ -628,5 +1272,272 @@ fn json_to_value(v: &serde_json::Value) -> Value {
                 .map(|(k, v)| (k.clone(), json_to_value(v)))
                 .collect(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value as J;
+
+    use super::*;
+
+    fn parse(s: &str) -> J {
+        serde_json::from_str(s).expect("valid JSON")
+    }
+
+    const USER_TASK_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    const SERVICE_TASK_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="work">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="do-work" />
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="work" />
+          <bpmn:sequenceFlow id="b" sourceRef="work" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    fn only_user_task_key(snap: &J) -> String {
+        let tasks = snap["userTasks"].as_array().expect("userTasks array");
+        assert_eq!(tasks.len(), 1, "expected one user task: {snap}");
+        tasks[0]["key"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn user_task_lifecycle_and_snapshot() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+
+        // A Created user task is surfaced, parked on the `review` element.
+        let task = &snap["userTasks"][0];
+        assert_eq!(task["state"], "Created");
+        assert_eq!(task["elementId"], "review");
+        assert_eq!(task["priority"], 50);
+        // Its element is highlighted as active and the entry flow is recorded.
+        assert!(snap["activeElementIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "review"));
+        assert!(snap["takenSequenceFlows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["from"] == "s" && f["to"] == "review"));
+
+        let key = only_user_task_key(&snap);
+
+        // Assign / unassign flow.
+        let snap = parse(&eng.assign_user_task(&key, "alice", false).unwrap());
+        assert_eq!(snap["userTasks"][0]["assignee"], "alice");
+        let snap = parse(&eng.unassign_user_task(&key).unwrap());
+        assert!(snap["userTasks"][0].get("assignee").is_none());
+
+        // Update attributes from a JSON changeset.
+        let snap = parse(
+            &eng.update_user_task(
+                &key,
+                r#"{"candidateGroups":["ops"],"priority":80,"dueDate":"2026-01-01"}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(snap["userTasks"][0]["candidateGroups"][0], "ops");
+        assert_eq!(snap["userTasks"][0]["priority"], 80);
+        assert_eq!(snap["userTasks"][0]["dueDate"], "2026-01-01");
+
+        // Completing resumes the token, completes the instance, and records the
+        // exit sequence flow + element-completed statistic.
+        let snap = parse(
+            &eng.complete_user_task(&key, r#"{"approved":true}"#)
+                .unwrap(),
+        );
+        assert_eq!(snap["userTasks"][0]["state"], "Completed");
+        assert_eq!(snap["completedInstances"], 1);
+        assert!(snap["takenSequenceFlows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["from"] == "review" && f["to"] == "e"));
+        let review_stat = snap["elementStats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["elementId"] == "review")
+            .expect("review stat");
+        assert_eq!(review_stat["completed"], 1);
+    }
+
+    #[test]
+    fn throw_error_without_boundary_raises_incident() {
+        let mut eng = TestEngine::new();
+        eng.deploy(SERVICE_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let job_key = snap["jobs"][0]["key"].as_str().unwrap().to_string();
+
+        // Throwing an uncaught business error consumes the job and raises an
+        // incident visible on the `work` element.
+        let snap = parse(&eng.throw_error(&job_key, "BOOM", "kaboom").unwrap());
+        let incidents = snap["incidents"].as_array().unwrap();
+        assert_eq!(incidents.len(), 1, "expected one incident: {snap}");
+        assert_eq!(incidents[0]["elementId"], "work");
+        assert!(snap["incidentElementIds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "work"));
+    }
+
+    #[test]
+    fn fail_update_retries_resolve_incident_recovers_job() {
+        let mut eng = TestEngine::new();
+        eng.deploy(SERVICE_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let job_key = snap["jobs"][0]["key"].as_str().unwrap().to_string();
+
+        // Fail with no retries left → incident.
+        let snap = parse(&eng.fail_job(&job_key, 0, "nope").unwrap());
+        let incident_key = snap["incidents"][0]["key"].as_str().unwrap().to_string();
+
+        // Give the job a retry, then resolve the incident to re-create the job.
+        eng.update_retries(&job_key, 1).unwrap();
+        let snap = parse(&eng.resolve_incident(&incident_key).unwrap());
+        assert!(
+            snap["incidents"].as_array().unwrap().is_empty(),
+            "incident should be resolved: {snap}"
+        );
+        assert!(
+            !snap["jobs"].as_array().unwrap().is_empty(),
+            "job should be activatable again: {snap}"
+        );
+    }
+
+    #[test]
+    fn set_variables_merges_into_instance() {
+        let mut eng = TestEngine::new();
+        eng.deploy(SERVICE_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", r#"{"a":1}"#).unwrap());
+        let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
+
+        let snap = parse(
+            &eng.set_variables(&instance_key, r#"{"b":2}"#, false)
+                .unwrap(),
+        );
+        let vars = &snap["instances"][0]["variables"];
+        assert_eq!(vars["a"], 1);
+        assert_eq!(vars["b"], 2);
+    }
+
+    #[test]
+    fn cancel_instance_terminates() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
+
+        let snap = parse(&eng.cancel_instance(&instance_key).unwrap());
+        assert_eq!(snap["instances"][0]["state"], "Terminated");
+        assert!(snap["userTasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["state"] != "Created"));
+    }
+
+    const TWO_TASK_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="a">
+            <bpmn:extensionElements><zeebe:taskDefinition type="ja" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:serviceTask id="b">
+            <bpmn:extensionElements><zeebe:taskDefinition type="jb" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="a" />
+          <bpmn:sequenceFlow id="f2" sourceRef="a" targetRef="b" />
+          <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    fn active_eik(snap: &J, element_id: &str) -> String {
+        snap["instances"][0]["activeElements"]
+            .as_array()
+            .expect("activeElements array")
+            .iter()
+            .find(|el| el["elementId"] == element_id)
+            .unwrap_or_else(|| panic!("no active element {element_id}: {snap}"))["key"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn modify_moves_a_token_between_elements() {
+        let mut eng = TestEngine::new();
+        eng.deploy(TWO_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
+        let a_eik = active_eik(&snap, "a");
+
+        // Terminate the token on `a` and activate one on `b`, merging a variable.
+        let snap = parse(
+            &eng.modify(
+                &instance_key,
+                r#"[{"elementId":"b","variables":{"approved":true}}]"#,
+                &format!("[\"{a_eik}\"]"),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(snap["instances"][0]["state"], "Active");
+        // Token now rests on `b` (a fresh `jb` job), not `a`.
+        assert!(snap["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["elementId"] == "b" && j["jobType"] == "jb"));
+        assert!(snap["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|j| j["elementId"] != "a"));
+        assert_eq!(snap["instances"][0]["variables"]["approved"], true);
+    }
+
+    #[test]
+    fn modify_terminating_last_token_terminates_instance() {
+        let mut eng = TestEngine::new();
+        eng.deploy(SERVICE_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
+        let work_eik = active_eik(&snap, "work");
+
+        let snap = parse(
+            &eng.modify(&instance_key, "[]", &format!("[\"{work_eik}\"]"))
+                .unwrap(),
+        );
+        assert_eq!(snap["instances"][0]["state"], "Terminated");
+        assert!(snap["jobs"].as_array().unwrap().is_empty());
     }
 }

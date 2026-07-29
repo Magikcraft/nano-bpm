@@ -48,6 +48,39 @@ class WasmBojtosSession {
     failJob(jobKey, retries, message) {
         return parseSnapshot(this.engine.failJob(jobKey, retries, message));
     }
+    throwError(jobKey, errorCode, errorMessage) {
+        return parseSnapshot(this.engine.throwError(jobKey, errorCode, errorMessage));
+    }
+    updateRetries(jobKey, retries) {
+        return parseSnapshot(this.engine.updateRetries(jobKey, retries));
+    }
+    resolveIncident(incidentKey) {
+        return parseSnapshot(this.engine.resolveIncident(incidentKey));
+    }
+    setVariables(scopeKey, variablesJson, local) {
+        return parseSnapshot(this.engine.setVariables(scopeKey, variablesJson || "{}", local));
+    }
+    broadcastSignal(signalName, variablesJson) {
+        return parseSnapshot(this.engine.broadcastSignal(signalName, variablesJson || "{}"));
+    }
+    cancelInstance(instanceKey) {
+        return parseSnapshot(this.engine.cancelInstance(instanceKey));
+    }
+    modify(instanceKey, activateInstructions, terminateElementInstanceKeys) {
+        return parseSnapshot(this.engine.modify(instanceKey, JSON.stringify(activateInstructions ?? []), JSON.stringify(terminateElementInstanceKeys ?? [])));
+    }
+    completeUserTask(userTaskKey, variablesJson) {
+        return parseSnapshot(this.engine.completeUserTask(userTaskKey, variablesJson || "{}"));
+    }
+    assignUserTask(userTaskKey, assignee, allowOverride) {
+        return parseSnapshot(this.engine.assignUserTask(userTaskKey, assignee, allowOverride));
+    }
+    unassignUserTask(userTaskKey) {
+        return parseSnapshot(this.engine.unassignUserTask(userTaskKey));
+    }
+    updateUserTask(userTaskKey, changesetJson) {
+        return parseSnapshot(this.engine.updateUserTask(userTaskKey, changesetJson || "{}"));
+    }
     correlateMessage(messageName, correlationKey, variablesJson) {
         return parseSnapshot(this.engine.correlateMessage(messageName, correlationKey, variablesJson || "{}"));
     }

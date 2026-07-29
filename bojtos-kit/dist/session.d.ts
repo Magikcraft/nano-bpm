@@ -1,5 +1,5 @@
 import { type InitInput } from "@nanobpm/engine-wasm";
-import type { ActivatedJob, Snapshot, WasmEvent } from "./types.js";
+import type { ActivatedJob, ActivateInstruction, Snapshot, WasmEvent } from "./types.js";
 /**
  * The source of the engine wasm binary. Under a bundler that understands
  * `new URL(..., import.meta.url)` (e.g. Vite) the default loader needs no
@@ -48,6 +48,63 @@ export interface BojtosSession {
     completeJob(jobKey: string, variablesJson: string): Snapshot;
     /** Fail a waiting job; with no retries left this raises an incident. */
     failJob(jobKey: string, retries: number, message: string): Snapshot;
+    /**
+     * Throw a BPMN business error from a waiting job: interrupts the activity via a
+     * matching error boundary/event-subprocess catch, or raises an incident if
+     * uncaught. The job is consumed either way.
+     */
+    throwError(jobKey: string, errorCode: string, errorMessage: string): Snapshot;
+    /**
+     * Set a job's remaining retries. Used to recover a job parked on a no-retries
+     * incident before resolving that incident; does not itself unblock the job.
+     */
+    updateRetries(jobKey: string, retries: number): Snapshot;
+    /**
+     * Resolve an open incident by key, retrying the work that failed (returns a
+     * parked job to the activatable pool / re-evaluates a gateway / re-creates a
+     * service-task job).
+     */
+    resolveIncident(incidentKey: string): Snapshot;
+    /**
+     * Merge variables into a scope (a process-instance or element-instance key).
+     * When `local` is true they are written strictly into the target scope,
+     * otherwise they propagate up to the nearest ancestor scope defining each name.
+     */
+    setVariables(scopeKey: string, variablesJson: string, local: boolean): Snapshot;
+    /**
+     * Broadcast a signal by name to every open subscription that matches, across
+     * all instances, merging `variablesJson` into each correlated instance.
+     */
+    broadcastSignal(signalName: string, variablesJson: string): Snapshot;
+    /** Cancel (terminate) a running process instance: every token is discarded. */
+    cancelInstance(instanceKey: string): Snapshot;
+    /**
+     * Modify a running process instance (Zeebe "modify process instance"): move
+     * tokens by terminating existing element instances and/or activating new
+     * ones. Each activate instruction places a token at `elementId` (in the
+     * process root scope), first merging its optional `variables` into the root
+     * scope; `terminateElementInstanceKeys` are the keys of active element
+     * instances (from `instances[].activeElements[].key`) to terminate. If the
+     * terminations drain the last token and nothing is activated, the instance is
+     * terminated.
+     */
+    modify(instanceKey: string, activateInstructions: ActivateInstruction[], terminateElementInstanceKeys: string[]): Snapshot;
+    /** Complete a waiting user task, merging `variablesJson` into the instance. */
+    completeUserTask(userTaskKey: string, variablesJson: string): Snapshot;
+    /**
+     * Assign a user task to `assignee`. With `allowOverride` false the command is
+     * rejected if the task already has an assignee (unassign it first).
+     */
+    assignUserTask(userTaskKey: string, assignee: string, allowOverride: boolean): Snapshot;
+    /** Clear a user task's assignee. */
+    unassignUserTask(userTaskKey: string): Snapshot;
+    /**
+     * Update a user task's attributes from a JSON changeset. Recognised keys (all
+     * optional): `candidateGroups` / `candidateUsers` (string arrays),
+     * `dueDate` / `followUpDate` (ISO-8601 string, or `null`/`""` to clear),
+     * `priority` (0..=100). Only present keys are changed.
+     */
+    updateUserTask(userTaskKey: string, changesetJson: string): Snapshot;
     /**
      * Correlate a message to any instance waiting on it: publishes `messageName`
      * with `correlationKey` (the value the waiting subscription's `correlationKey`

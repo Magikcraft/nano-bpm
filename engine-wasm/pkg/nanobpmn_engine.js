@@ -84,6 +84,113 @@ export class TestEngine {
         }
     }
     /**
+     * Assign a user task to `assignee`. When `allow_override` is false and the
+     * task already has an assignee the command is rejected (it must be
+     * unassigned first). Returns the snapshot.
+     * @param {string} user_task_key
+     * @param {string} assignee
+     * @param {boolean} allow_override
+     * @returns {string}
+     */
+    assignUserTask(user_task_key, assignee, allow_override) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(user_task_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(assignee, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.testengine_assignUserTask(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, allow_override);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Broadcast a signal by name to **every** open subscription that matches,
+     * across all instances, merging `variables_json` into each correlated
+     * instance. Signals correlate by name only and are not buffered. Returns
+     * the snapshot.
+     * @param {string} signal_name
+     * @param {string} variables_json
+     * @returns {string}
+     */
+    broadcastSignal(signal_name, variables_json) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(signal_name, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.testengine_broadcastSignal(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Cancel (terminate) a running process instance by key. Every token is
+     * discarded, pending jobs are canceled, and the instance transitions to
+     * `Terminated`. Returns the snapshot.
+     * @param {string} instance_key
+     * @returns {string}
+     */
+    cancelInstance(instance_key) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(instance_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_cancelInstance(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
      * Complete a waiting job by key, merging `variables_json` (a JSON object
      * string) into the instance. The job is activated first if it has not been
      * already, so the UI can complete a freshly-created job directly.
@@ -101,6 +208,42 @@ export class TestEngine {
             const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
             const len1 = WASM_VECTOR_LEN;
             wasm.testengine_completeJob(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
+     * Complete a waiting user task by key, merging `variables_json` into the
+     * instance before the parked token resumes. The task must be in the
+     * `Created` state. Returns the snapshot.
+     * @param {string} user_task_key
+     * @param {string} variables_json
+     * @returns {string}
+     */
+    completeUserTask(user_task_key, variables_json) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(user_task_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.testengine_completeUserTask(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
             var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
             var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
             var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
@@ -297,6 +440,50 @@ export class TestEngine {
         }
     }
     /**
+     * Modify a running process instance (Zeebe "modify process instance"): move
+     * tokens by terminating existing element instances and/or activating new
+     * ones. `activate_instructions_json` is a JSON array of
+     * `{ elementId: string, variables?: object }` (variables are merged into the
+     * instance's root scope before the token is placed);
+     * `terminate_instructions_json` is a JSON array of element-instance keys,
+     * each a decimal string or a `{ elementInstanceKey: string }` object.
+     * Activations run at the process root scope. Returns the snapshot.
+     * @param {string} instance_key
+     * @param {string} activate_instructions_json
+     * @param {string} terminate_instructions_json
+     * @returns {string}
+     */
+    modify(instance_key, activate_instructions_json, terminate_instructions_json) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(instance_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(activate_instructions_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(terminate_instructions_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.testengine_modify(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
      * Create a fresh, empty simulated engine. The virtual clock starts at 0.
      */
     constructor() {
@@ -324,6 +511,78 @@ export class TestEngine {
         wasm.testengine_reset(this.__wbg_ptr);
     }
     /**
+     * Resolve an open incident by key, retrying the work that failed (a job
+     * incident returns the parked job — which must have retries left — to the
+     * activatable pool; a gateway incident re-evaluates; an uncaught-error
+     * incident re-creates the service-task job). Returns the snapshot.
+     * @param {string} incident_key
+     * @returns {string}
+     */
+    resolveIncident(incident_key) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(incident_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_resolveIncident(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Merge variables into a scope (a process-instance key or an element-instance
+     * key). When `local` is true the values are written strictly into the target
+     * scope; otherwise they propagate upward to the nearest ancestor scope that
+     * defines each name (Zeebe `SetVariables` semantics). Returns the snapshot.
+     * @param {string} scope_key
+     * @param {string} variables_json
+     * @param {boolean} local
+     * @returns {string}
+     */
+    setVariables(scope_key, variables_json, local) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(scope_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.testengine_setVariables(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, local);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
+        }
+    }
+    /**
      * The current simulation state as a JSON [`Snapshot`].
      * @returns {string}
      */
@@ -349,6 +608,47 @@ export class TestEngine {
         } finally {
             wasm.__wbindgen_add_to_stack_pointer(16);
             wasm.__wbindgen_export3(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * Throw a BPMN business error from a waiting job by key. If the job's
+     * activity has a matching error boundary/event-subprocess catch it is
+     * interrupted and the error-handling path runs; otherwise an incident is
+     * raised. The job is activated first if needed, so the UI can throw an
+     * error directly from a freshly-created job. Returns the snapshot.
+     * @param {string} job_key
+     * @param {string} error_code
+     * @param {string} error_message
+     * @returns {string}
+     */
+    throwError(job_key, error_code, error_message) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(job_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(error_code, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(error_message, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.testengine_throwError(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred5_0, deferred5_1, 1);
         }
     }
     /**
@@ -383,6 +683,110 @@ export class TestEngine {
             wasm.__wbindgen_export3(deferred2_0, deferred2_1, 1);
         }
     }
+    /**
+     * Clear a user task's assignee. The task must be in the `Created` state.
+     * Returns the snapshot.
+     * @param {string} user_task_key
+     * @returns {string}
+     */
+    unassignUserTask(user_task_key) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(user_task_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_unassignUserTask(retptr, this.__wbg_ptr, ptr0, len0);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Set a job's remaining retries by key. Used to recover a job parked on a
+     * no-retries incident before resolving that incident; does not by itself
+     * unblock the job. Returns the snapshot.
+     * @param {string} job_key
+     * @param {number} retries
+     * @returns {string}
+     */
+    updateRetries(job_key, retries) {
+        let deferred3_0;
+        let deferred3_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(job_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            wasm.testengine_updateRetries(retptr, this.__wbg_ptr, ptr0, len0, retries);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr2 = r0;
+            var len2 = r1;
+            if (r3) {
+                ptr2 = 0; len2 = 0;
+                throw takeObject(r2);
+            }
+            deferred3_0 = ptr2;
+            deferred3_1 = len2;
+            return getStringFromWasm0(ptr2, len2);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred3_0, deferred3_1, 1);
+        }
+    }
+    /**
+     * Update a user task's attributes from a JSON changeset object. Recognised
+     * keys (all optional): `candidateGroups` / `candidateUsers` (string arrays),
+     * `dueDate` / `followUpDate` (ISO-8601 string, or `null`/`""` to clear),
+     * `priority` (0..=100). Only present keys are changed. The task must be in
+     * the `Created` state. Returns the snapshot.
+     * @param {string} user_task_key
+     * @param {string} changeset_json
+     * @returns {string}
+     */
+    updateUserTask(user_task_key, changeset_json) {
+        let deferred4_0;
+        let deferred4_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(user_task_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(changeset_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            wasm.testengine_updateUserTask(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr3 = r0;
+            var len3 = r1;
+            if (r3) {
+                ptr3 = 0; len3 = 0;
+                throw takeObject(r2);
+            }
+            deferred4_0 = ptr3;
+            deferred4_1 = len3;
+            return getStringFromWasm0(ptr3, len3);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred4_0, deferred4_1, 1);
+        }
+    }
 }
 if (Symbol.dispose) TestEngine.prototype[Symbol.dispose] = TestEngine.prototype.free;
 function __wbg_get_imports() {
@@ -395,6 +799,9 @@ function __wbg_get_imports() {
             // Cast intrinsic for `Ref(String) -> Externref`.
             const ret = getStringFromWasm0(arg0, arg1);
             return addHeapObject(ret);
+        },
+        __wbindgen_object_drop_ref: function(arg0) {
+            takeObject(arg0);
         },
     };
     return {

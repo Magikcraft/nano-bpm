@@ -84,7 +84,7 @@ pub mod xml;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
-pub use command::{Command, UserTaskChangeset};
+pub use command::{ActivateElementInstruction, Command, UserTaskChangeset};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
 pub use engine::{ActivatedJob, DecisionEvaluation, Engine, EngineError};
