@@ -405,6 +405,31 @@ export async function fetchProcessXml(
 
 // --- Project export (zip) + run/compile log stream (SSE) -------------------
 
+/// A BPMN model derived from a code-first workflow definition (ADR 0045).
+export interface DerivedModel {
+  id: string;
+  /** `imperative` (replayed) or `declarative` (graph) workflow. */
+  kind: string;
+  /** The executable BPMN XML derived from the code by `@nanobpm/workflow`. */
+  xml: string;
+}
+
+/// Derives the executable BPMN for a code-first workflow project. The server
+/// runs the project's `workflows/*.ts` through `@nanobpm/workflow`'s `toBpmn`
+/// (read-only). Throws with the server's detail on failure (e.g. Deno missing).
+export async function projectDerivedModels(
+  name: string,
+): Promise<DerivedModel[]> {
+  const res = await fetch(
+    `/console/api/projects/${encodeURIComponent(name)}/derived-models`,
+  );
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `derive → HTTP ${res.status}`);
+  }
+  return (await res.json()) as DerivedModel[];
+}
+
 /// The download URL for a project export zip. When `dist` is set the compiled
 /// `dist/` binaries are bundled too (large + platform-specific).
 export function projectExportUrl(name: string, dist = false): string {

@@ -121,6 +121,10 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/api/projects/{name}/file", get(project_file_get))
         .route("/console/api/projects/{name}/logs", get(project_logs))
         .route("/console/api/projects/{name}/export", get(project_export))
+        .route(
+            "/console/api/projects/{name}/derived-models",
+            get(project_derived_models),
+        )
         // Loopback-only host filesystem browser for the Import-by-reference
         // picker (ADR 0041). Hand-wired (not in the OpenAPI spec) because it
         // exposes the server's filesystem and is gated on the peer being local.
@@ -3242,6 +3246,20 @@ struct ExportQuery {
 /// `GET /console/api/projects/{name}/export[?dist=true]` — download the project
 /// as a zip. Source-only by default; pass `dist=true` to bundle compiled
 /// binaries from `dist/`.
+/// `GET /console/api/projects/{name}/derived-models` — derive the executable
+/// BPMN from a code-first workflow project's `workflows/*.ts` (ADR 0045) and
+/// return `[{id, kind, xml}]` for the console's read-only viewer. Degrades
+/// gracefully: derivation problems surface as an error status, not a panic.
+async fn project_derived_models(Path(name): Path<String>) -> Response {
+    match projects::derive_models(&name).await {
+        Ok(models) => (StatusCode::OK, Json(models)).into_response(),
+        Err(e) if e.contains("no such") || e.contains("invalid project") => {
+            (StatusCode::NOT_FOUND, e).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
 async fn project_export(Path(name): Path<String>, Query(q): Query<ExportQuery>) -> Response {
     // Export hook: refresh the generated domain types so the downloaded zip
     // ships source that types against the current schema + manifest `types`

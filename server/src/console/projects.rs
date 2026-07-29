@@ -2966,6 +2966,130 @@ pub fn export_filename(name: &str) -> String {
     format!("{name}.zip")
 }
 
+/// A BPMN model derived from a code-first workflow definition (ADR 0045).
+#[derive(Serialize, Deserialize, Debug)]
+pub struct DerivedModel {
+    pub id: String,
+    pub kind: String,
+    pub xml: String,
+}
+
+/// Deno driver that imports a code-first project's `workflows/*.ts`, filters the
+/// exported values that are `@nanobpm/workflow` Workflows (structural check: an
+/// object with a string `id` and `kind` in {imperative, declarative}), runs each
+/// through the SDK's `toBpmn`, and prints `[{id, kind, xml}]` as JSON. Detection
+/// is structural so it never depends on SDK exports beyond `toBpmn` (published
+/// `@nanobpm/workflow@^0.1.0`). Only `workflows/*.ts` are imported — never
+/// `main.ts`, whose top-level `deploy()` would hit the network.
+const DERIVE_MODELS_DRIVER: &str = r#"import { toBpmn } from "@nanobpm/workflow";
+
+const root = Deno.args[0] ?? ".";
+const wfDir = `${root}/workflows`;
+const out: Array<{ id: string; kind: string; xml: string }> = [];
+const seen = new Set<string>();
+
+function isWorkflow(v: unknown): v is { id: string; kind: string } {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as { id?: unknown }).id === "string" &&
+    ((v as { kind?: unknown }).kind === "imperative" ||
+      (v as { kind?: unknown }).kind === "declarative")
+  );
+}
+
+try {
+  for await (const entry of Deno.readDir(wfDir)) {
+    if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
+    let mod: Record<string, unknown>;
+    try {
+      mod = await import(`file://${wfDir}/${entry.name}`);
+    } catch (e) {
+      console.error(`skip ${entry.name}: ${e}`);
+      continue;
+    }
+    for (const value of Object.values(mod)) {
+      if (isWorkflow(value) && !seen.has(value.id)) {
+        seen.add(value.id);
+        try {
+          out.push({ id: value.id, kind: value.kind, xml: toBpmn(value as never) });
+        } catch (e) {
+          console.error(`toBpmn(${value.id}) failed: ${e}`);
+        }
+      }
+    }
+  }
+} catch (e) {
+  console.error(`readDir(${wfDir}) failed: ${e}`);
+}
+
+console.log(JSON.stringify(out));
+"#;
+
+/// Derive the executable BPMN for a code-first workflow project (ADR 0045).
+///
+/// Code-first projects have no authored `.bpmn`; the model is DERIVED from the
+/// `workflows/*.ts` via `@nanobpm/workflow`'s `toBpmn`. This runs that derivation
+/// under Deno (so the project's `deno.json` import map resolves the SDK) and
+/// returns the resulting models for the console's read-only viewer. It degrades
+/// gracefully: a missing Deno toolchain, a non-workflow project, or a derivation
+/// failure all surface as an `Err` string rather than panicking.
+pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
+    let dir = project_dir(name).ok_or("invalid project name")?;
+    if !dir.is_dir() {
+        return Err("no such project".into());
+    }
+    let wf_dir = dir.join("workflows");
+    if !wf_dir.is_dir() {
+        return Err("not a code-first workflow project (no workflows/ directory)".into());
+    }
+    let deno = super::extensions::find_program("deno").ok_or("deno toolchain not found on PATH")?;
+
+    // Canonicalize so the --allow-read scope matches the path Deno resolves.
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let cache = dir.join(".deno-cache");
+    let _ = std::fs::create_dir_all(&cache);
+
+    // Write the driver INTO the project dir so the project's `deno.json` import
+    // map (`@nanobpm/workflow` -> npm:...) applies; use a unique name + remove it.
+    let driver_name = format!(".nano-derive-{}.ts", std::process::id());
+    let driver_path = dir.join(&driver_name);
+    std::fs::write(&driver_path, DERIVE_MODELS_DRIVER)
+        .map_err(|e| format!("write derivation driver: {e}"))?;
+
+    let result = Command::new(&deno)
+        .current_dir(&dir)
+        .arg("run")
+        .arg("--no-prompt")
+        .arg("--allow-net")
+        .arg(format!("--allow-read={}", dir.display()))
+        .arg(format!("--allow-write={}", dir.display()))
+        .arg("--allow-env")
+        .arg(&driver_name)
+        .arg(&dir)
+        .env("DENO_DIR", &cache)
+        .output()
+        .await;
+
+    let _ = std::fs::remove_file(&driver_path);
+
+    let output = result.map_err(|e| format!("spawn deno: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("derivation failed: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // The driver prints diagnostics to stderr and the JSON array on stdout; take
+    // the last stdout line that looks like the array.
+    let json = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('['))
+        .unwrap_or("[]");
+    serde_json::from_str::<Vec<DerivedModel>>(json)
+        .map_err(|e| format!("parse derived models: {e}; deno output: {}", stdout.trim()))
+}
+
 // ---------------------------------------------------------------------------
 // Run / compile supervisor
 // ---------------------------------------------------------------------------
@@ -4908,6 +5032,27 @@ mod tests {
         let example = std::fs::read_to_string(dir.join("workflows/pr-review.ts")).unwrap();
         assert!(example.contains("defineWorkflow"));
         assert!(example.contains("ctx.run("));
+    }
+
+    #[tokio::test]
+    async fn derive_models_degrades_gracefully_without_panicking() {
+        let _g = lock();
+        let _root = temp_root();
+        // An unknown project name / missing dir -> NOT FOUND-style error, no panic.
+        let err = derive_models("does_not_exist").await.unwrap_err();
+        assert!(
+            err.contains("no such") || err.contains("invalid project"),
+            "missing project should surface a not-found error, got: {err}"
+        );
+
+        // A real project WITHOUT a workflows/ dir (not code-first) -> a clear
+        // "not a code-first workflow project" error rather than spawning Deno.
+        create_project("plain_app", "", "starter").expect("create");
+        let err = derive_models("plain_app").await.unwrap_err();
+        assert!(
+            err.contains("not a code-first"),
+            "a non-workflow project should be rejected before spawning Deno, got: {err}"
+        );
     }
 
     #[test]
