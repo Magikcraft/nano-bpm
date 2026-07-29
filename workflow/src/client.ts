@@ -102,13 +102,23 @@ export class WorkflowClient {
     );
   }
 
-  /** Correlate a signal to a parked declarative `signal` step. */
+  /** Correlate a signal to a parked declarative `signal` step. Fails fast on an
+   *  unknown signal name (a typo would otherwise send an uncorrelatable message
+   *  that the gateway silently drops). */
   async signal(
     flow: DeclarativeFlow,
     signalName: string,
     correlationKey: string,
     variables: JsonObject = {},
   ): Promise<JsonObject> {
+    const signals = flow.steps.filter((s) => s.kind === "signal").map((s) => s.name);
+    if (!signals.includes(signalName)) {
+      throw new WorkflowError(
+        `unknown signal "${signalName}" on flow "${flow.id}" — declared signals: ${
+          signals.length ? signals.map((s) => `"${s}"`).join(", ") : "(none)"
+        }`,
+      );
+    }
     return this.json<JsonObject>(
       `/v2/messages/correlation`,
       {

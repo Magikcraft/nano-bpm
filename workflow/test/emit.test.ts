@@ -9,6 +9,8 @@ import {
   toBpmn,
   replayOnce,
   Worker,
+  WorkflowClient,
+  WorkflowError,
   type ImperativeWorkflow,
   type Journal,
 } from "../dist/index.js";
@@ -142,4 +144,19 @@ test("worker: distinct workflow ids register without collision", () => {
   const b = defineFlow("wf-b", (w) => w.run("step", async () => ({})));
   const worker = new Worker({ baseUrl: "http://localhost:0", workflows: [a, b] });
   assert.deepEqual(worker.servedTypes.sort(), ["wf-a:step", "wf-b:step"]);
+});
+
+test("client.signal: rejects an unknown signal name with a clear error", async () => {
+  const flow = defineFlow("pr-review", (w) => {
+    w.run("fetchDiff", async () => ({}));
+    w.signal("humanApproval", { correlationKey: "prId" });
+  });
+  const client = new WorkflowClient({ baseUrl: "http://localhost:0" });
+  await assert.rejects(
+    () => client.signal(flow, "humanApprovel", "PR-1"),
+    (e: unknown) =>
+      e instanceof WorkflowError &&
+      /unknown signal "humanApprovel"/.test((e as Error).message) &&
+      /"humanApproval"/.test((e as Error).message),
+  );
 });

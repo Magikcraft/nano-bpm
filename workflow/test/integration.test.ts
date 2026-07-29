@@ -117,6 +117,7 @@ test("declarative flow parks at a signal and resumes via a correlated message", 
     await sleep(300);
 
     const final = await client.getInstance(String(inst.processInstanceKey));
+    assert.ok(final, "getInstance should return the completed instance (not null)");
     const state = (final?.state ?? (final as { processInstance?: { state?: string } })?.processInstance?.state) as string | undefined;
     assert.ok(state === "COMPLETED" || state === undefined, `instance should complete (state=${state})`);
   } finally {

@@ -37,7 +37,9 @@ export declare class WorkflowClient {
      * declarative flows `input` becomes the instance variables directly.
      */
     start(wf: Workflow, input?: JsonObject): Promise<StartResult>;
-    /** Correlate a signal to a parked declarative `signal` step. */
+    /** Correlate a signal to a parked declarative `signal` step. Fails fast on an
+     *  unknown signal name (a typo would otherwise send an uncorrelatable message
+     *  that the gateway silently drops). */
     signal(flow: DeclarativeFlow, signalName: string, correlationKey: string, variables?: JsonObject): Promise<JsonObject>;
     /** Fetch an instance (used by demos/tests to observe completion). */
     getInstance(processInstanceKey: string): Promise<JsonObject | null>;

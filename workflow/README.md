@@ -97,6 +97,12 @@ await client.signal(onboarding, "approved", userId, { by: "alice" });
 - **The determinism constraint binds only the imperative orchestration
   function**, not the activities. Do all non-deterministic / side-effecting work
   inside `ctx.run(name, fn)` closures — never in the orchestration body directly.
+- **Never swallow `ctx.run`'s suspension.** The imperative surface advances one
+  step per turn by *throwing* out of the orchestration body after the frontier
+  step. Do not wrap the orchestration body in a broad `try/catch` that catches
+  everything — catching that internal suspension breaks replay (multiple steps
+  could run in one turn, or the workflow could hang). Keep `try/catch` *inside*
+  individual `ctx.run(name, fn)` closures instead.
 - **The worker uses a single `baseUrl`.** For the single-user SDLC use case this
   is fine; it is a client SPOF (no worker-side failover), not an engine limit.
 
