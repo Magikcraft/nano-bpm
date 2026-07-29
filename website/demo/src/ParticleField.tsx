@@ -124,5 +124,5 @@ export function ParticleField() {
     };
   }, []);
 
-  return <canvas id="field" ref={ref} />;
+  return <canvas id="field" ref={ref} aria-hidden="true" />;
 }
