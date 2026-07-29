@@ -532,9 +532,16 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             undeclaredIds.push(current);
           // "Edit fields…" is offered only when the selected type is a model shape
           // this flat editor can round-trip losslessly (a non-empty list of pure
-          // scalar `extend` fields). Composition/list shapes and manifest `types`
-          // stay in their own surfaces (shape composer / `nano.app.json`).
-          const currentShape = allShapes.find((s) => s.id === current);
+          // scalar `extend` fields). It must also live on the **primary** process,
+          // since that's the only process the edit write path (`getShapes()`/
+          // `writeModelEnvelopeType`) touches — gating on `allShapes` here would
+          // offer the option for a non-primary shape and then no-op on click.
+          // Composition/list shapes and manifest `types` stay in their own
+          // surfaces (shape composer / `nano.app.json`).
+          const primaryShapes = modeler
+            ? readShapes(primaryProcess(modeler)?.processBo)
+            : [];
+          const currentShape = primaryShapes.find((s) => s.id === current);
           const currentEditable = envelopeEditableFields(currentShape) != null;
           return [
             // With a form default, clearing (this option) reverts to the inherited

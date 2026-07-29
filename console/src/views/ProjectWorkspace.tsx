@@ -2885,11 +2885,11 @@ function EnvelopeEditorModal({
             Type id
           </span>
           <input
-            autoFocus={!isEdit}
+            autoFocus
             value={id}
             onChange={(e) => setId(e.target.value)}
-            disabled={isEdit}
             readOnly={isEdit}
+            aria-readonly={isEdit}
             className={`${inputClass} w-full${isEdit ? " opacity-60" : ""}`}
             placeholder="orderPlaced"
           />
