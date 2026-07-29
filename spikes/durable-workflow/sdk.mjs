@@ -120,9 +120,13 @@ export function toBpmn(def) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export async function deployWorkflow(baseUrl, def) {
-  const xml = toBpmn(def);
+  return deployXml(baseUrl, def.id, toBpmn(def));
+}
+
+/** Deploy an already-rendered BPMN string (used by the Strategy B emitter). */
+export async function deployXml(baseUrl, id, xml) {
   const form = new FormData();
-  form.append("resources", new Blob([xml], { type: "text/xml" }), `${def.id}.bpmn`);
+  form.append("resources", new Blob([xml], { type: "text/xml" }), `${id}.bpmn`);
   const res = await fetch(`${baseUrl}/v2/deployments`, { method: "POST", body: form });
   if (!res.ok) throw new Error(`deploy failed: ${res.status} ${await res.text()}`);
   return res.json();

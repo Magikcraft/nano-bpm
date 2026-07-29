@@ -124,3 +124,53 @@ NEGATIVE_CONTROL=1 node spikes/durable-workflow/resume-code-first.mjs   # must N
 
 Still deliberately **not** proven here: imperative `ctx.run`/`await` replay (Strategy B),
 the wasm determinism sandbox (Strategy C), versioning, and multi-node — see ADR 0044.
+
+## Increment 3 — Strategy B: the replayed imperative surface (2026-07-29)
+
+The "true Temporal model". Instead of a declarative step list, the developer writes
+the orchestration as **one imperative async function with real control flow**:
+
+```js
+const wf = defineWorkflowB("pr-review", async (ctx) => {
+  const diff   = await ctx.run("fetchDiff",  () => gh.diff(ctx.input.prId));
+  const review = await ctx.run("autoReview", () => llm.review(diff));
+  if (review.blocking) await ctx.run("requestChanges", () => gh.comment(...)); // real `if`
+  await ctx.run("merge", () => gh.merge(ctx.input.prId));
+});
+```
+
+The engine drives it by **replay**. The derived model is a single orchestrator
+service task in a **loop** (`task → exclusiveGateway → back to task until wfDone`).
+Each engine turn activates the orchestrator; the worker replays the function from
+the top, feeding each `ctx.run(name, fn)` its recorded result from a durable
+**journal** kept in engine process variables:
+
+- a **recorded** step → return the journalled value, **do not** call `fn` (no side
+  effect, no re-execution) — this is replay;
+- the first **unrecorded** step (the "frontier") → call `fn` once (the real side
+  effect), then complete the orchestrator job with the result appended to the
+  journal; the engine durably commits and loops;
+- function returns with no new step → complete with `wfDone=true`, exit the loop.
+
+So exactly one new side effect per durable engine commit, and the journal — the
+replay log — is engine-durable. This is precisely the shape of ADR 0023's ad-hoc
+`outputCollection` accumulator.
+
+Files: `sdk-b.mjs` (`defineWorkflowB`, `toBpmnB` loop-model emitter, `runOrchestrator`
+replay worker), `resume-strategy-b.mjs` (crash-resume proof).
+
+```bash
+node spikes/durable-workflow/resume-strategy-b.mjs                     # replay + SIGKILL proof
+NEGATIVE_CONTROL=1 node spikes/durable-workflow/resume-strategy-b.mjs  # must NOT pass
+```
+
+**Result (2026-07-29, debug gateway): PASS** — an imperative function (with an `if`)
+driven by replay survived engine `SIGKILL` after B; A and B were replayed (not
+re-run), C ran exactly once, `{stepA:1, stepB:1, stepC:1}`. Negative control fails.
+
+**Scope of the prototype:** `ctx.run` (the crown-jewel replay mechanic) + crash-resume
+only. Durable waits (`ctx.signal`/`ctx.sleep`) in the replay model are *commands* that
+must emit a real wait state into the model (the Temporal command pattern) — described
+in ADR 0044, not built here. The orchestration function **must be deterministic** across
+replays (no wall-clock branching, RNG, or I/O in the function body — side effects live
+only inside `ctx.run` handlers).
