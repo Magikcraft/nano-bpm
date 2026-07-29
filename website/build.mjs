@@ -332,7 +332,7 @@ function homePage(title, body) {
     font: 17px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
-  #field { position: fixed; inset: 0; z-index: 0; display: block; }
+  #field { position: fixed; inset: 0; z-index: 0; display: block; pointer-events: none; }
   .glow {
     position: fixed; inset: 0; z-index: 1; pointer-events: none;
     background:
