@@ -465,6 +465,10 @@ ${body}
   if (!canvas) return;
   var ctx = canvas.getContext("2d");
   if (!ctx) return;
+  // Respect prefers-reduced-motion: the canvas is CSS-hidden, but bail out here too
+  // so we never start the rAF loop or resize handler for users who disabled motion.
+  var reduce = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)");
+  if (reduce && reduce.matches) return;
   var w, h, cx, cy, points, dpr, rot = 0;
   function resize() {
     dpr = Math.min(window.devicePixelRatio || 1, 2);

@@ -15,6 +15,14 @@ export function ParticleField() {
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
 
+    // Respect prefers-reduced-motion: skip seeding/animating and hide the canvas
+    // so users who disabled motion get no animated background and no wasted CPU.
+    const reduce = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    if (reduce?.matches) {
+      canvas.style.display = "none";
+      return;
+    }
+
     let w = 0;
     let h = 0;
     let cx = 0;
