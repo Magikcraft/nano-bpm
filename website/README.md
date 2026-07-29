@@ -19,6 +19,19 @@ resolves to `nanobpm.io`, and a repo-wide guard fails the build if any tracked
 file still references the legacy `.dev` domain — so the URLs, the `$id`s and the
 served files can only ever agree.
 
+## Site structure
+
+| Path | Content | Source |
+|---|---|---|
+| `/` | Marketing landing page ("The load-bearing runtime for agentic systems") | `homeHtml()` in [`build.mjs`](build.mjs) — always generated (pure static HTML, no toolchain) |
+| `/demo/` | The in-browser Bojtos demo (ADR 0043), a live wasm-engine run | [`website/demo/`](demo) Vite app (`base: "/demo/"`); copied in when its `dist/` has been built |
+| `/schemas/` | The published-schema registry (the table of the URLs above) | `schemasHtml()` in [`build.mjs`](build.mjs) |
+
+The landing page and schema registry are always emitted, so `node website/build.mjs`
+runs without the demo's npm toolchain (e.g. the zero-dep `schemas` CI drift check);
+`/demo/` is included only when `website/demo/dist` exists. The published schema URLs
+in the table above own their own paths and are unaffected by this layout.
+
 ## Build
 
 ```sh

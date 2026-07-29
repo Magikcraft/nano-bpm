@@ -43,9 +43,10 @@ jobs:
           # the spec-app / console CI jobs.
           node-version: '24'
       - name: Build live demo (website/demo)
-        # The ADR 0043 Bojtos in-browser demo that becomes the site root. Its
-        # @nanobpm/* deps resolve to the in-repo committed dist (bojtos-react ->
-        # bojtos-kit -> engine-wasm/pkg) via file: links, so no publish is needed.
+        # The ADR 0043 Bojtos in-browser demo, served at /demo/ (linked from the
+        # marketing landing page at /). Its @nanobpm/* deps resolve to the in-repo
+        # committed dist (bojtos-react -> bojtos-kit -> engine-wasm/pkg) via file:
+        # links, so no publish is needed.
         working-directory: website/demo
         run: |
           npm ci

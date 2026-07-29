@@ -1,7 +1,8 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// The nanobpm.io landing demo. Served at the site root, so `base` is "/".
+// The nanobpm.io in-browser demo. Served at `/demo/` (the marketing landing
+// page owns `/`), so `base` is "/demo/" and emitted asset URLs are `/demo/...`.
 //
 // The wasm engine (`@nanobpm/engine-wasm`, wasm-pack `--target web`) resolves
 // its binary via `new URL('nanobpmn_engine_bg.wasm', import.meta.url)`. We keep
@@ -9,7 +10,7 @@ import react from "@vitejs/plugin-react";
 // emits the `.wasm` as a hashed asset instead of esbuild rewriting the
 // `import.meta.url` and losing the binary. Mirrors the console's vite config.
 export default defineConfig({
-  base: "/",
+  base: "/demo/",
   plugins: [react()],
   resolve: {
     // The `@nanobpm/*` file: deps re-export each other transitively
