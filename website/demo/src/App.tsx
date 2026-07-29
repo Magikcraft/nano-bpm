@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BpmnRuntimeView, useBojtos } from "@nanobpm/bojtos-react";
 import convergenceLoopBpmn from "./convergence-loop.bpmn?raw";
-import { ParticleField } from "./ParticleField";
 import { makeWorkers, type ReviewStep } from "./workers";
 
 const PROCESS_ID = "convergence-loop";
@@ -135,32 +134,25 @@ export function App() {
 
   return (
     <div className="page">
-      <ParticleField />
-
       <header className="topbar">
-        <div className="brand">
-          <span className="logo" aria-hidden>
-            ◆
-          </span>
+        <a className="brand" href="/">
           nanobpm<span className="brand-io">.io</span>
-        </div>
+        </a>
         <nav className="topnav">
-          <a href="https://github.com/Magikcraft/nano-bpm">GitHub</a>
+          <a href="/">Home</a>
           <a href="/schemas/">Schemas</a>
+          <a href="https://github.com/Magikcraft/nano-bpm">GitHub</a>
         </nav>
       </header>
 
       <section className="hero">
-        <h1>
-          Automate anything
-          <br />
-          <span className="grad">to Greatness.</span>
-        </h1>
+        <p className="eyebrow">Durable · Load-bearing · Agentic</p>
+        <h1>The engine, running in your browser.</h1>
         <p className="sub">
-          nanobpm is a from-scratch process orchestration engine in a single Rust binary.
-          The workflow below is the real <code>urban-pr-review</code> convergence loop,
-          executing live on the WebAssembly build of the very same engine — no server, no
-          mocks in the runtime.
+          nanobpm is the load-bearing runtime for agentic systems — a from-scratch process
+          orchestration engine in a single Rust binary. The workflow below is the real{" "}
+          <code>urban-pr-review</code> convergence loop, executing live on the WebAssembly build of
+          the very same engine — no server, no mocks in the runtime.
         </p>
       </section>
 
