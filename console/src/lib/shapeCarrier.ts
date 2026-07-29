@@ -73,6 +73,33 @@ export interface ShapeDecl {
   ops: ShapeOp[];
 }
 
+/** A flat scalar field of a shape, as edited by the "Data envelope" field editor. */
+export interface EnvelopeShapeField {
+  name: string;
+  type: string;
+  optional: boolean;
+}
+
+/**
+ * The flat scalar field list of a shape, or `null` if the shape uses any op the
+ * flat envelope field editor can't round-trip losslessly — composition
+ * (`carry`/`project`/`reference`) or a `list` field. Drives both whether the
+ * picker offers "Edit fields…" and the editor's pre-fill: an empty shape or one
+ * with a single non-`extend` op returns `null` so those types stay in the shape
+ * composer instead of silently losing ops on save.
+ */
+export function envelopeEditableFields(
+  shape: ShapeDecl | undefined,
+): EnvelopeShapeField[] | null {
+  if (!shape || shape.ops.length === 0) return null;
+  const fields = shape.ops.flatMap((o) =>
+    o.op === "extend" && !o.list
+      ? [{ name: o.name, type: o.type, optional: !!o.optional }]
+      : [],
+  );
+  return fields.length === shape.ops.length ? fields : null;
+}
+
 /** The moddle `$type` for a `nano:shapes` container. */
 export const SHAPES_TYPE = "nano:Shapes";
 /** The moddle `$type` for one `nano:shape`. */
