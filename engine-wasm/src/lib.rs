@@ -16,9 +16,9 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    bpmn::parse_bpmn, ActivateElementInstruction, Command, Engine, Event, IncidentState, JobState,
-    MessageSubscriptionKind, MessageSubscriptionState, ProcessInstanceState, TimerState,
-    UserTaskChangeset, UserTaskState, Value,
+    bpmn::parse_bpmn, ActivateElementInstruction, Command, Engine, Event, IncidentKind,
+    IncidentState, JobState, MessageSubscriptionKind, MessageSubscriptionState,
+    ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState, Value,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -662,7 +662,7 @@ impl TestEngine {
                 key: i.key.to_string(),
                 instance_key: i.instance_key.to_string(),
                 element_id: i.element_id.clone(),
-                kind: format!("{:?}", i.kind),
+                kind: incident_kind_tag(&i.kind).to_string(),
                 reason: i.reason.clone(),
             })
             .collect();
@@ -975,6 +975,19 @@ struct DecisionInstanceDto {
     decision_id: String,
     output: serde_json::Value,
     evaluated_at: u64,
+}
+
+/// A stable camelCase discriminant for an incident kind, exposed to the UI
+/// instead of Rust `Debug` output so variant renames or formatting changes
+/// don't become breaking JSON-API changes.
+fn incident_kind_tag(kind: &IncidentKind) -> &'static str {
+    match kind {
+        IncidentKind::JobNoRetries => "jobNoRetries",
+        IncidentKind::NoMatchingSequenceFlow => "noMatchingSequenceFlow",
+        IncidentKind::ExpressionEvaluation => "expressionEvaluation",
+        IncidentKind::UnhandledError => "unhandledError",
+        IncidentKind::DecisionEvaluation => "decisionEvaluation",
+    }
 }
 
 /// A stable, camelCase discriminant string for a message/signal subscription
