@@ -1,20 +1,11 @@
-/* Demo theme — mirrors the nanobpm.io marketing landing (website/build.mjs):
-   light surface, indigo accent, dark code blocks. Keep these tokens in sync
-   with homePage()'s :root in build.mjs so the /demo/ subpage reads as one site
-   with the root landing page. */
 :root {
-  --bg: #ffffff;
-  --soft: #f6f7f9;
-  --ink: #0b1020;
-  --muted: #5b6472;
-  --line: #e6e8ee;
-  --accent: #4f46e5;
-  --accent-ink: #3730a3;
-  --code-bg: #0d1117;
-  --code-ink: #e6edf3;
-  --success: #16a34a;
-  --amber: #d97706;
-  --radius: 12px;
+  --emerald: #34d399;
+  --sky: #38bdf8;
+  --ink: #e4e4e7;
+  --muted: #a1a1aa;
+  --bg: #08080a;
+  --panel: rgba(20, 22, 27, 0.72);
+  --border: rgba(120, 130, 150, 0.16);
 }
 
 * {
@@ -31,12 +22,22 @@ body,
 body {
   background: var(--bg);
   color: var(--ink);
-  font: 17px/1.65 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-family:
+    "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Helvetica,
+    Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
+}
+
+#field {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
 }
 
 .page {
   position: relative;
+  z-index: 1;
   max-width: 1180px;
   margin: 0 auto;
   padding: 0 24px 64px;
@@ -47,14 +48,21 @@ body {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 18px 4px;
+  padding: 22px 4px;
 }
 .brand {
   font-weight: 700;
   font-size: 20px;
-  letter-spacing: -0.02em;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   color: var(--ink);
   text-decoration: none;
+}
+.logo {
+  color: var(--emerald);
+  font-size: 16px;
 }
 .brand-io {
   color: var(--muted);
@@ -67,7 +75,7 @@ body {
 .topnav a {
   color: var(--muted);
   text-decoration: none;
-  font-size: 15px;
+  font-size: 14px;
 }
 .topnav a:hover {
   color: var(--ink);
@@ -75,37 +83,34 @@ body {
 
 /* Hero */
 .hero {
-  padding: 40px 4px 26px;
+  padding: 42px 4px 30px;
   max-width: 820px;
 }
-.eyebrow {
-  text-transform: uppercase;
-  letter-spacing: 0.16em;
-  font-size: 0.78rem;
-  font-weight: 700;
-  color: var(--accent);
-  margin: 0 0 14px;
-}
 .hero h1 {
-  font-size: clamp(34px, 5vw, 52px);
-  line-height: 1.1;
+  font-size: clamp(34px, 5vw, 56px);
+  line-height: 1.04;
   letter-spacing: -0.02em;
-  margin: 0 0 18px;
-  font-weight: 700;
+  margin: 0 0 20px;
+  font-weight: 800;
+}
+.grad {
+  background: linear-gradient(90deg, var(--emerald), var(--sky));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
 }
 .sub {
   color: var(--muted);
-  font-size: 1.08rem;
+  font-size: 17px;
   line-height: 1.6;
   margin: 0;
   max-width: 680px;
 }
 code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.85em;
-  color: var(--ink);
-  background: var(--soft);
-  border: 1px solid var(--line);
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.88em;
+  color: var(--emerald);
+  background: rgba(52, 211, 153, 0.08);
   padding: 1px 6px;
   border-radius: 5px;
 }
@@ -113,19 +118,18 @@ code {
 /* Demo card */
 .demo {
   margin-top: 30px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--border);
   border-radius: 16px;
-  background: #fff;
+  background: var(--panel);
+  backdrop-filter: blur(10px);
   overflow: hidden;
-  box-shadow: 0 18px 40px -28px rgba(16, 20, 40, 0.35);
 }
 .demo-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 16px 20px;
-  border-bottom: 1px solid var(--line);
-  background: var(--soft);
+  border-bottom: 1px solid var(--border);
 }
 .demo-title {
   display: flex;
@@ -138,22 +142,22 @@ code {
   width: 9px;
   height: 9px;
   border-radius: 50%;
-  background: #c7ccd8;
+  background: #52525b;
 }
 .pulse.on {
-  background: var(--accent);
-  box-shadow: 0 0 0 0 rgba(79, 70, 229, 0.5);
+  background: var(--emerald);
+  box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.6);
   animation: pulse 1.8s infinite;
 }
 @keyframes pulse {
   0% {
-    box-shadow: 0 0 0 0 rgba(79, 70, 229, 0.45);
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.5);
   }
   70% {
-    box-shadow: 0 0 0 8px rgba(79, 70, 229, 0);
+    box-shadow: 0 0 0 8px rgba(52, 211, 153, 0);
   }
   100% {
-    box-shadow: 0 0 0 0 rgba(79, 70, 229, 0);
+    box-shadow: 0 0 0 0 rgba(52, 211, 153, 0);
   }
 }
 
@@ -163,19 +167,17 @@ code {
   font-size: 14px;
   font-weight: 600;
   cursor: pointer;
-  border: 1px solid var(--line);
-  background: #fff;
-  color: var(--ink);
+  border: 1px solid transparent;
   transition: all 0.15s;
 }
 .btn.ghost {
-  background: #fff;
-  border-color: var(--line);
+  background: transparent;
+  border-color: var(--border);
   color: var(--ink);
 }
 .btn.ghost:hover {
-  border-color: var(--accent);
-  color: var(--accent-ink);
+  border-color: var(--emerald);
+  color: var(--emerald);
 }
 
 .demo-grid {
@@ -192,13 +194,17 @@ code {
 
 .diagram-wrap {
   position: relative;
-  border-right: 1px solid var(--line);
-  background: radial-gradient(120% 120% at 50% 0%, rgba(79, 70, 229, 0.05), transparent 60%);
+  border-right: 1px solid var(--border);
+  background: radial-gradient(
+    120% 120% at 50% 0%,
+    rgba(56, 189, 248, 0.05),
+    transparent 60%
+  );
 }
 @media (max-width: 900px) {
   .diagram-wrap {
     border-right: none;
-    border-bottom: 1px solid var(--line);
+    border-bottom: 1px solid var(--border);
     min-height: 340px;
   }
 }
@@ -225,7 +231,7 @@ code {
   padding: 16px 18px;
 }
 .panel + .panel {
-  border-top: 1px solid var(--line);
+  border-top: 1px solid var(--border);
 }
 .panel.grow {
   flex: 1;
@@ -256,12 +262,12 @@ code {
 }
 .var dt {
   color: var(--muted);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
 }
 .var dd {
   margin: 0;
   color: var(--ink);
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-family: "JetBrains Mono", ui-monospace, monospace;
   text-align: right;
   word-break: break-all;
 }
@@ -298,20 +304,19 @@ code {
   background: var(--muted);
 }
 .log-submit::before {
-  background: var(--accent);
+  background: var(--sky);
 }
 .log-review::before {
-  background: var(--amber);
+  background: #f59e0b;
 }
 .log-msg::before {
-  background: var(--accent);
+  background: var(--sky);
 }
 .log-done {
-  color: var(--success);
-  font-weight: 600;
+  color: var(--emerald);
 }
 .log-done::before {
-  background: var(--success);
+  background: var(--emerald);
 }
 
 .foot {
@@ -323,21 +328,49 @@ code {
 }
 
 /* bpmn-js runtime palette + markers.
-   bpmn-js's default inline palette (white fill, dark stroke/text) already suits
-   this light canvas, so the base diagram is left unstyled. Only the token /
-   incident highlights are layered on top, recoloured to the indigo accent to
-   match the landing. Inline styles mean every override needs !important. */
+   bpmn-js renders every element with a light default palette set INLINE
+   (white fill, dark stroke/text/icons), which is illegible on this dark canvas —
+   inactive task labels (dark-on-white forced to light-on-white) vanished. Re-skin
+   the whole diagram for the dark theme first, then layer the token/incident
+   highlights on top. Inline styles mean every override needs !important. */
+.diagram .djs-shape .djs-visual > rect,
+.diagram .djs-shape .djs-visual > circle,
+.diagram .djs-shape .djs-visual > polygon {
+  fill: #232a36 !important;
+  stroke: rgba(190, 200, 220, 0.7) !important;
+  stroke-width: 1.6px !important;
+}
+/* Shape glyphs (gateway markers, task-type + event icons). */
+.diagram .djs-shape .djs-visual > path {
+  fill: rgba(210, 218, 232, 0.92) !important;
+  stroke: rgba(190, 200, 220, 0.8) !important;
+}
+.diagram .djs-visual text {
+  fill: var(--ink) !important;
+}
+/* Sequence-flow lines + their arrowheads. */
+.diagram .djs-connection .djs-visual > path {
+  stroke: rgba(160, 170, 190, 0.8) !important;
+}
+.diagram marker path {
+  fill: rgba(160, 170, 190, 0.9) !important;
+  stroke: rgba(160, 170, 190, 0.9) !important;
+}
+
+/* Active (token) highlight — bold, glowing and pulsing so the moving frontier
+   is unmistakable. Declared after the base so the equal-specificity !important
+   overrides win by source order. */
 .nano-active .djs-visual > :nth-child(1) {
-  stroke: var(--accent) !important;
+  stroke: var(--emerald) !important;
   stroke-width: 3.5px !important;
 }
 .nano-active .djs-visual > rect,
 .nano-active .djs-visual > circle,
 .nano-active .djs-visual > polygon {
-  fill: rgba(79, 70, 229, 0.14) !important;
+  fill: rgba(52, 211, 153, 0.35) !important;
 }
 .nano-active .djs-visual text {
-  fill: var(--accent-ink) !important;
+  fill: #eafff6 !important;
 }
 .nano-active {
   animation: nanoTokenPulse 1.3s ease-in-out infinite;
@@ -345,33 +378,33 @@ code {
 @keyframes nanoTokenPulse {
   0%,
   100% {
-    filter: drop-shadow(0 0 3px rgba(79, 70, 229, 0.45));
+    filter: drop-shadow(0 0 3px rgba(52, 211, 153, 0.55));
   }
   50% {
-    filter: drop-shadow(0 0 12px rgba(79, 70, 229, 0.85));
+    filter: drop-shadow(0 0 12px rgba(52, 211, 153, 1));
   }
 }
 .nano-incident .djs-visual > :nth-child(1) {
-  stroke: #dc2626 !important;
+  stroke: #f87171 !important;
   stroke-width: 3.5px !important;
 }
 .nano-incident .djs-visual > rect,
 .nano-incident .djs-visual > circle,
 .nano-incident .djs-visual > polygon {
-  fill: rgba(220, 38, 38, 0.14) !important;
+  fill: rgba(248, 113, 113, 0.32) !important;
 }
 
 /* The token badge overlaid on each active element (BpmnRuntimeView adds it via
-   the bpmn-js overlays API). A pulsing indigo puck = "the token is here". */
+   the bpmn-js overlays API). A pulsing emerald puck = "the token is here". */
 .nano-token {
   width: 18px;
   height: 18px;
   border-radius: 50%;
-  background: radial-gradient(circle at 35% 30%, #a5b4fc, var(--accent));
-  border: 2px solid #fff;
+  background: radial-gradient(circle at 35% 30%, #6ee7b7, var(--emerald));
+  border: 2px solid #052e21;
   box-shadow:
-    0 0 0 3px rgba(79, 70, 229, 0.24),
-    0 0 12px 2px rgba(79, 70, 229, 0.6);
+    0 0 0 3px rgba(52, 211, 153, 0.28),
+    0 0 12px 2px rgba(52, 211, 153, 0.85);
   animation: nanoTokenBadge 1.3s ease-in-out infinite;
   pointer-events: none;
 }
@@ -380,13 +413,13 @@ code {
   100% {
     transform: scale(0.9);
     box-shadow:
-      0 0 0 3px rgba(79, 70, 229, 0.2),
-      0 0 8px 1px rgba(79, 70, 229, 0.5);
+      0 0 0 3px rgba(52, 211, 153, 0.22),
+      0 0 8px 1px rgba(52, 211, 153, 0.7);
   }
   50% {
     transform: scale(1.12);
     box-shadow:
-      0 0 0 5px rgba(79, 70, 229, 0.12),
-      0 0 16px 3px rgba(79, 70, 229, 0.8);
+      0 0 0 5px rgba(52, 211, 153, 0.12),
+      0 0 16px 3px rgba(52, 211, 153, 1);
   }
 }

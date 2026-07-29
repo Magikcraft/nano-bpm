@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { BpmnRuntimeView, useBojtos } from "@nanobpm/bojtos-react";
 import convergenceLoopBpmn from "./convergence-loop.bpmn?raw";
+import { ParticleField } from "./ParticleField";
 import { makeWorkers, type ReviewStep } from "./workers";
 
 const PROCESS_ID = "convergence-loop";
@@ -134,20 +135,27 @@ export function App() {
 
   return (
     <div className="page">
+      <ParticleField />
+
       <header className="topbar">
         <a className="brand" href="/">
+          <span className="logo" aria-hidden>
+            ◆
+          </span>
           nanobpm<span className="brand-io">.io</span>
         </a>
         <nav className="topnav">
           <a href="/">Home</a>
           <a href="/schemas/">Schemas</a>
-          <a href="https://github.com/Magikcraft/nano-bpm">GitHub</a>
         </nav>
       </header>
 
       <section className="hero">
-        <p className="eyebrow">Durable · Load-bearing · Agentic</p>
-        <h1>The engine, running in your browser.</h1>
+        <h1>
+          The engine,
+          <br />
+          <span className="grad">running in your browser.</span>
+        </h1>
         <p className="sub">
           nanobpm is the load-bearing runtime for agentic systems — a from-scratch process
           orchestration engine in a single Rust binary. The workflow below is the real{" "}
