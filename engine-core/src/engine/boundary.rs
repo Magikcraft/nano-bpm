@@ -704,4 +704,140 @@ impl Engine {
             })
             .collect()
     }
+
+    /// Cancels every open signal subscription resting on `element_instance_key`
+    /// (any kind: boundary or intermediate catch), returning the
+    /// `SignalSubscriptionCanceled` events sorted by key.
+    pub(crate) fn cancel_all_signal_subscriptions_on(
+        &self,
+        element_instance_key: Key,
+    ) -> Vec<Event> {
+        let mut subs: Vec<&state::SignalSubscription> = self
+            .state
+            .signal_subscriptions
+            .values()
+            .filter(|s| {
+                s.element_instance_key == element_instance_key
+                    && s.state == state::MessageSubscriptionState::Open
+            })
+            .collect();
+        subs.sort_by_key(|s| s.key);
+        subs.into_iter()
+            .map(|s| Event::SignalSubscriptionCanceled {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                element_instance_key: s.element_instance_key,
+                element_id: s.element_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Cancels every open conditional subscription resting on
+    /// `element_instance_key` (any kind), returning the
+    /// `ConditionalSubscriptionCanceled` events sorted by key.
+    pub(crate) fn cancel_all_conditional_subscriptions_on(
+        &self,
+        element_instance_key: Key,
+    ) -> Vec<Event> {
+        let mut subs: Vec<&state::ConditionalSubscription> = self
+            .state
+            .conditional_subscriptions
+            .values()
+            .filter(|s| {
+                s.element_instance_key == element_instance_key
+                    && s.state == state::MessageSubscriptionState::Open
+            })
+            .collect();
+        subs.sort_by_key(|s| s.key);
+        subs.into_iter()
+            .map(|s| Event::ConditionalSubscriptionCanceled {
+                subscription_key: s.key,
+                instance_key: s.instance_key,
+                element_instance_key: s.element_instance_key,
+                element_id: s.element_id.clone(),
+            })
+            .collect()
+    }
+
+    /// Terminates a single active element instance as part of a
+    /// [`Command::ModifyInstance`] terminate instruction. Tears down whatever
+    /// work the element instance owns — a service task's job, a resting user
+    /// task, a sub-process's whole inner token scope, armed timers, and open
+    /// message/signal/conditional subscriptions (its own catch-event
+    /// subscriptions and any attached boundary events) — then completes its
+    /// element instance. Unlike [`Self::interrupt_activity_via_boundary`] this
+    /// also cancels a resting user task and works for any active element
+    /// instance, not only activities that carry boundary events. User-task
+    /// `canceling` listeners are not run: `modify` is an operational action.
+    pub(crate) fn terminate_element_instance(
+        &mut self,
+        log: &mut Vec<Event>,
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: &str,
+    ) {
+        if self.is_subprocess(instance_key, element_id) {
+            self.terminate_subprocess_scope(log, instance_key, element_instance_key);
+        } else if let Some(job_key) = self.active_job_on(element_instance_key) {
+            self.emit(
+                log,
+                Event::JobCanceled {
+                    job_key,
+                    instance_key,
+                },
+            );
+        }
+
+        let mut user_task_keys: Vec<Key> = self
+            .state
+            .user_tasks
+            .values()
+            .filter(|t| {
+                t.instance_key == instance_key
+                    && t.element_instance_key == element_instance_key
+                    && t.state == state::UserTaskState::Created
+            })
+            .map(|t| t.key)
+            .collect();
+        user_task_keys.sort_unstable();
+        for user_task_key in user_task_keys {
+            self.emit(
+                log,
+                Event::UserTaskCanceled {
+                    user_task_key,
+                    instance_key,
+                },
+            );
+        }
+
+        for event in self.cancel_all_timers_on(element_instance_key) {
+            self.emit(log, event);
+        }
+        for event in self.cancel_all_subscriptions_on(element_instance_key) {
+            self.emit(log, event);
+        }
+        for event in self.cancel_all_signal_subscriptions_on(element_instance_key) {
+            self.emit(log, event);
+        }
+        for event in self.cancel_all_conditional_subscriptions_on(element_instance_key) {
+            self.emit(log, event);
+        }
+
+        self.emit(
+            log,
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+            },
+        );
+        self.emit(
+            log,
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key,
+                element_id: element_id.to_string(),
+            },
+        );
+    }
 }

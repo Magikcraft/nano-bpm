@@ -66,6 +66,9 @@ class WasmBojtosSession {
     cancelInstance(instanceKey) {
         return parseSnapshot(this.engine.cancelInstance(instanceKey));
     }
+    modify(instanceKey, activateInstructions, terminateElementInstanceKeys) {
+        return parseSnapshot(this.engine.modify(instanceKey, JSON.stringify(activateInstructions ?? []), JSON.stringify(terminateElementInstanceKeys ?? [])));
+    }
     completeUserTask(userTaskKey, variablesJson) {
         return parseSnapshot(this.engine.completeUserTask(userTaskKey, variablesJson || "{}"));
     }

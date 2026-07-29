@@ -109,6 +109,16 @@ export interface DecisionInstanceDto {
     evaluatedAt: number;
 }
 /**
+ * One activation instruction for {@link BojtosSession.modify}: place a new token
+ * at `elementId`, first merging `variables` into the instance's root scope.
+ * Mirrors Zeebe's process-instance-modification activate instruction (the token
+ * is activated in the process root scope).
+ */
+export interface ActivateInstruction {
+    elementId: string;
+    variables?: Record<string, unknown>;
+}
+/**
  * The full simulation state returned by every engine command. `activeElementIds`
  * / `incidentElementIds` drive the token/incident highlight (the visual
  * contract, ADR 0043 §4); `instances[].variables` is the live payload.

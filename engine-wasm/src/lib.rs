@@ -16,8 +16,9 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    bpmn::parse_bpmn, Command, Engine, Event, IncidentState, JobState, MessageSubscriptionState,
-    ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState, Value,
+    bpmn::parse_bpmn, ActivateElementInstruction, Command, Engine, Event, IncidentState, JobState,
+    MessageSubscriptionState, ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState,
+    Value,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -366,6 +367,33 @@ impl TestEngine {
         let key = parse_key(instance_key)?;
         self.apply(Command::CancelInstance { instance_key: key })
             .map_err(|e| js_err(&format!("cancel instance error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Modify a running process instance (Zeebe "modify process instance"): move
+    /// tokens by terminating existing element instances and/or activating new
+    /// ones. `activate_instructions_json` is a JSON array of
+    /// `{ elementId: string, variables?: object }` (variables are merged into the
+    /// instance's root scope before the token is placed);
+    /// `terminate_instructions_json` is a JSON array of element-instance keys,
+    /// each a decimal string or a `{ elementInstanceKey: string }` object.
+    /// Activations run at the process root scope. Returns the snapshot.
+    #[wasm_bindgen(js_name = modify)]
+    pub fn modify(
+        &mut self,
+        instance_key: &str,
+        activate_instructions_json: &str,
+        terminate_instructions_json: &str,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(instance_key)?;
+        let activate_instructions = parse_activate_instructions(activate_instructions_json)?;
+        let terminate_instructions = parse_terminate_instructions(terminate_instructions_json)?;
+        self.apply(Command::ModifyInstance {
+            instance_key: key,
+            activate_instructions,
+            terminate_instructions,
+        })
+        .map_err(|e| js_err(&format!("modify instance error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -966,6 +994,88 @@ fn parse_key(s: &str) -> Result<u64, JsValue> {
         .map_err(|_| js_err(&format!("invalid key: {s}")))
 }
 
+/// Parse the `activate_instructions_json` argument of [`TestEngine::modify`]: a
+/// JSON array of `{ elementId: string, variables?: object }`. Empty/whitespace
+/// ⇒ no activations.
+fn parse_activate_instructions(s: &str) -> Result<Vec<ActivateElementInstruction>, JsValue> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json: serde_json::Value = serde_json::from_str(t)
+        .map_err(|e| js_err(&format!("invalid activate instructions JSON: {e}")))?;
+    let serde_json::Value::Array(items) = json else {
+        return Err(js_err("activate instructions must be a JSON array"));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let serde_json::Value::Object(map) = item else {
+            return Err(js_err("each activate instruction must be a JSON object"));
+        };
+        let element_id = match map.get("elementId") {
+            Some(serde_json::Value::String(id)) if !id.is_empty() => id.clone(),
+            _ => {
+                return Err(js_err(
+                    "activate instruction requires a non-empty elementId",
+                ))
+            }
+        };
+        let variables = match map.get("variables") {
+            None | Some(serde_json::Value::Null) => HashMap::new(),
+            Some(serde_json::Value::Object(vars)) => vars
+                .iter()
+                .map(|(k, v)| (k.clone(), json_to_value(v)))
+                .collect(),
+            Some(_) => {
+                return Err(js_err(
+                    "activate instruction variables must be a JSON object",
+                ))
+            }
+        };
+        out.push(ActivateElementInstruction {
+            element_id,
+            variables,
+        });
+    }
+    Ok(out)
+}
+
+/// Parse the `terminate_instructions_json` argument of [`TestEngine::modify`]: a
+/// JSON array of element-instance keys, each a decimal string, a number, or a
+/// `{ elementInstanceKey: string|number }` object. Empty/whitespace ⇒ none.
+fn parse_terminate_instructions(s: &str) -> Result<Vec<u64>, JsValue> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json: serde_json::Value = serde_json::from_str(t)
+        .map_err(|e| js_err(&format!("invalid terminate instructions JSON: {e}")))?;
+    let serde_json::Value::Array(items) = json else {
+        return Err(js_err("terminate instructions must be a JSON array"));
+    };
+    items.iter().map(json_to_element_instance_key).collect()
+}
+
+/// Coerce one terminate-instruction entry (string, number, or
+/// `{ elementInstanceKey }` object) into an element-instance key.
+fn json_to_element_instance_key(v: &serde_json::Value) -> Result<u64, JsValue> {
+    match v {
+        serde_json::Value::String(s) => parse_key(s),
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| js_err(&format!("invalid element instance key: {n}"))),
+        serde_json::Value::Object(map) => match map.get("elementInstanceKey") {
+            Some(inner) => json_to_element_instance_key(inner),
+            None => Err(js_err(
+                "terminate instruction requires an elementInstanceKey",
+            )),
+        },
+        _ => Err(js_err(
+            "terminate instruction must be a key string, number or object",
+        )),
+    }
+}
+
 /// Parse a JSON object string into engine variables. Empty/whitespace ⇒ none.
 fn parse_vars(s: &str) -> Result<HashMap<String, Value>, JsValue> {
     let t = s.trim();
@@ -1283,5 +1393,84 @@ mod tests {
             .unwrap()
             .iter()
             .all(|t| t["state"] != "Created"));
+    }
+
+    const TWO_TASK_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="a">
+            <bpmn:extensionElements><zeebe:taskDefinition type="ja" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:serviceTask id="b">
+            <bpmn:extensionElements><zeebe:taskDefinition type="jb" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="a" />
+          <bpmn:sequenceFlow id="f2" sourceRef="a" targetRef="b" />
+          <bpmn:sequenceFlow id="f3" sourceRef="b" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    fn active_eik(snap: &J, element_id: &str) -> String {
+        snap["instances"][0]["activeElements"]
+            .as_array()
+            .expect("activeElements array")
+            .iter()
+            .find(|el| el["elementId"] == element_id)
+            .unwrap_or_else(|| panic!("no active element {element_id}: {snap}"))["key"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn modify_moves_a_token_between_elements() {
+        let mut eng = TestEngine::new();
+        eng.deploy(TWO_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
+        let a_eik = active_eik(&snap, "a");
+
+        // Terminate the token on `a` and activate one on `b`, merging a variable.
+        let snap = parse(
+            &eng.modify(
+                &instance_key,
+                r#"[{"elementId":"b","variables":{"approved":true}}]"#,
+                &format!("[\"{a_eik}\"]"),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(snap["instances"][0]["state"], "Active");
+        // Token now rests on `b` (a fresh `jb` job), not `a`.
+        assert!(snap["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["elementId"] == "b" && j["jobType"] == "jb"));
+        assert!(snap["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|j| j["elementId"] != "a"));
+        assert_eq!(snap["instances"][0]["variables"]["approved"], true);
+    }
+
+    #[test]
+    fn modify_terminating_last_token_terminates_instance() {
+        let mut eng = TestEngine::new();
+        eng.deploy(SERVICE_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
+        let work_eik = active_eik(&snap, "work");
+
+        let snap = parse(
+            &eng.modify(&instance_key, "[]", &format!("[\"{work_eik}\"]"))
+                .unwrap(),
+        );
+        assert_eq!(snap["instances"][0]["state"], "Terminated");
+        assert!(snap["jobs"].as_array().unwrap().is_empty());
     }
 }

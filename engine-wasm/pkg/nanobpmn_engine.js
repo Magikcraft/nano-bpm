@@ -440,6 +440,50 @@ export class TestEngine {
         }
     }
     /**
+     * Modify a running process instance (Zeebe "modify process instance"): move
+     * tokens by terminating existing element instances and/or activating new
+     * ones. `activate_instructions_json` is a JSON array of
+     * `{ elementId: string, variables?: object }` (variables are merged into the
+     * instance's root scope before the token is placed);
+     * `terminate_instructions_json` is a JSON array of element-instance keys,
+     * each a decimal string or a `{ elementInstanceKey: string }` object.
+     * Activations run at the process root scope. Returns the snapshot.
+     * @param {string} instance_key
+     * @param {string} activate_instructions_json
+     * @param {string} terminate_instructions_json
+     * @returns {string}
+     */
+    modify(instance_key, activate_instructions_json, terminate_instructions_json) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(instance_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(activate_instructions_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(terminate_instructions_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.testengine_modify(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
      * Create a fresh, empty simulated engine. The virtual clock starts at 0.
      */
     constructor() {

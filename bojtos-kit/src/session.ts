@@ -1,5 +1,5 @@
 import init, { type InitInput, TestEngine } from "@nanobpm/engine-wasm";
-import type { ActivatedJob, Snapshot, WasmEvent } from "./types.js";
+import type { ActivatedJob, ActivateInstruction, Snapshot, WasmEvent } from "./types.js";
 
 // Lazily initialise the wasm module exactly once per page, no matter how many
 // sessions are created. Mirrors the console's original `ensureWasm`.
@@ -104,6 +104,21 @@ export interface BojtosSession {
   broadcastSignal(signalName: string, variablesJson: string): Snapshot;
   /** Cancel (terminate) a running process instance: every token is discarded. */
   cancelInstance(instanceKey: string): Snapshot;
+  /**
+   * Modify a running process instance (Zeebe "modify process instance"): move
+   * tokens by terminating existing element instances and/or activating new
+   * ones. Each activate instruction places a token at `elementId` (in the
+   * process root scope), first merging its optional `variables` into the root
+   * scope; `terminateElementInstanceKeys` are the keys of active element
+   * instances (from `instances[].activeElements[].key`) to terminate. If the
+   * terminations drain the last token and nothing is activated, the instance is
+   * terminated.
+   */
+  modify(
+    instanceKey: string,
+    activateInstructions: ActivateInstruction[],
+    terminateElementInstanceKeys: string[],
+  ): Snapshot;
   /** Complete a waiting user task, merging `variablesJson` into the instance. */
   completeUserTask(userTaskKey: string, variablesJson: string): Snapshot;
   /**
@@ -231,6 +246,20 @@ class WasmBojtosSession implements BojtosSession {
 
   cancelInstance(instanceKey: string): Snapshot {
     return parseSnapshot(this.engine.cancelInstance(instanceKey));
+  }
+
+  modify(
+    instanceKey: string,
+    activateInstructions: ActivateInstruction[],
+    terminateElementInstanceKeys: string[],
+  ): Snapshot {
+    return parseSnapshot(
+      this.engine.modify(
+        instanceKey,
+        JSON.stringify(activateInstructions ?? []),
+        JSON.stringify(terminateElementInstanceKeys ?? []),
+      ),
+    );
   }
 
   completeUserTask(userTaskKey: string, variablesJson: string): Snapshot {

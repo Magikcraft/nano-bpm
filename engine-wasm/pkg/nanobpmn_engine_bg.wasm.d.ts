@@ -14,6 +14,7 @@ export const testengine_createInstance: (a: number, b: number, c: number, d: num
 export const testengine_deploy: (a: number, b: number, c: number, d: number) => void;
 export const testengine_events: (a: number, b: number) => void;
 export const testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+export const testengine_modify: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const testengine_new: () => number;
 export const testengine_now: (a: number) => number;
 export const testengine_reset: (a: number) => void;

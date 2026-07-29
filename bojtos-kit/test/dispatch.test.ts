@@ -173,6 +173,36 @@ test("correlateMessage unblocks a token parked at a message catch event", async 
   session.free();
 });
 
+test("modify moves a token by terminating one element and activating another", async () => {
+  const session = await newOrderSession("{}");
+  // Token parked on `charge` (the `payment` job) right after creation.
+  const created = session.snapshot();
+  const instanceKey = created.instances[0]!.key;
+  const chargeEik = created.instances[0]!.activeElements.find(
+    (el) => el.elementId === "charge",
+  )!.key;
+
+  // Terminate the token on `charge` and activate one on `ship`, merging a var.
+  const snap = session.modify(
+    instanceKey,
+    [{ elementId: "ship", variables: { expedited: true } }],
+    [chargeEik],
+  );
+
+  assert.deepEqual(snap.activeElementIds, ["ship"], "token moved to ship");
+  assert.equal(snap.instances[0]?.state, "Active");
+  assert.equal(snap.instances[0]?.variables.expedited, true);
+  assert.ok(
+    snap.jobs.some((j) => j.jobType === "shipping"),
+    "a fresh shipping job is created for the new token",
+  );
+  assert.ok(
+    !snap.jobs.some((j) => j.jobType === "payment"),
+    "the charge job is gone",
+  );
+  session.free();
+});
+
 test("maxRounds guards against an unbounded drain", async () => {
   const session = await newOrderSession("{}");
   // The order process needs three rounds (payment, shipping, quiescent); cap at

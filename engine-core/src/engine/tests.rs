@@ -1,6 +1,7 @@
 //! Unit tests for the engine, extracted verbatim from the former inline `mod tests`.
 use super::*;
 use crate::model::{ProcessBuilder, ProcessDefinition};
+use crate::ActivateElementInstruction;
 
 fn linear_with_task() -> ProcessDefinition {
     ProcessBuilder::new("order")
@@ -5255,6 +5256,269 @@ fn cancel_rejects_unknown_or_finished_instances() {
         engine.apply_command(Command::cancel_instance(live)),
         Err(EngineError::InstanceNotFound { instance_key: live })
     );
+}
+
+// ---- modify process instance ----
+
+/// A linear process with two service tasks (`a` → `b`) so a modify can move a
+/// token from one to the other.
+fn two_service_tasks() -> ProcessDefinition {
+    ProcessBuilder::new("two")
+        .start_event("start")
+        .service_task("a", "jobA")
+        .service_task("b", "jobB")
+        .end_event("end")
+        .connect("start", "a")
+        .connect("a", "b")
+        .connect("b", "end")
+        .build()
+        .unwrap()
+}
+
+fn active_eik_of(engine: &Engine, instance_key: Key, element_id: &str) -> Key {
+    *engine
+        .instance(instance_key)
+        .unwrap()
+        .active
+        .iter()
+        .find(|(_, id)| id.as_str() == element_id)
+        .map(|(k, _)| k)
+        .unwrap_or_else(|| panic!("no active element instance for {element_id}"))
+}
+
+#[test]
+fn modify_terminates_one_element_and_activates_another() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Token parked on service task `a`.
+    let a_eik = active_eik_of(&engine, inst, "a");
+    let job_a = engine
+        .state()
+        .jobs
+        .values()
+        .find(|j| j.instance_key == inst)
+        .unwrap()
+        .key;
+
+    let events = engine
+        .apply_command(Command::modify_instance(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variables: HashMap::new(),
+            }],
+            vec![a_eik],
+        ))
+        .unwrap();
+
+    // `a`'s job is cancelled and its element instance completed.
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: job_a,
+        instance_key: inst,
+    }));
+    assert_eq!(engine.job(job_a).unwrap().state, state::JobState::Canceled);
+    // The instance stays active, now with a token (and fresh job) on `b`.
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Active
+    );
+    assert!(engine
+        .instance(inst)
+        .unwrap()
+        .active
+        .values()
+        .any(|id| id.as_str() == "b"));
+    assert!(engine
+        .state()
+        .jobs
+        .values()
+        .any(|j| j.instance_key == inst && j.state == state::JobState::Created));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceTerminated { .. })));
+}
+
+#[test]
+fn modify_terminating_the_last_token_terminates_the_instance() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let charge_eik = active_eik_of(&engine, inst, "charge");
+    let job = engine
+        .state()
+        .jobs
+        .values()
+        .find(|j| j.instance_key == inst)
+        .unwrap()
+        .key;
+
+    let events = engine
+        .apply_command(Command::modify_instance(inst, vec![], vec![charge_eik]))
+        .unwrap();
+
+    // The token's job is cancelled and the instance is terminated (not
+    // auto-completed) since nothing was activated to replace the last token.
+    assert!(events.contains(&Event::JobCanceled {
+        job_key: job,
+        instance_key: inst,
+    }));
+    assert!(events.contains(&Event::ProcessInstanceTerminated { instance_key: inst }));
+    assert!(!events
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+    assert_eq!(
+        engine.instance(inst).unwrap().state,
+        ProcessInstanceState::Terminated
+    );
+    assert!(engine.instance(inst).unwrap().active.is_empty());
+}
+
+#[test]
+fn modify_activating_an_element_merges_global_variables() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let a_eik = active_eik_of(&engine, inst, "a");
+
+    let mut vars = HashMap::new();
+    vars.insert("approved".to_string(), Value::Bool(true));
+    let events = engine
+        .apply_command(Command::modify_instance(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "b".into(),
+                variables: vars,
+            }],
+            vec![a_eik],
+        ))
+        .unwrap();
+
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::VariablesUpdated { instance_key, variables }
+            if *instance_key == inst && variables.get("approved") == Some(&Value::Bool(true))
+    )));
+    assert_eq!(
+        engine.instance(inst).unwrap().variables.get("approved"),
+        Some(&Value::Bool(true))
+    );
+}
+
+#[test]
+fn modify_rejects_unknown_instance_and_element_ids() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(two_service_tasks()))
+        .unwrap();
+
+    // Unknown instance.
+    assert_eq!(
+        engine.apply_command(Command::modify_instance(999, vec![], vec![])),
+        Err(EngineError::InstanceNotFound { instance_key: 999 })
+    );
+
+    let inst = engine
+        .apply_command(Command::create_instance("two"))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+    let a_eik = active_eik_of(&engine, inst, "a");
+
+    // Unknown activate element id — rejected, leaving the instance untouched.
+    assert_eq!(
+        engine.apply_command(Command::modify_instance(
+            inst,
+            vec![ActivateElementInstruction {
+                element_id: "nope".into(),
+                variables: HashMap::new(),
+            }],
+            vec![],
+        )),
+        Err(EngineError::ElementNotFound {
+            instance_key: inst,
+            element_id: "nope".into(),
+        })
+    );
+
+    // Unknown terminate element-instance key.
+    assert_eq!(
+        engine.apply_command(Command::modify_instance(inst, vec![], vec![424242])),
+        Err(EngineError::ElementInstanceNotFound {
+            instance_key: inst,
+            element_instance_key: 424242,
+        })
+    );
+
+    // The rejected commands changed nothing: the token is still on `a`.
+    assert_eq!(active_eik_of(&engine, inst, "a"), a_eik);
+}
+
+#[test]
+fn modify_survives_replay() {
+    let mut engine = Engine::new();
+    let mut log = Vec::new();
+    log.extend(
+        engine
+            .apply_command(Command::DeployProcess(two_service_tasks()))
+            .unwrap(),
+    );
+    let inst = {
+        let events = engine
+            .apply_command(Command::create_instance("two"))
+            .unwrap();
+        let k = events.iter().find_map(|e| e.instance_key()).unwrap();
+        log.extend(events);
+        k
+    };
+    let a_eik = active_eik_of(&engine, inst, "a");
+    log.extend(
+        engine
+            .apply_command(Command::modify_instance(
+                inst,
+                vec![ActivateElementInstruction {
+                    element_id: "b".into(),
+                    variables: HashMap::new(),
+                }],
+                vec![a_eik],
+            ))
+            .unwrap(),
+    );
+
+    let recovered = Engine::replay(log);
+    assert_eq!(
+        recovered.instance(inst).unwrap().state,
+        ProcessInstanceState::Active
+    );
+    assert!(recovered
+        .instance(inst)
+        .unwrap()
+        .active
+        .values()
+        .any(|id| id.as_str() == "b"));
 }
 
 #[test]

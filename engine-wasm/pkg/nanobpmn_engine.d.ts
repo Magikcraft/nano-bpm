@@ -83,6 +83,17 @@ export class TestEngine {
      */
     failJob(job_key: string, retries: number, message: string): string;
     /**
+     * Modify a running process instance (Zeebe "modify process instance"): move
+     * tokens by terminating existing element instances and/or activating new
+     * ones. `activate_instructions_json` is a JSON array of
+     * `{ elementId: string, variables?: object }` (variables are merged into the
+     * instance's root scope before the token is placed);
+     * `terminate_instructions_json` is a JSON array of element-instance keys,
+     * each a decimal string or a `{ elementInstanceKey: string }` object.
+     * Activations run at the process root scope. Returns the snapshot.
+     */
+    modify(instance_key: string, activate_instructions_json: string, terminate_instructions_json: string): string;
+    /**
      * Create a fresh, empty simulated engine. The virtual clock starts at 0.
      */
     constructor();
@@ -169,6 +180,7 @@ export interface InitOutput {
     readonly testengine_deploy: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_events: (a: number, b: number) => void;
     readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly testengine_modify: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_new: () => number;
     readonly testengine_now: (a: number) => number;
     readonly testengine_reset: (a: number) => void;
