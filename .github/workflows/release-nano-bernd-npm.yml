@@ -33,9 +33,10 @@ jobs:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
 
-      # npm OIDC trusted publishing needs npm CLI >= 11.5.1; upgrade to be safe.
+      # npm OIDC trusted publishing needs npm CLI >= 11.5.1; pin a known-good
+      # version (explicit, not @latest) so the publish pipeline is reproducible.
       - name: Upgrade npm (OIDC-capable)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.5.1
 
       - uses: dtolnay/rust-toolchain@stable
         with:

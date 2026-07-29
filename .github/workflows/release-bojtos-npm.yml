@@ -38,9 +38,10 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       # npm OIDC trusted publishing needs npm CLI >= 11.5.1; the bundled npm may
-      # be older, so upgrade to a known-good version.
+      # be older, so pin a known-good version (kept explicit for reproducible
+      # release builds rather than tracking @latest).
       - name: Upgrade npm (OIDC-capable)
-        run: npm install -g npm@latest
+        run: npm install -g npm@11.5.1
 
       - uses: dtolnay/rust-toolchain@stable
         with:
