@@ -8,7 +8,7 @@ Publishing uses **npm OIDC trusted publishing** — there is no `NPM_TOKEN`
 secret. Instead the package is bound to this repository + release workflow on
 npmjs.com, and the CI job mints a short-lived publish token via GitHub OIDC.
 
-### 1. Publish `0.2.0` once, locally
+### 1. Publish the initial version once, locally
 
 A Trusted Publisher can only be configured on a package that already exists, so
 the first publish is done by hand by a maintainer with `@nanobpm` publish

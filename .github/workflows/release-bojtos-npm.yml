@@ -50,7 +50,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y binaryen
 
       - name: Install wasm-pack
-        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+        run: cargo install wasm-pack --version 0.15.0 --locked
 
       # Build the in-browser engine wasm from source so the published
       # @nanobpm/engine-wasm tarball is provably built from the tag.

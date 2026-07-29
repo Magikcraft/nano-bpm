@@ -46,7 +46,13 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") opts.dryRun = true;
-    else if (a === "--tag") opts.tag = argv[++i];
+    else if (a === "--tag") {
+      opts.tag = argv[++i];
+      if (opts.tag === undefined) {
+        console.error("Missing value for --tag");
+        process.exit(2);
+      }
+    }
     else if (a === "--") opts.passthrough = argv.slice(i + 1);
     else if (a === "--help" || a === "-h") opts.help = true;
     else {
