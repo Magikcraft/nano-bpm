@@ -6,9 +6,11 @@ import { projectDerivedModels, type DerivedModel } from "../lib/api";
 
 // The Derived Model panel (ADR 0045). Code-first workflow projects have no
 // authored `.bpmn`; the executable BPMN is DERIVED from `workflows/*.ts` via
-// `@nanobpm/workflow`'s `toBpmn`. This read-only view shows the diagram that the
-// code produces so the maker can see (and screenshot) the model without a
-// separate modeller — the code stays the single source of truth.
+// `@nanobpm/workflow`'s `toBpmn`. The server overlays each model with the
+// on-disk auto-laid-out `resources/processes/<id>.bpmn` (ADR 0048), so this
+// read-only view renders the real diagram the code produces — the maker sees
+// (and screenshots) the model without a separate modeller, code stays the
+// single source of truth.
 
 function errMsg(e: unknown): string {
   if (e instanceof Error) return e.message;
