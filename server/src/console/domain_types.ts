@@ -490,7 +490,13 @@ function typeRefFor(id: string | undefined, declared: Set<string>): string | und
  * `undefined` when no keys are declared (the caller omits the entry so the
  * taskType falls back to `WorkerHdrs`). */
 function headerRefFor(keys: string[] | undefined): string | undefined {
-  const clean = [...new Set((keys ?? []).filter((k) => typeof k === "string" && k.length > 0))];
+  const clean = [
+    ...new Set(
+      (keys ?? []).filter((k) => typeof k === "string").map((k) => k.trim()).filter((k) =>
+        k.length > 0
+      ),
+    ),
+  ];
   if (clean.length === 0) return undefined;
   const fields = clean.map((k) => `${JSON.stringify(k)}: string`).join("; ");
   return `{ ${fields}; [key: string]: unknown }`;

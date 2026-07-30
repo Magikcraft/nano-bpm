@@ -518,7 +518,7 @@ Deno.test("emitWorkerBindings maps header keys → typed customHeaders shape (AD
   const out = emitWorkerBindings(
     [
       { taskType: "charge", headerKeys: ["region", "priority"] },
-      { taskType: "review", inputType: "savedOrder", headerKeys: ["region", "region", ""] }, // dedup + drop blank
+      { taskType: "review", inputType: "savedOrder", headerKeys: ["region", " region ", "region", "", "   "] }, // trim + dedup + drop blank
       { taskType: "noop" }, // no headers → absent from WorkerHeaders
     ],
     ["savedOrder"],
@@ -530,7 +530,7 @@ Deno.test("emitWorkerBindings maps header keys → typed customHeaders shape (AD
     out,
     `"charge": { "region": string; "priority": string; [key: string]: unknown };`,
   );
-  // Duplicate/blank keys are deduped/dropped.
+  // Untrimmed duplicates, blank and whitespace-only keys collapse to one clean key.
   assertStringIncludes(
     out,
     `"review": { "region": string; [key: string]: unknown };`,
