@@ -2461,6 +2461,35 @@ pub async fn run_data_op(
     Ok(val)
 }
 
+/// Case-insensitive project-name collision guard, the server-side half of the
+/// "client + server" uniqueness the console promises (mirrors
+/// `console/src/lib/projectName.ts`): a new project's slug must not
+/// case-insensitively match an existing project's slug, nor its display name an
+/// existing display name. `exclude_slug` skips the project being renamed.
+///
+/// The exact-case `dir.exists()` / `read_project_ref` checks are not enough: a
+/// non-console client (falcon/REST) bypasses the client-side guard, and because
+/// `is_safe_name` permits uppercase, `Home-Heating` and `home-heating` are
+/// distinct directories on a case-sensitive filesystem — a collision the exact
+/// checks miss and that is unsafe on case-insensitive filesystems.
+fn name_taken_ci(new_slug: &str, new_display: &str, exclude_slug: Option<&str>) -> bool {
+    let new_slug_lc = new_slug.to_lowercase();
+    let new_display_lc = new_display.trim().to_lowercase();
+    list_projects()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| exclude_slug != Some(p.name.as_str()))
+        .any(|p| {
+            p.name.to_lowercase() == new_slug_lc
+                || p.display_name
+                    .as_deref()
+                    .unwrap_or(&p.name)
+                    .trim()
+                    .to_lowercase()
+                    == new_display_lc
+        })
+}
+
 /// `template` selects which starter content to stamp out ("starter" default, or
 /// "throughput" for the benchmark demo). Unknown templates fall back to starter.
 pub fn create_project(
@@ -2489,6 +2518,12 @@ pub fn create_project(
         return Err("a project with that name already exists".into());
     }
     if dir.exists() {
+        return Err("a project with that name already exists".into());
+    }
+    // Reject case-insensitive collisions the exact checks above miss (e.g.
+    // `home-heating` vs `Home-Heating` on a case-sensitive filesystem), so a
+    // non-console client can't create ambiguous or non-portable duplicates.
+    if name_taken_ci(name, &display, None) {
         return Err("a project with that name already exists".into());
     }
     let mk = |p: PathBuf| std::fs::create_dir_all(&p).map_err(|e| format!("create {p:?}: {e}"));
@@ -2783,7 +2818,7 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     let Some(new_slug) = project_slug(&new_display) else {
         return Err("invalid new name".into());
     };
-    let new_display_name = (new_display != new_slug).then_some(new_display);
+    let new_display_name = (new_display != new_slug).then_some(new_display.clone());
     let new = new_slug.as_str();
     if !workspace::is_safe_name(old) {
         return Err("invalid project name".into());
@@ -2810,6 +2845,12 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     }
     let to = projects_root().join(new);
     if to.exists() {
+        return Err("a project with that name already exists".into());
+    }
+    // Case-insensitive collision against every other project's slug + display
+    // name (excluding the one being renamed), matching create_project and the
+    // console's client-side guard.
+    if name_taken_ci(new, &new_display, Some(old)) {
         return Err("a project with that name already exists".into());
     }
     std::fs::rename(&from, &to).map_err(|e| format!("rename: {e}"))?;
@@ -5272,6 +5313,32 @@ mod tests {
         let cfg2 = create_project("MyApp", "", "starter").expect("create");
         assert_eq!(cfg2.name, "MyApp");
         assert_eq!(cfg2.display_name, None);
+    }
+
+    #[test]
+    fn create_and_rename_reject_case_insensitive_name_collisions() {
+        let _g = lock();
+        let _root = temp_root();
+        // A safe verbatim name keeps its casing as the slug (is_safe_name allows
+        // uppercase) and records no display name.
+        create_project("MyApp", "", "starter").expect("create");
+        // A differently-cased safe name slugs to a DISTINCT directory on a
+        // case-sensitive filesystem, so the exact-case dir/ref checks miss it —
+        // the case-insensitive guard must reject it (the server half of the
+        // "client + server" uniqueness the console promises).
+        let err = create_project("myapp", "", "starter")
+            .err()
+            .expect("case-insensitive slug collision should be rejected");
+        assert!(err.contains("already exists"), "got: {err}");
+        // An unrelated name is still free.
+        create_project("cool-app-two", "", "starter").expect("unrelated name is free");
+        // Renaming another project INTO an existing name (any case) is rejected
+        // too — here the new slug "myapp" collides with "MyApp".
+        create_project("plain", "", "starter").expect("create");
+        let err = rename_project("plain", "MYAPP")
+            .err()
+            .expect("rename into an existing name (any case) should be rejected");
+        assert!(err.contains("already exists"), "got: {err}");
     }
 
     #[test]
