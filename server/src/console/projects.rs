@@ -1337,7 +1337,8 @@ const WORKFLOW_DENO_JSON: &str = r#"{
     "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.1.0"
   },
   "tasks": {
-    "start": "deno run --allow-net --allow-read --allow-env main.ts"
+    "start": "deno run --allow-net --allow-read --allow-env main.ts",
+    "start-instance": "deno run --allow-net --allow-read --allow-env scripts/start-instance.ts"
   }
 }
 "#;
@@ -1355,7 +1356,7 @@ const WORKFLOW_TSCONFIG_JSON: &str = r#"{
     "skipLibCheck": true,
     "lib": ["esnext", "dom"]
   },
-  "include": ["main.ts", "workflows/**/*.ts"],
+  "include": ["main.ts", "workflows/**/*.ts", "scripts/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }
 "#;
@@ -1371,7 +1372,8 @@ fn workflow_package_json(name: &str) -> String {
   "type": "module",
   "main": "main.ts",
   "scripts": {{
-    "start": "deno task start"
+    "start": "deno task start",
+    "start-instance": "deno task start-instance"
   }},
   "dependencies": {{
     "@nanobpm/workflow": "^0.1.0"
@@ -1419,46 +1421,76 @@ export const prReview = defineWorkflow("pr-review", async (ctx) => {
 });
 "#;
 
-/// Entrypoint: deploy the workflow(s), host a Worker, start one demo instance
-/// and exit when it completes. A production worker host omits the demo block and
-/// simply runs `worker.start()` forever.
+/// Entrypoint: the standalone **worker-host service**. It deploys the
+/// workflow(s), hosts a Worker, and runs forever (until Ctrl-C / SIGTERM) —
+/// exactly what "just run my application" should mean. Running it in the console
+/// / IDE ("Run") executes this same file, so standalone and in-IDE are identical.
+/// To kick off an instance, run `scripts/start-instance.ts` (see README).
 const WORKFLOW_MAIN_TS: &str = r#"// Code-first durable workflows on Nano (ADR 0044/0045). No diagram, no task-type
 // wiring, no correlation plumbing: @nanobpm/workflow derives the executable BPMN
 // model, the job types, and hosts a generic Worker.
+//
+// This is the whole application: it deploys the workflows and hosts their
+// workers in-process, then runs forever. Run it standalone (`deno task start`)
+// or with the console/IDE "Run" button — same artifact, same entrypoint.
 import { WorkflowClient, Worker } from "@nanobpm/workflow";
 import { prReview } from "./workflows/pr-review.ts";
 
 const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
 const workflows = [prReview];
 
+// 1) Deploy the derived BPMN for each workflow (idempotent — safe to redeploy).
 const client = new WorkflowClient({ baseUrl });
 for (const wf of workflows) {
   await client.deploy(wf);
   console.log(`deployed ${wf.id}`);
 }
 
-// Demo-only: resolve once the workflow reports done, so this script can exit.
-let markDone: () => void;
-const done = new Promise<void>((resolve) => (markDone = resolve));
-
+// 2) Host the workers in-process. The poll loops reconnect on their own, so the
+//    host survives an engine restart.
 const worker = new Worker({
   baseUrl,
   workflows,
-  onActivity: (e) => {
-    console.log(`  · ${e.workflowId}: ${e.step ?? e.elementId}`);
-    if (e.step === "__done") markDone();
-  },
   onError: (err) => console.error("worker error:", err.message),
 });
 worker.start();
+console.log(`worker host running against ${baseUrl} — press Ctrl-C to stop`);
 
-const { processInstanceKey } = await client.start(prReview, { prId: "PR-1234" });
-console.log(`started pr-review instance ${processInstanceKey}`);
+// 3) Run forever; stop cleanly on Ctrl-C / SIGTERM so in-flight polls drain.
+let shuttingDown = false;
+const shutdown = async () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log("\nshutting down…");
+  await worker.stop();
+  Deno.exit(0);
+};
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  try {
+    Deno.addSignalListener(sig, shutdown);
+  } catch {
+    // Signal not supported on this OS (e.g. SIGTERM on Windows) — skip it.
+  }
+}
+await new Promise<void>(() => {}); // keep the process alive until a signal fires
+"#;
 
-// A production worker host removes everything below and runs forever.
-await done;
-console.log("workflow complete \u2714");
-await worker.stop();
+/// Example script that kicks off a single workflow instance against the running
+/// app/gateway. Kept OUT of `main.ts` so the app is a pure long-running service:
+/// start the host with `deno task start`, then run this to create work.
+const WORKFLOW_START_INSTANCE_TS: &str = r#"// Kick off one `pr-review` instance against the running app/gateway.
+//
+//   deno task start                 # in one shell: the worker-host service
+//   deno task start-instance PR-42  # in another: create an instance
+import { WorkflowClient } from "@nanobpm/workflow";
+import { prReview } from "../workflows/pr-review.ts";
+
+const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+const prId = Deno.args[0] ?? "PR-1234";
+
+const client = new WorkflowClient({ baseUrl });
+const { processInstanceKey } = await client.start(prReview, { prId });
+console.log(`started ${prReview.id} instance ${processInstanceKey} (prId=${prId})`);
 "#;
 
 /// README for a code-first project.
@@ -1471,13 +1503,25 @@ async code; [`@nanobpm/workflow`](https://www.npmjs.com/package/@nanobpm/workflo
 derives the executable BPMN model, the job types and the wiring, and hosts a
 generic worker against a running Nano gateway.
 
+This project is a **standalone runnable application**: `main.ts` deploys the
+workflows and hosts their workers in-process, then runs forever. It's the same
+artifact whether you run it from a shell or with the console/IDE **Run** button.
+
 ## Run
 
 ```sh
 deno task start          # or: npm install && npm start
 ```
 
-Point at a non-default gateway with `NANOBPMN_BASE_URL`.
+That starts the long-running worker-host service (Ctrl-C to stop). Point it at a
+non-default gateway with `NANOBPMN_BASE_URL`.
+
+To create an instance, run the example script in another shell (the host must be
+running):
+
+```sh
+deno task start-instance PR-42     # kicks off one pr-review instance
+```
 
 ## Author
 
@@ -1489,6 +1533,8 @@ Point at a non-default gateway with `NANOBPMN_BASE_URL`.
   work. Jobs are **at-least-once**: keep step handlers idempotent.
 - For a human-in-the-loop wait, use the declarative surface (`defineFlow` with
   `w.run` / `w.signal`) instead.
+- `scripts/start-instance.ts` shows how a client starts an instance — keep the
+  worker host (`main.ts`) a pure long-running service.
 
 ## What gets derived
 
@@ -2460,6 +2506,7 @@ pub fn create_project(
     // and return before the model-first built-ins.
     if template == "workflow-starter" {
         mk(dir.join("workflows"))?;
+        mk(dir.join("scripts"))?;
         let w = |p: PathBuf, body: &str| {
             std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"))
         };
@@ -2470,6 +2517,10 @@ pub fn create_project(
         w(
             dir.join("workflows").join("pr-review.ts"),
             WORKFLOW_EXAMPLE_TS,
+        )?;
+        w(
+            dir.join("scripts").join("start-instance.ts"),
+            WORKFLOW_START_INSTANCE_TS,
         )?;
         w(dir.join("README.md"), &workflow_readme(name))?;
         let mut cfg = ProjectConfig::new(name, description);
@@ -5015,10 +5066,11 @@ mod tests {
         assert_eq!(cfg.app, "console");
         assert_eq!(cfg.main, "main.ts");
         let dir = root.join("pr_bot");
-        // The lean code-first tree: an entrypoint, an example workflow, and the
-        // three manifests — nothing else.
+        // The lean code-first tree: the worker-host entrypoint, an example
+        // workflow, the instance-starter script, and the manifests — nothing else.
         assert!(dir.join("main.ts").is_file());
         assert!(dir.join("workflows/pr-review.ts").is_file());
+        assert!(dir.join("scripts/start-instance.ts").is_file());
         assert!(dir.join("README.md").is_file());
         // Crucially: NONE of the model-first machinery leaks in — the model is
         // derived from the code, so there is no authored BPMN and no
@@ -5043,7 +5095,6 @@ mod tests {
                 .starts_with("npm:@nanobpm/workflow"),
             "@nanobpm/workflow must resolve to the published npm package"
         );
-        assert!(deno_json["tasks"]["start"].is_string());
         let package_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap())
                 .expect("package.json parses");
@@ -5055,6 +5106,23 @@ mod tests {
         let example = std::fs::read_to_string(dir.join("workflows/pr-review.ts")).unwrap();
         assert!(example.contains("defineWorkflow"));
         assert!(example.contains("ctx.run("));
+        // main.ts is a durable worker-host SERVICE: it hosts a worker and never
+        // self-exits. Starting an instance lives in the script, not the host, so
+        // "just run the app" means a long-running service (not a one-shot demo).
+        let main_ts = std::fs::read_to_string(dir.join("main.ts")).unwrap();
+        assert!(main_ts.contains("worker.start()"));
+        assert!(
+            !main_ts.contains("client.start("),
+            "the worker host must not start an instance itself (that lives in scripts/start-instance.ts)"
+        );
+        let starter = std::fs::read_to_string(dir.join("scripts/start-instance.ts")).unwrap();
+        assert!(
+            starter.contains("client.start("),
+            "the instance-starter script should start an instance"
+        );
+        // Both run tasks are wired.
+        assert!(deno_json["tasks"]["start"].is_string());
+        assert!(deno_json["tasks"]["start-instance"].is_string());
     }
 
     #[tokio::test]
