@@ -722,11 +722,12 @@ pub fn safe_project_path(name: &str, rel: &str) -> Option<PathBuf> {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectConfig {
     pub name: String,
-    /// Human-facing name as the user typed it (may contain spaces — e.g.
-    /// "Home Heating"), when it differs from `name`. `name` is always the
-    /// directory-safe slug ("home-heating") used for file naming, routes and
-    /// API paths; the Console displays `display_name` and falls back to
-    /// `name`. Absent on projects whose name needed no slugging.
+    /// Human-facing name as the user typed it (trimmed of surrounding
+    /// whitespace; may contain spaces — e.g. "Home Heating"), when it differs
+    /// from `name`. `name` is always the directory-safe slug ("home-heating")
+    /// used for file naming, routes and API paths; the Console displays
+    /// `display_name` and falls back to `name`. Absent on projects whose name
+    /// needed no slugging.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
     #[serde(default)]
@@ -2150,17 +2151,17 @@ any OpenAI-compatible endpoint via `NANO_APP_LLM_BASE_URL` (default \
 /// — a titled heading, an intro line and an `actionForm` that starts the scaffold's
 /// process. It is served (no hand-written frontend) by the `@nanobpm/app` runtime.
 /// Reopen and edit it in the Console Page Composer.
-fn urban_home_page(name: &str) -> String {
-    let pid = format!("{name}-process");
+fn urban_home_page(slug: &str, display: &str) -> String {
+    let pid = format!("{slug}-process");
     format!(
         r#"{{
   "schemaVersion": "1.0",
-  "title": "{name}",
+  "title": "{display}",
   "nodes": [
     {{
       "type": "text",
       "id": "home-title",
-      "props": {{ "text": "{name}", "variant": "heading" }}
+      "props": {{ "text": "{display}", "variant": "heading" }}
     }},
     {{
       "type": "text",
@@ -2474,8 +2475,12 @@ pub fn create_project(
     // `cfg.display_name` when it differs.
     let display = name.trim().to_string();
     let slug = project_slug(&display).ok_or("invalid project name")?;
-    let display_name = (display != slug).then_some(display);
+    let display_name = (display != slug).then_some(display.clone());
     let name = slug.as_str();
+    // Human-facing scaffold text (README headings, page titles, the Urban app
+    // manifest `name`) shows `display`; ids/filenames/package names use the
+    // slug (`name`). For a slug-safe name `display == name`, so this is a no-op
+    // there and only diverges for spaced names like "Home Heating".
     let dir = project_dir(name).ok_or("invalid project name")?;
     // A name that already has an import reference (ADR 0041) — even a dangling
     // one — is taken. Never let `create_project` scaffold into a ref's external
@@ -2585,7 +2590,7 @@ pub fn create_project(
             dir.join("workflows").join("pr-review.ts"),
             WORKFLOW_EXAMPLE_TS,
         )?;
-        w(dir.join("README.md"), &workflow_readme(name))?;
+        w(dir.join("README.md"), &workflow_readme(&display))?;
         let mut cfg = ProjectConfig::new(name, description);
         cfg.display_name = display_name.clone();
         cfg.lang = "deno".to_string();
@@ -2665,7 +2670,7 @@ pub fn create_project(
         w(dir.join("deno.json"), &gendir(GUI_DENO_JSON))?;
         w(dir.join("main.ts"), GUI_MAIN_TS)?;
         w(dir.join("public").join("index.html"), GUI_INDEX_HTML)?;
-        w(dir.join("README.md"), &gui_readme(name))?;
+        w(dir.join("README.md"), &gui_readme(&display))?;
         w(
             dir.join("resources")
                 .join("processes")
@@ -2679,12 +2684,15 @@ pub fn create_project(
         let app_id = slugify_app_id(name);
         w(dir.join("deno.json"), &gendir(URBAN_DENO_JSON))?;
         w(dir.join("main.ts"), URBAN_MAIN_TS)?;
-        w(dir.join("nano.app.json"), &urban_manifest(&app_id, name))?;
+        w(
+            dir.join("nano.app.json"),
+            &urban_manifest(&app_id, &display),
+        )?;
         w(
             dir.join("pages").join("home.page.json"),
-            &urban_home_page(name),
+            &urban_home_page(name, &display),
         )?;
-        w(dir.join("README.md"), &urban_readme(name))?;
+        w(dir.join("README.md"), &urban_readme(&display))?;
         w(
             dir.join("resources")
                 .join("processes")
@@ -2705,7 +2713,7 @@ pub fn create_project(
         let starter_worker = dir.join("workers").join("do-work");
         mk(starter_worker.clone())?;
         w(dir.join("main.ts"), MAIN_TS)?;
-        w(dir.join("README.md"), &readme_md(name))?;
+        w(dir.join("README.md"), &readme_md(&display))?;
         w(
             dir.join("resources")
                 .join("processes")
