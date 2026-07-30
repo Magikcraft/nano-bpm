@@ -25,6 +25,7 @@ import type { ComponentOutput } from "../lib/bpmnDomainVariables";
 import {
   SERVICE_TASK_TYPES,
   CREATE_ENVELOPE,
+  EDIT_ENVELOPE,
   envelopeContext,
   readEnvelope,
   writeEnvelope,
@@ -36,6 +37,7 @@ import {
   readShapes,
   writeMeta,
   writeShapes,
+  envelopeEditableFields,
   type MetaEntry,
   type ShapeDecl,
   type ShapeModdle,
@@ -267,6 +269,14 @@ export interface DomainTypeBinding {
   /// affordance). Resolves with the new type id, or `undefined` if the maker
   /// cancelled. Absent → no create option.
   createType?(): Promise<string | undefined>;
+  /// Opens the field-authoring surface pre-filled for an existing model-shape
+  /// type (`nano:shape`) so a maker can edit its fields in place — the "Edit
+  /// fields…" affordance offered on the envelope picker when the selected type is
+  /// an editable model shape (a flat scalar field list). Resolves with the type
+  /// id once saved, or `undefined` if the maker cancelled or the type isn't
+  /// editable through the flat editor (composition/list shapes stay in the shape
+  /// composer). Absent → no edit option.
+  editType?(id: string): Promise<string | undefined>;
   /// The declared domain type bound to a form in the manifest `bindings[]`
   /// (ADR 0029 §5), or undefined. A user task whose linked form is typed defaults
   /// its envelope to this (ADR 0033 §6) — the form binding stays the single source
@@ -488,17 +498,18 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           // Composed shapes are first-class registry entries (ADR 0040 §9), so a
           // shape id is a selectable envelope type too — gathered from every
           // process (shapes fold into one global registry) and de-duped against
-          // the manifest types.
-          const shapeIds = modeler
-            ? [
-                ...new Set(
-                  allProcessBos(modeler)
-                    .flatMap((p) => readShapes(p))
-                    .map((s) => s.id)
-                    .filter((id): id is string => !!id && !known.has(id)),
-                ),
-              ]
+          // the manifest types. Keep the full decls (not just ids) so we can tell
+          // which are editable through the flat field modal below.
+          const allShapes = modeler
+            ? allProcessBos(modeler).flatMap((p) => readShapes(p))
             : [];
+          const shapeIds = [
+            ...new Set(
+              allShapes
+                .map((s) => s.id)
+                .filter((id): id is string => !!id && !known.has(id)),
+            ),
+          ];
           // Types the *model* already references via an envelope but that are
           // neither a declared manifest type nor a composed shape — e.g. a
           // hand-authored or drifted `.bpmn`. The model is the authoritative
@@ -519,6 +530,19 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
             !undeclaredIds.includes(current)
           )
             undeclaredIds.push(current);
+          // "Edit fields…" is offered only when the selected type is a model shape
+          // this flat editor can round-trip losslessly (a non-empty list of pure
+          // scalar `extend` fields). It must also live on the **primary** process,
+          // since that's the only process the edit write path (`getShapes()`/
+          // `writeModelEnvelopeType`) touches — gating on `allShapes` here would
+          // offer the option for a non-primary shape and then no-op on click.
+          // Composition/list shapes and manifest `types` stay in their own
+          // surfaces (shape composer / `nano.app.json`).
+          const primaryShapes = modeler
+            ? readShapes(primaryProcess(modeler)?.processBo)
+            : [];
+          const currentShape = primaryShapes.find((s) => s.id === current);
+          const currentEditable = envelopeEditableFields(currentShape) != null;
           return [
             // With a form default, clearing (this option) reverts to the inherited
             // type rather than "no type", so name it accordingly.
@@ -536,6 +560,11 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
               value: id,
               label: `${id} (undeclared)`,
             })),
+            ...(current &&
+            currentEditable &&
+            domainTypeBindingRef.current?.editType
+              ? [{ value: EDIT_ENVELOPE, label: "✎ Edit fields…" }]
+              : []),
             ...(domainTypeBindingRef.current?.createType
               ? [{ value: CREATE_ENVELOPE, label: "➕ Create new envelope…" }]
               : []),
@@ -553,6 +582,13 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           setValue: (value: string) => {
             if (value === CREATE_ENVELOPE) {
               void createEnvelope(applyValue);
+              return;
+            }
+            if (value === EDIT_ENVELOPE) {
+              // Edit the currently-set type's fields in place; the envelope ref
+              // itself is unchanged, so nothing to re-apply on the element.
+              const cur = getValue();
+              if (cur) void domainTypeBindingRef.current?.editType?.(cur);
               return;
             }
             applyValue(value);

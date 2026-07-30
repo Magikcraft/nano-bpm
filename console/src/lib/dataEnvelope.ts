@@ -57,6 +57,10 @@ export const ENVELOPE_KEY: Record<EnvelopeField, string> = {
 // Sentinel option value: picking it opens the create-a-new-type flow.
 export const CREATE_ENVELOPE = "\u0000__create_envelope__";
 
+// Sentinel option value: picking it opens the edit-fields flow for the
+// currently-selected type (only offered for editable model shapes).
+export const EDIT_ENVELOPE = "\u0000__edit_envelope__";
+
 export interface EnvelopeContext {
   // The moddle object the reserved properties are read from / written to.
   target: EnvModdleElement;

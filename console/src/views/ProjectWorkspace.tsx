@@ -22,6 +22,7 @@ import PageComposer, {
   type PageComposerHandle,
 } from "../components/PageComposer";
 import type { MetaEntry, ShapeDecl, ShapeOp } from "../lib/shapeCarrier";
+import { envelopeEditableFields } from "../lib/shapeCarrier";
 import type { ComposerEntity } from "../lib/shapeComposer";
 import { SCALAR_KEYWORDS } from "../lib/shapeComposer";
 import AppManifestEditor, {
@@ -1338,6 +1339,13 @@ function EditorPane({
   // while the shapes drawer is open, so read the ids fresh from the model at
   // open time — independent of the drawer.
   const [envelopeShapeIds, setEnvelopeShapeIds] = useState<string[]>([]);
+  // When set, the envelope editor is in *edit* mode for this existing model-shape
+  // type (id locked, fields pre-filled). Null → create mode. `editDomainType`
+  // populates it; `closeEnvelopeEditor` clears it.
+  const [envelopeEditInitial, setEnvelopeEditInitial] = useState<{
+    id: string;
+    fields: { name: string; type: string; optional: boolean }[];
+  } | null>(null);
   const createDomainType = useCallback((): Promise<string | undefined> => {
     if (envelopePromiseRef.current) return envelopePromiseRef.current;
     setEnvelopeShapeIds((bpmnRef.current?.getShapes() ?? []).map((s) => s.id));
@@ -1350,11 +1358,37 @@ function EditorPane({
   }, []);
   const closeEnvelopeEditor = useCallback((id: string | undefined) => {
     setEnvelopeEditorOpen(false);
+    setEnvelopeEditInitial(null);
     const resolve = envelopeResolverRef.current;
     envelopeResolverRef.current = null;
     envelopePromiseRef.current = null;
     resolve?.(id);
   }, []);
+  // Opens the envelope editor pre-filled for an existing model-shape type so its
+  // fields can be edited in place (the picker's "Edit fields…" affordance). Only a
+  // pure `extend` shape (a flat scalar field list, no composition/list ops) round-
+  // trips losslessly through the flat editor; anything richer resolves `undefined`
+  // (no-op) so the maker keeps using the shape composer for it.
+  const editDomainType = useCallback(
+    (typeId: string): Promise<string | undefined> => {
+      if (envelopePromiseRef.current) return envelopePromiseRef.current;
+      const shapes = bpmnRef.current?.getShapes() ?? [];
+      const shape = shapes.find((s) => s.id === typeId);
+      const fields = envelopeEditableFields(shape);
+      // Bail if the shape isn't a flat scalar field list the editor can
+      // round-trip (composition/list shapes stay in the shape composer).
+      if (!fields) return Promise.resolve(undefined);
+      setEnvelopeShapeIds(shapes.map((s) => s.id));
+      setEnvelopeEditInitial({ id: typeId, fields });
+      const p = new Promise<string | undefined>((resolve) => {
+        envelopeResolverRef.current = resolve;
+        setEnvelopeEditorOpen(true);
+      });
+      envelopePromiseRef.current = p;
+      return p;
+    },
+    [],
+  );
   // Projects a service task's chosen envelope onto its `workers[]` entry (creating
   // it if absent, clearing on ""), so the reifier keeps `defineWorker` typed while
   // the model stays the source of truth (ADR 0033 §6). Optimistic — updates the
@@ -1406,11 +1440,12 @@ function EditorPane({
       typeIds: domainTypeIds,
       set: setWorkerType,
       createType: createDomainType,
+      editType: editDomainType,
       // A user task's envelope defaults to the domain type bound to its linked
       // form in `bindings[]` (ADR 0033 §6 / 0029 §5).
       formType: (formId: string) => formTypeId(manifest, formId),
     }),
-    [manifest, domainTypeIds, setWorkerType, createDomainType],
+    [manifest, domainTypeIds, setWorkerType, createDomainType, editDomainType],
   );
   // Datasource aliases declared in the App manifest (`data.sources`), for the
   // form editor's "Data source" binding inspector (ADR 0024 §5). Recomputed when
@@ -1598,6 +1633,7 @@ function EditorPane({
     async (
       id: string,
       fields: { name: string; type: string; optional?: boolean }[],
+      replaceId?: string,
     ): Promise<void> => {
       // Fail fast rather than silently no-op: the modal closes and the envelope
       // selection references this id the moment this resolves, so a swallowed
@@ -1610,7 +1646,9 @@ function EditorPane({
         );
       }
       const existing = bpmn.getShapes();
-      if (existing.some((s) => s.id === id)) {
+      // In edit mode (`replaceId`) the id is expected to already exist — it's the
+      // shape being rewritten. Only a *different* shape sharing the id collides.
+      if (existing.some((s) => s.id === id && s.id !== replaceId)) {
         throw new Error(`Type "${id}" already exists in the model.`);
       }
       const ops: ShapeOp[] = fields
@@ -1624,7 +1662,11 @@ function EditorPane({
           if (f.optional) op.optional = true;
           return op;
         });
-      const next: ShapeDecl[] = [...existing, { id, ops }];
+      // Edit mode rewrites the target shape's ops in place (preserving author
+      // order); create mode appends a new shape.
+      const next: ShapeDecl[] = replaceId
+        ? existing.map((s) => (s.id === replaceId ? { id, ops } : s))
+        : [...existing, { id, ops }];
       // Server-fuse pre-check: the up-front editor guard only knows model shapes
       // and manifest `types`, but a new id can also collide with a *fused leaf
       // entity* (e.g. a datasource table). `resolveShapes` reports that as an
@@ -2189,9 +2231,14 @@ function EditorPane({
                 existingIds={[
                   ...new Set([...domainTypeIds, ...envelopeShapeIds]),
                 ]}
+                initial={envelopeEditInitial ?? undefined}
                 onCancel={() => closeEnvelopeEditor(undefined)}
                 onSave={async (id, fields) => {
-                  await writeModelEnvelopeType(id, fields);
+                  await writeModelEnvelopeType(
+                    id,
+                    fields,
+                    envelopeEditInitial?.id,
+                  );
                   closeEnvelopeEditor(id);
                 }}
               />
@@ -2727,25 +2774,37 @@ const IDENT_RE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
 /// shape composer / raw JSON editor.
 function EnvelopeEditorModal({
   existingIds,
+  initial,
   onSave,
   onCancel,
 }: {
   existingIds: string[];
+  // When provided, the modal edits this existing model-shape type in place: the
+  // id is locked and the fields are pre-filled. Absent → create a new type.
+  initial?: {
+    id: string;
+    fields: { name: string; type: string; optional: boolean }[];
+  };
   onSave: (
     id: string,
     fields: { name: string; type: string; optional?: boolean }[],
   ) => Promise<void>;
   onCancel: () => void;
 }) {
-  const [id, setId] = useState("");
+  const isEdit = initial != null;
+  const [id, setId] = useState(initial?.id ?? "");
   const [fields, setFields] = useState<
     { key: number; name: string; type: string; optional: boolean }[]
-  >([{ key: 0, name: "", type: "string", optional: false }]);
+  >(
+    initial && initial.fields.length > 0
+      ? initial.fields.map((f, i) => ({ key: i, ...f }))
+      : [{ key: 0, name: "", type: "string", optional: false }],
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Monotonic id source so each row keeps a stable React key across
   // removals/reorders (index keys would make edited values appear to jump rows).
-  const nextFieldKey = useRef(1);
+  const nextFieldKey = useRef(initial ? initial.fields.length : 1);
 
   const setField = (
     i: number,
@@ -2772,7 +2831,10 @@ function EnvelopeEditorModal({
     if (!tid) return "Enter a type id.";
     if (!IDENT_RE.test(tid))
       return "Type id must be a valid identifier (letters, digits, _ or $; not starting with a digit).";
-    if (existingIds.includes(tid)) return `Type "${tid}" already exists.`;
+    // In edit mode the id is locked to an existing type, so a self-match is fine;
+    // only guard collisions when creating a new id.
+    if (!isEdit && existingIds.includes(tid))
+      return `Type "${tid}" already exists.`;
     const named = fields
       .map((f) => ({ ...f, name: f.name.trim() }))
       .filter((f) => f.name);
@@ -2813,7 +2875,10 @@ function EnvelopeEditorModal({
   };
 
   return (
-    <Modal title="New envelope" onClose={busy ? () => {} : onCancel}>
+    <Modal
+      title={isEdit ? `Edit envelope — ${initial.id}` : "New envelope"}
+      onClose={busy ? () => {} : onCancel}
+    >
       <div className="space-y-4">
         <label className="block">
           <span className="mb-1.5 block text-xs font-medium uppercase tracking-wider text-fg-faint">
@@ -2823,7 +2888,9 @@ function EnvelopeEditorModal({
             autoFocus
             value={id}
             onChange={(e) => setId(e.target.value)}
-            className={`${inputClass} w-full`}
+            readOnly={isEdit}
+            aria-readonly={isEdit}
+            className={`${inputClass} w-full${isEdit ? " opacity-60" : ""}`}
             placeholder="orderPlaced"
           />
         </label>
@@ -2902,7 +2969,13 @@ function EnvelopeEditorModal({
             Cancel
           </Button>
           <Button variant="primary" onClick={() => void save()} disabled={busy}>
-            {busy ? "Creating…" : "Create"}
+            {busy
+              ? isEdit
+                ? "Saving…"
+                : "Creating…"
+              : isEdit
+                ? "Save changes"
+                : "Create"}
           </Button>
         </div>
       </div>

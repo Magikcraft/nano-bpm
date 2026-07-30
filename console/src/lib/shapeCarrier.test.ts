@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   buildShapesContainer,
+  envelopeEditableFields,
   readMeta,
   readShapes,
   type MetaEntry,
@@ -81,6 +82,44 @@ test("readShapes: round-trips the four-op algebra in author order", () => {
 test("readShapes: returns [] when the process declares no shapes", () => {
   assert.deepEqual(readShapes({ $type: "bpmn:Process" }), []);
   assert.deepEqual(readShapes(undefined), []);
+});
+
+test("envelopeEditableFields: maps a pure-extend shape to its scalar fields", () => {
+  const shape: ShapeDecl = {
+    id: "orderPlaced",
+    ops: [
+      { op: "extend", name: "orderId", type: "string" },
+      { op: "extend", name: "total", type: "number", optional: true },
+    ],
+  };
+  assert.deepEqual(envelopeEditableFields(shape), [
+    { name: "orderId", type: "string", optional: false },
+    { name: "total", type: "number", optional: true },
+  ]);
+});
+
+test("envelopeEditableFields: null for empty, undefined, or non-extend shapes", () => {
+  assert.equal(envelopeEditableFields(undefined), null);
+  assert.equal(envelopeEditableFields({ id: "empty", ops: [] }), null);
+  // A composition op (carry) can't be represented by the flat field editor.
+  assert.equal(
+    envelopeEditableFields({
+      id: "composed",
+      ops: [
+        { op: "extend", name: "note", type: "string" },
+        { op: "carry", ref: "base" },
+      ],
+    }),
+    null,
+  );
+  // A `list` extend field would be dropped on save, so it's not editable here.
+  assert.equal(
+    envelopeEditableFields({
+      id: "listy",
+      ops: [{ op: "extend", name: "tags", type: "string", list: true }],
+    }),
+    null,
+  );
 });
 
 test("readShapes: drops a shape with no id and malformed ops", () => {
