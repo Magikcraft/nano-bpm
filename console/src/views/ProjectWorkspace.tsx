@@ -10,13 +10,12 @@ import {
 import { Link, useParams } from "react-router-dom";
 import CodeEditor, { languageForFile } from "../components/CodeEditor";
 import MarkdownPreview from "../components/MarkdownPreview";
-import BpmnModeler, {
-  type BpmnModelerHandle,
-  type DomainTypeBinding,
+import type {
+  BpmnModelerHandle,
+  DomainTypeBinding,
 } from "../components/BpmnModeler";
-import DmnModeler, { type DmnModelerHandle } from "../components/DmnModeler";
-import FormEditor, { type FormEditorHandle } from "../components/FormEditor";
-import FormPreview from "../components/FormPreview";
+import type { DmnModelerHandle } from "../components/DmnModeler";
+import type { FormEditorHandle } from "../components/FormEditor";
 import ShapeComposer, { type ShapePreview } from "../components/ShapeComposer";
 import PageComposer, {
   type PageComposerHandle,
@@ -32,6 +31,21 @@ const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 const DataPanel = lazy(() => import("../components/DataPanel"));
 const TriggersPanel = lazy(() => import("../components/TriggersPanel"));
 const DerivedModelPanel = lazy(() => import("../components/DerivedModelPanel"));
+// The BPMN/DMN/form modelers each drag in a heavy editor stack (bpmn-js,
+// dmn-js, @bpmn-io/form-js-editor). They are used ONLY here and only when a file
+// of that kind is open, so lazy-load them: this splits ~megabytes out of the
+// ProjectWorkspace chunk and defers the cost until you actually edit that file
+// type. Each usage is wrapped in <Suspense fallback={modelerFallback}>.
+const BpmnModeler = lazy(() => import("../components/BpmnModeler"));
+const DmnModeler = lazy(() => import("../components/DmnModeler"));
+const FormEditor = lazy(() => import("../components/FormEditor"));
+const FormPreview = lazy(() => import("../components/FormPreview"));
+
+const modelerFallback = (
+  <div className="flex h-full items-center justify-center text-sm text-fg-faint">
+    Loading editor…
+  </div>
+);
 import {
   compileProject,
   createProjectPath,
@@ -2201,13 +2215,15 @@ function EditorPane({
             <div
               className={bpmnView === "visual" ? "h-full" : "h-full invisible"}
             >
-              <BpmnModeler
-                ref={bpmnRef}
-                onChange={onBpmnChange}
-                getVariables={bpmnGetVariables}
-                components={components}
-                domainTypeBinding={bpmnDomainTypeBinding}
-              />
+              <Suspense fallback={modelerFallback}>
+                <BpmnModeler
+                  ref={bpmnRef}
+                  onChange={onBpmnChange}
+                  getVariables={bpmnGetVariables}
+                  components={components}
+                  domainTypeBinding={bpmnDomainTypeBinding}
+                />
+              </Suspense>
             </div>
             {bpmnView === "xml" && (
               <div className="absolute inset-0 bg-app">
@@ -2280,11 +2296,13 @@ function EditorPane({
           </div>
         )}
         {kind === "dmn" && (
-          <DmnModeler
-            ref={dmnRef}
-            onChange={() => setDirty(true)}
-            getVariables={dmnGetVariables}
-          />
+          <Suspense fallback={modelerFallback}>
+            <DmnModeler
+              ref={dmnRef}
+              onChange={() => setDirty(true)}
+              getVariables={dmnGetVariables}
+            />
+          </Suspense>
         )}
         {kind === "page" && (
           <PageComposer
@@ -2304,11 +2322,13 @@ function EditorPane({
             <div
               className={formView === "visual" ? "h-full" : "h-full invisible"}
             >
-              <FormEditor
-                ref={formRef}
-                onChange={() => setDirty(true)}
-                getDataSources={formGetDataSources}
-              />
+              <Suspense fallback={modelerFallback}>
+                <FormEditor
+                  ref={formRef}
+                  onChange={() => setDirty(true)}
+                  getDataSources={formGetDataSources}
+                />
+              </Suspense>
             </div>
             {formView === "json" && (
               <div className="absolute inset-0 bg-app">
@@ -2327,11 +2347,13 @@ function EditorPane({
             )}
             {formView === "preview" && (
               <div className="absolute inset-0 bg-app">
-                <FormPreview
-                  schema={formJson}
-                  name={name}
-                  defaultSource={defaultDataSource}
-                />
+                <Suspense fallback={modelerFallback}>
+                  <FormPreview
+                    schema={formJson}
+                    name={name}
+                    defaultSource={defaultDataSource}
+                  />
+                </Suspense>
               </div>
             )}
           </div>

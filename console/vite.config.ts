@@ -70,6 +70,13 @@ export default defineConfig({
   build: {
     outDir: "dist",
     emptyOutDir: true,
+    // Every view is a lazy route chunk and the heaviest editors (Monaco and its
+    // ~3.6MB TypeScript language service, the bpmn/dmn/form modeler stacks) are
+    // further lazy-loaded on demand — so a large chunk here is an inherently big
+    // third-party editor fetched only when used, not eager startup weight. Raise
+    // the warning threshold above those known-large on-demand chunks so the
+    // signal flags genuinely new regressions instead of firing on every build.
+    chunkSizeWarningLimit: 4000,
   },
   server: {
     port,
