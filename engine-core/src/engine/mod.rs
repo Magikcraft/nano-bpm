@@ -4820,6 +4820,17 @@ impl Engine {
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_conditional_subscriptions_on(element_instance_key));
+        // Event-based gateway deferred choice: when this completing element is
+        // the catch event that won the race downstream of an event-based
+        // gateway, withdraw the losing sibling catch events (cancel their armed
+        // timers/subscriptions and consume their tokens) so only the winning
+        // branch continues. A no-op for any element not fed by such a gateway.
+        events.extend(self.withdraw_event_gateway_siblings(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+        ));
         // A script task's (or business rule task's) result is merged before output
         // mappings so a `zeebe:output` can reference/remap it (Zeebe merges
         // `resultVariable` first, then applies output mappings).
@@ -5033,7 +5044,151 @@ impl Engine {
         (events, followups)
     }
 
-    /// Deferred completion of an embedded sub-process (or spliced call activity)
+    /// Withdraws the losing siblings of an event-based gateway's deferred choice.
+    ///
+    /// An event-based gateway routes into several intermediate catch events and
+    /// arms them all at once (its completion takes every outgoing flow). The
+    /// first event to occur wins: this helper is called when that winning catch
+    /// event completes and tears down the *other* targets of the same gateway —
+    /// cancelling every armed timer and open (message/signal/conditional)
+    /// subscription resting on each losing sibling, then completing its element
+    /// instance so its token is consumed without taking an outgoing flow. Only
+    /// active sibling instances in the same token `scope` are withdrawn, so a
+    /// gateway reached again on a loop only ever withdraws the current race.
+    ///
+    /// Returns an empty vec — the overwhelmingly common path — when `winner`
+    /// is not the immediate target of an event-based gateway, or when its owning
+    /// gateway is ambiguous (more than one event-based gateway routes into the
+    /// same catch event), in which case no siblings are withdrawn.
+    fn withdraw_event_gateway_siblings(
+        &self,
+        instance_key: Key,
+        winner_eik: Key,
+        winner_element_id: &str,
+        scope: Key,
+    ) -> Vec<Event> {
+        let Some(def) = self.process_of_instance(instance_key) else {
+            return Vec::new();
+        };
+        // An event-based gateway's deferred choice is a race between intermediate
+        // catch events only. `is_catch_event` gates both the winner (below) and
+        // each losing sibling: it keeps the completion hot path O(1) for the
+        // common (non-catch) completion, and — should a malformed model route a
+        // gateway into a non-catch node (e.g. a service task) — prevents this
+        // code from force-completing that node's element instance via
+        // `ElementCompleted` while leaving its job/user-task uncancelled (which
+        // would orphan work). Withdrawal only ever cancels timers/subscriptions
+        // resting on genuine catch siblings.
+        let is_catch_event = |element_id: &str| {
+            matches!(
+                def.elements.get(element_id).map(|e| &e.kind),
+                Some(
+                    ElementKind::TimerIntermediateCatchEvent { .. }
+                        | ElementKind::MessageIntermediateCatchEvent { .. }
+                        | ElementKind::SignalIntermediateCatchEvent { .. }
+                        | ElementKind::ConditionalIntermediateCatchEvent { .. }
+                )
+            )
+        };
+        if !is_catch_event(winner_element_id) {
+            return Vec::new();
+        }
+        // A catch event downstream of an event-based gateway has exactly one
+        // incoming flow — from the gateway. If the winner has any *other*
+        // incoming path (a malformed graph where a non-gateway node also routes
+        // into it), we cannot be sure this token arrived via the gateway, so we
+        // conservatively withdraw nothing rather than risk cancelling an
+        // unrelated race in the same scope.
+        let incoming_count = def
+            .elements
+            .values()
+            .flat_map(|element| element.outgoing.iter())
+            .filter(|f| f.to == winner_element_id)
+            .count();
+        if incoming_count != 1 {
+            return Vec::new();
+        }
+        // Find the event-based gateway(s) that route into the winning catch
+        // event. In a well-formed model a catch event has exactly one incoming
+        // flow, so at most one gateway owns the race. If more than one gateway
+        // routes into the same catch event the owning race is ambiguous — we
+        // cannot tell which gateway's siblings to withdraw without risking the
+        // cancellation of an unrelated gateway's branch — so we conservatively
+        // do nothing.
+        let owners: Vec<&crate::model::Element> = def
+            .elements
+            .values()
+            .filter(|element| matches!(element.kind, ElementKind::EventBasedGateway))
+            .filter(|element| element.outgoing.iter().any(|f| f.to == winner_element_id))
+            .collect();
+        let [owner] = owners.as_slice() else {
+            return Vec::new();
+        };
+        // The owning gateway must itself have exactly one incoming flow. A
+        // gateway reachable via multiple incoming flows (e.g. fed by both arms of
+        // a parallel split) can be activated concurrently in the same scope,
+        // arming several live instances of each sibling element id at once. Since
+        // losers are matched by element id + scope, withdrawing here could cancel
+        // a sibling instance belonging to a *different* concurrent activation of
+        // the same gateway. When the owner's static in-degree is not exactly 1 we
+        // cannot isolate a single race, so we conservatively withdraw nothing.
+        let owner_incoming = def
+            .elements
+            .values()
+            .flat_map(|element| element.outgoing.iter())
+            .filter(|f| f.to == owner.id)
+            .count();
+        if owner_incoming != 1 {
+            return Vec::new();
+        }
+        // The sibling targets are the owning gateway's *other* outgoing catch
+        // events. Any non-catch target is skipped (see `is_catch_event` above).
+        let sibling_ids: Vec<&str> = owner
+            .outgoing
+            .iter()
+            .filter(|f| f.to != winner_element_id)
+            .map(|f| f.to.as_str())
+            .filter(|id| is_catch_event(id))
+            .collect();
+        if sibling_ids.is_empty() {
+            return Vec::new();
+        }
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return Vec::new();
+        };
+        // Every active element instance of a losing sibling in this token scope.
+        // Sorted by element-instance key for a deterministic, replay-stable log.
+        let mut losers: Vec<(Key, String)> = instance
+            .active
+            .iter()
+            .filter(|(eik, eid)| {
+                **eik != winner_eik
+                    && sibling_ids.contains(&eid.as_str())
+                    && self.scope_of(instance_key, **eik) == scope
+            })
+            .map(|(eik, eid)| (*eik, eid.clone()))
+            .collect();
+        losers.sort_by_key(|(eik, _)| *eik);
+
+        let mut events = Vec::new();
+        for (eik, eid) in losers {
+            events.extend(self.cancel_all_timers_on(eik));
+            events.extend(self.cancel_all_subscriptions_on(eik));
+            events.extend(self.cancel_all_signal_subscriptions_on(eik));
+            events.extend(self.cancel_all_conditional_subscriptions_on(eik));
+            events.push(Event::ElementCompleting {
+                instance_key,
+                element_instance_key: eik,
+                element_id: eid.clone(),
+            });
+            events.push(Event::ElementCompleted {
+                instance_key,
+                element_instance_key: eik,
+                element_id: eid,
+            });
+        }
+        events
+    }
     /// whose `end` execution-listener chain has drained (ADR 0037). Its boundary
     /// events disarmed and its output mappings projected when it parked (in the
     /// drained-sub-process sweep); this emits the parked `ElementCompleted` and

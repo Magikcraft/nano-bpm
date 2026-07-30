@@ -146,6 +146,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::UserTask(_) => "userTask",
         ElementKind::ExclusiveGateway => "exclusiveGateway",
         ElementKind::ParallelGateway => "parallelGateway",
+        ElementKind::EventBasedGateway => "eventBasedGateway",
         ElementKind::ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
         ElementKind::TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
         ElementKind::TimerBoundaryEvent { .. } => "timerBoundaryEvent",
@@ -174,6 +175,7 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         | ElementKind::EndEvent
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::EventBasedGateway
         | ElementKind::IntermediateThrowEvent => {}
         ElementKind::ServiceTask { job_type, priority } => {
             attrs.push(format!("jobType {}", quote(job_type)));
@@ -1052,6 +1054,7 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         "endEvent" => ElementKind::EndEvent,
         "exclusiveGateway" => ElementKind::ExclusiveGateway,
         "parallelGateway" => ElementKind::ParallelGateway,
+        "eventBasedGateway" => ElementKind::EventBasedGateway,
         "intermediateThrowEvent" => ElementKind::IntermediateThrowEvent,
         "serviceTask" => ElementKind::ServiceTask {
             job_type: attrs.require("jobType", id)?,
@@ -1155,6 +1158,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::UserTask(_)
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
+        | ElementKind::EventBasedGateway
         | ElementKind::TimerIntermediateCatchEvent { .. }
         | ElementKind::MessageIntermediateCatchEvent { .. }
         | ElementKind::MessageStartEvent { .. }
