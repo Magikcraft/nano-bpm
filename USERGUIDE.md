@@ -89,7 +89,7 @@ The most common settings:
 |---|---|
 | `PORT=<n>` | HTTP listen port (default `8080`). |
 | `NANOBPMN_DATA_DIR=<dir>` | Durable data directory (event log + read model). **Without it, the server runs fully in-memory and loses everything on exit.** Set it for anything you want to keep. |
-| `NANOBPMN_WORKSPACE_DIR=<dir>` | Where the console stores your models and workers (default `./nanobpm-workspace`). Survives deletion of the engine data dir. |
+| `NANOBPMN_WORKSPACE_DIR=<dir>` | Where the console stores your projects and workers (default `./nanobpm-workspace`; projects live under `<workspace>/projects/`). Survives deletion of the engine data dir. |
 | `DEBUG_REST=1` | Log every REST request/response (method, URI, status, latency). Leave off in production. |
 
 The clustering and tuning variables are covered in
@@ -98,39 +98,48 @@ The clustering and tuning variables are covered in
 
 ## Tour the web console
 
-Open `http://127.0.0.1:8080/console`. The console is a single-page app with five
-tabs. The root `/` is a small landing page, and `/swagger` is an **offline**
-Swagger UI for the REST API (nothing is fetched from the internet).
+Open `http://127.0.0.1:8080/console`. The console is a single-page app whose
+navigation depends on the build **profile**: the **Studio** (authoring) profile
+adds the **Projects** and **Extensions** tabs, while the **Observe** (operator)
+profile shows only the runtime tabs below. The root `/` is a small landing page,
+and `/swagger` is an **offline** Swagger UI for the REST API (nothing is fetched
+from the internet).
 
-| Tab | What it's for |
-|---|---|
-| **Topology** | Cluster, partition, and Raft overview with **live per-node health** — each node is probed every few seconds for reachability, version, and round-trip latency. |
-| **Metrics** | A live performance dashboard — process starts/s, jobs/s, active processes, connected clients, commit-pipeline depth, journal/fsync timings, memory — with sparklines, and a per-node breakdown in a cluster. |
-| **Modeler** | A BPMN editor. Create, edit, **deploy**, pull a deployed model back from the engine, and **test-run** a model entirely in your browser. See [Model and test a process](#model-and-test-a-process). |
-| **Explorer** | A live process-instance explorer — variables, jobs, incidents, and the BPMN XML for each running or completed instance. |
-| **Workers** | Author TypeScript job workers in the browser, run them as sandboxed Deno processes, watch a live fleet view, and export them as a standalone app. See [Write and run job workers](#write-and-run-job-workers). |
+| Tab | Profile | What it's for |
+|---|---|---|
+| **Projects** | Studio | The Rapid Application Development IDE. Open a project and author BPMN models, DMN decisions, forms, and pages; **deploy**, **start** instances, and **test** a model in your browser. See [Model and test a process](#model-and-test-a-process). |
+| **Extensions** | Studio | Install extension packs — agentic SDLC, languages, app templates, example apps, triggers, and themes. |
+| **Topology** | both | Cluster, partition, and Raft overview with **live per-node health** — each node is probed every few seconds for reachability, version, and round-trip latency. |
+| **Metrics** | both | A live performance dashboard — process starts/s, jobs/s, active processes, connected clients, commit-pipeline depth, journal/fsync timings, memory — with sparklines, and a per-node breakdown in a cluster. |
+| **Explorer** | both | A live process-instance explorer — variables, jobs, incidents, and the BPMN XML for each running or completed instance. |
+| **Traces** | both | **Execution traces** folded from the engine event stream — a per-instance timeline of elements visited, jobs created/completed, and variable snapshots. |
+| **Workers** | both | Author TypeScript job workers in the browser, run them as sandboxed Deno processes, watch a live fleet view, and export them as a standalone app. See [Write and run job workers](#write-and-run-job-workers). |
+
+(Two more views, **Config** and **Credits**, are reachable by route but are not on
+the navigation rail.)
 
 ## Model and test a process
 
-The **Modeler** tab is a full BPMN editor backed by a workspace model library.
+Models are authored inside a **project** in the **Projects** tab, alongside its
+DMN decisions, forms, and pages.
 
-- **Create / edit** a model, **Deploy** it to the engine (deployment is
+- **Create / edit** a `.bpmn` model, **Deploy** it to the engine (deployment is
   idempotent — redeploying an unchanged model is a no-op; a changed model becomes
-  the next version), **pull** a deployed model back to edit it, or **duplicate**
-  one.
+  the next version), then **Start instance** once the saved model matches what is
+  deployed.
 
 ### Test a model in the browser (μ-nano)
 
-Click **Test run** to execute a model **entirely in your browser** — no cluster
+Click **Test** to execute a model **entirely in your browser** — no cluster
 round-trip, fully offline. Test mode is powered by **μ-nano** ("micro-nano"), a
 compact (~0.5 MB) WebAssembly build of the *exact same* Rust engine the cluster
 runs. Because it is the real engine and not a re-implementation, token flow,
-gateways, timers, and FEEL expressions behave precisely as they will on the
+gateways, timers, DMN, and FEEL expressions behave precisely as they will on the
 server.
 
 To run a test and inspect what happened:
 
-1. Open a model and click **Test run**.
+1. Open a model and click **Test**.
 2. **Start an instance**, optionally supplying initial variables as JSON.
 3. As each job activates, **complete** it with mock result variables, **fail** it,
    or throw a BPMN **error** — μ-nano advances the tokens accordingly.

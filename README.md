@@ -712,11 +712,21 @@ JSON API under `/console/api/*`. The root `/` serves a small self-contained
 landing page, and `/swagger` serves an **offline** Swagger UI with the OpenAPI
 spec bundled in (nothing fetched from a CDN).
 
-The console has five tabs, each described below.
+The console ships in two **profiles** and the navigation adapts to each:
 
-The console is also **extensible**: language support, project templates, examples,
-themes, and event triggers are shipped as **extension packs** — plain npm packages
-discovered by the `nano-ide-ext` keyword and installed from the console UI. The
+- **Studio** (the default authoring build) shows **Projects**, **Extensions**,
+  **Topology**, **Metrics**, **Explorer**, **Traces**, and **Workers**.
+- **Observe** (the operator build) drops the two authoring tabs and shows only
+  **Topology**, **Metrics**, **Explorer**, **Traces**, and **Workers**.
+
+Two more views — **Config** (appearance, theme packs, and server settings) and
+**Credits** — are reachable by route but do not live on the navigation rail. Each
+tab is described below.
+
+The console is also **extensible**: an agentic SDLC pack, language support, app
+templates, example apps, event triggers, and themes are shipped as **extension
+packs** — plain npm packages discovered by the `nano-ide-ext` keyword and
+installed from the console UI. The
 console can install any pack carrying that keyword; the **first-party** packs live
 in the [`nano-ide`](https://github.com/jwulf/nano-ide) repo, and their manifest
 schema is defined here in `server/src/console/extensions.rs`. See
@@ -756,24 +766,48 @@ exposes when a node is pressed against a capacity ceiling:
 All are published ~1 Hz off the hot path (relaxed atomic reads + cheap
 low-priority scans), so scraping them never touches the create/complete path.
 
-### Modeler
+### Projects (RAD IDE)
 
-A bpmn-js editor backed by a workspace model library. Create, edit, deploy
-(idempotent), pull a deployed model back from the engine, and duplicate.
+**Projects** is the home of Nano's **Rapid Application Development** environment
+and replaces the old standalone "Modeler" tab. A project is a self-contained,
+runnable Deno application directory (see [Workspace vs cluster
+data](#workspace-vs-cluster-data)); the Projects view is a tile gallery with a
+**New project** template picker, and opening a project drops you into its
+workspace. First-party project templates and example apps are themselves shipped
+as extension packs.
 
-**Test run** executes a model entirely in the browser, with no cluster round-trip
-and fully offline. The Test mode is powered by **μ-nano** ("micro-nano") — a
-compact WebAssembly build of the very same Rust `engine-core` that the cluster
-runs, aggressively size-optimized (`opt-level="z"`, fat LTO, single codegen unit,
-`panic="abort"`, `wasm-opt -Oz`) to about **0.5 MB**, and served gzip-compressed
-so it lands in **~0.2 MB** over the wire. It is compiled for `wasm32` and loaded
-straight into the page. Because it is the production engine (not a
-re-implementation), token flow, gateways, timers, and FEEL expressions behave
-exactly as they will on the server.
+Inside a project you author four first-class file kinds, each with a dedicated
+editor:
+
+- **Models** (`.bpmn`, in `resources/processes/`) — a bpmn-js editor.
+- **Decisions** (`.dmn`, in `resources/decisions/`) — a dmn-js editor. DMN is
+  executed **natively** by the engine's Rust decision engine (no JVM), so a
+  `businessRuleTask` with a `zeebe:calledDecision` evaluates on the cluster just
+  like any other element.
+- **Forms** (`.form`, in `resources/forms/`) — a form editor with live preview.
+- **Pages** (`.page.json`, in `pages/`) — a **Page Composer** for assembling data
+  grids and page layouts over the project's domain.
+
+From a BPMN file you can **Deploy** the model to the engine (idempotent), **Start
+instance** (optionally supplying initial variables as JSON) once the saved XML
+matches what is deployed, and **Test** it entirely in the browser. At the project
+level a **Run / Stop / Compile / Configure / Export** toolbar spawns
+`deno run main.ts`, cross-compiles a binary, or zips the whole project — none of
+which touches the engine data dir.
+
+**Test** executes a model entirely in the browser, with no cluster round-trip and
+fully offline. It is powered by **μ-nano** ("micro-nano") — a compact WebAssembly
+build of the very same Rust `engine-core` that the cluster runs, aggressively
+size-optimized (`opt-level="z"`, fat LTO, single codegen unit, `panic="abort"`,
+`wasm-opt -Oz`) to about **0.5 MB**, and served gzip-compressed so it lands in
+**~0.2 MB** over the wire. It is compiled for `wasm32` and loaded straight into
+the page. Because it is the production engine (not a re-implementation), token
+flow, gateways, timers, DMN, and FEEL expressions behave exactly as they will on
+the server.
 
 To run a test and inspect the trace:
 
-1. Open a model in the Modeler and click **Test run**.
+1. Open a model in a project and click **Test**.
 2. Start an instance (optionally supplying initial variables as JSON).
 3. As each job activates, **complete** it with mock result variables, **fail** it,
    or throw a BPMN **error** — μ-nano advances the tokens accordingly.
@@ -786,6 +820,14 @@ To run a test and inspect the trace:
 
 A live process-instance explorer (variables, jobs, incidents) with BPMN XML for
 each running or completed instance.
+
+### Traces
+
+**Execution traces** folded from the engine event stream: a searchable list of
+process instances (active, completed, terminated) with a per-instance **timeline**
+of the elements visited, jobs created/completed, and variable snapshots. Where
+Explorer shows live instance state, Traces reconstructs the ordered history of how
+each instance got there.
 
 ### Workers
 
@@ -836,20 +878,32 @@ handler body. That ethos drives the code intelligence:
 
 The console keeps the user's **authoring source of truth** in a *workspace*
 directory, deliberately separate from the engine's data dir so that deleting
-cluster data leaves your models and workers intact.
+cluster data leaves your projects and workers intact. Each project is a
+self-contained, runnable Deno application under `<workspace>/projects/`:
 
 ```text
 <workspace>/
-├── models/<name>.bpmn          # BPMN models (Modeler)
-├── workers/<name>/             # one directory per worker (worker.ts, deno.json, …)
-├── lib/                        # shared library modules, importable as `@lib/…`
-├── .nanobpm/worker-sdk.ts      # embedded Deno worker SDK (auto-written)
-└── .deno-cache/                # DENO_DIR for worker dependency caching
+└── projects/<project>/          # one directory per RAD project (a runnable Deno app)
+    ├── nanobpm.project.json      # project config (name, deploy target, platforms)
+    ├── deno.json                 # import map (@nanobpm/worker, @lib/) + start task
+    ├── tsconfig.json             # standard-tooling type resolution
+    ├── package.json              # npm identity + `npm install` deps
+    ├── main.ts                   # entrypoint: deploys processes + starts workers
+    ├── resources/
+    │   ├── processes/<name>.bpmn # BPMN models (deployed to the engine on run)
+    │   ├── decisions/<name>.dmn  # DMN decisions
+    │   └── forms/<name>.form     # forms
+    ├── pages/<name>.page.json    # Page Composer pages
+    ├── workers/<name>/           # one directory per worker (worker.ts, deno.json, …)
+    ├── lib/                      # shared library modules, importable as `@lib/…`
+    ├── nano-generated/worker-sdk.ts  # embedded Deno worker SDK (auto-written)
+    └── .deno-cache/              # DENO_DIR for worker dependency caching
 ```
 
 | Variable | Meaning |
 | --- | --- |
-| `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (models + workers). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
+| `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (holds `projects/`). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
+| `NANOBPMN_PROJECTS_DIR=<dir>` | Override the projects root directly. Default `<workspace>/projects`. |
 | `NANOBPMN_DENO_BIN=<path>` | Explicit path to the Deno binary used to run workers. Default: `deno` on `PATH`, else `~/.deno/bin/deno`. |
 
 ### Embedded workers (Deno)
