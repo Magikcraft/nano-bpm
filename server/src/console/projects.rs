@@ -2880,7 +2880,17 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
         return Err("a project with that name already exists".into());
     }
     let to = projects_root().join(new);
-    if to.exists() {
+    // On a case-insensitive filesystem `to.exists()` is true for a case-only
+    // rename (e.g. "MyApp" → "myapp") because `to` and `from` are the same
+    // directory — allow that, and only reject when `to` is a genuinely
+    // different existing entry. Canonicalizing both collapses the case so the
+    // self-directory comparison holds on case-insensitive and case-sensitive
+    // filesystems alike.
+    let to_is_self = match (to.canonicalize(), from.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if to.exists() && !to_is_self {
         return Err("a project with that name already exists".into());
     }
     // Case-insensitive collision against every other project's slug + display
@@ -5411,6 +5421,32 @@ mod tests {
         let cfg = rename_project("cool-app", "cool-app").expect("clear display");
         assert_eq!(cfg.name, "cool-app");
         assert_eq!(cfg.display_name, None);
+    }
+
+    #[test]
+    fn rename_changes_only_case_of_the_slug() {
+        let _g = lock();
+        let _root = temp_root();
+        create_project("MyApp", "", "starter").expect("create");
+        // A case-only slug rename must succeed even on a case-insensitive
+        // filesystem, where `to` (myapp) resolves to the project's own "MyApp"
+        // directory and the naive `to.exists()` check would wrongly reject it.
+        let cfg = rename_project("MyApp", "myapp").expect("case-only rename");
+        assert_eq!(cfg.name, "myapp");
+        // No duplicate project resulted — the single dir was renamed in place.
+        let names: Vec<String> = list_projects()
+            .expect("list")
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(
+            names
+                .iter()
+                .filter(|n| n.eq_ignore_ascii_case("myapp"))
+                .count(),
+            1,
+            "expected exactly one myapp project, got: {names:?}"
+        );
     }
 
     #[test]

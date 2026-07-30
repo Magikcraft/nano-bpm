@@ -254,7 +254,11 @@ export default function Projects() {
           </div>
         </Card>
 
-        {templates.length === 0 ? (
+        {loading ? (
+          <div className="py-16 text-center text-sm text-fg-faint">
+            Loading…
+          </div>
+        ) : templates.length === 0 ? (
           <EmptyState
             title="No templates available."
             hint="The server reported no scaffold templates — check the gateway connection."
