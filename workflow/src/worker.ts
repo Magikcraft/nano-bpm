@@ -91,6 +91,15 @@ export class Worker {
         // `task` (external worker) contribute no in-process route.
         if (s.kind !== "run") continue;
         const handler = wf.handlers[s.name];
+        if (typeof handler !== "function") {
+          // `DeclarativeFlow` is a public type; a consumer-constructed flow could
+          // carry a `run` step with no handler. Fail fast at registration with a
+          // clear message rather than a `handler is not a function` TypeError on
+          // the first job activation.
+          throw new Error(
+            `workflow "${wf.id}": run step "${s.name}" has no handler function`,
+          );
+        }
         this.addRoute(jobType(wf.id, s.name), {
           workflowId: wf.id,
           handle: async (job) => ({ variables: ((await handler(job)) ?? {}) as JsonObject }),

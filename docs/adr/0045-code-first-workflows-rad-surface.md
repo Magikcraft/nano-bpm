@@ -6,9 +6,11 @@ Date: 2026-07-29.
 > **Decision update (2026-07-30).** The code-first surface this RAD integration exposes is the
 > **declarative `defineFlow`** builder only — the single code-first authoring surface per ADR 0044's
 > 2026-07-30 update. The imperative `defineWorkflow` replay function is experimental/internal and is
-> **not** scaffolded. The scaffold example authors a `defineFlow` with `w.run` (local step),
-> `w.signal` (durable human-in-the-loop wait), and `w.task` (external-worker step); it also ships a
-> `scripts/approve.ts` demonstrating the signal correlation. References to "imperative orchestration
+> **not** scaffolded. The scaffold example authors a `defineFlow` with `w.run` (local step) and
+> `w.signal` (durable human-in-the-loop wait), and ships a `scripts/approve.ts` demonstrating the
+> signal correlation. The third verb, `w.task` (external-worker step), is documented in the README
+> and supported by the SDK but is intentionally left out of the runnable example so the scaffold
+> completes end-to-end without an external worker. References to "imperative orchestration
 > function" below are historical; the shipped scaffold is declarative.
 Relates to:
 ADR 0044 (`0044-code-first-durable-orchestration.md`, the `@nanobpm/workflow` SDK this surfaces),

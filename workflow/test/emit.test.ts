@@ -14,6 +14,7 @@ import {
   WorkflowError,
   type ImperativeWorkflow,
   type Journal,
+  type DeclarativeFlow,
 } from "../dist/index.js";
 
 test("imperative emit: single looped orchestrator with derived job type", () => {
@@ -173,6 +174,22 @@ test("declarative task: a duplicate task/run step name is rejected", () => {
         w.task("a");
       }),
     /duplicate step name "a"/,
+  );
+});
+
+test("worker: a run step with no handler is rejected at registration (fail fast)", () => {
+  // `DeclarativeFlow` is a public type; a consumer could hand-build a flow whose
+  // `run` step has no handler. Registration must fail fast rather than crash on
+  // the first job activation with `handler is not a function`.
+  const malformed: DeclarativeFlow = {
+    kind: "declarative",
+    id: "broken",
+    steps: [{ kind: "run", name: "a" }],
+    handlers: {}, // no handler for "a"
+  };
+  assert.throws(
+    () => new Worker({ baseUrl: "http://localhost:0", workflows: [malformed] }),
+    /run step "a" has no handler/,
   );
 });
 
