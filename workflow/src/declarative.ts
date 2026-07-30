@@ -15,8 +15,17 @@ import type { DeclarativeFlow, DeclarativeStep, StepHandler } from "./types.js";
 import { assertIdent, escapeXml, jobType, messageName } from "./xml.js";
 
 export interface FlowBuilder {
-  /** A durable activity served by a worker (a BPMN service task). */
+  /** A durable activity served by a worker THIS program hosts (a BPMN service
+   *  task; the handler runs in the in-process `Worker`). */
   run(name: string, handler: StepHandler): FlowBuilder;
+  /**
+   * A durable activity served by a worker OUTSIDE this program (a BPMN service
+   * task with the same derived job type `${flowId}:${name}`, but no
+   * locally-hosted handler). The engine offers the job to whichever worker
+   * subscribes to that type — in another process, service, or language. Use
+   * `externalJobTypes(flow)` to list the contract those workers must poll.
+   */
+  task(name: string): FlowBuilder;
   /**
    * A durable wait for an external/human event, correlated on a process
    * variable (a BPMN message intermediate catch event). Resume it with
@@ -41,6 +50,13 @@ export function defineFlow(id: string, build: (w: FlowBuilder) => void): Declara
       handlers[name] = handler;
       return w;
     },
+    task(name) {
+      assertIdent("step name", name);
+      if (seen.has(name)) throw new Error(`duplicate step name "${name}" in flow "${id}"`);
+      seen.add(name);
+      steps.push({ kind: "task", name });
+      return w;
+    },
     signal(name, opts) {
       assertIdent("step name", name);
       if (seen.has(name)) throw new Error(`duplicate step name "${name}" in flow "${id}"`);
@@ -56,6 +72,13 @@ export function defineFlow(id: string, build: (w: FlowBuilder) => void): Declara
   return { kind: "declarative", id, steps, handlers };
 }
 
+/** The derived job types of a flow's external `task` steps — the contract that
+ *  workers outside this program must subscribe to (the engine offers those jobs
+ *  to whoever polls the type). Empty when the flow hosts all its own steps. */
+export function externalJobTypes(flow: DeclarativeFlow): string[] {
+  return flow.steps.filter((s) => s.kind === "task").map((s) => jobType(flow.id, s.name));
+}
+
 /** Derive an executable BPMN model from a declarative flow. */
 export function declarativeToBpmn(flow: DeclarativeFlow): string {
   const nodes: string[] = [];
@@ -67,7 +90,10 @@ export function declarativeToBpmn(flow: DeclarativeFlow): string {
   flow.steps.forEach((step, i) => {
     const incoming = `flow_${i}`;
     const outgoing = `flow_${i + 1}`;
-    if (step.kind === "run") {
+    if (step.kind === "run" || step.kind === "task") {
+      // Both hosted (`run`) and external (`task`) steps are BPMN service tasks
+      // with the same derived job type; they differ only in whether the local
+      // Worker registers a handler for that type.
       nodes.push(
         `    <bpmn:serviceTask id="${escapeXml(step.name)}" name="${escapeXml(step.name)}">\n` +
           `      <bpmn:extensionElements><zeebe:taskDefinition type="${escapeXml(jobType(flow.id, step.name))}" /></bpmn:extensionElements>\n` +

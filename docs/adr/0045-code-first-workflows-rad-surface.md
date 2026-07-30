@@ -2,6 +2,14 @@
 
 Status: **Proposed.**
 Date: 2026-07-29.
+
+> **Decision update (2026-07-30).** The code-first surface this RAD integration exposes is the
+> **declarative `defineFlow`** builder only — the single code-first authoring surface per ADR 0044's
+> 2026-07-30 update. The imperative `defineWorkflow` replay function is experimental/internal and is
+> **not** scaffolded. The scaffold example authors a `defineFlow` with `w.run` (local step),
+> `w.signal` (durable human-in-the-loop wait), and `w.task` (external-worker step); it also ships a
+> `scripts/approve.ts` demonstrating the signal correlation. References to "imperative orchestration
+> function" below are historical; the shipped scaffold is declarative.
 Relates to:
 ADR 0044 (`0044-code-first-durable-orchestration.md`, the `@nanobpm/workflow` SDK this surfaces),
 ADR 0022 (`0022-nano-rad-application.md`, Urban — the model-first RAD App this sits beside),
@@ -19,8 +27,8 @@ model, forms, pages — stamping it into `nano-generated/` so `deno.json`-mapped
 (`@nanobpm/worker`, `@nanobpm/domain`, …) resolve. The authoring act is *drawing the model*; the
 code is derived.
 
-ADR 0044 shipped the **code-first dual**: `@nanobpm/workflow`, where the developer writes an
-ordinary async function (`defineWorkflow`/`defineFlow`) and the SDK *derives the executable BPMN
+ADR 0044 shipped the **code-first dual**: `@nanobpm/workflow`, where the developer writes a
+declarative flow (`defineFlow`) and the SDK *derives the executable BPMN
 model*, the job types, and the message/correlation wiring. The authoring act is *writing the code*;
 the model is derived.
 
@@ -45,8 +53,8 @@ Two questions this ADR must answer explicitly, because they came up directly:
 `@nanobpm/workflow` is a **runtime SDK**, not an IDE pack. Its three couplings are all to this
 repository, so it must co-evolve here:
 
-- **BPMN emission** depends on engine semantics — the imperative surface's looped orchestrator
-  relies on exclusive-gateway loop support in `engine-core/src/bpmn.rs`.
+- **BPMN emission** depends on engine semantics — the declarative builder emits service tasks,
+  message catch events, and (next increment) gateways that `engine-core` must support.
 - **The client** targets the gateway's REST v2 API (`server/`).
 - **Its integration tests boot the sibling `server/` binary** and prove crash-resume in this repo's
   CI.
@@ -77,9 +85,10 @@ stubs, etc.). It stamps a lean tree:
   tsconfig.json      authoring-time types
   main.ts            standalone worker-host service: deploy the workflow(s) + Worker.start(), run forever
   workflows/
-    pr-review.ts     a defineWorkflow example (the durable SDLC loop)
+    pr-review.ts     a defineFlow example (the durable SDLC flow: w.run/w.signal/w.task)
   scripts/
     start-instance.ts  example client that starts one instance (kept out of the host)
+    approve.ts         example client that correlates the `humanApproval` signal
   README.md
 ```
 
@@ -128,10 +137,9 @@ to land the surface.
 
 - **Not the default.** Model-first Urban remains the headline RAD surface; code-first is an
   additional axis for the developer-automation audience.
-- **The determinism constraint (ADR 0044) still binds the imperative orchestration function** — all
-  side effects go inside `ctx.run(name, fn)`. The scaffold's example and README make this explicit.
-- **At-least-once idempotency (ADR 0044)** is inherited; the example handlers are written to be
-  idempotent and say so.
+- **At-least-once idempotency (ADR 0044)** binds each `w.run` step handler; the example handlers are
+  written to be idempotent and say so. (Declarative steps run as ordinary engine jobs, so the
+  imperative replay-determinism constraint does not apply to this surface.)
 - **Round-trip is one-way.** Editing the derived diagram is not supported; the modeller renders it
   read-only for code-first projects.
 - **Versioning / version-skew** for redeploys of a changed orchestration is punted here (tracked on

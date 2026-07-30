@@ -18,7 +18,13 @@
 // The orchestration body MUST be deterministic across replays (no wall-clock
 // branching, RNG, or I/O outside `ctx.run` handlers).
 import { assertIdent, escapeXml, orchestrateType } from "./xml.js";
-/** Define an imperative, replay-driven durable workflow. */
+/** Define an imperative, replay-driven durable workflow.
+ *
+ * @experimental Not the recommended code-first surface. Prefer `defineFlow`
+ * (declarative), whose steps are engine-visible BPMN nodes. This imperative
+ * replay surface compiles to a single opaque looping orchestrator and requires
+ * determinism discipline in the orchestration body; it is retained for advanced
+ * durable-orchestration use only. */
 export function defineWorkflow(id, orchestrate) {
     assertIdent("workflow id", id);
     if (typeof orchestrate !== "function")
