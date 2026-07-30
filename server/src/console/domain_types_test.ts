@@ -528,12 +528,12 @@ Deno.test("emitWorkerBindings maps header keys → typed customHeaders shape (AD
   // Known keys map to `string` (wire type) with an index-signature escape hatch.
   assertStringIncludes(
     out,
-    `"charge": { "region": string; "priority": string; [key: string]: unknown };`,
+    `"charge": { "region": string; "priority": string; [key: string]: string };`,
   );
   // Untrimmed duplicates, blank and whitespace-only keys collapse to one clean key.
   assertStringIncludes(
     out,
-    `"review": { "region": string; [key: string]: unknown };`,
+    `"review": { "region": string; [key: string]: string };`,
   );
   // A worker with no declared headers carries no WorkerHeaders entry.
   assertEquals(out.includes('"noop": {'), false);

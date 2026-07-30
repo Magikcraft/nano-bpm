@@ -2909,14 +2909,19 @@ async fn regenerate_domain_types(name: &str) {
 }
 
 /// Whether a saved project file is a process model that carries the worker/message
-/// I/O + custom-header contract the `domaintypes` op derives (ADR 0033 §3). A
-/// `.bpmn` under `resources/processes/` is the scan surface (`envelope_scan::
-/// scan_project`), so saving one must retrigger regeneration to avoid drift. The
-/// check is on the extension (case-insensitive) so a model saved anywhere counts.
+/// I/O + custom-header contract the `domaintypes` op derives (ADR 0033 §3). The
+/// scan surface is exactly `resources/processes/*.bpmn` (`envelope_scan::
+/// scan_project` reads that directory non-recursively), so the regeneration
+/// trigger matches it precisely: a `.bpmn` directly under `resources/processes/`
+/// (extension case-insensitive). A `.bpmn` saved elsewhere is not scanned, so it
+/// must not spuriously retrigger a regeneration that could not reflect it.
 pub(super) fn is_model_resource(rel: &str) -> bool {
-    std::path::Path::new(rel)
-        .extension()
+    // Mirror `safe_project_path`'s leading-slash tolerance so the trigger matches
+    // exactly what was saved.
+    let path = std::path::Path::new(rel.trim_start_matches('/'));
+    path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("bpmn"))
+        && path.parent() == Some(std::path::Path::new("resources/processes"))
 }
 
 /// `GET /console/api/projects/{name}/data/sources` — the datasources the App
@@ -3481,8 +3486,16 @@ mod asset_encoding_tests {
 
     #[test]
     fn is_model_resource_matches_bpmn_only() {
+        // The scan surface: `.bpmn` directly under `resources/processes/`,
+        // extension matched case-insensitively.
         assert!(is_model_resource("resources/processes/order.bpmn"));
-        assert!(is_model_resource("order.BPMN")); // case-insensitive
+        assert!(is_model_resource("resources/processes/order.BPMN")); // case-insensitive
+        assert!(is_model_resource("/resources/processes/order.bpmn")); // leading-slash tolerated
+        // A `.bpmn` outside the scan surface is NOT a scanned model, so it must
+        // not trigger a regeneration that could not reflect it.
+        assert!(!is_model_resource("order.bpmn")); // project root, not scanned
+        assert!(!is_model_resource("resources/processes/sub/order.bpmn")); // nested, not scanned
+        assert!(!is_model_resource("resources/order.bpmn"));
         assert!(!is_model_resource("workers/charge/worker.ts"));
         assert!(!is_model_resource("resources/forms/f.form"));
         assert!(!is_model_resource("nano.app.json"));
