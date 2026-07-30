@@ -1,0 +1,76 @@
+/* Theme the driver.js popover with the console's own design tokens so the tour
+ * tracks dark/light mode automatically (tokens defined in src/theme/tokens.css).
+ * Scoped to `.driver-popover.nano-tour` (set via the `popoverClass` option). */
+
+.driver-popover.nano-tour {
+  background-color: var(--nano-panel);
+  color: var(--nano-text);
+  border: 1px solid var(--nano-edge);
+  border-radius: 12px;
+  box-shadow:
+    0 10px 30px -10px rgb(0 0 0 / 45%),
+    0 2px 8px -4px rgb(0 0 0 / 30%);
+  max-width: 320px;
+}
+
+.driver-popover.nano-tour .driver-popover-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--nano-text);
+}
+
+.driver-popover.nano-tour .driver-popover-description {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--nano-text-muted);
+}
+
+.driver-popover.nano-tour .driver-popover-progress-text {
+  font-size: 11px;
+  color: var(--nano-text-faint);
+}
+
+/* Arrow inherits the popover background so it blends on every side. */
+.driver-popover.nano-tour .driver-popover-arrow {
+  color: var(--nano-panel);
+}
+
+.driver-popover.nano-tour .driver-popover-navigation-btns button,
+.driver-popover.nano-tour .driver-popover-close-btn {
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 550;
+  text-shadow: none;
+  transition: background-color 120ms ease;
+}
+
+/* Primary (Next / Done). */
+.driver-popover.nano-tour .driver-popover-next-btn {
+  background-color: var(--nano-accent);
+  color: var(--nano-on-accent);
+  border: 1px solid transparent;
+}
+
+.driver-popover.nano-tour .driver-popover-next-btn:hover {
+  background-color: var(--nano-accent-strong);
+}
+
+/* Secondary (Back). */
+.driver-popover.nano-tour .driver-popover-prev-btn {
+  background-color: transparent;
+  color: var(--nano-text-muted);
+  border: 1px solid var(--nano-edge-strong);
+}
+
+.driver-popover.nano-tour .driver-popover-prev-btn:hover {
+  background-color: var(--nano-hover);
+  color: var(--nano-text);
+}
+
+.driver-popover.nano-tour .driver-popover-close-btn {
+  color: var(--nano-text-faint);
+}
+
+.driver-popover.nano-tour .driver-popover-close-btn:hover {
+  color: var(--nano-text);
+}

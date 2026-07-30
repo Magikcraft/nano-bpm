@@ -19,6 +19,7 @@ import { getExtensions, getMarketplace, getTopology } from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 import { IS_STUDIO } from "./lib/profile";
+import { useProductTour } from "./lib/tour/useProductTour";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -210,6 +211,7 @@ function ThemeToggle() {
 
 export default function App() {
   const location = useLocation();
+  const { startTour } = useProductTour({ autoStart: true });
   // Remember the last place the user was within the Projects section (the
   // project list or a specific workspace) so the rail's "Projects" item returns
   // them there after a detour through Metrics/Traces/etc. — instead of always
@@ -334,7 +336,12 @@ export default function App() {
               ? location.pathname.startsWith("/projects")
               : location.pathname === item.to;
             return (
-              <NavLink key={item.to} to={to} className={railItemClass(active)}>
+              <NavLink
+                key={item.to}
+                to={to}
+                data-tour={`nav-${item.label.toLowerCase()}`}
+                className={railItemClass(active)}
+              >
                 <ActiveBar show={active} />
                 {item.icon}
                 {item.label}
@@ -353,9 +360,24 @@ export default function App() {
           })}
         </nav>
 
+        <button
+          type="button"
+          onClick={startTour}
+          data-tour="take-a-tour"
+          className={`mt-auto mx-3 ${railItemClass(false)}`}
+          title="Replay the product tour"
+        >
+          <Icon>
+            <circle cx="12" cy="12" r="9" />
+            <path d="M9.1 9a3 3 0 1 1 4.3 3.2c-.8.5-1.4 1-1.4 1.9" />
+            <path d="M12 17h.01" />
+          </Icon>
+          Take a tour
+        </button>
+
         <a
           href="/docs"
-          className={`mt-auto mx-3 ${railItemClass(false)}`}
+          className={`mx-3 ${railItemClass(false)}`}
           title="Documentation"
         >
           {icons.docs}

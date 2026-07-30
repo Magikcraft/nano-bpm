@@ -298,6 +298,7 @@ export default function Projects() {
             </Button>
             <Button
               variant="primary"
+              data-tour="new-project"
               onClick={() => {
                 setCreating(true);
                 setImporting(false);
