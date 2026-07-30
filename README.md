@@ -141,12 +141,12 @@ c8ctl nano start 3 --rf 3
 # Show cluster status and per-node health (queries each node's /v2/topology)
 c8ctl nano status
 
-# Tail a node's log
-c8ctl nano logs 1 --follow
+# Tail a node's log (node ids are 0-indexed, so a single node is node 0)
+c8ctl nano logs 0 --follow
 
 # Simulate a node failing and recovering
-c8ctl nano pause 1
-c8ctl nano resume 1
+c8ctl nano pause 0
+c8ctl nano resume 0
 
 # Stop the cluster (engine data retained); add --purge to delete engine data
 c8ctl nano stop
