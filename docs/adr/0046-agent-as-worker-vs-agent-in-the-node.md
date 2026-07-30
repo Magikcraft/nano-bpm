@@ -107,7 +107,7 @@ the authoring model for the SDLC use case, and **not** the surface the code-firs
 | Reasoning loop | Engine-hosted | Inside the harness |
 | Tools | Modeled BPMN inner elements (`elementId` catalog) | The agent's own, opaque |
 | LLM config | Engine (`provider`/`model`/`systemPrompt`) | The harness |
-| Budget | Engine-metered (`maxTokens`/`maxToolCalls`) | Harness-internal |
+| Budget | Engine-metered (`maxTokens`/`maxModelCalls`/`maxToolCalls`) | Harness-internal |
 | Engine's role | **Runs** the agent | **Routes to & awaits** the agent |
 | Primitive | `adHocSubProcess` | external job (`w.task`) |
 | Good for | Governed, bounded, pre-enumerated capabilities | Open-ended, long-running autonomous work |
@@ -121,8 +121,8 @@ the authoring model for the SDLC use case, and **not** the surface the code-firs
    engine to run *the* loop and call the model. Nesting them is wasteful or contradictory.
 3. **LLM config is in the wrong place.** Engine-side `provider`/`model`/`systemPrompt` assumes the
    engine calls the model. The harness owns the model, prompt, and context.
-4. **Budget semantics don't transfer.** `maxToolCalls`/`maxTokens` meter the engine's LLM calls; the
-   harness manages its own budget the engine can't see.
+4. **Budget semantics don't transfer.** `AgentInstanceLimits` (`maxTokens`/`maxModelCalls`/`maxToolCalls`)
+   meters the engine's own model and tool calls; the harness manages its own budget the engine can't see.
 5. **Wrong durability shape.** Ad-hoc tool activations are short, in-turn. A coding investigation is a
    long-running (hours), crash-resumable job — external-worker/job-stream territory (heartbeats,
    timeout extension, at-least-once), not tool activation.
