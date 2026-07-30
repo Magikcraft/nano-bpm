@@ -25,11 +25,14 @@ export interface StartProcessAction {
   process: string;
 }
 
-/** An equality filter on a datasource column (whitelisted against the schema at
- * runtime, so it can never inject SQL). */
+/** An filter on a datasource column (whitelisted against the schema at runtime,
+ * so it can never inject SQL). Either an equality (`eq`) or a set membership
+ * (`in`) — set membership is what a tab like "Active = converging|waiting|escalated"
+ * needs. Exactly one of `eq`/`in` should be set; `eq` wins if both are present. */
 export interface ColumnFilter {
   field: string;
-  eq: string;
+  eq?: string;
+  in?: string[];
 }
 
 /** A grid's sort order (a single column, ascending or descending). */
@@ -240,10 +243,17 @@ function parseColumns(raw: unknown): GridColumn[] {
 }
 
 function parseFilter(raw: unknown): ColumnFilter[] {
-  return (Array.isArray(raw) ? raw : [])
-    .filter(isRecord)
-    .map((f) => ({ field: str(f.field), eq: str(f.eq) }))
-    .filter((f) => f.field !== "");
+  const out: ColumnFilter[] = [];
+  for (const f of Array.isArray(raw) ? raw : []) {
+    if (!isRecord(f) || typeof f.field !== "string" || !f.field) continue;
+    if (Array.isArray(f.in)) {
+      const values = f.in.filter((v): v is string => typeof v === "string");
+      if (values.length) out.push({ field: f.field, in: values });
+    } else if (typeof f.eq === "string") {
+      out.push({ field: f.field, eq: f.eq });
+    }
+  }
+  return out;
 }
 
 function parseOrder(raw: unknown): GridOrder | undefined {

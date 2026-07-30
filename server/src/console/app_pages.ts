@@ -161,9 +161,10 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
       if (!tables.has(table)) {
         return json({ error: `unknown table "${table}"` }, 404);
       }
-      // Parse ?where=col:value (repeatable, ANDed) and ?order=col:dir. Every
-      // column is whitelisted against the table's real columns before it reaches
-      // the SQL; values are always bound as `?` parameters.
+      // Parse ?where=col:value (equality) or ?where=col:in:v1,v2 (set membership),
+      // repeatable and ANDed, plus ?order=col:dir. Every column is whitelisted
+      // against the table's real columns before it reaches the SQL; values are
+      // always bound as `?` parameters (commas in an `in` list split values).
       let columns: Set<string>;
       try {
         columns = await knownColumns(table);
@@ -176,12 +177,18 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
         const colon = raw.indexOf(":");
         if (colon <= 0) return json({ error: "invalid where clause" }, 400);
         const field = raw.slice(0, colon);
-        const value = raw.slice(colon + 1);
+        const rest = raw.slice(colon + 1);
         if (!columns.has(field)) {
           return json({ error: `unknown column "${field}"` }, 400);
         }
-        clauses.push(`${field} = ?`);
-        params.push(value);
+        if (rest.startsWith("in:")) {
+          const values = rest.slice(3).split(",");
+          clauses.push(`${field} IN (${values.map(() => "?").join(", ")})`);
+          for (const v of values) params.push(v);
+        } else {
+          clauses.push(`${field} = ?`);
+          params.push(rest);
+        }
       }
       let orderSql = "";
       const orderRaw = url.searchParams.get("order");
@@ -460,7 +467,10 @@ function renderDataGrid(node) {
   function dataUrl(source, tbl, filters, order) {
     let u = "/app/data/" + encodeURIComponent(source) + "/" + encodeURIComponent(tbl);
     const qs = [];
-    for (const f of filters || []) qs.push("where=" + encodeURIComponent(f.field + ":" + f.eq));
+    for (const f of filters || []) {
+      if (Array.isArray(f.in)) qs.push("where=" + encodeURIComponent(f.field + ":in:" + f.in.join(",")));
+      else qs.push("where=" + encodeURIComponent(f.field + ":" + f.eq));
+    }
     if (order && order.field) qs.push("order=" + encodeURIComponent(order.field + ":" + (order.dir || "asc")));
     return qs.length ? u + "?" + qs.join("&") : u;
   }

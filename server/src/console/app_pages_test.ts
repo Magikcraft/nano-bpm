@@ -252,3 +252,25 @@ Deno.test("POST /app/actions/message requires name and correlationKey", async ()
   );
   assertEquals(res.status, 400);
 });
+
+Deno.test("GET /app/data supports a whitelisted IN filter (set membership)", async () => {
+  let seenSql = "";
+  let seenParams: unknown[] = [];
+  const c = ctx({
+    db: {
+      schema: () => Promise.resolve([{ name: "pull_requests" }]),
+      query: (sql: string, params?: unknown[]) => {
+        if (/table_info/.test(sql)) return Promise.resolve([{ name: "status" }]);
+        seenSql = sql;
+        seenParams = params ?? [];
+        return Promise.resolve([]);
+      },
+    },
+  });
+  const res = await createPagesHandler(c)(
+    new Request("http://x/app/data/app/pull_requests?where=status:in:converging,escalated,waiting_review"),
+  );
+  assertEquals(res.status, 200);
+  assert(seenSql.includes("status IN (?, ?, ?)"));
+  assertEquals(seenParams, ["converging", "escalated", "waiting_review"]);
+});

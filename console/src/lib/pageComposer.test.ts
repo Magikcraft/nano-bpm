@@ -177,8 +177,19 @@ const v2Grid: PageDoc = {
         columns: [{ field: "pr_key", header: "PR" }],
         rowKey: "pr_key",
         tabs: [
-          { label: "Active", filter: [{ field: "status", eq: "converging" }] },
-          { label: "History", filter: [{ field: "status", eq: "converged" }] },
+          {
+            label: "Active",
+            filter: [
+              {
+                field: "status",
+                in: ["converging", "waiting_review", "escalated"],
+              },
+            ],
+          },
+          {
+            label: "History",
+            filter: [{ field: "status", in: ["converged", "abandoned"] }],
+          },
         ],
         rowActions: [
           {
