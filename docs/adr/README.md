@@ -57,6 +57,8 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0042](0042-urban-page-screen-composer.md) | The Urban Page/Screen Composer: a Craft.js WYSIWYG surface over an owned `page.json`, served by a generic runtime | Proposed | 2026-07-27 |
 | [0043](0043-bojtos-demo-framework.md) | Bojtos: a publishable in-browser BPMN demo framework | Proposed | 2026-07-28 |
 | [0044](0044-code-first-durable-orchestration.md) | Code-first durable orchestration for the single-user SDLC (Camunda Nano) | Proposed | 2026-07-29 |
+| [0045](0045-code-first-workflows-rad-surface.md) | Code-first workflows as a RAD authoring surface | Proposed | 2026-07-29 |
+| [0046](0046-agent-as-worker-vs-agent-in-the-node.md) | Two agent topologies: agent-as-worker (native) vs agent-in-the-node (compat) | Proposed | 2026-07-30 |
 
 ## Reading paths
 
