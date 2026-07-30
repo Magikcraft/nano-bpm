@@ -9622,3 +9622,67 @@ fn event_based_gateway_message_wins_and_withdraws_the_timer_sibling() {
     // The cancelled timer never fires, even past its original due instant.
     assert!(engine.trigger_timers(6_000).is_empty());
 }
+
+// Two event-based gateways route into the same catch event `onShared`, making
+// the owning race ambiguous. When `onShared` wins we must NOT withdraw the
+// sibling of either gateway, since we cannot tell which race it belonged to.
+fn ambiguous_event_gateway_race() -> ProcessDefinition {
+    ProcessBuilder::new("ambig")
+        .start_event("start")
+        .event_based_gateway("gw1")
+        .event_based_gateway("gw2")
+        .message_intermediate_catch_event("onShared", "reply", "orderId")
+        .timer_intermediate_catch_event("onTimer1", 5_000)
+        .timer_intermediate_catch_event("onTimer2", 5_000)
+        .end_event("sharedEnd")
+        .end_event("end1")
+        .end_event("end2")
+        .connect("start", "gw1")
+        .connect("gw1", "onShared")
+        .connect("gw1", "onTimer1")
+        .connect("gw2", "onShared")
+        .connect("gw2", "onTimer2")
+        .connect("onShared", "sharedEnd")
+        .connect("onTimer1", "end1")
+        .connect("onTimer2", "end2")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn event_based_gateway_ambiguous_owner_withdraws_nothing() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(ambiguous_event_gateway_race()))
+        .unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("orderId".to_string(), Value::Str("A".to_string()));
+    let events = engine
+        .apply_command_at(Command::create_instance_with("ambig", vars), 1_000)
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Only gw1's race is live (gw2 is never reached): its timer `onTimer1` and
+    // the shared message subscription are armed.
+    assert_eq!(engine.timers().len(), 1);
+    assert_eq!(engine.timers()[0].state, state::TimerState::Created);
+    assert_eq!(engine.message_subscriptions().len(), 1);
+
+    // The shared catch event wins its message. Because two gateways statically
+    // route into it, the owning race is ambiguous, so the guard withdraws
+    // nothing: the timer sibling is left armed (not cancelled), and its lingering
+    // token keeps the instance live rather than completing it.
+    let correlated = engine
+        .apply_command_at(Command::correlate_message("reply", "A"), 2_000)
+        .unwrap();
+    assert!(!correlated
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+    assert!(!engine.is_completed(instance_key));
+    assert_eq!(
+        engine.timers()[0].state,
+        state::TimerState::Created,
+        "ambiguous owner must not cancel the sibling timer"
+    );
+}

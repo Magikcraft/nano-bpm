@@ -5057,7 +5057,9 @@ impl Engine {
     /// gateway reached again on a loop only ever withdraws the current race.
     ///
     /// Returns an empty vec — the overwhelmingly common path — when `winner`
-    /// is not the immediate target of an event-based gateway.
+    /// is not the immediate target of an event-based gateway, or when its owning
+    /// gateway is ambiguous (more than one event-based gateway routes into the
+    /// same catch event), in which case no siblings are withdrawn.
     fn withdraw_event_gateway_siblings(
         &self,
         instance_key: Key,
@@ -5068,21 +5070,30 @@ impl Engine {
         let Some(def) = self.process_of_instance(instance_key) else {
             return Vec::new();
         };
-        // The sibling target ids are the *other* outgoing targets of any
-        // event-based gateway that routes into the winning catch event.
-        let mut sibling_ids: Vec<&str> = Vec::new();
-        for element in def.elements.values() {
-            if !matches!(element.kind, ElementKind::EventBasedGateway) {
-                continue;
-            }
-            if element.outgoing.iter().any(|f| f.to == winner_element_id) {
-                for flow in &element.outgoing {
-                    if flow.to != winner_element_id {
-                        sibling_ids.push(flow.to.as_str());
-                    }
-                }
-            }
-        }
+        // Find the event-based gateway(s) that route into the winning catch
+        // event. In a well-formed model a catch event has exactly one incoming
+        // flow, so at most one gateway owns the race. If more than one gateway
+        // routes into the same catch event the owning race is ambiguous — we
+        // cannot tell which gateway's siblings to withdraw without risking the
+        // cancellation of an unrelated gateway's branch — so we conservatively
+        // do nothing.
+        let owners: Vec<&crate::model::Element> = def
+            .elements
+            .values()
+            .filter(|element| matches!(element.kind, ElementKind::EventBasedGateway))
+            .filter(|element| element.outgoing.iter().any(|f| f.to == winner_element_id))
+            .collect();
+        let [owner] = owners.as_slice() else {
+            return Vec::new();
+        };
+        // The sibling target ids are the *other* outgoing targets of the owning
+        // gateway.
+        let sibling_ids: Vec<&str> = owner
+            .outgoing
+            .iter()
+            .filter(|f| f.to != winner_element_id)
+            .map(|f| f.to.as_str())
+            .collect();
         if sibling_ids.is_empty() {
             return Vec::new();
         }
