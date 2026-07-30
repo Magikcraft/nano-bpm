@@ -399,7 +399,7 @@ test("signal: a typed payload envelope is lifted onto the message", () => {
     "ask",
     { waitAnswer: { in: Answer } },
     (w) => {
-      w.run("ask", async () => ({}));
+      w.run("prepare", async () => ({}));
       w.signal("waitAnswer", { correlationKey: "caseId" });
     },
   );
@@ -497,4 +497,50 @@ test("urban golden: a loop wrapping a status switch with a nested guard compiles
   assert.ok(worker.servedTypes.includes("convergence-loop:review-round"));
   assert.ok(worker.servedTypes.includes("convergence-loop:persist-converged"));
   assert.ok(worker.servedTypes.includes("convergence-loop:persist-round"));
+});
+
+// --- Slice 2: review hardening -----------------------------------------------
+
+test("client.signal: accepts a signal nested inside a switch/branch/loop", async () => {
+  const flow = defineFlow("nested", (w) => {
+    w.run("start", async () => ({}));
+    w.loop((b) => {
+      b.run("attempt", async () => ({}));
+      b.branch("done", {
+        then: (g) => g.break(),
+        else: (g) => g.signal("waitReview", { correlationKey: "prKey" }),
+      });
+    });
+  });
+  const client = new WorkflowClient({ baseUrl: "http://localhost:0" });
+  // The nested signal name is discovered via walkNodes, so it is NOT rejected as
+  // unknown; the call fails only when the (unreachable) gateway is dialed.
+  await assert.rejects(
+    () => client.signal(flow, "waitReview", "PR-1"),
+    (e: unknown) => !(e instanceof WorkflowError && /unknown signal/.test((e as Error).message)),
+  );
+  // A genuine typo is still rejected fast.
+  await assert.rejects(
+    () => client.signal(flow, "waitReviwe", "PR-1"),
+    /unknown signal "waitReviwe"/,
+  );
+});
+
+test("defineFlow: rejects a non-object contracts arg and a missing build callback", () => {
+  // @ts-expect-error contracts must be an object
+  assert.throws(() => defineFlow("f", null, (w) => w.run("a", async () => ({}))), /contracts argument must be an object/);
+  // @ts-expect-error build callback is required
+  assert.throws(() => defineFlow("f", { a: {} }), /build callback .* is required/);
+});
+
+test("defineFlow: rejects step names that collide with generated BPMN ids", () => {
+  for (const bad of ["Start", "End", "Gw_0", "Loop_0", "Msg_x", "f_0"]) {
+    assert.throws(
+      () => defineFlow("wf", (w) => w.run(bad, async () => ({}))),
+      /reserved/,
+      `"${bad}" must be rejected`,
+    );
+  }
+  // A step named the same as the workflow id collides with the process id.
+  assert.throws(() => defineFlow("wf", (w) => w.run("wf", async () => ({}))), /reserved/);
 });

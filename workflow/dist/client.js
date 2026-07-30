@@ -1,7 +1,7 @@
 // A thin, dependency-free client for a running nanobpmn gateway (REST v2):
 // deploy a workflow's derived model, start instances, correlate signals, and the
 // low-level job activate/complete/fail used by the Worker runtime.
-import { declarativeToBpmn } from "./declarative.js";
+import { declarativeToBpmn, walkNodes } from "./declarative.js";
 import { imperativeToBpmn } from "./imperative.js";
 import { assertWorkflowIds, messageName } from "./xml.js";
 /** Render a workflow (either surface) to its executable BPMN model. */
@@ -75,7 +75,13 @@ export class WorkflowClient {
      *  unknown signal name (a typo would otherwise send an uncorrelatable message
      *  that the gateway silently drops). */
     async signal(flow, signalName, correlationKey, variables = {}) {
-        const signals = flow.steps.filter((s) => s.kind === "signal").map((s) => s.name);
+        // Signal steps can live anywhere in the tree (inside switch/branch/loop),
+        // so walk the whole flow, not just the top-level sequence.
+        const signals = [];
+        walkNodes(flow.steps, (n) => {
+            if (n.kind === "signal")
+                signals.push(n.name);
+        });
         if (!signals.includes(signalName)) {
             throw new WorkflowError(`unknown signal "${signalName}" on flow "${flow.id}" — declared signals: ${signals.length ? signals.map((s) => `"${s}"`).join(", ") : "(none)"}`);
         }

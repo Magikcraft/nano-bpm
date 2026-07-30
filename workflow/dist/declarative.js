@@ -26,8 +26,18 @@
 // zeebe:property), so the generated .bpmn is ejectable to model-first with its
 // typed contracts intact.
 import { assertIdent, escapeXml, jobType, messageName } from "./xml.js";
+/** Ids the emitter generates for structural nodes / flows / messages. A step
+ *  name that collides with one of these would produce a duplicate BPMN id and an
+ *  invalid model, so reject them at authoring time. */
+const RESERVED_PREFIXES = /^(Gw_|Loop_|Msg_|f_)/;
 function claimName(ctx, id, name) {
     assertIdent("step name", name);
+    if (name === "Start" || name === "End" || name === id) {
+        throw new Error(`step name "${name}" is reserved (collides with a generated BPMN id) in flow "${id}"`);
+    }
+    if (RESERVED_PREFIXES.test(name)) {
+        throw new Error(`step name "${name}" uses a reserved prefix (Gw_/Loop_/Msg_/f_ are generated ids) in flow "${id}"`);
+    }
     if (ctx.seen.has(name))
         throw new Error(`duplicate step name "${name}" in flow "${id}"`);
     ctx.seen.add(name);
@@ -120,8 +130,14 @@ function makeBuilder(id, out, ctx) {
 }
 export function defineFlow(id, second, third) {
     assertIdent("workflow id", id);
+    if (typeof second !== "function" && (second === null || typeof second !== "object")) {
+        throw new Error(`defineFlow("${id}"): the contracts argument must be an object`);
+    }
     const contracts = typeof second === "function" ? {} : second;
     const build = (typeof second === "function" ? second : third);
+    if (typeof build !== "function") {
+        throw new Error(`defineFlow("${id}"): a build callback (w) => {…} is required`);
+    }
     const steps = [];
     const handlers = {};
     const ctx = { contracts, handlers, seen: new Set(), loopDepth: 0 };
