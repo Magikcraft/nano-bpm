@@ -1037,7 +1037,19 @@ impl apis::projects::Projects for ServerImpl {
         body: &String,
     ) -> Result<apis::projects::SaveProjectFileResponse, ()> {
         match super::project_file_save(&path_params.name, &query_params.path, body) {
-            Ok(_) => Ok(apis::projects::SaveProjectFileResponse::Status204_Saved),
+            Ok(_) => {
+                // Regenerate the typed SDK when a process model is saved: the
+                // model is the source of truth for worker/message I/O + custom
+                // headers (ADR 0033 §3), so a saved `.bpmn` must re-derive
+                // `worker-io.d.ts` et al. or the generated types drift from the
+                // model. Best-effort — the save already succeeded and the types
+                // are an authoring-time contract only (mirrors the DDL/migrate
+                // regen triggers on the data path).
+                if super::is_model_resource(&query_params.path) {
+                    super::regenerate_domain_types(&path_params.name).await;
+                }
+                Ok(apis::projects::SaveProjectFileResponse::Status204_Saved)
+            }
             Err((_, msg)) => {
                 Ok(apis::projects::SaveProjectFileResponse::Status400_InvalidRequest(msg))
             }
