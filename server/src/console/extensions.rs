@@ -297,6 +297,17 @@ pub struct ConfigField {
 pub struct TemplateSpec {
     pub id: String,
     pub label: String,
+    /// One-line description for the New Project template card. Older packs
+    /// instead cram "Title — description" into `label`; the template menu
+    /// splits that on the em-dash as a fallback (see `project_templates`).
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Language pack id this template's project uses, when it differs from
+    /// what the pack implies (lang packs → the pack id; app/example packs →
+    /// `requires[0]`, else "deno"). Drives the card's language icon AND the
+    /// scaffolded project's `lang`.
+    #[serde(default)]
+    pub lang: Option<String>,
 }
 
 /// The `nano-ide.ext.json` manifest, read as data.
@@ -410,7 +421,9 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             file_types: vec![],
             templates: vec![TemplateSpec {
                 id: "gui-starter".into(),
-                label: "GUI app — served UI binary (Deno.serve)".into(),
+                label: "GUI app".into(),
+                description: Some("Served UI binary (Deno.serve)".into()),
+                lang: None,
             }],
             toolchain: Toolchain::default(),
             requires: vec![],

@@ -9,16 +9,14 @@ import {
   type ProjectSummary,
   type ProjectTemplate,
 } from "../gen";
-import {
-  Button,
-  Card,
-  EmptyState,
-  Input,
-  PageHeader,
-  inputClass,
-} from "../components/ui";
+import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
 import DirectoryPicker from "../components/DirectoryPicker";
 import { isLocalhost } from "../lib/api";
+import {
+  slugifyProjectName,
+  validateProjectName,
+  validateSafeName,
+} from "../lib/projectName";
 
 /// Resolved language-pack presentation for a project card: the pack's icon
 /// (inline SVG markup or a data:/http: URL) and its human-facing name.
@@ -34,29 +32,10 @@ function iconSrc(icon: string): string {
   return s;
 }
 
-/// Mirrors the server's `is_safe_name` (console/workspace.rs) so the New Project
-/// form can validate in real time instead of failing on submit. Returns a
-/// human-readable error, or `null` when the name is acceptable.
-function validateProjectName(
-  raw: string,
-  existing: ProjectSummary[],
-): string | null {
-  const name = raw.trim();
-  if (!name) return null; // empty is "incomplete", not an error to shout about
-  if (name.length > 128) return "Too long — 128 characters max.";
-  if (name === "." || name.includes(".."))
-    return "Cannot be “.” or contain “..”.";
-  if (/\s/.test(name)) return "No spaces — use dashes or underscores instead.";
-  const bad = [...name].find((c) => !/[A-Za-z0-9_.-]/.test(c));
-  if (bad)
-    return `Invalid character “${bad}”. Use letters, digits, dashes, underscores or dots.`;
-  if (existing.some((p) => p.name.toLowerCase() === name.toLowerCase()))
-    return "A project with that name already exists.";
-  return null;
-}
-
 /// Home view of the RAD environment: every project as a tile (like the LLM
-/// profile tiles), plus a create form. Opening a tile routes to its workspace.
+/// profile tiles). "New project" swaps to a template gallery — every scaffold
+/// template as a card (title, language, description) — plus the name form.
+/// Opening a project tile routes to its workspace.
 export default function Projects() {
   const navigate = useNavigate();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
@@ -102,16 +81,28 @@ export default function Projects() {
     void reload();
   }, [reload]);
 
+  // The selected template card. Falls back to the first template so the
+  // gallery never renders with nothing selected (e.g. a pack shadowed away
+  // the remembered id between visits).
+  const selectedTemplate =
+    templates.find((t) => t.id === newTemplate) ?? templates[0];
+
   const create = async () => {
     const name = newName.trim();
     if (!name || nameError) return;
     setBusy(true);
     try {
-      await createProject({
-        body: { name, description: newDesc.trim(), template: newTemplate },
+      const res = await createProject({
+        body: {
+          name,
+          description: newDesc.trim(),
+          template: selectedTemplate?.id ?? "starter",
+        },
         throwOnError: true,
       });
-      navigate(`/projects/${encodeURIComponent(name)}`);
+      // Route by the server's directory-safe slug — for a display name with
+      // spaces ("Home Heating") the project lives at /projects/home-heating.
+      navigate(`/projects/${encodeURIComponent(res.data.name)}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
@@ -123,9 +114,10 @@ export default function Projects() {
     [newName, projects],
   );
   const nameValid = newName.trim().length > 0 && !nameError;
+  const nameSlug = slugifyProjectName(newName);
 
   const importNameError = useMemo(
-    () => validateProjectName(importName, projects),
+    () => validateSafeName(importName, projects),
     [importName, projects],
   );
   const importValid =
@@ -152,14 +144,15 @@ export default function Projects() {
 
   const remove = async (project: ProjectSummary) => {
     const { name, source } = project;
+    const label = project.displayName ?? name;
     // A linked (imported-by-reference) project owns only a pointer file — the
     // backend deletes the reference and leaves the external checkout on disk
     // untouched (ADR 0041). Only a workspace project's files are actually
     // removed, so don't warn about deleting files we won't touch.
     const message =
       source === "path"
-        ? `Remove the link to “${name}”? The files on disk won’t be deleted.`
-        : `Delete project “${name}” and all its files? This cannot be undone.`;
+        ? `Remove the link to “${label}”? The files on disk won’t be deleted.`
+        : `Delete project “${label}” and all its files? This cannot be undone.`;
     if (!confirm(message)) return;
     try {
       await deleteProject({ path: { name }, throwOnError: true });
@@ -169,12 +162,13 @@ export default function Projects() {
     }
   };
 
-  const rename = async (name: string) => {
-    const next = prompt(`Rename “${name}” to:`, name)?.trim();
-    if (!next || next === name) return;
+  const rename = async (project: ProjectSummary) => {
+    const current = project.displayName ?? project.name;
+    const next = prompt(`Rename “${current}” to:`, current)?.trim();
+    if (!next || next === current) return;
     try {
       await renameProject({
-        path: { name },
+        path: { name: project.name },
         body: { newName: next },
         throwOnError: true,
       });
@@ -184,6 +178,109 @@ export default function Projects() {
     }
   };
 
+  const errorBanner = error && (
+    <div className="mb-4 rounded-md border border-danger/40 bg-danger/10 px-4 py-2 text-sm text-danger">
+      {error}
+    </div>
+  );
+
+  // ── New Project: template gallery ─────────────────────────────────────────
+  if (creating) {
+    return (
+      <div className="mx-auto max-w-6xl p-8">
+        <PageHeader
+          title="New project"
+          subtitle="Pick a template and name your project — a runnable app is scaffolded for you."
+          actions={
+            <Button variant="secondary" onClick={() => setCreating(false)}>
+              ← Back to projects
+            </Button>
+          }
+        />
+
+        {errorBanner}
+
+        <Card className="mb-6 p-4">
+          <div className="grid gap-3 sm:grid-cols-[1fr_2fr]">
+            <div>
+              <input
+                autoFocus
+                value={newName}
+                onChange={(e) => setNewName(e.target.value)}
+                placeholder="Project name"
+                aria-invalid={!!nameError}
+                className={`w-full rounded-md border bg-inset px-3 py-2 text-sm text-fg placeholder:text-fg-faint outline-none ${
+                  nameError
+                    ? "border-danger/70 focus:border-danger"
+                    : "border-edge-strong focus:border-accent"
+                }`}
+                onKeyDown={(e) =>
+                  e.key === "Enter" && nameValid && void create()
+                }
+              />
+              <p
+                className={`mt-1 text-xs ${
+                  nameError ? "text-danger" : "text-fg-faint"
+                }`}
+              >
+                {nameError ??
+                  (nameSlug && nameSlug !== newName.trim()
+                    ? `Files will live in “${nameSlug}”.`
+                    : "Spaces are OK — files use a URL-safe slug.")}
+              </p>
+            </div>
+            <Input
+              value={newDesc}
+              onChange={(e) => setNewDesc(e.target.value)}
+              placeholder="Short description (optional)"
+              className="h-fit"
+              onKeyDown={(e) => e.key === "Enter" && nameValid && void create()}
+            />
+          </div>
+          <div className="mt-3 flex items-center gap-3">
+            <Button
+              variant="primary"
+              onClick={() => void create()}
+              disabled={busy || !nameValid}
+            >
+              {busy ? "Creating…" : "Create project"}
+            </Button>
+            {selectedTemplate && (
+              <span className="text-xs text-fg-faint">
+                Template:{" "}
+                <span className="text-fg-muted">{selectedTemplate.label}</span>
+              </span>
+            )}
+          </div>
+        </Card>
+
+        {loading ? (
+          <div className="py-16 text-center text-sm text-fg-faint">
+            Loading…
+          </div>
+        ) : templates.length === 0 ? (
+          <EmptyState
+            title="No templates available."
+            hint="The server reported no scaffold templates — check the gateway connection."
+          />
+        ) : (
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {templates.map((t) => (
+              <TemplateTile
+                key={t.id}
+                template={t}
+                lang={langMeta[t.lang]}
+                selected={t.id === selectedTemplate?.id}
+                onSelect={() => setNewTemplate(t.id)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // ── Projects home ──────────────────────────────────────────────────────────
   return (
     <div className="mx-auto max-w-6xl p-8">
       <PageHeader
@@ -195,7 +292,6 @@ export default function Projects() {
               variant="secondary"
               onClick={() => {
                 setImporting((v) => !v);
-                setCreating(false);
               }}
             >
               {importing ? "Cancel" : "Import by reference"}
@@ -203,11 +299,11 @@ export default function Projects() {
             <Button
               variant="primary"
               onClick={() => {
-                setCreating((v) => !v);
+                setCreating(true);
                 setImporting(false);
               }}
             >
-              {creating ? "Cancel" : "+ New project"}
+              + New project
             </Button>
           </div>
         }
@@ -227,80 +323,7 @@ export default function Projects() {
         </div>
       )}
 
-      {error && (
-        <div className="mb-4 rounded-md border border-danger/40 bg-danger/10 px-4 py-2 text-sm text-danger">
-          {error}
-        </div>
-      )}
-
-      {creating && (
-        <Card className="mb-6 p-4">
-          <div className="grid gap-3 sm:grid-cols-[1fr_2fr]">
-            <div>
-              <input
-                autoFocus
-                value={newName}
-                onChange={(e) => setNewName(e.target.value)}
-                placeholder="project-name"
-                aria-invalid={!!nameError}
-                className={`w-full rounded-md border bg-inset px-3 py-2 text-sm text-fg placeholder:text-fg-faint outline-none ${
-                  nameError
-                    ? "border-danger/70 focus:border-danger"
-                    : "border-edge-strong focus:border-accent"
-                }`}
-                onKeyDown={(e) =>
-                  e.key === "Enter" && nameValid && void create()
-                }
-              />
-              <p
-                className={`mt-1 text-xs ${
-                  nameError ? "text-danger" : "text-fg-faint"
-                }`}
-              >
-                {nameError ??
-                  "Letters, digits, dashes, underscores and dots — no spaces."}
-              </p>
-            </div>
-            <Input
-              value={newDesc}
-              onChange={(e) => setNewDesc(e.target.value)}
-              placeholder="Short description (optional)"
-              className="h-fit"
-              onKeyDown={(e) => e.key === "Enter" && nameValid && void create()}
-            />
-          </div>
-          {templates.length > 0 && (
-            <div className="mt-3">
-              <label className="mb-1 block text-xs text-fg-faint">
-                Template
-              </label>
-              <select
-                value={newTemplate}
-                onChange={(e) => setNewTemplate(e.target.value)}
-                className={`w-full ${inputClass}`}
-              >
-                {templates.map((t) => (
-                  <option key={t.id} value={t.id}>
-                    {t.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-          <div className="mt-3 flex items-center gap-3">
-            <Button
-              variant="primary"
-              onClick={() => void create()}
-              disabled={busy || !nameValid}
-            >
-              {busy ? "Creating…" : "Create project"}
-            </Button>
-            <span className="text-xs text-fg-faint">
-              A starter app is scaffolded for you.
-            </span>
-          </div>
-        </Card>
-      )}
+      {errorBanner}
 
       {importing && (
         <Card className="mb-6 p-4">
@@ -400,12 +423,106 @@ export default function Projects() {
               lang={langMeta[p.lang]}
               onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)}
               onDelete={() => void remove(p)}
-              onRename={() => void rename(p.name)}
+              onRename={() => void rename(p)}
             />
           ))}
         </div>
       )}
     </div>
+  );
+}
+
+/// The language badge shared by project and template cards: the lang pack's
+/// icon when installed, else a two-letter fallback tile.
+function LangIcon({ langId, lang }: { langId: string; lang?: LangMeta }) {
+  const langLabel = lang?.displayName ?? langId;
+  return lang?.icon ? (
+    <img
+      src={iconSrc(lang.icon)}
+      alt={langLabel}
+      title={langLabel}
+      className="h-5 w-5 shrink-0 rounded-sm"
+    />
+  ) : (
+    <span
+      role="img"
+      aria-label={langLabel}
+      title={langLabel}
+      className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm bg-inset text-[9px] font-bold uppercase text-fg-faint"
+    >
+      {(langId || "?").slice(0, 2)}
+    </span>
+  );
+}
+
+/// One scaffold template as a selectable card in the New Project gallery:
+/// language icon + title, the language's name, the template's one-line
+/// description, and its provenance (built-in or contributing pack).
+function TemplateTile({
+  template,
+  lang,
+  selected,
+  onSelect,
+}: {
+  template: ProjectTemplate;
+  lang?: LangMeta;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const langLabel = lang?.displayName ?? template.lang;
+  return (
+    <Card
+      className={`flex flex-col p-4 transition-colors ${
+        selected
+          ? "border-accent ring-1 ring-accent"
+          : "hover:border-edge-strong"
+      }`}
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        aria-pressed={selected}
+        className="flex flex-1 flex-col text-left"
+      >
+        <div className="flex w-full items-center gap-2">
+          <LangIcon langId={template.lang} lang={lang} />
+          <span className="truncate text-base font-semibold text-fg">
+            {template.label}
+          </span>
+          {selected && (
+            <span
+              aria-hidden
+              className="ml-auto inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-accent text-[11px] font-bold text-on-accent"
+            >
+              ✓
+            </span>
+          )}
+        </div>
+        <div className="mt-1 text-xs text-fg-muted">{langLabel}</div>
+        <p className="mt-1 line-clamp-3 min-h-[3.75rem] text-sm text-fg-faint">
+          {template.description || "No description"}
+        </p>
+        <div
+          className="mt-2 flex items-center gap-1 truncate text-[11px] text-fg-faint"
+          title={
+            template.source === "pack"
+              ? `Contributed by the “${template.pack ?? "extension"}” extension pack`
+              : "Built-in scaffold — works offline"
+          }
+        >
+          {template.source === "pack" ? (
+            <>
+              <span aria-hidden>⧉</span>
+              <span className="truncate">
+                {template.pack ?? "Extension pack"}
+              </span>
+            </>
+          ) : (
+            <span>Built-in</span>
+          )}
+        </div>
+      </button>
+    </Card>
   );
 }
 
@@ -422,7 +539,7 @@ function ProjectTile({
   onDelete: () => void;
   onRename: () => void;
 }) {
-  const langLabel = lang?.displayName ?? project.lang;
+  const title = project.displayName ?? project.name;
   return (
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
       <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex">
@@ -430,7 +547,7 @@ function ProjectTile({
           type="button"
           onClick={onRename}
           title="Rename project"
-          aria-label={`Rename project ${project.name}`}
+          aria-label={`Rename project ${title}`}
           className="rounded px-1.5 py-0.5 text-xs text-fg-faint hover:bg-hover hover:text-fg"
         >
           ✎
@@ -441,8 +558,8 @@ function ProjectTile({
           title={project.source === "path" ? "Remove link" : "Delete project"}
           aria-label={
             project.source === "path"
-              ? `Remove link to ${project.name}`
-              : `Delete project ${project.name}`
+              ? `Remove link to ${title}`
+              : `Delete project ${title}`
           }
           className="rounded px-1.5 py-0.5 text-xs text-fg-faint hover:bg-danger/10 hover:text-danger"
         >
@@ -451,23 +568,16 @@ function ProjectTile({
       </div>
       <button onClick={onOpen} className="flex flex-1 flex-col text-left">
         <div className="flex items-center gap-2">
-          {lang?.icon ? (
-            <img
-              src={iconSrc(lang.icon)}
-              alt={langLabel}
-              title={langLabel}
-              className="h-5 w-5 shrink-0 rounded-sm"
-            />
-          ) : (
-            <span
-              title={langLabel}
-              className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm bg-inset text-[9px] font-bold uppercase text-fg-faint"
-            >
-              {(project.lang || "?").slice(0, 2)}
-            </span>
-          )}
-          <span className="truncate text-base font-semibold text-fg">
-            {project.name}
+          <LangIcon langId={project.lang} lang={lang} />
+          <span
+            className="truncate text-base font-semibold text-fg"
+            title={
+              project.displayName
+                ? `${project.displayName} (${project.name})`
+                : project.name
+            }
+          >
+            {title}
           </span>
           {project.source === "path" && (
             <span

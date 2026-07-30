@@ -343,7 +343,9 @@ export default function ProjectWorkspace() {
             Projects
           </Link>
           <span className="text-fg-faint">/</span>
-          <span className="font-semibold text-fg">{detail.config.name}</span>
+          <span className="font-semibold text-fg" title={detail.config.name}>
+            {detail.config.displayName ?? detail.config.name}
+          </span>
         </nav>
         {running && (
           <span className="inline-flex items-center gap-1 rounded-full bg-ok/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ok">
