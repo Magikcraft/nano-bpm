@@ -2064,12 +2064,17 @@ const URBAN_COMPONENT_CLASSIFY_LLM: &str = r#"{
 /// Console model editors use; a single sqlite datasource with a `db/migrations`
 /// dir; the task inbox surface enabled. Valid against `spec-app/nano-app.schema.json`.
 fn urban_manifest(app_id: &str, display_name: &str) -> String {
+    // The human-facing display name is no longer restricted to is_safe_name, so
+    // JSON-escape it (quotes / backslashes / control chars) before embedding it
+    // in this manifest — a raw interpolation would emit invalid JSON for an
+    // exotic name and break the Urban scaffold.
+    let name_json = serde_json::to_string(display_name).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"{{
   "$schema": "https://nanobpm.io/spec-app/nano-app.schema.json",
   "schemaVersion": 1,
   "id": "{app_id}",
-  "name": "{display_name}",
+  "name": {name_json},
   "models": {{
     "processes": ["resources/processes/*.bpmn"],
     "decisions": ["resources/decisions/*.dmn"],
@@ -2153,15 +2158,19 @@ any OpenAI-compatible endpoint via `NANO_APP_LLM_BASE_URL` (default \
 /// Reopen and edit it in the Console Page Composer.
 fn urban_home_page(slug: &str, display: &str) -> String {
     let pid = format!("{slug}-process");
+    // Same JSON-escaping concern as urban_manifest: `display` may now contain
+    // quotes / backslashes / newlines, so embed it as a properly-escaped JSON
+    // string literal rather than interpolating it raw into the template.
+    let title_json = serde_json::to_string(display).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         r#"{{
   "schemaVersion": "1.0",
-  "title": "{display}",
+  "title": {title_json},
   "nodes": [
     {{
       "type": "text",
       "id": "home-title",
-      "props": {{ "text": "{display}", "variant": "heading" }}
+      "props": {{ "text": {title_json}, "variant": "heading" }}
     }},
     {{
       "type": "text",
@@ -5335,6 +5344,22 @@ mod tests {
         let cfg2 = create_project("MyApp", "", "starter").expect("create");
         assert_eq!(cfg2.name, "MyApp");
         assert_eq!(cfg2.display_name, None);
+    }
+
+    #[test]
+    fn urban_scaffolds_json_escape_exotic_display_names() {
+        // Display names are no longer restricted to is_safe_name, so both Urban
+        // JSON scaffolds must escape quotes / backslashes / newlines or they
+        // emit invalid JSON and a broken app.
+        let nasty = "My \"App\"\nline\\two";
+        let manifest = urban_manifest("my-app", nasty);
+        let v: serde_json::Value =
+            serde_json::from_str(&manifest).expect("manifest must be valid JSON");
+        assert_eq!(v["name"], serde_json::json!(nasty));
+        let page = urban_home_page("my-app", nasty);
+        let v: serde_json::Value =
+            serde_json::from_str(&page).expect("home page must be valid JSON");
+        assert_eq!(v["title"], serde_json::json!(nasty));
     }
 
     #[test]
