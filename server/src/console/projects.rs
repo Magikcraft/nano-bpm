@@ -455,6 +455,13 @@ pub struct ProjectRef {
     pub source: String,
     /// Canonical absolute directory the project resolves to.
     pub path: String,
+    /// The human-facing name the operator typed at import time, kept when it
+    /// differs from the directory-safe slug used as the project key (e.g. a name
+    /// with spaces like "Urban PR Review"). `None` when the typed name was
+    /// already slug-safe. Surfaced by the projects list so the tile shows the
+    /// spelling the operator chose rather than the hyphenated slug.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 /// Path to the reference file for `name`, or `None` when the name is unsafe.
@@ -536,9 +543,16 @@ pub fn project_dir(name: &str) -> Option<PathBuf> {
 /// name, the path does not resolve to a directory, or that directory is not a
 /// Nano app/project (has neither `nano.app.json` nor `nanobpm.project.json`).
 pub fn import_project_ref(name: &str, path: &str) -> Result<ProjectRef, String> {
-    if !workspace::is_safe_name(name) {
-        return Err(format!("invalid project name \"{name}\""));
-    }
+    // The operator-supplied name is the human-facing display name and may contain
+    // spaces (or other non-slug characters). Everything on disk — the ref
+    // filename and the project key that flows into `project_dir` — uses its
+    // directory-safe slug, mirroring `create_project`. The original spelling is
+    // kept as `display_name` when it differs so the tile shows what was typed.
+    let display = name.trim().to_string();
+    let slug =
+        project_slug(&display).ok_or_else(|| format!("invalid project name \"{display}\""))?;
+    let display_name = (display != slug).then_some(display);
+    let name = slug.as_str();
     // The API contract documents `path` as an absolute host path. Reject a
     // relative path up front so an import never depends on the server's CWD
     // (canonicalize would otherwise resolve it against the working directory).
@@ -571,6 +585,7 @@ pub fn import_project_ref(name: &str, path: &str) -> Result<ProjectRef, String> 
     let r = ProjectRef {
         source: "path".to_string(),
         path,
+        display_name,
     };
     let f = project_ref_file(name).ok_or_else(|| format!("invalid project name \"{name}\""))?;
     let body = serde_json::to_vec_pretty(&r).map_err(|e| format!("serialize reference: {e}"))?;
@@ -3161,7 +3176,13 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         let res = dir.join("resources");
         out.push(ProjectSummary {
             name: name.to_string(),
-            display_name: cfg.display_name,
+            // Prefer the spelling the operator typed at import time (kept on the
+            // reference), falling back to the external project's own displayName.
+            // The external checkout is never mutated on import (ADR 0041), so a
+            // spaced import name is preserved here rather than in its config.
+            display_name: read_project_ref(name)
+                .and_then(|r| r.display_name)
+                .or(cfg.display_name),
             description: cfg.description,
             deploy_target: cfg.deploy_target,
             updated_ms: cfg.updated_ms,
@@ -3333,7 +3354,7 @@ static DERIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// is structural so it never depends on SDK exports beyond `toBpmn` (published
 /// `@nanobpm/workflow@^0.1.0`). Only `workflows/*.ts` are imported — never
 /// `main.ts`, whose top-level `deploy()` would hit the network.
-const DERIVE_MODELS_DRIVER: &str = r#"import { toBpmn } from "@nanobpm/workflow";
+const DERIVE_MODELS_DRIVER: &str = r#"import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
 
 const root = Deno.args[0] ?? ".";
 const wfDir = `${root}/workflows`;
@@ -3355,7 +3376,9 @@ try {
     if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
     let mod: Record<string, unknown>;
     try {
-      mod = await import(`file://${wfDir}/${entry.name}`);
+      // Encode the path so a project dir / filename with spaces or other
+      // characters that must be URL-escaped still yields a valid `file://` URL.
+      mod = await import(`file://${encodeURI(`${wfDir}/${entry.name}`)}`);
     } catch (e) {
       console.error(`skip ${entry.name}: ${e}`);
       continue;
@@ -3364,7 +3387,18 @@ try {
       if (isWorkflow(value) && !seen.has(value.id)) {
         seen.add(value.id);
         try {
-          out.push({ id: value.id, kind: value.kind, xml: toBpmn(value as never) });
+          const bpmn = toBpmn(value as never);
+          // Auto-lay-out so the viewer renders a real diagram even for a project
+          // that has never been saved (e.g. just imported by reference) and thus
+          // has no on-disk `resources/processes/*.bpmn` to overlay. Fall back to
+          // the DI-less XML if layout fails, so the panel still shows *something*.
+          let xml = bpmn;
+          try {
+            xml = await layoutBpmn(bpmn);
+          } catch (e) {
+            console.error(`layout(${value.id}) failed, serving DI-less: ${e}`);
+          }
+          out.push({ id: value.id, kind: value.kind, xml });
         } catch (e) {
           console.error(`toBpmn(${value.id}) failed: ${e}`);
         }
@@ -3490,11 +3524,24 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     let cache = dir.join(".deno-cache");
     let _ = std::fs::create_dir_all(&cache);
 
-    // Write the driver INTO the project dir so the project's `deno.json` import
-    // map (`@nanobpm/workflow` -> npm:...) applies. Name it uniquely per call
-    // (pid + a process-wide sequence) so concurrent derivations of the same
-    // project never collide on the driver file; remove it afterwards.
     let seq = DERIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // The derivation now auto-lays-out each model (so an imported, never-saved
+    // project still renders a diagram), which needs the `bpmn-auto-layout` peer
+    // dep. An older project's `deno.json` isn't guaranteed to declare it, so —
+    // exactly like `generate_models` — synthesize an import map that merges the
+    // project's own imports and defaults in the SDK + layout dep, and pass it via
+    // `--import-map --no-config` (Deno forbids a map from both a discovered
+    // `deno.json` and the flag). It lives in the cache dir, the only writable scope.
+    let map_name = format!(".nano-derivemap-{}-{}.json", std::process::id(), seq);
+    let map_path = cache.join(&map_name);
+    std::fs::write(&map_path, synthesize_generate_import_map(&dir))
+        .map_err(|e| format!("write import map: {e}"))?;
+
+    // Write the driver INTO the project dir so `file://.../workflows/*.ts` imports
+    // resolve relative to it. Name it uniquely per call (pid + a process-wide
+    // sequence) so concurrent derivations of the same project never collide on
+    // the driver file; remove it afterwards.
     let driver_name = format!(".nano-derive-{}-{}.ts", std::process::id(), seq);
     let driver_path = dir.join(&driver_name);
     std::fs::write(&driver_path, DERIVE_MODELS_DRIVER)
@@ -3518,6 +3565,8 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
         .arg("run")
         .arg("--no-prompt")
         .arg("--no-lock")
+        .arg("--no-config")
+        .arg(format!("--import-map={}", map_path.display()))
         .arg(format!("--allow-net={allow_net}"))
         .arg(format!("--allow-read={}", dir.display()))
         .arg(format!("--allow-write={}", cache.display()))
@@ -3528,6 +3577,7 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
         .await;
 
     let _ = std::fs::remove_file(&driver_path);
+    let _ = std::fs::remove_file(&map_path);
 
     let output = result.map_err(|e| format!("spawn deno: {e}"))?;
     if !output.status.success() {
@@ -5156,6 +5206,36 @@ mod tests {
         let live = std::fs::read_to_string(project_dir("pr-review").unwrap().join("nano.app.json"))
             .unwrap();
         assert!(live.contains("\"id\":\"y\""));
+    }
+
+    #[test]
+    fn import_project_ref_slugs_spaced_name_and_keeps_display() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = ext_app_dir("spaced");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"x","name":"X"}"#,
+        )
+        .unwrap();
+
+        // A name with spaces is accepted: it slugs to the directory-safe key and
+        // the typed spelling is kept as the reference's display name.
+        let r = import_project_ref("Urban PR Review", ext.to_str().unwrap()).expect("import ok");
+        assert_eq!(r.display_name.as_deref(), Some("Urban PR Review"));
+
+        // The on-disk key / ref file uses the slug, and resolves the external dir.
+        assert!(root.join("urban-pr-review.project-ref.json").is_file());
+        let resolved = project_dir("urban-pr-review").expect("resolves");
+        assert_eq!(resolved, std::fs::canonicalize(&ext).unwrap());
+
+        // The projects list surfaces the typed (spaced) display name for the slug.
+        let list = list_projects().unwrap();
+        let linked = list
+            .iter()
+            .find(|p| p.name == "urban-pr-review")
+            .expect("listed by slug");
+        assert_eq!(linked.display_name.as_deref(), Some("Urban PR Review"));
     }
 
     #[test]
