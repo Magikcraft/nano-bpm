@@ -5,22 +5,31 @@
 // evaluation and a default flow, and tasks with multiple incoming flows act as
 // an implicit XOR merge).
 //
-//   const convergence = defineFlow("convergence-loop", (w) => {
-//     w.loop((b) => {
-//       b.task("review-round", { in: PrReviewRoundIn, out: PrReviewRoundOut });
-//       b.switch("status", {
-//         converged: (c) => { c.run("persist-converged", { in: PrFinalizeIn }, finalize); c.break(); },
-//         addressed: (c) => c.branch("round >= maxRounds", {
-//           then: (g) => { g.run("persist-escalation-maxrounds", persistEsc);
-//                          g.signal("wait-answer", { correlationKey: "prKey", payload: EscalationAnswered }); },
-//           else: (g) => { g.run("persist-round", persistRound);   // returns { round: round + 1 }
-//                          g.signal("wait-review", { correlationKey: "prKey", payload: ReviewReady }); },
-//         }),
-//         default: (c) => { c.run("persist-escalation", persistEsc);
-//                           c.signal("wait-answer", { correlationKey: "prKey", payload: EscalationAnswered }); },
+//   const convergence = defineFlow(
+//     "convergence-loop",
+//     {                                             // contracts keyed by step name
+//       "review-round": { in: PrReviewRoundIn, out: PrReviewRoundOut },
+//       "persist-round": { out: RoundState },
+//       "wait-review":  { in: ReviewReady },
+//       "wait-answer":  { in: EscalationAnswered },
+//     },
+//     (w) => {
+//       w.loop((b) => {
+//         b.run("review-round", reviewRound);       // job.variables typed from the contract
+//         b.switch("status", {
+//           converged: (c) => { c.run("persist-converged", finalize); c.break(); },
+//           addressed: (c) => c.branch("round >= maxRounds", {
+//             then: (g) => { g.run("persist-escalation-maxrounds", persistEsc);
+//                            g.signal("wait-answer", { correlationKey: "prKey" }); },
+//             else: (g) => { g.run("persist-round", persistRound);   // returns { round: round + 1 }
+//                            g.signal("wait-review", { correlationKey: "prKey" }); },
+//           }),
+//           default: (c) => { c.run("persist-escalation", persistEsc);
+//                             c.signal("wait-answer", { correlationKey: "prKey" }); },
+//         });
 //       });
-//     });
-//   });
+//     },
+//   );
 //
 // Typed data envelopes are LIFTED into the model (nano:shape + dataEnvelope
 // zeebe:property), so the generated .bpmn is ejectable to model-first with its

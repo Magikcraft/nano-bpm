@@ -544,3 +544,11 @@ test("defineFlow: rejects step names that collide with generated BPMN ids", () =
   // A step named the same as the workflow id collides with the process id.
   assert.throws(() => defineFlow("wf", (w) => w.run("wf", async () => ({}))), /reserved/);
 });
+
+test("envelope: rejects a null/invalid field spec with a clear error (not a TypeError)", () => {
+  assert.throws(
+    // @ts-expect-error null is not a valid field spec
+    () => envelope("Bad", { a: null }),
+    /must be a scalar type or a \{ type, optional\?, list\? \} object/,
+  );
+});

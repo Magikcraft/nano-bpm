@@ -94,6 +94,9 @@ const SCALARS: ReadonlySet<string> = new Set([
 ]);
 
 function normaliseField(name: string, spec: FieldSpec): EnvelopeField {
+  if (spec === null || (typeof spec !== "string" && typeof spec !== "object")) {
+    throw new Error(`envelope field "${name}": must be a scalar type or a { type, optional?, list? } object`);
+  }
   const raw = typeof spec === "string" ? { type: spec } : spec;
   if (!SCALARS.has(raw.type)) {
     throw new Error(
