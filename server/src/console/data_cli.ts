@@ -115,6 +115,10 @@ export function overlayDerivedWorkerIo(
     else delete merged.inputType;
     if (d.outputType) merged.outputType = d.outputType;
     else delete merged.outputType;
+    // Header keys are authored on the model, so the derived set is authoritative:
+    // replace (not union) the manifest's, and clear when the model declares none.
+    if (d.headerKeys && d.headerKeys.length > 0) merged.headerKeys = [...d.headerKeys];
+    else delete merged.headerKeys;
     byType.set(d.taskType, merged);
   }
   return [...byType.values()];

@@ -32,6 +32,78 @@ There are no pre-existing failures or warnings, and you will not allow any to en
 
 All BPMN Models need DI for rendering for humans.
 
+## Adding Support for a New BPMN Element
+
+A BPMN element type touches several layers. Because most of these are
+compile-time exhaustive matches, the compiler will force some (but **not** all)
+of the updates — the non-exhaustive ones (parsers, thin JSON pass-throughs,
+regenerated artifacts) are silent and are the usual source of "it parsed but
+didn't execute" or drift bugs. Work through **every** surface below. Reference
+implementation: the `eventBasedGateway` support (`feat/event-based-gateway`).
+
+**1. `engine-core` — the executable model (always required):**
+
+- `engine-core/src/model.rs`
+  - Add a variant to `enum ElementKind` (the engine's real element type), with
+    any payload fields, and a doc comment describing its runtime semantics.
+  - Add a `ProcessBuilder` constructor method (mirror `exclusive_gateway` /
+    `parallel_gateway`) so the element can be built programmatically.
+  - Some model transforms match on `ElementKind` (`inline_call_activities`,
+    `remap_kind_ids`, …) — only relevant if the element carries embedded ids to
+    remap; the compiler flags any exhaustive match.
+- `engine-core/src/bpmn.rs` (the XML parser — **not** compiler-checked, easy to
+  forget):
+  - Add a variant to the parser-local `enum NodeKind`.
+  - Add a tag-match arm recognizing the BPMN tag (near `exclusiveGateway` /
+    `parallelGateway`). An unrecognized tag is silently dropped, so a flow into
+    it fails deploy with a misleading "unknown target element" error at the
+    *flow*, not the element.
+  - Add the `NodeKind` → `ProcessBuilder` dispatch arm.
+  - Update the `## Supported subset` doc comment at the top of the file.
+- `engine-core/src/engine/mod.rs` (runtime execution):
+  - Pass-through elements (gateways, none events) fall through the `Some(_)` arm
+    in `run_activation_body` (activate → immediately `Complete`) and take their
+    outgoing flow(s) in `finalize_completion`. Bespoke behaviour goes in
+    `activate` / `complete` / `finalize_completion`.
+  - `engine-core/src/engine/boundary.rs` only if the element is boundary-like.
+- Tests: parser test in `bpmn.rs` (inline `#[cfg(test)]`), execution test in
+  `engine/tests.rs`. Update `engine-core/README.md`'s supported-subset list.
+
+**2. `processos` — the reversible IR / structural analysis (compiler-forced +
+one parity test):**
+
+- `processos/src/ir_spec.rs`: add a `KindSpec` to `ELEMENT_KIND_SPECS` (the
+  canonical supported-element registry), a `sample_instances()` entry, and a
+  `variant_witness` arm. The `specs_match_pretty_printer` parity test fails if
+  these drift from `ElementKind`.
+- `processos/src/model_ir.rs`: `kind_keyword`, `render_kind_attrs`, `build_kind`
+  (exhaustive — will not compile until handled).
+- `processos/src/bpmn_model.rs`: `kind_label`, `is_gateway`/`is_task` helpers,
+  the XML emitter match, and `node_dims` (diagram footprint).
+- Regenerate the grammar artifact: `cd processos && cargo run -- emit-gbnf --out
+  assets/ir.gbnf` (commit the result — it is a checked-in derived artifact).
+
+**3. `engine-wasm` + `bojtos-kit` — thin pass-throughs, but regenerate the
+committed artifacts (silent):**
+
+- `engine-core/src/ffi.rs` and `engine-wasm/src/lib.rs` enumerate no element
+  types (JSON snapshots), so no code change — **but** the compiled wasm and its
+  generated `.d.ts`/`.js` are committed. Rebuild: `make console-wasm`
+  (regenerates `engine-wasm/pkg/`) and `make bojtos` (rebuilds
+  `bojtos-kit/dist/` + `bojtos-react/dist/`). `bojtos-kit/src/types.ts`'s
+  `Snapshot` is element-type-agnostic and needs no change.
+
+**4. `console` — only if the element needs modeller/palette support:**
+
+- `console/src/components/BpmnModeler.tsx` / `console/src/lib/urbanComponents.ts`
+  (element templates). Standard BPMN elements that `bpmn-js` already knows need
+  no change; only bespoke `nano:` shapes do.
+
+**Verify end-to-end** by deploying a model using the new element through the
+freshly-built wasm (a Node probe: `createBojtosSession({ wasm: bytes })` →
+`session.deploy(xml)`), not just the Rust unit tests — that is the surface Play
+and the console actually consume.
+
 ## Merging PRs
 
 This repository does **not** auto-merge pull requests. Opening a PR is *not* the

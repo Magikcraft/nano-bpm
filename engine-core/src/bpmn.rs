@@ -15,7 +15,7 @@
 //!
 //! * `process` (one or more per file) with its `id`.
 //! * Flow nodes: `startEvent`, `endEvent`, `serviceTask`, `userTask`,
-//!   `exclusiveGateway`, `parallelGateway`.
+//!   `exclusiveGateway`, `parallelGateway`, `eventBasedGateway`.
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
 //!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an
 //!   interrupting error boundary on the sub-process.
@@ -262,6 +262,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             }
                             "parallelGateway" => {
                                 acc.add_node(attrs, NodeKind::Parallel);
+                            }
+                            "eventBasedGateway" => {
+                                acc.add_node(attrs, NodeKind::EventBased);
                             }
                             "serviceTask" => {
                                 let idx = acc.add_node(attrs, NodeKind::Service);
@@ -1059,6 +1062,7 @@ enum NodeKind {
     User,
     Exclusive,
     Parallel,
+    EventBased,
     IntermediateCatch,
     IntermediateThrow,
     SubProcess,
@@ -1418,6 +1422,7 @@ impl ProcessAcc {
                 NodeKind::IntermediateThrow => builder.intermediate_throw_event(node.id),
                 NodeKind::Exclusive => builder.exclusive_gateway(node.id),
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
+                NodeKind::EventBased => builder.event_based_gateway(node.id),
                 NodeKind::Service => {
                     // A scriptTask carrying an inline zeebe:script (expression +
                     // resultVariable) is an inline-FEEL script task, evaluated on
@@ -2357,6 +2362,47 @@ mod tests {
         );
         let to_no = gw.outgoing.iter().find(|f| f.to == "no").unwrap();
         assert_eq!(to_no.condition, None);
+    }
+
+    #[test]
+    fn should_parse_event_based_gateway_and_its_catch_events() {
+        // given: an event-based gateway routing to a timer and a message
+        // intermediate catch event (a classic timer-vs-message race).
+        let xml = r#"
+          <definitions>
+            <message id="Msg_reply" name="reply">
+              <extensionElements>
+                <zeebe:subscription correlationKey="=orderId" />
+              </extensionElements>
+            </message>
+            <process id="race">
+              <startEvent id="s" />
+              <eventBasedGateway id="gw" />
+              <intermediateCatchEvent id="onTimer">
+                <timerEventDefinition><timeDuration>PT1H</timeDuration></timerEventDefinition>
+              </intermediateCatchEvent>
+              <intermediateCatchEvent id="onReply">
+                <messageEventDefinition messageRef="Msg_reply" />
+              </intermediateCatchEvent>
+              <endEvent id="timedOut" />
+              <endEvent id="replied" />
+              <sequenceFlow id="f0" sourceRef="s" targetRef="gw" />
+              <sequenceFlow id="f1" sourceRef="gw" targetRef="onTimer" />
+              <sequenceFlow id="f2" sourceRef="gw" targetRef="onReply" />
+              <sequenceFlow id="f3" sourceRef="onTimer" targetRef="timedOut" />
+              <sequenceFlow id="f4" sourceRef="onReply" targetRef="replied" />
+            </process>
+          </definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the gateway parsed as an event-based gateway with both targets.
+        let gw = def.element("gw").unwrap();
+        assert_eq!(gw.kind, crate::model::ElementKind::EventBasedGateway);
+        let targets: std::collections::BTreeSet<&str> =
+            gw.outgoing.iter().map(|f| f.to.as_str()).collect();
+        assert_eq!(targets, ["onReply", "onTimer"].into_iter().collect());
     }
 
     #[test]

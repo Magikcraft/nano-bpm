@@ -75,15 +75,19 @@ stubs, etc.). It stamps a lean tree:
   deno.json          import map: @nanobpm/workflow → npm:@nanobpm/workflow ; start task
   package.json       node identity + @nanobpm/workflow dependency
   tsconfig.json      authoring-time types
-  main.ts            deploy the workflow(s) + start a Worker (+ demo: start one instance)
+  main.ts            standalone worker-host service: deploy the workflow(s) + Worker.start(), run forever
   workflows/
     pr-review.ts     a defineWorkflow example (the durable SDLC loop)
+  scripts/
+    start-instance.ts  example client that starts one instance (kept out of the host)
   README.md
 ```
 
 - **Editor**: TypeScript is already supported (Monaco `ts` worker is bundled); no new grammar.
 - **Run supervisor**: reuse the existing Deno run profile — a code-first project is a TS project
-  whose `start` task runs `main.ts` (`deploy` + `Worker.start()`). No new toolchain.
+  whose `start` task runs `main.ts` (`deploy` + `Worker.start()`, then runs forever). No new
+  toolchain. "Run" in the console/IDE executes the same `main.ts`, so standalone and in-IDE are
+  identical (the app is a true standalone runnable, like the model-first scaffolds).
 - **New-Project picker**: the scaffolder's template menu (`project_templates()`) auto-surfaces it,
   so it appears alongside the model-first scaffolds with provenance.
 

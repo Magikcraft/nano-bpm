@@ -43,6 +43,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::UserTask(_) => "userTask",
         ElementKind::ExclusiveGateway => "exclusiveGateway",
         ElementKind::ParallelGateway => "parallelGateway",
+        ElementKind::EventBasedGateway => "eventBasedGateway",
         ElementKind::ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
         ElementKind::TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
         ElementKind::TimerBoundaryEvent { .. } => "timerBoundaryEvent",
@@ -82,7 +83,9 @@ fn is_boundary(kind: &ElementKind) -> bool {
 fn is_gateway(kind: &ElementKind) -> bool {
     matches!(
         kind,
-        ElementKind::ExclusiveGateway | ElementKind::ParallelGateway
+        ElementKind::ExclusiveGateway
+            | ElementKind::ParallelGateway
+            | ElementKind::EventBasedGateway
     )
 }
 
@@ -2019,6 +2022,9 @@ fn emit_element(
         ElementKind::ParallelGateway => {
             out.push_str(&format!("    <bpmn:parallelGateway id=\"{eid}\"{na}/>\n"));
         }
+        ElementKind::EventBasedGateway => {
+            out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}/>\n"));
+        }
         ElementKind::ServiceTask { job_type, priority } => {
             out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:extensionElements>\n");
@@ -2733,7 +2739,9 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
         | ElementKind::UserTask(_)
         | ElementKind::CallActivity { .. }
         | ElementKind::SubProcess { .. } => (110.0, 80.0),
-        ElementKind::ExclusiveGateway | ElementKind::ParallelGateway => (50.0, 50.0),
+        ElementKind::ExclusiveGateway
+        | ElementKind::ParallelGateway
+        | ElementKind::EventBasedGateway => (50.0, 50.0),
         _ => (36.0, 36.0),
     }
 }
