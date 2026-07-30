@@ -788,6 +788,17 @@ impl apis::projects::Projects for ServerImpl {
         let template = flatten_nullable(&body.template).unwrap_or_else(|| "starter".to_string());
         match super::project_create(&body.name, &description, &template) {
             Ok(v) => {
+                // Code-first projects (ADR 0048): generate the initial laid-out
+                // `resources/processes/*.bpmn` from the scaffolded `workflows/*.ts`
+                // so a brand-new project opens with a rendered model. Fire-and-
+                // forget — it needs a Deno round-trip (npm fetch) we must not block
+                // the create response on; best-effort, failures are logged only.
+                if template == "workflow-starter" {
+                    let project = body.name.clone();
+                    tokio::spawn(async move {
+                        super::regenerate_workflow_models(&project).await;
+                    });
+                }
                 Ok(apis::projects::CreateProjectResponse::Status201_ProjectCreated(from_val(v)))
             }
             Err((code, msg)) if code == http::StatusCode::CONFLICT => {
@@ -1047,6 +1058,16 @@ impl apis::projects::Projects for ServerImpl {
                 // regen triggers on the data path).
                 if super::is_model_resource(&query_params.path) {
                     super::regenerate_domain_types(&path_params.name).await;
+                } else if super::is_workflow_source(&query_params.path) {
+                    // Code-first inverse (ADR 0048): a `workflows/*.ts` save
+                    // (re)generates the laid-out `resources/processes/*.bpmn` the
+                    // SDK derives, then refreshes the types from them. Fire-and-
+                    // forget — it needs a Deno round-trip (npm fetch + auto-layout)
+                    // we must not block the save response on; best-effort.
+                    let project = path_params.name.clone();
+                    tokio::spawn(async move {
+                        super::regenerate_workflow_models(&project).await;
+                    });
                 }
                 Ok(apis::projects::SaveProjectFileResponse::Status204_Saved)
             }

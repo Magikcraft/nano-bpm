@@ -60,6 +60,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0045](0045-code-first-workflows-rad-surface.md) | Code-first workflows as a RAD authoring surface | Proposed | 2026-07-29 |
 | [0046](0046-agent-as-worker-vs-agent-in-the-node.md) | Two agent topologies: agent-as-worker (native) vs agent-in-the-node (compat) | Proposed | 2026-07-30 |
 | [0047](0047-declarative-flow-control-and-typed-envelopes.md) | Declarative flow-control combinators and typed data envelopes | Proposed | 2026-07-30 |
+| [0048](0048-code-first-model-generation-with-di.md) | Code-first model generation with diagram layout (on-disk BPMN) | Proposed | 2026-07-30 |
 
 ## Reading paths
 
