@@ -3383,15 +3383,22 @@ console.log(JSON.stringify(out));
 /// `<bpmn:process` and `<process`). Returns `None` if no process element is found
 /// or it has no id.
 fn process_id_from_bpmn(xml: &str) -> Option<String> {
-    for (idx, _) in xml.match_indices("process") {
+    const TAG: &str = "process";
+    for (idx, _) in xml.match_indices(TAG) {
         // Only treat `process` as a tag name when preceded by `<` or a namespace
         // separator `:` (i.e. `<bpmn:process`), never as a substring of another
         // token.
         if !matches!(xml[..idx].chars().last(), Some('<') | Some(':')) {
             continue;
         }
-        let rest = &xml[idx..];
-        let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
+        // ...AND the tag name must END here: the next char must be a tag-name
+        // boundary (whitespace, `/`, or `>`). Otherwise `<bpmn:processes id="x">`
+        // would false-match and pick the wrong id.
+        let after = &xml[idx + TAG.len()..];
+        if !matches!(after.chars().next(), Some(c) if c.is_whitespace() || c == '/' || c == '>') {
+            continue;
+        }
+        let tag = &after[..after.find('>').unwrap_or(after.len())];
         if let Some(start) = tag.find(" id=\"") {
             let value = &tag[start + 5..];
             if let Some(end) = value.find('"') {
@@ -3542,8 +3549,23 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
         .rev()
         .find(|l| l.trim_start().starts_with('['))
         .unwrap_or("[]");
-    let mut models = serde_json::from_str::<Vec<DerivedModel>>(json)
-        .map_err(|e| format!("parse derived models: {e}; deno output: {}", stdout.trim()))?;
+    let mut models = match serde_json::from_str::<Vec<DerivedModel>>(json) {
+        Ok(models) => models,
+        Err(e) => {
+            // The driver ran but its stdout wasn't parseable models JSON (e.g. a
+            // workflow module printed its own `[`-looking line). Prefer the
+            // last-generated on-disk models over surfacing a hard error, matching
+            // the subprocess-failure fallback above.
+            let disk = ondisk_generated_models(&proc_dir);
+            if !disk.is_empty() {
+                return Ok(disk);
+            }
+            return Err(format!(
+                "parse derived models: {e}; deno output: {}",
+                stdout.trim()
+            ));
+        }
+    };
 
     // Prefer the on-disk, auto-laid-out model (ADR 0048) so the console viewer
     // renders a real diagram instead of a blank canvas: `generate_models` writes
@@ -5043,6 +5065,13 @@ mod tests {
         // `process` appearing only as a substring (e.g. an attribute) is ignored.
         let none = r#"<definitions dataProcessing="id=\"x\""/>"#;
         assert_eq!(process_id_from_bpmn(none), None);
+        // A tag whose NAME merely starts with `process` (e.g. `processes`) must not
+        // false-match — the real process element wins.
+        let tricky =
+            r#"<definitions><bpmn:processes id="oops"/><bpmn:process id="real"/></definitions>"#;
+        assert_eq!(process_id_from_bpmn(tricky).as_deref(), Some("real"));
+        // Self-closing process with no id yields None (no false attribute grab).
+        assert_eq!(process_id_from_bpmn(r#"<bpmn:process/>"#), None);
     }
 
     #[test]
