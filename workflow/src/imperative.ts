@@ -21,7 +21,13 @@
 import type { ImperativeWorkflow, Json, JsonObject, Orchestration, WorkflowContext } from "./types.js";
 import { assertIdent, escapeXml, orchestrateType } from "./xml.js";
 
-/** Define an imperative, replay-driven durable workflow. */
+/** Define an imperative, replay-driven durable workflow.
+ *
+ * @experimental Not the recommended code-first surface. Prefer `defineFlow`
+ * (declarative), whose steps are engine-visible BPMN nodes. This imperative
+ * replay surface compiles to a single opaque looping orchestrator and requires
+ * determinism discipline in the orchestration body; it is retained for advanced
+ * durable-orchestration use only. */
 export function defineWorkflow(id: string, orchestrate: Orchestration): ImperativeWorkflow {
   assertIdent("workflow id", id);
   if (typeof orchestrate !== "function") throw new Error("defineWorkflow needs an async orchestration function");

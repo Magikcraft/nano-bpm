@@ -1,31 +1,47 @@
-// @nanobpm/workflow — code-first durable orchestration for nanobpmn (ADR 0044).
+// @nanobpm/workflow — code-first durable workflows for nanobpmn (ADR 0044/0045).
 //
-// Two authoring surfaces over the same engine durability:
+// THE code-first surface is the declarative flow builder — a list of steps the
+// engine runs and shows you one at a time, because each compiles to a real,
+// engine-visible BPMN node:
 //
-//   defineWorkflow(id, async (ctx) => { await ctx.run(...) })   // imperative (replay)
-//   defineFlow(id, (w) => { w.run(...); w.signal(...); })       // declarative (+signals)
+//   defineFlow(id, (w) => {
+//     w.run("fetchDiff", async (job) => ({ diff: await gh.diff(job.variables.prId) }));
+//     w.signal("humanApproval", { correlationKey: "prId" }); // durable human wait
+//     w.task("signPdf");                                      // served by an EXTERNAL worker
+//     w.run("merge", async (job) => ({ merged: await gh.merge(job.variables.prId) }));
+//   });
 //
-// The SDK derives the BPMN model, job types, and message/correlation wiring; the
-// Worker runtime hosts them; the WorkflowClient deploys, starts, and signals.
+// The SDK derives the BPMN model, the job types (`${flowId}:${step}`), and the
+// message/correlation wiring; the Worker hosts your `run` steps; the
+// WorkflowClient deploys, starts, and signals. `w.task` steps are served by a
+// worker outside this program (see `externalJobTypes`).
+//
+// `defineWorkflow` (imperative, Temporal-style replay) is EXPERIMENTAL and kept
+// for advanced durable-orchestration use only; prefer `defineFlow`. Its steps
+// are not engine-visible (a single looping orchestrator) and it requires
+// determinism discipline. It is not the recommended authoring surface.
 //
 // Quickstart:
 //
-//   import { defineWorkflow, WorkflowClient, Worker } from "@nanobpm/workflow";
+//   import { defineFlow, WorkflowClient, Worker } from "@nanobpm/workflow";
 //
-//   const wf = defineWorkflow("pr-review", async (ctx) => {
-//     const diff = await ctx.run("fetchDiff", () => gh.diff(ctx.input.prId));
-//     await ctx.run("merge", () => gh.merge(ctx.input.prId));
+//   const prReview = defineFlow("pr-review", (w) => {
+//     w.run("fetchDiff", async (job) => ({ files: 3 }));
+//     w.run("merge", async (job) => ({ merged: true }));
 //   });
 //
 //   const client = new WorkflowClient({ baseUrl: "http://localhost:8080" });
-//   await client.deploy(wf);
-//   const worker = new Worker({ baseUrl: "http://localhost:8080", workflows: [wf] });
+//   await client.deploy(prReview);
+//   const worker = new Worker({ baseUrl: "http://localhost:8080", workflows: [prReview] });
 //   worker.start();
-//   await client.start(wf, { prId: "PR-1234" });
+//   await client.start(prReview, { prId: "PR-1234" });
 
+// EXPERIMENTAL — imperative (Temporal-style replay) surface. Not the recommended
+// code-first surface (steps are not engine-visible; requires determinism
+// discipline). Retained for advanced durable-orchestration use only.
 export { defineWorkflow, imperativeToBpmn, replayOnce } from "./imperative.js";
 export type { Journal, ReplayStep } from "./imperative.js";
-export { defineFlow, declarativeToBpmn } from "./declarative.js";
+export { defineFlow, declarativeToBpmn, externalJobTypes } from "./declarative.js";
 export type { FlowBuilder } from "./declarative.js";
 export { WorkflowClient, WorkflowError, toBpmn } from "./client.js";
 export type { WorkflowClientOptions, ActivateOptions } from "./client.js";

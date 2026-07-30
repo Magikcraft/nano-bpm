@@ -1445,11 +1445,12 @@ const WORKER_DENO_JSON: &str = r#"{
 /// the entrypoint (which deploys the workflows and hosts a Worker).
 const WORKFLOW_DENO_JSON: &str = r#"{
   "imports": {
-    "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.1.0"
+    "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.2.0"
   },
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-env main.ts",
-    "start-instance": "deno run --allow-net --allow-read --allow-env scripts/start-instance.ts"
+    "start-instance": "deno run --allow-net --allow-read --allow-env scripts/start-instance.ts",
+    "approve": "deno run --allow-net --allow-read --allow-env scripts/approve.ts"
   }
 }
 "#;
@@ -1484,10 +1485,11 @@ fn workflow_package_json(name: &str) -> String {
   "main": "main.ts",
   "scripts": {{
     "start": "deno task start",
-    "start-instance": "deno task start-instance"
+    "start-instance": "deno task start-instance",
+    "approve": "deno task approve"
   }},
   "dependencies": {{
-    "@nanobpm/workflow": "^0.1.0"
+    "@nanobpm/workflow": "^0.2.0"
   }},
   "devDependencies": {{
     "@types/node": "^22"
@@ -1498,36 +1500,43 @@ fn workflow_package_json(name: &str) -> String {
     )
 }
 
-/// Example imperative (replayed) workflow — the durable SDLC loop. Every side
-/// effect lives inside a `ctx.run(name, fn)` step: on resume, a completed step
-/// is replayed from the journal (its `fn` is NOT re-run) and only the frontier
-/// step executes, so the workflow survives an engine crash without repeating
-/// work. Handlers must be idempotent (ADR 0044).
-const WORKFLOW_EXAMPLE_TS: &str = r#"import { defineWorkflow } from "@nanobpm/workflow";
+/// Example **declarative flow** — the code-first surface (ADR 0044/0045). Each
+/// `w.run(name, fn)` becomes a real, engine-visible BPMN service task and
+/// `w.signal(name, { correlationKey })` a durable human-in-the-loop wait
+/// (a correlated message catch event). Steps run as ordinary workers — no
+/// replay/determinism discipline — and a crash mid-flow resumes from the engine
+/// journal without re-running completed steps. Jobs are at-least-once, so step
+/// handlers must be idempotent.
+const WORKFLOW_EXAMPLE_TS: &str = r#"import { defineFlow } from "@nanobpm/workflow";
 
-// A durable "review a pull request" loop. Replace the step bodies with real
-// work (GitHub calls, an LLM review, a merge). Keep every side effect inside a
-// `ctx.run(...)` step and make it idempotent — a crash between a side effect and
-// its journal commit redelivers the step (at-least-once).
-export const prReview = defineWorkflow("pr-review", async (ctx) => {
-  const prId = ctx.input.prId;
-  if (typeof prId !== "string" || prId.length === 0) {
-    throw new Error("pr-review requires a non-empty string `prId` input");
-  }
-
-  const diff = await ctx.run("fetchDiff", async () => {
+// A code-first "review a pull request" flow. Each `w.run` step is a real,
+// engine-visible BPMN service task; `w.signal` is a durable human-in-the-loop
+// wait. Replace the step bodies with real work (GitHub calls, an LLM review, a
+// merge). A crash between a side effect and its job completion redelivers the
+// step (at-least-once), so keep each one idempotent.
+export const prReview = defineFlow("pr-review", (w) => {
+  w.run("fetchDiff", async (job) => {
+    const prId = job.variables.prId;
+    if (typeof prId !== "string" || prId.length === 0) {
+      throw new Error("pr-review requires a non-empty string `prId` input");
+    }
     // Idempotent: reading a diff is a pure read.
-    return { prId, files: 3, additions: 42 };
+    return { files: 3, additions: 42 };
   });
 
-  const review = await ctx.run("review", async () => {
-    // e.g. hand `diff` to an LLM; deterministic key -> replayed on resume.
-    return { verdict: "approve", notes: `looks good (${diff.files} files)` };
+  w.run("review", async (job) => {
+    // e.g. hand the diff to an LLM and record its verdict.
+    return { verdict: "approve", notes: `looks good (${job.variables.files} files)` };
   });
 
-  await ctx.run("merge", async () => {
+  // Durable wait for a human decision, correlated on the instance's `prId`.
+  // Resume it with `scripts/approve.ts` (see README) — this is the surface
+  // Temporal-style code-first cannot draw: a real, visible catch event.
+  w.signal("humanApproval", { correlationKey: "prId" });
+
+  w.run("merge", async (job) => {
     // Idempotent: keyed by prId; a redelivery re-merges the same PR.
-    return { merged: review.verdict === "approve", prId };
+    return { merged: job.variables.verdict === "approve", approvedBy: job.variables.approvedBy ?? null };
   });
 });
 "#;
@@ -1609,6 +1618,26 @@ const { processInstanceKey } = await client.start(prReview, { prId });
 console.log(`started ${prReview.id} instance ${processInstanceKey} (prId=${prId})`);
 "#;
 
+/// Example script that resumes a parked instance by correlating the
+/// `humanApproval` signal — the human-in-the-loop half of the flow. This is the
+/// declarative surface's differentiator: a real, engine-visible catch event.
+const WORKFLOW_APPROVE_TS: &str = r#"// Approve a parked `pr-review` instance: correlate the `humanApproval` signal on
+// its prId so the flow proceeds from the durable wait to `merge`.
+//
+//   deno task start                 # the worker-host service
+//   deno task start-instance PR-42  # create an instance (parks at humanApproval)
+//   deno task approve PR-42         # resume it past the human-in-the-loop wait
+import { WorkflowClient } from "@nanobpm/workflow";
+import { prReview } from "../workflows/pr-review.ts";
+
+const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").replace(/\/+$/, "");
+const prId = Deno.args[0] ?? "PR-1234";
+
+const client = new WorkflowClient({ baseUrl });
+await client.signal(prReview, "humanApproval", prId, { approvedBy: "me" });
+console.log(`approved ${prReview.id} (prId=${prId})`);
+"#;
+
 /// README for a code-first project.
 fn workflow_readme(name: &str) -> String {
     format!(
@@ -1632,31 +1661,42 @@ deno task start          # or: npm install && npm start
 That starts the long-running worker-host service (Ctrl-C to stop). Point it at a
 non-default gateway with `NANOBPMN_BASE_URL`.
 
-To create an instance, run the example script in another shell (the host must be
+To drive an instance through the flow, in another shell (the host must be
 running):
 
 ```sh
 deno task start-instance PR-42     # kicks off one pr-review instance
+deno task approve PR-42            # resume it past the human-in-the-loop wait
 ```
 
 ## Author
 
-- `workflows/pr-review.ts` — an example imperative workflow. Add more with
-  `defineWorkflow(id, async (ctx) => {{ ... }})` and list them in `main.ts`.
-- Every side effect goes inside a `ctx.run(name, fn)` step. On an engine crash a
-  completed step is **replayed from the journal** (its `fn` is not re-run) and
-  only the frontier step executes — so the workflow resumes without repeating
-  work. Jobs are **at-least-once**: keep step handlers idempotent.
-- For a human-in-the-loop wait, use the declarative surface (`defineFlow` with
-  `w.run` / `w.signal`) instead.
-- `scripts/start-instance.ts` shows how a client starts an instance — keep the
-  worker host (`main.ts`) a pure long-running service.
+- `workflows/pr-review.ts` — an example **declarative flow**. Each
+  `w.run(name, fn)` becomes a real, engine-visible BPMN service task; a crash
+  mid-flow resumes from the engine journal without re-running completed steps.
+  Jobs are **at-least-once**, so keep step handlers idempotent. Add more flows
+  with `defineFlow(id, (w) => {{ ... }})` and list them in `main.ts`.
+- `w.signal(name, {{ correlationKey }})` is a durable human-in-the-loop wait — a
+  correlated message catch event. `scripts/approve.ts` shows how a client
+  resumes it. This is what a diagram-less, Temporal-style code-first surface
+  cannot give you: a real, visible catch event.
+- `w.task(name)` declares a step served by a worker **outside this program** (a
+  service task whose derived job type another process/service/language polls).
+  It emits the same job type as `w.run` but the in-process `Worker` does not host
+  it — list the contract with `externalJobTypes(flow)`.
+- `scripts/start-instance.ts` starts an instance — keep the worker host
+  (`main.ts`) a pure long-running service.
 
 ## What gets derived
 
-`WorkflowClient.deploy(wf)` deploys the BPMN that `@nanobpm/workflow` emits from
+`WorkflowClient.deploy(flow)` deploys the BPMN that `@nanobpm/workflow` emits from
 your code; the `Worker` routes the derived job types (`{{id}}:step`) back to your
-step bodies. Inspect the derived model with `toBpmn(wf)`.
+`run` handlers. Inspect the derived model with `toBpmn(flow)`.
+
+> **Advanced:** an experimental imperative (Temporal-style replay) surface
+> (`defineWorkflow` + `ctx.run`) also exists for arbitrary control flow, but its
+> steps are not engine-visible and it requires determinism discipline. Prefer
+> `defineFlow`.
 "#,
         name = name
     )
@@ -2712,6 +2752,7 @@ pub fn create_project(
             dir.join("scripts").join("start-instance.ts"),
             WORKFLOW_START_INSTANCE_TS,
         )?;
+        w(dir.join("scripts").join("approve.ts"), WORKFLOW_APPROVE_TS)?;
         w(dir.join("README.md"), &workflow_readme(&display))?;
         let mut cfg = ProjectConfig::new(name, description);
         cfg.display_name = display_name.clone();
@@ -5312,6 +5353,7 @@ mod tests {
         assert!(dir.join("main.ts").is_file());
         assert!(dir.join("workflows/pr-review.ts").is_file());
         assert!(dir.join("scripts/start-instance.ts").is_file());
+        assert!(dir.join("scripts/approve.ts").is_file());
         assert!(dir.join("README.md").is_file());
         // Crucially: NONE of the model-first machinery leaks in — the model is
         // derived from the code, so there is no authored BPMN and no
@@ -5343,10 +5385,17 @@ mod tests {
             package_json["dependencies"]["@nanobpm/workflow"].is_string(),
             "package.json must depend on @nanobpm/workflow"
         );
-        // The example uses the imperative surface with a durable step.
+        // The example uses the declarative surface (THE code-first way): a
+        // step list with a human-in-the-loop signal, NOT the imperative replay
+        // surface. It must not carry the imperative `ctx.run`/defineWorkflow.
         let example = std::fs::read_to_string(dir.join("workflows/pr-review.ts")).unwrap();
-        assert!(example.contains("defineWorkflow"));
-        assert!(example.contains("ctx.run("));
+        assert!(example.contains("defineFlow"));
+        assert!(example.contains("w.run("));
+        assert!(example.contains("w.signal("));
+        assert!(
+            !example.contains("defineWorkflow"),
+            "the scaffold must lead with the declarative surface, not imperative replay"
+        );
         // main.ts is a durable worker-host SERVICE: it hosts a worker and never
         // self-exits. Starting an instance lives in the script, not the host, so
         // "just run the app" means a long-running service (not a one-shot demo).
@@ -5361,9 +5410,15 @@ mod tests {
             starter.contains("client.start("),
             "the instance-starter script should start an instance"
         );
-        // Both run tasks are wired.
+        let approve = std::fs::read_to_string(dir.join("scripts/approve.ts")).unwrap();
+        assert!(
+            approve.contains("client.signal("),
+            "the approve script should correlate the human-in-the-loop signal"
+        );
+        // All three Deno tasks are defined.
         assert!(deno_json["tasks"]["start"].is_string());
         assert!(deno_json["tasks"]["start-instance"].is_string());
+        assert!(deno_json["tasks"]["approve"].is_string());
     }
 
     #[tokio::test]

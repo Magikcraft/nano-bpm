@@ -19,6 +19,9 @@ export type DeclarativeStep = {
     kind: "run";
     name: string;
 } | {
+    kind: "task";
+    name: string;
+} | {
     kind: "signal";
     name: string;
     correlationKey: string;
