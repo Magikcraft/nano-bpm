@@ -198,6 +198,9 @@ export interface WorkerDecl {
   taskType: string;
   inputType?: string;
   outputType?: string;
+  /** The `zeebe:header` keys declared on the task (ADR 0033 §3). Model-derived;
+   * reified into a typed `job.customHeaders` shape (known keys, `string` values). */
+  headerKeys?: string[];
 }
 
 /// Walk up from `startDir` to the first directory containing `nano.app.json` and
