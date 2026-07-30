@@ -62,4 +62,10 @@ test("validateSafeName keeps the strict no-spaces rules for import", () => {
     validateSafeName("my-app", [{ name: "MY-APP" }]) ?? "",
     /exists/,
   );
+  // An import must also collide against an existing project's display name,
+  // not just its slug — otherwise two cards render the same visible title.
+  assert.match(
+    validateSafeName("MyApp", [{ name: "other", displayName: "myapp" }]) ?? "",
+    /exists/,
+  );
 });

@@ -64,10 +64,12 @@ export function validateProjectName(
 
 /// Validate a name that must be directory-safe as typed — used by Import by
 /// reference, where the name IS the pointer file's basename and is never
-/// slugged. Mirrors the server's `is_safe_name` rejection reasons.
+/// slugged. Mirrors the server's `is_safe_name` rejection reasons. Collisions
+/// are checked against both existing slugs (`name`) and display names, so an
+/// import can't reproduce a title already visible in the Projects list.
 export function validateSafeName(
   raw: string,
-  existing: Array<{ name: string }>,
+  existing: Array<{ name: string; displayName?: string }>,
 ): string | null {
   const name = raw.trim();
   if (!name) return null;
@@ -78,7 +80,11 @@ export function validateSafeName(
   const bad = [...name].find((c) => !/[A-Za-z0-9_.-]/.test(c));
   if (bad)
     return `Invalid character “${bad}”. Use letters, digits, dashes, underscores or dots.`;
-  if (existing.some((p) => p.name.toLowerCase() === name.toLowerCase()))
-    return "A project with that name already exists.";
+  const taken = existing.some(
+    (p) =>
+      p.name.toLowerCase() === name.toLowerCase() ||
+      (p.displayName ?? p.name).trim().toLowerCase() === name.toLowerCase(),
+  );
+  if (taken) return "A project with that name already exists.";
   return null;
 }

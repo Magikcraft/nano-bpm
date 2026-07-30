@@ -441,6 +441,8 @@ function LangIcon({ langId, lang }: { langId: string; lang?: LangMeta }) {
     />
   ) : (
     <span
+      role="img"
+      aria-label={langLabel}
       title={langLabel}
       className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-sm bg-inset text-[9px] font-bold uppercase text-fg-faint"
     >
