@@ -502,14 +502,16 @@ function TemplateTile({
           className="mt-2 flex items-center gap-1 truncate text-[11px] text-fg-faint"
           title={
             template.source === "pack"
-              ? `Contributed by the “${template.pack}” extension pack`
+              ? `Contributed by the “${template.pack ?? "extension"}” extension pack`
               : "Built-in scaffold — works offline"
           }
         >
           {template.source === "pack" ? (
             <>
               <span aria-hidden>⧉</span>
-              <span className="truncate">{template.pack}</span>
+              <span className="truncate">
+                {template.pack ?? "Extension pack"}
+              </span>
             </>
           ) : (
             <span>Built-in</span>

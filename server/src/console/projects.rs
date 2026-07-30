@@ -347,7 +347,11 @@ pub fn project_templates() -> Vec<serde_json::Value> {
                     "id": t.id,
                     "label": label,
                     "description": description,
-                    "lang": t.lang.clone().unwrap_or_else(|| pack_lang.clone()),
+                    "lang": t
+                        .lang
+                        .clone()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| pack_lang.clone()),
                     "source": "pack",
                     "pack": ext.id,
                 }));
@@ -2572,7 +2576,8 @@ pub fn create_project(
             .templates
             .iter()
             .find(|t| t.id == template)
-            .and_then(|t| t.lang.clone());
+            .and_then(|t| t.lang.clone())
+            .filter(|s| !s.trim().is_empty());
         let cfg_lang = spec_lang.unwrap_or_else(|| {
             if m.kind == super::extensions::ExtKind::Lang {
                 m.id.clone()
