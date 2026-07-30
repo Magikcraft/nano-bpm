@@ -321,6 +321,9 @@ export default function App() {
             <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
               Advanced Research Prototype
             </div>
+            <div className="mt-1.5 text-[10px] text-fg-faint">
+              Free for evaluation use
+            </div>
           </a>
         </div>
         <nav className="flex flex-col gap-1 px-3">
