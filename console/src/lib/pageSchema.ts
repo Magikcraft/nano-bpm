@@ -25,19 +25,130 @@ export interface StartProcessAction {
   process: string;
 }
 
-/** A `dataGrid`'s data binding — v1 reads a datasource table (the rest bank, 0024). */
+/** An filter on a datasource column (whitelisted against the schema at runtime,
+ * so it can never inject SQL). Either an equality (`eq`) or a set membership
+ * (`in`) — set membership is what a tab like "Active = converging|waiting|escalated"
+ * needs. Exactly one of `eq`/`in` should be set; `eq` wins if both are present. */
+export interface ColumnFilter {
+  field: string;
+  eq?: string;
+  in?: string[];
+}
+
+/** A grid's sort order (a single column, ascending or descending). */
+export interface GridOrder {
+  field: string;
+  dir: "asc" | "desc";
+}
+
+/** A `dataGrid`'s data binding — reads a datasource table (the rest bank, 0024),
+ * optionally filtered and ordered (v2, ADR 0042 Increment). */
 export interface DatasourceBinding {
   kind: "datasource";
   /** The datasource alias (default `app`). */
   source: string;
   /** A table/entity id from the fuse. */
   table: string;
+  /** Optional equality filters, ANDed together. */
+  filter?: ColumnFilter[];
+  /** Optional single-column sort. */
+  orderBy?: GridOrder;
 }
 
 export interface GridColumn {
   /** A column name on the bound table/entity. */
   field: string;
   header: string;
+}
+
+/** A tab over a single grid — selecting it swaps the active row filter
+ * (client-side) without changing the bound table (e.g. Converging vs History). */
+export interface GridTab {
+  label: string;
+  filter: ColumnFilter[];
+}
+
+/** A row-scoped `startProcess`. Only the static `variables` below are sent; the
+ * runtime does not read row fields into the started instance. */
+export interface RowStartProcessAction {
+  kind: "startProcess";
+  process: string;
+  /** Static extra variables merged into the started instance. */
+  variables?: Record<string, string>;
+}
+
+/** Cancel the process instance whose key lives in the row field `keyField`. */
+export interface CancelProcessAction {
+  kind: "cancelProcess";
+  keyField: string;
+}
+
+/** Publish a message correlated on the row field `correlationKeyField`, carrying
+ * the values typed into the (optional) prompt input plus any static `variables`. */
+export interface PublishMessageAction {
+  kind: "publishMessage";
+  message: string;
+  correlationKeyField: string;
+  variables?: Record<string, string>;
+}
+
+export type RowActionBinding =
+  RowStartProcessAction | CancelProcessAction | PublishMessageAction;
+
+/** A button rendered on every grid row, firing a row-bound action. */
+export interface RowAction {
+  label: string;
+  action: RowActionBinding;
+  /** Optional `confirm()` text shown before the action fires. */
+  confirm?: string;
+  /** Only render the button when this row field is truthy. */
+  showWhenField?: string;
+}
+
+/** A field shown in a row's expandable detail. `lazy` defers its *display* until
+ * the row is expanded (the value is already fetched with the row, not lazily loaded). */
+export interface DetailField {
+  field: string;
+  label: string;
+  lazy?: boolean;
+}
+
+/** A grid nested inside a row's detail, filtered by a parent-row field
+ * (`childField` = parent[`parentField`]) — e.g. a PR's rounds. */
+export interface ChildGrid {
+  title?: string;
+  source: string;
+  table: string;
+  parentField: string;
+  childField: string;
+  columns: GridColumn[];
+  orderBy?: GridOrder;
+  /** A per-child-row field whose display is deferred until the row is expanded
+   * (already fetched with the row, not lazily loaded), e.g. a transcript. */
+  lazyField?: DetailField;
+}
+
+/** A conditional action form inside a row's detail — shown only when the parent
+ * row field `showWhenField` is truthy (e.g. an open escalation). Publishes a
+ * message to resume the process. */
+export interface DetailForm {
+  showWhenField: string;
+  title?: string;
+  /** A parent field rendered as the prompt above the input. */
+  promptField?: string;
+  inputKey: string;
+  inputLabel: string;
+  submitLabel: string;
+  action: PublishMessageAction;
+}
+
+/** A per-row expandable detail: an optional external link, scalar fields, nested
+ * child grids, and one conditional form. */
+export interface DetailSpec {
+  linkField?: string;
+  fields?: DetailField[];
+  children?: ChildGrid[];
+  form?: DetailForm;
 }
 
 export type TextVariant = "heading" | "body" | "sub";
@@ -66,6 +177,16 @@ export interface DataGridNode {
     title: string;
     data: DatasourceBinding;
     columns: GridColumn[];
+    /** Tabs that swap the active filter over the same table. */
+    tabs?: GridTab[];
+    /** The row field carrying a stable identity (defaults to `id`). */
+    rowKey?: string;
+    /** Per-row action buttons (cancel / publishMessage / startProcess). */
+    rowActions?: RowAction[];
+    /** A per-row expandable detail (child grids, lazy fields, conditional form). */
+    detail?: DetailSpec;
+    /** Auto-refresh interval in ms (0/omitted disables). */
+    refreshMs?: number;
   };
 }
 
@@ -112,6 +233,186 @@ export function defaultProps(type: PageNodeType): PageNode["props"] {
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null && !Array.isArray(x);
+}
+
+const str = (x: unknown, fallback = ""): string =>
+  typeof x === "string" ? x : fallback;
+
+function parseColumns(raw: unknown): GridColumn[] {
+  return (Array.isArray(raw) ? raw : [])
+    .filter(isRecord)
+    .map((c) => ({ field: str(c.field), header: str(c.header) }))
+    .filter((c) => c.field !== "");
+}
+
+function parseFilter(raw: unknown): ColumnFilter[] {
+  const out: ColumnFilter[] = [];
+  for (const f of Array.isArray(raw) ? raw : []) {
+    if (!isRecord(f) || typeof f.field !== "string" || !f.field) continue;
+    if (Array.isArray(f.in)) {
+      const values = f.in.filter((v): v is string => typeof v === "string");
+      if (values.length) out.push({ field: f.field, in: values });
+    } else if (typeof f.eq === "string") {
+      out.push({ field: f.field, eq: f.eq });
+    }
+  }
+  return out;
+}
+
+function parseOrder(raw: unknown): GridOrder | undefined {
+  if (!isRecord(raw) || typeof raw.field !== "string" || !raw.field)
+    return undefined;
+  return { field: raw.field, dir: raw.dir === "desc" ? "desc" : "asc" };
+}
+
+function parseStaticVars(raw: unknown): Record<string, string> | undefined {
+  if (!isRecord(raw)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw))
+    if (typeof v === "string") out[k] = v;
+  return Object.keys(out).length ? out : undefined;
+}
+
+function parseRowAction(raw: unknown): RowAction | null {
+  if (!isRecord(raw)) return null;
+  const a = isRecord(raw.action) ? raw.action : {};
+  let action: RowActionBinding;
+  switch (a.kind) {
+    case "cancelProcess":
+      if (typeof a.keyField !== "string" || !a.keyField) return null;
+      action = { kind: "cancelProcess", keyField: a.keyField };
+      break;
+    case "publishMessage":
+      if (
+        typeof a.message !== "string" ||
+        !a.message ||
+        typeof a.correlationKeyField !== "string" ||
+        !a.correlationKeyField
+      )
+        return null;
+      action = {
+        kind: "publishMessage",
+        message: a.message,
+        correlationKeyField: a.correlationKeyField,
+        ...(parseStaticVars(a.variables)
+          ? { variables: parseStaticVars(a.variables) }
+          : {}),
+      };
+      break;
+    case "startProcess":
+      if (typeof a.process !== "string" || !a.process) return null;
+      action = {
+        kind: "startProcess",
+        process: a.process,
+        ...(parseStaticVars(a.variables)
+          ? { variables: parseStaticVars(a.variables) }
+          : {}),
+      };
+      break;
+    default:
+      return null;
+  }
+  return {
+    label: str(raw.label, "Action"),
+    action,
+    ...(typeof raw.confirm === "string" ? { confirm: raw.confirm } : {}),
+    ...(typeof raw.showWhenField === "string" && raw.showWhenField
+      ? { showWhenField: raw.showWhenField }
+      : {}),
+  };
+}
+
+function parseDetailFields(raw: unknown): DetailField[] {
+  return (Array.isArray(raw) ? raw : [])
+    .filter(isRecord)
+    .map((f) => ({
+      field: str(f.field),
+      label: str(f.label),
+      ...(f.lazy === true ? { lazy: true } : {}),
+    }))
+    .filter((f) => f.field !== "");
+}
+
+function parseChildGrids(raw: unknown): ChildGrid[] {
+  const out: ChildGrid[] = [];
+  for (const c of Array.isArray(raw) ? raw : []) {
+    if (!isRecord(c)) continue;
+    if (
+      typeof c.table !== "string" ||
+      !c.table ||
+      typeof c.parentField !== "string" ||
+      !c.parentField ||
+      typeof c.childField !== "string" ||
+      !c.childField
+    )
+      continue;
+    const order = parseOrder(c.orderBy);
+    const lazyField = parseDetailFields(c.lazyField ? [c.lazyField] : [])[0];
+    out.push({
+      ...(typeof c.title === "string" ? { title: c.title } : {}),
+      source: str(c.source, "app"),
+      table: c.table,
+      parentField: c.parentField,
+      childField: c.childField,
+      columns: parseColumns(c.columns),
+      ...(order ? { orderBy: order } : {}),
+      ...(lazyField ? { lazyField } : {}),
+    });
+  }
+  return out;
+}
+
+function parseDetailForm(raw: unknown): DetailForm | undefined {
+  if (!isRecord(raw)) return undefined;
+  const a = isRecord(raw.action) ? raw.action : {};
+  if (
+    typeof raw.showWhenField !== "string" ||
+    !raw.showWhenField ||
+    typeof raw.inputKey !== "string" ||
+    !raw.inputKey ||
+    typeof a.message !== "string" ||
+    !a.message ||
+    typeof a.correlationKeyField !== "string" ||
+    !a.correlationKeyField
+  )
+    return undefined;
+  return {
+    showWhenField: raw.showWhenField,
+    ...(typeof raw.title === "string" ? { title: raw.title } : {}),
+    ...(typeof raw.promptField === "string" && raw.promptField
+      ? { promptField: raw.promptField }
+      : {}),
+    inputKey: raw.inputKey,
+    inputLabel: str(raw.inputLabel, raw.inputKey),
+    submitLabel: str(raw.submitLabel, "Submit"),
+    action: {
+      kind: "publishMessage",
+      message: a.message,
+      correlationKeyField: a.correlationKeyField,
+      ...(parseStaticVars(a.variables)
+        ? { variables: parseStaticVars(a.variables) }
+        : {}),
+    },
+  };
+}
+
+function parseDetail(raw: unknown): DetailSpec | undefined {
+  if (!isRecord(raw)) return undefined;
+  const fields = parseDetailFields(raw.fields);
+  const children = parseChildGrids(raw.children);
+  const form = parseDetailForm(raw.form);
+  const linkField =
+    typeof raw.linkField === "string" && raw.linkField
+      ? raw.linkField
+      : undefined;
+  if (!fields.length && !children.length && !form && !linkField)
+    return undefined;
+  return {
+    ...(linkField ? { linkField } : {}),
+    ...(fields.length ? { fields } : {}),
+    ...(children.length ? { children } : {}),
+    ...(form ? { form } : {}),
+  };
 }
 
 /**
@@ -192,21 +493,44 @@ export function parsePageDoc(
       }
       case "dataGrid": {
         const data = isRecord(props.data) ? props.data : {};
-        const columns = Array.isArray(props.columns) ? props.columns : [];
+        const filter = parseFilter(data.filter);
+        const orderBy = parseOrder(data.orderBy);
+        const tabs = (Array.isArray(props.tabs) ? props.tabs : [])
+          .filter(isRecord)
+          .map((t) => ({
+            label: str(t.label, "Tab"),
+            filter: parseFilter(t.filter),
+          }));
+        const rowActions = (
+          Array.isArray(props.rowActions) ? props.rowActions : []
+        )
+          .map(parseRowAction)
+          .filter((a): a is RowAction => a !== null);
+        const detail = parseDetail(props.detail);
+        const refreshMs =
+          typeof props.refreshMs === "number" && props.refreshMs > 0
+            ? props.refreshMs
+            : undefined;
         nodes.push({
           type: "dataGrid",
           id,
           props: {
-            title: typeof props.title === "string" ? props.title : "",
+            title: str(props.title),
             data: {
               kind: "datasource",
-              source: typeof data.source === "string" ? data.source : "app",
-              table: typeof data.table === "string" ? data.table : "",
+              source: str(data.source, "app"),
+              table: str(data.table),
+              ...(filter.length ? { filter } : {}),
+              ...(orderBy ? { orderBy } : {}),
             },
-            columns: columns.filter(isRecord).map((c) => ({
-              field: typeof c.field === "string" ? c.field : "",
-              header: typeof c.header === "string" ? c.header : "",
-            })),
+            columns: parseColumns(props.columns),
+            ...(tabs.length ? { tabs } : {}),
+            ...(typeof props.rowKey === "string" && props.rowKey
+              ? { rowKey: props.rowKey }
+              : {}),
+            ...(rowActions.length ? { rowActions } : {}),
+            ...(detail ? { detail } : {}),
+            ...(refreshMs ? { refreshMs } : {}),
           },
         });
         break;
