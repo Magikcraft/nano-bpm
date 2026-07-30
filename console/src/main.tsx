@@ -4,6 +4,9 @@ import { BrowserRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import { ThemeProvider } from "./theme/ThemeProvider";
+// Self-hosted JetBrains Mono (variable) — bundled so the code editor uses it
+// offline, without relying on the font being installed on the user's machine.
+import "@fontsource-variable/jetbrains-mono";
 import "./index.css";
 
 const queryClient = new QueryClient({
