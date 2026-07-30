@@ -794,8 +794,9 @@ pub struct AdHocSubProcessDef {
 /// `JobResult.java`). All fields are optional/empty for an ordinary
 /// (non-agentic) job completion, so plain completions are byte-unchanged.
 ///
-/// This is transport-plumbed today (ADR 0023 seam 3); the engine does not yet
-/// act on it — activate-element execution lands in the runtime seam.
+/// This is transport-plumbed and acted on by the engine (ADR 0023 seam 3): its
+/// `activate_elements` drive the ad-hoc container's tool activations in the
+/// runtime seam.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AdHocJobResult {

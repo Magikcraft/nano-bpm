@@ -321,3 +321,128 @@ test("reset wipes engine state so a re-run starts from zero completed instances"
   assert.equal(created.totalInstances, 1);
   session.free();
 });
+
+// An ad-hoc sub-process agent: the container emits an `agent-worker` job; its
+// handler returns `activateElements` to run inner tools, the engine loops, and a
+// later turn completes the container. Exercises the `agents` dispatch seam end
+// to end against the real wasm engine.
+const ADHOC_AGENT_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="agentic" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:adHocSubProcess id="agent">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="agent-worker" />
+        <zeebe:adHoc outputCollection="results" outputElement="=result" />
+      </bpmn:extensionElements>
+      <bpmn:serviceTask id="toolA"><bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements></bpmn:serviceTask>
+      <bpmn:serviceTask id="toolB"><bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements></bpmn:serviceTask>
+    </bpmn:adHocSubProcess>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+    <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>`;
+
+test("agent dispatch: activateElements runs tools, loops, and completes the container", async () => {
+  const session = await createBojtosSession({ wasm: wasmBytes });
+  session.deploy(ADHOC_AGENT_BPMN);
+  session.createInstance("agentic", "{}");
+
+  const toolsRun: string[] = [];
+  let agentTurns = 0;
+
+  const result = await dispatchWorkers(
+    session,
+    {
+      tool: (job) => {
+        toolsRun.push(job.elementId);
+        // Each tool's `result` is captured into the container's outputCollection.
+        return { result: job.elementId };
+      },
+    },
+    {
+      agents: {
+        "agent-worker": () => {
+          agentTurns++;
+          if (agentTurns === 1) {
+            // Turn 1: activate both tools.
+            return {
+              activateElements: [
+                { elementId: "toolA" },
+                { elementId: "toolB" },
+              ],
+            };
+          }
+          // Turn 2: the tools have drained (the engine re-emitted the agent
+          // job); the agent decides it is done and completes the container,
+          // merging its decision into the instance.
+          return {
+            completionConditionFulfilled: true,
+            variables: { decision: "cleared" },
+          };
+        },
+      },
+    },
+  );
+
+  assert.deepEqual(toolsRun.slice().sort(), ["toolA", "toolB"], "both tools ran");
+  assert.equal(agentTurns, 2, "agent ran two turns (activate, then complete)");
+  assert.equal(
+    result.snapshot.completedInstances,
+    1,
+    "the agent's completion finished the container and the instance",
+  );
+  session.free();
+});
+
+test("an empty agent result completes the container with no tools", async () => {
+  const session = await createBojtosSession({ wasm: wasmBytes });
+  session.deploy(ADHOC_AGENT_BPMN);
+  session.createInstance("agentic", "{}");
+
+  const result = await dispatchWorkers(
+    session,
+    {},
+    { agents: { "agent-worker": () => ({}) } },
+  );
+  assert.equal(
+    result.snapshot.completedInstances,
+    1,
+    "an agent that activates nothing still completes the container",
+  );
+  session.free();
+});
+
+test("an unserializable agent result is translated to failJob, not bubbled", async () => {
+  // Mirrors the plain-job case: an AgentResult the engine can't serialize (a
+  // BigInt) is the demo's own logic failing — it must fail the job, never reach
+  // completeAgentJob, and never bubble out of the round.
+  const { session, calls } = fakeSession({
+    completeAgentJob: () => {
+      throw new Error("completeAgentJob should never be reached");
+    },
+  });
+
+  const round = await dispatchRound(
+    session,
+    {},
+    { agents: { payment: () => ({ variables: { amount: 1n } }) } },
+  );
+
+  assert.equal(round.handled, 1, "the agent job still counts as handled");
+  assert.equal(calls.failed, true, "serialization failure fails the agent job");
+});
+
+test("dispatchRound rejects a job type registered as both a worker and an agent", async () => {
+  // Overlapping keys are a footgun: the worker pass would activate and
+  // plain-complete the job first, so its agentic activateElements could never
+  // fire. Reject up front instead of silently no-op'ing the tool activation.
+  const { session } = fakeSession({});
+  await assert.rejects(
+    dispatchRound(session, { payment: () => ({}) }, { agents: { payment: () => ({}) } }),
+    /registered as both a worker and an agent/,
+    "an overlapping worker/agent key is rejected, not silently mis-dispatched",
+  );
+});
+

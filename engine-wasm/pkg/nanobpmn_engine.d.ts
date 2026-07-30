@@ -39,6 +39,28 @@ export class TestEngine {
      */
     cancelInstance(instance_key: string): string;
     /**
+     * Complete an ad-hoc sub-process **agent** job — the container's
+     * JOB_WORKER job (Camunda's agentic `aiagent-job-worker`) — carrying the
+     * agent's activate-element instructions so the engine runs the selected
+     * inner "tools" this turn (ADR 0023 seam 2/3; Camunda `JobResult` /
+     * `activateElements[]`). This is the browser seam that the plain
+     * `completeJob` deliberately omits (it always sends
+     * `adhoc_result: None`).
+     *
+     * `agent_result_json` shape (camelCase, mirroring Camunda's agentic
+     * `JobResult`):
+     * ```json
+     * { "activateElements": [{ "elementId": "toolA", "variables": { "q": 1 } }],
+     *   "completionConditionFulfilled": false,
+     *   "cancelRemainingInstances": false }
+     * ```
+     * Empty/whitespace ⇒ a no-op result, so the container completes this turn
+     * (no tool activated). `variables_json` merges instance variables exactly
+     * like `completeJob` — e.g. the agent's final
+     * decision when it signals `completionConditionFulfilled`.
+     */
+    completeAgentJob(job_key: string, variables_json: string, agent_result_json: string): string;
+    /**
      * Complete a waiting job by key, merging `variables_json` (a JSON object
      * string) into the instance. The job is activated first if it has not been
      * already, so the UI can complete a freshly-created job directly.
@@ -173,6 +195,7 @@ export interface InitOutput {
     readonly testengine_assignUserTask: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_broadcastSignal: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_cancelInstance: (a: number, b: number, c: number, d: number) => void;
+    readonly testengine_completeAgentJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_completeUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;

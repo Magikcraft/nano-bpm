@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  type AgentResult,
   type BojtosSession,
   createBojtosSession,
   type DispatchOptions,
@@ -43,6 +44,13 @@ export interface BojtosControls {
   createInstance(processId: string, variablesJson: string): Snapshot | null;
   /** Complete a waiting job, merging output variables. */
   completeJob(jobKey: string, variablesJson: string): Snapshot | null;
+  /**
+   * Complete an ad-hoc sub-process's **agent** job with an {@link AgentResult}
+   * (activate tools this turn / signal completion / merge variables). For the
+   * usual dispatch-loop case, register agents via `runWorkers`/`stepWorkers`
+   * `opts.agents` instead of calling this directly.
+   */
+  completeAgentJob(jobKey: string, result: AgentResult): Snapshot | null;
   /** Fail a waiting job (raises an incident with no retries left). */
   failJob(jobKey: string, retries: number, message: string): Snapshot | null;
   /**
@@ -61,7 +69,9 @@ export interface BojtosControls {
   /**
    * Run the registered worker handlers until the process settles (activate →
    * handler → complete/fail), then reflect the resulting snapshot/events.
-   * Resolves to the settled snapshot, or null if there is no live session.
+   * Register ad-hoc **agent** handlers via `opts.agents` to drive
+   * `adHocSubProcess` tool activation in the same loop. Resolves to the settled
+   * snapshot, or null if there is no live session.
    */
   runWorkers(
     workers: Record<string, JobHandler>,
@@ -189,6 +199,11 @@ export function useBojtos({ bpmn, wasm }: UseBojtosOptions): BojtosControls {
       run((s) => s.completeJob(jobKey, variablesJson)),
     [run],
   );
+  const completeAgentJob = useCallback(
+    (jobKey: string, result: AgentResult) =>
+      run((s) => s.completeAgentJob(jobKey, result)),
+    [run],
+  );
   const failJob = useCallback(
     (jobKey: string, retries: number, message: string) =>
       run((s) => s.failJob(jobKey, retries, message)),
@@ -285,6 +300,7 @@ export function useBojtos({ bpmn, wasm }: UseBojtosOptions): BojtosControls {
     events,
     createInstance,
     completeJob,
+    completeAgentJob,
     failJob,
     advanceTime,
     correlateMessage,

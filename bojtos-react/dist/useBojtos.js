@@ -92,6 +92,7 @@ export function useBojtos({ bpmn, wasm }) {
     }, []);
     const createInstance = useCallback((processId, variablesJson) => run((s) => s.createInstance(processId, variablesJson)), [run]);
     const completeJob = useCallback((jobKey, variablesJson) => run((s) => s.completeJob(jobKey, variablesJson)), [run]);
+    const completeAgentJob = useCallback((jobKey, result) => run((s) => s.completeAgentJob(jobKey, result)), [run]);
     const failJob = useCallback((jobKey, retries, message) => run((s) => s.failJob(jobKey, retries, message)), [run]);
     const advanceTime = useCallback((byMs) => run((s) => s.advanceTime(byMs)), [run]);
     const correlateMessage = useCallback((messageName, correlationKey, variablesJson) => run((s) => s.correlateMessage(messageName, correlationKey, variablesJson)), [run]);
@@ -167,6 +168,7 @@ export function useBojtos({ bpmn, wasm }) {
         events,
         createInstance,
         completeJob,
+        completeAgentJob,
         failJob,
         advanceTime,
         correlateMessage,

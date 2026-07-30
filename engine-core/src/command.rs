@@ -51,7 +51,8 @@ pub enum Command {
         /// Optional agentic result for a JOB_WORKER ad-hoc sub-process container
         /// job (Camunda `JobResult`). `None` for every ordinary completion, and
         /// skipped on the wire so plain completions are byte-unchanged. Plumbed
-        /// through the transports today; the engine does not yet act on it
+        /// through the transports and acted on by the engine — its
+        /// `activate_elements` drive the ad-hoc container's tool activations
         /// (ADR 0023 seam 3).
         #[cfg_attr(
             feature = "serde",

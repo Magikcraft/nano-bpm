@@ -1,4 +1,4 @@
-import { type DispatchOptions, type JobHandler, type RoundResult, type Snapshot, type WasmEvent, type WasmSource } from "@nanobpm/bojtos-kit";
+import { type AgentResult, type DispatchOptions, type JobHandler, type RoundResult, type Snapshot, type WasmEvent, type WasmSource } from "@nanobpm/bojtos-kit";
 /** Lifecycle of the in-browser engine load. */
 export type BojtosPhase = "loading" | "ready" | "error";
 export interface UseBojtosOptions {
@@ -28,6 +28,13 @@ export interface BojtosControls {
     createInstance(processId: string, variablesJson: string): Snapshot | null;
     /** Complete a waiting job, merging output variables. */
     completeJob(jobKey: string, variablesJson: string): Snapshot | null;
+    /**
+     * Complete an ad-hoc sub-process's **agent** job with an {@link AgentResult}
+     * (activate tools this turn / signal completion / merge variables). For the
+     * usual dispatch-loop case, register agents via `runWorkers`/`stepWorkers`
+     * `opts.agents` instead of calling this directly.
+     */
+    completeAgentJob(jobKey: string, result: AgentResult): Snapshot | null;
     /** Fail a waiting job (raises an incident with no retries left). */
     failJob(jobKey: string, retries: number, message: string): Snapshot | null;
     /**
@@ -42,7 +49,9 @@ export interface BojtosControls {
     /**
      * Run the registered worker handlers until the process settles (activate →
      * handler → complete/fail), then reflect the resulting snapshot/events.
-     * Resolves to the settled snapshot, or null if there is no live session.
+     * Register ad-hoc **agent** handlers via `opts.agents` to drive
+     * `adHocSubProcess` tool activation in the same loop. Resolves to the settled
+     * snapshot, or null if there is no live session.
      */
     runWorkers(workers: Record<string, JobHandler>, opts?: DispatchOptions): Promise<Snapshot | null>;
     /**

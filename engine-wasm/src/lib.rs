@@ -16,9 +16,10 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    bpmn::parse_bpmn, ActivateElementInstruction, Command, Engine, Event, IncidentKind,
-    IncidentState, JobState, MessageSubscriptionKind, MessageSubscriptionState,
-    ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState, Value,
+    bpmn::parse_bpmn, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult, Command,
+    Engine, Event, IncidentKind, IncidentState, JobState, MessageSubscriptionKind,
+    MessageSubscriptionState, ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState,
+    Value,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -142,6 +143,46 @@ impl TestEngine {
             task_listener_result: None,
         })
         .map_err(|e| js_err(&format!("complete error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
+    /// Complete an ad-hoc sub-process **agent** job — the container's
+    /// JOB_WORKER job (Camunda's agentic `aiagent-job-worker`) — carrying the
+    /// agent's activate-element instructions so the engine runs the selected
+    /// inner "tools" this turn (ADR 0023 seam 2/3; Camunda `JobResult` /
+    /// `activateElements[]`). This is the browser seam that the plain
+    /// `completeJob` deliberately omits (it always sends
+    /// `adhoc_result: None`).
+    ///
+    /// `agent_result_json` shape (camelCase, mirroring Camunda's agentic
+    /// `JobResult`):
+    /// ```json
+    /// { "activateElements": [{ "elementId": "toolA", "variables": { "q": 1 } }],
+    ///   "completionConditionFulfilled": false,
+    ///   "cancelRemainingInstances": false }
+    /// ```
+    /// Empty/whitespace ⇒ a no-op result, so the container completes this turn
+    /// (no tool activated). `variables_json` merges instance variables exactly
+    /// like `completeJob` — e.g. the agent's final
+    /// decision when it signals `completionConditionFulfilled`.
+    #[wasm_bindgen(js_name = completeAgentJob)]
+    pub fn complete_agent_job(
+        &mut self,
+        job_key: &str,
+        variables_json: &str,
+        agent_result_json: &str,
+    ) -> Result<String, JsValue> {
+        let key = parse_key(job_key)?;
+        let variables = parse_vars(variables_json)?;
+        let adhoc_result = parse_adhoc_result(agent_result_json)?;
+        self.ensure_activated(key)?;
+        self.apply(Command::CompleteJob {
+            job_key: key,
+            variables,
+            adhoc_result: Some(adhoc_result),
+            task_listener_result: None,
+        })
+        .map_err(|e| js_err(&format!("complete agent job error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }
 
@@ -1104,6 +1145,74 @@ fn parse_activate_instructions(s: &str) -> Result<Vec<ActivateElementInstruction
     Ok(out)
 }
 
+/// Parse the `agent_result_json` of [`TestEngine::complete_agent_job`] into an
+/// [`AdHocJobResult`]. Shape (camelCase, mirroring Camunda's agentic
+/// `JobResult`):
+/// `{ "activateElements": [{ "elementId": string, "variables"?: object }],
+///    "completionConditionFulfilled"?: bool, "cancelRemainingInstances"?: bool }`.
+/// Empty/whitespace ⇒ an empty (no-op) result, so it degrades to a plain
+/// completion (the container ends its turn with nothing activated).
+fn parse_adhoc_result(s: &str) -> Result<AdHocJobResult, JsValue> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(AdHocJobResult::default());
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(t).map_err(|e| js_err(&format!("invalid agent result JSON: {e}")))?;
+    let serde_json::Value::Object(map) = json else {
+        return Err(js_err("agent result must be a JSON object"));
+    };
+    let activate_elements = match map.get("activateElements") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let serde_json::Value::Object(obj) = item else {
+                    return Err(js_err("each activateElements entry must be a JSON object"));
+                };
+                let element_id = match obj.get("elementId") {
+                    Some(serde_json::Value::String(id)) if !id.is_empty() => id.clone(),
+                    _ => {
+                        return Err(js_err(
+                            "activateElements entry requires a non-empty elementId",
+                        ))
+                    }
+                };
+                let variables = match obj.get("variables") {
+                    None | Some(serde_json::Value::Null) => HashMap::new(),
+                    Some(serde_json::Value::Object(vars)) => vars
+                        .iter()
+                        .map(|(k, v)| (k.clone(), json_to_value(v)))
+                        .collect(),
+                    Some(_) => {
+                        return Err(js_err(
+                            "activateElements entry variables must be a JSON object",
+                        ))
+                    }
+                };
+                out.push(AdHocActivateElement {
+                    element_id,
+                    variables,
+                });
+            }
+            out
+        }
+        Some(_) => return Err(js_err("activateElements must be a JSON array")),
+    };
+    let flag = |k: &str| -> Result<bool, JsValue> {
+        match map.get(k) {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(serde_json::Value::Bool(b)) => Ok(*b),
+            Some(_) => Err(js_err(&format!("agent result `{k}` must be a boolean"))),
+        }
+    };
+    Ok(AdHocJobResult {
+        activate_elements,
+        completion_condition_fulfilled: flag("completionConditionFulfilled")?,
+        cancel_remaining_instances: flag("cancelRemainingInstances")?,
+    })
+}
+
 /// Parse the `terminate_instructions_json` argument of [`TestEngine::modify`]: a
 /// JSON array of element-instance keys, each a decimal string, a number, or a
 /// `{ elementInstanceKey: string|number }` object. Empty/whitespace ⇒ none.
@@ -1539,5 +1648,134 @@ mod tests {
         );
         assert_eq!(snap["instances"][0]["state"], "Terminated");
         assert!(snap["jobs"].as_array().unwrap().is_empty());
+    }
+
+    const ADHOC_AGENT_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    fn job_key(snap: &J, element_id: &str, job_type: &str) -> String {
+        snap["jobs"]
+            .as_array()
+            .expect("jobs array")
+            .iter()
+            .find(|j| j["elementId"] == element_id && j["jobType"] == job_type)
+            .unwrap_or_else(|| panic!("no {job_type} job for {element_id}: {snap}"))["key"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    // The browser seam for Camunda agentic ad-hoc sub-processes: `completeAgentJob`
+    // carries the agent's `activateElements[]` so the engine runs the chosen inner
+    // tools, loops, and completes the container — behaviour the plain `completeJob`
+    // (which always sends `adhoc_result: None`) cannot drive. Mirrors the engine-core
+    // test `adhoc_agent_activates_tools_loops_and_completes_with_output_collection`.
+    #[test]
+    fn complete_agent_job_activates_tools_loops_and_completes() {
+        let mut eng = TestEngine::new();
+        eng.deploy(ADHOC_AGENT_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+
+        // The container emitted its agent job; no tools are active yet.
+        let agent = job_key(&snap, "agent", "agent-worker");
+        assert!(
+            !snap["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|j| j["jobType"] == "tool"),
+            "no tool jobs before the first agent turn: {snap}"
+        );
+
+        // Turn 1: the agent activates both tools → each becomes a real `tool` job.
+        let snap = parse(
+            &eng.complete_agent_job(
+                &agent,
+                "{}",
+                r#"{"activateElements":[{"elementId":"toolA"},{"elementId":"toolB"}]}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(snap["instances"][0]["state"], "Active", "container parks");
+        let tool_a = job_key(&snap, "toolA", "tool");
+        let tool_b = job_key(&snap, "toolB", "tool");
+
+        // Drain both tool jobs, each producing a `result` captured via outputElement.
+        eng.complete_job(&tool_a, r#"{"result":"A"}"#).unwrap();
+        let snap = parse(&eng.complete_job(&tool_b, r#"{"result":"B"}"#).unwrap());
+        assert!(
+            !snap["jobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|j| j["jobType"] == "tool"),
+            "all tools drained: {snap}"
+        );
+
+        // The agent job re-emitted for the next turn.
+        let agent2 = job_key(&snap, "agent", "agent-worker");
+
+        // Turn 2: the agent signals completion → the container completes, writing
+        // its `outputCollection`, and the instance finishes.
+        let snap = parse(
+            &eng.complete_agent_job(&agent2, "{}", r#"{"completionConditionFulfilled":true}"#)
+                .unwrap(),
+        );
+        assert!(
+            !snap["instances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["state"] == "Active"),
+            "no active instance remains after the agent completes: {snap}"
+        );
+        assert!(
+            snap["jobs"].as_array().unwrap().is_empty(),
+            "no jobs remain: {snap}"
+        );
+    }
+
+    // A whitespace/empty agent result degrades to a plain completion: the container
+    // ends its turn with nothing activated and finishes.
+    #[test]
+    fn complete_agent_job_empty_result_completes_container() {
+        let mut eng = TestEngine::new();
+        eng.deploy(ADHOC_AGENT_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let agent = job_key(&snap, "agent", "agent-worker");
+
+        let snap = parse(&eng.complete_agent_job(&agent, "{}", "").unwrap());
+        assert!(
+            !snap["instances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|i| i["state"] == "Active"),
+            "empty result completes the container: {snap}"
+        );
     }
 }
