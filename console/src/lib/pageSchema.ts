@@ -68,7 +68,8 @@ export interface GridTab {
   filter: ColumnFilter[];
 }
 
-/** A row-scoped `startProcess` (variables are bound from the row's fields). */
+/** A row-scoped `startProcess`. Only the static `variables` below are sent; the
+ * runtime does not read row fields into the started instance. */
 export interface RowStartProcessAction {
   kind: "startProcess";
   process: string;
@@ -104,7 +105,8 @@ export interface RowAction {
   showWhenField?: string;
 }
 
-/** A field shown in a row's expandable detail. `lazy` fetches it on expand. */
+/** A field shown in a row's expandable detail. `lazy` defers its *display* until
+ * the row is expanded (the value is already fetched with the row, not lazily loaded). */
 export interface DetailField {
   field: string;
   label: string;
@@ -121,7 +123,8 @@ export interface ChildGrid {
   childField: string;
   columns: GridColumn[];
   orderBy?: GridOrder;
-  /** A per-child-row lazy field (fetched on row expand), e.g. a transcript. */
+  /** A per-child-row field whose display is deferred until the row is expanded
+   * (already fetched with the row, not lazily loaded), e.g. a transcript. */
   lazyField?: DetailField;
 }
 

@@ -578,7 +578,7 @@ function renderDataGrid(node) {
         cbody.append(el("tr", {}, ...cells));
       }
     } catch (e) {
-      cbody.append(el("tr", {}, el("td", {}, String(e.message || e))));
+      cbody.append(el("tr", {}, el("td", { colspan: cspan }, String(e.message || e))));
     }
     return wrap;
   }
@@ -586,8 +586,15 @@ function renderDataGrid(node) {
   function detailPanel(row) {
     const box = el("div", { class: "pc-detail" });
     if (detail.linkField && row[detail.linkField]) {
-      box.append(el("a", { class: "pc-link", href: String(row[detail.linkField]), target: "_blank" },
-        String(row[detail.linkField])));
+      const href = String(row[detail.linkField]);
+      // Render as a link only for http(s); anything else (e.g. a javascript: URL
+      // smuggled through row data) is shown as inert text. External links get
+      // rel="noopener noreferrer" so the opened page can't reach window.opener.
+      if (/^https?:\/\//i.test(href)) {
+        box.append(el("a", { class: "pc-link", href, target: "_blank", rel: "noopener noreferrer" }, href));
+      } else {
+        box.append(el("span", { class: "pc-link" }, href));
+      }
     }
     for (const df of detail.fields || []) {
       box.append(el("div", { class: "pc-detail-field" },
