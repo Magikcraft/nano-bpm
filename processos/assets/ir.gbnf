@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent
+element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -58,6 +58,11 @@ attr-line-exclusiveGateway  ::= attr-parent | attr-retries | attr-timer | attr-i
 elem-parallelGateway  ::= indent "parallelGateway" sp id (sp string)? (sp attrs-parallelGateway)? nl
 attrs-parallelGateway   ::= "{" nl (indent2 attr-line-parallelGateway nl)+ indent "}"
 attr-line-parallelGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+
+# eventBasedGateway — Deferred choice. Arms all downstream intermediate catch events at once; the first to fire wins and the losing siblings are withdrawn.
+elem-eventBasedGateway  ::= indent "eventBasedGateway" sp id (sp string)? (sp attrs-eventBasedGateway)? nl
+attrs-eventBasedGateway   ::= "{" nl (indent2 attr-line-eventBasedGateway nl)+ indent "}"
+attr-line-eventBasedGateway  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 
 # errorBoundaryEvent — Error boundary on an activity. Fires when a job throws the matching `errorCode`.
 elem-errorBoundaryEvent  ::= indent "errorBoundaryEvent" sp id (sp string)? (sp attrs-errorBoundaryEvent)? nl

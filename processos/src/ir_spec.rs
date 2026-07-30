@@ -172,6 +172,12 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         attrs: &[],
     },
     KindSpec {
+        keyword: "eventBasedGateway",
+        doc: "Deferred choice. Arms all downstream intermediate catch events at once; the first \
+              to fire wins and the losing siblings are withdrawn.",
+        attrs: &[],
+    },
+    KindSpec {
         keyword: "errorBoundaryEvent",
         doc: "Error boundary on an activity. Fires when a job throws the matching `errorCode`.",
         attrs: &[
@@ -776,6 +782,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         UserTask(_) => "userTask",
         ExclusiveGateway => "exclusiveGateway",
         ParallelGateway => "parallelGateway",
+        EventBasedGateway => "eventBasedGateway",
         ErrorBoundaryEvent { .. } => "errorBoundaryEvent",
         TimerIntermediateCatchEvent { .. } => "timerIntermediateCatchEvent",
         TimerBoundaryEvent { .. } => "timerBoundaryEvent",
@@ -830,6 +837,7 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
         ),
         ("exclusiveGateway", ElementKind::ExclusiveGateway),
         ("parallelGateway", ElementKind::ParallelGateway),
+        ("eventBasedGateway", ElementKind::EventBasedGateway),
         (
             "errorBoundaryEvent",
             ElementKind::ErrorBoundaryEvent {
