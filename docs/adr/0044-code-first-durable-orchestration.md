@@ -6,6 +6,23 @@ replay + `defineFlow` declarative with signals), a `WorkflowClient` and generic
 `Worker` over REST v2, unit + integration tests (crash-resume + signal), CI gate, and
 OIDC publishing (`release-workflow-npm.yml`, `docs/releasing-workflow-npm.md`).
 Date: 2026-07-29.
+
+> **Decision update (2026-07-30) — declarative `defineFlow` is the one true code-first surface.**
+> This ADR originally named the declarative builder as "Strategy A / v1 (BUILD NOW)" and the
+> imperative replay function as "Strategy B (DESCRIBE, don't build yet)". Both were subsequently
+> *spiked* into `@nanobpm/workflow`. The firmed product decision is: **`defineFlow` (declarative,
+> BPMN-visible) is Nano's single code-first authoring surface.** The imperative `defineWorkflow`
+> replay machinery is **demoted to experimental/internal** — kept as the seed for a future
+> "code-block-in-a-node" escape hatch, marked `@experimental`, removed from the scaffold and
+> getting-started, and **not** presented as a co-equal API. The rationale: a single "picture or
+> code?" story with one code answer avoids a confusing second decision point, and only the
+> declarative surface yields a real, inspectable BPMN model (Nano's differentiator over both
+> graphical-only and code-only durable-execution engines). This update also adds a third
+> declarative step verb — **`w.task(name)`** — a step serviced by an *external* worker: it emits the
+> same BPMN service task + derived job type as `w.run` but is intentionally **not** hosted by the
+> local generic worker; `externalJobTypes(flow)` surfaces the contract external workers poll.
+> Declarative control-flow combinators (branch/match/parallel/while/forEach → real gateways) are the
+> planned next increment.
 Relates to:
 ADR 0023 (`0023-adhoc-subprocess-execution-parity.md`, the executable ad-hoc sub-process — the
 agent-loop primitive this builds on), ADR 0040 (`0040-fused-domain-model.md`, the fused domain
@@ -82,9 +99,11 @@ reject the ceremony itself.
 ### What we take from Temporal
 
 - **Author the workflow as code**, not as a diagram the developer draws.
-- **A first-class "local activity"** (`ctx.run(name, fn)`): a durable step whose handler is ordinary
+- **A first-class "local activity"** (`w.run(name, fn)`): a durable step whose handler is ordinary
   code doing real work.
-- **Durable waits as code** (`ctx.signal`, `ctx.sleep`): a human-in-the-loop approval or a timer is
+- **A first-class "external activity"** (`w.task(name)`): a durable step serviced by a worker
+  outside this program (same service task + derived job type, not locally hosted).
+- **Durable waits as code** (`w.signal`): a human-in-the-loop approval or an external event is
   one line, not a modeled event the developer wires by hand.
 - **"It just resumes."** The developer never thinks about the journal; crash-resume is implicit.
 
@@ -126,13 +145,14 @@ durability. The **spike's façade demonstrates this end to end**: a code-first c
 hand-written model, and a demo (`demo.mjs`) runs `fetchDiff → autoReview → [durable wait] →
 humanApproval → merge` to `COMPLETED`, sending the approval as a correlated message.
 
-- **`ctx.run`** = a local activity (an engine service task; the durability unit).
-- **`ctx.signal`** = a durable wait for an external/human event = the `useJourney` "action" surface
+- **`w.run`** = a local activity (an engine service task; the durability unit).
+- **`w.task`** = an external activity (an engine service task serviced by a worker outside this
+  program; the same derived job type, but not hosted by the built-in generic worker).
+- **`w.signal`** = a durable wait for an external/human event = the `useJourney` "action" surface
   (ADR 0040/0043 frontend twin): the set of currently-valid, typed actions on an instance.
-- **`ctx.sleep`** = a BPMN timer (later increment).
-- An **agent loop** maps to ADR 0023's ad-hoc container; a **linear flow** maps to a generated
-  linear model. Everything downstream (types, actions, stages) is *derived*, per the fused domain
-  model.
+- A **linear flow** maps to a generated linear model; **branch/parallel/loop** combinators (next
+  increment) map to generated gateways. Everything downstream (types, actions, stages) is *derived*,
+  per the fused domain model.
 
 ### v1 durability model
 
@@ -154,12 +174,15 @@ both, over one artifact.
 - **Strategy A — compile a declarative workflow to a model (BUILD NOW).** The `defineFlow`
   builder above. Cheap, reuses durability directly, no determinism discipline. **This is v1, and
   the spike proves it.**
-- **Strategy B — replayed imperative function = the true Temporal model (DESCRIBE, don't build
-  yet).** `async (ctx) => { const d = await ctx.run("fetchDiff", …); … }`, replayed against the
-  engine log. The **beautiful insight**: ADR 0023's ad-hoc `outputCollection` accumulator **is**
-  the replay log — each activated-tool output is a durably-recorded step result, which is exactly
-  what a replay engine folds back into a function's local state. Strategy B is the trajectory; it
-  needs the determinism discipline and is not undertaken in v1.
+- **Strategy B — replayed imperative function (SPIKED, now EXPERIMENTAL/INTERNAL — not a peer
+  surface).** `async (ctx) => { const d = await ctx.run("fetchDiff", …); … }`, replayed against the
+  engine log. It was spiked into `@nanobpm/workflow` (`defineWorkflow`, proven crash-resumable), but
+  per the 2026-07-30 decision update it is **not** a co-equal code-first surface: it is marked
+  `@experimental`, kept out of the scaffold/getting-started, and retained only as the seed for a
+  future "code-block-in-a-node" escape hatch. The **beautiful insight** still holds: ADR 0023's
+  ad-hoc `outputCollection` accumulator **is** the replay log — each activated-tool output is a
+  durably-recorded step result, which is exactly what a replay engine folds back into a function's
+  local state. Its determinism discipline is why it is not the default surface.
 - **Strategy C — wasm-as-determinism-sandbox (OUT OF SCOPE).** Compiling the orchestration function
   to wasm to *enforce* determinism is the differentiated long-term moat but requires the
   side-effect-free-orchestration constraint and heavy machinery; explicitly a non-goal here.

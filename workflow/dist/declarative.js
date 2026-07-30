@@ -29,6 +29,14 @@ export function defineFlow(id, build) {
             handlers[name] = handler;
             return w;
         },
+        task(name) {
+            assertIdent("step name", name);
+            if (seen.has(name))
+                throw new Error(`duplicate step name "${name}" in flow "${id}"`);
+            seen.add(name);
+            steps.push({ kind: "task", name });
+            return w;
+        },
         signal(name, opts) {
             assertIdent("step name", name);
             if (seen.has(name))
@@ -46,6 +54,12 @@ export function defineFlow(id, build) {
         throw new Error(`flow "${id}" declared no steps`);
     return { kind: "declarative", id, steps, handlers };
 }
+/** The derived job types of a flow's external `task` steps — the contract that
+ *  workers outside this program must subscribe to (the engine offers those jobs
+ *  to whoever polls the type). Empty when the flow hosts all its own steps. */
+export function externalJobTypes(flow) {
+    return flow.steps.filter((s) => s.kind === "task").map((s) => jobType(flow.id, s.name));
+}
 /** Derive an executable BPMN model from a declarative flow. */
 export function declarativeToBpmn(flow) {
     const nodes = [];
@@ -56,7 +70,10 @@ export function declarativeToBpmn(flow) {
     flow.steps.forEach((step, i) => {
         const incoming = `flow_${i}`;
         const outgoing = `flow_${i + 1}`;
-        if (step.kind === "run") {
+        if (step.kind === "run" || step.kind === "task") {
+            // Both hosted (`run`) and external (`task`) steps are BPMN service tasks
+            // with the same derived job type; they differ only in whether the local
+            // Worker registers a handler for that type.
             nodes.push(`    <bpmn:serviceTask id="${escapeXml(step.name)}" name="${escapeXml(step.name)}">\n` +
                 `      <bpmn:extensionElements><zeebe:taskDefinition type="${escapeXml(jobType(flow.id, step.name))}" /></bpmn:extensionElements>\n` +
                 `      <bpmn:incoming>${incoming}</bpmn:incoming><bpmn:outgoing>${outgoing}</bpmn:outgoing>\n` +

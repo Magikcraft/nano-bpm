@@ -7,12 +7,14 @@ import {
   defineWorkflow,
   defineFlow,
   toBpmn,
+  externalJobTypes,
   replayOnce,
   Worker,
   WorkflowClient,
   WorkflowError,
   type ImperativeWorkflow,
   type Journal,
+  type DeclarativeFlow,
 } from "../dist/index.js";
 
 test("imperative emit: single looped orchestrator with derived job type", () => {
@@ -144,6 +146,51 @@ test("worker: distinct workflow ids register without collision", () => {
   const b = defineFlow("wf-b", (w) => w.run("step", async () => ({})));
   const worker = new Worker({ baseUrl: "http://localhost:0", workflows: [a, b] });
   assert.deepEqual(worker.servedTypes.sort(), ["wf-a:step", "wf-b:step"]);
+});
+
+test("declarative task: external step emits a service task + job type but is NOT hosted", () => {
+  const flow = defineFlow("pr-review", (w) => {
+    w.run("fetchDiff", async () => ({}));
+    w.task("signPdf"); // served by a worker outside this program
+    w.run("merge", async () => ({}));
+  });
+  const xml = toBpmn(flow);
+  // External `task` derives the same service task + job type as a `run`.
+  assert.match(xml, /<bpmn:serviceTask id="signPdf" name="signPdf">/);
+  assert.match(xml, /<zeebe:taskDefinition type="pr-review:signPdf" \/>/);
+  // externalJobTypes surfaces the contract external workers must poll.
+  assert.deepEqual(externalJobTypes(flow), ["pr-review:signPdf"]);
+  // The local Worker hosts only the `run` steps; the external type is unhosted.
+  const worker = new Worker({ baseUrl: "http://localhost:0", workflows: [flow] });
+  assert.deepEqual(worker.servedTypes.sort(), ["pr-review:fetchDiff", "pr-review:merge"]);
+  assert.equal(worker.servedTypes.includes("pr-review:signPdf"), false);
+});
+
+test("declarative task: a duplicate task/run step name is rejected", () => {
+  assert.throws(
+    () =>
+      defineFlow("dup", (w) => {
+        w.run("a", async () => ({}));
+        w.task("a");
+      }),
+    /duplicate step name "a"/,
+  );
+});
+
+test("worker: a run step with no handler is rejected at registration (fail fast)", () => {
+  // `DeclarativeFlow` is a public type; a consumer could hand-build a flow whose
+  // `run` step has no handler. Registration must fail fast rather than crash on
+  // the first job activation with `handler is not a function`.
+  const malformed: DeclarativeFlow = {
+    kind: "declarative",
+    id: "broken",
+    steps: [{ kind: "run", name: "a" }],
+    handlers: {}, // no handler for "a"
+  };
+  assert.throws(
+    () => new Worker({ baseUrl: "http://localhost:0", workflows: [malformed] }),
+    /run step "a" has no handler/,
+  );
 });
 
 test("client.signal: rejects an unknown signal name with a clear error", async () => {

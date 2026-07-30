@@ -1,5 +1,11 @@
 import type { ImperativeWorkflow, Json, JsonObject, Orchestration } from "./types.js";
-/** Define an imperative, replay-driven durable workflow. */
+/** Define an imperative, replay-driven durable workflow.
+ *
+ * @experimental Not the recommended code-first surface. Prefer `defineFlow`
+ * (declarative), whose steps are engine-visible BPMN nodes. This imperative
+ * replay surface compiles to a single opaque looping orchestrator and requires
+ * determinism discipline in the orchestration body; it is retained for advanced
+ * durable-orchestration use only. */
 export declare function defineWorkflow(id: string, orchestrate: Orchestration): ImperativeWorkflow;
 /** The looped-orchestrator model: start → orchestrate → gw → (done ? end : loop). */
 export declare function imperativeToBpmn(wf: ImperativeWorkflow): string;
