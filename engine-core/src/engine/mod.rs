@@ -5093,6 +5093,21 @@ impl Engine {
         if !is_catch_event(winner_element_id) {
             return Vec::new();
         }
+        // A catch event downstream of an event-based gateway has exactly one
+        // incoming flow — from the gateway. If the winner has any *other*
+        // incoming path (a malformed graph where a non-gateway node also routes
+        // into it), we cannot be sure this token arrived via the gateway, so we
+        // conservatively withdraw nothing rather than risk cancelling an
+        // unrelated race in the same scope.
+        let incoming_count = def
+            .elements
+            .values()
+            .flat_map(|element| element.outgoing.iter())
+            .filter(|f| f.to == winner_element_id)
+            .count();
+        if incoming_count != 1 {
+            return Vec::new();
+        }
         // Find the event-based gateway(s) that route into the winning catch
         // event. In a well-formed model a catch event has exactly one incoming
         // flow, so at most one gateway owns the race. If more than one gateway
