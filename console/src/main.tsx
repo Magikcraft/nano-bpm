@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import App from "./App";
 import { ThemeProvider } from "./theme/ThemeProvider";
+import { ProductTourProvider } from "./lib/tour/ProductTourProvider";
 // Self-hosted JetBrains Mono (variable) — bundled so the code editor uses it
 // offline, without relying on the font being installed on the user's machine.
 import "@fontsource-variable/jetbrains-mono";
@@ -21,7 +22,9 @@ ReactDOM.createRoot(document.getElementById("root")!).render(
     <BrowserRouter basename="/console">
       <QueryClientProvider client={queryClient}>
         <ThemeProvider>
-          <App />
+          <ProductTourProvider>
+            <App />
+          </ProductTourProvider>
         </ThemeProvider>
       </QueryClientProvider>
     </BrowserRouter>

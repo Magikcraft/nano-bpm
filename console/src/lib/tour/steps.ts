@@ -3,10 +3,14 @@
 // The console ships two build profiles (ADR 0034): "studio" (the maker IDE) and
 // "observe" (the operator surface). The journey — and therefore the tour — is
 // different in each, so the step list is derived from CONSOLE_PROFILE rather
-// than duplicated. Each step names a react-router `route` it needs (the hook
-// navigates there before showing the step) and a `selector` to highlight;
-// driver.js waits for that selector to appear (see useProductTour) so steps can
+// than duplicated. Each step names a react-router `route` it needs (the tour
+// navigates there before showing the step) and a `selector` to highlight; the
+// runner waits for that selector to appear (see useProductTour) so steps can
 // target elements that mount asynchronously (lazy routes, the bpmn-js canvas).
+//
+// This list is engine-agnostic and shared verbatim between the driver.js and
+// @reactour/tour spikes (issue #393) — the only thing that differs is how each
+// runner consumes it.
 
 import { CONSOLE_PROFILE, type ConsoleProfile } from "../profile";
 

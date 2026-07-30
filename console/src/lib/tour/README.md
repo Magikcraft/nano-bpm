@@ -1,38 +1,40 @@
-# Product tour — driver.js spike (issue #393)
+# Product tour — @reactour/tour spike (issue #393)
 
-A first-run product tour for the console, built on [driver.js](https://driverjs.com)
-(MIT, zero-dep, ~5kb). This is a **spike** to evaluate driver.js against a
-`@reactour/tour` spike before we commit to one.
+A first-run product tour for the console, built on
+[@reactour/tour](https://docs.react.tours) (MIT). This is the **B side** of an
+A/B spike — the A side is the [driver.js](https://driverjs.com) spike on
+`feat/console-product-tour`. Same journey, same `data-tour` anchors, same
+`steps.ts`; only the tour engine differs.
 
-## Why driver.js
+## The reactour shape (vs driver.js)
 
-The console journey **spans react-router routes** and targets elements that
-**mount asynchronously** over CSS-transformed canvases (bpmn-js / monaco). driver.js
-gives us two things that fit that exactly, for free:
+reactour is **declarative**: the tour is a React context you mount high in the
+tree (`<TourProvider>`), and you read/drive it through `useTour()`. That has two
+consequences the driver.js spike doesn't have:
 
-- `waitForElement` — waits for a step's target to appear before showing it (the
-  generalised "canvas ready" gate).
-- `skipMissingElement` — skips a step whose target never appears, so the tour
-  degrades gracefully (e.g. the **Run** step is skipped on a fresh install with
-  no open project).
+- **A provider must wrap the app** (`ProductTourProvider` in `main.tsx`) so any
+  view can call `useTour()`. driver.js needs no provider.
+- **Two capabilities are bolted on by us**, because reactour doesn't have them:
+  - _route navigation_ — reactour is DOM-only, so `useProductTour` watches
+    `currentStep` and drives react-router; each step's `mutationObservables`
+    then waits for the target to mount on the new route (reactour's analogue of
+    driver.js's `waitForElement`).
+  - _skip-missing-target_ — reactour has no `skipMissingElement`, so we filter
+    the step list at start (`isStepReachable`): an anchored step with no route
+    whose target isn't in the DOM (e.g. **Run**, workspace-only) is dropped.
 
-The only thing driver.js can't do is drive react-router, so the hook does that.
+Positioning is also coarser — reactour picks a `side`, with no separate `align`
+axis, so `TourStep.align` is ignored here.
 
 ## Pieces
 
 | File | Role |
 | ---- | ---- |
-| `steps.ts` | Profile-aware step list (`CONSOLE_PROFILE`: studio vs observe). Each step names the `route` it needs and the `selector` to highlight. Single source of truth — no duplication across profiles. |
-| `useProductTour.ts` | The hook: builds the driver, navigates the router between steps, and persists a `localStorage` "seen" flag so it auto-starts only on first run. Returns `startTour` / `resetTour`. |
-| `tour.css` | Popover theming via the app's own `--nano-*` tokens, so it tracks dark/light mode. |
-
-Targets are stable `data-tour="…"` anchors (`nav-*`, `new-project`, `run`), not
-brittle text/class selectors.
-
-## Wiring
-
-`App.tsx` calls `useProductTour({ autoStart: true })` and renders a **Take a tour**
-rail button (`startTour`) to replay it.
+| `steps.ts` | Profile-aware step list. **Identical** to the driver.js spike — the journey is engine-agnostic. |
+| `reactourStep.tsx` | Single source of truth converting `TourStep → @reactour/tour StepType`. Used by both the provider and the hook so the mapping never drifts. |
+| `ProductTourProvider.tsx` | Mounts `<TourProvider>` with token-themed popover/mask `styles` and text Back/Next/Done controls (replacing reactour's default arrows + dots). |
+| `useProductTour.tsx` | Route navigation, skip-missing filter, first-run `localStorage` flag; returns `startTour` / `resetTour`. Same public shape as the driver.js hook, so `App.tsx` is unchanged. |
+| `tour.css` | Content + control theming via `--nano-*` tokens (tracks dark/light mode). |
 
 ## Try it
 
@@ -40,10 +42,11 @@ rail button (`startTour`) to replay it.
 npm run dev
 ```
 
-The tour auto-starts on first load. To replay after that, click **Take a tour**
-in the sidebar, or clear the flag: `localStorage.removeItem("nano.tour.v1.seen")`.
+The tour auto-starts on first load. Replay via **Take a tour** in the sidebar,
+or clear the flag: `localStorage.removeItem("nano.tour.v1.seen")`.
 
-## Evaluating vs @reactour
+## Compare against driver.js
 
-Compare on: popover positioning over the transformed bpmn-js canvas, route-spanning
-ergonomics, theming effort, and API feel. See issue #393 for the follow-up spike.
+Run both spikes on different ports and A/B them on: popover positioning over the
+transformed bpmn-js canvas, route-spanning ergonomics, theming effort, bundle
+size, and how much glue code each library needs. See issue #393.
