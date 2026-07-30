@@ -1458,12 +1458,17 @@ console.log(`worker host running against ${baseUrl} — press Ctrl-C to stop`);
 
 // 3) Run forever; stop cleanly on Ctrl-C / SIGTERM so in-flight polls drain.
 let shuttingDown = false;
-const shutdown = async () => {
+const drainAndExit = async () => {
   if (shuttingDown) return;
   shuttingDown = true;
   console.log("\nshutting down…");
   await worker.stop();
   Deno.exit(0);
+};
+// Deno.addSignalListener expects a synchronous handler (() => void), so wrap
+// the async drain logic in a sync closure rather than passing it directly.
+const shutdown = (): void => {
+  void drainAndExit();
 };
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   try {
