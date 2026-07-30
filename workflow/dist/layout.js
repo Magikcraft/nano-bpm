@@ -32,6 +32,13 @@ export async function layoutBpmn(bpmnXml) {
         ({ layoutProcess } = await import("bpmn-auto-layout"));
     }
     catch (cause) {
+        // Only substitute the friendly "not installed" message when the module
+        // genuinely cannot be resolved. A different failure (the package is present
+        // but fails to load — syntax, a broken transitive dep, a runtime throw at
+        // import time) must surface as-is so it isn't masked as a missing dependency.
+        if (cause?.code !== "ERR_MODULE_NOT_FOUND") {
+            throw cause;
+        }
         throw new Error('layoutBpmn requires the optional peer dependency "bpmn-auto-layout". ' +
             "Install it to generate diagram layout: npm i bpmn-auto-layout", { cause });
     }
