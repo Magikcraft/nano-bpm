@@ -7,6 +7,8 @@ import {
   defineWorkflow,
   defineFlow,
   toBpmn,
+  declarativeToLayoutedBpmn,
+  layoutBpmn,
   externalJobTypes,
   replayOnce,
   Worker,
@@ -39,6 +41,51 @@ test("declarative emit: service tasks + derived types + message/subscription", (
   assert.match(xml, /<bpmn:intermediateCatchEvent id="humanApproval"/);
   assert.match(xml, /<bpmn:message id="Msg_humanApproval" name="pr-review:humanApproval">/);
   assert.match(xml, /<zeebe:subscription correlationKey="=prId" \/>/);
+});
+
+test("declarative layout: auto-generates diagram interchange (DI) and preserves zeebe wiring", async () => {
+  const flow = defineFlow("pr-review", (w) => {
+    w.run("fetchDiff", async () => ({}));
+    w.signal("humanApproval", { correlationKey: "prId" });
+    w.task("merge");
+  });
+
+  // The semantic emitter is DI-less: the engine runs it, but it has no diagram.
+  assert.doesNotMatch(toBpmn(flow), /bpmndi:BPMNDiagram/);
+
+  const laid = await declarativeToLayoutedBpmn(flow);
+
+  // A diagram is now present, with a shape per flow node and an edge per flow.
+  assert.match(laid, /<bpmndi:BPMNDiagram\b/);
+  assert.match(laid, /<bpmndi:BPMNPlane\b/);
+  // Start, fetchDiff, humanApproval, merge, End = 5 shapes; 4 sequence flows.
+  assert.ok(
+    (laid.match(/<bpmndi:BPMNShape\b/g) ?? []).length >= 5,
+    "expected a shape per flow node",
+  );
+  assert.ok(
+    (laid.match(/<bpmndi:BPMNEdge\b/g) ?? []).length >= 4,
+    "expected an edge per sequence flow",
+  );
+
+  // The semantic content survives the layout round-trip (bpmn-moddle re-serialise):
+  // job types, the message, and its zeebe subscription/correlation are intact.
+  assert.match(laid, /zeebe:taskDefinition type="pr-review:merge"/);
+  assert.match(laid, /<bpmn:message\b/);
+  assert.match(laid, /zeebe:subscription/);
+  assert.match(laid, /correlationKey="=prId"/);
+});
+
+test("layoutBpmn: adds DI to a DI-less model and is idempotent on already-laid-out input", async () => {
+  const flow = defineFlow("linear", (w) => {
+    w.run("a", async () => ({}));
+    w.run("b", async () => ({}));
+  });
+  const once = await layoutBpmn(toBpmn(flow));
+  assert.match(once, /<bpmndi:BPMNDiagram\b/);
+  // Re-laying-out an already-diagrammed model still yields exactly one diagram.
+  const twice = await layoutBpmn(once);
+  assert.equal((twice.match(/<bpmndi:BPMNDiagram\b/g) ?? []).length, 1);
 });
 
 test("declarative validation: duplicates, missing correlationKey, empty, bad id", () => {
