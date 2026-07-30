@@ -48,8 +48,9 @@ export async function layoutBpmn(bpmnXml: string): Promise<string> {
     );
   }
   const result = await layoutProcess(bpmnXml);
-  // Version-shape normalization: bpmn-auto-layout >= 1.4 (and `main`) resolves to
-  // `{ xml, warnings }`; 1.3.x resolves to the laid-out XML string directly.
+  // Version-shape normalization: bpmn-auto-layout 2.x (and >= 1.4) resolves to
+  // `{ xml, warnings }`; 1.3.x resolved to the laid-out XML string directly. We
+  // pin >= 2.0.0-alpha.2 but normalize both so the SDK tolerates the whole range.
   return typeof result === "string" ? result : result.xml;
 }
 

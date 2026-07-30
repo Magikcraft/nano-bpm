@@ -1446,7 +1446,7 @@ const WORKER_DENO_JSON: &str = r#"{
 const WORKFLOW_DENO_JSON: &str = r#"{
   "imports": {
     "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.3.0",
-    "bpmn-auto-layout": "npm:bpmn-auto-layout@^1.3.0"
+    "bpmn-auto-layout": "npm:bpmn-auto-layout@^2.0.0-alpha.2"
   },
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-env main.ts",
@@ -1494,7 +1494,7 @@ fn workflow_package_json(name: &str) -> String {
   }},
   "devDependencies": {{
     "@types/node": "^22",
-    "bpmn-auto-layout": "^1.3.0"
+    "bpmn-auto-layout": "^2.0.0-alpha.2"
   }}
 }}
 "#,
@@ -3706,7 +3706,7 @@ fn synthesize_generate_import_map(dir: &std::path::Path) -> String {
         .or_insert_with(|| serde_json::json!("npm:@nanobpm/workflow@^0.3.0"));
     imports
         .entry("bpmn-auto-layout".to_string())
-        .or_insert_with(|| serde_json::json!("npm:bpmn-auto-layout@^1.3.0"));
+        .or_insert_with(|| serde_json::json!("npm:bpmn-auto-layout@^2.0.0-alpha.2"));
     serde_json::json!({ "imports": imports }).to_string()
 }
 

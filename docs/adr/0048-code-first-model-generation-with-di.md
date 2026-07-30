@@ -65,8 +65,8 @@ Concretely:
   the layout helpers ship in `@nanobpm/workflow >= 0.3.0`. Neither is guaranteed in an older project's
   `deno.json`, so generation runs under a **synthesized import map** (`--import-map` + `--no-config`,
   since Deno forbids a map from both a discovered `deno.json` and the flag). The map merges the
-  project's own imports and *defaults in* the SDK (`^0.3.0`) and `bpmn-auto-layout` (`^1.3.0`) when
-  absent, never overriding an explicit project pin.
+  project's own imports and *defaults in* the SDK (`^0.3.0`) and `bpmn-auto-layout`
+  (`^2.0.0-alpha.2`) when absent, never overriding an explicit project pin.
 - **Trigger (`is_workflow_source` + `regenerate_workflow_models`).** The code-first inverse of
   `is_model_resource`: a `.ts` directly under `workflows/` re-generates the models on save. Because the
   output lands on the scan surface, generation then refreshes the derived domain/worker types from the
