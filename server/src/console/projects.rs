@@ -3156,7 +3156,9 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         if !dir.is_dir() {
             out.push(ProjectSummary {
                 name: name.to_string(),
-                display_name: None,
+                // Keep the operator's typed (possibly spaced) label even when the
+                // source is missing, so a dangling tile is still recognisable.
+                display_name: read_project_ref(name).and_then(|r| r.display_name),
                 description: "(source not found)".to_string(),
                 deploy_target: default_deploy_target(),
                 updated_ms: 0,
@@ -3350,10 +3352,15 @@ static DERIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// Deno driver that imports a code-first project's `workflows/*.ts`, filters the
 /// exported values that are `@nanobpm/workflow` Workflows (structural check: an
 /// object with a string `id` and `kind` in {imperative, declarative}), runs each
-/// through the SDK's `toBpmn`, and prints `[{id, kind, xml}]` as JSON. Detection
-/// is structural so it never depends on SDK exports beyond `toBpmn` (published
-/// `@nanobpm/workflow@^0.1.0`). Only `workflows/*.ts` are imported — never
-/// `main.ts`, whose top-level `deploy()` would hit the network.
+/// through the SDK's `toBpmn` and then `layoutBpmn` (adding a `bpmndi:` diagram,
+/// with a per-model fallback to the DI-less XML if layout fails), and prints
+/// `[{id, kind, xml}]` as JSON. Laying out here — rather than relying solely on
+/// the on-disk models `generate_models` writes on save — means the viewer renders
+/// a diagram even for a project that has never been saved (e.g. just imported by
+/// reference). Detection is structural so it never depends on SDK exports beyond
+/// `toBpmn`/`layoutBpmn` (published `@nanobpm/workflow@^0.3.0`). Only
+/// `workflows/*.ts` are imported — never `main.ts`, whose top-level `deploy()`
+/// would hit the network.
 const DERIVE_MODELS_DRIVER: &str = r#"import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
 
 const root = Deno.args[0] ?? ".";
@@ -3487,13 +3494,15 @@ fn ondisk_generated_models(proc_dir: &std::path::Path) -> Vec<DerivedModel> {
 /// Derive the executable BPMN for a code-first workflow project (ADR 0045).
 ///
 /// Code-first projects have no authored `.bpmn`; the model is DERIVED from the
-/// `workflows/*.ts` via `@nanobpm/workflow`'s `toBpmn`. This runs that derivation
-/// under Deno (so the project's `deno.json` import map resolves the SDK) and
-/// returns the resulting models for the console's read-only viewer. The XML is
-/// overlaid with the on-disk auto-laid-out model (ADR 0048) when present so the
-/// diagram renders; a missing Deno toolchain or a failed/empty live derivation
-/// falls back to those on-disk models, and only truly bare projects surface an
-/// `Err` string (never a panic).
+/// `workflows/*.ts` via `@nanobpm/workflow`'s `toBpmn`, then auto-laid-out
+/// (`layoutBpmn`) so the returned XML carries a diagram even for a project that
+/// has never been saved. This runs that derivation under Deno (with a synthesized
+/// import map that resolves the SDK + layout dep) and returns the resulting
+/// models for the console's read-only viewer. The XML is further overlaid with
+/// the on-disk auto-laid-out model (ADR 0048) when present so the on-save,
+/// provenance-marked model wins; a missing Deno toolchain or a failed/empty live
+/// derivation falls back to those on-disk models, and only truly bare projects
+/// surface an `Err` string (never a panic).
 pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     let dir = project_dir(name).ok_or("invalid project name")?;
     if !dir.is_dir() {
@@ -3649,8 +3658,11 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
 /// Deno driver that imports a code-first project's `workflows/*.ts`, derives the
 /// executable BPMN for each exported Workflow via `toBpmn`, then AUTO-LAYS-OUT it
 /// (adds a `bpmndi:` diagram) via `layoutBpmn`, and prints `[{id, kind, xml}]` as
-/// JSON. Unlike `DERIVE_MODELS_DRIVER` (which emits DI-less XML for a read-only
-/// viewer) this produces a *renderable, round-trippable* model. The layout
+/// JSON. Both this and `DERIVE_MODELS_DRIVER` lay out their models; the
+/// difference is what the server does with them: `generate_models` WRITES these
+/// to `resources/processes/<id>.bpmn` (the persistent, provenance-marked scan
+/// surface, and it tracks an `incomplete` flag to gate the stale-model sweep),
+/// while the derive driver only returns them for the read-only viewer. The layout
 /// preserves `zeebe:` extensions, so the emitted XML is a valid model-first scan
 /// surface. Structural workflow detection matches the derive driver; only
 /// `workflows/*.ts` are imported — never `main.ts` (its top-level `deploy()`
@@ -5235,6 +5247,30 @@ mod tests {
             .iter()
             .find(|p| p.name == "urban-pr-review")
             .expect("listed by slug");
+        assert_eq!(linked.display_name.as_deref(), Some("Urban PR Review"));
+    }
+
+    #[test]
+    fn list_projects_keeps_display_name_for_a_dangling_spaced_import() {
+        let _g = lock();
+        let _root = temp_root();
+        let ext = ext_app_dir("dangling");
+        std::fs::write(
+            ext.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"x","name":"X"}"#,
+        )
+        .unwrap();
+        import_project_ref("Urban PR Review", ext.to_str().unwrap()).expect("import ok");
+
+        // The external checkout goes away → the tile is dangling, but the typed
+        // (spaced) label is still shown so the operator can recognise/fix it.
+        std::fs::remove_dir_all(&ext).unwrap();
+        let list = list_projects().unwrap();
+        let linked = list
+            .iter()
+            .find(|p| p.name == "urban-pr-review")
+            .expect("dangling ref still listed");
+        assert_eq!(linked.description, "(source not found)");
         assert_eq!(linked.display_name.as_deref(), Some("Urban PR Review"));
     }
 
