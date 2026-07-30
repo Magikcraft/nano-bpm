@@ -2928,6 +2928,43 @@ pub(super) fn is_model_resource(rel: &str) -> bool {
         && path.parent() == Some(std::path::Path::new("resources/processes"))
 }
 
+/// Whether a saved project file is a code-first workflow *source* — a `.ts`
+/// directly under `workflows/` — whose save should (re)generate the on-disk BPMN
+/// model(s) with diagram layout (ADR 0048). This is the code-first inverse of
+/// [`is_model_resource`]: there the authored `.bpmn` is the source of truth and a
+/// save re-derives the typed SDK; here the workflow *code* is the source of truth
+/// and a save re-generates the `resources/processes/*.bpmn` the SDK derives from.
+/// Matched precisely (a `.ts` in `workflows/`, not nested, not the project root)
+/// so an unrelated `.ts` save never triggers a Deno round-trip.
+pub(super) fn is_workflow_source(rel: &str) -> bool {
+    let path = std::path::Path::new(rel.trim_start_matches('/'));
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("ts"))
+        && path.parent() == Some(std::path::Path::new("workflows"))
+}
+
+/// Best-effort regeneration of a code-first project's on-disk BPMN models (with
+/// diagram layout) after a `workflows/*.ts` save (ADR 0048). On success the
+/// generated `.bpmn` land on the model-first scan surface, so we then refresh the
+/// derived domain/worker types from them — mirroring the `is_model_resource`
+/// path. Failure is logged, never surfaced: the save already succeeded and the
+/// models are a derived, always-regenerable artifact.
+async fn regenerate_workflow_models(name: &str) {
+    match projects::generate_models(name).await {
+        Ok(ids) if !ids.is_empty() => {
+            tracing::debug!(
+                project = name,
+                count = ids.len(),
+                "regenerated workflow models"
+            );
+            // The generated `.bpmn` now feed the envelope/domaintypes derivation.
+            regenerate_domain_types(name).await;
+        }
+        Ok(_) => {}
+        Err(msg) => tracing::debug!(project = name, "workflow model regen skipped: {msg}"),
+    }
+}
+
 /// `GET /console/api/projects/{name}/data/sources` — the datasources the App
 /// manifest declares (resolved driver/url) plus the default source name.
 pub(super) async fn project_data_sources(name: &str) -> ApiResult {
@@ -3518,6 +3555,22 @@ mod asset_encoding_tests {
         assert!(!is_model_resource("resources/forms/f.form"));
         assert!(!is_model_resource("nano.app.json"));
         assert!(!is_model_resource("README")); // no extension
+    }
+
+    #[test]
+    fn is_workflow_source_matches_workflows_ts_only() {
+        // The code-first trigger surface: a `.ts` directly under `workflows/`.
+        assert!(is_workflow_source("workflows/pr-review.ts"));
+        assert!(is_workflow_source("workflows/order.TS")); // case-insensitive
+        assert!(is_workflow_source("/workflows/pr-review.ts")); // leading-slash tolerated
+        // Anything outside `workflows/*.ts` must not trigger a Deno round-trip.
+        assert!(!is_workflow_source("pr-review.ts")); // project root
+        assert!(!is_workflow_source("workflows/sub/pr-review.ts")); // nested
+        assert!(!is_workflow_source("scripts/approve.ts"));
+        assert!(!is_workflow_source("main.ts"));
+        assert!(!is_workflow_source("workflows/pr-review.js")); // not TS
+        assert!(!is_workflow_source("workflows/README")); // no extension
+        assert!(!is_workflow_source("resources/processes/order.bpmn"));
     }
 
     fn accept(value: &str) -> AcceptedEncodings {

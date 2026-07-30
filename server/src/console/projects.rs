@@ -1445,7 +1445,8 @@ const WORKER_DENO_JSON: &str = r#"{
 /// the entrypoint (which deploys the workflows and hosts a Worker).
 const WORKFLOW_DENO_JSON: &str = r#"{
   "imports": {
-    "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.2.0"
+    "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.3.0",
+    "bpmn-auto-layout": "npm:bpmn-auto-layout@^1.3.0"
   },
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-env main.ts",
@@ -1489,10 +1490,11 @@ fn workflow_package_json(name: &str) -> String {
     "approve": "deno task approve"
   }},
   "dependencies": {{
-    "@nanobpm/workflow": "^0.2.0"
+    "@nanobpm/workflow": "^0.3.0"
   }},
   "devDependencies": {{
-    "@types/node": "^22"
+    "@types/node": "^22",
+    "bpmn-auto-layout": "^1.3.0"
   }}
 }}
 "#,
@@ -3446,6 +3448,232 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
         .map_err(|e| format!("parse derived models: {e}; deno output: {}", stdout.trim()))
 }
 
+/// Deno driver that imports a code-first project's `workflows/*.ts`, derives the
+/// executable BPMN for each exported Workflow via `toBpmn`, then AUTO-LAYS-OUT it
+/// (adds a `bpmndi:` diagram) via `layoutBpmn`, and prints `[{id, kind, xml}]` as
+/// JSON. Unlike `DERIVE_MODELS_DRIVER` (which emits DI-less XML for a read-only
+/// viewer) this produces a *renderable, round-trippable* model. The layout
+/// preserves `zeebe:` extensions, so the emitted XML is a valid model-first scan
+/// surface. Structural workflow detection matches the derive driver; only
+/// `workflows/*.ts` are imported — never `main.ts` (its top-level `deploy()`
+/// would hit the network).
+const GENERATE_MODELS_DRIVER: &str = r#"import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
+
+const root = Deno.args[0] ?? ".";
+const wfDir = `${root}/workflows`;
+const out: Array<{ id: string; kind: string; xml: string }> = [];
+const seen = new Set<string>();
+
+function isWorkflow(v: unknown): v is { id: string; kind: string } {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    typeof (v as { id?: unknown }).id === "string" &&
+    ((v as { kind?: unknown }).kind === "imperative" ||
+      (v as { kind?: unknown }).kind === "declarative")
+  );
+}
+
+try {
+  for await (const entry of Deno.readDir(wfDir)) {
+    if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
+    let mod: Record<string, unknown>;
+    try {
+      mod = await import(`file://${wfDir}/${entry.name}`);
+    } catch (e) {
+      console.error(`skip ${entry.name}: ${e}`);
+      continue;
+    }
+    for (const value of Object.values(mod)) {
+      if (isWorkflow(value) && !seen.has(value.id)) {
+        seen.add(value.id);
+        try {
+          const xml = await layoutBpmn(toBpmn(value as never));
+          out.push({ id: value.id, kind: value.kind, xml });
+        } catch (e) {
+          console.error(`layout(${value.id}) failed: ${e}`);
+        }
+      }
+    }
+  }
+} catch (e) {
+  console.error(`readDir(${wfDir}) failed: ${e}`);
+}
+
+console.log(JSON.stringify(out));
+"#;
+
+/// Map a workflow `id` to a safe `<id>.bpmn` filename, or `None` when nothing
+/// filename-worthy survives sanitization. Any character outside `[A-Za-z0-9._-]`
+/// (notably path separators) becomes `-`, so a hostile or awkward id can never
+/// escape `resources/processes/`.
+fn bpmn_filename(id: &str) -> Option<String> {
+    let safe: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = safe.trim_matches(|c| c == '.' || c == '-');
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(format!("{trimmed}.bpmn"))
+}
+
+/// Prepend a provenance comment to a generated model so a reader (or a diff)
+/// knows it is DERIVED from the workflow code and regenerated on every save —
+/// hand-edits in a modeller are clobbered. Inserted *after* the XML prolog
+/// (a comment before `<?xml ?>` is not well-formed); prepended when there is no
+/// prolog.
+fn with_provenance(xml: &str) -> String {
+    const NOTE: &str = "<!-- Generated from workflows/*.ts by @nanobpm/workflow (ADR 0048). \
+Do not edit: regenerated on every workflow save. -->";
+    let trimmed = xml.trim_start();
+    if trimmed.starts_with("<?xml")
+        && let Some(end) = trimmed.find("?>")
+    {
+        let (prolog, rest) = trimmed.split_at(end + 2);
+        return format!("{prolog}\n{NOTE}{rest}");
+    }
+    format!("{NOTE}\n{xml}")
+}
+
+/// Synthesize the import map used for model *generation*. The layout helpers
+/// (`layoutBpmn`) ship in `@nanobpm/workflow >= 0.3.0` and lazily import the
+/// optional `bpmn-auto-layout` peer dep — neither of which an older project's
+/// `deno.json` is guaranteed to declare. We merge the project's own imports (so
+/// a workflow module's other bare imports still resolve) and *default in* the SDK
+/// and layout dep when absent, without overriding a project's explicit pins.
+/// Emitted into the cache dir and passed via `--import-map --no-config` (Deno
+/// forbids an import map from both a discovered `deno.json` and the flag).
+fn synthesize_generate_import_map(dir: &std::path::Path) -> String {
+    let mut imports = serde_json::Map::new();
+    if let Ok(txt) = std::fs::read_to_string(dir.join("deno.json"))
+        && let Ok(serde_json::Value::Object(obj)) = serde_json::from_str::<serde_json::Value>(&txt)
+        && let Some(serde_json::Value::Object(im)) = obj.get("imports")
+    {
+        imports = im.clone();
+    }
+    imports
+        .entry("@nanobpm/workflow".to_string())
+        .or_insert_with(|| serde_json::json!("npm:@nanobpm/workflow@^0.3.0"));
+    imports
+        .entry("bpmn-auto-layout".to_string())
+        .or_insert_with(|| serde_json::json!("npm:bpmn-auto-layout@^1.3.0"));
+    serde_json::json!({ "imports": imports }).to_string()
+}
+
+/// Generate on-disk, auto-laid-out BPMN models for a code-first workflow project
+/// (ADR 0048) and return the ids written. Runs the derivation under Deno like
+/// [`derive_models`], but layers `bpmn-auto-layout` to add diagram interchange
+/// and WRITES each model to `resources/processes/<id>.bpmn` — the model-first
+/// scan surface — so a code-first flow becomes visually inspectable,
+/// round-trippable in a modeller, and feeds the envelope/domaintypes derivation
+/// exactly as an authored model does. Best-effort: a missing Deno toolchain, a
+/// non-workflow project, or a layout failure surface as an `Err` string rather
+/// than panicking (the semantic in-memory derivation still works).
+pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
+    let dir = project_dir(name).ok_or("invalid project name")?;
+    if !dir.is_dir() {
+        return Err("no such project".into());
+    }
+    let wf_dir = dir.join("workflows");
+    if !wf_dir.is_dir() {
+        return Err("not a code-first workflow project (no workflows/ directory)".into());
+    }
+    let deno = super::extensions::find_program("deno").ok_or("deno toolchain not found on PATH")?;
+
+    // Canonicalize so the --allow-read scope matches the path Deno resolves.
+    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let cache = dir.join(".deno-cache");
+    let _ = std::fs::create_dir_all(&cache);
+
+    let seq = DERIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    // The synthesized import map lives in the cache dir (the only writable scope);
+    // `--no-config` disables `deno.json` discovery so the flag map is the sole map.
+    let map_name = format!(".nano-genmap-{}-{}.json", std::process::id(), seq);
+    let map_path = cache.join(&map_name);
+    std::fs::write(&map_path, synthesize_generate_import_map(&dir))
+        .map_err(|e| format!("write import map: {e}"))?;
+
+    // Write the driver INTO the project dir so `file://.../workflows/*.ts` imports
+    // resolve relative to it; name it uniquely per call so concurrent generations
+    // never collide; remove it afterwards.
+    let driver_name = format!(".nano-generate-{}-{}.ts", std::process::id(), seq);
+    let driver_path = dir.join(&driver_name);
+    std::fs::write(&driver_path, GENERATE_MODELS_DRIVER)
+        .map_err(|e| format!("write generation driver: {e}"))?;
+
+    // Same least-privilege sandbox as `derive_models`: read the project, fetch the
+    // SDK + layout dep from the registry, write ONLY to the Deno cache (the model
+    // files are written by the server below, not the sandbox). No `--allow-env`.
+    let allow_net = std::env::var("NANOBPMN_DERIVE_ALLOW_NET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "registry.npmjs.org".to_string());
+    let result = Command::new(&deno)
+        .current_dir(&dir)
+        .arg("run")
+        .arg("--no-prompt")
+        .arg("--no-lock")
+        .arg("--no-config")
+        .arg(format!("--import-map={}", map_path.display()))
+        .arg(format!("--allow-net={allow_net}"))
+        .arg(format!("--allow-read={}", dir.display()))
+        .arg(format!("--allow-write={}", cache.display()))
+        .arg(&driver_name)
+        .arg(&dir)
+        .env("DENO_DIR", &cache)
+        .output()
+        .await;
+
+    let _ = std::fs::remove_file(&driver_path);
+    let _ = std::fs::remove_file(&map_path);
+
+    let output = result.map_err(|e| format!("spawn deno: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("model generation failed: {}", stderr.trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('['))
+        .unwrap_or("[]");
+    let models: Vec<DerivedModel> = serde_json::from_str(json).map_err(|e| {
+        format!(
+            "parse generated models: {e}; deno output: {}",
+            stdout.trim()
+        )
+    })?;
+
+    // Write each laid-out model to the model-first scan surface. `resources/
+    // processes/` is exactly where `envelope_scan::scan_project` reads, so these
+    // generated `.bpmn` become a first-class scan surface: worker/message I/O and
+    // custom headers derive from them just as they do for an authored model.
+    let proc_dir = dir.join("resources").join("processes");
+    std::fs::create_dir_all(&proc_dir).map_err(|e| format!("create resources/processes: {e}"))?;
+    let mut written = Vec::new();
+    for m in &models {
+        let Some(file) = bpmn_filename(&m.id) else {
+            tracing::debug!(project = name, id = %m.id, "skipping model with unsafe id");
+            continue;
+        };
+        let path = proc_dir.join(&file);
+        std::fs::write(&path, with_provenance(&m.xml))
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        written.push(m.id.clone());
+    }
+    Ok(written)
+}
+
 // ---------------------------------------------------------------------------
 // Run / compile supervisor
 // ---------------------------------------------------------------------------
@@ -4569,6 +4797,46 @@ mod tests {
             std::env::set_var("NANOBPMN_PROJECTS_DIR", &p);
         }
         p
+    }
+
+    #[test]
+    fn bpmn_filename_sanitizes_and_rejects_empty() {
+        // A clean id maps to `<id>.bpmn`.
+        assert_eq!(
+            bpmn_filename("pr-review").as_deref(),
+            Some("pr-review.bpmn")
+        );
+        assert_eq!(
+            bpmn_filename("Order_v2.1").as_deref(),
+            Some("Order_v2.1.bpmn")
+        );
+        // Path separators and other unsafe chars become `-`, so a hostile id can
+        // never escape `resources/processes/`.
+        assert_eq!(
+            bpmn_filename("../../etc/passwd").as_deref(),
+            Some("etc-passwd.bpmn"),
+        );
+        assert_eq!(bpmn_filename("a/b").as_deref(), Some("a-b.bpmn"));
+        assert_eq!(bpmn_filename("a b:c").as_deref(), Some("a-b-c.bpmn"));
+        // Nothing filename-worthy survives → None (so it's skipped, not written).
+        assert_eq!(bpmn_filename(""), None);
+        assert_eq!(bpmn_filename("..."), None);
+        assert_eq!(bpmn_filename("///"), None);
+    }
+
+    #[test]
+    fn with_provenance_inserts_after_prolog() {
+        let xml = "<?xml version=\"1.0\"?><bpmn:definitions/>";
+        let out = with_provenance(xml);
+        // Comment lands AFTER the prolog (a comment before `<?xml` is malformed).
+        assert!(out.starts_with("<?xml version=\"1.0\"?>"));
+        assert!(out.contains("Generated from workflows/*.ts"));
+        let prolog_end = out.find("?>").unwrap();
+        let comment_at = out.find("<!--").unwrap();
+        assert!(comment_at > prolog_end);
+        // Prologless input gets the note prepended.
+        let bare = with_provenance("<bpmn:definitions/>");
+        assert!(bare.starts_with("<!--"));
     }
 
     #[test]
