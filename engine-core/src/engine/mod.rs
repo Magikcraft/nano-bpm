@@ -4820,6 +4820,17 @@ impl Engine {
         events.extend(self.cancel_boundary_message_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_signal_subscriptions_on(element_instance_key));
         events.extend(self.cancel_boundary_conditional_subscriptions_on(element_instance_key));
+        // Event-based gateway deferred choice: when this completing element is
+        // the catch event that won the race downstream of an event-based
+        // gateway, withdraw the losing sibling catch events (cancel their armed
+        // timers/subscriptions and consume their tokens) so only the winning
+        // branch continues. A no-op for any element not fed by such a gateway.
+        events.extend(self.withdraw_event_gateway_siblings(
+            instance_key,
+            element_instance_key,
+            &element_id,
+            scope,
+        ));
         // A script task's (or business rule task's) result is merged before output
         // mappings so a `zeebe:output` can reference/remap it (Zeebe merges
         // `resultVariable` first, then applies output mappings).
@@ -5033,7 +5044,84 @@ impl Engine {
         (events, followups)
     }
 
-    /// Deferred completion of an embedded sub-process (or spliced call activity)
+    /// Withdraws the losing siblings of an event-based gateway's deferred choice.
+    ///
+    /// An event-based gateway routes into several intermediate catch events and
+    /// arms them all at once (its completion takes every outgoing flow). The
+    /// first event to occur wins: this helper is called when that winning catch
+    /// event completes and tears down the *other* targets of the same gateway —
+    /// cancelling every armed timer and open (message/signal/conditional)
+    /// subscription resting on each losing sibling, then completing its element
+    /// instance so its token is consumed without taking an outgoing flow. Only
+    /// active sibling instances in the same token `scope` are withdrawn, so a
+    /// gateway reached again on a loop only ever withdraws the current race.
+    ///
+    /// Returns an empty vec — the overwhelmingly common path — when `winner`
+    /// is not the immediate target of an event-based gateway.
+    fn withdraw_event_gateway_siblings(
+        &self,
+        instance_key: Key,
+        winner_eik: Key,
+        winner_element_id: &str,
+        scope: Key,
+    ) -> Vec<Event> {
+        let Some(def) = self.process_of_instance(instance_key) else {
+            return Vec::new();
+        };
+        // The sibling target ids are the *other* outgoing targets of any
+        // event-based gateway that routes into the winning catch event.
+        let mut sibling_ids: Vec<&str> = Vec::new();
+        for element in def.elements.values() {
+            if !matches!(element.kind, ElementKind::EventBasedGateway) {
+                continue;
+            }
+            if element.outgoing.iter().any(|f| f.to == winner_element_id) {
+                for flow in &element.outgoing {
+                    if flow.to != winner_element_id {
+                        sibling_ids.push(flow.to.as_str());
+                    }
+                }
+            }
+        }
+        if sibling_ids.is_empty() {
+            return Vec::new();
+        }
+        let Some(instance) = self.state.instances.get(&instance_key) else {
+            return Vec::new();
+        };
+        // Every active element instance of a losing sibling in this token scope.
+        // Sorted by element-instance key for a deterministic, replay-stable log.
+        let mut losers: Vec<(Key, String)> = instance
+            .active
+            .iter()
+            .filter(|(eik, eid)| {
+                **eik != winner_eik
+                    && sibling_ids.iter().any(|s| *s == eid.as_str())
+                    && self.scope_of(instance_key, **eik) == scope
+            })
+            .map(|(eik, eid)| (*eik, eid.clone()))
+            .collect();
+        losers.sort_by_key(|(eik, _)| *eik);
+
+        let mut events = Vec::new();
+        for (eik, eid) in losers {
+            events.extend(self.cancel_all_timers_on(eik));
+            events.extend(self.cancel_all_subscriptions_on(eik));
+            events.extend(self.cancel_all_signal_subscriptions_on(eik));
+            events.extend(self.cancel_all_conditional_subscriptions_on(eik));
+            events.push(Event::ElementCompleting {
+                instance_key,
+                element_instance_key: eik,
+                element_id: eid.clone(),
+            });
+            events.push(Event::ElementCompleted {
+                instance_key,
+                element_instance_key: eik,
+                element_id: eid,
+            });
+        }
+        events
+    }
     /// whose `end` execution-listener chain has drained (ADR 0037). Its boundary
     /// events disarmed and its output mappings projected when it parked (in the
     /// drained-sub-process sweep); this emits the parked `ElementCompleted` and

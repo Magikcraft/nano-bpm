@@ -428,6 +428,14 @@ pub enum ElementKind {
     /// join (more than one incoming flow) it waits for a token on every incoming
     /// flow before producing one outgoing token.
     ParallelGateway,
+    /// An event-based gateway: a *deferred choice* over the intermediate catch
+    /// events (timer/message/signal/conditional) that immediately follow it.
+    /// On arrival it takes *all* outgoing flows — arming every downstream catch
+    /// event at once — and the first event to occur wins: its token continues
+    /// while the losing siblings are withdrawn (their timers/subscriptions
+    /// cancelled, their tokens consumed). It is a pure routing element with no
+    /// join behaviour and no synchronisation.
+    EventBasedGateway,
     /// An error boundary event attached to an activity (here, a service task).
     /// It has no incoming sequence flow; instead it is triggered when a job
     /// throws a business error whose code matches `error_code`, interrupting the
@@ -1389,6 +1397,14 @@ impl ProcessBuilder {
     /// Adds a parallel (AND) gateway.
     pub fn parallel_gateway(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::ParallelGateway)
+    }
+
+    /// Adds an event-based gateway: a deferred choice over the intermediate
+    /// catch events that immediately follow it. On arrival it takes every
+    /// outgoing flow (arming each downstream catch event); the first to fire
+    /// wins and the losing siblings are withdrawn.
+    pub fn event_based_gateway(self, id: impl Into<String>) -> Self {
+        self.add(id, ElementKind::EventBasedGateway)
     }
 
     /// Adds an embedded sub-process whose inner token scope begins at

@@ -9529,3 +9529,96 @@ fn canceling_a_task_mid_transition_clears_its_pending_state() {
         state::ProcessInstanceState::Terminated
     );
 }
+
+/// Builds the classic event-based gateway race: a gateway routing to a timer
+/// intermediate catch (`onTimer`, due 5s after activation) and a message
+/// intermediate catch (`onReply`, correlated on `orderId`). Whichever fires
+/// first wins; the loser is withdrawn.
+fn event_gateway_race() -> ProcessDefinition {
+    ProcessBuilder::new("race")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .timer_intermediate_catch_event("onTimer", 5_000)
+        .message_intermediate_catch_event("onReply", "reply", "orderId")
+        .end_event("timedOut")
+        .end_event("replied")
+        .connect("start", "gw")
+        .connect("gw", "onTimer")
+        .connect("gw", "onReply")
+        .connect("onTimer", "timedOut")
+        .connect("onReply", "replied")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn event_based_gateway_arms_all_catch_events_then_timer_wins() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(event_gateway_race()))
+        .unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("orderId".to_string(), Value::Str("A".to_string()));
+    let events = engine
+        .apply_command_at(Command::create_instance_with("race", vars), 1_000)
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The gateway split armed both catch events at once: a timer (due 6000) and
+    // an open message subscription.
+    assert_eq!(engine.timers().len(), 1);
+    assert_eq!(engine.timers()[0].state, state::TimerState::Created);
+    assert_eq!(engine.timers()[0].due_at, 6_000);
+    assert_eq!(engine.message_subscriptions().len(), 1);
+    assert_eq!(
+        engine.message_subscriptions()[0].state,
+        state::MessageSubscriptionState::Open
+    );
+    assert!(!engine.is_completed(instance_key));
+
+    // The timer fires first: its branch completes the instance and the losing
+    // message sibling is withdrawn (its subscription cancelled).
+    let fired = engine.trigger_timers(6_000);
+    assert!(fired.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+    assert_eq!(
+        engine.message_subscriptions()[0].state,
+        state::MessageSubscriptionState::Canceled
+    );
+
+    // A message arriving after the race is over correlates nothing.
+    let late = engine
+        .apply_command(Command::correlate_message("reply", "A"))
+        .unwrap();
+    assert!(!late
+        .iter()
+        .any(|e| matches!(e, Event::ElementActivated { .. })));
+}
+
+#[test]
+fn event_based_gateway_message_wins_and_withdraws_the_timer_sibling() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(event_gateway_race()))
+        .unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("orderId".to_string(), Value::Str("A".to_string()));
+    let events = engine
+        .apply_command_at(Command::create_instance_with("race", vars), 1_000)
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The message correlates before the timer is due: its branch completes the
+    // instance and the losing timer sibling is cancelled.
+    let correlated = engine
+        .apply_command_at(Command::correlate_message("reply", "A"), 2_000)
+        .unwrap();
+    assert!(correlated.contains(&Event::ProcessInstanceCompleted { instance_key }));
+    assert!(engine.is_completed(instance_key));
+    assert_eq!(engine.timers()[0].state, state::TimerState::Canceled);
+
+    // The cancelled timer never fires, even past its original due instant.
+    assert!(engine.trigger_timers(6_000).is_empty());
+}
