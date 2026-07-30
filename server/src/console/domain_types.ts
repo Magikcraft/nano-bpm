@@ -471,6 +471,10 @@ export interface WorkerBindingDecl {
   taskType: string;
   inputType?: string;
   outputType?: string;
+  /** The `zeebe:header` keys declared on the task; reified into a typed
+   * `job.customHeaders` shape (known keys, `string` values — headers are strings
+   * on the wire). Empty/absent leaves `customHeaders` the untyped fallback. */
+  headerKeys?: string[];
 }
 
 /** The TS type expression for a worker's declared input/output type id: an index
@@ -478,6 +482,18 @@ export interface WorkerBindingDecl {
  * caller omits the entry so the taskType falls back to `WorkerVars`). */
 function typeRefFor(id: string | undefined, declared: Set<string>): string | undefined {
   return id != null && declared.has(id) ? `DomainTypes[${JSON.stringify(id)}]` : undefined;
+}
+
+/** The TS type expression for a worker's declared custom-header keys: an object
+ * type mapping each declared key to `string` (Zeebe headers are strings on the
+ * wire) plus an index signature so undeclared headers stay accessible. Returns
+ * `undefined` when no keys are declared (the caller omits the entry so the
+ * taskType falls back to `WorkerHdrs`). */
+function headerRefFor(keys: string[] | undefined): string | undefined {
+  const clean = [...new Set((keys ?? []).filter((k) => typeof k === "string" && k.length > 0))];
+  if (clean.length === 0) return undefined;
+  const fields = clean.map((k) => `${JSON.stringify(k)}: string`).join("; ");
+  return `{ ${fields}; [key: string]: unknown }`;
 }
 
 /**
@@ -512,12 +528,15 @@ export function emitWorkerBindings(
     : "string";
   const inputs: string[] = [];
   const outputs: string[] = [];
+  const headers: string[] = [];
   for (const w of workers) {
     if (typeof w?.taskType !== "string" || w.taskType.length === 0) continue;
     const inRef = typeRefFor(w.inputType, declared);
     if (inRef) inputs.push(`  ${propKey(w.taskType)}: ${inRef};`);
     const outRef = typeRefFor(w.outputType, declared);
     if (outRef) outputs.push(`  ${propKey(w.taskType)}: ${outRef};`);
+    const hdrRef = headerRefFor(w.headerKeys);
+    if (hdrRef) headers.push(`  ${propKey(w.taskType)}: ${hdrRef};`);
   }
 
   const header =
@@ -539,18 +558,27 @@ export function emitWorkerBindings(
   const outputsIface = outputs.length > 0
     ? `export interface WorkerOutputs {\n${outputs.join("\n")}\n}\n`
     : `export interface WorkerOutputs {}\n`;
+  const headersIface = headers.length > 0
+    ? `export interface WorkerHeaders {\n${headers.join("\n")}\n}\n`
+    : `export interface WorkerHeaders {}\n`;
 
   return `${header}\n` +
     importTypes +
     `\n/** Untyped fallback for a job whose worker declares no input/output type. */\n` +
     `export type WorkerVars = Record<string, unknown>;\n\n` +
+    `/** Untyped fallback for a job whose worker declares no custom headers. */\n` +
+    `export type WorkerHdrs = Record<string, unknown>;\n\n` +
     `/** Every declared worker \`taskType\` (ADR 0033 §3): the model-derived set the\n` +
     ` * typed \`defineWorker\` accepts, so \`type\` autocompletes and rejects unknown jobs. */\n` +
     `export type WorkerTaskType = ${taskTypeUnion};\n\n` +
     `/** Input payload (\`job.variables\`) per declared worker, keyed by \`taskType\`. */\n` +
     inputsIface +
     `\n/** Output payload (worker result) per declared worker, keyed by \`taskType\`. */\n` +
-    outputsIface;
+    outputsIface +
+    `\n/** Custom headers (\`job.customHeaders\`) per declared worker, keyed by \`taskType\`.\n` +
+    ` * Header values are strings on the wire, so each declared key maps to \`string\`;\n` +
+    ` * the extra index signature keeps undeclared headers accessible (non-breaking). */\n` +
+    headersIface;
 }
 
 /**
@@ -572,19 +600,20 @@ export function emitWorkerBindingsRuntime(): string {
     "// eslint-disable\n\n" +
     `import { defineWorker as defineWorkerRaw } from "./worker-sdk.ts";\n` +
     `import type { WorkerOptions } from "./worker-sdk.ts";\n` +
-    `import type { WorkerInputs, WorkerOutputs, WorkerTaskType, WorkerVars } from "./${WORKER_BINDINGS_DTS}";\n\n` +
+    `import type { WorkerInputs, WorkerOutputs, WorkerHeaders, WorkerTaskType, WorkerVars, WorkerHdrs } from "./${WORKER_BINDINGS_DTS}";\n\n` +
     `export * from "./worker-sdk.ts";\n\n` +
     `type InFor<K extends WorkerTaskType> = K extends keyof WorkerInputs ? WorkerInputs[K] : WorkerVars;\n` +
-    `type OutFor<K extends WorkerTaskType> = K extends keyof WorkerOutputs ? WorkerOutputs[K] : WorkerVars;\n\n` +
+    `type OutFor<K extends WorkerTaskType> = K extends keyof WorkerOutputs ? WorkerOutputs[K] : WorkerVars;\n` +
+    `type HdrFor<K extends WorkerTaskType> = K extends keyof WorkerHeaders ? WorkerHeaders[K] : WorkerHdrs;\n\n` +
     `/**\n` +
     ` * Typed \`defineWorker\`: \`type\` is constrained to the model's declared job types\n` +
     ` * (\`WorkerTaskType\`, ADR 0033 §3) so it autocompletes and rejects unknown jobs,\n` +
-    ` * and the handler's \`job.variables\` + result are typed from the worker's declared\n` +
-    ` * \`inputType\`/\`outputType\`. A declared job type with no domain type falls back to\n` +
-    ` * WorkerVars.\n` +
+    ` * and the handler's \`job.variables\`, \`job.customHeaders\` + result are typed from\n` +
+    ` * the worker's declared \`inputType\`/\`outputType\`/header keys. A declared job type\n` +
+    ` * with no declared type falls back to WorkerVars / WorkerHdrs.\n` +
     ` */\n` +
     `export function defineWorker<K extends WorkerTaskType>(\n` +
-    `  opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object>,\n` +
+    `  opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object, HdrFor<K> & object>,\n` +
     `): void {\n` +
     `  defineWorkerRaw(opts as unknown as WorkerOptions);\n` +
     `}\n`;

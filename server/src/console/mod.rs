@@ -2908,6 +2908,17 @@ async fn regenerate_domain_types(name: &str) {
     }
 }
 
+/// Whether a saved project file is a process model that carries the worker/message
+/// I/O + custom-header contract the `domaintypes` op derives (ADR 0033 §3). A
+/// `.bpmn` under `resources/processes/` is the scan surface (`envelope_scan::
+/// scan_project`), so saving one must retrigger regeneration to avoid drift. The
+/// check is on the extension (case-insensitive) so a model saved anywhere counts.
+pub(super) fn is_model_resource(rel: &str) -> bool {
+    std::path::Path::new(rel)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("bpmn"))
+}
+
 /// `GET /console/api/projects/{name}/data/sources` — the datasources the App
 /// manifest declares (resolved driver/url) plus the default source name.
 pub(super) async fn project_data_sources(name: &str) -> ApiResult {
@@ -3467,6 +3478,16 @@ nanobpm_handoff_lag_entries 1200
 #[cfg(test)]
 mod asset_encoding_tests {
     use super::*;
+
+    #[test]
+    fn is_model_resource_matches_bpmn_only() {
+        assert!(is_model_resource("resources/processes/order.bpmn"));
+        assert!(is_model_resource("order.BPMN")); // case-insensitive
+        assert!(!is_model_resource("workers/charge/worker.ts"));
+        assert!(!is_model_resource("resources/forms/f.form"));
+        assert!(!is_model_resource("nano.app.json"));
+        assert!(!is_model_resource("README")); // no extension
+    }
 
     fn accept(value: &str) -> AcceptedEncodings {
         let mut headers = HeaderMap::new();

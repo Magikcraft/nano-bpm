@@ -514,11 +514,38 @@ Deno.test("emitWorkerBindings maps taskType → declared input/output types (ADR
   assertEquals(out.split(`"review-order": DomainTypes`).length, 2);
 });
 
+Deno.test("emitWorkerBindings maps header keys → typed customHeaders shape (ADR 0033 §3)", () => {
+  const out = emitWorkerBindings(
+    [
+      { taskType: "charge", headerKeys: ["region", "priority"] },
+      { taskType: "review", inputType: "savedOrder", headerKeys: ["region", "region", ""] }, // dedup + drop blank
+      { taskType: "noop" }, // no headers → absent from WorkerHeaders
+    ],
+    ["savedOrder"],
+  );
+  assertStringIncludes(out, "export interface WorkerHeaders {");
+  assertStringIncludes(out, "export type WorkerHdrs = Record<string, unknown>;");
+  // Known keys map to `string` (wire type) with an index-signature escape hatch.
+  assertStringIncludes(
+    out,
+    `"charge": { "region": string; "priority": string; [key: string]: unknown };`,
+  );
+  // Duplicate/blank keys are deduped/dropped.
+  assertStringIncludes(
+    out,
+    `"review": { "region": string; [key: string]: unknown };`,
+  );
+  // A worker with no declared headers carries no WorkerHeaders entry.
+  assertEquals(out.includes('"noop": {'), false);
+});
+
 Deno.test("emitWorkerBindings with no declared worker types is a valid empty map", () => {
   const out = emitWorkerBindings([{ taskType: "noop" }], []);
   assertStringIncludes(out, "export interface WorkerInputs {}");
   assertStringIncludes(out, "export interface WorkerOutputs {}");
+  assertStringIncludes(out, "export interface WorkerHeaders {}");
   assertStringIncludes(out, "export type WorkerVars = Record<string, unknown>;");
+  assertStringIncludes(out, "export type WorkerHdrs = Record<string, unknown>;");
   // The taskType is still surfaced in the model-derived union.
   assertStringIncludes(out, `export type WorkerTaskType = "noop";`);
   // No registry import when nothing references it.
@@ -533,9 +560,10 @@ Deno.test("emitWorkerBindings with no workers at all yields a permissive WorkerT
 Deno.test("emitWorkerBindingsRuntime is a taskType-keyed typed defineWorker wrapper", () => {
   const out = emitWorkerBindingsRuntime();
   assertStringIncludes(out, `export * from "./worker-sdk.ts";`);
-  assertStringIncludes(out, `import type { WorkerInputs, WorkerOutputs, WorkerTaskType, WorkerVars } from "./${WORKER_BINDINGS_DTS}";`);
+  assertStringIncludes(out, `import type { WorkerInputs, WorkerOutputs, WorkerHeaders, WorkerTaskType, WorkerVars, WorkerHdrs } from "./${WORKER_BINDINGS_DTS}";`);
   assertStringIncludes(out, "export function defineWorker<K extends WorkerTaskType>(");
-  assertStringIncludes(out, "opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object>,");
+  assertStringIncludes(out, "opts: { type: K } & WorkerOptions<InFor<K> & object, OutFor<K> & object, HdrFor<K> & object>,");
+  assertStringIncludes(out, "type HdrFor<K extends WorkerTaskType> = K extends keyof WorkerHeaders ? WorkerHeaders[K] : WorkerHdrs;");
   // Node strip-only safety (ADR 0036): no TS parameter properties/enums.
   assertEquals(out.includes("constructor(private"), false);
   assertEquals(out.includes("enum "), false);

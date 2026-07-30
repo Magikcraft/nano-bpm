@@ -76,7 +76,16 @@ export interface WorkerContext {
  * handler's inputs and outputs while authoring — erased at runtime. */
 export type WorkerVars = Record<string, unknown>;
 
-export interface WorkerJob<In extends object = WorkerVars, Out extends object = WorkerVars> {
+/** The untyped custom-header fallback. A worker whose model declares `zeebe:header`
+ * keys gets a typed shape (known keys → `string`, ADR 0033 §3) via the generated
+ * typed `defineWorker`; otherwise `customHeaders` stays this untyped bag. */
+export type WorkerHdrs = Record<string, unknown>;
+
+export interface WorkerJob<
+  In extends object = WorkerVars,
+  Out extends object = WorkerVars,
+  Hdr extends object = WorkerHdrs,
+> {
   readonly jobKey: string;
   readonly type: string;
   readonly processInstanceKey: string;
@@ -85,7 +94,7 @@ export interface WorkerJob<In extends object = WorkerVars, Out extends object = 
   readonly elementId?: string;
   readonly retries?: number;
   readonly variables: In;
-  readonly customHeaders: Record<string, unknown>;
+  readonly customHeaders: Hdr;
   /** Complete the job, optionally setting output variables. */
   complete(variables?: Out): void;
   /** Fail the job (optionally with remaining retries and a message). */
@@ -94,14 +103,18 @@ export interface WorkerJob<In extends object = WorkerVars, Out extends object = 
   error(errorCode: string, errorMessage?: string): void;
 }
 
-export interface WorkerOptions<In extends object = WorkerVars, Out extends object = WorkerVars> {
+export interface WorkerOptions<
+  In extends object = WorkerVars,
+  Out extends object = WorkerVars,
+  Hdr extends object = WorkerHdrs,
+> {
   /** BPMN job type to work on. */
   type: string;
   /** Handler invoked per job. Return output vars, or call a job action. The
    * optional 2nd arg exposes the App runtime: `ctx.data(name?)` opens a
    * declared datasource (ADR 0024). Single-arg handlers keep working. */
   handle: (
-    job: WorkerJob<In, Out>,
+    job: WorkerJob<In, Out, Hdr>,
     ctx: WorkerContext,
   ) => Promise<void | Out> | void | Out;
   /** Max jobs in flight (also the streaming credit window). Default 10. */
@@ -255,7 +268,8 @@ export async function publishMessage(
 export function defineWorker<
   In extends object = WorkerVars,
   Out extends object = WorkerVars,
->(typedOpts: WorkerOptions<In, Out>): void {
+  Hdr extends object = WorkerHdrs,
+>(typedOpts: WorkerOptions<In, Out, Hdr>): void {
   // The machinery below is type-agnostic (it moves JSON on the wire); the
   // generics are an authoring-time contract only, so erase them internally.
   const opts = typedOpts as unknown as WorkerOptions;

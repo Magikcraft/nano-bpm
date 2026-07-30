@@ -52,6 +52,13 @@ pub struct WorkerIo {
     pub input_type: Option<String>,
     #[serde(rename = "outputType", skip_serializing_if = "Option::is_none")]
     pub output_type: Option<String>,
+    /// The `zeebe:header` keys declared on the task (in author order, deduped).
+    /// The reifier turns these into a typed `job.customHeaders` shape keyed by
+    /// name with `string` values (Zeebe headers are strings on the wire), so a
+    /// worker gets autocomplete + typo rejection on its custom headers. Empty =
+    /// no declared headers (`job.customHeaders` stays the untyped fallback).
+    #[serde(rename = "headerKeys", skip_serializing_if = "Vec::is_empty")]
+    pub header_keys: Vec<String>,
 }
 
 /// A model-derived message payload binding: a message name and the envelope type
@@ -154,6 +161,8 @@ struct Accum {
     key: Option<String>,
     input_type: Option<String>,
     output_type: Option<String>,
+    /// A worker's declared `zeebe:header` keys, in author order (deduped).
+    header_keys: Vec<String>,
 }
 
 impl Accum {
@@ -163,6 +172,7 @@ impl Accum {
             key,
             input_type: None,
             output_type: None,
+            header_keys: Vec::new(),
         }
     }
 }
@@ -278,6 +288,18 @@ pub fn scan_bpmn(xml: &str) -> BpmnScan {
                             }
                             _ => {}
                         },
+                        // A `zeebe:header` (child of `zeebe:taskHeaders`): collect
+                        // its literal `key` so the reifier can type `customHeaders`.
+                        // Keys are strings on the wire; a blank/duplicate key is
+                        // dropped so the derived shape stays clean and deterministic.
+                        "header" if matches!(acc.kind, Kind::Worker) => {
+                            if let Some(k) = attr(attrs, "key") {
+                                let k = k.trim();
+                                if !k.is_empty() && !acc.header_keys.iter().any(|e| e == k) {
+                                    acc.header_keys.push(k.to_string());
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -444,9 +466,16 @@ fn flush(
                     task_type: task_type.to_string(),
                     input_type: None,
                     output_type: None,
+                    header_keys: Vec::new(),
                 });
             fill(&mut entry.input_type, acc.input_type);
             fill(&mut entry.output_type, acc.output_type);
+            // Union header keys across duplicate task entries, first-seen order.
+            for k in acc.header_keys {
+                if !entry.header_keys.contains(&k) {
+                    entry.header_keys.push(k);
+                }
+            }
         }
         Kind::Message => {
             let entry = messages
@@ -500,9 +529,15 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
                     task_type: io.task_type.clone(),
                     input_type: None,
                     output_type: None,
+                    header_keys: Vec::new(),
                 });
             fill(&mut entry.input_type, io.input_type);
             fill(&mut entry.output_type, io.output_type);
+            for k in io.header_keys {
+                if !entry.header_keys.contains(&k) {
+                    entry.header_keys.push(k);
+                }
+            }
         }
         for io in scan.messages {
             let entry = messages
@@ -586,6 +621,7 @@ mod tests {
                 task_type: "charge".into(),
                 input_type: Some("Order".into()),
                 output_type: Some("Receipt".into()),
+                header_keys: vec![],
             }]
         );
     }
@@ -598,7 +634,8 @@ mod tests {
             vec![WorkerIo {
                 task_type: "noop".into(),
                 input_type: None,
-                output_type: None
+                output_type: None,
+                header_keys: vec![],
             }]
         );
     }
@@ -653,6 +690,7 @@ mod tests {
                 task_type: "svc".into(),
                 input_type: Some("Order".into()),
                 output_type: None,
+                header_keys: vec![],
             }]
         );
     }
@@ -675,6 +713,7 @@ mod tests {
                 task_type: "charge".into(),
                 input_type: Some("Order".into()),
                 output_type: None,
+                header_keys: vec![],
             }]
         );
     }
@@ -685,11 +724,83 @@ mod tests {
             task_type: "charge".into(),
             input_type: Some("Order".into()),
             output_type: None,
+            header_keys: vec![],
         };
         let v = serde_json::to_value(&io).unwrap();
         assert_eq!(v["taskType"], "charge");
         assert_eq!(v["inputType"], "Order");
         assert!(v.get("outputType").is_none());
+        assert!(v.get("headerKeys").is_none());
+    }
+
+    // --- custom-header keys (typed `job.customHeaders`, ADR 0033 §3) --------
+
+    /// Build a service task carrying `zeebe:taskHeaders` with the given headers,
+    /// each a `(key, value)` pair, plus an optional envelope body.
+    fn task_with_headers(id: &str, job: &str, headers: &[(&str, &str)], env: &str) -> String {
+        let hs: String = headers
+            .iter()
+            .map(|(k, v)| format!(r#"<zeebe:header key="{k}" value="{v}" />"#))
+            .collect();
+        format!(
+            r#"<bpmn:serviceTask id="{id}" name="{id}">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="{job}" />
+                <zeebe:taskHeaders>{hs}</zeebe:taskHeaders>
+                <zeebe:properties>{env}</zeebe:properties>
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>"#
+        )
+    }
+
+    #[test]
+    fn derives_header_keys_in_author_order() {
+        let xml = doc(&task_with_headers(
+            "t1",
+            "charge",
+            &[("region", "eu"), ("priority", "high")],
+            IN_ORDER,
+        ));
+        assert_eq!(
+            workers(&xml),
+            vec![WorkerIo {
+                task_type: "charge".into(),
+                input_type: Some("Order".into()),
+                output_type: None,
+                header_keys: vec!["region".into(), "priority".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn dedups_and_drops_blank_header_keys() {
+        let xml = doc(&task_with_headers(
+            "t1",
+            "charge",
+            &[("region", "eu"), ("  ", "x"), ("region", "us")],
+            "",
+        ));
+        assert_eq!(
+            workers(&xml),
+            vec![WorkerIo {
+                task_type: "charge".into(),
+                input_type: None,
+                output_type: None,
+                header_keys: vec!["region".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn serializes_header_keys_when_present() {
+        let io = WorkerIo {
+            task_type: "charge".into(),
+            input_type: None,
+            output_type: None,
+            header_keys: vec!["region".into(), "priority".into()],
+        };
+        let v = serde_json::to_value(&io).unwrap();
+        assert_eq!(v["headerKeys"], serde_json::json!(["region", "priority"]));
     }
 
     // --- message-carried envelopes (ADR 0040 slice 2) ----------------------
@@ -788,6 +899,7 @@ mod tests {
                 task_type: "charge".into(),
                 input_type: None,
                 output_type: Some("Receipt".into()),
+                header_keys: vec![],
             }]
         );
         assert_eq!(
