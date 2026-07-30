@@ -5163,7 +5163,7 @@ impl Engine {
             .iter()
             .filter(|(eik, eid)| {
                 **eik != winner_eik
-                    && sibling_ids.iter().any(|s| *s == eid.as_str())
+                    && sibling_ids.contains(&eid.as_str())
                     && self.scope_of(instance_key, **eik) == scope
             })
             .map(|(eik, eid)| (*eik, eid.clone()))

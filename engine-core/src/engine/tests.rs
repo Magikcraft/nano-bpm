@@ -9732,7 +9732,7 @@ fn event_based_gateway_never_force_completes_non_catch_sibling() {
         .values()
         .find(|j| j.job_type == "do-work")
         .expect("a do-work job was created");
-    let job_state_before = job_before.state.clone();
+    let job_state_before = job_before.state;
 
     // The message wins. The service-task sibling is a non-catch node, so it is
     // left untouched: its job survives in the same state (never force-completed),
