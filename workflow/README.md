@@ -31,13 +31,102 @@ Requires Node ≥ 20 and a reachable nanobpmn gateway (default `http://localhost
 
 Both compile to the same engine durability; pick per workflow.
 
-### Imperative (Temporal-style, engine-replayed)
+### Declarative (with control flow, human-in-the-loop signals, and typed I/O)
+
+**The recommended surface.** Describe the flow as a **tree of nodes**: `w.run` (a
+locally-hosted service task), `w.task` (an external-worker service task), and
+`w.signal` (a durable message catch that resumes via a correlated message — the
+human-in-the-loop path), composed with control-flow combinators:
+
+- `w.switch(subject, cases)` — a multi-way exclusive choice; each case key routes
+  when `subject = value`; an optional `default` case is the fallback.
+- `w.branch(condition, { then, else? })` — a two-way choice on a FEEL boolean.
+- `w.loop(body)` — a durable loop (back-edge to the loop head).
+- `w.break()` / `w.continue()` — exit the enclosing loop, or jump back to its head.
+
+```ts
+import { defineFlow, WorkflowClient, Worker } from "@nanobpm/workflow";
+
+const onboarding = defineFlow("onboarding", (w) => {
+  w.run("createAccount", async (job) => ({ userId: makeId() }));
+  w.signal("approved", { correlationKey: "userId" });
+  w.run("provision", async (job) => ({ ok: true }));
+});
+
+const client = new WorkflowClient({ baseUrl: "http://localhost:8080" });
+await client.deploy(onboarding);
+new Worker({ baseUrl: "http://localhost:8080", workflows: [onboarding] }).start();
+
+const { processInstanceKey } = await client.start(onboarding, {});
+// ... later, when a human approves:
+await client.signal(onboarding, "approved", userId, { by: "alice" });
+```
+
+A durable convergence loop (the shape `urban-pr-review` uses) — a loop wrapping a
+status switch with a nested guard:
+
+```ts
+const convergence = defineFlow("convergence-loop", (w) => {
+  w.loop((b) => {
+    b.run("review-round", async (job) => ({ status: classify(job.variables) }));
+    b.switch("status", {
+      converged: (c) => { c.run("persist-converged", finalize); c.break(); },
+      addressed: (c) => c.branch("round >= maxRounds", {
+        then: (g) => { g.run("persist-escalation", persist);
+                       g.signal("wait-answer", { correlationKey: "prKey" }); },
+        else: (g) => { g.run("persist-round", persist);   // returns { round: round + 1 }
+                       g.signal("wait-review", { correlationKey: "prKey" }); },
+      }),
+      default: (c) => { c.run("persist-blocked", persist);
+                        c.signal("wait-input", { correlationKey: "prKey" }); },
+    });
+  });
+});
+```
+
+Each combinator compiles to a BPMN primitive the engine already runs: `switch` /
+`branch` → an exclusive gateway (in-order conditions, first match wins, default =
+unconditional flow); `loop` → a convergent gateway whose body falls through back to
+the head; nodes with multiple incoming flows are an implicit XOR merge. See
+**ADR 0047**.
+
+#### Typed data envelopes (eject to model-first with contracts intact)
+
+Declare typed payload contracts in code with `envelope(name, fields)`, then pass a
+**contracts map keyed by step name** as `defineFlow`'s second argument. The step
+name auto-types the handler's `job.variables` (from `in`) and its return (from
+`out`), and the envelopes are **lifted into the emitted model** as `nano:shape` +
+`io.nanobpm.dataEnvelope.*` — the exact carrier the Fused Domain Model (ADR 0040)
+derives worker I/O from. So the generated `.bpmn` is ejectable to the modeller with
+its typed contracts intact — no cliff between code-first and model-first.
+
+```ts
+import { defineFlow, envelope } from "@nanobpm/workflow";
+
+const ChargeIn  = envelope("ChargeIn",  { orderId: "string", total: "number" });
+const ChargeOut = envelope("ChargeOut", { ok: "boolean" });
+
+const orders = defineFlow(
+  "orders",
+  { charge: { in: ChargeIn, out: ChargeOut } },
+  (w) => w.run("charge", async (job) => {
+    // job.variables is typed { orderId: string; total: number }
+    return { ok: await gateway.charge(job.variables) };  // typed ChargeOut
+  }),
+);
+```
+
+### Imperative (Temporal-style, engine-replayed) — experimental/internal
 
 Write the orchestration as a function. `ctx.run(name, fn)` is a durable step: its
 result is journalled in an engine process variable, so on resume a completed step
 is **replayed from the journal** (its side effect is **not** re-run) and only the
 frontier step executes. The engine drives the function by re-invoking a single
 looped orchestrator job each turn.
+
+> This surface is **experimental/internal** — the declarative `defineFlow` above is
+> the one true code-first surface (ADR 0044 update, 2026-07-30). The replay
+> machinery is retained as the seed for a future code-block-in-a-node escape hatch.
 
 ```ts
 import { defineWorkflow, WorkflowClient, Worker } from "@nanobpm/workflow";
@@ -60,30 +149,6 @@ await client.start(prReview, { prId: "PR-1234" });
 If the engine crashes after `review` commits and restarts cold, `fetchDiff` and
 `review` are **not** re-run — the workflow resumes at `merge`, which runs exactly
 once.
-
-### Declarative (with human-in-the-loop signals)
-
-Describe the flow as an ordered set of steps and signals. Each `w.run` is a
-service task (its own job type + handler); each `w.signal` parks the instance on a
-message-catch that resumes via a correlated message — the human-in-the-loop path.
-
-```ts
-import { defineFlow, WorkflowClient, Worker } from "@nanobpm/workflow";
-
-const onboarding = defineFlow("onboarding", (w) => {
-  w.run("createAccount", async (job) => ({ userId: makeId() }));
-  w.signal("approved", { correlationKey: "userId" });
-  w.run("provision", async (job) => ({ ok: true }));
-});
-
-const client = new WorkflowClient({ baseUrl: "http://localhost:8080" });
-await client.deploy(onboarding);
-new Worker({ baseUrl: "http://localhost:8080", workflows: [onboarding] }).start();
-
-const { processInstanceKey } = await client.start(onboarding, {});
-// ... later, when a human approves:
-await client.signal(onboarding, "approved", userId, { by: "alice" });
-```
 
 ## Honest scope
 
@@ -110,14 +175,17 @@ await client.signal(onboarding, "approved", userId, { by: "alice" });
 
 | Export | Purpose |
 | --- | --- |
-| `defineWorkflow(id, orchFn)` | Imperative (replayed) workflow. |
-| `defineFlow(id, build)` | Declarative flow with `w.run` / `w.signal`. |
+| `defineWorkflow(id, orchFn)` | Imperative (replayed) workflow — experimental/internal. |
+| `defineFlow(id, [contracts,] build)` | Declarative flow: `run`/`task`/`signal` + `switch`/`branch`/`loop`/`break`/`continue`, with an optional typed contracts map. |
+| `envelope(name, fields)` | A typed data envelope; lifted into the model as a `nano:shape` + `dataEnvelope` wiring. |
+| `externalJobTypes(flow)` | The derived job types of a flow's external `task` steps. |
 | `WorkflowClient` | `deploy`, `start`, `signal`, `getInstance` over REST v2. |
 | `Worker` | Generic job runtime; routes job types → handlers, hosts the replay loop. |
 | `toBpmn(workflow)` | The derived BPMN XML (for inspection / deployment). |
 
 See [ADR 0044](../docs/adr/0044-code-first-durable-orchestration.md) for the design
-rationale and the de-risking spike.
+rationale and [ADR 0047](../docs/adr/0047-declarative-flow-control-and-typed-envelopes.md)
+for the control-flow combinators and typed data envelopes.
 
 ## Development
 

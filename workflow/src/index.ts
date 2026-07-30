@@ -41,9 +41,19 @@
 // discipline). Retained for advanced durable-orchestration use only.
 export { defineWorkflow, imperativeToBpmn, replayOnce } from "./imperative.js";
 export type { Journal, ReplayStep } from "./imperative.js";
-export { defineFlow, declarativeToBpmn, externalJobTypes } from "./declarative.js";
+export { defineFlow, declarativeToBpmn, externalJobTypes, walkNodes } from "./declarative.js";
 export type { FlowBuilder } from "./declarative.js";
 export { layoutBpmn, declarativeToLayoutedBpmn } from "./layout.js";
+export { envelope } from "./envelope.js";
+export type {
+  Envelope,
+  EnvelopeType,
+  EnvelopeField,
+  FieldSpec,
+  ScalarType,
+  ScalarTs,
+  FieldTs,
+} from "./envelope.js";
 export { WorkflowClient, WorkflowError, toBpmn } from "./client.js";
 export type { WorkflowClientOptions, ActivateOptions } from "./client.js";
 export { Worker } from "./worker.js";
@@ -55,6 +65,11 @@ export type {
   StepHandler,
   DeclarativeFlow,
   DeclarativeStep,
+  FlowNode,
+  SwitchCase,
+  NodeEnvelopes,
+  StepContract,
+  FlowContracts,
   ImperativeWorkflow,
   Orchestration,
   WorkflowContext,

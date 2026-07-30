@@ -22,7 +22,34 @@ export function assertIdent(kind, value) {
 export function assertWorkflowIds(wf) {
     assertIdent("workflow id", wf.id);
     if (wf.kind === "declarative") {
-        for (const step of wf.steps)
-            assertIdent("step name", step.name);
+        assertNodeNames(wf.steps);
+    }
+}
+function assertNodeNames(nodes) {
+    for (const node of nodes) {
+        switch (node.kind) {
+            case "run":
+            case "task":
+            case "signal":
+                assertIdent("step name", node.name);
+                break;
+            case "switch":
+                for (const c of node.cases)
+                    assertNodeNames(c.body);
+                if (node.default)
+                    assertNodeNames(node.default);
+                break;
+            case "branch":
+                assertNodeNames(node.then);
+                if (node.else)
+                    assertNodeNames(node.else);
+                break;
+            case "loop":
+                assertNodeNames(node.body);
+                break;
+            case "break":
+            case "continue":
+                break;
+        }
     }
 }

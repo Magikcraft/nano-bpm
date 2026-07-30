@@ -2,7 +2,7 @@
 // deploy a workflow's derived model, start instances, correlate signals, and the
 // low-level job activate/complete/fail used by the Worker runtime.
 
-import { declarativeToBpmn } from "./declarative.js";
+import { declarativeToBpmn, walkNodes } from "./declarative.js";
 import { imperativeToBpmn } from "./imperative.js";
 import type { DeclarativeFlow, DeployResult, Job, JsonObject, StartResult, Workflow } from "./types.js";
 import { assertWorkflowIds, messageName } from "./xml.js";
@@ -111,7 +111,12 @@ export class WorkflowClient {
     correlationKey: string,
     variables: JsonObject = {},
   ): Promise<JsonObject> {
-    const signals = flow.steps.filter((s) => s.kind === "signal").map((s) => s.name);
+    // Signal steps can live anywhere in the tree (inside switch/branch/loop),
+    // so walk the whole flow, not just the top-level sequence.
+    const signals: string[] = [];
+    walkNodes(flow.steps, (n) => {
+      if (n.kind === "signal") signals.push(n.name);
+    });
     if (!signals.includes(signalName)) {
       throw new WorkflowError(
         `unknown signal "${signalName}" on flow "${flow.id}" — declared signals: ${
