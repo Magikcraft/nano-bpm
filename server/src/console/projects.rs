@@ -2472,11 +2472,18 @@ pub async fn run_data_op(
 /// `is_safe_name` permits uppercase, `Home-Heating` and `home-heating` are
 /// distinct directories on a case-sensitive filesystem — a collision the exact
 /// checks miss and that is unsafe on case-insensitive filesystems.
-fn name_taken_ci(new_slug: &str, new_display: &str, exclude_slug: Option<&str>) -> bool {
+fn name_taken_ci(
+    new_slug: &str,
+    new_display: &str,
+    exclude_slug: Option<&str>,
+) -> std::io::Result<bool> {
     let new_slug_lc = new_slug.to_lowercase();
     let new_display_lc = new_display.trim().to_lowercase();
-    list_projects()
-        .unwrap_or_default()
+    // Propagate a listing error instead of swallowing it: a silent
+    // `unwrap_or_default()` here would disable the collision guard under I/O
+    // failure and let a case-differing duplicate slip through. Fail closed by
+    // bubbling the error so the caller rejects the operation.
+    Ok(list_projects()?
         .into_iter()
         .filter(|p| exclude_slug != Some(p.name.as_str()))
         .any(|p| {
@@ -2487,7 +2494,7 @@ fn name_taken_ci(new_slug: &str, new_display: &str, exclude_slug: Option<&str>) 
                     .trim()
                     .to_lowercase()
                     == new_display_lc
-        })
+        }))
 }
 
 /// `template` selects which starter content to stamp out ("starter" default, or
@@ -2523,7 +2530,7 @@ pub fn create_project(
     // Reject case-insensitive collisions the exact checks above miss (e.g.
     // `home-heating` vs `Home-Heating` on a case-sensitive filesystem), so a
     // non-console client can't create ambiguous or non-portable duplicates.
-    if name_taken_ci(name, &display, None) {
+    if name_taken_ci(name, &display, None).map_err(|e| format!("list projects: {e}"))? {
         return Err("a project with that name already exists".into());
     }
     let mk = |p: PathBuf| std::fs::create_dir_all(&p).map_err(|e| format!("create {p:?}: {e}"));
@@ -2838,6 +2845,21 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
         }
         return Err("no such project".into());
     }
+    // Same slug (e.g. only the capitalization/spacing of the display name
+    // changed, or the display name is being cleared): there is no directory to
+    // move, so update the config in place instead of erroring on the
+    // `to.exists()` check below (which would otherwise reject every
+    // display-only rename because `to` is the project's own directory).
+    if new == old {
+        if name_taken_ci(new, &new_display, Some(old)).map_err(|e| format!("list projects: {e}"))? {
+            return Err("a project with that name already exists".into());
+        }
+        let mut cfg = read_config(old).ok_or("config missing")?;
+        cfg.display_name = new_display_name;
+        cfg.updated_ms = now_ms();
+        write_config(old, &cfg).map_err(|e| format!("write config: {e}"))?;
+        return Ok(cfg);
+    }
     // Refuse renaming *into* any referenced name (even a dangling ref) — that
     // name is taken, and letting the move win would shadow the pointer.
     if read_project_ref(new).is_some() {
@@ -2850,7 +2872,7 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     // Case-insensitive collision against every other project's slug + display
     // name (excluding the one being renamed), matching create_project and the
     // console's client-side guard.
-    if name_taken_ci(new, &new_display, Some(old)) {
+    if name_taken_ci(new, &new_display, Some(old)).map_err(|e| format!("list projects: {e}"))? {
         return Err("a project with that name already exists".into());
     }
     std::fs::rename(&from, &to).map_err(|e| format!("rename: {e}"))?;
@@ -5339,6 +5361,26 @@ mod tests {
             .err()
             .expect("rename into an existing name (any case) should be rejected");
         assert!(err.contains("already exists"), "got: {err}");
+    }
+
+    #[test]
+    fn rename_with_same_slug_updates_display_in_place() {
+        let _g = lock();
+        let _root = temp_root();
+        // Spaced name → slug "cool-app", display "Cool App".
+        let cfg = create_project("Cool App", "", "starter").expect("create");
+        assert_eq!(cfg.name, "cool-app");
+        assert_eq!(cfg.display_name.as_deref(), Some("Cool App"));
+        // Renaming to a different spelling that slugs to the SAME directory is a
+        // display-only edit — it must succeed in place, not error on the
+        // self-directory existence check.
+        let cfg = rename_project("cool-app", "COOL app").expect("display-only rename");
+        assert_eq!(cfg.name, "cool-app");
+        assert_eq!(cfg.display_name.as_deref(), Some("COOL app"));
+        // Renaming to the bare slug clears the display name (display == slug).
+        let cfg = rename_project("cool-app", "cool-app").expect("clear display");
+        assert_eq!(cfg.name, "cool-app");
+        assert_eq!(cfg.display_name, None);
     }
 
     #[test]
