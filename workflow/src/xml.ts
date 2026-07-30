@@ -1,6 +1,6 @@
 // XML helpers + derived-name conventions shared by both model emitters.
 
-import type { Workflow } from "./types.js";
+import type { FlowNode, Workflow } from "./types.js";
 
 export function escapeXml(s: string): string {
   return String(s)
@@ -30,6 +30,32 @@ export function assertIdent(kind: string, value: string): void {
 export function assertWorkflowIds(wf: Workflow): void {
   assertIdent("workflow id", wf.id);
   if (wf.kind === "declarative") {
-    for (const step of wf.steps) assertIdent("step name", step.name);
+    assertNodeNames(wf.steps);
+  }
+}
+
+function assertNodeNames(nodes: FlowNode[]): void {
+  for (const node of nodes) {
+    switch (node.kind) {
+      case "run":
+      case "task":
+      case "signal":
+        assertIdent("step name", node.name);
+        break;
+      case "switch":
+        for (const c of node.cases) assertNodeNames(c.body);
+        if (node.default) assertNodeNames(node.default);
+        break;
+      case "branch":
+        assertNodeNames(node.then);
+        if (node.else) assertNodeNames(node.else);
+        break;
+      case "loop":
+        assertNodeNames(node.body);
+        break;
+      case "break":
+      case "continue":
+        break;
+    }
   }
 }

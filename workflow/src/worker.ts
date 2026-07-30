@@ -14,6 +14,7 @@
 
 import { WorkflowClient } from "./client.js";
 import { replayOnce } from "./imperative.js";
+import { walkNodes } from "./declarative.js";
 import type { Job, JsonObject, Workflow } from "./types.js";
 import { jobType } from "./xml.js";
 
@@ -86,10 +87,12 @@ export class Worker {
         },
       });
     } else {
-      for (const s of wf.steps) {
-        // Only `run` steps are hosted locally; `signal` (message catch) and
-        // `task` (external worker) contribute no in-process route.
-        if (s.kind !== "run") continue;
+      // Walk the flow tree; only `run` steps are hosted locally. `signal`
+      // (message catch) and `task` (external worker) contribute no in-process
+      // route, and structural combinators (`switch`/`branch`/`loop`) are pure
+      // routing with no job of their own.
+      walkNodes(wf.steps, (s) => {
+        if (s.kind !== "run") return;
         const handler = wf.handlers[s.name];
         if (typeof handler !== "function") {
           // `DeclarativeFlow` is a public type; a consumer-constructed flow could
@@ -104,7 +107,7 @@ export class Worker {
           workflowId: wf.id,
           handle: async (job) => ({ variables: ((await handler(job)) ?? {}) as JsonObject }),
         });
-      }
+      });
     }
   }
 

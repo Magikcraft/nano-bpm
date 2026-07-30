@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   defineWorkflow,
   defineFlow,
+  envelope,
   toBpmn,
   declarativeToLayoutedBpmn,
   layoutBpmn,
@@ -253,4 +254,247 @@ test("client.signal: rejects an unknown signal name with a clear error", async (
       /unknown signal "humanApprovel"/.test((e as Error).message) &&
       /"humanApproval"/.test((e as Error).message),
   );
+});
+
+// --- Slice 2: control-flow combinators ---------------------------------------
+
+test("switch: emits an exclusive gateway with a conditional edge per case + a default", () => {
+  const flow = defineFlow("router", (w) => {
+    w.run("classify", async () => ({}));
+    w.switch("status", {
+      approved: (c) => c.run("doApprove", async () => ({})),
+      rejected: (c) => c.run("doReject", async () => ({})),
+      default: (c) => c.run("doEscalate", async () => ({})),
+    });
+  });
+  const xml = toBpmn(flow);
+  // One gateway named for the subject.
+  assert.match(xml, /<bpmn:exclusiveGateway id="Gw_0" name="status" default="f_\d+">/);
+  // A FEEL equality condition per case.
+  assert.match(xml, /<bpmn:conditionExpression>=status = &quot;approved&quot;<\/bpmn:conditionExpression>/);
+  assert.match(xml, /<bpmn:conditionExpression>=status = &quot;rejected&quot;<\/bpmn:conditionExpression>/);
+  // All three arms lead to their service tasks.
+  for (const t of ["doApprove", "doReject", "doEscalate"]) {
+    assert.match(xml, new RegExp(`<bpmn:serviceTask id="${t}"`));
+    assert.match(xml, new RegExp(`<zeebe:taskDefinition type="router:${t}" \\/>`));
+  }
+});
+
+test("switch: requires at least one non-default case", () => {
+  assert.throws(
+    () =>
+      defineFlow("f", (w) => {
+        w.run("a", async () => ({}));
+        // @ts-expect-error a switch with only a default is meaningless
+        w.switch("x", { default: (c) => c.run("b", async () => ({})) });
+      }),
+    /needs at least one case/,
+  );
+});
+
+test("branch: then is guarded by the condition, else is the gateway default", () => {
+  const flow = defineFlow("guard", (w) => {
+    w.run("check", async () => ({}));
+    w.branch("count >= 3", {
+      then: (g) => g.run("tooMany", async () => ({})),
+      else: (g) => g.run("again", async () => ({})),
+    });
+  });
+  const xml = toBpmn(flow);
+  assert.match(xml, /<bpmn:exclusiveGateway id="Gw_0" default="f_\d+">/);
+  assert.match(xml, /<bpmn:conditionExpression>=count &gt;= 3<\/bpmn:conditionExpression>/);
+  assert.match(xml, /<bpmn:serviceTask id="tooMany"/);
+  assert.match(xml, /<bpmn:serviceTask id="again"/);
+});
+
+test("loop: the body falls through back to the loop head; break exits to End", () => {
+  const flow = defineFlow("poll", (w) => {
+    w.loop((b) => {
+      b.run("attempt", async () => ({}));
+      b.branch("done", {
+        then: (g) => g.break(),
+        else: (g) => g.run("wait", async () => ({})),
+      });
+    });
+  });
+  const xml = toBpmn(flow);
+  // A convergent loop-head gateway exists.
+  assert.match(xml, /<bpmn:exclusiveGateway id="Loop_0">/);
+  // The "attempt" task's outgoing eventually targets the branch gateway, and the
+  // else arm ("wait") falls through back to the loop head (a back-edge).
+  const back = xml.match(/<bpmn:sequenceFlow id="f_\d+" sourceRef="wait" targetRef="Loop_0" \/>/);
+  assert.ok(back, "wait must loop back to the loop head");
+  // The break arm's edge (from the branch gateway's then) reaches End.
+  assert.match(xml, /<bpmn:endEvent id="End">/);
+  assert.match(xml, /targetRef="End"/);
+});
+
+test("break/continue: rejected outside a loop", () => {
+  assert.throws(
+    () => defineFlow("f", (w) => w.break()),
+    /break\(\) is only valid inside a loop/,
+  );
+  assert.throws(
+    () => defineFlow("f", (w) => w.continue()),
+    /continue\(\) is only valid inside a loop/,
+  );
+});
+
+test("continue: jumps straight back to the loop head", () => {
+  const flow = defineFlow("c", (w) => {
+    w.loop((b) => {
+      b.run("tick", async () => ({}));
+      b.branch("retry", {
+        then: (g) => g.continue(),
+        else: (g) => g.break(),
+      });
+    });
+  });
+  const xml = toBpmn(flow);
+  // continue routes the branch's then edge (a conditional flow) back to the head.
+  assert.match(xml, /<bpmn:sequenceFlow id="f_\d+" sourceRef="Gw_1" targetRef="Loop_0" name="then">/);
+});
+
+// --- Slice 2: typed data envelopes lifted into the model ---------------------
+
+test("envelope: referenced shapes are lifted to nano:shapes + dataEnvelope props", () => {
+  const OrderIn = envelope("OrderIn", {
+    orderId: "string",
+    total: "number",
+    lines: { type: "integer", list: true },
+    note: { type: "string", optional: true },
+  });
+  const OrderOut = envelope("OrderOut", { ok: "boolean" });
+  const flow = defineFlow(
+    "orders",
+    { charge: { in: OrderIn, out: OrderOut } },
+    (w) => w.run("charge", async () => ({ ok: true })),
+  );
+  const xml = toBpmn(flow);
+  // The shape container is lifted onto the process.
+  assert.match(xml, /<nano:shapes>/);
+  assert.match(xml, /<nano:shape id="OrderIn">/);
+  assert.match(xml, /<nano:extend name="orderId" type="string" \/>/);
+  assert.match(xml, /<nano:extend name="lines" type="integer" list="true" \/>/);
+  assert.match(xml, /<nano:extend name="note" type="string" optional="true" \/>/);
+  assert.match(xml, /<nano:shape id="OrderOut">/);
+  // The service task carries the dataEnvelope wiring.
+  assert.match(xml, /<zeebe:property name="io.nanobpm.dataEnvelope.in" value="OrderIn" \/>/);
+  assert.match(xml, /<zeebe:property name="io.nanobpm.dataEnvelope.out" value="OrderOut" \/>/);
+  // The nano namespace is declared.
+  assert.match(xml, /xmlns:nano="https:\/\/nanobpm.io\/schema\/shapes\/1.0"/);
+});
+
+test("envelope: an unreferenced envelope is NOT lifted (only used shapes appear)", () => {
+  const Used = envelope("Used", { a: "string" });
+  const flow = defineFlow("f", { s: { in: Used } }, (w) => w.run("s", async () => ({})));
+  const xml = toBpmn(flow);
+  assert.match(xml, /<nano:shape id="Used">/);
+  assert.doesNotMatch(xml, /Unused/);
+});
+
+test("signal: a typed payload envelope is lifted onto the message", () => {
+  const Answer = envelope("Answer", { verdict: "string" });
+  const flow = defineFlow(
+    "ask",
+    { waitAnswer: { in: Answer } },
+    (w) => {
+      w.run("ask", async () => ({}));
+      w.signal("waitAnswer", { correlationKey: "caseId" });
+    },
+  );
+  const xml = toBpmn(flow);
+  assert.match(xml, /<bpmn:message id="Msg_waitAnswer" name="ask:waitAnswer">/);
+  assert.match(xml, /<zeebe:subscription correlationKey="=caseId" \/>/);
+  assert.match(xml, /<zeebe:property name="io.nanobpm.dataEnvelope.in" value="Answer" \/>/);
+  assert.match(xml, /<nano:shape id="Answer">/);
+});
+
+// --- Slice 2: the urban-pr-review convergence loop (golden model) ------------
+
+test("urban golden: a loop wrapping a status switch with a nested guard compiles", () => {
+  const ReviewRoundIn = envelope("ReviewRoundIn", {
+    prKey: "string",
+    prompt: "string",
+    round: "integer",
+    maxRounds: "integer",
+  });
+  const ReviewRoundOut = envelope("ReviewRoundOut", { status: "string" });
+  const RoundState = envelope("RoundState", { round: "integer" });
+  const ReviewReady = envelope("ReviewReady", { reviewId: "string" });
+  const EscalationAnswered = envelope("EscalationAnswered", { answer: "string" });
+
+  const convergence = defineFlow(
+    "convergence-loop",
+    {
+      "review-round": { in: ReviewRoundIn, out: ReviewRoundOut },
+      "persist-round": { out: RoundState },
+      "wait-review": { in: ReviewReady },
+      "wait-answer": { in: EscalationAnswered },
+      "wait-answer-max": { in: EscalationAnswered },
+    },
+    (w) => {
+      w.loop((b) => {
+        b.run("review-round", async () => ({ status: "addressed" }));
+        b.switch("status", {
+          converged: (c) => {
+            c.run("persist-converged", async () => ({}));
+            c.break();
+          },
+          addressed: (c) =>
+            c.branch("round >= maxRounds", {
+              then: (g) => {
+                g.run("persist-escalation-maxrounds", async () => ({}));
+                g.signal("wait-answer-max", { correlationKey: "prKey" });
+              },
+              else: (g) => {
+                g.run("persist-round", async () => ({ round: 1 }));
+                g.signal("wait-review", { correlationKey: "prKey" });
+              },
+            }),
+          default: (c) => {
+            c.run("persist-escalation", async () => ({}));
+            c.signal("wait-answer", { correlationKey: "prKey" });
+          },
+        });
+      });
+    },
+  );
+
+  const xml = toBpmn(convergence);
+
+  // The status switch: a gateway with a case edge per terminal status.
+  assert.match(xml, /<bpmn:exclusiveGateway id="Gw_\d+" name="status" default="f_\d+">/);
+  assert.match(xml, /=status = &quot;converged&quot;/);
+  assert.match(xml, /=status = &quot;addressed&quot;/);
+
+  // The nested max-rounds guard.
+  assert.match(xml, /=round &gt;= maxRounds/);
+
+  // The two durable waits (correlated on prKey) plus their payload shapes.
+  assert.match(xml, /<bpmn:intermediateCatchEvent id="wait-review"/);
+  assert.match(xml, /<bpmn:intermediateCatchEvent id="wait-answer"/);
+  assert.match(xml, /<zeebe:subscription correlationKey="=prKey" \/>/);
+  assert.match(xml, /<nano:shape id="ReviewReady">/);
+  assert.match(xml, /<nano:shape id="EscalationAnswered">/);
+
+  // The loop back-edges: both waits and the addressed persist path re-enter the
+  // loop head (the review-round runs again after a wait resumes).
+  assert.match(xml, /sourceRef="wait-review" targetRef="Loop_0" \/>/);
+  assert.match(xml, /sourceRef="wait-answer" targetRef="Loop_0" \/>/);
+  assert.match(xml, /sourceRef="wait-answer-max" targetRef="Loop_0" \/>/);
+
+  // review-round is the loop head's downstream task and carries its typed I/O.
+  assert.match(xml, /<zeebe:property name="io.nanobpm.dataEnvelope.in" value="ReviewRoundIn" \/>/);
+  assert.match(xml, /<zeebe:property name="io.nanobpm.dataEnvelope.out" value="ReviewRoundOut" \/>/);
+
+  // The converged path breaks out of the loop to End.
+  assert.match(xml, /<bpmn:serviceTask id="persist-converged"/);
+  assert.match(xml, /<bpmn:endEvent id="End">/);
+
+  // The Worker hosts every run step; the derived types are the workers' contract.
+  const worker = new Worker({ baseUrl: "http://localhost:0", workflows: [convergence] });
+  assert.ok(worker.servedTypes.includes("convergence-loop:review-round"));
+  assert.ok(worker.servedTypes.includes("convergence-loop:persist-converged"));
+  assert.ok(worker.servedTypes.includes("convergence-loop:persist-round"));
 });

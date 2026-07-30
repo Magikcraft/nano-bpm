@@ -39,7 +39,8 @@
 // code-first surface (steps are not engine-visible; requires determinism
 // discipline). Retained for advanced durable-orchestration use only.
 export { defineWorkflow, imperativeToBpmn, replayOnce } from "./imperative.js";
-export { defineFlow, declarativeToBpmn, externalJobTypes } from "./declarative.js";
+export { defineFlow, declarativeToBpmn, externalJobTypes, walkNodes } from "./declarative.js";
 export { layoutBpmn, declarativeToLayoutedBpmn } from "./layout.js";
+export { envelope } from "./envelope.js";
 export { WorkflowClient, WorkflowError, toBpmn } from "./client.js";
 export { Worker } from "./worker.js";

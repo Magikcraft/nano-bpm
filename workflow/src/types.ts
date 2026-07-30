@@ -1,32 +1,79 @@
 // Public types for @nanobpm/workflow.
 
+import type { Envelope } from "./envelope.js";
+
 /** A JSON-serialisable value, as carried by process variables. */
 export type Json = null | boolean | number | string | Json[] | { [k: string]: Json };
 export type JsonObject = { [k: string]: Json };
 
-/** A job as delivered by the nanobpmn gateway's `POST /v2/jobs/activation`. */
-export interface Job {
+/** A job as delivered by the nanobpmn gateway's `POST /v2/jobs/activation`. The
+ *  `variables` type parameter carries the input envelope's inferred payload when
+ *  a step is declared with a typed envelope; it defaults to the untyped
+ *  `JsonObject`. */
+export interface Job<V extends JsonObject = JsonObject> {
   jobKey: string;
   processInstanceKey: string;
   elementId: string;
   type: string;
-  variables: JsonObject;
+  variables: V;
 }
 
-// --- Declarative surface (Strategy A: compile a step list to a linear model) --
+// --- Declarative surface (Strategy A: compile a step tree to a BPMN model) ----
+//
+// A flow is a TREE of nodes, not a flat list: leaf activities (`run`/`task`/
+// `signal`) plus structural combinators (`switch`/`branch`/`loop`) that compile
+// to real XOR gateways and back-edges. See declarative.ts for the compiler.
+
+/** The input/output data envelopes lifted onto an activity node. */
+export interface NodeEnvelopes {
+  in?: Envelope;
+  out?: Envelope;
+}
+
+/** A typed I/O contract for one step: its input and/or output data envelope.
+ *  For a `signal`, `in` types the message payload. */
+export interface StepContract {
+  in?: Envelope;
+  out?: Envelope;
+}
+
+/** A flow's typed I/O registry, keyed by step name — the single source of truth
+ *  for each step's envelopes. Passed to `defineFlow`; a step whose name is a key
+ *  is typed (and its envelopes lifted to the model), others fall back to the
+ *  untyped `JsonObject`. */
+export type FlowContracts = Record<string, StepContract>;
 
 /** Handler for a declarative `run` step: does real work, returns variables. */
 export type StepHandler = (job: Job) => Promise<JsonObject | void> | JsonObject | void;
 
-export type DeclarativeStep =
-  | { kind: "run"; name: string }
-  | { kind: "task"; name: string }
-  | { kind: "signal"; name: string; correlationKey: string };
+/** A node in a declarative flow tree. Leaf activities carry optional data
+ *  envelopes (lifted to `nano:shape` + `dataEnvelope` in the model); structural
+ *  combinators carry nested `FlowNode[]` bodies. */
+export type FlowNode =
+  | { kind: "run"; name: string; envelopes?: NodeEnvelopes }
+  | { kind: "task"; name: string; envelopes?: NodeEnvelopes }
+  | { kind: "signal"; name: string; correlationKey: string; payload?: Envelope }
+  | { kind: "switch"; subject: string; cases: SwitchCase[]; default?: FlowNode[] }
+  | { kind: "branch"; condition: string; then: FlowNode[]; else?: FlowNode[] }
+  | { kind: "loop"; body: FlowNode[] }
+  | { kind: "break" }
+  | { kind: "continue" };
+
+/** One case of a `switch`: routed when `subject = value` (FEEL equality). */
+export interface SwitchCase {
+  value: string;
+  body: FlowNode[];
+}
+
+/** @deprecated Renamed to {@link FlowNode} now that a flow is a tree of nodes,
+ *  not a flat list of steps. Kept as an alias for source compatibility. */
+export type DeclarativeStep = FlowNode;
 
 export interface DeclarativeFlow {
   kind: "declarative";
   id: string;
-  steps: DeclarativeStep[];
+  /** The flow's node tree (top-level sequence). */
+  steps: FlowNode[];
   handlers: Record<string, StepHandler>;
 }
 
