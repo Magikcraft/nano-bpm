@@ -5070,6 +5070,22 @@ impl Engine {
         let Some(def) = self.process_of_instance(instance_key) else {
             return Vec::new();
         };
+        // Fast guard: only an intermediate catch event can win an event-based
+        // gateway's deferred choice. Skip the definition scan for every other
+        // (far more common) element completion, and never withdraw on a
+        // non-catch node that a malformed model might route a gateway into.
+        let is_catch_event = matches!(
+            def.elements.get(winner_element_id).map(|e| &e.kind),
+            Some(
+                ElementKind::TimerIntermediateCatchEvent { .. }
+                    | ElementKind::MessageIntermediateCatchEvent { .. }
+                    | ElementKind::SignalIntermediateCatchEvent { .. }
+                    | ElementKind::ConditionalIntermediateCatchEvent { .. }
+            )
+        );
+        if !is_catch_event {
+            return Vec::new();
+        }
         // Find the event-based gateway(s) that route into the winning catch
         // event. In a well-formed model a catch event has exactly one incoming
         // flow, so at most one gateway owns the race. If more than one gateway
