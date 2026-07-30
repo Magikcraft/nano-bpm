@@ -406,8 +406,10 @@ fn now_ms() -> u64 {
 /// group via `kill(-pid)`. This is essential for wrappers that fork a real
 /// worker child — e.g. `uv run worker.py` execs `uv`, which spawns `python`;
 /// killing only `uv` (`child.start_kill()`) would orphan the python worker,
-/// which keeps polling the gateway after the user hits **Stop**. Off Unix (or
-/// if the pid is already gone) we fall back to killing just the direct child.
+/// which keeps polling the gateway after the user hits **Stop**. On Windows,
+/// which has no such process group, we reap the descendant tree by PID with
+/// `taskkill /T`. Everywhere else (or if the pid is already gone) we fall back
+/// to killing just the direct child.
 fn kill_process_group(child: &mut tokio::process::Child) {
     #[cfg(unix)]
     {
@@ -418,6 +420,22 @@ fn kill_process_group(child: &mut tokio::process::Child) {
                 libc::kill(-(pid as i32), libc::SIGKILL);
             }
             return;
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Windows has no process group we can signal like Unix, and
+        // `child.start_kill()` (TerminateProcess) only reaps the direct child —
+        // it would orphan any worker grandchild (e.g. `uv run` -> python) that
+        // keeps polling the gateway after Stop. `taskkill /T` walks and kills
+        // the whole descendant tree by PID, which is the behaviour we need.
+        if let Some(pid) = child.id() {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            // Fall through to start_kill as a backstop (harmless if already dead).
         }
     }
     let _ = child.start_kill();
@@ -2512,7 +2530,7 @@ pub async fn run_data_op(
     // Canonicalize so the --allow-read/-write scope matches the path Deno
     // resolves (e.g. macOS /tmp -> /private/tmp); otherwise findManifest can't
     // read nano.app.json and every op fails with "manifest not found".
-    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
     let cache = dir.join(".deno-cache");
     let _ = std::fs::create_dir_all(&cache);
     let cli = dir.join(GEN_DIR).join("data-cli.ts");
@@ -3532,7 +3550,7 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     if !wf_dir.is_dir() {
         return Err("not a code-first workflow project (no workflows/ directory)".into());
     }
-    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
     let proc_dir = dir.join("resources").join("processes");
 
     // If the Deno toolchain is missing we can't re-derive live, but the on-disk
@@ -3861,7 +3879,7 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
     let deno = super::extensions::find_program("deno").ok_or("deno toolchain not found on PATH")?;
 
     // Canonicalize so the --allow-read scope matches the path Deno resolves.
-    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
     let cache = dir.join(".deno-cache");
     let _ = std::fs::create_dir_all(&cache);
 
@@ -4586,7 +4604,7 @@ impl ProjectSupervisor {
         }
         // Canonicalize so the --allow-read/-write scope matches the path Deno
         // resolves (e.g. macOS /tmp -> /private/tmp), otherwise access is denied.
-        let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+        let dir = dunce::canonicalize(&dir).unwrap_or(dir);
         let cache = dir.join(".deno-cache");
         let _ = std::fs::create_dir_all(&cache);
         let base_url = Self::base_url(&cfg);
@@ -4749,7 +4767,7 @@ impl ProjectSupervisor {
             return Ok(());
         }
         *inner.phase.lock().await = Phase::Starting;
-        let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let dir = dunce::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         let base_url = Self::base_url(cfg);
         Self::auto_deploy_resources(cfg, &dir, &base_url, &inner).await;
         let mut cmd = Command::new(&bin);
