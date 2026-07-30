@@ -2,6 +2,7 @@ export { defineWorkflow, imperativeToBpmn, replayOnce } from "./imperative.js";
 export type { Journal, ReplayStep } from "./imperative.js";
 export { defineFlow, declarativeToBpmn, externalJobTypes } from "./declarative.js";
 export type { FlowBuilder } from "./declarative.js";
+export { layoutBpmn, declarativeToLayoutedBpmn } from "./layout.js";
 export { WorkflowClient, WorkflowError, toBpmn } from "./client.js";
 export type { WorkflowClientOptions, ActivateOptions } from "./client.js";
 export { Worker } from "./worker.js";
