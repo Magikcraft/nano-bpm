@@ -31,6 +31,7 @@ import AppManifestEditor, {
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 const DataPanel = lazy(() => import("../components/DataPanel"));
 const TriggersPanel = lazy(() => import("../components/TriggersPanel"));
+const DerivedModelPanel = lazy(() => import("../components/DerivedModelPanel"));
 import {
   compileProject,
   createProjectPath,
@@ -108,6 +109,7 @@ export default function ProjectWorkspace() {
   const [showCompile, setShowCompile] = useState(false);
   const [showData, setShowData] = useState(false);
   const [showTriggers, setShowTriggers] = useState(false);
+  const [showModel, setShowModel] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const [consoleHeight, setConsoleHeight] = useState(() => {
     const saved = Number(localStorage.getItem("nano.consoleHeight"));
@@ -325,6 +327,10 @@ export default function ProjectWorkspace() {
     (f) => f.kind === "file" && f.name === "nano.app.json",
   );
 
+  // Code-first workflow projects (ADR 0045) have no authored `.bpmn`; their model
+  // is DERIVED from `workflows/*.ts`. Offer a read-only "Model" view for them.
+  const isWorkflowProject = hasTopLevelDir(detail.files, "workflows");
+
   return (
     <div className="flex h-full flex-col">
       {/* Toolbar */}
@@ -394,6 +400,7 @@ export default function ProjectWorkspace() {
             onClick={() => {
               setShowData((v) => !v);
               setShowTriggers(false);
+              setShowModel(false);
             }}
             kind={showData ? "primary" : undefined}
           >
@@ -405,10 +412,23 @@ export default function ProjectWorkspace() {
             onClick={() => {
               setShowTriggers((v) => !v);
               setShowData(false);
+              setShowModel(false);
             }}
             kind={showTriggers ? "primary" : undefined}
           >
             Triggers
+          </ToolbarButton>
+        )}
+        {isWorkflowProject && (
+          <ToolbarButton
+            onClick={() => {
+              setShowModel((v) => !v);
+              setShowData(false);
+              setShowTriggers(false);
+            }}
+            kind={showModel ? "primary" : undefined}
+          >
+            Model
           </ToolbarButton>
         )}
         <ToolbarButton onClick={() => setShowConfig(true)}>
@@ -493,6 +513,18 @@ export default function ProjectWorkspace() {
               }
             >
               <TriggersPanel name={name} />
+            </Suspense>
+          </div>
+        ) : showModel ? (
+          <div className="flex min-w-0 flex-1 flex-col">
+            <Suspense
+              fallback={
+                <div className="p-8 text-sm text-fg-faint">
+                  Loading Model view…
+                </div>
+              }
+            >
+              <DerivedModelPanel name={name} />
             </Suspense>
           </div>
         ) : (
