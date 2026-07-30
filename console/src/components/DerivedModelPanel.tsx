@@ -48,6 +48,7 @@ export default function DerivedModelPanel({ name }: { name: string }) {
         <span className="text-sm font-semibold text-fg">Derived model</span>
         {models && models.length > 1 && (
           <select
+            aria-label="Select derived workflow model"
             className="rounded border border-edge bg-input px-2 py-1 text-sm text-fg"
             value={active}
             onChange={(e) => setActive(Number(e.target.value))}

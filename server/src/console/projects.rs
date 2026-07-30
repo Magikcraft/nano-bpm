@@ -2977,6 +2977,10 @@ pub struct DerivedModel {
     pub xml: String,
 }
 
+/// Process-wide sequence used to give each concurrent `derive_models` call a
+/// unique temporary driver filename (see the collision note there).
+static DERIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Deno driver that imports a code-first project's `workflows/*.ts`, filters the
 /// exported values that are `@nanobpm/workflow` Workflows (structural check: an
 /// object with a string `id` and `kind` in {imperative, declarative}), runs each
@@ -3054,20 +3058,29 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     let _ = std::fs::create_dir_all(&cache);
 
     // Write the driver INTO the project dir so the project's `deno.json` import
-    // map (`@nanobpm/workflow` -> npm:...) applies; use a unique name + remove it.
-    let driver_name = format!(".nano-derive-{}.ts", std::process::id());
+    // map (`@nanobpm/workflow` -> npm:...) applies. Name it uniquely per call
+    // (pid + a process-wide sequence) so concurrent derivations of the same
+    // project never collide on the driver file; remove it afterwards.
+    let seq = DERIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let driver_name = format!(".nano-derive-{}-{}.ts", std::process::id(), seq);
     let driver_path = dir.join(&driver_name);
     std::fs::write(&driver_path, DERIVE_MODELS_DRIVER)
         .map_err(|e| format!("write derivation driver: {e}"))?;
 
+    // Least-privilege sandbox for a *read-only* derivation: read the project (to
+    // import `workflows/*.ts` + resolve the import map), fetch the SDK from npm,
+    // and write ONLY to the Deno cache. No `--allow-env` (workflow module
+    // top-level code must not read the server's environment) and `--no-lock`
+    // (never mutate a `deno.lock` in the project) — so a "Model" refresh can't
+    // touch arbitrary project files or leak env vars.
     let result = Command::new(&deno)
         .current_dir(&dir)
         .arg("run")
         .arg("--no-prompt")
+        .arg("--no-lock")
         .arg("--allow-net")
         .arg(format!("--allow-read={}", dir.display()))
-        .arg(format!("--allow-write={}", dir.display()))
-        .arg("--allow-env")
+        .arg(format!("--allow-write={}", cache.display()))
         .arg(&driver_name)
         .arg(&dir)
         .env("DENO_DIR", &cache)
