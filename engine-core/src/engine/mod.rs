@@ -5124,6 +5124,23 @@ impl Engine {
         let [owner] = owners.as_slice() else {
             return Vec::new();
         };
+        // The owning gateway must itself have exactly one incoming flow. A
+        // gateway reachable via multiple incoming flows (e.g. fed by both arms of
+        // a parallel split) can be activated concurrently in the same scope,
+        // arming several live instances of each sibling element id at once. Since
+        // losers are matched by element id + scope, withdrawing here could cancel
+        // a sibling instance belonging to a *different* concurrent activation of
+        // the same gateway. When the owner's static in-degree is not exactly 1 we
+        // cannot isolate a single race, so we conservatively withdraw nothing.
+        let owner_incoming = def
+            .elements
+            .values()
+            .flat_map(|element| element.outgoing.iter())
+            .filter(|f| f.to == owner.id)
+            .count();
+        if owner_incoming != 1 {
+            return Vec::new();
+        }
         // The sibling targets are the owning gateway's *other* outgoing catch
         // events. Any non-catch target is skipped (see `is_catch_event` above).
         let sibling_ids: Vec<&str> = owner
