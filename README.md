@@ -878,11 +878,16 @@ handler body. That ethos drives the code intelligence:
 
 The console keeps the user's **authoring source of truth** in a *workspace*
 directory, deliberately separate from the engine's data dir so that deleting
-cluster data leaves your projects and workers intact. Each project is a
-self-contained, runnable Deno application under `<workspace>/projects/`:
+cluster data leaves your projects and workers intact. The workspace holds the
+standalone **Workers** tab's files at the top level, and every RAD **project**
+under `projects/` as a self-contained, runnable Deno application:
 
 ```text
 <workspace>/
+├── workers/<name>/              # standalone Workers-tab workers (worker.ts, deno.json, …)
+├── lib/                         # shared library modules for those workers (@lib/…)
+├── nano-generated/worker-sdk.ts # embedded Deno worker SDK (auto-written)
+├── .deno-cache/                 # DENO_DIR for worker dependency caching
 └── projects/<project>/          # one directory per RAD project (a runnable Deno app)
     ├── nanobpm.project.json      # project config (name, deploy target, platforms)
     ├── deno.json                 # import map (@nanobpm/worker, @lib/) + start task
@@ -894,15 +899,15 @@ self-contained, runnable Deno application under `<workspace>/projects/`:
     │   ├── decisions/<name>.dmn  # DMN decisions
     │   └── forms/<name>.form     # forms
     ├── pages/<name>.page.json    # Page Composer pages
-    ├── workers/<name>/           # one directory per worker (worker.ts, deno.json, …)
-    ├── lib/                      # shared library modules, importable as `@lib/…`
+    ├── workers/<name>/           # the project's own workers (worker.ts, deno.json, …)
+    ├── lib/                      # the project's shared library modules (@lib/…)
     ├── nano-generated/worker-sdk.ts  # embedded Deno worker SDK (auto-written)
-    └── .deno-cache/              # DENO_DIR for worker dependency caching
+    └── .deno-cache/              # DENO_DIR for dependency caching
 ```
 
 | Variable | Meaning |
 | --- | --- |
-| `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (holds `projects/`). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
+| `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (holds the standalone `workers/` plus `projects/`). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
 | `NANOBPMN_PROJECTS_DIR=<dir>` | Override the projects root directly. Default `<workspace>/projects`. |
 | `NANOBPMN_DENO_BIN=<path>` | Explicit path to the Deno binary used to run workers. Default: `deno` on `PATH`, else `~/.deno/bin/deno`. |
 
