@@ -90,6 +90,7 @@ The most common settings:
 | `PORT=<n>` | HTTP listen port (default `8080`). |
 | `NANOBPMN_DATA_DIR=<dir>` | Durable data directory (event log + read model). **Without it, the server runs fully in-memory and loses everything on exit.** Set it for anything you want to keep. |
 | `NANOBPMN_WORKSPACE_DIR=<dir>` | Where the console stores your projects and workers (default `./nanobpm-workspace`; projects live under `<workspace>/projects/`). Survives deletion of the engine data dir. |
+| `NANOBPMN_PROJECTS_DIR=<dir>` | Advanced: override the projects root directly (default `<workspace>/projects`). |
 | `DEBUG_REST=1` | Log every REST request/response (method, URI, status, latency). Leave off in production. |
 
 The clustering and tuning variables are covered in
@@ -120,8 +121,13 @@ the navigation rail.)
 
 ## Model and test a process
 
-Models are authored inside a **project** in the **Projects** tab, alongside its
-DMN decisions, forms, and pages.
+Models are authored inside a **project** in the **Projects** tab. To get started:
+
+1. Open the **Projects** tab and **create or open a project** (use **New project**
+   to scaffold one from a template).
+2. In the project workspace, use **New file → Model** to create a `.bpmn` file (or
+   open an existing one under `resources/processes/`). DMN decisions, forms, and
+   Page Composer pages are authored the same way, alongside the model.
 
 - **Create / edit** a `.bpmn` model, **Deploy** it to the engine (deployment is
   idempotent — redeploying an unchanged model is a no-op; a changed model becomes

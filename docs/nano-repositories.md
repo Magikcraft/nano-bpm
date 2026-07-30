@@ -37,7 +37,7 @@ Where each piece lives:
 | `engine-core/` | The deterministic, event-sourced BPMN engine (pure Rust crate, no I/O). |
 | `server/` | The `nanobpmn` gateway binary: Camunda 8-compatible **v2 REST API**, append-only journal, SQLite read model, optional multi-node Raft replication, and the built-in **web console** host. |
 | `server/src/console/extensions.rs` | The **authoritative extension-manifest schema** that Nano IDE packs target (see repo 2). |
-| `console/` | The built-in web console SPA — the **RAD IDE** (Projects: BPMN, DMN, forms, and Page Composer authoring), Extensions, Explorer, Traces, Workers, and Topology/Metrics. |
+| `console/` | The built-in web console SPA — the **RAD IDE** (Projects: BPMN, DMN, forms, and Page Composer authoring), Extensions, Explorer, **Traces** (per-instance execution timelines), Workers, and Topology/Metrics. See the console tour in [`README.md`](../README.md#web-console) and [`USERGUIDE.md`](../USERGUIDE.md#tour-the-web-console). |
 | `engine-wasm/` + `clients/nano-bernd/` | The engine compiled to WASM and wrapped as an **embeddable library** with two hosts: `@nanobpm/nano-bernd` (npm) and `io.github.jwulf:nano-bernd` (JVM / Maven Central). |
 | `clients/` | Client transports (e.g. the `node-stream` command-stream client). |
 | `spec/`, `spec-app/`, `spec-console/` | JSON Schemas / OpenAPI specs, published to `nanobpm.io`. |
