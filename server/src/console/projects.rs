@@ -3362,11 +3362,33 @@ static DERIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 /// `workflows/*.ts` are imported — never `main.ts`, whose top-level `deploy()`
 /// would hit the network.
 const DERIVE_MODELS_DRIVER: &str = r#"import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
+import { layoutProcess } from "bpmn-auto-layout";
 
 const root = Deno.args[0] ?? ".";
 const wfDir = `${root}/workflows`;
 const out: Array<{ id: string; kind: string; xml: string }> = [];
 const seen = new Set<string>();
+
+// Add a `bpmndi:` diagram to a DI-less BPMN string. The SDK's `layoutBpmn`
+// dynamically `import("bpmn-auto-layout")`s the optional peer from WITHIN its own
+// package scope, which the sandbox's `--import-map` does not reach — so under the
+// console it fails with "requires the optional peer dependency". Importing
+// `layoutProcess` here, in the DRIVER's own module graph, DOES resolve via the
+// map, so we lay out directly and only fall back to the SDK. Returns null if
+// neither works, so the caller can still serve the DI-less model.
+async function layout(bpmn: string): Promise<string | null> {
+  try {
+    const r = await layoutProcess(bpmn);
+    return typeof r === "string" ? r : (r as { xml: string }).xml;
+  } catch (_e) {
+    try {
+      return await layoutBpmn(bpmn);
+    } catch (e2) {
+      console.error(`layout failed: ${e2}`);
+      return null;
+    }
+  }
+}
 
 function isWorkflow(v: unknown): v is { id: string; kind: string } {
   return (
@@ -3399,13 +3421,8 @@ try {
           // that has never been saved (e.g. just imported by reference) and thus
           // has no on-disk `resources/processes/*.bpmn` to overlay. Fall back to
           // the DI-less XML if layout fails, so the panel still shows *something*.
-          let xml = bpmn;
-          try {
-            xml = await layoutBpmn(bpmn);
-          } catch (e) {
-            console.error(`layout(${value.id}) failed, serving DI-less: ${e}`);
-          }
-          out.push({ id: value.id, kind: value.kind, xml });
+          const laid = await layout(bpmn);
+          out.push({ id: value.id, kind: value.kind, xml: laid ?? bpmn });
         } catch (e) {
           console.error(`toBpmn(${value.id}) failed: ${e}`);
         }
@@ -3668,6 +3685,7 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
 /// `workflows/*.ts` are imported — never `main.ts` (its top-level `deploy()`
 /// would hit the network).
 const GENERATE_MODELS_DRIVER: &str = r#"import { toBpmn, layoutBpmn } from "@nanobpm/workflow";
+import { layoutProcess } from "bpmn-auto-layout";
 
 const root = Deno.args[0] ?? ".";
 const wfDir = `${root}/workflows`;
@@ -3677,6 +3695,26 @@ const seen = new Set<string>();
 // server SKIPS its destructive stale-model sweep, so a transient parse error in
 // one file can never wipe still-valid generated models for the others.
 let incomplete = false;
+
+// Add a `bpmndi:` diagram to a DI-less BPMN string. The SDK's `layoutBpmn`
+// dynamically `import("bpmn-auto-layout")`s the optional peer from WITHIN its own
+// package scope, which the sandbox's `--import-map` does not reach; importing
+// `layoutProcess` here (in the DRIVER's own module graph) DOES resolve via the
+// map. Try the direct call first, fall back to the SDK, and return null on total
+// failure so the caller can mark the run incomplete rather than write a model.
+async function layout(bpmn: string): Promise<string | null> {
+  try {
+    const r = await layoutProcess(bpmn);
+    return typeof r === "string" ? r : (r as { xml: string }).xml;
+  } catch (_e) {
+    try {
+      return await layoutBpmn(bpmn);
+    } catch (e2) {
+      console.error(`layout failed: ${e2}`);
+      return null;
+    }
+  }
+}
 
 function isWorkflow(v: unknown): v is { id: string; kind: string } {
   return (
@@ -3705,7 +3743,11 @@ try {
       if (isWorkflow(value) && !seen.has(value.id)) {
         seen.add(value.id);
         try {
-          const xml = await layoutBpmn(toBpmn(value as never));
+          const xml = await layout(toBpmn(value as never));
+          if (xml === null) {
+            incomplete = true;
+            continue;
+          }
           out.push({ id: value.id, kind: value.kind, xml });
         } catch (e) {
           console.error(`layout(${value.id}) failed: ${e}`);
