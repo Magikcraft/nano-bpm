@@ -66,7 +66,7 @@ is the wrong abstraction.
 Name and support **two distinct agent topologies**, and be explicit about which is native and which
 is compatibility-only.
 
-### 1. Agent-as-the-worker (Nano-native, differentiated)
+### 1. Agent-as-worker (Nano-native, differentiated)
 
 The agent is a **process participant serviced through a job**. The process contains a *call to* an
 agent (`w.task`, ADR 0045 — an external service task with a derived job type); the agent's tools and
@@ -102,7 +102,7 @@ the authoring model for the SDLC use case, and **not** the surface the code-firs
 
 ### The distinction, at a glance
 
-| | Agent-in-the-node (Camunda `AgentInstance`) | Agent-as-the-worker (Nano-native) |
+| | Agent-in-the-node (Camunda `AgentInstance`) | Agent-as-worker (Nano-native) |
 |---|---|---|
 | Reasoning loop | Engine-hosted | Inside the harness |
 | Tools | Modeled BPMN inner elements (`elementId` catalog) | The agent's own, opaque |
