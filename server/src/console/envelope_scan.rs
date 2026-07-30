@@ -514,7 +514,10 @@ pub fn scan_project(project_dir: &Path) -> BpmnScan {
     let mut files: Vec<std::path::PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "bpmn"))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x.eq_ignore_ascii_case("bpmn"))
+        })
         .collect();
     files.sort();
     for path in files {
@@ -1177,5 +1180,38 @@ mod tests {
         let scan = scan_bpmn(&xml);
         assert!(scan.meta.is_empty());
         assert_eq!(scan.shapes.len(), 1);
+    }
+
+    #[test]
+    fn scan_project_matches_bpmn_extension_case_insensitively() {
+        // `is_model_resource` triggers regeneration on any `.bpmn`/`.BPMN` save
+        // (case-insensitive), so the project scanner must accept the same set of
+        // files — otherwise an uppercase `.BPMN` model would regenerate against an
+        // empty scan and silently drift the derived worker/header types.
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nano-scan-case-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let processes = root.join("resources").join("processes");
+        std::fs::create_dir_all(&processes).unwrap();
+        let xml = doc(&task(
+            "t1",
+            "serviceTask",
+            "charge",
+            &format!("{IN_ORDER}{OUT_RECEIPT}"),
+        ));
+        std::fs::write(processes.join("order.BPMN"), &xml).unwrap();
+
+        let scan = scan_project(&root);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(
+            scan.workers.len(),
+            1,
+            "uppercase .BPMN model must be scanned"
+        );
+        assert_eq!(scan.workers[0].task_type, "charge");
     }
 }
