@@ -3068,17 +3068,24 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
         .map_err(|e| format!("write derivation driver: {e}"))?;
 
     // Least-privilege sandbox for a *read-only* derivation: read the project (to
-    // import `workflows/*.ts` + resolve the import map), fetch the SDK from npm,
-    // and write ONLY to the Deno cache. No `--allow-env` (workflow module
-    // top-level code must not read the server's environment) and `--no-lock`
-    // (never mutate a `deno.lock` in the project) — so a "Model" refresh can't
-    // touch arbitrary project files or leak env vars.
+    // import `workflows/*.ts` + resolve the import map), fetch the SDK from the
+    // npm registry, and write ONLY to the Deno cache. Network is scoped to the
+    // registry host(s) `npm:` resolution needs (default the public registry; a
+    // private-registry user widens it via NANOBPMN_DERIVE_ALLOW_NET, comma-
+    // separated) so a workflow module can't exfiltrate to arbitrary hosts. No
+    // `--allow-env` (module top-level code must not read the server's
+    // environment) and `--no-lock` (never mutate a `deno.lock` in the project) —
+    // so a "Model" refresh can't touch arbitrary project files, hosts, or env.
+    let allow_net = std::env::var("NANOBPMN_DERIVE_ALLOW_NET")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "registry.npmjs.org".to_string());
     let result = Command::new(&deno)
         .current_dir(&dir)
         .arg("run")
         .arg("--no-prompt")
         .arg("--no-lock")
-        .arg("--allow-net")
+        .arg(format!("--allow-net={allow_net}"))
         .arg(format!("--allow-read={}", dir.display()))
         .arg(format!("--allow-write={}", cache.display()))
         .arg(&driver_name)
