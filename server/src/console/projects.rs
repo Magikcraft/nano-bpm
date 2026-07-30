@@ -5038,6 +5038,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
     async fn derive_models_degrades_gracefully_without_panicking() {
         let _g = lock();
         let _root = temp_root();
