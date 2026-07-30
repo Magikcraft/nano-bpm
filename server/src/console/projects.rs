@@ -3312,6 +3312,16 @@ pub struct DerivedModel {
     pub xml: String,
 }
 
+/// Output of the [`GENERATE_MODELS_DRIVER`] (ADR 0048): the laid-out models plus
+/// an `incomplete` flag set when any workflow module failed to import or lay out,
+/// which suppresses the destructive stale-model sweep in [`generate_models`].
+#[derive(Deserialize, Debug)]
+struct GenerateResult {
+    models: Vec<DerivedModel>,
+    #[serde(default)]
+    incomplete: bool,
+}
+
 /// Process-wide sequence used to give each concurrent `derive_models` call a
 /// unique temporary driver filename (see the collision note there).
 static DERIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -3463,6 +3473,10 @@ const root = Deno.args[0] ?? ".";
 const wfDir = `${root}/workflows`;
 const out: Array<{ id: string; kind: string; xml: string }> = [];
 const seen = new Set<string>();
+// Track whether any workflow module failed to import or lay out. When set, the
+// server SKIPS its destructive stale-model sweep, so a transient parse error in
+// one file can never wipe still-valid generated models for the others.
+let incomplete = false;
 
 function isWorkflow(v: unknown): v is { id: string; kind: string } {
   return (
@@ -3479,9 +3493,12 @@ try {
     if (!entry.isFile || !entry.name.endsWith(".ts")) continue;
     let mod: Record<string, unknown>;
     try {
-      mod = await import(`file://${wfDir}/${entry.name}`);
+      // Encode the path so a project dir / filename with spaces or other
+      // characters that must be URL-escaped still yields a valid `file://` URL.
+      mod = await import(`file://${encodeURI(`${wfDir}/${entry.name}`)}`);
     } catch (e) {
       console.error(`skip ${entry.name}: ${e}`);
+      incomplete = true;
       continue;
     }
     for (const value of Object.values(mod)) {
@@ -3492,15 +3509,17 @@ try {
           out.push({ id: value.id, kind: value.kind, xml });
         } catch (e) {
           console.error(`layout(${value.id}) failed: ${e}`);
+          incomplete = true;
         }
       }
     }
   }
 } catch (e) {
   console.error(`readDir(${wfDir}) failed: ${e}`);
+  incomplete = true;
 }
 
-console.log(JSON.stringify(out));
+console.log(JSON.stringify({ models: out, incomplete }));
 "#;
 
 /// Map a workflow `id` to a safe `<id>.bpmn` filename, or `None` when nothing
@@ -3525,22 +3544,29 @@ fn bpmn_filename(id: &str) -> Option<String> {
     Some(format!("{trimmed}.bpmn"))
 }
 
+/// Substring stamped into every generated model's provenance comment. Used both
+/// to write the comment ([`with_provenance`]) and to identify OUR files during
+/// the stale-model sweep in [`generate_models`] — so an authored `.bpmn` (which
+/// lacks this marker) is never removed.
+const PROVENANCE_MARKER: &str = "Generated from workflows/*.ts by @nanobpm/workflow";
+
 /// Prepend a provenance comment to a generated model so a reader (or a diff)
 /// knows it is DERIVED from the workflow code and regenerated on every save —
 /// hand-edits in a modeller are clobbered. Inserted *after* the XML prolog
 /// (a comment before `<?xml ?>` is not well-formed); prepended when there is no
 /// prolog.
 fn with_provenance(xml: &str) -> String {
-    const NOTE: &str = "<!-- Generated from workflows/*.ts by @nanobpm/workflow (ADR 0048). \
-Do not edit: regenerated on every workflow save. -->";
+    let note = format!(
+        "<!-- {PROVENANCE_MARKER} (ADR 0048). Do not edit: regenerated on every workflow save. -->"
+    );
     let trimmed = xml.trim_start();
     if trimmed.starts_with("<?xml")
         && let Some(end) = trimmed.find("?>")
     {
         let (prolog, rest) = trimmed.split_at(end + 2);
-        return format!("{prolog}\n{NOTE}{rest}");
+        return format!("{prolog}\n{note}{rest}");
     }
-    format!("{NOTE}\n{xml}")
+    format!("{note}\n{xml}")
 }
 
 /// Synthesize the import map used for model *generation*. The layout helpers
@@ -3645,9 +3671,9 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
     let json = stdout
         .lines()
         .rev()
-        .find(|l| l.trim_start().starts_with('['))
-        .unwrap_or("[]");
-    let models: Vec<DerivedModel> = serde_json::from_str(json).map_err(|e| {
+        .find(|l| l.trim_start().starts_with('{'))
+        .unwrap_or("{}");
+    let result: GenerateResult = serde_json::from_str(json).map_err(|e| {
         format!(
             "parse generated models: {e}; deno output: {}",
             stdout.trim()
@@ -3661,15 +3687,63 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
     let proc_dir = dir.join("resources").join("processes");
     std::fs::create_dir_all(&proc_dir).map_err(|e| format!("create resources/processes: {e}"))?;
     let mut written = Vec::new();
-    for m in &models {
+    // The set of filenames we (re)generated this pass; also used to detect two
+    // ids that sanitize to the same filename and to spare current files from the
+    // stale sweep below.
+    let mut written_files: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &result.models {
         let Some(file) = bpmn_filename(&m.id) else {
             tracing::debug!(project = name, id = %m.id, "skipping model with unsafe id");
             continue;
         };
+        if !written_files.insert(file.clone()) {
+            // Two distinct ids sanitized to the same filename — skip+log rather
+            // than silently overwriting a sibling model (which would corrupt the
+            // scan surface and the derived types).
+            tracing::warn!(
+                project = name,
+                id = %m.id,
+                file = %file,
+                "skipping model: filename collides with an already-generated model"
+            );
+            continue;
+        }
         let path = proc_dir.join(&file);
         std::fs::write(&path, with_provenance(&m.xml))
             .map_err(|e| format!("write {}: {e}", path.display()))?;
         written.push(m.id.clone());
+    }
+
+    // Sweep stale generated models: a prior file WE generated (identified by the
+    // provenance marker) that isn't in the current set was orphaned by a deleted,
+    // renamed, or no-longer-exported flow — remove it so the scan surface tracks
+    // the code and the derived types don't drift. Authored `.bpmn` (no marker)
+    // are never touched. Skipped when the derivation was `incomplete` (a workflow
+    // module failed to import/lay out), so a transient parse error never wipes a
+    // model whose source is only momentarily broken.
+    if !result.incomplete
+        && let Ok(entries) = std::fs::read_dir(&proc_dir)
+    {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("bpmn"))
+            {
+                continue;
+            }
+            let fname = entry.file_name().to_string_lossy().into_owned();
+            if written_files.contains(&fname) {
+                continue;
+            }
+            match std::fs::read_to_string(&path) {
+                Ok(content) if content.contains(PROVENANCE_MARKER) => {
+                    let _ = std::fs::remove_file(&path);
+                    tracing::debug!(project = name, file = %fname, "removed stale generated model");
+                }
+                _ => {}
+            }
+        }
     }
     Ok(written)
 }
@@ -4831,6 +4905,9 @@ mod tests {
         // Comment lands AFTER the prolog (a comment before `<?xml` is malformed).
         assert!(out.starts_with("<?xml version=\"1.0\"?>"));
         assert!(out.contains("Generated from workflows/*.ts"));
+        // The comment carries the marker the stale-sweep matches on, so a
+        // generated file is always identifiable as ours.
+        assert!(out.contains(PROVENANCE_MARKER));
         let prolog_end = out.find("?>").unwrap();
         let comment_at = out.find("<!--").unwrap();
         assert!(comment_at > prolog_end);

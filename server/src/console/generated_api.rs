@@ -1061,8 +1061,13 @@ impl apis::projects::Projects for ServerImpl {
                 } else if super::is_workflow_source(&query_params.path) {
                     // Code-first inverse (ADR 0048): a `workflows/*.ts` save
                     // (re)generates the laid-out `resources/processes/*.bpmn` the
-                    // SDK derives, then refreshes the types from them.
-                    super::regenerate_workflow_models(&path_params.name).await;
+                    // SDK derives, then refreshes the types from them. Fire-and-
+                    // forget — it needs a Deno round-trip (npm fetch + auto-layout)
+                    // we must not block the save response on; best-effort.
+                    let project = path_params.name.clone();
+                    tokio::spawn(async move {
+                        super::regenerate_workflow_models(&project).await;
+                    });
                 }
                 Ok(apis::projects::SaveProjectFileResponse::Status204_Saved)
             }
