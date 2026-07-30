@@ -5189,7 +5189,7 @@ mod tests {
             approve.contains("client.signal("),
             "the approve script should correlate the human-in-the-loop signal"
         );
-        // All three run tasks are wired.
+        // All three Deno tasks are defined.
         assert!(deno_json["tasks"]["start"].is_string());
         assert!(deno_json["tasks"]["start-instance"].is_string());
         assert!(deno_json["tasks"]["approve"].is_string());
