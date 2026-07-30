@@ -134,12 +134,21 @@ designer instead of hand-written HTML.
   three v1 components, the generic runtime (`/app/pages`, `/app/data`, `/app/actions/start`, renderer shell),
   and a scaffolded starter page — proven by reproducing `urban-pr-review`'s Submit + Converging screen with
   zero hand-written frontend.
-- **2 — layout & nesting:** container/columns/tabs nodes (Craft.js nested canvases), the flat list becomes a
-  tree; a **detail/record** control (one entity by id) and a **form-embed** (a form-js schema in a page).
-- **3 — reactive controls:** `dataGrid`/bound controls get push updates (SSE/websocket) to feel Delphi-live
-  (ADR 0026's open reactive-binding question), and the remaining action bindings (`message`, task-complete)
-  join the palette so the composed page is a full inbox replacement.
-- **4 — chat & LLM surface:** a chat panel node driving the action API via the agent tools (ADR 0022 §E).
+- **2 — action + relational surface (delivered):** the runtime and `page.json` grow the pieces the witness's
+  hand-written SPA needed beyond a flat table: (a) **row/detail actions** `cancelProcess` (`/app/actions/cancel`)
+  and `publishMessage` (`/app/actions/message`) join `startProcess`, so a page can cancel a run or answer an
+  escalation; (b) **filtered/ordered/tabbed grids** — `data.filter`/`data.orderBy` and a `tabs` control map to a
+  whitelisted `?where=col:val&order=col:dir` on `/app/data` (columns checked against `PRAGMA table_info`, values
+  always bound — no injection surface); (c) a per-row **expandable detail** with an external link, scalar fields,
+  lazily-fetched nested **child grids** (filtered by a parent-row field, e.g. a PR's rounds/transcripts), and a
+  conditional **answer form** shown when a parent field is truthy; (d) opt-in **auto-refresh** (`refreshMs`).
+  The composer exposes the new knobs via a validated advanced-JSON editor on the `dataGrid` settings; the node
+  set stays at three types so the serializer is unchanged.
+- **3 — layout & nesting:** container/columns nodes (Craft.js nested canvases), the flat list becomes a tree; a
+  **form-embed** (a form-js schema in a page).
+- **4 — reactive controls:** `dataGrid`/bound controls get push updates (SSE/websocket) to feel Delphi-live
+  (ADR 0026's open reactive-binding question), replacing the `refreshMs` poll.
+- **5 — chat & LLM surface:** a chat panel node driving the action API via the agent tools (ADR 0022 §E).
 
 ## Open questions
 

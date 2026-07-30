@@ -8,11 +8,13 @@
 // self-contained, testable (`app_pages_test.ts`), and free of the hyphenated
 // emit-time specifiers that make `data-cli.ts` un-typecheckable in-tree.
 //
-// Endpoints (ADR 0026 §1 action API, `start`-only subset for v1):
-//   GET  /app/pages/<id>                → the page's page.json
-//   GET  /app/data/<source>/<table>     → rows from the datasource (the rest bank)
-//   POST /app/actions/start/<process>   → createProcessInstance (attended-sync)
-//   GET  /  (+ /app/runtime.js)         → the schema-driven browser renderer
+// Endpoints (ADR 0026 §1 action API):
+//   GET  /app/pages/<id>                        → the page's page.json
+//   GET  /app/data/<source>/<table>[?where&order]→ rows (filtered/ordered, whitelisted)
+//   POST /app/actions/start/<process>           → createProcessInstance (attended-sync)
+//   POST /app/actions/cancel                    → cancelProcessInstance (row cancel)
+//   POST /app/actions/message                   → publishMessage (row/detail answer)
+//   GET  /  (+ /app/runtime.js)                 → the schema-driven browser renderer
 
 /** The subset of the `@nanobpm/data` DataSource the runtime needs. */
 export interface PagesDataSource {
@@ -25,6 +27,18 @@ export interface PagesEngine {
   createProcessInstance(
     input: { processDefinitionId: string; variables?: Record<string, unknown> },
   ): Promise<{ processInstanceKey?: string | number }>;
+  /** Cancel a running instance (row cancel action). */
+  cancelProcessInstance(
+    input: { processInstanceKey: string | number },
+  ): Promise<unknown>;
+  /** Publish a correlated message (row/detail publishMessage action). */
+  publishMessage(
+    input: {
+      name: string;
+      correlationKey: string;
+      variables?: Record<string, unknown>;
+    },
+  ): Promise<unknown>;
 }
 
 export interface PagesContext {
@@ -77,6 +91,26 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
       },
     ));
 
+  // Per-table column whitelist, introspected once per table via `PRAGMA
+  // table_info`. Every filter/order column named in a `/app/data` query is checked
+  // against this set before it reaches the SQL, so — like the table whitelist —
+  // an attacker-supplied `where`/`order` can never inject. `table` is already
+  // IDENT-guarded and table-whitelisted before we get here.
+  const tableColumns = new Map<string, Promise<Set<string>>>();
+  const knownColumns = (table: string): Promise<Set<string>> => {
+    const cached = tableColumns.get(table);
+    if (cached) return cached;
+    const p = ctx.db
+      .query(`PRAGMA table_info(${table})`)
+      .then((rows) => new Set(rows.map((r) => String(r.name))))
+      .catch((err) => {
+        tableColumns.delete(table);
+        throw err;
+      });
+    tableColumns.set(table, p);
+    return p;
+  };
+
   return async function handle(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const { pathname } = url;
@@ -127,7 +161,47 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
       if (!tables.has(table)) {
         return json({ error: `unknown table "${table}"` }, 404);
       }
-      const rows = await ctx.db.query(`SELECT * FROM ${table} LIMIT ${rowLimit}`);
+      // Parse ?where=col:value (repeatable, ANDed) and ?order=col:dir. Every
+      // column is whitelisted against the table's real columns before it reaches
+      // the SQL; values are always bound as `?` parameters.
+      let columns: Set<string>;
+      try {
+        columns = await knownColumns(table);
+      } catch {
+        return json({ error: "schema introspection failed" }, 500);
+      }
+      const params: unknown[] = [];
+      const clauses: string[] = [];
+      for (const raw of url.searchParams.getAll("where")) {
+        const colon = raw.indexOf(":");
+        if (colon <= 0) return json({ error: "invalid where clause" }, 400);
+        const field = raw.slice(0, colon);
+        const value = raw.slice(colon + 1);
+        if (!columns.has(field)) {
+          return json({ error: `unknown column "${field}"` }, 400);
+        }
+        clauses.push(`${field} = ?`);
+        params.push(value);
+      }
+      let orderSql = "";
+      const orderRaw = url.searchParams.get("order");
+      if (orderRaw) {
+        const colon = orderRaw.indexOf(":");
+        const field = colon > 0 ? orderRaw.slice(0, colon) : orderRaw;
+        const dir =
+          colon > 0 && orderRaw.slice(colon + 1).toLowerCase() === "desc"
+            ? "DESC"
+            : "ASC";
+        if (!columns.has(field)) {
+          return json({ error: `unknown column "${field}"` }, 400);
+        }
+        orderSql = ` ORDER BY ${field} ${dir}`;
+      }
+      const whereSql = clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "";
+      const rows = await ctx.db.query(
+        `SELECT * FROM ${table}${whereSql}${orderSql} LIMIT ${rowLimit}`,
+        params,
+      );
       return json({ rows });
     }
 
@@ -152,6 +226,61 @@ export function createPagesHandler(ctx: PagesContext): (req: Request) => Promise
       try {
         const res = await ctx.nano.createProcessInstance({ processDefinitionId: process, variables });
         return json({ processInstanceKey: res.processInstanceKey ?? null });
+      } catch (e) {
+        return json({ error: String((e as Error)?.message ?? e) }, 502);
+      }
+    }
+
+    // ── POST /app/actions/cancel ──────────────────────────────────────────
+    if (req.method === "POST" && pathname === "/app/actions/cancel") {
+      let key: string | number | undefined;
+      try {
+        const body = await req.json();
+        const k = (body as { processInstanceKey?: unknown })?.processInstanceKey;
+        if (typeof k === "string" || typeof k === "number") key = k;
+      } catch {
+        return json({ error: "body must be JSON" }, 400);
+      }
+      if (key === undefined || key === "") {
+        return json({ error: "processInstanceKey is required" }, 400);
+      }
+      try {
+        await ctx.nano.cancelProcessInstance({ processInstanceKey: key });
+        return json({ ok: true });
+      } catch (e) {
+        return json({ error: String((e as Error)?.message ?? e) }, 502);
+      }
+    }
+
+    // ── POST /app/actions/message ─────────────────────────────────────────
+    if (req.method === "POST" && pathname === "/app/actions/message") {
+      let name = "";
+      let correlationKey = "";
+      let variables: Record<string, unknown> = {};
+      try {
+        const body = (await req.json()) as {
+          name?: unknown;
+          correlationKey?: unknown;
+          variables?: unknown;
+        };
+        if (typeof body?.name === "string") name = body.name;
+        if (typeof body?.correlationKey === "string" || typeof body?.correlationKey === "number") {
+          correlationKey = String(body.correlationKey);
+        }
+        const v = body?.variables;
+        if (v && typeof v === "object" && !Array.isArray(v)) {
+          variables = v as Record<string, unknown>;
+        }
+      } catch {
+        return json({ error: "body must be JSON" }, 400);
+      }
+      if (!name) return json({ error: "message name is required" }, 400);
+      if (!correlationKey) {
+        return json({ error: "correlationKey is required" }, 400);
+      }
+      try {
+        await ctx.nano.publishMessage({ name, correlationKey, variables });
+        return json({ ok: true });
       } catch (e) {
         return json({ error: String((e as Error)?.message ?? e) }, 502);
       }
@@ -211,6 +340,23 @@ body { margin:0; font:15px/1.5 system-ui,sans-serif; padding:2rem; max-width:64r
 table.pc-grid { width:100%; border-collapse:collapse; font-size:.9rem; }
 table.pc-grid th, table.pc-grid td { text-align:left; padding:.4rem .6rem; border-bottom:1px solid var(--pc-edge); }
 table.pc-grid th { font-weight:600; opacity:.75; }
+.pc-tabs { display:flex; gap:.5rem; margin-bottom:.75rem; }
+.pc-tab { padding:.35rem .8rem; border:1px solid var(--pc-edge); border-radius:.4rem; background:transparent; color:inherit; font:inherit; cursor:pointer; }
+.pc-tab.active { background:var(--pc-accent); color:#fff; border-color:var(--pc-accent); }
+.pc-btn-sm { padding:.25rem .55rem; font-size:.8rem; margin-right:.3rem; }
+.pc-chevron { background:transparent; color:inherit; border:1px solid var(--pc-edge); }
+.pc-row-actions { white-space:nowrap; text-align:right; }
+.pc-detail { padding:.75rem .25rem; }
+.pc-detail-field { display:flex; gap:.5rem; font-size:.85rem; margin:.15rem 0; }
+.pc-detail-label { opacity:.7; min-width:8rem; }
+.pc-link { color:var(--pc-accent); }
+.pc-child { margin:.6rem 0; }
+.pc-child-title { font-size:.8rem; font-weight:600; opacity:.7; margin-bottom:.25rem; }
+.pc-transcript { white-space:pre-wrap; max-height:22rem; overflow:auto; background:rgba(120,120,160,.08); padding:.5rem; border-radius:.4rem; font-size:.8rem; margin-top:.4rem; }
+.pc-subform { margin-top:.75rem; padding:.6rem; border:1px dashed var(--pc-edge); border-radius:.5rem; }
+.pc-subform-title { font-weight:600; font-size:.85rem; margin-bottom:.4rem; }
+.pc-prompt { font-size:.85rem; opacity:.8; margin-bottom:.4rem; white-space:pre-wrap; }
+.pc-textarea { width:100%; min-height:4rem; padding:.5rem; border:1px solid var(--pc-edge); border-radius:.4rem; font:inherit; }
 `;
 
 // The schema-driven browser renderer (ADR 0042 §3). Plain ES module string served at
@@ -281,21 +427,219 @@ function renderDataGrid(node) {
   const card = el("section", { class: "pc-card" });
   if (p.title) card.append(el("h2", {}, p.title));
   const cols = p.columns || [];
-  const thead = el("thead", {}, el("tr", {}, ...cols.map((c) => el("th", {}, c.header || c.field))));
+  const tabs = p.tabs || [];
+  const rowActions = p.rowActions || [];
+  const detail = p.detail || null;
+  const hasExtra = rowActions.length > 0 || detail != null;
+  let activeFilter = p.data.filter || [];
+
+  if (tabs.length) {
+    const bar = el("div", { class: "pc-tabs" });
+    activeFilter = tabs[0].filter || [];
+    tabs.forEach((t, i) => {
+      const b = el("button", { class: "pc-tab" + (i === 0 ? " active" : "") }, t.label);
+      b.addEventListener("click", () => {
+        activeFilter = t.filter || [];
+        for (const c of bar.children) c.classList.remove("active");
+        b.classList.add("active");
+        refresh();
+      });
+      bar.append(b);
+    });
+    card.append(bar);
+  }
+
+  const headCells = cols.map((c) => el("th", {}, c.header || c.field));
+  if (hasExtra) headCells.push(el("th", {}, ""));
+  const thead = el("thead", {}, el("tr", {}, ...headCells));
   const tbody = el("tbody", {});
   const table = el("table", { class: "pc-grid" }, thead, tbody);
   card.append(table);
+  const span = String((cols.length || 1) + (hasExtra ? 1 : 0));
+
+  function dataUrl(source, tbl, filters, order) {
+    let u = "/app/data/" + encodeURIComponent(source) + "/" + encodeURIComponent(tbl);
+    const qs = [];
+    for (const f of filters || []) qs.push("where=" + encodeURIComponent(f.field + ":" + f.eq));
+    if (order && order.field) qs.push("order=" + encodeURIComponent(order.field + ":" + (order.dir || "asc")));
+    return qs.length ? u + "?" + qs.join("&") : u;
+  }
+
+  async function fireAction(action, row) {
+    if (action.kind === "cancelProcess") {
+      return getJSON("/app/actions/cancel", { method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ processInstanceKey: row[action.keyField] }) });
+    }
+    if (action.kind === "publishMessage") {
+      return getJSON("/app/actions/message", { method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: action.message, correlationKey: row[action.correlationKeyField],
+          variables: { ...(action.variables || {}) } }) });
+    }
+    if (action.kind === "startProcess") {
+      return getJSON("/app/actions/start/" + encodeURIComponent(action.process), { method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ variables: { ...(action.variables || {}) } }) });
+    }
+    throw new Error("unknown action");
+  }
+
+  function rowActionButton(row, ra) {
+    if (ra.showWhenField && !row[ra.showWhenField]) return null;
+    const b = el("button", { class: "pc-btn pc-btn-sm" }, ra.label);
+    b.addEventListener("click", async (ev) => {
+      ev.stopPropagation();
+      if (ra.confirm && !confirm(ra.confirm)) return;
+      b.disabled = true;
+      try {
+        await fireAction(ra.action, row);
+        document.dispatchEvent(new CustomEvent("pc:refresh"));
+      } catch (e) {
+        b.disabled = false;
+        alert(String(e.message || e));
+      }
+    });
+    return b;
+  }
+
+  function detailForm(row) {
+    const f = detail.form;
+    if (!f || !row[f.showWhenField]) return null;
+    const box = el("div", { class: "pc-subform" });
+    if (f.title) box.append(el("div", { class: "pc-subform-title" }, f.title));
+    if (f.promptField && row[f.promptField] != null) {
+      box.append(el("div", { class: "pc-prompt" }, String(row[f.promptField])));
+    }
+    const input = el("textarea", { class: "pc-textarea", placeholder: f.inputLabel || f.inputKey });
+    const msg = el("p", { class: "pc-msg" });
+    const btn = el("button", { class: "pc-btn pc-btn-sm" }, f.submitLabel || "Submit");
+    btn.addEventListener("click", async () => {
+      btn.disabled = true; msg.className = "pc-msg"; msg.textContent = "Sending…";
+      try {
+        await getJSON("/app/actions/message", { method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ name: f.action.message, correlationKey: row[f.action.correlationKeyField],
+            variables: { [f.inputKey]: input.value, ...(f.action.variables || {}) } }) });
+        msg.className = "pc-msg ok"; msg.textContent = "Sent";
+        document.dispatchEvent(new CustomEvent("pc:refresh"));
+      } catch (e) {
+        btn.disabled = false; msg.className = "pc-msg err"; msg.textContent = String(e.message || e);
+      }
+    });
+    box.append(el("div", { class: "pc-field" }, input), btn, msg);
+    return box;
+  }
+
+  async function childGrid(cg, row) {
+    const wrap = el("div", { class: "pc-child" });
+    if (cg.title) wrap.append(el("div", { class: "pc-child-title" }, cg.title));
+    const ccols = cg.columns || [];
+    const cbody = el("tbody", {});
+    const ctable = el("table", { class: "pc-grid" },
+      el("thead", {}, el("tr", {}, ...ccols.map((c) => el("th", {}, c.header || c.field)),
+        ...(cg.lazyField ? [el("th", {}, "")] : []))), cbody);
+    wrap.append(ctable);
+    try {
+      const { rows } = await getJSON(dataUrl(cg.source || "app", cg.table,
+        [{ field: cg.childField, eq: row[cg.parentField] }], cg.orderBy));
+      const cspan = String((ccols.length || 1) + (cg.lazyField ? 1 : 0));
+      if (!rows.length) {
+        cbody.append(el("tr", {}, el("td", { colspan: cspan }, "None")));
+      }
+      for (const cr of rows) {
+        const cells = ccols.map((c) => el("td", {}, cr[c.field] == null ? "" : String(cr[c.field])));
+        if (cg.lazyField) {
+          const lf = cg.lazyField;
+          const has = cr[lf.field] != null && String(cr[lf.field]).trim() !== "";
+          const cell = el("td", {});
+          if (has) {
+            const toggle = el("button", { class: "pc-btn pc-btn-sm" }, lf.label || "Show");
+            const pre = el("pre", { class: "pc-transcript", hidden: "" });
+            pre.textContent = String(cr[lf.field]);
+            toggle.addEventListener("click", () => {
+              pre.hidden = !pre.hidden;
+              toggle.textContent = pre.hidden ? (lf.label || "Show") : "Hide";
+            });
+            cell.append(toggle, pre);
+          }
+          cells.push(cell);
+        }
+        cbody.append(el("tr", {}, ...cells));
+      }
+    } catch (e) {
+      cbody.append(el("tr", {}, el("td", {}, String(e.message || e))));
+    }
+    return wrap;
+  }
+
+  function detailPanel(row) {
+    const box = el("div", { class: "pc-detail" });
+    if (detail.linkField && row[detail.linkField]) {
+      box.append(el("a", { class: "pc-link", href: String(row[detail.linkField]), target: "_blank" },
+        String(row[detail.linkField])));
+    }
+    for (const df of detail.fields || []) {
+      box.append(el("div", { class: "pc-detail-field" },
+        el("span", { class: "pc-detail-label" }, df.label || df.field),
+        el("span", {}, row[df.field] == null ? "" : String(row[df.field]))));
+    }
+    for (const cg of detail.children || []) {
+      const holder = el("div", {});
+      box.append(holder);
+      childGrid(cg, row).then((w) => holder.replaceChildren(w));
+    }
+    const form = detailForm(row);
+    if (form) box.append(form);
+    return box;
+  }
+
+  function renderRow(row) {
+    const cells = cols.map((c) => el("td", {}, row[c.field] == null ? "" : String(row[c.field])));
+    let toggle = null;
+    if (hasExtra) {
+      const actionCell = el("td", { class: "pc-row-actions" });
+      if (detail) {
+        toggle = el("button", { class: "pc-btn pc-btn-sm pc-chevron" }, "▸");
+        actionCell.append(toggle);
+      }
+      for (const ra of rowActions) {
+        const b = rowActionButton(row, ra);
+        if (b) actionCell.append(b);
+      }
+      cells.push(actionCell);
+    }
+    const tr = el("tr", {}, ...cells);
+    tbody.append(tr);
+    if (detail && toggle) {
+      const dtr = el("tr", { hidden: "" }, el("td", { colspan: span }));
+      let built = false;
+      toggle.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const open = dtr.hidden;
+        dtr.hidden = !open;
+        toggle.textContent = open ? "▾" : "▸";
+        if (open && !built) {
+          built = true;
+          dtr.firstChild.append(detailPanel(row));
+        }
+      });
+      tbody.append(dtr);
+    }
+  }
+
   async function refresh() {
     try {
-      const { rows } = await getJSON("/app/data/" + encodeURIComponent(p.data.source) + "/" + encodeURIComponent(p.data.table));
-      tbody.replaceChildren(...rows.map((row) =>
-        el("tr", {}, ...cols.map((c) => el("td", {}, row[c.field] == null ? "" : String(row[c.field]))))));
-      if (!rows.length) tbody.append(el("tr", {}, el("td", { colspan: String(cols.length || 1) }, "No rows")));
+      const { rows } = await getJSON(dataUrl(p.data.source, p.data.table, activeFilter, p.data.orderBy));
+      tbody.replaceChildren();
+      for (const row of rows) renderRow(row);
+      if (!rows.length) tbody.append(el("tr", {}, el("td", { colspan: span }, "No rows")));
     } catch (e) {
-      tbody.replaceChildren(el("tr", {}, el("td", { colspan: String(cols.length || 1) }, String(e.message || e))));
+      tbody.replaceChildren(el("tr", {}, el("td", { colspan: span }, String(e.message || e))));
     }
   }
   document.addEventListener("pc:refresh", refresh);
+  if (p.refreshMs && p.refreshMs > 0) setInterval(refresh, p.refreshMs);
   refresh();
   return card;
 }

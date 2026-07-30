@@ -155,3 +155,139 @@ test("makeNode produces a validatable node of the requested type", () => {
     assert.equal(n.type, type);
   }
 });
+
+// The full v2 witness: filtered/tabbed grid with row actions (cancel), a lazy
+// nested child grid, and a conditional escalation-answer form (ADR 0042 v2).
+const v2Grid: PageDoc = {
+  schemaVersion: PAGE_SCHEMA_VERSION,
+  title: "PRs",
+  nodes: [
+    {
+      type: "dataGrid",
+      id: "list",
+      props: {
+        title: "Pull Requests",
+        data: {
+          kind: "datasource",
+          source: "app",
+          table: "pull_requests",
+          filter: [{ field: "status", eq: "converging" }],
+          orderBy: { field: "updated_at", dir: "desc" },
+        },
+        columns: [{ field: "pr_key", header: "PR" }],
+        rowKey: "pr_key",
+        tabs: [
+          { label: "Active", filter: [{ field: "status", eq: "converging" }] },
+          { label: "History", filter: [{ field: "status", eq: "converged" }] },
+        ],
+        rowActions: [
+          {
+            label: "Cancel",
+            confirm: "Cancel this PR review?",
+            action: { kind: "cancelProcess", keyField: "process_key" },
+          },
+        ],
+        detail: {
+          linkField: "url",
+          fields: [{ field: "repo", label: "Repo" }],
+          children: [
+            {
+              title: "Rounds",
+              source: "app",
+              table: "rounds",
+              parentField: "pr_key",
+              childField: "pr_key",
+              columns: [{ field: "round_no", header: "#" }],
+              orderBy: { field: "round_no", dir: "asc" },
+              lazyField: {
+                field: "transcript",
+                label: "Transcript",
+                lazy: true,
+              },
+            },
+          ],
+          form: {
+            showWhenField: "open_escalation_id",
+            title: "Answer escalation",
+            promptField: "open_escalation_question",
+            inputKey: "answer",
+            inputLabel: "Your answer",
+            submitLabel: "Send answer",
+            action: {
+              kind: "publishMessage",
+              message: "escalation-answered",
+              correlationKeyField: "pr_key",
+            },
+          },
+        },
+        refreshMs: 5000,
+      },
+    },
+  ],
+};
+
+test("parsePageDoc accepts the full v2 dataGrid (filters, tabs, actions, detail)", () => {
+  const r = parsePageDoc(v2Grid);
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  assert.deepEqual(r.doc, v2Grid);
+});
+
+test("v2 dataGrid survives a Craft.js round-trip unchanged", () => {
+  const state = fromPageDoc(v2Grid);
+  const back = toPageDoc(state, v2Grid.title);
+  assert.deepEqual(back, v2Grid);
+});
+
+test("parsePageDoc drops a row action with an unknown kind", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "dataGrid",
+        id: "g",
+        props: {
+          data: { kind: "datasource", source: "app", table: "t" },
+          columns: [{ field: "id", header: "ID" }],
+          rowActions: [
+            { label: "Bad", action: { kind: "wat" } },
+            {
+              label: "Cancel",
+              action: { kind: "cancelProcess", keyField: "k" },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const grid = r.ok && r.doc.nodes[0];
+  assert.equal(
+    grid && grid.type === "dataGrid" && grid.props.rowActions?.length,
+    1,
+  );
+});
+
+test("parsePageDoc omits an empty detail rather than storing a hollow object", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "dataGrid",
+        id: "g",
+        props: {
+          data: { kind: "datasource", source: "app", table: "t" },
+          columns: [],
+          detail: { fields: [], children: [] },
+        },
+      },
+    ],
+  });
+  assert.ok(r.ok);
+  const grid = r.ok && r.doc.nodes[0];
+  assert.equal(
+    grid && grid.type === "dataGrid" && grid.props.detail,
+    undefined,
+  );
+});

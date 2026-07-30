@@ -7,15 +7,25 @@ function ctx(over: Partial<PagesContext> = {}): PagesContext {
   return {
     db: {
       schema: () => Promise.resolve([{ name: "pull_requests" }]),
-      query: (_sql: string) => Promise.resolve([{ pr_key: "o/r#1", status: "converging" }]),
+      query: (sql: string) =>
+        /table_info/.test(sql)
+          ? Promise.resolve([{ name: "pr_key" }, { name: "status" }])
+          : Promise.resolve([{ pr_key: "o/r#1", status: "converging" }]),
     },
-    nano: {
-      createProcessInstance: (_i) => Promise.resolve({ processInstanceKey: 42 }),
-    },
+    nano: fakeEngine(),
     readPage: (path: string) =>
       path.endsWith("home.page.json")
         ? Promise.resolve(JSON.stringify({ schemaVersion: "1.0", title: "T", nodes: [] }))
         : Promise.reject(new Error("nope")),
+    ...over,
+  };
+}
+
+function fakeEngine(over: Partial<PagesContext["nano"]> = {}): PagesContext["nano"] {
+  return {
+    createProcessInstance: (_i) => Promise.resolve({ processInstanceKey: 42 }),
+    cancelProcessInstance: (_i) => Promise.resolve({}),
+    publishMessage: (_i) => Promise.resolve({}),
     ...over,
   };
 }
@@ -62,12 +72,12 @@ Deno.test("GET /app/data rejects a source other than the injected default", asyn
 Deno.test("POST /app/actions/start starts a process with the posted variables", async () => {
   let seen: unknown = null;
   const c = ctx({
-    nano: {
+    nano: fakeEngine({
       createProcessInstance: (i) => {
         seen = i;
         return Promise.resolve({ processInstanceKey: 7 });
       },
-    },
+    }),
   });
   const res = await createPagesHandler(c)(
     new Request("http://x/app/actions/start/convergence-loop", {
@@ -84,12 +94,12 @@ Deno.test("POST /app/actions/start starts a process with the posted variables", 
 Deno.test("POST /app/actions/start defaults a non-object `variables` to {}", async () => {
   let seen: unknown = null;
   const c = ctx({
-    nano: {
+    nano: fakeEngine({
       createProcessInstance: (i) => {
         seen = i;
         return Promise.resolve({ processInstanceKey: 9 });
       },
-    },
+    }),
   });
   const res = await createPagesHandler(c)(
     new Request("http://x/app/actions/start/p", {
@@ -104,7 +114,7 @@ Deno.test("POST /app/actions/start defaults a non-object `variables` to {}", asy
 
 Deno.test("POST /app/actions/start surfaces an engine error as 502", async () => {
   const c = ctx({
-    nano: { createProcessInstance: () => Promise.reject(new Error("engine down")) },
+    nano: fakeEngine({ createProcessInstance: () => Promise.reject(new Error("engine down")) }),
   });
   const res = await createPagesHandler(c)(
     new Request("http://x/app/actions/start/p", {
@@ -144,4 +154,101 @@ Deno.test("GET /app/data retries schema introspection after a transient failure"
   const second = await handle(new Request("http://x/app/data/app/pull_requests"));
   assertEquals(second.status, 200);
   assertEquals(calls, 2);
+});
+
+Deno.test("GET /app/data applies whitelisted where + order as bound params", async () => {
+  let seenSql = "";
+  let seenParams: unknown[] = [];
+  const c = ctx({
+    db: {
+      schema: () => Promise.resolve([{ name: "pull_requests" }]),
+      query: (sql: string, params?: unknown[]) => {
+        if (/table_info/.test(sql)) {
+          return Promise.resolve([{ name: "status" }, { name: "updated_at" }]);
+        }
+        seenSql = sql;
+        seenParams = params ?? [];
+        return Promise.resolve([{ status: "converging" }]);
+      },
+    },
+  });
+  const res = await createPagesHandler(c)(
+    new Request("http://x/app/data/app/pull_requests?where=status:converging&order=updated_at:desc"),
+  );
+  assertEquals(res.status, 200);
+  assert(seenSql.includes("WHERE status = ?"));
+  assert(seenSql.includes("ORDER BY updated_at DESC"));
+  assertEquals(seenParams, ["converging"]);
+});
+
+Deno.test("GET /app/data rejects a where column not on the table (no injection)", async () => {
+  const res = await createPagesHandler(ctx())(
+    new Request("http://x/app/data/app/pull_requests?where=evil'--:1"),
+  );
+  assertEquals(res.status, 400);
+});
+
+Deno.test("POST /app/actions/cancel cancels the posted instance", async () => {
+  let seen: unknown = null;
+  const c = ctx({
+    nano: fakeEngine({
+      cancelProcessInstance: (i) => {
+        seen = i;
+        return Promise.resolve({});
+      },
+    }),
+  });
+  const res = await createPagesHandler(c)(
+    new Request("http://x/app/actions/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ processInstanceKey: "123" }),
+    }),
+  );
+  assertEquals(res.status, 200);
+  assertEquals((await res.json()).ok, true);
+  assertEquals(seen, { processInstanceKey: "123" });
+});
+
+Deno.test("POST /app/actions/cancel requires a key", async () => {
+  const res = await createPagesHandler(ctx())(
+    new Request("http://x/app/actions/cancel", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    }),
+  );
+  assertEquals(res.status, 400);
+});
+
+Deno.test("POST /app/actions/message publishes a correlated message", async () => {
+  let seen: unknown = null;
+  const c = ctx({
+    nano: fakeEngine({
+      publishMessage: (i) => {
+        seen = i;
+        return Promise.resolve({});
+      },
+    }),
+  });
+  const res = await createPagesHandler(c)(
+    new Request("http://x/app/actions/message", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "escalation-answered", correlationKey: "o/r#1", variables: { answer: "yes" } }),
+    }),
+  );
+  assertEquals(res.status, 200);
+  assertEquals(seen, { name: "escalation-answered", correlationKey: "o/r#1", variables: { answer: "yes" } });
+});
+
+Deno.test("POST /app/actions/message requires name and correlationKey", async () => {
+  const res = await createPagesHandler(ctx())(
+    new Request("http://x/app/actions/message", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "m" }),
+    }),
+  );
+  assertEquals(res.status, 400);
 });

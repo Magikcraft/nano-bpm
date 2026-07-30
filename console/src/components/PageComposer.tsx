@@ -416,6 +416,7 @@ function Settings({
               )
             }
           />
+          <GridAdvanced props={props} set={set} />
         </>
       )}
 
@@ -441,6 +442,77 @@ function Row({
       <span>{label}</span>
       {children}
     </label>
+  );
+}
+
+/** An escape-hatch JSON editor for a `dataGrid`'s v2 knobs (filters, orderBy,
+ * tabs, rowKey, rowActions, detail, refreshMs). The structured pickers above
+ * cover the common case (table + columns); this exposes the relational/action
+ * surface (ADR 0042 v2) without a bespoke widget per nested shape. It parses on
+ * change and only commits valid JSON, so a mid-edit typo never corrupts props. */
+function GridAdvanced({
+  props,
+  set,
+}: {
+  props: Record<string, unknown>;
+  set: (key: string, value: unknown) => void;
+}): ReactElement {
+  const advancedKeys = [
+    "tabs",
+    "rowKey",
+    "rowActions",
+    "detail",
+    "refreshMs",
+  ] as const;
+  const current = () => {
+    const out: Record<string, unknown> = {};
+    const data = (props.data as Record<string, unknown>) ?? {};
+    if (data.filter) out.filter = data.filter;
+    if (data.orderBy) out.orderBy = data.orderBy;
+    for (const k of advancedKeys) if (props[k] !== undefined) out[k] = props[k];
+    return JSON.stringify(out, null, 2);
+  };
+  const [text, setText] = useState(current);
+  const [err, setErr] = useState<string | null>(null);
+  const commit = (value: string) => {
+    setText(value);
+    if (!value.trim()) {
+      setErr(null);
+      const data = { ...((props.data as Record<string, unknown>) ?? {}) };
+      delete data.filter;
+      delete data.orderBy;
+      set("data", data);
+      for (const k of advancedKeys) set(k, undefined);
+      return;
+    }
+    try {
+      const parsed = JSON.parse(value) as Record<string, unknown>;
+      setErr(null);
+      const data = { ...((props.data as Record<string, unknown>) ?? {}) };
+      data.filter = parsed.filter;
+      data.orderBy = parsed.orderBy;
+      if (parsed.filter === undefined) delete data.filter;
+      if (parsed.orderBy === undefined) delete data.orderBy;
+      set("data", data);
+      for (const k of advancedKeys) set(k, parsed[k]);
+    } catch (e) {
+      setErr(String((e as Error).message));
+    }
+  };
+  return (
+    <div className="pc-list">
+      <div className="pc-row">
+        <span>Advanced (filters, tabs, row actions, detail)</span>
+      </div>
+      <textarea
+        className="pc-advanced"
+        rows={10}
+        value={text}
+        onChange={(e) => commit(e.target.value)}
+        spellCheck={false}
+      />
+      {err && <div className="pc-advanced-err">Invalid JSON: {err}</div>}
+    </div>
   );
 }
 
@@ -618,5 +690,7 @@ const PAGE_COMPOSER_CSS = `
 .pc-row input, .pc-row select, .pc-list input { padding:.3rem .4rem; border:1px solid var(--color-edge,#d0d0d8); border-radius:.3rem; background:transparent; color:inherit; width:100%; }
 .pc-list-row { display:flex; gap:.3rem; margin-bottom:.3rem; }
 .pc-btn-danger { border:1px solid #e0b4b4; color:#c0392b; background:transparent; border-radius:.3rem; padding:.25rem .5rem; cursor:pointer; margin-top:.5rem; }
+.pc-advanced { width:100%; font:12px/1.4 ui-monospace,monospace; padding:.4rem; border:1px solid var(--color-edge,#d0d0d8); border-radius:.3rem; background:transparent; color:inherit; resize:vertical; }
+.pc-advanced-err { color:#c0392b; font-size:.72rem; margin-top:.25rem; }
 .pc-empty { opacity:.55; }
 `;
