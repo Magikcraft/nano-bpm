@@ -380,6 +380,10 @@ export type IdeConfig = {
 
 export type ProjectSummary = {
     name: string;
+    /**
+     * Human-facing name (may contain spaces), present when it differs from the directory-safe `name`. The console shows this on the project card and falls back to `name`.
+     */
+    displayName?: string;
     description: string;
     deployTarget: string;
     updatedMs: number;
@@ -433,6 +437,10 @@ export type ProjectScaffoldedFrom = {
 
 export type ProjectConfig = {
     name: string;
+    /**
+     * Human-facing name (may contain spaces), present when it differs from the directory-safe `name` used for file naming and routes.
+     */
+    displayName?: string;
     description: string;
     deployTarget: string;
     main: string;
@@ -475,7 +483,26 @@ export type RunState = {
 
 export type ProjectTemplate = {
     id: string;
+    /**
+     * Short human-facing title rendered on the template card.
+     */
     label: string;
+    /**
+     * One-line description rendered on the template card. May be empty for packs that predate the manifest `description` field.
+     */
+    description: string;
+    /**
+     * Language pack id the scaffolded project runs on (e.g. "deno", "rust", "java"). The console resolves the card's language icon by matching this to an Extension of kind "lang".
+     */
+    lang: string;
+    /**
+     * Where the template comes from — an offline built-in scaffold or an installed extension pack.
+     */
+    source: 'builtin' | 'pack';
+    /**
+     * Contributing extension pack id; present only when source is "pack".
+     */
+    pack?: string;
 };
 
 export type ProjectDetail = {
@@ -528,6 +555,9 @@ export type ProjectsResponse = {
 };
 
 export type CreateProjectRequest = {
+    /**
+     * Human-facing project name; spaces are allowed. Files are created under its directory-safe slug (e.g. "Home Heating" → "home-heating"), returned as the created config's `name`; the original spelling is kept as `displayName` when it differs.
+     */
     name: string;
     description?: string;
     template?: string | null;

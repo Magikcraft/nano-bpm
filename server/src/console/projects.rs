@@ -237,29 +237,54 @@ pub const PLATFORMS: &[&str] = &[
     "x86_64-pc-windows-msvc",
 ];
 
-/// The project templates the scaffolder can stamp out. `(id, label)`.
-pub const TEMPLATES: &[(&str, &str)] = &[
-    ("starter", "Starter app — one process, one worker"),
-    (
-        "throughput",
-        "Throughput (REST) — 30s ramp benchmark over the HTTP API",
-    ),
-    (
-        "throughput-stream",
-        "Throughput (falcon) — same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
-    ),
-    (
-        "gui-starter",
-        "GUI app — served-UI binary (Deno.serve) for a process application",
-    ),
-    (
-        "urban-starter",
-        "Urban App — a RAD application (nano.app.json) with models, data, triggers & surfaces",
-    ),
-    (
-        "workflow-starter",
-        "Code-first workflow — durable orchestration authored as code (@nanobpm/workflow), model derived",
-    ),
+/// A built-in scaffold template the New Project picker can render as a card:
+/// short title (`label`), one-line `description`, and the language pack id the
+/// scaffolded project runs on (drives the card's language icon).
+pub struct BuiltinTemplate {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub description: &'static str,
+    pub lang: &'static str,
+}
+
+/// The project templates the scaffolder can stamp out.
+pub const TEMPLATES: &[BuiltinTemplate] = &[
+    BuiltinTemplate {
+        id: "starter",
+        label: "Starter app",
+        description: "One process, one worker",
+        lang: "deno",
+    },
+    BuiltinTemplate {
+        id: "throughput",
+        label: "Throughput (REST)",
+        description: "30s ramp benchmark over the HTTP API",
+        lang: "deno",
+    },
+    BuiltinTemplate {
+        id: "throughput-stream",
+        label: "Throughput (falcon)",
+        description: "Same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
+        lang: "deno",
+    },
+    BuiltinTemplate {
+        id: "gui-starter",
+        label: "GUI app",
+        description: "Served-UI binary (Deno.serve) for a process application",
+        lang: "deno",
+    },
+    BuiltinTemplate {
+        id: "urban-starter",
+        label: "Urban App",
+        description: "A RAD application (nano.app.json) with models, data, triggers & surfaces",
+        lang: "deno",
+    },
+    BuiltinTemplate {
+        id: "workflow-starter",
+        label: "Code-first workflow",
+        description: "Durable orchestration authored as code (@nanobpm/workflow), model derived",
+        lang: "deno",
+    },
 ];
 
 /// The scaffolder's full template menu: the offline built-ins from [`TEMPLATES`]
@@ -277,26 +302,52 @@ pub const TEMPLATES: &[(&str, &str)] = &[
 ///
 /// Each entry carries a `source` discriminator (`"builtin"` or `"pack"`); pack
 /// entries also include a `pack` field with the contributing extension id, so
-/// the Console can render provenance in the New Project picker.
+/// the Console can render provenance in the New Project picker. Every entry
+/// also carries a one-line `description` and the `lang` pack id its project
+/// runs on, so the picker can render each template as a card with a language
+/// icon (older packs that cram "Title — description" into `label` are split
+/// on the em-dash as a fallback).
 pub fn project_templates() -> Vec<serde_json::Value> {
     use super::extensions::ExtKind;
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<serde_json::Value> = TEMPLATES
         .iter()
-        .map(|(id, label)| {
-            seen.insert((*id).to_string());
-            serde_json::json!({"id": id, "label": label, "source": "builtin"})
+        .map(|t| {
+            seen.insert(t.id.to_string());
+            serde_json::json!({
+                "id": t.id,
+                "label": t.label,
+                "description": t.description,
+                "lang": t.lang,
+                "source": "builtin",
+            })
         })
         .collect();
     for ext in super::extensions::all_extensions() {
         if ext.builtin {
             continue;
         }
+        // The language a pack's templates imply, absent a per-template `lang`:
+        // mirrors `create_project`'s derivation of the scaffolded `cfg.lang`.
+        let pack_lang = if ext.kind == ExtKind::Lang {
+            ext.id.clone()
+        } else {
+            ext.requires
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "deno".to_string())
+        };
         for t in &ext.templates {
             if seen.insert(t.id.clone()) {
+                let (label, description) = match &t.description {
+                    Some(d) => (t.label.clone(), d.clone()),
+                    None => split_label(&t.label),
+                };
                 out.push(serde_json::json!({
                     "id": t.id,
-                    "label": t.label,
+                    "label": label,
+                    "description": description,
+                    "lang": t.lang.clone().unwrap_or_else(|| pack_lang.clone()),
                     "source": "pack",
                     "pack": ext.id,
                 }));
@@ -305,20 +356,26 @@ pub fn project_templates() -> Vec<serde_json::Value> {
         // Example packs advertise themselves as a template — no registration
         // in a sibling lang pack required.
         if ext.kind == ExtKind::Example && seen.insert(ext.id.clone()) {
-            let label = ext
-                .summary
-                .clone()
-                .map(|s| format!("{} — {}", ext.display_name, s))
-                .unwrap_or_else(|| ext.display_name.clone());
             out.push(serde_json::json!({
                 "id": ext.id,
-                "label": label,
+                "label": ext.display_name,
+                "description": ext.summary.clone().unwrap_or_default(),
+                "lang": pack_lang,
                 "source": "pack",
                 "pack": ext.id,
             }));
         }
     }
     out
+}
+
+/// Fallback title/description split for pack templates that predate the
+/// `description` manifest field and encode "Title — description" in `label`.
+fn split_label(label: &str) -> (String, String) {
+    match label.split_once(" — ") {
+        Some((title, desc)) => (title.trim().to_string(), desc.trim().to_string()),
+        None => (label.to_string(), String::new()),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -410,6 +467,37 @@ pub fn read_project_ref(name: &str) -> Option<ProjectRef> {
 /// well-formed (`source == "path"` with an **absolute** path). Otherwise the
 /// default workspace location is returned, so a bad ref can never redirect the
 /// console's file APIs to an unexpected base.
+/// Directory-safe slug for a human-facing project name. A name that already
+/// satisfies [`workspace::is_safe_name`] is used verbatim (zero behaviour
+/// change for names without spaces — the directory IS the name, casing and
+/// dots preserved). Anything else — typically a display name with spaces like
+/// "Home Heating" — is lowercased and hyphen-slugged, mirroring
+/// `slugify_app_id`. Returns `None` when nothing slug-worthy survives (e.g.
+/// "!!!"), which callers surface as "invalid project name".
+pub fn project_slug(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if workspace::is_safe_name(name) {
+        return Some(name.to_string());
+    }
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = out.trim_matches('-').to_string();
+    if workspace::is_safe_name(&slug) {
+        Some(slug)
+    } else {
+        None
+    }
+}
+
 pub fn project_dir(name: &str) -> Option<PathBuf> {
     if !workspace::is_safe_name(name) {
         return None;
@@ -634,6 +722,13 @@ pub fn safe_project_path(name: &str, rel: &str) -> Option<PathBuf> {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectConfig {
     pub name: String,
+    /// Human-facing name as the user typed it (may contain spaces — e.g.
+    /// "Home Heating"), when it differs from `name`. `name` is always the
+    /// directory-safe slug ("home-heating") used for file naming, routes and
+    /// API paths; the Console displays `display_name` and falls back to
+    /// `name`. Absent on projects whose name needed no slugging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default)]
     pub description: String,
     /// Gateway base URL the app deploys to and dials the Falcon protocol on. The
@@ -814,6 +909,7 @@ impl ProjectConfig {
         let ts = now_ms();
         ProjectConfig {
             name: name.to_string(),
+            display_name: None,
             description: description.to_string(),
             deploy_target: default_deploy_target(),
             main: default_main(),
@@ -2371,6 +2467,15 @@ pub fn create_project(
     description: &str,
     template: &str,
 ) -> Result<ProjectConfig, String> {
+    // The caller-supplied name is the human-facing display name and may
+    // contain spaces. Everything on disk uses its directory-safe slug — the
+    // name flows into filenames, BPMN ids and package.json names below, which
+    // all need safe characters. The original spelling is kept as
+    // `cfg.display_name` when it differs.
+    let display = name.trim().to_string();
+    let slug = project_slug(&display).ok_or("invalid project name")?;
+    let display_name = (display != slug).then_some(display);
+    let name = slug.as_str();
     let dir = project_dir(name).ok_or("invalid project name")?;
     // A name that already has an import reference (ADR 0041) — even a dangling
     // one — is taken. Never let `create_project` scaffold into a ref's external
@@ -2403,17 +2508,25 @@ pub fn create_project(
         mk(dir.clone())?;
         super::extensions::copy_tree(&src, &dir).map_err(|e| format!("copy pack template: {e}"))?;
         // The project's `lang` drives the run/compile toolchain (lang_pack lookup):
-        // a LANG pack's own template implies the pack itself; app/example packs
+        // an explicit per-template `lang` in the manifest wins; otherwise a LANG
+        // pack's own template implies the pack itself, and app/example packs
         // name their language via `requires` (first entry = the lang pack id).
-        // Only with neither do we fall back to the built-in Deno runtime.
-        let cfg_lang = if m.kind == super::extensions::ExtKind::Lang {
-            m.id.clone()
-        } else {
-            m.requires
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "deno".to_string())
-        };
+        // Only with none of those do we fall back to the built-in Deno runtime.
+        let spec_lang = m
+            .templates
+            .iter()
+            .find(|t| t.id == template)
+            .and_then(|t| t.lang.clone());
+        let cfg_lang = spec_lang.unwrap_or_else(|| {
+            if m.kind == super::extensions::ExtKind::Lang {
+                m.id.clone()
+            } else {
+                m.requires
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "deno".to_string())
+            }
+        });
         // Best-effort detection of the "main" entrypoint the console
         // surfaces in the workspace toolbar. Ordered from most specific
         // to least so multi-module Java packs prefer the actual module
@@ -2432,6 +2545,7 @@ pub fn create_project(
             .map(|c| c.to_string())
             .unwrap_or_else(|| "main.ts".to_string());
         let mut cfg = ProjectConfig::new(name, description);
+        cfg.display_name = display_name.clone();
         cfg.lang = cfg_lang;
         cfg.app = "console".to_string();
         cfg.main = cfg_main;
@@ -2473,6 +2587,7 @@ pub fn create_project(
         )?;
         w(dir.join("README.md"), &workflow_readme(name))?;
         let mut cfg = ProjectConfig::new(name, description);
+        cfg.display_name = display_name.clone();
         cfg.lang = "deno".to_string();
         cfg.app = "console".to_string();
         cfg.main = "main.ts".to_string();
@@ -2602,6 +2717,7 @@ pub fn create_project(
     }
 
     let mut cfg = ProjectConfig::new(name, description);
+    cfg.display_name = display_name;
     cfg.lang = cfg_lang;
     cfg.app = cfg_app.to_string();
     cfg.main = cfg_main;
@@ -2652,9 +2768,15 @@ pub fn delete_project(name: &str) -> std::io::Result<()> {
 /// the source is missing, the target name is unsafe, or the target exists. The
 /// caller must ensure the project is stopped first.
 pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
-    if !workspace::is_safe_name(new) {
+    // Like `create_project`, `new` is the human-facing display name (spaces
+    // allowed); the directory move targets its slug and the original spelling
+    // is kept as `display_name` when it differs.
+    let new_display = new.trim().to_string();
+    let Some(new_slug) = project_slug(&new_display) else {
         return Err("invalid new name".into());
-    }
+    };
+    let new_display_name = (new_display != new_slug).then_some(new_display);
+    let new = new_slug.as_str();
     if !workspace::is_safe_name(old) {
         return Err("invalid project name".into());
     }
@@ -2688,6 +2810,7 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
     remove_project_ref(old).map_err(|e| format!("remove reference: {e}"))?;
     let mut cfg = read_config(new).ok_or("config missing after rename")?;
     cfg.name = new.to_string();
+    cfg.display_name = new_display_name;
     cfg.updated_ms = now_ms();
     write_config(new, &cfg).map_err(|e| format!("write config: {e}"))?;
     Ok(cfg)
@@ -2702,6 +2825,11 @@ pub fn rename_project(old: &str, new: &str) -> Result<ProjectConfig, String> {
 #[serde(rename_all = "camelCase")]
 pub struct ProjectSummary {
     pub name: String,
+    /// Human-facing name (may contain spaces), when it differs from the
+    /// directory-safe `name`. The Console shows this on the card and falls
+    /// back to `name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub description: String,
     pub deploy_target: String,
     pub updated_ms: u64,
@@ -2763,6 +2891,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         let res = path.join("resources");
         out.push(ProjectSummary {
             name: name.to_string(),
+            display_name: cfg.display_name,
             description: cfg.description,
             deploy_target: cfg.deploy_target,
             updated_ms: cfg.updated_ms,
@@ -2808,6 +2937,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         if !dir.is_dir() {
             out.push(ProjectSummary {
                 name: name.to_string(),
+                display_name: None,
                 description: "(source not found)".to_string(),
                 deploy_target: default_deploy_target(),
                 updated_ms: 0,
@@ -2827,6 +2957,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         let res = dir.join("resources");
         out.push(ProjectSummary {
             name: name.to_string(),
+            display_name: cfg.display_name,
             description: cfg.description,
             deploy_target: cfg.deploy_target,
             updated_ms: cfg.updated_ms,
@@ -5089,6 +5220,69 @@ mod tests {
     }
 
     #[test]
+    fn project_slug_keeps_safe_names_and_slugs_the_rest() {
+        // A name that is already directory-safe is used verbatim — casing,
+        // dots and underscores preserved (zero behaviour change).
+        assert_eq!(project_slug("MyApp").as_deref(), Some("MyApp"));
+        assert_eq!(
+            project_slug("order_2.final").as_deref(),
+            Some("order_2.final")
+        );
+        // Display names with spaces (or other unsafe chars) get hyphen-slugged.
+        assert_eq!(
+            project_slug("Home Heating").as_deref(),
+            Some("home-heating")
+        );
+        assert_eq!(project_slug("  My   App!! ").as_deref(), Some("my-app"));
+        assert_eq!(project_slug("v2 Beta").as_deref(), Some("v2-beta"));
+        // Nothing slug-worthy => invalid.
+        assert_eq!(project_slug("!!!"), None);
+        assert_eq!(project_slug(""), None);
+    }
+
+    #[test]
+    fn create_project_slugs_a_spaced_name_and_keeps_the_display_name() {
+        let _g = lock();
+        let root = temp_root();
+        let cfg = create_project("Home Heating", "warm floors", "starter").expect("create");
+        assert_eq!(cfg.name, "home-heating");
+        assert_eq!(cfg.display_name.as_deref(), Some("Home Heating"));
+        // Files live under the slug; scaffolds (BPMN filename etc.) use it too.
+        let dir = root.join("home-heating");
+        assert!(dir.join("nanobpm.project.json").is_file());
+        assert!(dir.join("resources/processes/home-heating.bpmn").is_file());
+        // The slug is taken now — the same display name collides.
+        let err = create_project("home heating", "", "starter")
+            .err()
+            .expect("colliding slug should be rejected");
+        assert!(err.contains("already exists"), "got: {err}");
+        // The summary surfaces the display name for the card.
+        let list = list_projects().expect("list");
+        let p = list.iter().find(|p| p.name == "home-heating").unwrap();
+        assert_eq!(p.display_name.as_deref(), Some("Home Heating"));
+        // A safe name stays verbatim and records no display name.
+        let cfg2 = create_project("MyApp", "", "starter").expect("create");
+        assert_eq!(cfg2.name, "MyApp");
+        assert_eq!(cfg2.display_name, None);
+    }
+
+    #[test]
+    fn rename_project_slugs_the_new_name_and_updates_the_display_name() {
+        let _g = lock();
+        let root = temp_root();
+        create_project("plain", "", "starter").expect("create");
+        let cfg = rename_project("plain", "Warm House").expect("rename");
+        assert_eq!(cfg.name, "warm-house");
+        assert_eq!(cfg.display_name.as_deref(), Some("Warm House"));
+        assert!(root.join("warm-house").is_dir());
+        assert!(!root.join("plain").exists());
+        // Renaming back to a safe name clears the display name.
+        let cfg = rename_project("warm-house", "plain2").expect("rename");
+        assert_eq!(cfg.name, "plain2");
+        assert_eq!(cfg.display_name, None);
+    }
+
+    #[test]
     fn project_templates_merges_pack_templates_after_builtins() {
         let _g = lock();
         let _root = temp_root();
@@ -5128,10 +5322,13 @@ mod tests {
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
         let _ = std::fs::remove_dir_all(&ext);
 
-        // Built-ins come first, in order, each tagged source=builtin.
-        for (i, (id, _label)) in TEMPLATES.iter().enumerate() {
-            assert_eq!(templates[i]["id"].as_str(), Some(*id));
+        // Built-ins come first, in order, each tagged source=builtin and
+        // carrying the card metadata (description + lang).
+        for (i, t) in TEMPLATES.iter().enumerate() {
+            assert_eq!(templates[i]["id"].as_str(), Some(t.id));
             assert_eq!(templates[i]["source"].as_str(), Some("builtin"));
+            assert_eq!(templates[i]["description"].as_str(), Some(t.description));
+            assert_eq!(templates[i]["lang"].as_str(), Some(t.lang));
         }
         // The pack template appears exactly once, after the built-ins, with pack provenance.
         let pack_hits: Vec<_> = templates
@@ -5142,13 +5339,16 @@ mod tests {
         assert_eq!(pack_hits[0]["source"].as_str(), Some("pack"));
         assert_eq!(pack_hits[0]["pack"].as_str(), Some("embedded-nano"));
         assert_eq!(pack_hits[0]["label"].as_str(), Some("Embedded engine"));
+        // An app pack with no `requires` implies the Deno runtime — mirrored
+        // from create_project's cfg.lang derivation.
+        assert_eq!(pack_hits[0]["lang"].as_str(), Some("deno"));
         // The shadowing pack's `starter` must not have overridden the built-in
         // (only one entry with id="starter", and its source is "builtin").
         let starter_hits: Vec<_> = templates.iter().filter(|t| t["id"] == "starter").collect();
         assert_eq!(starter_hits.len(), 1);
         assert_eq!(starter_hits[0]["source"].as_str(), Some("builtin"));
-        // The example pack should appear as a template automatically, with its
-        // display name + summary composed into the label.
+        // The example pack should appear as a template automatically, its
+        // display name as the card title and its summary as the description.
         let ex_hits: Vec<_> = templates
             .iter()
             .filter(|t| t["id"] == "thing-example")
@@ -5156,10 +5356,8 @@ mod tests {
         assert_eq!(ex_hits.len(), 1, "example pack should auto-register");
         assert_eq!(ex_hits[0]["source"].as_str(), Some("pack"));
         assert_eq!(ex_hits[0]["pack"].as_str(), Some("thing-example"));
-        assert_eq!(
-            ex_hits[0]["label"].as_str(),
-            Some("Thing example — Runs the thing")
-        );
+        assert_eq!(ex_hits[0]["label"].as_str(), Some("Thing example"));
+        assert_eq!(ex_hits[0]["description"].as_str(), Some("Runs the thing"));
     }
 
     #[test]

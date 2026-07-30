@@ -1733,6 +1733,12 @@ components:
       required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running, source, lang]
       properties:
         name: { type: string }
+        displayName:
+          type: string
+          description: >-
+            Human-facing name (may contain spaces), present when it differs
+            from the directory-safe `name`. The console shows this on the
+            project card and falls back to `name`.
         description: { type: string }
         deployTarget: { type: string }
         updatedMs: { type: integer, format: int64 }
@@ -1812,6 +1818,11 @@ components:
       required: [name, description, deployTarget, main, platforms, lang, app, createdMs, updatedMs]
       properties:
         name: { type: string }
+        displayName:
+          type: string
+          description: >-
+            Human-facing name (may contain spaces), present when it differs
+            from the directory-safe `name` used for file naming and routes.
         description: { type: string }
         deployTarget: { type: string }
         main: { type: string }
@@ -1864,10 +1875,34 @@ components:
         compiling: { type: boolean }
     ProjectTemplate:
       type: object
-      required: [id, label]
+      required: [id, label, description, lang, source]
       properties:
         id: { type: string }
-        label: { type: string }
+        label:
+          type: string
+          description: Short human-facing title rendered on the template card.
+        description:
+          type: string
+          description: >-
+            One-line description rendered on the template card. May be empty
+            for packs that predate the manifest `description` field.
+        lang:
+          type: string
+          description: >-
+            Language pack id the scaffolded project runs on (e.g. "deno",
+            "rust", "java"). The console resolves the card's language icon by
+            matching this to an Extension of kind "lang".
+        source:
+          type: string
+          enum: [builtin, pack]
+          description: >-
+            Where the template comes from — an offline built-in scaffold or an
+            installed extension pack.
+        pack:
+          type: string
+          description: >-
+            Contributing extension pack id; present only when source is
+            "pack".
     ProjectDetail:
       type: object
       required: [config, files, runState, denoAvailable, nodeAvailable, runnable, platforms, rootPath]
@@ -1947,7 +1982,13 @@ components:
       type: object
       required: [name]
       properties:
-        name: { type: string }
+        name:
+          type: string
+          description: >-
+            Human-facing project name; spaces are allowed. Files are created
+            under its directory-safe slug (e.g. "Home Heating" →
+            "home-heating"), returned as the created config's `name`; the
+            original spelling is kept as `displayName` when it differs.
         description: { type: string }
         template: { type: string, nullable: true }
     ImportProjectRequest:
