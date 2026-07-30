@@ -9686,3 +9686,72 @@ fn event_based_gateway_ambiguous_owner_withdraws_nothing() {
         "ambiguous owner must not cancel the sibling timer"
     );
 }
+
+// A malformed model routes an event-based gateway into a non-catch node (a
+// service task) alongside a genuine catch event. When the catch event wins, the
+// service-task sibling must NOT be force-completed: doing so would emit
+// `ElementCompleted` without cancelling its job, orphaning the work. Only genuine
+// catch siblings are ever withdrawn.
+fn malformed_event_gateway_with_service_task_sibling() -> ProcessDefinition {
+    ProcessBuilder::new("malformed")
+        .start_event("start")
+        .event_based_gateway("gw")
+        .message_intermediate_catch_event("onReply", "reply", "orderId")
+        .service_task("work", "do-work")
+        .end_event("replied")
+        .end_event("worked")
+        .connect("start", "gw")
+        .connect("gw", "onReply")
+        .connect("gw", "work")
+        .connect("onReply", "replied")
+        .connect("work", "worked")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn event_based_gateway_never_force_completes_non_catch_sibling() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            malformed_event_gateway_with_service_task_sibling(),
+        ))
+        .unwrap();
+
+    let mut vars = HashMap::new();
+    vars.insert("orderId".to_string(), Value::Str("A".to_string()));
+    let events = engine
+        .apply_command_at(Command::create_instance_with("malformed", vars), 1_000)
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // The gateway armed both the message catch and the service task: a job exists.
+    let job_before = engine
+        .state()
+        .jobs
+        .values()
+        .find(|j| j.job_type == "do-work")
+        .expect("a do-work job was created");
+    let job_state_before = job_before.state.clone();
+
+    // The message wins. The service-task sibling is a non-catch node, so it is
+    // left untouched: its job survives in the same state (never force-completed),
+    // and the lingering token keeps the instance live.
+    let correlated = engine
+        .apply_command_at(Command::correlate_message("reply", "A"), 2_000)
+        .unwrap();
+    assert!(!correlated
+        .iter()
+        .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })));
+    assert!(!engine.is_completed(instance_key));
+    let job_after = engine
+        .state()
+        .jobs
+        .values()
+        .find(|j| j.job_type == "do-work")
+        .expect("the do-work job must still exist");
+    assert_eq!(
+        job_after.state, job_state_before,
+        "a non-catch sibling must not be force-completed (its job must survive)"
+    );
+}

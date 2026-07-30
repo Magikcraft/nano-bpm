@@ -5070,20 +5070,27 @@ impl Engine {
         let Some(def) = self.process_of_instance(instance_key) else {
             return Vec::new();
         };
-        // Fast guard: only an intermediate catch event can win an event-based
-        // gateway's deferred choice. Skip the definition scan for every other
-        // (far more common) element completion, and never withdraw on a
-        // non-catch node that a malformed model might route a gateway into.
-        let is_catch_event = matches!(
-            def.elements.get(winner_element_id).map(|e| &e.kind),
-            Some(
-                ElementKind::TimerIntermediateCatchEvent { .. }
-                    | ElementKind::MessageIntermediateCatchEvent { .. }
-                    | ElementKind::SignalIntermediateCatchEvent { .. }
-                    | ElementKind::ConditionalIntermediateCatchEvent { .. }
+        // An event-based gateway's deferred choice is a race between intermediate
+        // catch events only. `is_catch_event` gates both the winner (below) and
+        // each losing sibling: it keeps the completion hot path O(1) for the
+        // common (non-catch) completion, and — should a malformed model route a
+        // gateway into a non-catch node (e.g. a service task) — prevents this
+        // code from force-completing that node's element instance via
+        // `ElementCompleted` while leaving its job/user-task uncancelled (which
+        // would orphan work). Withdrawal only ever cancels timers/subscriptions
+        // resting on genuine catch siblings.
+        let is_catch_event = |element_id: &str| {
+            matches!(
+                def.elements.get(element_id).map(|e| &e.kind),
+                Some(
+                    ElementKind::TimerIntermediateCatchEvent { .. }
+                        | ElementKind::MessageIntermediateCatchEvent { .. }
+                        | ElementKind::SignalIntermediateCatchEvent { .. }
+                        | ElementKind::ConditionalIntermediateCatchEvent { .. }
+                )
             )
-        );
-        if !is_catch_event {
+        };
+        if !is_catch_event(winner_element_id) {
             return Vec::new();
         }
         // Find the event-based gateway(s) that route into the winning catch
@@ -5102,13 +5109,14 @@ impl Engine {
         let [owner] = owners.as_slice() else {
             return Vec::new();
         };
-        // The sibling target ids are the *other* outgoing targets of the owning
-        // gateway.
+        // The sibling targets are the owning gateway's *other* outgoing catch
+        // events. Any non-catch target is skipped (see `is_catch_event` above).
         let sibling_ids: Vec<&str> = owner
             .outgoing
             .iter()
             .filter(|f| f.to != winner_element_id)
             .map(|f| f.to.as_str())
+            .filter(|id| is_catch_event(id))
             .collect();
         if sibling_ids.is_empty() {
             return Vec::new();
