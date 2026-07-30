@@ -3422,6 +3422,9 @@ try {
           // has no on-disk `resources/processes/*.bpmn` to overlay. Fall back to
           // the DI-less XML if layout fails, so the panel still shows *something*.
           const laid = await layout(bpmn);
+          if (laid === null) {
+            console.error(`layout(${value.id}) failed, serving DI-less`);
+          }
           out.push({ id: value.id, kind: value.kind, xml: laid ?? bpmn });
         } catch (e) {
           console.error(`toBpmn(${value.id}) failed: ${e}`);
@@ -3745,6 +3748,7 @@ try {
         try {
           const xml = await layout(toBpmn(value as never));
           if (xml === null) {
+            console.error(`layout(${value.id}) failed, skipping (run marked incomplete)`);
             incomplete = true;
             continue;
           }
