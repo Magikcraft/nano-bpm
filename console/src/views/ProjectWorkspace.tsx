@@ -27,25 +27,6 @@ import { SCALAR_KEYWORDS } from "../lib/shapeComposer";
 import AppManifestEditor, {
   isAppManifestPath,
 } from "../components/AppManifestEditor";
-const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
-const DataPanel = lazy(() => import("../components/DataPanel"));
-const TriggersPanel = lazy(() => import("../components/TriggersPanel"));
-const DerivedModelPanel = lazy(() => import("../components/DerivedModelPanel"));
-// The BPMN/DMN/form modelers each drag in a heavy editor stack (bpmn-js,
-// dmn-js, @bpmn-io/form-js-editor). They are used ONLY here and only when a file
-// of that kind is open, so lazy-load them: this splits ~megabytes out of the
-// ProjectWorkspace chunk and defers the cost until you actually edit that file
-// type. Each usage is wrapped in <Suspense fallback={modelerFallback}>.
-const BpmnModeler = lazy(() => import("../components/BpmnModeler"));
-const DmnModeler = lazy(() => import("../components/DmnModeler"));
-const FormEditor = lazy(() => import("../components/FormEditor"));
-const FormPreview = lazy(() => import("../components/FormPreview"));
-
-const modelerFallback = (
-  <div className="flex h-full items-center justify-center text-sm text-fg-faint">
-    Loading editor…
-  </div>
-);
 import {
   compileProject,
   createProjectPath,
@@ -96,6 +77,29 @@ import {
   debug,
   type DebugEntry,
 } from "../lib/debugBus";
+
+// All route-level lazy chunks + their shared fallback. Declared here, below the
+// full import block, so every `import` stays contiguous at the top of the module
+// (ESM hoists imports, but keeping them together is clearer and lint-friendly).
+// The BPMN/DMN/form modelers each drag in a heavy editor stack (bpmn-js, dmn-js,
+// @bpmn-io/form-js-editor); they are used ONLY here and only when a file of that
+// kind is open, so lazy-loading them splits ~megabytes out of the
+// ProjectWorkspace chunk and defers the cost until you actually edit that file
+// type. Each modeler usage is wrapped in <Suspense fallback={modelerFallback}>.
+const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
+const DataPanel = lazy(() => import("../components/DataPanel"));
+const TriggersPanel = lazy(() => import("../components/TriggersPanel"));
+const DerivedModelPanel = lazy(() => import("../components/DerivedModelPanel"));
+const BpmnModeler = lazy(() => import("../components/BpmnModeler"));
+const DmnModeler = lazy(() => import("../components/DmnModeler"));
+const FormEditor = lazy(() => import("../components/FormEditor"));
+const FormPreview = lazy(() => import("../components/FormPreview"));
+
+const modelerFallback = (
+  <div className="flex h-full items-center justify-center text-sm text-fg-faint">
+    Loading editor…
+  </div>
+);
 
 /// One project's workspace: file browser, graphical/code editors, the run
 /// console, and the Run/Stop/Compile/Configure/Export toolbar.
