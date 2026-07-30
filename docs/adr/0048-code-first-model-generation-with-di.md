@@ -92,8 +92,14 @@ logged skip, never a failed save — the in-memory semantic derivation (deploy +
   hand-edit in the modeller is clobbered on the next code save (a leading provenance comment says so).
   Code is the source of truth; ejecting to model-first means *taking over* the file (removing the flow),
   a follow-up affordance.
-- **Runtime prerequisite.** The layout helpers live in `@nanobpm/workflow@0.3.0`, which must be
-  published (tag `workflow-npm-v0.3.0`) for generation to resolve the SDK; until then generation
-  degrades gracefully to a logged skip.
-- **Follow-ups.** (a) Point the Derived Model viewer at the on-disk laid-out models (or make
-  `derive_models` layout too) so the panel renders. (b) An explicit "eject to model-first" action.
+- **Runtime prerequisite.** The layout helpers live in `@nanobpm/workflow@0.3.0`, published on
+  2026-07-30 (tag `workflow-npm-v0.3.0`); generation resolves the SDK from the registry. (Historically,
+  before that publish, generation degraded gracefully to a logged skip.)
+- **The Derived Model viewer renders.** `derive_models` now overlays each model's XML with the on-disk
+  auto-laid-out `resources/processes/<id>.bpmn` (matched by `PROVENANCE_MARKER`), so the console panel
+  shows a real diagram instead of a blank canvas. It also falls back to those on-disk models when the
+  live Deno derivation is unavailable (no toolchain), fails transiently, or yields nothing — so an
+  already-generated project always renders. The live derivation stays authoritative for `id`/`kind`;
+  the on-disk read only supplies DI (and, in the fallback, the whole model with `kind: "generated"`).
+- **Follow-up.** An explicit "eject to model-first" action (take over a generated `.bpmn`, remove the
+  flow from `workflows/`).

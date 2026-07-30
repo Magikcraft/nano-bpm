@@ -3378,14 +3378,81 @@ try {
 console.log(JSON.stringify(out));
 "#;
 
+/// Extract the executable process id from a BPMN document: the `id` attribute of
+/// the first `<...:process ...>` opening tag. Namespace-prefix agnostic (matches
+/// `<bpmn:process` and `<process`). Returns `None` if no process element is found
+/// or it has no id.
+fn process_id_from_bpmn(xml: &str) -> Option<String> {
+    for (idx, _) in xml.match_indices("process") {
+        // Only treat `process` as a tag name when preceded by `<` or a namespace
+        // separator `:` (i.e. `<bpmn:process`), never as a substring of another
+        // token.
+        if !matches!(xml[..idx].chars().last(), Some('<') | Some(':')) {
+            continue;
+        }
+        let rest = &xml[idx..];
+        let tag = &rest[..rest.find('>').unwrap_or(rest.len())];
+        if let Some(start) = tag.find(" id=\"") {
+            let value = &tag[start + 5..];
+            if let Some(end) = value.find('"') {
+                return Some(value[..end].to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Read the on-disk, auto-laid-out models this project generated (ADR 0048) from
+/// `resources/processes/`. Only provenance-marked files (ours) are returned, so
+/// an authored `.bpmn` is never surfaced as "derived". The id is parsed from the
+/// model (falling back to the filename); `kind` is not stored on disk and is
+/// reported as `generated`. Used as the viewer's fallback when the live Deno
+/// derivation is unavailable or empty — these models already carry `bpmndi:`, so
+/// the panel renders without re-running the toolchain.
+fn ondisk_generated_models(proc_dir: &std::path::Path) -> Vec<DerivedModel> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(proc_dir) else {
+        return out;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("bpmn"))
+        {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if !content.contains(PROVENANCE_MARKER) {
+            continue;
+        }
+        let id = process_id_from_bpmn(&content).unwrap_or_else(|| {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+        out.push(DerivedModel {
+            id,
+            kind: "generated".into(),
+            xml: content,
+        });
+    }
+    out
+}
+
 /// Derive the executable BPMN for a code-first workflow project (ADR 0045).
 ///
 /// Code-first projects have no authored `.bpmn`; the model is DERIVED from the
 /// `workflows/*.ts` via `@nanobpm/workflow`'s `toBpmn`. This runs that derivation
 /// under Deno (so the project's `deno.json` import map resolves the SDK) and
-/// returns the resulting models for the console's read-only viewer. It degrades
-/// gracefully: a missing Deno toolchain, a non-workflow project, or a derivation
-/// failure all surface as an `Err` string rather than panicking.
+/// returns the resulting models for the console's read-only viewer. The XML is
+/// overlaid with the on-disk auto-laid-out model (ADR 0048) when present so the
+/// diagram renders; a missing Deno toolchain or a failed/empty live derivation
+/// falls back to those on-disk models, and only truly bare projects surface an
+/// `Err` string (never a panic).
 pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     let dir = project_dir(name).ok_or("invalid project name")?;
     if !dir.is_dir() {
@@ -3395,10 +3462,24 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     if !wf_dir.is_dir() {
         return Err("not a code-first workflow project (no workflows/ directory)".into());
     }
-    let deno = super::extensions::find_program("deno").ok_or("deno toolchain not found on PATH")?;
-
-    // Canonicalize so the --allow-read scope matches the path Deno resolves.
     let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let proc_dir = dir.join("resources").join("processes");
+
+    // If the Deno toolchain is missing we can't re-derive live, but the on-disk
+    // auto-laid-out models (ADR 0048) already carry a `bpmndi:` diagram, so serve
+    // those directly instead of erroring — the panel still renders.
+    let deno = match super::extensions::find_program("deno") {
+        Some(d) => d,
+        None => {
+            let disk = ondisk_generated_models(&proc_dir);
+            return if disk.is_empty() {
+                Err("deno toolchain not found on PATH".into())
+            } else {
+                Ok(disk)
+            };
+        }
+    };
+
     let cache = dir.join(".deno-cache");
     let _ = std::fs::create_dir_all(&cache);
 
@@ -3443,6 +3524,13 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
 
     let output = result.map_err(|e| format!("spawn deno: {e}"))?;
     if !output.status.success() {
+        // Live re-derivation failed (e.g. a transient type error). Fall back to
+        // the last-generated on-disk models so the viewer still renders what was
+        // saved, rather than surfacing a hard error over a stale-but-valid model.
+        let disk = ondisk_generated_models(&proc_dir);
+        if !disk.is_empty() {
+            return Ok(disk);
+        }
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("derivation failed: {}", stderr.trim()));
     }
@@ -3454,8 +3542,36 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
         .rev()
         .find(|l| l.trim_start().starts_with('['))
         .unwrap_or("[]");
-    serde_json::from_str::<Vec<DerivedModel>>(json)
-        .map_err(|e| format!("parse derived models: {e}; deno output: {}", stdout.trim()))
+    let mut models = serde_json::from_str::<Vec<DerivedModel>>(json)
+        .map_err(|e| format!("parse derived models: {e}; deno output: {}", stdout.trim()))?;
+
+    // Prefer the on-disk, auto-laid-out model (ADR 0048) so the console viewer
+    // renders a real diagram instead of a blank canvas: `generate_models` writes
+    // a `bpmndi:`-bearing `.bpmn` to `resources/processes/<id>.bpmn` on every
+    // workflow save. The live `toBpmn` above is DI-less, so overlay the on-disk
+    // laid-out XML for any model that has one. Guarded by `PROVENANCE_MARKER` so
+    // only OUR generated files are used (never an authored `.bpmn` that happens
+    // to share the id) and so a not-yet-generated model falls back to the
+    // DI-less XML rather than erroring.
+    for m in &mut models {
+        if let Some(file) = bpmn_filename(&m.id)
+            && let Ok(content) = std::fs::read_to_string(proc_dir.join(&file))
+            && content.contains(PROVENANCE_MARKER)
+        {
+            m.xml = content;
+        }
+    }
+
+    // A code-first project whose workflows haven't been re-exported yet (or an
+    // older SDK without the layout helpers) can derive nothing live while still
+    // having generated models on disk — surface those so the panel isn't empty.
+    if models.is_empty() {
+        let disk = ondisk_generated_models(&proc_dir);
+        if !disk.is_empty() {
+            return Ok(disk);
+        }
+    }
+    Ok(models)
 }
 
 /// Deno driver that imports a code-first project's `workflows/*.ts`, derives the
@@ -4914,6 +5030,46 @@ mod tests {
         // Prologless input gets the note prepended.
         let bare = with_provenance("<bpmn:definitions/>");
         assert!(bare.starts_with("<!--"));
+    }
+
+    #[test]
+    fn process_id_from_bpmn_reads_first_process() {
+        // Namespaced process element.
+        let xml = r#"<?xml version="1.0"?><bpmn:definitions><bpmn:process id="pr-review" isExecutable="true"/></bpmn:definitions>"#;
+        assert_eq!(process_id_from_bpmn(xml).as_deref(), Some("pr-review"));
+        // Un-prefixed process element.
+        let bare = r#"<definitions><process id="orders"/></definitions>"#;
+        assert_eq!(process_id_from_bpmn(bare).as_deref(), Some("orders"));
+        // `process` appearing only as a substring (e.g. an attribute) is ignored.
+        let none = r#"<definitions dataProcessing="id=\"x\""/>"#;
+        assert_eq!(process_id_from_bpmn(none), None);
+    }
+
+    #[test]
+    fn ondisk_generated_models_returns_only_provenance_marked() {
+        let _g = lock();
+        let root = temp_root();
+        let proc_dir = root.join("resources").join("processes");
+        std::fs::create_dir_all(&proc_dir).unwrap();
+        // A generated model (carries the provenance marker) — surfaced.
+        let generated = with_provenance(
+            r#"<?xml version="1.0"?><bpmn:definitions><bpmn:process id="flow-a"/></bpmn:definitions>"#,
+        );
+        std::fs::write(proc_dir.join("flow-a.bpmn"), &generated).unwrap();
+        // An authored model (no marker) — never surfaced as "derived".
+        std::fs::write(
+            proc_dir.join("authored.bpmn"),
+            r#"<?xml version="1.0"?><bpmn:definitions><bpmn:process id="authored"/></bpmn:definitions>"#,
+        )
+        .unwrap();
+
+        let models = ondisk_generated_models(&proc_dir);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "flow-a");
+        assert_eq!(models[0].kind, "generated");
+        assert!(models[0].xml.contains(PROVENANCE_MARKER));
+        // Missing directory yields an empty list, not a panic.
+        assert!(ondisk_generated_models(&root.join("nope")).is_empty());
     }
 
     #[test]
