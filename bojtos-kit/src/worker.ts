@@ -1,5 +1,5 @@
 import type { BojtosSession } from "./session.js";
-import type { ActivatedJob, Snapshot } from "./types.js";
+import type { ActivatedJob, AgentResult, Snapshot } from "./types.js";
 
 /**
  * The variables a handler merges into its instance on completion. Return an
@@ -18,6 +18,20 @@ export type JobResult = Record<string, unknown>;
 export type JobHandler = (
   job: ActivatedJob,
 ) => JobResult | void | Promise<JobResult | void>;
+
+/**
+ * A handler for an ad-hoc sub-process's **agent** job (the container's
+ * JOB_WORKER job). Given the activated container job (carrying the instance's
+ * current variables — e.g. accumulated tool outputs), return the
+ * {@link AgentResult} for this turn: which inner tools to activate, whether the
+ * agent is done, and any variables to merge. Called once per agent turn; the
+ * engine re-emits the agent job after the activated tools drain, so a stateful
+ * closure can drive a multi-turn agent (activate tools → read results →
+ * decide → complete). May be async. Throw to fail the container job.
+ */
+export type AgentHandler = (
+  job: ActivatedJob,
+) => AgentResult | Promise<AgentResult>;
 
 /**
  * Throw from a {@link JobHandler} to fail a job with an explicit remaining
@@ -48,6 +62,16 @@ export interface DispatchOptions {
    * exceeding the cap throws instead.
    */
   maxRounds?: number;
+  /**
+   * Handlers for ad-hoc sub-process **agent** job types (Camunda agentic
+   * `aiagent-job-worker`), keyed by the container's `zeebe:taskDefinition type`.
+   * Dispatched like {@link JobHandler}s but completed via
+   * {@link BojtosSession.completeAgentJob}, so their returned
+   * {@link AgentResult} drives the tools to activate this turn. The engine
+   * re-emits the agent job across turns, so the standard drain loop advances the
+   * whole agent conversation to quiescence.
+   */
+  agents?: Record<string, AgentHandler>;
 }
 
 /** What one {@link dispatchRound} pass did. */
@@ -96,6 +120,35 @@ async function runOne(
   session.completeJob(job.key, payload);
 }
 
+async function runOneAgent(
+  session: BojtosSession,
+  handler: AgentHandler,
+  job: ActivatedJob,
+): Promise<void> {
+  let result: AgentResult;
+  try {
+    // As with a plain job, only the handler is treated as demo logic: a throw
+    // (or a result the engine can't serialize) fails the container job rather
+    // than bubbling up as an engine/ABI error.
+    result = await handler(job);
+    // Mirror runOne: a result the engine can't serialize is the demo's own
+    // logic failing, not an engine/ABI error. session.completeAgentJob
+    // stringifies the result internally (outside this try), so probe-serialize
+    // it here to route a serialization failure through failJob instead of
+    // letting it bubble out of the dispatch loop.
+    JSON.stringify(result);
+  } catch (e) {
+    const retries =
+      e instanceof JobFailure && e.retries !== undefined
+        ? e.retries
+        : Math.max(0, job.retries - 1);
+    const message = e instanceof Error ? e.message : String(e);
+    session.failJob(job.key, retries, message);
+    return;
+  }
+  session.completeAgentJob(job.key, result);
+}
+
 /**
  * Run one activate-and-handle pass: activate every registered job type's
  * currently-`Created` jobs *first* (a snapshot of the token frontier), then hand
@@ -105,6 +158,13 @@ async function runOne(
  * exactly one step. That makes this the animatable unit: drive it on a timer to
  * watch the token(s) hop task-to-task. {@link dispatchWorkers} loops it to
  * quiescence.
+ *
+ * Ad-hoc **agent** job types registered via `opts.agents` are activated and
+ * completed in the same frontier-snapshot pass, but through
+ * {@link BojtosSession.completeAgentJob} so their {@link AgentResult} activates
+ * the chosen tools. A tool a turn activates joins the *next* frontier, and the
+ * engine re-emits the agent job after those tools drain, so the agent's whole
+ * multi-turn conversation animates one step per round like any other token.
  */
 export async function dispatchRound(
   session: BojtosSession,
@@ -114,20 +174,44 @@ export async function dispatchRound(
   const maxJobs = opts.maxJobsPerActivation ?? 10;
   const timeout = opts.lockTimeoutMs ?? 30_000;
   const worker = opts.worker ?? "bojtos";
+  const agents = opts.agents ?? {};
+  // A job type registered as both a worker and an agent is ambiguous: the
+  // worker pass below would activate and plain-complete it first, so its
+  // agentic `activateElements` could never be sent. Reject up front rather than
+  // silently no-op the tool activation.
+  for (const jobType of Object.keys(agents)) {
+    if (jobType in workers) {
+      throw new Error(
+        `dispatchRound: job type "${jobType}" is registered as both a worker and an agent — register it as exactly one`,
+      );
+    }
+  }
   // Activation pass: lock the whole current frontier before running any handler,
   // so a job a handler unblocks isn't also picked up this round (which would
   // cascade the entire chain in a single "step").
-  const batch: { handler: JobHandler; job: ActivatedJob }[] = [];
+  const jobBatch: { handler: JobHandler; job: ActivatedJob }[] = [];
   for (const [jobType, handler] of Object.entries(workers)) {
     for (const job of session.activateJobs(jobType, maxJobs, timeout, worker)) {
-      batch.push({ handler, job });
+      jobBatch.push({ handler, job });
+    }
+  }
+  const agentBatch: { handler: AgentHandler; job: ActivatedJob }[] = [];
+  for (const [jobType, handler] of Object.entries(agents)) {
+    for (const job of session.activateJobs(jobType, maxJobs, timeout, worker)) {
+      agentBatch.push({ handler, job });
     }
   }
   // Handle pass.
-  for (const { handler, job } of batch) {
+  for (const { handler, job } of jobBatch) {
     await runOne(session, handler, job);
   }
-  return { snapshot: session.snapshot(), handled: batch.length };
+  for (const { handler, job } of agentBatch) {
+    await runOneAgent(session, handler, job);
+  }
+  return {
+    snapshot: session.snapshot(),
+    handled: jobBatch.length + agentBatch.length,
+  };
 }
 
 /**

@@ -1,5 +1,11 @@
 import init, { type InitInput, TestEngine } from "@nanobpm/engine-wasm";
-import type { ActivatedJob, ActivateInstruction, Snapshot, WasmEvent } from "./types.js";
+import type {
+  ActivatedJob,
+  ActivateInstruction,
+  AgentResult,
+  Snapshot,
+  WasmEvent,
+} from "./types.js";
 
 // Lazily initialise the wasm module exactly once per page, no matter how many
 // sessions are created. Mirrors the console's original `ensureWasm`.
@@ -68,6 +74,16 @@ export interface BojtosSession {
   ): ActivatedJob[];
   /** Complete a waiting job, merging `variablesJson` into the instance. */
   completeJob(jobKey: string, variablesJson: string): Snapshot;
+  /**
+   * Complete an ad-hoc sub-process's **agent** job — the container's JOB_WORKER
+   * job (Camunda's agentic `aiagent-job-worker`) — carrying the agent's
+   * {@link AgentResult}. Its `activateElements` run the chosen inner tools this
+   * turn; `completionConditionFulfilled` ends the agent loop; `variables` merge
+   * into the instance (e.g. the agent's final decision). This is the ad-hoc seam
+   * plain {@link completeJob} deliberately omits. Register agents on the dispatch
+   * loop via `DispatchOptions.agents` rather than calling this directly.
+   */
+  completeAgentJob(jobKey: string, result: AgentResult): Snapshot;
   /** Fail a waiting job; with no retries left this raises an incident. */
   failJob(jobKey: string, retries: number, message: string): Snapshot;
   /**
@@ -204,6 +220,17 @@ class WasmBojtosSession implements BojtosSession {
 
   completeJob(jobKey: string, variablesJson: string): Snapshot {
     return parseSnapshot(this.engine.completeJob(jobKey, variablesJson || "{}"));
+  }
+
+  completeAgentJob(jobKey: string, result: AgentResult): Snapshot {
+    const { variables, ...agentResult } = result ?? {};
+    return parseSnapshot(
+      this.engine.completeAgentJob(
+        jobKey,
+        JSON.stringify(variables ?? {}),
+        JSON.stringify(agentResult ?? {}),
+      ),
+    );
   }
 
   failJob(jobKey: string, retries: number, message: string): Snapshot {

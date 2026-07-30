@@ -191,6 +191,61 @@ export class TestEngine {
         }
     }
     /**
+     * Complete an ad-hoc sub-process **agent** job — the container's
+     * JOB_WORKER job (Camunda's agentic `aiagent-job-worker`) — carrying the
+     * agent's activate-element instructions so the engine runs the selected
+     * inner "tools" this turn (ADR 0023 seam 2/3; Camunda `JobResult` /
+     * `activateElements[]`). This is the browser seam that the plain
+     * `completeJob` deliberately omits (it always sends
+     * `adhoc_result: None`).
+     *
+     * `agent_result_json` shape (camelCase, mirroring Camunda's agentic
+     * `JobResult`):
+     * ```json
+     * { "activateElements": [{ "elementId": "toolA", "variables": { "q": 1 } }],
+     *   "completionConditionFulfilled": false,
+     *   "cancelRemainingInstances": false }
+     * ```
+     * Empty/whitespace ⇒ a no-op result, so the container completes this turn
+     * (no tool activated). `variables_json` merges instance variables exactly
+     * like `completeJob` — e.g. the agent's final
+     * decision when it signals `completionConditionFulfilled`.
+     * @param {string} job_key
+     * @param {string} variables_json
+     * @param {string} agent_result_json
+     * @returns {string}
+     */
+    completeAgentJob(job_key, variables_json, agent_result_json) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(job_key, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(agent_result_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.testengine_completeAgentJob(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
      * Complete a waiting job by key, merging `variables_json` (a JSON object
      * string) into the instance. The job is activated first if it has not been
      * already, so the UI can complete a freshly-created job directly.

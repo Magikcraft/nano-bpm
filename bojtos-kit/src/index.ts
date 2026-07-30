@@ -14,6 +14,7 @@ export {
   JobFailure,
   type JobHandler,
   type JobResult,
+  type AgentHandler,
   type DispatchOptions,
   type DispatchResult,
   type RoundResult,
@@ -26,5 +27,7 @@ export type {
   IncidentDto,
   TimerDto,
   ActiveEl,
+  AgentActivation,
+  AgentResult,
   WasmEvent,
 } from "./types.js";

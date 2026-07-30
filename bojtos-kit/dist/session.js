@@ -45,6 +45,10 @@ class WasmBojtosSession {
     completeJob(jobKey, variablesJson) {
         return parseSnapshot(this.engine.completeJob(jobKey, variablesJson || "{}"));
     }
+    completeAgentJob(jobKey, result) {
+        const { variables, ...agentResult } = result ?? {};
+        return parseSnapshot(this.engine.completeAgentJob(jobKey, JSON.stringify(variables ?? {}), JSON.stringify(agentResult ?? {})));
+    }
     failJob(jobKey, retries, message) {
         return parseSnapshot(this.engine.failJob(jobKey, retries, message));
     }

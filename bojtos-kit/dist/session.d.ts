@@ -1,5 +1,5 @@
 import { type InitInput } from "@nanobpm/engine-wasm";
-import type { ActivatedJob, ActivateInstruction, Snapshot, WasmEvent } from "./types.js";
+import type { ActivatedJob, ActivateInstruction, AgentResult, Snapshot, WasmEvent } from "./types.js";
 /**
  * The source of the engine wasm binary. Under a bundler that understands
  * `new URL(..., import.meta.url)` (e.g. Vite) the default loader needs no
@@ -46,6 +46,16 @@ export interface BojtosSession {
     activateJobs(jobType: string, maxJobs: number, timeoutMs: number, worker: string): ActivatedJob[];
     /** Complete a waiting job, merging `variablesJson` into the instance. */
     completeJob(jobKey: string, variablesJson: string): Snapshot;
+    /**
+     * Complete an ad-hoc sub-process's **agent** job — the container's JOB_WORKER
+     * job (Camunda's agentic `aiagent-job-worker`) — carrying the agent's
+     * {@link AgentResult}. Its `activateElements` run the chosen inner tools this
+     * turn; `completionConditionFulfilled` ends the agent loop; `variables` merge
+     * into the instance (e.g. the agent's final decision). This is the ad-hoc seam
+     * plain {@link completeJob} deliberately omits. Register agents on the dispatch
+     * loop via `DispatchOptions.agents` rather than calling this directly.
+     */
+    completeAgentJob(jobKey: string, result: AgentResult): Snapshot;
     /** Fail a waiting job; with no retries left this raises an incident. */
     failJob(jobKey: string, retries: number, message: string): Snapshot;
     /**

@@ -138,6 +138,35 @@ export interface ActivateInstruction {
 }
 
 /**
+ * One tool activation an agent asks for inside an ad-hoc sub-process (Camunda
+ * agentic `activateElements[]`): activate the inner element `elementId`, seeding
+ * `variables` into its local scope. Distinct from {@link ActivateInstruction}
+ * (process-instance modification) — this activates a *child* of the ad-hoc
+ * container, not a token in the process root.
+ */
+export interface AgentActivation {
+  elementId: string;
+  variables?: Record<string, unknown>;
+}
+
+/**
+ * The result an agent returns when completing an ad-hoc sub-process's agent job
+ * (Camunda's agentic `JobResult`): the tools to run this turn
+ * (`activateElements`), whether the container's `<completionCondition>` is now
+ * satisfied (`completionConditionFulfilled`), and whether to cancel any
+ * still-running tools (`cancelRemainingInstances`). `variables` merges into the
+ * instance on completion exactly like a plain job result (e.g. the agent's final
+ * decision). All fields optional: an empty result completes the container this
+ * turn with nothing activated.
+ */
+export interface AgentResult {
+  activateElements?: AgentActivation[];
+  completionConditionFulfilled?: boolean;
+  cancelRemainingInstances?: boolean;
+  variables?: Record<string, unknown>;
+}
+
+/**
  * The full simulation state returned by every engine command. `activeElementIds`
  * / `incidentElementIds` drive the token/incident highlight (the visual
  * contract, ADR 0043 §4); `instances[].variables` is the live payload.

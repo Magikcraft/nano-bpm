@@ -7,6 +7,7 @@ export const testengine_advanceTime: (a: number, b: number, c: number) => void;
 export const testengine_assignUserTask: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
 export const testengine_broadcastSignal: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const testengine_cancelInstance: (a: number, b: number, c: number, d: number) => void;
+export const testengine_completeAgentJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const testengine_completeUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
