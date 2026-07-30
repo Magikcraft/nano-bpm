@@ -345,10 +345,16 @@ export default function CodeEditor({
         editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () =>
           saveRef.current?.(),
         );
+        // Monaco measures monospace glyph widths at init; if the JetBrains Mono
+        // webfont is still loading it measures the fallback and the caret/columns
+        // misalign. Remeasure once the font is ready so glyphs line up.
+        void document.fonts.ready.then(() => monaco.editor.remeasureFonts());
       }}
       loading={<div className="p-4 text-sm text-fg-faint">Loading editor…</div>}
       options={{
         readOnly,
+        fontFamily:
+          '"JetBrains Mono Variable", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
         fontSize: 13,
         tabSize: 2,
         insertSpaces: true,
