@@ -46,6 +46,12 @@ export const TOUR_ANCHOR = {
   takeATour: "take-a-tour",
   /** Explorer's inspection panel — the localdev journey's "where you debug" step. */
   explorerInspect: "explorer-inspect",
+  /** The workspace file tree — the RAD journey names the four parts of a fullstack app here. */
+  fileTree: "file-tree",
+  /** The page/form editor surface — the RAD journey's "change a screen without a frontend" moment. */
+  pageEditor: "page-editor",
+  /** The served-app link shown while an Urban App runs — the RAD journey's payoff (opens the app on its own port). */
+  servedApp: "served-app",
 } as const;
 
 export type TourAnchor = (typeof TOUR_ANCHOR)[keyof typeof TOUR_ANCHOR];
