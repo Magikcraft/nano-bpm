@@ -104,6 +104,59 @@ freshly-built wasm (a Node probe: `createBojtosSession({ wasm: bytes })` →
 `session.deploy(xml)`), not just the Rust unit tests — that is the surface Play
 and the console actually consume.
 
+## Claim Your Task Before You Start
+
+Work here runs in **parallel worktrees across several agents** — an epic routinely
+fans a dozen slices out at once. Your worktree is invisible to everyone else, so
+the issue (or PR) is the only shared bus, and a claim signal on it is the only
+thing preventing two agents from silently building the same slice and colliding
+in the same files. Post the signal *before* writing code, not when you open the
+PR — by then the duplicate work already happened.
+
+- **Check first.** Before starting any planned task, look for an existing issue
+  or PR covering it. If one is **already claimed** — a claim comment, an
+  assignee, or an open PR — do **not** start. Stop and flag it to the user with a
+  link. Never work a task in parallel with an untracked, unclaimed, or
+  already-claimed item.
+- **Then check the code, not just the issue.** An unclaimed issue does not mean
+  unfinished work: at this velocity a slice can land while its issue stays open,
+  and it is worse for a **cross-repo** slice, where the diff lands somewhere the
+  issue does not live. So before claiming, confirm the work is actually absent —
+  `git fetch` and look for the file, the field, the flag; check the other repo's
+  `main`; check remote branches. Two of these have already been claimed after they
+  were done. Claiming a finished task wastes an agent and, worse, tells everyone
+  else the task is being handled when it needs nothing.
+- **Nothing tracked yet → create it, then claim it.** Open the issue before
+  writing any code, so the work is visible at the velocity this repo moves at.
+- **Claim it by commenting your worktree name.** The comment is the canonical
+  signal, because an agent is not always a repo collaborator and therefore cannot
+  always assign or label. Lead with the marker word so claims are greppable
+  (`gh issue view <n> --comments | grep Claimed`):
+
+  ```
+  Claimed — worktree `guided-journeys-contract`, branch `feat/guided-journeys-contract`.
+  ```
+
+  Name the worktree exactly as it appears in `git worktree list` (ours live in
+  `~/workspace/nanobpmn-worktrees/<name>`) so a human can find the work in
+  progress on disk. Add the PR link to the same thread once you open one, and
+  assign yourself **if you have the permissions** — that reinforces the comment,
+  it does not replace it. (There is deliberately no `in progress` label to
+  maintain: one signal, in one place, cannot drift out of sync with itself.)
+- **Release what you drop.** If you abandon or hand off a task, say so in the
+  same thread (`Released — worktree <name>, <reason>`). A claim that outlives the
+  work is worse than no claim: it deadlocks the slice behind an agent that is
+  gone.
+- **Reclaiming a stale claim.** A claim is stale when its worktree is absent from
+  `git worktree list` **and** its branch has no unmerged commits. Say that in a
+  comment, with what you checked, then claim it yourself. Never silently
+  double-claim — if the evidence is ambiguous, ask the user rather than risk two
+  agents in one file.
+- **Cross-repo slices claim in the hub.** Work that lands in `jwulf/nano-ide`,
+  `jwulf/c8ctl-plugin-nano` or a demo app is still claimed on its
+  `Magikcraft/nano-bpm` issue, and the resulting PRs link back to it — one place
+  to look, whatever repo the diff ends up in.
+
 ## Merging PRs
 
 This repository does **not** auto-merge pull requests. Opening a PR is *not* the
