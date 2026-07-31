@@ -26,7 +26,7 @@
 //! of this is feature-gated behind `console` and never touches the engine data
 //! dir.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -1152,7 +1152,23 @@ const PROJECT_TSCONFIG_JSON: &str = r#"{
 /// under standard tooling. It does *not* carry the `@nanobpm/*` alias map —
 /// `package.json` cannot express it (`imports` keys must be `#`-prefixed); that
 /// lives in `deno.json` (runtime) and `tsconfig.json` (types).
-fn project_package_json(name: &str) -> String {
+///
+/// `deps` are the npm dependencies **derived** from the project's final
+/// `deno.json` import map (the single source of truth — see
+/// [`npm_deps_from_deno_json`]), rendered into `dependencies` so `npm install`
+/// materialises them into `node_modules` for the Node fallback loader to resolve
+/// (issue #437). Passing an empty map yields the depless base manifest.
+fn project_package_json(name: &str, deps: &BTreeMap<String, String>) -> String {
+    let dependencies = if deps.is_empty() {
+        String::new()
+    } else {
+        let body = deps
+            .iter()
+            .map(|(pkg, range)| format!("    {:?}: {:?}", pkg, range))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("  \"dependencies\": {{\n{body}\n  }},\n")
+    };
     format!(
         r#"{{
   "name": "{}",
@@ -1163,13 +1179,120 @@ fn project_package_json(name: &str) -> String {
   "scripts": {{
     "start": "deno task start"
   }},
-  "devDependencies": {{
+{}  "devDependencies": {{
     "@types/node": "^22"
   }}
 }}
 "#,
-        slugify_app_id(name)
+        slugify_app_id(name),
+        dependencies
     )
+}
+
+/// Parse a `deno.json` import-map value into an npm `(name, range)` dependency,
+/// mirroring **exactly** the `npm:` handling in `node-loader.mjs`: strip the
+/// `npm:` scheme, then split a trailing `@range` while preserving a leading
+/// `@scope` (`lastIndexOf('@')`, split only when the `@` is past index 0). A
+/// value with no range pins to `*`. Returns `None` for any non-`npm:` value
+/// (relative `./`/`../` paths, `jsr:`, `http(s):`) — those are not
+/// `node_modules` dependencies.
+///
+/// This is the lone build-time reader of the `npm:` grammar; keeping it the sole
+/// parser is what lets `package.json` **derive** its deps from `deno.json`
+/// instead of hand-mirroring them (which silently drifts — issue #437).
+fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
+    let bare = value.strip_prefix("npm:")?;
+    match bare.rfind('@') {
+        // A trailing `@range` (the `@` is past a leading `@scope`).
+        Some(at) if at > 0 => Some((bare[..at].to_string(), bare[at + 1..].to_string())),
+        // Leading-scope-only (`@scope/pkg`) or unscoped-no-range (`pkg`).
+        _ => Some((bare.to_string(), "*".to_string())),
+    }
+}
+
+/// Derive the npm dependencies a project's Node fallback needs from a `deno.json`
+/// import map — the single source of truth (issue #437). Every `npm:`-mapped
+/// specifier the loader strips must exist in `node_modules`, so it must be a
+/// `package.json` dependency; non-`npm:` entries (relative/jsr/http) are skipped.
+fn npm_deps_from_deno_json(deno_json: &str) -> BTreeMap<String, String> {
+    let mut deps = BTreeMap::new();
+    if let Ok(serde_json::Value::Object(root)) =
+        serde_json::from_str::<serde_json::Value>(deno_json)
+        && let Some(serde_json::Value::Object(imports)) = root.get("imports")
+    {
+        for value in imports.values() {
+            if let Some((name, range)) = value.as_str().and_then(npm_dep_from_import) {
+                deps.insert(name, range);
+            }
+        }
+    }
+    deps
+}
+
+/// Read the npm deps a project requires from its on-disk `deno.json`/`deno.jsonc`
+/// (mirrors `node-loader.mjs`'s file lookup). Missing/unparseable → empty.
+fn required_npm_deps(dir: &Path) -> BTreeMap<String, String> {
+    for name in ["deno.json", "deno.jsonc"] {
+        if let Ok(raw) = std::fs::read_to_string(dir.join(name)) {
+            return npm_deps_from_deno_json(&raw);
+        }
+    }
+    BTreeMap::new()
+}
+
+/// The Node-fallback safety net: ensure `dir/package.json` declares every npm
+/// dependency the project's `deno.json` import map requires, so `npm install`
+/// materialises them into `node_modules` and the Node loader can resolve the
+/// `npm:` specifiers it strips (issue #437). Additive and non-destructive:
+///
+/// * a dep already present in **either** `dependencies` or `devDependencies` is
+///   left untouched — never moved buckets or re-pinned, so a maker's version
+///   choices and the code-first `bpmn-auto-layout` devDep split survive;
+/// * only genuinely-missing deps are added, to `dependencies`;
+/// * `package.json` is rewritten only when something was added, so healthy and
+///   maker-edited manifests are never reformatted.
+///
+/// No-op when either file is absent/unparseable (Rust/Java packs have no
+/// `deno.json`; a pack may ship no `package.json`). Run on every project build
+/// (via [`ensure_project_sdk`]) it heals projects scaffolded before this fix.
+fn heal_package_json_npm_deps(dir: &Path) -> std::io::Result<()> {
+    let required = required_npm_deps(dir);
+    if required.is_empty() {
+        return Ok(());
+    }
+    let pkg_path = dir.join("package.json");
+    let (Ok(raw), true) = (std::fs::read_to_string(&pkg_path), pkg_path.exists()) else {
+        return Ok(());
+    };
+    let Ok(serde_json::Value::Object(mut root)) = serde_json::from_str::<serde_json::Value>(&raw)
+    else {
+        return Ok(());
+    };
+    let declared: BTreeSet<String> = ["dependencies", "devDependencies"]
+        .iter()
+        .filter_map(|k| root.get(*k))
+        .filter_map(|v| v.as_object())
+        .flat_map(|o| o.keys().cloned())
+        .collect();
+    let mut added = false;
+    for (name, range) in required {
+        if declared.contains(&name) {
+            continue;
+        }
+        if let serde_json::Value::Object(deps) = root
+            .entry("dependencies")
+            .or_insert_with(|| serde_json::Value::Object(Default::default()))
+        {
+            deps.insert(name, serde_json::Value::String(range));
+            added = true;
+        }
+    }
+    if added {
+        let mut out = serde_json::to_string_pretty(&serde_json::Value::Object(root))?;
+        out.push('\n');
+        std::fs::write(&pkg_path, out)?;
+    }
+    Ok(())
 }
 /// and workers on disk, so dropping a file into the project is all it takes.
 const MAIN_TS: &str = r#"// Generated entrypoint for your Nano application. Edit freely. The deploy +
@@ -2558,8 +2681,17 @@ pub fn ensure_project_sdk(name: &str) -> std::io::Result<()> {
     }
     let package_json = dir.join("package.json");
     if !package_json.exists() {
-        std::fs::write(&package_json, project_package_json(name))?;
+        std::fs::write(
+            &package_json,
+            project_package_json(name, &required_npm_deps(&dir)),
+        )?;
     }
+    // Heal projects scaffolded before deps were derived from `deno.json`: add any
+    // `npm:` import-map dependency missing from `package.json` so `npm install`
+    // materialises it and the Node fallback loader resolves the stripped `npm:`
+    // specifier (issue #437). Additive + no-op when already covered — this runs
+    // on every project build, so a pre-existing broken project self-heals.
+    heal_package_json_npm_deps(&dir)?;
     Ok(())
 }
 
@@ -2959,7 +3091,6 @@ pub fn create_project(
         |p: PathBuf, body: &str| std::fs::write(&p, body).map_err(|e| format!("write {p:?}: {e}"));
     w(dir.join("deno.json"), &gendir(PROJECT_DENO_JSON))?;
     w(dir.join("tsconfig.json"), &gendir(PROJECT_TSCONFIG_JSON))?;
-    w(dir.join("package.json"), &project_package_json(name))?;
     w(dir.join(GEN_DIR).join("data-sdk.ts"), DATA_SDK_TS)?;
     w(dir.join(GEN_DIR).join("app-pages.ts"), APP_PAGES_TS)?;
     w(dir.join(GEN_DIR).join("data-cli.ts"), DATA_CLI_TS)?;
@@ -3070,6 +3201,17 @@ pub fn create_project(
         w(starter_worker.join("worker.ts"), STARTER_WORKER_TS)?;
         w(starter_worker.join("deno.json"), &gendir(WORKER_DENO_JSON))?;
     }
+
+    // Derive the Node manifest's npm deps from the project's *final* `deno.json`
+    // — the SDK templates in the branch above overwrite `deno.json`, so read it
+    // back as the single source of truth (issue #437) rather than hand-mirroring.
+    // Every `npm:` specifier the Node loader strips is declared here so
+    // `npm install` can materialise it into `node_modules`.
+    let deno_json = std::fs::read_to_string(dir.join("deno.json")).unwrap_or_default();
+    w(
+        dir.join("package.json"),
+        &project_package_json(name, &npm_deps_from_deno_json(&deno_json)),
+    )?;
 
     let mut cfg = ProjectConfig::new(name, description);
     cfg.display_name = display_name;
@@ -8615,5 +8757,192 @@ mod tests {
         assert!(text.contains("filedAt: string;")); // datetime → string
         assert!(text.contains("note?: string;")); // optional widens
         assert!(text.contains("lines: DomainTypes[\"tax-line\"][];")); // ref + list
+    }
+
+    // ── Node fallback: package.json npm deps derived from deno.json (#437) ──
+
+    /// The `npm:` grammar parser must mirror `node-loader.mjs` exactly: strip the
+    /// scheme, split a trailing `@range` while preserving a leading `@scope`, and
+    /// reject non-`npm:` values (the other loader specifier classes).
+    #[test]
+    fn npm_dep_from_import_mirrors_the_node_loader_grammar() {
+        assert_eq!(
+            npm_dep_from_import("npm:@nanobpm/nano-sdk@^1"),
+            Some(("@nanobpm/nano-sdk".into(), "^1".into()))
+        );
+        // Scoped, no range → pins to `*` (the `@` is the leading scope, index 0).
+        assert_eq!(
+            npm_dep_from_import("npm:@nanobpm/nano-sdk"),
+            Some(("@nanobpm/nano-sdk".into(), "*".into()))
+        );
+        // Unscoped with a dotted pre-release range.
+        assert_eq!(
+            npm_dep_from_import("npm:bpmn-auto-layout@^2.0.0-alpha.2"),
+            Some(("bpmn-auto-layout".into(), "^2.0.0-alpha.2".into()))
+        );
+        // Unscoped, no range.
+        assert_eq!(
+            npm_dep_from_import("npm:left-pad"),
+            Some(("left-pad".into(), "*".into()))
+        );
+        // Every non-`npm:` specifier class the loader handles is NOT an npm dep.
+        assert_eq!(npm_dep_from_import("./nano-generated/workers.ts"), None);
+        assert_eq!(npm_dep_from_import("../shared/lib.ts"), None);
+        assert_eq!(npm_dep_from_import("jsr:@std/assert@^1"), None);
+        assert_eq!(npm_dep_from_import("https://esm.sh/x"), None);
+    }
+
+    /// Red/Green repro for #437: the SDK template (`throughput-stream`) mapped
+    /// `@nanobpm/nano-sdk` only in `deno.json`, leaving `package.json` depless —
+    /// so the Node fallback's `npm install` had nothing to fetch and the loader
+    /// crashed with `ERR_MODULE_NOT_FOUND`. The scaffold must now declare it.
+    #[test]
+    fn scaffold_derives_the_nano_sdk_npm_dep_into_package_json() {
+        let _g = lock();
+        let _root = temp_root();
+        create_project("stream", "d", "throughput-stream").expect("scaffold ok");
+        let dir = project_dir("stream").unwrap();
+        let pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap())
+                .expect("package.json parses");
+        assert_eq!(
+            pkg["dependencies"]["@nanobpm/nano-sdk"].as_str(),
+            Some("^1"),
+            "package.json must declare the npm: dep from deno.json so npm install materialises it"
+        );
+    }
+
+    /// Defect-class guard across the WHOLE built-in surface (drift-free — driven
+    /// off the `TEMPLATES` registry, so a new template is covered automatically).
+    /// Guards *both* Node-fallback failure modes for every template:
+    ///   (a) every `npm:` import in the project `deno.json` is declared in
+    ///       `package.json` (`dependencies` ∪ `devDependencies`) — the #437 crash;
+    ///   (b) every import value anywhere in the project (root + `workers/*`
+    ///       `deno.json`) is Node-loader-resolvable: relative or `npm:`, never
+    ///       `jsr:`/`http(s):` (which `node-loader.mjs` throws on).
+    #[test]
+    fn every_builtin_template_is_node_fallback_resolvable() {
+        let _g = lock();
+        let _root = temp_root();
+        for t in TEMPLATES {
+            let name = format!("cov-{}", t.id);
+            create_project(&name, "d", t.id).unwrap_or_else(|e| panic!("{}: {e}", t.id));
+            let dir = project_dir(&name).unwrap();
+
+            // (a) package.json covers every npm: dep the root import map requires.
+            let deno_raw = std::fs::read_to_string(dir.join("deno.json"))
+                .unwrap_or_else(|e| panic!("{}: read deno.json: {e}", t.id));
+            let pkg: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap())
+                    .unwrap_or_else(|e| panic!("{}: package.json parses: {e}", t.id));
+            let declared = |name: &str| -> bool {
+                ["dependencies", "devDependencies"]
+                    .iter()
+                    .any(|b| pkg[b].get(name).map(|v| v.is_string()).unwrap_or(false))
+            };
+            for (dep, _range) in npm_deps_from_deno_json(&deno_raw) {
+                assert!(
+                    declared(&dep),
+                    "{}: npm dep `{dep}` is in deno.json but missing from package.json",
+                    t.id
+                );
+            }
+
+            // (b) no import anywhere resolves to a scheme the Node loader rejects.
+            let mut deno_files = vec![dir.join("deno.json")];
+            let workers = dir.join("workers");
+            if workers.is_dir() {
+                for entry in std::fs::read_dir(&workers).unwrap().flatten() {
+                    let dj = entry.path().join("deno.json");
+                    if dj.is_file() {
+                        deno_files.push(dj);
+                    }
+                }
+            }
+            for dj in deno_files {
+                let raw = std::fs::read_to_string(&dj).unwrap();
+                let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if let Some(imports) = v["imports"].as_object() {
+                    for (key, val) in imports {
+                        let s = val.as_str().unwrap_or_default();
+                        let ok =
+                            s.starts_with("./") || s.starts_with("../") || s.starts_with("npm:");
+                        assert!(
+                            ok,
+                            "{}: import `{key}` -> `{s}` in {dj:?} is not Node-loader-resolvable \
+                             (must be relative or npm:, never jsr:/http:)",
+                            t.id
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The chokepoint heals an already-scaffolded broken project on its next
+    /// build: a project with an SDK `deno.json` but a depless `package.json`
+    /// (the exact #437 state on disk) gains the missing dep via
+    /// `ensure_project_sdk`, without clobbering the maker's other fields.
+    #[test]
+    fn ensure_project_sdk_heals_a_depless_package_json() {
+        let _g = lock();
+        let root = temp_root();
+        let dir = root.join("legacy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("deno.json"),
+            r#"{"imports":{"@nanobpm/nano-sdk":"npm:@nanobpm/nano-sdk@^1","@lib/":"./lib/"}}"#,
+        )
+        .unwrap();
+        // A maker-shaped manifest that predates dep derivation: has a custom dep,
+        // but not the SDK one.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"legacy","version":"0.0.0","dependencies":{"chalk":"^5"}}"#,
+        )
+        .unwrap();
+
+        ensure_project_sdk("legacy").expect("ensure ok");
+
+        let pkg: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("package.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            pkg["dependencies"]["@nanobpm/nano-sdk"].as_str(),
+            Some("^1"),
+            "missing npm: dep must be healed into package.json"
+        );
+        assert_eq!(
+            pkg["dependencies"]["chalk"].as_str(),
+            Some("^5"),
+            "healing must be additive — the maker's existing dep survives"
+        );
+    }
+
+    /// The heal is non-destructive: a dep already declared in `devDependencies`
+    /// is not duplicated into `dependencies` (guards the code-first
+    /// `bpmn-auto-layout` devDep split), and an already-covered manifest is left
+    /// byte-for-byte untouched (rewrite only on change).
+    #[test]
+    fn heal_respects_the_devdependencies_bucket_and_skips_covered_manifests() {
+        let _g = lock();
+        let root = temp_root();
+        let dir = root.join("covered");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("deno.json"),
+            r#"{"imports":{"bpmn-auto-layout":"npm:bpmn-auto-layout@^2"}}"#,
+        )
+        .unwrap();
+        let original = "{\n  \"devDependencies\": {\n    \"bpmn-auto-layout\": \"^2\"\n  }\n}\n";
+        std::fs::write(dir.join("package.json"), original).unwrap();
+
+        heal_package_json_npm_deps(&dir).expect("heal ok");
+
+        let after = std::fs::read_to_string(dir.join("package.json")).unwrap();
+        assert_eq!(
+            after, original,
+            "a dep covered via devDependencies must not be re-added, nor the file reformatted"
+        );
     }
 }
