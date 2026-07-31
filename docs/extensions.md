@@ -41,11 +41,11 @@ It drives a few well-defined console seams:
 ### The marketplace: discovery, categories, official vs community
 
 The console's **Extensions** tab (a Studio-profile tab) is the marketplace. It
-discovers packs by shelling out to `npm search keywords:nano-ide-ext
---searchlimit=250` — **every** public npm package tagged with the `nano-ide-ext`
-keyword is listed (the explicit `--searchlimit` is required because `npm search`
-otherwise returns only its top 20 hits, which would silently hide packs as the
-ecosystem grows past 20).
+discovers packs by shelling out to
+`npm search keywords:nano-ide-ext --searchlimit=250` — **every** public npm
+package tagged with the `nano-ide-ext` keyword is listed (the explicit
+`--searchlimit` is required because `npm search` otherwise returns only its top
+20 hits, which would silently hide packs as the ecosystem grows past 20).
 
 A pack's **category** is derived from a *second* keyword, tested in a fixed
 priority order (first match wins):
