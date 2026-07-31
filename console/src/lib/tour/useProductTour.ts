@@ -84,7 +84,10 @@ export function useProductTour(
 
   const toDriveStep = useCallback(
     (step: TourStep, index: number): DriveStep => ({
-      element: step.selector,
+      // Omit `element` entirely for anchorless (centered "welcome") steps — a
+      // present `element: undefined` key works today but driver.js's contract
+      // is that a centered step has no element at all, so keep to that shape.
+      ...(step.selector ? { element: step.selector } : {}),
       popover: {
         title: step.title,
         description: step.body,
