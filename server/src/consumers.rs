@@ -112,10 +112,22 @@ fn env_u64(key: &str) -> Option<u64> {
         .filter(|&n| n > 0)
 }
 
+/// Whether a REST consumer counts as **live** at `now`: from the poll's start
+/// through its long-poll window close (`live_until_ms`) plus a `stale` grace for
+/// the worker to re-issue. Measuring the grace from the window close (not the
+/// poll start) keeps a long poll live for the full grace *after* it returns,
+/// rather than greying the instant a >`stale` window closes.
+fn rest_live(p: &RestPoll, now: u64, stale: u64) -> bool {
+    now < p.live_until_ms.saturating_add(stale)
+}
+
 /// Whether a poll should still be retained (live or merely idle) at `now`: kept
-/// while its long-poll window is open or it went idle less than `evict` ago.
+/// until `evict` past its long-poll window close. Anchored on `live_until_ms`
+/// (not `last_seen_ms`) for the same reason as [`rest_live`] — a worker that
+/// just finished a long poll longer than `evict` still gets the eviction grace
+/// to re-issue before its row vanishes.
 fn rest_retained(p: &RestPoll, now: u64, evict: u64) -> bool {
-    now < p.live_until_ms || now.saturating_sub(p.last_seen_ms) < evict
+    now < p.live_until_ms.saturating_add(evict)
 }
 
 /// Records that `worker` polled `job_type` over REST (an `activateJobs` call)
@@ -211,14 +223,17 @@ pub fn snapshot(registry: &Registry) -> ConsumersResponse {
         polls.retain(|_, p| rest_retained(p, now, evict));
         for ((job_type, worker), p) in polls.iter() {
             let age = now.saturating_sub(p.last_seen_ms);
-            let live = now < p.live_until_ms || age < stale;
             consumers.push(Consumer {
                 job_type: job_type.clone(),
                 worker: worker.clone(),
                 transport: "rest",
                 last_seen_ms: p.last_seen_ms,
                 age_ms: age,
-                status: if live { "live" } else { "idle" },
+                status: if rest_live(p, now, stale) {
+                    "live"
+                } else {
+                    "idle"
+                },
             });
         }
     }
@@ -288,6 +303,40 @@ mod tests {
                 live_until_ms,
             },
         );
+    }
+
+    #[test]
+    fn grace_applies_after_a_long_poll_closes_not_from_its_start() {
+        // A long poll (window ≫ stale) that closed within the grace stays live;
+        // the same poll closed past the grace greys to idle but is retained. This
+        // guards that the grace is measured from window close, not poll start.
+        let jt = "t-grace:review";
+        clear("t-grace:");
+        let now = now_ms();
+        let stale = rest_stale_ms();
+        // Closed 1s ago after a 30s poll ⇒ within grace ⇒ live.
+        insert_poll(
+            jt,
+            "agent-g",
+            now.saturating_sub(31_000),
+            now.saturating_sub(1_000),
+        );
+        assert_eq!(
+            rest_rows(&snapshot(&falcon::Registry::new()), "t-grace:")[0].status,
+            "live",
+            "just-closed long poll is live during the post-close grace"
+        );
+        // Closed past the grace ⇒ idle, still listed.
+        insert_poll(
+            jt,
+            "agent-g",
+            now.saturating_sub(31_000),
+            now.saturating_sub(stale + 1_000),
+        );
+        let rows = rest_rows(&snapshot(&falcon::Registry::new()), "t-grace:");
+        assert_eq!(rows.len(), 1, "still retained");
+        assert_eq!(rows[0].status, "idle", "past the post-close grace ⇒ idle");
+        clear("t-grace:");
     }
 
     #[test]

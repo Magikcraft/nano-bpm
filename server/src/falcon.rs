@@ -896,14 +896,15 @@ impl Registry {
     /// Snapshot of live push consumers: one entry per `(connection, job type)`
     /// subscription, carrying the lease-owner worker name and the connection's
     /// last-activity timestamp. Powers the console "who is polling what" panel
-    /// (issue #404). A cheap snapshot under the `conns`/`subs` locks, off the hot
-    /// path; the connection reaper independently evicts silent connections, so a
-    /// reaped consumer simply stops appearing here.
+    /// (issue #404). Snapshots the connection list under `conns` and releases it
+    /// before locking each connection's `subs`, so this 2s UI poll never holds
+    /// `conns` while touching `subs` and can't contend with the dispatcher /
+    /// register / unregister on the hot path. The reaper independently evicts
+    /// silent connections, so a reaped consumer simply stops appearing here.
     #[cfg(feature = "console")]
     pub fn consumers(&self) -> Vec<FalconConsumer> {
-        let conns = self.conns.lock().expect("registry poisoned");
         let mut out = Vec::new();
-        for conn in conns.values() {
+        for conn in self.all_connections() {
             let last_seen_ms = conn.last_seen_ms.load(Ordering::Relaxed);
             let subs = conn.subs.lock().expect("registry poisoned");
             for (job_type, sub) in subs.iter() {
