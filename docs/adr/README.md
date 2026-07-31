@@ -64,6 +64,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0049](0049-guided-journeys.md) | Guided journeys: onboarding chosen by the entry point, not the build profile | Proposed | 2026-07-31 |
 | [0050](0050-urban-connectors-outbound-io-and-project-enablement.md) | Urban connectors: the outbound I/O edge (workers + components) and project-enablement | Proposed | 2026-07-31 |
 | [0051](0051-nano-workforce.md) | Nano Workforce: a durable agent-crew orchestrator as an Urban app | Proposed | 2026-07-31 |
+| [0052](0052-urban-runtime-decoupled-manifest-interpreter.md) | The Urban runtime: a decoupled manifest interpreter (`@nanobpm/urban-runtime`), a scaffolder, and interchangeable hosts | Proposed | 2026-07-31 |
 
 ## Reading paths
 
