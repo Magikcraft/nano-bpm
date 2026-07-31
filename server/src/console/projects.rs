@@ -431,15 +431,20 @@ fn kill_process_group(child: &mut tokio::process::Child) {
         // the whole descendant tree by PID, which is the behaviour we need.
         if let Some(pid) = child.id() {
             // Spawn without waiting: `.status()` would block the Tokio worker
-            // thread (this runs inside spawned Stop tasks). Return WITHOUT
-            // falling through to `start_kill()` — killing the parent PID first
-            // could reparent the grandchildren before taskkill walks the tree.
-            let _ = std::process::Command::new("taskkill")
+            // thread (this runs inside spawned Stop tasks). On a successful
+            // launch, return WITHOUT falling through to `start_kill()` — killing
+            // the parent PID first could reparent the grandchildren before
+            // taskkill walks the tree. If taskkill can't even be spawned, fall
+            // through to `start_kill()` as a backstop so the child still dies.
+            let spawned = std::process::Command::new("taskkill")
                 .args(["/F", "/T", "/PID", &pid.to_string()])
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
-                .spawn();
-            return;
+                .spawn()
+                .is_ok();
+            if spawned {
+                return;
+            }
         }
     }
     let _ = child.start_kill();
