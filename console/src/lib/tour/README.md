@@ -149,7 +149,10 @@ Other ways in:
 - **Take a tour** in the rail (**Resume tour** when a journey was interrupted).
 - **`?tour=<journeyId>`** deep links still work (parsed by `deepLink.ts`, stripped
   once started) — a valid, no-longer-advertised entry, kept for links already in
-  the wild. Nothing emits them anymore.
+  the wild. The CLI stopped emitting them in
+  [jwulf/c8ctl-plugin-nano#22](https://github.com/jwulf/c8ctl-plugin-nano/pull/22)
+  (part of [#464](https://github.com/Magikcraft/nano-bpm/issues/464)); the startup
+  panel is the front door now.
 
 ## Try it
 
