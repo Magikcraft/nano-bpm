@@ -1458,6 +1458,7 @@ await new Promise((r) => setTimeout(r, 60000));
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let pack = ext_root.join("nano-ide-trigger-testpack");
+        let _ = std::fs::remove_dir_all(&ext_root);
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::write(
             pack.join("nano-ide.ext.json"),
@@ -1552,6 +1553,7 @@ await new Promise((r) => setTimeout(r, 60000));
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let pack = ext_root.join("nano-ide-trigger-untrusted");
+        let _ = std::fs::remove_dir_all(&ext_root);
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::write(
             pack.join("nano-ide.ext.json"),
@@ -1642,6 +1644,7 @@ for (let i = 0; i < 100; i++) {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let pack = ext_root.join("nano-ide-connector-testpack");
+        let _ = std::fs::remove_dir_all(&ext_root);
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::write(
             pack.join("nano-ide.ext.json"),
