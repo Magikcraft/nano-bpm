@@ -390,6 +390,19 @@ pub(crate) fn spawn_sources(project: &str, manifest: &Json, handle: Arc<LoopHand
                 let Some(driver) = super::extensions::trigger_driver(&src.kind) else {
                     continue;
                 };
+                // Security gate (#460): a pack driver is out-of-process code —
+                // withhold it unless the contributing pack is trusted, mirroring
+                // the lang/app toolchain gate. Logged + skipped, never fatal.
+                if !super::extensions::is_trusted(&driver.id) {
+                    tracing::warn!(
+                        project,
+                        kind = %src.kind,
+                        ext = %driver.id,
+                        "pack trigger driver withheld: extension '{}' is not approved to run code; approve it (or enable yolo) in Extensions",
+                        driver.id
+                    );
+                    continue;
+                }
                 let Some(trigger) = raw_trigger(manifest, &src.id) else {
                     continue;
                 };
@@ -654,6 +667,19 @@ pub(crate) fn spawn_workers(project: &str, manifest: &Json, handle: Arc<LoopHand
         let Some(driver) = super::extensions::worker_driver(&task_type) else {
             continue;
         };
+        // Security gate (#460): a connector worker is out-of-process code —
+        // withhold it unless the contributing pack is trusted, mirroring the
+        // lang/app toolchain gate. Logged + skipped, never fatal.
+        if !super::extensions::is_trusted(&driver.id) {
+            tracing::warn!(
+                project,
+                worker = %task_type,
+                ext = %driver.id,
+                "pack connector worker withheld: extension '{}' is not approved to run code; approve it (or enable yolo) in Extensions",
+                driver.id
+            );
+            continue;
+        }
         let (project, handle) = (project.to_string(), handle.clone());
         tokio::spawn(run_pack_worker(project, task_type, driver, handle));
     }
