@@ -247,6 +247,11 @@ export function useProductTour(
   const resetTour = useCallback(() => {
     resetState();
     setActiveId(undefined);
+    // resetState() cleared the persisted key, so the startup-panel preference is
+    // back to its default. Re-derive the in-memory flag from storage (rather than
+    // hardcoding true) so the two never drift — "forget onboarding" also means
+    // "show the startup panel again".
+    setShowStartupPanelState(startupPanelEnabled(readState()));
   }, []);
 
   // Recompute which journeys are offerable once real context exists: a
