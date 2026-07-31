@@ -10,9 +10,13 @@ import {
   type ProjectTemplate,
 } from "../gen";
 import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
+import JourneyPicker from "../components/JourneyPicker";
 import DirectoryPicker from "../components/DirectoryPicker";
 import { isLocalhost } from "../lib/api";
-import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
+import { CONSOLE_PROFILE } from "../lib/profile";
+import { TOUR_ANCHOR, templateAnchor } from "../lib/tour/tourAnchors";
+import { useTour } from "../lib/tour/tourContext";
+import { pickerJourneys } from "../lib/tour/picker";
 import {
   slugifyProjectName,
   validateProjectName,
@@ -39,6 +43,7 @@ function iconSrc(icon: string): string {
 /// Opening a project tile routes to its workspace.
 export default function Projects() {
   const navigate = useNavigate();
+  const tour = useTour();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [denoAvailable, setDenoAvailable] = useState(true);
   const [nodeAvailable, setNodeAvailable] = useState(true);
@@ -412,9 +417,26 @@ export default function Projects() {
       {loading ? (
         <div className="py-16 text-center text-sm text-fg-faint">Loading…</div>
       ) : projects.length === 0 ? (
-        <EmptyState
+        // The empty state IS the journey picker (#411, ADR 0049 §2): a
+        // first-timer with no projects chooses an outcome-shaped journey (or the
+        // quiet overview) instead of hitting a dead-end "Create one to get
+        // started." Cards are derived from the registry, so a new journey needs
+        // no change here, and the whole block stops rendering once projects
+        // exist — no dismissal state to track.
+        <JourneyPicker
           title="No projects yet."
-          hint="Create one to get started."
+          subtitle="Pick a guided journey to build your first one — or explore on your own."
+          journeys={
+            tour ? pickerJourneys(tour.availableJourneys, CONSOLE_PROFILE) : []
+          }
+          onPick={(id) => tour?.startJourney(id)}
+          onOverview={tour ? () => tour.startTour() : undefined}
+          fallback={
+            <EmptyState
+              title="No projects yet."
+              hint="Create one to get started."
+            />
+          }
         />
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
@@ -474,6 +496,7 @@ function TemplateTile({
   const langLabel = lang?.displayName ?? template.lang;
   return (
     <Card
+      data-tour={templateAnchor(template.id)}
       className={`flex flex-col p-4 transition-colors ${
         selected
           ? "border-accent ring-1 ring-accent"
