@@ -24,7 +24,7 @@ The only thing driver.js can't do is drive react-router, so the hook does that.
 | File | Role |
 | ---- | ---- |
 | `steps.ts` | Profile-aware step list (`CONSOLE_PROFILE`: studio vs observe). Each step names the `route` it needs and the `selector` to highlight. Single source of truth — no duplication across profiles. |
-| `tourAnchors.ts` | The `data-tour` anchor names + `navAnchor()` / `tourSelector()` helpers. Both the steps (selectors) and the views (`data-tour` attributes) derive from here, so a rename can't silently break a step. |
+| `tourAnchors.ts` | The `data-tour` anchor names + `navAnchor()` / `tourSelector()` helpers. Both the steps (selectors) and the views (`data-tour` attributes) derive from here, and nav anchors key off the stable **route** (`item.to`) not the display label, so a rename can't silently break a step. |
 | `steps.test.ts` | `node --test` guard: structural invariants + that each profile only targets anchors that render in it (e.g. observe never points at the studio-only Projects nav). |
 | `useProductTour.ts` | The hook: builds the driver, navigates the router between steps, and persists a `localStorage` "seen" flag so it auto-starts only on first run. Returns `startTour` / `resetTour`. |
 | `tour.css` | Popover theming via the app's own `--nano-*` tokens, so it tracks dark/light mode. |

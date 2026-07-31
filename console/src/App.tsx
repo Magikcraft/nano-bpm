@@ -348,7 +348,7 @@ export default function App() {
               <NavLink
                 key={item.to}
                 to={to}
-                data-tour={navAnchor(item.label)}
+                data-tour={navAnchor(item.to)}
                 className={railItemClass(active)}
               >
                 <ActiveBar show={active} />

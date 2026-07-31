@@ -9,17 +9,22 @@
 // Used by: steps.ts (selectors), App.tsx (rail nav + "Take a tour"),
 // Projects.tsx ("New project"), ProjectWorkspace.tsx (Run).
 
-/** `data-tour` value for a rail nav item, derived from its (single-word) label. */
-export function navAnchor(label: string): string {
-  return `nav-${label.toLowerCase()}`;
+/**
+ * `data-tour` value for a rail nav item, derived from its **route** (`item.to`)
+ * rather than its display label. The route is the stable identity — renaming the
+ * visible label must not silently move the DOM anchor away from the selector the
+ * tour targets. `"/projects"` → `"nav-projects"`.
+ */
+export function navAnchor(route: string): string {
+  return `nav-${route.replace(/^\//, "").toLowerCase()}`;
 }
 
 /** Every `data-tour` anchor the tour targets, in one place. */
 export const TOUR_ANCHOR = {
-  projectsNav: navAnchor("Projects"),
-  explorerNav: navAnchor("Explorer"),
-  topologyNav: navAnchor("Topology"),
-  metricsNav: navAnchor("Metrics"),
+  projectsNav: navAnchor("/projects"),
+  explorerNav: navAnchor("/explorer"),
+  topologyNav: navAnchor("/topology"),
+  metricsNav: navAnchor("/metrics"),
   newProject: "new-project",
   run: "run",
   takeATour: "take-a-tour",

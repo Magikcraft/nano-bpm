@@ -106,8 +106,8 @@ test("observe never targets studio-only anchors", () => {
   }
 });
 
-test("tourAnchors helpers: navAnchor lowercases, tourSelector wraps", () => {
-  assert.equal(navAnchor("Projects"), "nav-projects");
-  assert.equal(navAnchor("Explorer"), "nav-explorer");
+test("tourAnchors helpers: navAnchor strips the leading slash + lowercases, tourSelector wraps", () => {
+  assert.equal(navAnchor("/projects"), "nav-projects");
+  assert.equal(navAnchor("/Explorer"), "nav-explorer");
   assert.equal(tourSelector("run"), '[data-tour="run"]');
 });
