@@ -89,7 +89,7 @@ The most common settings:
 |---|---|
 | `PORT=<n>` | HTTP listen port (default `8080`). |
 | `NANOBPMN_DATA_DIR=<dir>` | Durable data directory (event log + read model). **Without it, the server runs fully in-memory and loses everything on exit.** Set it for anything you want to keep. |
-| `NANOBPMN_WORKSPACE_DIR=<dir>` | Where the console stores your projects and workers (default `./nanobpm-workspace`; projects live under `<workspace>/projects/`). Survives deletion of the engine data dir. |
+| `NANOBPMN_WORKSPACE_DIR=<dir>` | Where the console stores your projects and workers (default `./nanobpm-workspace`; projects live under `<workspace>/projects/` by default, unless `NANOBPMN_PROJECTS_DIR` moves them). Survives deletion of the engine data dir. |
 | `NANOBPMN_PROJECTS_DIR=<dir>` | Advanced: override the projects root directly (default `<workspace>/projects`). |
 | `DEBUG_REST=1` | Log every REST request/response (method, URI, status, latency). Leave off in production. |
 

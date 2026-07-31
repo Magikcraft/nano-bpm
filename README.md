@@ -910,7 +910,7 @@ under `projects/` as a self-contained, runnable Deno application:
 
 | Variable | Meaning |
 | --- | --- |
-| `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (holds the standalone `workers/` plus `projects/`). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
+| `NANOBPMN_WORKSPACE_DIR=<dir>` | Console workspace root (holds the standalone `workers/` plus, by default, `projects/` — unless `NANOBPMN_PROJECTS_DIR` moves the projects root). Default `./nanobpm-workspace`. Survives deletion of `NANOBPMN_DATA_DIR`. |
 | `NANOBPMN_PROJECTS_DIR=<dir>` | Override the projects root directly. Default `<workspace>/projects`. |
 | `NANOBPMN_DENO_BIN=<path>` | Explicit path to the Deno binary used to run workers. Default: `deno` on `PATH`, else `~/.deno/bin/deno`. |
 
