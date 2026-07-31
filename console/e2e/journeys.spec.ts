@@ -25,6 +25,7 @@ import {
   resetTourState,
   seedTourState,
   stubConsoleApi,
+  suppressStartupPanel,
 } from "./fixtures.ts";
 
 // ── Registry enumeration ─────────────────────────────────────────────────────
@@ -140,11 +141,11 @@ test.describe("journey anchors resolve", () => {
         const noCrash = assertNoPageCrash(page);
         await stubConsoleApi(page);
         await resetTourState(page);
-        // #464 adds a startup persona panel that opens on console load unless a
-        // journey is running or resumable — which is the case here, since this test
-        // starts none. The assertion below is DOM-presence (`toHaveCount`), so an
-        // overlay does not affect it, but when #464 lands this test should suppress
-        // the panel explicitly rather than pass because of that detail.
+        // The startup persona panel (#464/#471) opens on console load unless a
+        // journey is running or resumable — and this test starts none. Suppress it
+        // so the assertion is about the anchor, not about an overlay happening not
+        // to affect `toHaveCount`.
+        await suppressStartupPanel(page);
         // Route is absolute under the router basename; baseURL already ends in
         // /console/, so strip the leading slash.
         await page.goto(step.route!.replace(/^\//, ""));
@@ -182,6 +183,8 @@ test.describe("?tour= deep links", () => {
   test("an unknown journey id is ignored, not fatal", async ({ page }) => {
     await stubConsoleApi(page);
     await resetTourState(page);
+    // An unknown id starts nothing, so the startup panel would open over this.
+    await suppressStartupPanel(page);
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.goto("projects?tour=no-such-journey");

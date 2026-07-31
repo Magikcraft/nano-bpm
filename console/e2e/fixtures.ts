@@ -200,6 +200,36 @@ export async function resetTourState(page: Page): Promise<void> {
 }
 
 /**
+ * Suppress the startup persona panel (#464/#471).
+ *
+ * That panel is a `role="dialog" aria-modal="true"` overlay shown on console open,
+ * and its "Show at startup" preference lives INSIDE tour state — so
+ * `resetTourState` (which deletes the key) restores the default and the panel
+ * opens. Every test here that does not start a journey therefore gets a modal on
+ * top of the page.
+ *
+ * The anchor assertions are DOM-presence (`toHaveCount`), so they pass either way
+ * — but passing because an overlay happens not to affect `toHaveCount` is luck, not
+ * design. Suppressing it explicitly keeps each test about one thing, and keeps this
+ * suite from silently becoming a test of the panel's z-index.
+ *
+ * Safe to call whether or not the panel exists: an unknown field in tour state is
+ * ignored, so this is a no-op on a console predating #471.
+ */
+export async function suppressStartupPanel(page: Page): Promise<void> {
+  await page.addInitScript(() => {
+    try {
+      const raw = window.localStorage.getItem("nano.tour.v2");
+      const state = raw ? JSON.parse(raw) : { version: 2, journeys: {} };
+      state.showStartupPanel = false;
+      window.localStorage.setItem("nano.tour.v2", JSON.stringify(state));
+    } catch {
+      /* storage disabled — the app tolerates it, so must the test */
+    }
+  });
+}
+
+/**
  * Seed journey state so a journey resumes at a chosen authored step.
  *
  * Walking a journey click-by-click is not viable for the workspace-heavy ones: a
