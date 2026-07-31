@@ -2184,6 +2184,18 @@ components:
         installed: { type: boolean }
         installedVersion: { type: string }
         updateAvailable: { type: boolean }
+        repository:
+          type: string
+          description: >-
+            Browsable source-repository URL (normalized from the package's npm
+            `repository` field, e.g. a GitHub URL), when published. Lets users
+            read the source and report issues upstream.
+        homepage:
+          type: string
+          description: Package homepage URL, when published.
+        npmUrl:
+          type: string
+          description: The package's page on the npm registry.
     Marketplace:
       type: object
       required: [entries]

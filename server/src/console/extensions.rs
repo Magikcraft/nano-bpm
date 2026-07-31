@@ -878,6 +878,59 @@ pub struct MarketEntry {
     /// True when the pack is installed and its version differs from the latest
     /// on npm — i.e. an update can be pulled.
     pub update_available: bool,
+    /// Browsable source-repository URL (normalized from the package's npm
+    /// `repository` field), when published. Lets users read the source and
+    /// report issues upstream.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    /// Package homepage URL, when published.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    /// The package's page on the npm registry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub npm_url: Option<String>,
+}
+
+/// Accept a URL only when it uses an `http`/`https` scheme, rejecting anything
+/// else (e.g. `javascript:`, `data:`, `file:`). npm package metadata is
+/// untrusted input rendered into `<a href>` in the console, so this guards
+/// against URL-injection / XSS on click. Case-insensitive on the scheme.
+fn safe_http_url(s: &str) -> Option<String> {
+    let s = s.trim();
+    let lower = s.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Normalize an npm `repository` URL into a browsable https URL. npm surfaces
+/// forms like `git+https://github.com/owner/repo.git`, `git://…`, or the SCP-ish
+/// `git@github.com:owner/repo.git`; all are rewritten to `https://…/owner/repo`.
+/// Returns `None` for empty input or any URL that is not http(s) after
+/// normalization (untrusted npm metadata — see `safe_http_url`).
+fn normalize_repo_url(raw: &str) -> Option<String> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // `git@github.com:owner/repo(.git)` → `https://github.com/owner/repo`
+    if let Some(rest) = s.strip_prefix("git@")
+        && let Some((host, path)) = rest.split_once(':')
+    {
+        let path = path.trim_end_matches(".git");
+        return Some(format!("https://{host}/{path}"));
+    }
+    let s = s.strip_prefix("git+").unwrap_or(s);
+    let s = if let Some(rest) = s.strip_prefix("git://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = s.strip_prefix("ssh://git@") {
+        format!("https://{rest}")
+    } else {
+        s.to_string()
+    };
+    safe_http_url(s.trim_end_matches(".git"))
 }
 
 /// Marketplace category derived from a pack's npm keywords. Categories are
@@ -955,6 +1008,10 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                 .as_deref()
                 .map(|iv| !iv.is_empty() && !latest.is_empty() && iv != latest)
                 .unwrap_or(false);
+            let links = &p["links"];
+            let repository = links["repository"].as_str().and_then(normalize_repo_url);
+            let homepage = links["homepage"].as_str().and_then(safe_http_url);
+            let npm_url = links["npm"].as_str().and_then(safe_http_url);
             MarketEntry {
                 installed,
                 version: latest,
@@ -963,6 +1020,9 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                 official,
                 installed_version: inst_ver,
                 update_available,
+                repository,
+                homepage,
+                npm_url,
                 name,
             }
         })
@@ -1169,6 +1229,53 @@ mod tests {
             classify_category(&[MARKETPLACE_KEYWORD.to_string()]),
             "other"
         );
+    }
+
+    #[test]
+    fn normalize_repo_url_rewrites_git_forms() {
+        let n = |s: &str| normalize_repo_url(s);
+        assert_eq!(
+            n("git+https://github.com/jwulf/nano-ide.git").as_deref(),
+            Some("https://github.com/jwulf/nano-ide")
+        );
+        assert_eq!(
+            n("git://github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            n("ssh://git@github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        assert_eq!(
+            n("git@github.com:owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        // Already-clean https URL passes through unchanged.
+        assert_eq!(
+            n("https://github.com/owner/repo").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        // Empty / whitespace yields None.
+        assert_eq!(n("   "), None);
+        // Untrusted non-http(s) schemes are rejected (no XSS via href).
+        assert_eq!(n("javascript:alert(1)"), None);
+        assert_eq!(n("data:text/html,<script>1</script>"), None);
+        assert_eq!(n("file:///etc/passwd"), None);
+    }
+
+    #[test]
+    fn safe_http_url_allows_only_http_schemes() {
+        assert_eq!(
+            safe_http_url("https://example.com").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            safe_http_url("HTTP://Example.com/x").as_deref(),
+            Some("HTTP://Example.com/x")
+        );
+        assert_eq!(safe_http_url("javascript:alert(1)"), None);
+        assert_eq!(safe_http_url("ftp://host/f"), None);
+        assert_eq!(safe_http_url(""), None);
     }
 
     #[test]
