@@ -13,7 +13,7 @@
 // localStorage "seen" flag so it auto-starts only on first run.
 
 import { useCallback, useEffect, useMemo, useRef } from "react";
-import { useNavigate } from "react-router-dom";
+import { useNavigate, useLocation } from "react-router-dom";
 import { driver, type Driver, type DriveStep } from "driver.js";
 import "driver.js/dist/driver.css";
 import "./tour.css";
@@ -60,14 +60,24 @@ export function useProductTour(
 ): ProductTour {
   const { autoStart = false } = options;
   const navigate = useNavigate();
+  const location = useLocation();
+  // Kept in a ref so goToRoute can read the live pathname without taking
+  // location as a dependency (which would churn the callback every navigation).
+  const pathnameRef = useRef(location.pathname);
+  pathnameRef.current = location.pathname;
   const driverRef = useRef<Driver | null>(null);
   const steps = useMemo(() => getTourSteps(), []);
 
   // Navigate to a step's route (if any) before it is shown; driver.js's
-  // waitForElement then handles the async mount on the new route.
+  // waitForElement then handles the async mount on the new route. Skip the
+  // navigation when we're already on that route — consecutive same-route steps
+  // (e.g. projects-nav → new-project, both on /projects) would otherwise push
+  // redundant history entries and break the tour's Back button.
   const goToRoute = useCallback(
     (step: TourStep | undefined) => {
-      if (step?.route) navigate(step.route);
+      if (step?.route && step.route !== pathnameRef.current) {
+        navigate(step.route);
+      }
     },
     [navigate],
   );
