@@ -97,8 +97,8 @@ pack (including `rust`) is installed from npm.
 ### Trust and consent
 
 A pack's *manifest* is pure data, but a `lang`/`app` pack's **toolchain commands
-run on your machine**, and a `trigger`/connector pack's **driver/worker runs as a
-supervised child process**. Both are gated by a per-workspace trust store at
+run on your machine**, and a `trigger`/connector pack's **driver or worker child
+runs as a supervised process**. Both are gated by a per-workspace trust store at
 `<workspace>/extensions/trust.json`:
 
 - **per-extension approve-always** — allow one pack's code to run without

@@ -1079,6 +1079,13 @@ mod tests {
         workers::usable_node().is_some() || workers::find_deno().is_some()
     }
 
+    /// Grace period a withheld-pack test waits before concluding no child
+    /// launched. A safety net, not a correctness signal: a launched driver/worker
+    /// reaches out within ~1s locally, and the happy-path twins observe a launch
+    /// well inside this budget; 8s leaves ample headroom for a slow cold start on
+    /// a loaded CI runner without the per-poll cost of the (~500ms) inbox query.
+    const WITHHELD_GRACE: Duration = Duration::from_secs(8);
+
     /// Materialise a fresh Urban App project (sqlite datasource + optional
     /// `triggers[]`) under a unique projects root, and return its name.
     fn setup_app(triggers_json: &str) -> String {
@@ -1584,18 +1591,12 @@ await new Promise((r) => setTimeout(r, 60000));
         let handle = LoopHandle::new_running();
         crate::console::trigger_sources::spawn_sources(&name, &manifest, handle.clone());
 
-        // Watch for ~1.5s — ample time for a launched driver to emit its first
-        // event (it fetches immediately). Nothing must land.
-        let mut pending = 0;
-        for _ in 0..15 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if let Ok(s) = inbox_status(&name).await {
-                pending = s.pending;
-                if pending > 0 {
-                    break;
-                }
-            }
-        }
+        // Give a would-be driver the full grace period to launch + emit (a real
+        // launch posts within ~1s), then check the inbox once. A single expensive
+        // inbox query instead of a tight poll keeps the test bounded (~8s) rather
+        // than paying ~500ms per iteration across a long window.
+        tokio::time::sleep(WITHHELD_GRACE).await;
+        let pending = inbox_status(&name).await.map(|s| s.pending).unwrap_or(0);
 
         handle.stop_for_test();
         server.abort();
@@ -1646,7 +1647,7 @@ for (let i = 0; i < 100; i++) {
             pack.join("nano-ide.ext.json"),
             r#"{
                 "id": "nano-ide-connector-testpack",
-                "kind": "trigger",
+                "kind": "app",
                 "displayName": "Test connector pack",
                 "workers": [
                     { "type": "test:job", "entry": "worker.mjs", "displayName": "Test worker" }
@@ -1740,15 +1741,11 @@ for (let i = 0; i < 100; i++) {
         let handle = LoopHandle::new_running();
         crate::console::trigger_sources::spawn_workers(&name, &manifest, handle.clone());
 
-        // Watch ~1.5s — ample for a launched worker to connect. Nothing must.
-        let mut launched = false;
-        for _ in 0..15 {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            if hit.load(Ordering::Relaxed) {
-                launched = true;
-                break;
-            }
-        }
+        // Give a would-be worker the full grace period to launch + connect (the
+        // happy-path twin observes a launch well inside this budget), then check
+        // the cheap hit flag once.
+        tokio::time::sleep(WITHHELD_GRACE).await;
+        let launched = hit.load(Ordering::Relaxed);
 
         handle.stop_for_test();
         server.abort();
