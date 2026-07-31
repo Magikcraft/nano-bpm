@@ -1228,27 +1228,88 @@ pub fn pack_readme(pkg: &str) -> Option<PackReadme> {
 /// `uv` installer) and `~/.cargo/bin` (rustup). We fall back to those so a
 /// pack's toolchain (`uv`, `cargo`, …) is found for both detection and
 /// execution without the operator having to symlink or patch PATH.
+///
+/// On Windows the tools we resolve are batch shims, not bare executables:
+/// `npm` ships as `npm.cmd`, `deno`/`tar` as `.exe`. A literal `dir\npm`
+/// probe therefore matches nothing (or, worse, the non-runnable POSIX shell
+/// shim npm also drops next to `npm.cmd`), which is why the console showed an
+/// empty extension marketplace on Windows: `find_program("npm")` returned
+/// `None` and `marketplace()` failed with "npm not found on PATH". So on
+/// Windows we mirror cmd.exe's PATHEXT resolution — try `name` + each PATHEXT
+/// extension (`.CMD`, `.EXE`, …) before the bare name. `USERPROFILE` is also
+/// consulted as the home dir since Windows does not set `HOME`.
 pub fn find_program(name: &str) -> Option<PathBuf> {
+    let candidates = program_file_candidates(name, cfg!(windows), std::env::var("PATHEXT").ok());
+    let first_existing = |dir: &std::path::Path| -> Option<PathBuf> {
+        candidates.iter().find_map(|cand| {
+            let c = dir.join(cand);
+            c.is_file().then_some(c)
+        })
+    };
     if let Ok(path) = std::env::var("PATH") {
         for d in std::env::split_paths(&path) {
-            let c = d.join(name);
-            if c.is_file() {
-                return Some(c);
+            if let Some(hit) = first_existing(&d) {
+                return Some(hit);
             }
         }
     }
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = PathBuf::from(home);
-        for sub in [
-            home.join(".local").join("bin").join(name),
-            home.join(".cargo").join("bin").join(name),
+    let home_dirs = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from);
+    for home in home_dirs {
+        for bin in [
+            home.join(".local").join("bin"),
+            home.join(".cargo").join("bin"),
         ] {
-            if sub.is_file() {
-                return Some(sub);
+            if let Some(hit) = first_existing(&bin) {
+                return Some(hit);
             }
         }
     }
     None
+}
+
+/// Build the ordered list of filenames to probe for a program in a directory.
+///
+/// POSIX: just the bare name. Windows: `name` + each extension from `PATHEXT`
+/// (executable extensions come first so `npm.cmd` wins over npm's non-runnable
+/// bare POSIX shim), then the bare name last as a fallback. A name that already
+/// carries a PATHEXT extension is probed verbatim only. Exported for unit tests
+/// so the Windows branch is exercised from a POSIX host.
+pub(crate) fn program_file_candidates(
+    name: &str,
+    windows: bool,
+    pathext: Option<String>,
+) -> Vec<String> {
+    if !windows {
+        return vec![name.to_string()];
+    }
+    // Default mirrors a stock Windows PATHEXT.
+    let raw = pathext.unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string());
+    let exts: Vec<String> = raw
+        .split(';')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| {
+            if e.starts_with('.') {
+                e.to_string()
+            } else {
+                format!(".{e}")
+            }
+        })
+        .map(|e| e.to_ascii_lowercase())
+        .collect();
+    // If the name already ends with one of these extensions, use it verbatim.
+    let already_has_ext = exts
+        .iter()
+        .any(|e| name.to_ascii_lowercase().ends_with(&e.to_ascii_lowercase()));
+    if already_has_ext {
+        return vec![name.to_string()];
+    }
+    let mut out: Vec<String> = exts.iter().map(|e| format!("{name}{e}")).collect();
+    out.push(name.to_string());
+    out
 }
 
 /// Whether a pack's toolchain is installed (detect probe). Built-in/empty => true.
@@ -1541,6 +1602,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
 
         assert_eq!(found.as_deref(), Some(local_bin.join(&tool).as_path()));
+    }
+
+    /// Regression for the empty Windows extension marketplace: on Windows `npm`
+    /// is `npm.cmd`, so `find_program("npm")` must probe PATHEXT extensions, not
+    /// just the bare name. Exercised from POSIX via the pure candidate builder.
+    #[test]
+    fn windows_program_candidates_apply_pathext() {
+        // Windows: npm.cmd / deno.exe must be probed, and executable
+        // extensions come BEFORE the bare name (npm ships a non-runnable POSIX
+        // shim named exactly `npm` next to `npm.cmd`).
+        let npm = program_file_candidates("npm", true, Some(".COM;.EXE;.BAT;.CMD".to_string()));
+        assert_eq!(
+            npm,
+            vec!["npm.com", "npm.exe", "npm.bat", "npm.cmd", "npm"]
+                .into_iter()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+            "npm.cmd must be a probed candidate, ahead of the bare name"
+        );
+        assert!(
+            npm.iter().position(|c| c == "npm.cmd").unwrap()
+                < npm.iter().position(|c| c == "npm").unwrap(),
+            "the runnable shim must win over the bare POSIX shim"
+        );
+
+        // A name that already carries a PATHEXT extension is probed verbatim.
+        assert_eq!(
+            program_file_candidates("npm.cmd", true, None),
+            vec!["npm.cmd".to_string()]
+        );
+
+        // Missing PATHEXT falls back to a sane default that still includes .CMD.
+        assert!(program_file_candidates("npm", true, None).contains(&"npm.cmd".to_string()));
+
+        // POSIX is unchanged: bare name only, no extension games.
+        assert_eq!(
+            program_file_candidates("npm", false, Some(".EXE;.CMD".to_string())),
+            vec!["npm".to_string()]
+        );
+    }
+
+    /// Class-scoped: the same PATHEXT resolution must let `find_program` locate
+    /// a `.cmd` shim on PATH under Windows semantics — the exact failure that
+    /// hid every extension. Emulated on POSIX by placing a `<tool>.cmd` file on
+    /// PATH and asserting the Windows candidate list would select it.
+    #[test]
+    fn windows_find_program_resolves_cmd_shim() {
+        let dir = std::env::temp_dir().join(format!("nano-fp-cmd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("npm.cmd"), b"@echo off\n").unwrap();
+
+        // Under Windows semantics, `npm` resolves to the `.cmd` shim on PATH.
+        let cands = program_file_candidates("npm", true, None);
+        let hit = cands.iter().find_map(|c| {
+            let p = dir.join(c);
+            p.is_file().then_some(p)
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            hit.as_deref().and_then(|p| p.file_name()),
+            Some(std::ffi::OsStr::new("npm.cmd"))
+        );
     }
 
     #[test]
