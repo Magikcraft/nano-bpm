@@ -497,6 +497,21 @@ pub fn extensions_root() -> PathBuf {
     }
 }
 
+/// The installed-pack directories under [`extensions_root`], sorted by path so
+/// the on-disk scan order is deterministic. `read_dir` yields entries in an
+/// arbitrary, platform/filesystem-dependent order, which would make every
+/// "first-pack-wins" resolver ([`all_extensions`], [`trigger_driver`],
+/// [`worker_driver`], …) nondeterministic; sorting gives one stable resolution
+/// order. Returns empty when the root is missing or unreadable.
+fn pack_dirs() -> Vec<PathBuf> {
+    let Ok(rd) = std::fs::read_dir(extensions_root()) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    dirs.sort();
+    dirs
+}
+
 fn manifest_name() -> &'static str {
     "nano-ide.ext.json"
 }
@@ -506,15 +521,13 @@ fn manifest_name() -> &'static str {
 pub fn all_extensions() -> Vec<ExtManifest> {
     let mut out = builtin_extensions();
     let seen: BTreeSet<String> = out.iter().map(|e| e.id.clone()).collect();
-    if let Ok(rd) = std::fs::read_dir(extensions_root()) {
-        for entry in rd.flatten() {
-            let mf = entry.path().join(manifest_name());
-            if let Ok(txt) = std::fs::read_to_string(&mf)
-                && let Ok(m) = serde_json::from_str::<ExtManifest>(&txt)
-                && !seen.contains(&m.id)
-            {
-                out.push(m);
-            }
+    for base in pack_dirs() {
+        let mf = base.join(manifest_name());
+        if let Ok(txt) = std::fs::read_to_string(&mf)
+            && let Ok(m) = serde_json::from_str::<ExtManifest>(&txt)
+            && !seen.contains(&m.id)
+        {
+            out.push(m);
         }
     }
     out
@@ -561,9 +574,7 @@ pub struct TriggerDriver {
 /// path-escaping / missing driver file. First matching pack wins, mirroring
 /// [`all_trigger_sources`]'s first-wins dedup.
 pub fn trigger_driver(kind: &str) -> Option<TriggerDriver> {
-    let rd = std::fs::read_dir(extensions_root()).ok()?;
-    for entry in rd.flatten() {
-        let base = entry.path();
+    for base in pack_dirs() {
         let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
             continue;
         };
@@ -602,9 +613,7 @@ pub struct WorkerDriver {
 /// type but no `entry` (declaration-only — run out-of-band), or a path-escaping
 /// / missing entry file. First matching pack wins, mirroring [`trigger_driver`].
 pub fn worker_driver(worker_type: &str) -> Option<WorkerDriver> {
-    let rd = std::fs::read_dir(extensions_root()).ok()?;
-    for entry in rd.flatten() {
-        let base = entry.path();
+    for base in pack_dirs() {
         let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
             continue;
         };
@@ -639,9 +648,7 @@ pub fn find_ext(id: &str) -> Option<ExtManifest> {
 /// tarball) or when the pack dir isn't found. Used as the `scaffoldedFrom.
 /// version` breadcrumb on a project — never as a run-time gate.
 pub fn pack_version(ext_id: &str) -> Option<String> {
-    let rd = std::fs::read_dir(extensions_root()).ok()?;
-    for entry in rd.flatten() {
-        let base = entry.path();
+    for base in pack_dirs() {
         let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
             continue;
         };
@@ -669,11 +676,7 @@ pub fn pack_version(ext_id: &str) -> Option<String> {
 /// Path-escaping paths, missing files, and malformed JSON are skipped so a bad
 /// pack never blanks the palette. Built-in packs (no on-disk dir) yield nothing.
 pub fn pack_component_templates(ext_id: &str) -> Vec<serde_json::Value> {
-    let Ok(rd) = std::fs::read_dir(extensions_root()) else {
-        return vec![];
-    };
-    for entry in rd.flatten() {
-        let base = entry.path();
+    for base in pack_dirs() {
         let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
             continue;
         };
@@ -737,9 +740,7 @@ fn safe_pack_path(base: &std::path::Path, rel: &str) -> Option<PathBuf> {
 /// installed pack: `templates/<template_id>` for lang/app packs, or the
 /// example's `appDir`. Returns (manifest, dir) so the scaffolder can copy it.
 pub fn template_source(template_id: &str) -> Option<(ExtManifest, PathBuf)> {
-    let rd = std::fs::read_dir(extensions_root()).ok()?;
-    for entry in rd.flatten() {
-        let base = entry.path();
+    for base in pack_dirs() {
         // The extensions root holds more than pack dirs — the trust store
         // (trust.json), OS litter (.DS_Store), a mid-install tarball. Skip
         // anything without a readable manifest instead of aborting the scan:
@@ -907,9 +908,7 @@ pub fn remove(pkg: &str) -> Result<(), String> {
 /// so callers holding only a manifest id (like the Console UI) can uninstall
 /// without also carrying the pack's npm package name.
 fn pack_dir_by_manifest_id(ext_id: &str) -> Option<PathBuf> {
-    let rd = std::fs::read_dir(extensions_root()).ok()?;
-    for entry in rd.flatten() {
-        let base = entry.path();
+    for base in pack_dirs() {
         if !base.is_dir() {
             continue;
         }

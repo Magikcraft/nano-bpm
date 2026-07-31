@@ -434,6 +434,11 @@ fn resolve_connection(manifest: &Json, trigger: &Json) -> Json {
 /// Backoff floor/ceiling for respawning a crashed pack driver.
 const DRIVER_BACKOFF_MIN: Duration = Duration::from_millis(500);
 const DRIVER_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// A driver/worker that stays up at least this long counts as a healthy run, so
+/// its next restart starts fresh from [`DRIVER_BACKOFF_MIN`]. Shorter-lived
+/// exits are treated as a crash-loop and keep ramping the backoff toward the
+/// cap, instead of resetting to the floor on every exit.
+const DRIVER_HEALTHY_UPTIME: Duration = DRIVER_BACKOFF_MAX;
 
 /// Supervise one pack source's out-of-process driver (ADR 0025 phase 4): launch
 /// it (Node-first, ADR 0038), pipe its logs, and on crash restart with capped
@@ -481,6 +486,7 @@ async fn run_pack_driver(
             token.as_deref(),
         ) {
             Ok(mut child) => {
+                let started = std::time::Instant::now();
                 let pid = child.id().unwrap_or(0);
                 tracing::info!(project, trigger = id, kind, pid, "trigger driver started");
                 let stopped = tokio::select! {
@@ -500,8 +506,11 @@ async fn run_pack_driver(
                 if stopped {
                     break;
                 }
-                // A driver that stayed up a while gets a fresh backoff window.
-                backoff = DRIVER_BACKOFF_MIN;
+                // A driver that stayed up a while gets a fresh backoff window;
+                // a fast crash-loop keeps ramping the backoff toward the cap.
+                if started.elapsed() >= DRIVER_HEALTHY_UPTIME {
+                    backoff = DRIVER_BACKOFF_MIN;
+                }
             }
             Err(e) => {
                 tracing::error!(
@@ -671,6 +680,7 @@ async fn run_pack_worker(
     while handle.is_running() {
         match spawn_worker_child(&driver, &base_url, &project, &task_type, &worker_name) {
             Ok(mut child) => {
+                let started = std::time::Instant::now();
                 let pid = child.id().unwrap_or(0);
                 tracing::info!(project, worker = task_type, pid, "connector worker started");
                 let stopped = tokio::select! {
@@ -690,7 +700,11 @@ async fn run_pack_worker(
                 if stopped {
                     break;
                 }
-                backoff = DRIVER_BACKOFF_MIN;
+                // A worker that stayed up a while gets a fresh backoff window;
+                // a fast crash-loop keeps ramping the backoff toward the cap.
+                if started.elapsed() >= DRIVER_HEALTHY_UPTIME {
+                    backoff = DRIVER_BACKOFF_MIN;
+                }
             }
             Err(e) => {
                 tracing::error!(
