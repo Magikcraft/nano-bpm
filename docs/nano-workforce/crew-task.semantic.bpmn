@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  id="nano-workforce-defs"
+                  targetNamespace="https://nanobpm.io/workforce">
+  <bpmn:message id="msg-task-requested" name="workforce.task-requested" />
+  <bpmn:message id="msg-crewmate-status" name="workforce.crewmate-status" />
+
+  <bpmn:process id="crew-task" name="Crew Task" isExecutable="true">
+    <!-- Intake: a connector / chat / issue-label trigger creates one instance per task. -->
+    <bpmn:startEvent id="start-requested" name="Task requested">
+      <bpmn:messageEventDefinition id="med-requested" messageRef="msg-task-requested" />
+      <bpmn:outgoing>f-start-dispatch</bpmn:outgoing>
+    </bpmn:startEvent>
+
+    <!-- DMN: task-shape x risk x quota -> {harness, model, effort, mode}. -->
+    <bpmn:businessRuleTask id="dispatch" name="Dispatch decision">
+      <bpmn:extensionElements>
+        <zeebe:calledDecision decisionId="workforce-dispatch" resultVariable="dispatch" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f-start-dispatch</bpmn:incoming>
+      <bpmn:outgoing>f-dispatch-claim</bpmn:outgoing>
+    </bpmn:businessRuleTask>
+
+    <!-- Claim: acquire a worktree lease (the mutex) via a job worker. -->
+    <bpmn:serviceTask id="claim" name="Acquire worktree lease">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="workforce.claim" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f-dispatch-claim</bpmn:incoming>
+      <bpmn:outgoing>f-claim-run</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <!-- Run crewmate: worker spawns an agent in the leased worktree and streams
+         status; a non-interrupting boundary timer escalates a wedged crewmate. -->
+    <bpmn:serviceTask id="run-crewmate" name="Run crewmate">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="workforce.run-crewmate" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f-claim-run</bpmn:incoming>
+      <bpmn:incoming>f-inspect-run</bpmn:incoming>
+      <bpmn:outgoing>f-run-outcome</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:boundaryEvent id="wedge-timer" name="Stale / wedged" attachedToRef="run-crewmate" cancelActivity="false">
+      <bpmn:timerEventDefinition id="ted-wedge">
+        <bpmn:timeDuration>PT10M</bpmn:timeDuration>
+      </bpmn:timerEventDefinition>
+      <bpmn:outgoing>f-wedge-inspect</bpmn:outgoing>
+    </bpmn:boundaryEvent>
+
+    <bpmn:userTask id="inspect" name="Inspect wedged crewmate">
+      <bpmn:incoming>f-wedge-inspect</bpmn:incoming>
+      <bpmn:outgoing>f-inspect-run</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <!-- Ship or scout? -->
+    <bpmn:exclusiveGateway id="gw-outcome" name="Outcome?">
+      <bpmn:incoming>f-run-outcome</bpmn:incoming>
+      <bpmn:outgoing>f-outcome-mode</bpmn:outgoing>
+      <bpmn:outgoing>f-outcome-report</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <!-- Ship: gate validation by project mode. -->
+    <bpmn:exclusiveGateway id="gw-mode" name="Mode?">
+      <bpmn:incoming>f-outcome-mode</bpmn:incoming>
+      <bpmn:outgoing>f-mode-validate</bpmn:outgoing>
+      <bpmn:outgoing>f-mode-approve</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:callActivity id="validate" name="Validate (no-mistakes)">
+      <bpmn:extensionElements>
+        <zeebe:calledElement processId="workforce-validate" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f-mode-validate</bpmn:incoming>
+      <bpmn:outgoing>f-validate-approve</bpmn:outgoing>
+    </bpmn:callActivity>
+
+    <bpmn:exclusiveGateway id="gw-approve-join">
+      <bpmn:incoming>f-mode-approve</bpmn:incoming>
+      <bpmn:incoming>f-validate-approve</bpmn:incoming>
+      <bpmn:outgoing>f-join-approve</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <!-- Captain decision: hard rule "never merge without the captain's word". -->
+    <bpmn:userTask id="approve-merge" name="Approve merge?">
+      <bpmn:incoming>f-join-approve</bpmn:incoming>
+      <bpmn:outgoing>f-approve-land</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <bpmn:serviceTask id="land" name="Merge / land">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="workforce.land" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f-approve-land</bpmn:incoming>
+      <bpmn:outgoing>f-land-teardown</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <!-- Scout: write a standalone report, then a human reviews it. -->
+    <bpmn:serviceTask id="write-report" name="Write report">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="workforce.write-report" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f-outcome-report</bpmn:incoming>
+      <bpmn:outgoing>f-report-review</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:userTask id="review-findings" name="Review findings">
+      <bpmn:incoming>f-report-review</bpmn:incoming>
+      <bpmn:outgoing>f-review-teardown</bpmn:outgoing>
+    </bpmn:userTask>
+
+    <!-- Teardown: fail-closed; committed work must be landed before the worktree returns. -->
+    <bpmn:exclusiveGateway id="gw-teardown-join">
+      <bpmn:incoming>f-land-teardown</bpmn:incoming>
+      <bpmn:incoming>f-review-teardown</bpmn:incoming>
+      <bpmn:outgoing>f-join-teardown</bpmn:outgoing>
+    </bpmn:exclusiveGateway>
+
+    <bpmn:serviceTask id="teardown" name="Teardown worktree">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="workforce.teardown" />
+      </bpmn:extensionElements>
+      <bpmn:incoming>f-join-teardown</bpmn:incoming>
+      <bpmn:outgoing>f-teardown-done</bpmn:outgoing>
+    </bpmn:serviceTask>
+
+    <bpmn:endEvent id="end-done" name="Task done">
+      <bpmn:incoming>f-teardown-done</bpmn:incoming>
+    </bpmn:endEvent>
+
+    <bpmn:sequenceFlow id="f-start-dispatch" sourceRef="start-requested" targetRef="dispatch" />
+    <bpmn:sequenceFlow id="f-dispatch-claim" sourceRef="dispatch" targetRef="claim" />
+    <bpmn:sequenceFlow id="f-claim-run" sourceRef="claim" targetRef="run-crewmate" />
+    <bpmn:sequenceFlow id="f-wedge-inspect" sourceRef="wedge-timer" targetRef="inspect" />
+    <bpmn:sequenceFlow id="f-inspect-run" sourceRef="inspect" targetRef="run-crewmate" />
+    <bpmn:sequenceFlow id="f-run-outcome" sourceRef="run-crewmate" targetRef="gw-outcome" />
+    <bpmn:sequenceFlow id="f-outcome-mode" name="ship" sourceRef="gw-outcome" targetRef="gw-mode">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=shape = "ship"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f-outcome-report" name="scout" sourceRef="gw-outcome" targetRef="write-report" />
+    <bpmn:sequenceFlow id="f-mode-validate" name="no-mistakes" sourceRef="gw-mode" targetRef="validate">
+      <bpmn:conditionExpression xsi:type="bpmn:tFormalExpression">=dispatch.mode = "no-mistakes"</bpmn:conditionExpression>
+    </bpmn:sequenceFlow>
+    <bpmn:sequenceFlow id="f-mode-approve" name="direct-PR / local-only" sourceRef="gw-mode" targetRef="gw-approve-join" />
+    <bpmn:sequenceFlow id="f-validate-approve" sourceRef="validate" targetRef="gw-approve-join" />
+    <bpmn:sequenceFlow id="f-join-approve" sourceRef="gw-approve-join" targetRef="approve-merge" />
+    <bpmn:sequenceFlow id="f-approve-land" sourceRef="approve-merge" targetRef="land" />
+    <bpmn:sequenceFlow id="f-land-teardown" sourceRef="land" targetRef="gw-teardown-join" />
+    <bpmn:sequenceFlow id="f-report-review" sourceRef="write-report" targetRef="review-findings" />
+    <bpmn:sequenceFlow id="f-review-teardown" sourceRef="review-findings" targetRef="gw-teardown-join" />
+    <bpmn:sequenceFlow id="f-join-teardown" sourceRef="gw-teardown-join" targetRef="teardown" />
+    <bpmn:sequenceFlow id="f-teardown-done" sourceRef="teardown" targetRef="end-done" />
+  </bpmn:process>
+</bpmn:definitions>
