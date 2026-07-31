@@ -39,6 +39,7 @@ import { overviewJourneyId } from "./journeys/overview";
 // effect, eagerly, so it is offered in the picker and reachable via ?tour=
 // before its own view (Explorer, lazy-loaded) has mounted.
 import "./journeys/localdev";
+import "./journeys/rad";
 
 /**
  * Delay before an auto-started journey opens, letting the initial route and the

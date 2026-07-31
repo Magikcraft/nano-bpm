@@ -22,6 +22,7 @@ import type { Journey } from "./types.ts";
 // Import for the registration side effect.
 import "./journeys/overview.ts";
 import "./journeys/localdev.ts";
+import "./journeys/rad.ts";
 
 const KNOWN_SELECTORS = new Set(
   Object.values(TOUR_ANCHOR).map((a) => tourSelector(a)),
@@ -48,6 +49,12 @@ const RENDERS_IN = {
 
 const anchorOf = (selector: string): string =>
   selector.slice('[data-tour="'.length, -2);
+
+// Template cards (`data-tour="template-<id>"`, slice 4 / #411) are derived
+// dynamically via `templateAnchor()`, so they are not in `TOUR_ANCHOR`. They are
+// studio-only (the Projects/New-project surface the observe build strips).
+const isTemplateAnchor = (anchor: string): boolean =>
+  anchor.startsWith("template-");
 
 const journeys = allJourneys();
 
@@ -97,7 +104,8 @@ for (const journey of journeys) {
     for (const s of eachStep(journey)) {
       if (s.kind !== "spotlight") continue;
       assert.ok(
-        KNOWN_SELECTORS.has(s.selector),
+        KNOWN_SELECTORS.has(s.selector) ||
+          isTemplateAnchor(anchorOf(s.selector)),
         `step ${s.id} uses unknown selector ${s.selector} — derive it from TOUR_ANCHOR`,
       );
     }
@@ -108,6 +116,14 @@ for (const journey of journeys) {
       for (const s of eachStep(journey)) {
         if (s.kind !== "spotlight") continue;
         const anchor = anchorOf(s.selector);
+        if (isTemplateAnchor(anchor)) {
+          assert.equal(
+            profile,
+            "studio",
+            `${journey.id} step ${s.id} targets template card ${anchor}, which only renders in studio`,
+          );
+          continue;
+        }
         assert.ok(
           RENDERS_IN[profile].has(anchor as never),
           `${journey.id} step ${s.id} targets ${anchor}, which does not render in ${profile}`,
