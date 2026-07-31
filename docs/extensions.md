@@ -97,9 +97,8 @@ pack (including `rust`) is installed from npm.
 ### Trust and consent
 
 A pack's *manifest* is pure data, but a `lang`/`app` pack's **toolchain commands
-run on your machine**, and a `trigger`/connector pack's **driver/worker runs as a
-supervised child process**. Those are gated by a per-workspace trust store at
-`<workspace>/extensions/trust.json`:
+run on your machine**. Those toolchain commands are gated by a per-workspace trust
+store at `<workspace>/extensions/trust.json`:
 
 - **per-extension approve-always** — allow one pack's commands to run without
   prompting;
@@ -108,6 +107,12 @@ supervised child process**. Those are gated by a per-workspace trust store at
 Both are **off by default**; built-in packs are pre-trusted. Manifest reading,
 grammar/theme/template wiring, and BPMN element templates need no trust (they run
 nothing).
+
+> **Scope of the gate.** Only `lang`/`app` toolchain **run/compile** commands
+> consult `trust.json` today. A `trigger`/connector pack's **driver/worker child
+> process** is currently supervised but **not** trust-gated — it launches when its
+> app runs. Only install packs whose driver/worker code you trust, and prefer
+> official (`@nanobpm/`) packs for those kinds.
 
 ---
 
@@ -361,8 +366,9 @@ using that trigger runs.
   `.ts`/`.js`/`.mjs`) with the **pack directory as its working directory**,
   restarts it with backoff on crash, and kills it when the app stops. Omit
   `driver` for a declaration-only source you run out-of-band.
-- Drivers/workers are **trust-gated** and their deps must be vendored in the
-  tarball.
+- Drivers/workers run as **supervised child processes** and their deps must be
+  vendored in the tarball. Note the driver/worker child is **not** trust-gated
+  today (unlike `lang`/`app` toolchain commands) — it launches with its app.
 
 Keywords: `["nano-ide-ext", "nano-ide-trigger"]`.
 
@@ -419,5 +425,7 @@ and [ADR 0033](adr/0033-urban-element-templates-first-class-components.md)).
 
 Because the host never runs your install scripts and reads the manifest as data,
 a pack is safe to browse; the only code that ever executes is a `lang`/`app`
-toolchain command or a `trigger`/connector driver/worker — each **trust-gated** on
-the user's machine.
+toolchain command — **trust-gated** on the user's machine — or a
+`trigger`/connector driver/worker, which runs as a supervised child process when
+its app runs (not currently trust-gated, so install those kinds only from packs
+you trust).
