@@ -32,6 +32,12 @@ export interface TourState {
   version: 2;
   /** Which journey the user picked, when they chose one explicitly. */
   persona?: string;
+  /**
+   * Whether the startup persona panel (#464) auto-opens when the console is
+   * opened. Absent means "show" — the panel is on by default; the user turns it
+   * off with its "Show at startup" checkbox, which persists `false` here.
+   */
+  showStartupPanel?: boolean;
   journeys: Record<string, JourneyRecord>;
 }
 
@@ -151,6 +157,20 @@ export function activeJourneyId(state: TourState): string | undefined {
 
 export function hasCompleted(state: TourState, journeyId: string): boolean {
   return recordFor(state, journeyId).status === "completed";
+}
+
+/**
+ * Whether the startup persona panel should auto-open (#464). Default is `true`
+ * — absent means show — so a fresh install is greeted by the panel, and only an
+ * explicit `false` (the user unchecking "Show at startup") suppresses it.
+ */
+export function startupPanelEnabled(state: TourState): boolean {
+  return state.showStartupPanel !== false;
+}
+
+/** Persist the "Show at startup" preference, returning the new state. */
+export function withStartupPanel(state: TourState, show: boolean): TourState {
+  return { ...state, showStartupPanel: show };
 }
 
 /** Clear all journey state — the "show me the onboarding again" lever. */

@@ -131,16 +131,31 @@ align), and far healthier upstream (1.4M dl/wk vs 167k; released weekly vs last 
 > 1 yr ago). reactour's only edge — built-in focus-lock a11y — didn't outweigh it. The
 > reactour spike lived on `feat/console-tour-reactour` (PR #397, closed).
 
+## Entry points
+
+The front door is the **startup persona panel** ([#464](https://github.com/Magikcraft/nano-bpm/issues/464)):
+a modal shown when the console is opened, listing the offerable journeys as
+first-person personas ("I want to …") the person self-selects. A **"Show at
+startup" checkbox** (default checked, persisted as `showStartupPanel` in
+`nano.tour.v2`) turns it off for returning users. This replaced the earlier
+design where `c8ctl` sprayed `…/console?tour=<id>` links across every
+`start` / `hire` / `work` — the persona is now chosen _in_ the console, by the
+person, not encoded in whichever link they happened to click.
+
+Other ways in:
+
+- **`JourneyPicker`** — the same journeys as cards on the Projects/Topology empty
+  state ([#411](https://github.com/Magikcraft/nano-bpm/issues/411)).
+- **Take a tour** in the rail (**Resume tour** when a journey was interrupted).
+- **`?tour=<journeyId>`** deep links still work (parsed by `deepLink.ts`, stripped
+  once started) — a valid, no-longer-advertised entry, kept for links already in
+  the wild. Nothing emits them anymore.
+
 ## Try it
 
 ```bash
 npm run dev
 ```
-
-`?tour=<journeyId>` starts a journey directly — this is what `c8ctl nano start` / `hire`
-will print ([#413](https://github.com/Magikcraft/nano-bpm/issues/413)), so the entry
-point chooses the journey instead of the console guessing the persona. The param is
-stripped once the journey starts, so a refresh does not restart it.
 
 To replay: **Take a tour** in the rail (**Resume tour** when a journey was interrupted).
 To forget everything: `localStorage.removeItem("nano.tour.v2")`, or `resetTour()`.

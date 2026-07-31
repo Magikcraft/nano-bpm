@@ -189,6 +189,8 @@ export const rad: Journey = {
   title: "Prototype a fullstack app in 90 seconds",
   blurb:
     "Process, screens, the app's own database and workers — one project, compiled to a single binary. No frontend, no external server.",
+  persona:
+    "prototype a fullstack app — process, screens, database and workers in one binary",
   // Studio-only: this is the maker journey. The lean `observe` build strips the
   // Projects, editor and Run surfaces every step here points at (ADR 0034).
   profiles: ["studio"],

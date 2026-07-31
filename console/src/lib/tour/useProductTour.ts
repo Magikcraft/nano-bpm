@@ -26,7 +26,9 @@ import {
   readState,
   recordFor,
   resetState,
+  startupPanelEnabled,
   withJourney,
+  withStartupPanel,
   writeState,
   type TourState,
 } from "./state";
@@ -97,6 +99,13 @@ export interface ProductTour {
   isRunning: boolean;
   /** Forget all journey state so onboarding can be seen again. */
   resetTour: () => void;
+  /**
+   * Whether the startup persona panel (#464) is enabled to auto-open. Default
+   * true; the panel's "Show at startup" checkbox flips it.
+   */
+  showStartupPanel: boolean;
+  /** Persist the "Show at startup" preference. */
+  setShowStartupPanel: (show: boolean) => void;
 }
 
 export function useProductTour(
@@ -118,6 +127,14 @@ export function useProductTour(
     journeysFor(CONSOLE_PROFILE),
   );
   const [running, setRunning] = useState(false);
+  const [showStartupPanel, setShowStartupPanelState] = useState<boolean>(() =>
+    startupPanelEnabled(readState()),
+  );
+
+  const setShowStartupPanel = useCallback((show: boolean) => {
+    writeState(withStartupPanel(readState(), show));
+    setShowStartupPanelState(show);
+  }, []);
 
   const persist = useCallback((next: TourState) => {
     writeState(next);
@@ -293,5 +310,7 @@ export function useProductTour(
     activeJourney: activeId ? getJourney(activeId) : undefined,
     isRunning: running,
     resetTour,
+    showStartupPanel,
+    setShowStartupPanel,
   };
 }

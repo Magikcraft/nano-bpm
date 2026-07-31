@@ -191,6 +191,8 @@ export const localdev: Journey = {
   title: "Run it as a headless engine",
   blurb:
     "Replace Docker + Zeebe + Elasticsearch for local dev — point your existing Camunda 8 client at one URL.",
+  persona:
+    "run a local Camunda-compatible engine (no Docker, no Zeebe, no Elasticsearch)",
   // Profile-agnostic on purpose: an operator on the lean `observe` build benefits
   // from steps 2–4 just as much as a maker does. It is the only one of the three
   // journeys where the persona does not depend on the build.

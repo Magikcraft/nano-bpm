@@ -18,10 +18,12 @@ import { useTheme } from "./theme/ThemeProvider";
 import { getExtensions, getMarketplace, getTopology } from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
-import { IS_STUDIO } from "./lib/profile";
+import { IS_STUDIO, CONSOLE_PROFILE } from "./lib/profile";
 import { useProductTour } from "./lib/tour/useProductTour";
 import { TourContext } from "./lib/tour/tourContext";
 import { navAnchor, TOUR_ANCHOR } from "./lib/tour/tourAnchors";
+import { pickerJourneys } from "./lib/tour/picker";
+import StartupJourneyPanel from "./components/StartupJourneyPanel";
 import { RouteErrorBoundary } from "./components/RouteErrorBoundary";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
@@ -217,6 +219,12 @@ function ThemeToggle() {
   );
 }
 
+/**
+ * Delay before the startup persona panel (#464) opens, letting the initial
+ * route render and the journey list settle before the modal appears.
+ */
+const STARTUP_PANEL_DELAY_MS = 500;
+
 export default function App() {
   const location = useLocation();
   // The one product-tour instance for the whole app. Published via TourContext
@@ -234,6 +242,35 @@ export default function App() {
   // on screen — otherwise the label would invite the user to resume the tour
   // they are looking at.
   const canResume = !!activeJourney && !isRunning;
+
+  // The startup persona panel (#464): the front door that replaces the CLI's
+  // `?tour=` link-spray. Personas are the offerable, outcome-shaped journeys
+  // (everything but the zero-commitment overview), derived from the registry.
+  const personaJourneys = pickerJourneys(
+    tour.availableJourneys,
+    CONSOLE_PROFILE,
+  );
+  const [startupOpen, setStartupOpen] = useState(false);
+  // One-shot decision, deferred a beat so the initial route renders first and
+  // the journey list settles against real context. Never interrupts a journey
+  // already running or resumable (e.g. a `?tour=` deep link that still fires).
+  const startupDecided = useRef(false);
+  const personaJourneysRef = useRef(personaJourneys);
+  personaJourneysRef.current = personaJourneys;
+  useEffect(() => {
+    if (startupDecided.current) return;
+    if (!tour.showStartupPanel) {
+      startupDecided.current = true;
+      return;
+    }
+    const id = window.setTimeout(() => {
+      startupDecided.current = true;
+      if (isRunning || activeJourney) return;
+      if (personaJourneysRef.current.length === 0) return;
+      setStartupOpen(true);
+    }, STARTUP_PANEL_DELAY_MS);
+    return () => window.clearTimeout(id);
+  }, [tour.showStartupPanel, isRunning, activeJourney]);
   // Remember the last place the user was within the Projects section (the
   // project list or a specific workspace) so the rail's "Projects" item returns
   // them there after a detour through Metrics/Traces/etc. — instead of always
@@ -503,6 +540,22 @@ export default function App() {
           </Suspense>
         </main>
       </div>
+      {startupOpen && (
+        <StartupJourneyPanel
+          journeys={personaJourneys}
+          showAtStartup={tour.showStartupPanel}
+          onToggleShowAtStartup={tour.setShowStartupPanel}
+          onPick={(journeyId) => {
+            setStartupOpen(false);
+            tour.startJourney(journeyId);
+          }}
+          onOverview={() => {
+            setStartupOpen(false);
+            startTour();
+          }}
+          onClose={() => setStartupOpen(false)}
+        />
+      )}
     </TourContext.Provider>
   );
 }

@@ -151,6 +151,13 @@ export interface Journey {
   title: string;
   /** One line for the picker card (#411). */
   blurb: string;
+  /**
+   * First-person outcome for the startup persona panel (#464), completing the
+   * sentence "I want to …" (e.g. "run a local Camunda-compatible engine"). The
+   * panel lists offerable journeys as personas the user self-selects, replacing
+   * the CLI's `?tour=` link-spray. Falls back to `title` when absent.
+   */
+  persona?: string;
   /** Profiles this journey is offered in — a filter, no longer the branch. */
   profiles: ConsoleProfile[];
   /** Journey-level gate: not offered at all when any of these is not `ok`. */

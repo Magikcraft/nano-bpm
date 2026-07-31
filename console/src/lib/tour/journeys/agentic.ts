@@ -85,6 +85,7 @@ export const agenticAuthor: Journey = {
   title: "Author a durable agent loop",
   blurb:
     "Build a durable, multi-round loop around a coding-agent harness — with a human approval gate.",
+  persona: "author a durable, human-gated loop around a coding-agent harness",
   profiles: ["studio"],
   successEvent: agenticAuthorSucceeded,
   nextJourneys: ["agentic-hire"],
@@ -151,6 +152,7 @@ export const agenticHire: Journey = {
   title: "Hire an agent and close the loop",
   blurb:
     "Point a coding-agent harness at the loop, start an instance, and drive it through the human gate.",
+  persona: "hire a coding agent and drive an instance through the human gate",
   profiles: ["studio"],
   successEvent: agenticHireSucceeded,
   steps: [

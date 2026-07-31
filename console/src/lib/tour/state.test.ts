@@ -15,7 +15,9 @@ import {
   readState,
   recordFor,
   resetState,
+  startupPanelEnabled,
   withJourney,
+  withStartupPanel,
   writeState,
 } from "./state.ts";
 import {
@@ -171,6 +173,36 @@ test("resetState: clears the legacy flag too, or the migration would resurrect i
   resetState(s);
   assert.deepEqual(readState(s), emptyState());
   assert.equal(hasCompleted(readState(s), OVERVIEW_JOURNEY_ID), false);
+});
+
+// ── startup panel preference (#464) ────────────────────────────────────────
+
+test("startupPanelEnabled: defaults to true when unset (fresh install shows it)", () => {
+  assert.equal(startupPanelEnabled(emptyState()), true);
+});
+
+test("startupPanelEnabled: only an explicit false suppresses it", () => {
+  assert.equal(
+    startupPanelEnabled(withStartupPanel(emptyState(), false)),
+    false,
+  );
+  assert.equal(startupPanelEnabled(withStartupPanel(emptyState(), true)), true);
+});
+
+test("withStartupPanel: persists the preference without mutating or losing journeys", () => {
+  const seeded = withJourney(emptyState(), "localdev", {
+    status: "completed",
+    stepIndex: 0,
+  });
+  const off = withStartupPanel(seeded, false);
+  assert.equal(off.showStartupPanel, false);
+  // Original untouched, journey records preserved.
+  assert.equal(seeded.showStartupPanel, undefined);
+  assert.equal(off.journeys.localdev.status, "completed");
+  // Round-trips through storage.
+  const s = fakeStorage();
+  writeState(off, s);
+  assert.equal(startupPanelEnabled(readState(s)), false);
 });
 
 // ── deep links ───────────────────────────────────────────────────────────────
