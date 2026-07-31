@@ -623,7 +623,7 @@ export type ExtensionTemplate = {
 
 export type Extension = {
     id: string;
-    kind: 'lang' | 'app' | 'example' | 'theme';
+    kind: 'lang' | 'app' | 'example' | 'theme' | 'trigger';
     displayName: string;
     /**
      * Optional icon for the pack, as an inline SVG XML string (preferred) or a data:/http: URL. Lang packs supply this so the console can badge project cards with a language icon.
@@ -641,6 +641,13 @@ export type Extension = {
      * Zeebe element templates the pack contributes as installable BPMN components (ADR 0033 §4). The console merges these under a project's own components (project wins on an id collision) to drive the palette. Kept as free-form objects so the full element-template shape survives the response round-trip; the modeler validates them at registration.
      */
     components?: Array<{
+        [key: string]: unknown;
+    }>;
+    /**
+     * Guided journeys the pack contributes (ADR 0049 §7) — the mechanism by which onboarding scales with the pack ecosystem instead of living in a hardcoded list in the console. Kept as free-form objects for the same reason as `components` above: the authoritative schema is the manifest contract (server/src/console/extensions.rs `TourSpec`, mirrored for pack authors in @nanobpm/nano-ide-ext-types), and structural validation happens in exactly one place — the console adapter that turns a spec into a runnable journey. Typing the full step union here as well would be a third copy to keep in sync.
+     * Already trust-filtered: `handoff` steps are stripped from untrusted packs server-side, and a journey left with no steps is omitted, so anything present here is safe to offer.
+     */
+    tours?: Array<{
         [key: string]: unknown;
     }>;
     toolchainAvailable: boolean;
