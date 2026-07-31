@@ -25,9 +25,12 @@ export const TOUR_ANCHOR = {
   explorerNav: navAnchor("/explorer"),
   topologyNav: navAnchor("/topology"),
   metricsNav: navAnchor("/metrics"),
+  tracesNav: navAnchor("/traces"),
   newProject: "new-project",
   run: "run",
   takeATour: "take-a-tour",
+  /** Explorer's inspection panel — the localdev journey's "where you debug" step. */
+  explorerInspect: "explorer-inspect",
 } as const;
 
 export type TourAnchor = (typeof TOUR_ANCHOR)[keyof typeof TOUR_ANCHOR];

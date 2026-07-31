@@ -18,7 +18,11 @@ import {
   withJourney,
   writeState,
 } from "./state.ts";
-import { readTourParam, stripTourParam } from "./deepLink.ts";
+import {
+  readTourParam,
+  stripTourParam,
+  consumeDeepLinkTourParam,
+} from "./deepLink.ts";
 import {
   baseContext,
   clearContextSources,
@@ -199,6 +203,21 @@ test("readTourParam: rejects ids that are not journey-id shaped", () => {
   assert.equal(readTourParam("?tour=-leading"), null);
   assert.equal(readTourParam("?tour="), null);
   assert.equal(readTourParam(`?tour=${"x".repeat(200)}`), null);
+});
+
+test("consumeDeepLinkTourParam: reads an injected search (module snapshot path is browser-only)", () => {
+  // The default (no-arg) path snapshots window.location at module load, which a
+  // Node test has no way to set; the injected-search overload is the seam that
+  // keeps the parsing rule under test. It parses exactly like readTourParam.
+  assert.equal(consumeDeepLinkTourParam("?tour=localdev"), "localdev");
+  assert.equal(
+    consumeDeepLinkTourParam(
+      "http://127.0.0.1:8080/console?tour=agentic-author",
+    ),
+    "agentic-author",
+  );
+  assert.equal(consumeDeepLinkTourParam("?other=1"), null);
+  assert.equal(consumeDeepLinkTourParam("?tour=%3Cscript%3E"), null);
 });
 
 test("stripTourParam: removes only the tour param and preserves the rest", () => {
