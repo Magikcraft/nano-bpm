@@ -113,7 +113,7 @@ fn config_fields_json(fields: &[extensions::ConfigField]) -> Vec<Json> {
 
 /// The App's enabled connectors resolved against the registry (ADR 0050) —
 /// powers the Connectors panel and the "Add connector" picker. Each enabled
-/// connector is tagged `backed` (an installed pack still ships a launchable
+/// connector is tagged `backed` (the pinned pack still ships a launchable
 /// worker) and `recognized` (the type is in the registry at all); incoherent
 /// enablements are surfaced as `errors`. The outbound mirror of
 /// [`super::triggers::triggers_overview`].
@@ -139,7 +139,7 @@ pub(crate) fn connectors_overview(project: &str) -> Result<Json, TriggerError> {
                 .to_string();
             let kind = registry.iter().find(|k| k.task_type == task_type);
             let recognized = kind.is_some();
-            let backed = extensions::worker_driver(&task_type).is_some();
+            let backed = extensions::worker_driver_for(&connector, &task_type).is_some();
             if !recognized {
                 errors.push(format!(
                     "connector '{task_type}' (pack '{connector}') is enabled but not installed"
@@ -254,6 +254,12 @@ pub(crate) fn add_connector(
         ce.entry("type")
             .or_insert_with(|| json!(connector_id.clone()));
         for (k, v) in cfg {
+            // Never let a pack's config field clobber the reserved `type`
+            // discriminator — that would corrupt the connection and break
+            // resolution. `type` is owned by the enablement seam, not config.
+            if k == "type" {
+                continue;
+            }
             ce.insert(k.clone(), json!(v));
         }
     }
@@ -285,7 +291,7 @@ pub(crate) fn validate_connector_seam(project: &str) -> Result<(), String> {
                 "connector from pack '{connector}' is missing a taskType in nano.app.json"
             ));
         }
-        if extensions::worker_driver(task_type).is_none() {
+        if extensions::worker_driver_for(connector, task_type).is_none() {
             return Err(format!(
                 "connector '{task_type}' (pack '{connector}') enabled in nano.app.json has no \
                  launchable worker — install the pack or remove the worker (ADR 0050)"
@@ -521,5 +527,92 @@ mod tests {
         unsafe {
             std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
         }
+    }
+
+    /// A pack's config field must never overwrite the reserved `type`
+    /// discriminator on the connection object (ADR 0025 §1) — otherwise a pack
+    /// declaring a `type` config field could corrupt connection resolution.
+    #[test]
+    fn add_connector_config_cannot_clobber_reserved_type() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let name = setup(BARE_APP, true, true);
+        add_connector(
+            &name,
+            "test.slack",
+            Some("slack"),
+            &cfg(&[("type", "attacker-owned"), ("token", "env:SLACK_TOKEN")]),
+        )
+        .unwrap();
+
+        let manifest = read_manifest(&name).unwrap();
+        // `type` stays the seam-owned connector id, not the config value.
+        assert_eq!(
+            manifest["connections"]["slack"]["type"],
+            "nano-ide-connector-testpack"
+        );
+        // The non-reserved config field is still persisted.
+        assert_eq!(manifest["connections"]["slack"]["token"], "env:SLACK_TOKEN");
+    }
+
+    /// Materialise a project whose manifest pins its connector to pack `packb`,
+    /// while the only installed pack is `packa` — which independently declares the
+    /// same worker `type` (launchable) and ships its seam component. This models
+    /// the drift the seam gate exists to catch: the *pinned* pack is uninstalled,
+    /// but a *different* pack coincidentally backs the same type. Deterministic
+    /// (single pack ⇒ no `read_dir`-order dependence).
+    fn setup_pinned_pack_missing() -> String {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let base = std::env::temp_dir().join(format!("nano-conn-pin-{}-{n}", std::process::id()));
+
+        let proj_root = base.join("projects");
+        let name = "pinapp";
+        let dir = proj_root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Manifest pins connector = "packb", which is not installed.
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "workers": [ { "taskType": "test.slack", "connector": "packb" } ] }"#,
+        )
+        .unwrap();
+
+        // The only installed pack is `packa`: launchable worker + seam component.
+        let ext_root = base.join("ext");
+        let packa = ext_root.join("packa");
+        std::fs::create_dir_all(&packa).unwrap();
+        std::fs::write(packa.join("worker.mjs"), "export default {}\n").unwrap();
+        std::fs::write(packa.join("tpl.json"), component_template("test.slack")).unwrap();
+        std::fs::write(
+            packa.join("nano-ide.ext.json"),
+            r#"{ "id": "packa", "kind": "app", "displayName": "Pack A", "components": ["tpl.json"],
+                "workers": [ { "type": "test.slack", "entry": "worker.mjs" } ] }"#,
+        )
+        .unwrap();
+
+        unsafe {
+            std::env::set_var("NANOBPMN_PROJECTS_DIR", &proj_root);
+            std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
+        }
+        name.to_string()
+    }
+
+    /// The seam gate must interrogate the *pinned* `connector` pack, not whichever
+    /// pack first-wins the type. `packb` is pinned but not installed; a type-scoped
+    /// check would see `packa` back `test.slack` and wrongly report the connector
+    /// as launchable/backed (it would instead trip on the pack-scoped *component*
+    /// check — the wrong error, and `backed` would read `true`).
+    #[test]
+    fn validate_seam_is_pack_scoped_not_type_scoped() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let name = setup_pinned_pack_missing();
+        let err = validate_connector_seam(&name).unwrap_err();
+        assert!(err.contains("launchable"), "got: {err}");
+
+        // The overview agrees: the pinned connector is not backed.
+        let ov = connectors_overview(&name).unwrap();
+        let enabled = ov["connectors"].as_array().unwrap();
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0]["connector"], "packb");
+        assert_eq!(enabled[0]["backed"], false);
     }
 }

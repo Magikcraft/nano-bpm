@@ -1,5 +1,5 @@
 // Unit tests for the connector palette gate (ADR 0050, amending ADR 0033 §2).
-// Run with `node --experimental-strip-types --test src/lib/projectComponents.test.ts`.
+// Run with `node --experimental-strip-types --test src/lib/connectorPalette.test.ts`.
 // `componentTaskType` must stay in lockstep with the server's
 // `connectors::component_task_type` (server/src/console/connectors.rs).
 import { test } from "node:test";

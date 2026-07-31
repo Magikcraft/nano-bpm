@@ -835,6 +835,42 @@ pub fn worker_driver(worker_type: &str) -> Option<WorkerDriver> {
     None
 }
 
+/// Pack-scoped [`worker_driver`]: resolve the on-disk worker entry for
+/// `worker_type` **only** in the pack whose manifest id is `pack_id` (ADR 0050
+/// §2). The enablement seam pins a specific `connector` pack, so its coherence
+/// checks (is the worker still launchable?) must interrogate *that* pack — not
+/// whichever pack first-wins the type — or duplicate worker types across packs
+/// would let the type-scoped [`worker_driver`] mask an uninstalled pinned pack.
+/// This keeps the seam's worker check consistent with its pack-scoped component
+/// check ([`pack_component_templates`]).
+pub fn worker_driver_for(pack_id: &str, worker_type: &str) -> Option<WorkerDriver> {
+    let rd = std::fs::read_dir(extensions_root()).ok()?;
+    for entry in rd.flatten() {
+        let base = entry.path();
+        let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<ExtManifest>(&txt) else {
+            continue;
+        };
+        if m.id != pack_id {
+            continue;
+        }
+        let spec = m.workers.iter().find(|w| w.worker_type == worker_type)?;
+        let worker_entry = spec.entry.as_deref().filter(|e| !e.is_empty())?;
+        let path = safe_pack_path(&base, worker_entry)?;
+        if !path.is_file() {
+            return None;
+        }
+        return Some(WorkerDriver {
+            id: m.id,
+            dir: base,
+            entry: worker_entry.to_string(),
+        });
+    }
+    None
+}
+
 /// Resolve any installed extension (lang/app/example/theme) by manifest id.
 /// Used for the trust check on a project's snapshotted toolchain (approving
 /// `embedded-jvm` covers Run/Compile on projects it scaffolded).
