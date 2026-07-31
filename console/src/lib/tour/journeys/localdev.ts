@@ -16,7 +16,11 @@ import { registerContextSource } from "../context.ts";
 import { hasTraces } from "../preconditions.ts";
 import { TOUR_ANCHOR, tourSelector } from "../tourAnchors.ts";
 import type { Journey } from "../types";
-import { localdevSucceeded, v2BaseUrl } from "./localdev-progress.ts";
+import {
+  localdevSucceeded,
+  markBaseUrlCopied,
+  v2BaseUrl,
+} from "./localdev-progress.ts";
 
 /**
  * The compatibility-subset boundary (#416, merged as `docs/camunda-compatibility.md`).
@@ -84,6 +88,10 @@ export const localdev: Journey = {
       // cannot watch your terminal, so this self-reports via "I've done it".
       copy: v2BaseUrl(),
       copyLabel: "Copy base URL",
+      // Latch "the base URL was taken" (ADR 0049 §4, journey 1's success signal)
+      // from the real copy here in the journey flow — not only from the durable
+      // Explorer affordance, which a user following the tour need never touch.
+      onCopied: markBaseUrlCopied,
       body: 'Your existing Camunda 8 client works unchanged — <strong>this is the only line you change</strong>. Explore the API offline at <a href="/swagger" target="_blank" rel="noopener noreferrer">/swagger</a>.',
     },
     {

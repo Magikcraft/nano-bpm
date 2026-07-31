@@ -81,6 +81,32 @@ test("the non-optional steps always survive resolution", () => {
   assert.deepEqual(ids, ["already-running", "point-your-client", "debugger"]);
 });
 
+test("the journey's own handoff copy latches success — not only the Explorer affordance", () => {
+  resetLocaldevProgress();
+  const handoff = localdev.steps.find((s) => s.kind === "handoff");
+  assert.ok(
+    handoff && handoff.kind === "handoff",
+    "journey 1 has a handoff step",
+  );
+  assert.equal(
+    handoff.copy,
+    v2BaseUrl(),
+    "the handoff copies the /v2 base URL",
+  );
+  assert.ok(
+    handoff.onCopied,
+    "the handoff latches the base-URL-taken signal on copy",
+  );
+
+  // Simulate the in-journey flow: copy the base URL in the handoff, then reach
+  // the Explorer via the spotlight step. This must satisfy success without ever
+  // touching the durable Explorer copy affordance.
+  handoff.onCopied?.();
+  markExplorerReached();
+  assert.equal(localdev.successEvent(ctx()), true);
+  resetLocaldevProgress();
+});
+
 test("v2BaseUrl tracks the live origin — not a hardcoded :8080", () => {
   const stub = { location: { origin: "http://192.168.1.5:9999" } };
   Reflect.set(globalThis, "window", stub);
