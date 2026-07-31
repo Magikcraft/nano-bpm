@@ -104,8 +104,31 @@ export function writeState(
   }
 }
 
+const JOURNEY_STATUSES: ReadonlySet<string> = new Set([
+  "unseen",
+  "active",
+  "completed",
+  "abandoned",
+]);
+
+/** A record read from storage is only trusted if it is shaped like one. */
+function isJourneyRecord(v: unknown): v is JourneyRecord {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as Record<string, unknown>;
+  return (
+    typeof o.status === "string" &&
+    JOURNEY_STATUSES.has(o.status) &&
+    typeof o.stepIndex === "number"
+  );
+}
+
 export function recordFor(state: TourState, journeyId: string): JourneyRecord {
-  return state.journeys[journeyId] ?? { status: "unseen", stepIndex: 0 };
+  const rec = state.journeys[journeyId];
+  // isTourState only guarantees `journeys` is an object, not that each record is
+  // well-formed. A record hand-corrupted in localStorage (e.g. a string) must
+  // degrade to "unseen" rather than let a caller throw on `record.status` —
+  // onboarding state is never worth breaking the app over.
+  return isJourneyRecord(rec) ? rec : { status: "unseen", stepIndex: 0 };
 }
 
 /** Merge one journey's record, returning a new state (never mutates). */

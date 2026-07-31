@@ -16,6 +16,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import { listProjects } from "../../gen";
 import { CONSOLE_PROFILE } from "../profile";
 import { buildContext } from "./context";
+import type { ProjectsSnapshot } from "./context";
 import { readTourParam, stripTourParam } from "./deepLink";
 import { getJourney, journeysFor } from "./registry";
 import { createJourneyRunner } from "./runner";
@@ -40,6 +41,15 @@ import { overviewJourneyId } from "./journeys/overview";
  * sidebar render before the first anchored step is highlighted.
  */
 const AUTOSTART_DELAY_MS = 800;
+
+/**
+ * How long a `listProjects()` context snapshot is reused before refetching.
+ *
+ * Kept under the runner's 2s verify cadence, so a handoff poll tick still reads
+ * reasonably fresh state, while the burst of `getContext()` calls around a single
+ * step transition share one request instead of each hitting the backend.
+ */
+const SNAPSHOT_TTL_MS = 1500;
 
 export interface UseProductTourOptions {
   /**
@@ -110,13 +120,40 @@ export function useProductTour(
    * registered context source then merges its own fields in. A failed fetch still
    * yields a usable context whose runtime flags read false, so a Run step
    * repairs into an install hint rather than promising something unverified.
+   *
+   * The `listProjects()` payload (projects + runtime flags + template menu +
+   * extensions) is cached for a short window and its in-flight request is shared,
+   * so the several `getContext()` calls that cluster around one step transition
+   * (resolve, render, finish) — and the handoff `verify` poll — do not each fire
+   * a fresh, potentially heavy request. The window is under the 2s verify cadence,
+   * so a poll tick still re-reads reasonably fresh state. #404 is the structural
+   * fix: once the consumer panel polls, verify reads its data via a registered
+   * context source instead of driving its own fetch.
    */
+  const snapshotCache = useRef<{
+    at: number;
+    snapshot: ProjectsSnapshot | null;
+  } | null>(null);
+  const snapshotInflight = useRef<Promise<ProjectsSnapshot | null> | null>(
+    null,
+  );
   const getContext = useCallback(async (): Promise<TourContext> => {
-    let snapshot = null;
-    try {
-      snapshot = (await listProjects({ throwOnError: true })).data;
-    } catch {
-      snapshot = null;
+    const now = Date.now();
+    const cached = snapshotCache.current;
+    let snapshot: ProjectsSnapshot | null;
+    if (cached && now - cached.at < SNAPSHOT_TTL_MS) {
+      snapshot = cached.snapshot;
+    } else {
+      snapshot = await (snapshotInflight.current ??= (async () => {
+        try {
+          return (await listProjects({ throwOnError: true })).data ?? null;
+        } catch {
+          return null;
+        } finally {
+          snapshotInflight.current = null;
+        }
+      })());
+      snapshotCache.current = { at: Date.now(), snapshot };
     }
     return buildContext({
       profile: CONSOLE_PROFILE,

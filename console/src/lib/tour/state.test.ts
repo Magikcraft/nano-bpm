@@ -128,6 +128,37 @@ test("withJourney: merges without mutating, and activeJourneyId finds the live o
   );
 });
 
+test("recordFor: a malformed stored record degrades to unseen, never throws", () => {
+  // isTourState only guarantees `journeys` is an object; a hand-corrupted record
+  // (string, or missing/invalid fields) must not reach a caller that reads
+  // `.status`. Each of these must fall back to the unseen default.
+  for (const bad of [
+    "oops",
+    42,
+    null,
+    {},
+    { status: "active" },
+    { status: "bogus", stepIndex: 0 },
+    { stepIndex: 2 },
+  ]) {
+    const state = {
+      version: 2 as const,
+      journeys: { overview: bad as never },
+    };
+    assert.deepEqual(recordFor(state, "overview"), {
+      status: "unseen",
+      stepIndex: 0,
+    });
+  }
+  // A well-formed record is still returned as-is.
+  const good = withJourney(emptyState(), "overview", {
+    status: "completed",
+    stepIndex: 3,
+  });
+  assert.equal(recordFor(good, "overview").status, "completed");
+  assert.equal(recordFor(good, "overview").stepIndex, 3);
+});
+
 test("resetState: clears the legacy flag too, or the migration would resurrect it", () => {
   const s = fakeStorage({
     [LEGACY_SEEN_KEY]: "1",
