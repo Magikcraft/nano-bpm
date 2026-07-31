@@ -1493,7 +1493,8 @@ const WORKFLOW_DENO_JSON: &str = r#"{
   "tasks": {
     "start": "deno run --allow-net --allow-read --allow-env main.ts",
     "start-instance": "deno run --allow-net --allow-read --allow-env scripts/start-instance.ts",
-    "approve": "deno run --allow-net --allow-read --allow-env scripts/approve.ts"
+    "approve": "deno run --allow-net --allow-read --allow-env scripts/approve.ts",
+    "job-types": "deno run --allow-net --allow-read --allow-env scripts/job-types.ts"
   }
 }
 "#;
@@ -1529,7 +1530,8 @@ fn workflow_package_json(name: &str) -> String {
   "scripts": {{
     "start": "deno task start",
     "start-instance": "deno task start-instance",
-    "approve": "deno task approve"
+    "approve": "deno task approve",
+    "job-types": "deno task job-types"
   }},
   "dependencies": {{
     "@nanobpm/workflow": "^0.3.0"
@@ -1544,21 +1546,49 @@ fn workflow_package_json(name: &str) -> String {
     )
 }
 
-/// Example **declarative flow** — the code-first surface (ADR 0044/0045). Each
-/// `w.run(name, fn)` becomes a real, engine-visible BPMN service task and
-/// `w.signal(name, { correlationKey })` a durable human-in-the-loop wait
-/// (a correlated message catch event). Steps run as ordinary workers — no
-/// replay/determinism discipline — and a crash mid-flow resumes from the engine
-/// journal without re-running completed steps. Jobs are at-least-once, so step
-/// handlers must be idempotent.
-const WORKFLOW_EXAMPLE_TS: &str = r#"import { defineFlow } from "@nanobpm/workflow";
+/// Example **declarative flow** — the code-first surface (ADR 0044/0045). It
+/// demonstrates all three step verbs:
+/// - `w.run(name, fn)` — a real, engine-visible BPMN service task this app
+///   hosts itself (an ordinary in-process worker — no replay/determinism
+///   discipline);
+/// - `w.task(name)` — the **agentic seam** (ADR 0046 "agent-as-worker"): a
+///   service task with a derived job type serviced by a worker **outside** this
+///   program (a coding-agent harness). Its I/O is a typed envelope pair (the
+///   `contracts` passed to `defineFlow`); its worker-subscription contract —
+///   the derived job type string — is surfaced by `externalJobTypes(flow)`;
+/// - `w.signal(name, { correlationKey })` — a durable human-in-the-loop wait (a
+///   correlated message catch event).
+///
+/// A crash mid-flow resumes from the engine journal without re-running completed
+/// steps. Jobs are at-least-once, so step handlers must be idempotent.
+const WORKFLOW_EXAMPLE_TS: &str = r#"import { defineFlow, envelope, externalJobTypes } from "@nanobpm/workflow";
 
-// A code-first "review a pull request" flow. Each `w.run` step is a real,
-// engine-visible BPMN service task; `w.signal` is a durable human-in-the-loop
-// wait. Replace the step bodies with real work (GitHub calls, an LLM review, a
-// merge). A crash between a side effect and its job completion redelivers the
-// step (at-least-once), so keep each one idempotent.
-export const prReview = defineFlow("pr-review", (w) => {
+// A code-first "review a pull request" flow showing all three step verbs:
+//
+//   fetchDiff      w.run     in-process work this app hosts itself
+//   review         w.task    an EXTERNAL step — a coding-agent harness services
+//                            the derived job type `pr-review:review`
+//   humanApproval  w.signal  a durable human-in-the-loop wait (catch event)
+//   merge          w.run     in-process work this app hosts itself
+//
+// A crash between a side effect and its job completion redelivers the step
+// (at-least-once), so keep every step handler idempotent — the in-process
+// `w.run` workers AND the external `w.task` harness worker (which can also see
+// redeliveries).
+
+// Typed data envelopes (ADR 0045) declare the external `review` step's I/O
+// contract IN CODE. They are lifted into the derived BPMN as a `nano:shape` +
+// `io.nanobpm.dataEnvelope` property, so the harness — and a future model-first
+// eject — sees exactly what to read and return. `env.type` is a phantom type:
+// it never exists at runtime.
+const contracts = {
+  review: {
+    in: envelope("PrReviewIn", { prId: "string", files: "integer", additions: "integer" }),
+    out: envelope("PrReviewOut", { verdict: "string", notes: "string" }),
+  },
+};
+
+export const prReview = defineFlow("pr-review", contracts, (w) => {
   w.run("fetchDiff", async (job) => {
     const prId = job.variables.prId;
     if (typeof prId !== "string" || prId.length === 0) {
@@ -1568,10 +1598,19 @@ export const prReview = defineFlow("pr-review", (w) => {
     return { files: 3, additions: 42 };
   });
 
-  w.run("review", async (job) => {
-    // e.g. hand the diff to an LLM and record its verdict.
-    return { verdict: "approve", notes: `looks good (${job.variables.files} files)` };
-  });
+  // The agentic seam (ADR 0046 "agent-as-worker"). `review` is NOT hosted by
+  // this app's in-process Worker: it is a service task whose derived job type is
+  // `pr-review:review`, serviced by a coding-agent harness running OUTSIDE this
+  // program (e.g. hand the diff to an LLM and return its verdict). Point a
+  // harness at it — until one is hosted, every instance PARKS here, which is the
+  // whole point: the engine durably owns the wait.
+  //
+  //   c8ctl nano hire            # create a reviewer agent profile (once)
+  //   c8ctl nano work <name>     # host it against the job type pr-review:review
+  //
+  // The engine only routes-to and awaits the agent; the agent's tools and
+  // reasoning are its own, opaque to the engine. See the README.
+  w.task("review");
 
   // Durable wait for a human decision, correlated on the instance's `prId`.
   // Resume it with `scripts/approve.ts` (see README) — this is the surface
@@ -1579,10 +1618,16 @@ export const prReview = defineFlow("pr-review", (w) => {
   w.signal("humanApproval", { correlationKey: "prId" });
 
   w.run("merge", async (job) => {
-    // Idempotent: keyed by prId; a redelivery re-merges the same PR.
+    // Idempotent: keyed by prId; a redelivery re-merges the same PR. `verdict`
+    // was produced by the external reviewer (see the `review` out envelope).
     return { merged: job.variables.verdict === "approve", approvedBy: job.variables.approvedBy ?? null };
   });
 });
+
+// The external job type(s) a harness must service — `["pr-review:review"]`.
+// `scripts/job-types.ts` prints this so you can confirm exactly what to
+// `c8ctl nano work` against; a mismatch would park every instance forever.
+export const externalReviewJobTypes = externalJobTypes(prReview);
 "#;
 
 /// Entrypoint: the standalone **worker-host service**. It deploys the
@@ -1669,8 +1714,12 @@ const WORKFLOW_APPROVE_TS: &str = r#"// Approve a parked `pr-review` instance: c
 // its prId so the flow proceeds from the durable wait to `merge`.
 //
 //   deno task start                 # the worker-host service
-//   deno task start-instance PR-42  # create an instance (parks at humanApproval)
+//   deno task start-instance PR-42  # create an instance (parks on `review`, then humanApproval)
 //   deno task approve PR-42         # resume it past the human-in-the-loop wait
+//
+// Note: the instance first parks on the external `review` w.task until a harness
+// services `pr-review:review`; only then does it reach the humanApproval wait
+// this script resumes. See the README's "external-agent seam" section.
 import { WorkflowClient } from "@nanobpm/workflow";
 import { prReview } from "../workflows/pr-review.ts";
 
@@ -1678,8 +1727,44 @@ const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").r
 const prId = Deno.args[0] ?? "PR-1234";
 
 const client = new WorkflowClient({ baseUrl });
-await client.signal(prReview, "humanApproval", prId, { approvedBy: "me" });
-console.log(`approved ${prReview.id} (prId=${prId})`);
+try {
+  await client.signal(prReview, "humanApproval", prId, { approvedBy: "me" });
+  console.log(`approved ${prReview.id} (prId=${prId})`);
+} catch (err) {
+  // The most common cause is signalling before the instance has reached the
+  // humanApproval wait: it is still parked on the external `review` w.task, so
+  // there is no open `humanApproval` subscription yet (the gateway returns 404).
+  console.error(
+    `could not approve ${prReview.id} (prId=${prId}): ${err instanceof Error ? err.message : err}\n` +
+      "Is the instance still parked on `review`? Host a worker for `pr-review:review` " +
+      "(deno task job-types) so it advances to the humanApproval wait, then retry.",
+  );
+  Deno.exit(1);
+}
+"#;
+
+/// Example script that prints the flow's **external** job types — the ones a
+/// coding-agent harness (`c8ctl nano hire`/`work`) must service. Kept as a
+/// script so the number the README tells you to `hire` against is derived from
+/// the code, never hand-copied (a mismatch would silently park instances).
+const WORKFLOW_JOB_TYPES_TS: &str = r#"// Print the EXTERNAL job types this app expects a harness to service.
+//
+//   deno task job-types            # -> pr-review:review
+//
+// Point a coding-agent harness at exactly these (see README): until one is
+// hosted, instances park on the `review` step. No gateway needed — this only
+// inspects the derived model.
+import { externalJobTypes } from "@nanobpm/workflow";
+import { prReview } from "../workflows/pr-review.ts";
+
+const types = externalJobTypes(prReview);
+if (types.length === 0) {
+  console.log("no external (w.task) steps — every step is hosted in-process");
+} else {
+  // One bare job type per line, so `deno task job-types` output is exactly what
+  // the README tells you to hire against (copy/paste straight into a harness).
+  for (const t of types) console.log(t);
+}
 "#;
 
 /// README for a code-first project.
@@ -1710,24 +1795,75 @@ running):
 
 ```sh
 deno task start-instance PR-42     # kicks off one pr-review instance
+```
+
+The instance first parks on the **`review`** step — an external `w.task` (see
+below) — and stays there until an external worker completes the `pr-review:review`
+job. Only then does it advance to the human-in-the-loop wait, which you resume
+with:
+
+```sh
 deno task approve PR-42            # resume it past the human-in-the-loop wait
 ```
 
+> If nothing seems to happen after `start-instance`, that's expected: the
+> instance is durably parked on `review` waiting for an external agent. See
+> **The external-agent seam** below to service it.
+
+## The external-agent seam (`w.task`)
+
+The `review` step is a **`w.task`**: an external service task this app does
+**not** host. It is the agentic seam (ADR 0046 "agent-as-worker") — the engine
+routes to and awaits a coding-agent harness, and the agent's tools and reasoning
+are its own, opaque to the engine. The step's derived job type is:
+
+```
+pr-review:review
+```
+
+Confirm it straight from the code (never hand-copy it):
+
+```sh
+deno task job-types      # -> pr-review:review
+```
+
+> **This starter does not run end-to-end on its own — by design.** A fresh
+> instance runs `fetchDiff`, then **parks on `review`** until a worker services
+> `pr-review:review`. The park *is* the lesson: the engine durably owns the wait
+> (nothing is lost across a restart), exactly as it does for the `humanApproval`
+> signal. Journey 0a's success is "a worker host is up", not "an instance
+> completed".
+
+Host a coding-agent harness for that job type with `c8ctl nano hire` / `work`:
+
+```sh
+c8ctl nano hire          # create a reviewer agent profile (once, interactive)
+c8ctl nano work <name>   # host it — it services the job type pr-review:review
+```
+
+Once a worker completes the `review` job (returning the `PrReviewOut` envelope —
+`verdict` + `notes`), the instance advances to the `humanApproval` wait, and
+`deno task approve` carries it to `merge`.
+
 ## Author
 
-- `workflows/pr-review.ts` — an example **declarative flow**. Each
-  `w.run(name, fn)` becomes a real, engine-visible BPMN service task; a crash
-  mid-flow resumes from the engine journal without re-running completed steps.
-  Jobs are **at-least-once**, so keep step handlers idempotent. Add more flows
-  with `defineFlow(id, (w) => {{ ... }})` and list them in `main.ts`.
+- `workflows/pr-review.ts` — an example **declarative flow** demonstrating all
+  three step verbs. Add more flows with `defineFlow(id, contracts, (w) => {{ ... }})`
+  and list them in `main.ts`.
+- `w.run(name, fn)` becomes a real, engine-visible BPMN service task **hosted
+  in-process** by this app's worker; a crash mid-flow resumes from the engine
+  journal without re-running completed steps. Jobs are **at-least-once**, so keep
+  handlers idempotent.
+- `w.task(name)` declares a step served by a worker **outside this program** — a
+  service task whose derived job type (`pr-review:review` here) a coding-agent
+  harness polls. The in-process `Worker` does **not** host it; list the contract
+  with `externalJobTypes(flow)` (see `scripts/job-types.ts`). Typed data
+  envelopes on the step (`PrReviewIn`/`PrReviewOut`) declare its I/O in code and
+  are lifted into the derived BPMN.
 - `w.signal(name, {{ correlationKey }})` is a durable human-in-the-loop wait — a
   correlated message catch event. `scripts/approve.ts` shows how a client
   resumes it. This is what a diagram-less, Temporal-style code-first surface
   cannot give you: a real, visible catch event.
-- `w.task(name)` declares a step served by a worker **outside this program** (a
-  service task whose derived job type another process/service/language polls).
-  It emits the same job type as `w.run` but the in-process `Worker` does not host
-  it — list the contract with `externalJobTypes(flow)`.
 - `scripts/start-instance.ts` starts an instance — keep the worker host
   (`main.ts`) a pure long-running service.
 
@@ -2797,6 +2933,10 @@ pub fn create_project(
             WORKFLOW_START_INSTANCE_TS,
         )?;
         w(dir.join("scripts").join("approve.ts"), WORKFLOW_APPROVE_TS)?;
+        w(
+            dir.join("scripts").join("job-types.ts"),
+            WORKFLOW_JOB_TYPES_TS,
+        )?;
         w(dir.join("README.md"), &workflow_readme(&display))?;
         let mut cfg = ProjectConfig::new(name, description);
         cfg.display_name = display_name.clone();
@@ -6073,6 +6213,7 @@ mod tests {
         assert!(dir.join("workflows/pr-review.ts").is_file());
         assert!(dir.join("scripts/start-instance.ts").is_file());
         assert!(dir.join("scripts/approve.ts").is_file());
+        assert!(dir.join("scripts/job-types.ts").is_file());
         assert!(dir.join("README.md").is_file());
         // Crucially: NONE of the model-first machinery leaks in — the model is
         // derived from the code, so there is no authored BPMN and no
@@ -6111,6 +6252,37 @@ mod tests {
         assert!(example.contains("defineFlow"));
         assert!(example.contains("w.run("));
         assert!(example.contains("w.signal("));
+        // The agentic seam (ADR 0046): the `review` step must be an EXTERNAL
+        // `w.task`, not an in-process `w.run` — that seam is the whole point of
+        // journey 0a step 3. Its typed envelope + the derived job type the
+        // README tells users to `hire` against must both be present, and must
+        // agree (a mismatch silently parks instances forever — journey 0b).
+        assert!(
+            example.contains("w.task(\"review\")"),
+            "the `review` step must be an external w.task (the agentic seam)"
+        );
+        assert!(example.contains("envelope(\"PrReviewIn\""));
+        assert!(example.contains("envelope(\"PrReviewOut\""));
+        assert!(example.contains("externalJobTypes"));
+        let readme = std::fs::read_to_string(dir.join("README.md")).unwrap();
+        assert!(
+            readme.contains("pr-review:review"),
+            "README must name the exact derived external job type"
+        );
+        assert!(
+            readme.contains("c8ctl nano hire") && readme.contains("c8ctl nano work"),
+            "README must give the hire + work invocation for the external seam"
+        );
+        let job_types = std::fs::read_to_string(dir.join("scripts/job-types.ts")).unwrap();
+        assert!(job_types.contains("externalJobTypes(prReview)"));
+        // The README instructs `deno task job-types`, so the package.json script
+        // parity must exist or the `npm run job-types` alternative silently breaks
+        // (the deno.json task itself is asserted below alongside the other tasks).
+        let package_json = std::fs::read_to_string(dir.join("package.json")).unwrap();
+        assert!(
+            package_json.contains("\"job-types\""),
+            "package.json scripts must keep parity with the deno.json job-types task"
+        );
         assert!(
             !example.contains("defineWorkflow"),
             "the scaffold must lead with the declarative surface, not imperative replay"
@@ -6134,10 +6306,11 @@ mod tests {
             approve.contains("client.signal("),
             "the approve script should correlate the human-in-the-loop signal"
         );
-        // All three Deno tasks are defined.
+        // All Deno tasks are defined (incl. the job-types task the README advertises).
         assert!(deno_json["tasks"]["start"].is_string());
         assert!(deno_json["tasks"]["start-instance"].is_string());
         assert!(deno_json["tasks"]["approve"].is_string());
+        assert!(deno_json["tasks"]["job-types"].is_string());
     }
 
     #[tokio::test]
