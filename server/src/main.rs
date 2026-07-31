@@ -15907,11 +15907,16 @@ async fn main() {
         .route(
             "/debug/heap/prof",
             axum::routing::get(|| async {
-                let path = format!(
-                    "{}/nano-heap-{}.prof",
-                    std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()),
-                    std::process::id()
-                );
+                // Prefer HOME (Unix), fall back to USERPROFILE (Windows), then
+                // the OS temp dir — `/tmp` isn't a valid writable path on Windows.
+                let base = std::env::var_os("HOME")
+                    .or_else(|| std::env::var_os("USERPROFILE"))
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir);
+                let path = base
+                    .join(format!("nano-heap-{}.prof", std::process::id()))
+                    .to_string_lossy()
+                    .into_owned();
                 if crate::memory::prof_dump(&path) {
                     format!("dumped {path}\n")
                 } else {
