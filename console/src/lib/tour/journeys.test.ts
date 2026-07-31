@@ -34,9 +34,12 @@ const KNOWN_SELECTORS = new Set(
  * card. Its id is derived, not enumerated in `TOUR_ANCHOR`, so the guard accepts
  * the whole family by shape rather than pinning every template id here — and the
  * cards render on the studio-only Projects route, so they count as studio anchors.
+ * The suffix is left unconstrained on purpose: `ProjectTemplate.id` is an
+ * unconstrained string (a pack can contribute ids with dots/underscores), and a
+ * selector correctly derived from `templateAnchor(id)` must pass whatever the id.
  */
 const isTemplateAnchor = (anchor: string): boolean =>
-  /^template-[a-z0-9][a-z0-9-]*$/.test(anchor);
+  /^template-.+$/.test(anchor);
 
 /**
  * Anchors that actually render per profile. Projects, the New-project button and

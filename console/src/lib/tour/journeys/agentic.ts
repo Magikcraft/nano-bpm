@@ -53,15 +53,16 @@ const PR_REVIEW_JOB_TYPE = "pr-review:review";
  * 0a succeeded when the worker host is actually up: the project reports running
  * AND its run log shows the deploy + the polling worker host. The template's
  * `main.ts` logs `deployed pr-review` and `worker host running against <url>`, so
- * matching either — with `running` — distinguishes "the process booted and is
- * polling for jobs" from "the user merely pressed Run and it errored out". Both
- * halves are required: `running` alone flickers true during a crash-loop start,
- * and the log alone can be a stale tail from a previous run.
+ * matching either — pinned to the `pr-review` flow id rather than a bare
+ * `deployed`, which any project's output could contain — distinguishes "the
+ * process booted and is polling for jobs" from "the user merely pressed Run and
+ * it errored out". Both halves are required: `running` alone flickers true during
+ * a crash-loop start, and the log alone can be a stale tail from a previous run.
  */
 export const agenticAuthorSucceeded: Predicate = (ctx: TourContext) => {
   const rs = ctx.runState;
   if (!rs?.running) return false;
-  return /worker host running|deployed\s/i.test(rs.output);
+  return /worker host running|deployed\s+pr-review/i.test(rs.output);
 };
 
 /**
@@ -216,6 +217,20 @@ function clip(s: string): string {
   return s.length > MAX_TAIL ? s.slice(-MAX_TAIL) : s;
 }
 
+/**
+ * Close and drop every open tail except (optionally) one to keep. Called when the
+ * journey's project is gone, changed, or we are outside studio — so a project
+ * that disappears from `ctx.projects` (deleted, renamed, or an observe refresh)
+ * never leaves an `EventSource` streaming forever.
+ */
+function closeTailsExcept(keep?: string): void {
+  for (const [name, tail] of tails) {
+    if (name === keep) continue;
+    tail.es?.close();
+    tails.delete(name);
+  }
+}
+
 /** Ensure an SSE run-log tail is open while running, and closed once it stops. */
 async function ensureTail(name: string, running: boolean): Promise<RunTail> {
   let tail = tails.get(name);
@@ -282,10 +297,23 @@ async function refreshParkMarker(tail: RunTail): Promise<void> {
 }
 
 registerContextSource(async (ctx): Promise<Partial<TourContext>> => {
+  // Studio-only: both agentic journeys are studio, so never open an SSE stream
+  // or poll `/instances` in an observe build — `enrichContext` runs every source
+  // regardless of profile, so the guard has to live here.
+  if (ctx.profile !== "studio") {
+    closeTailsExcept();
+    return {};
+  }
+
   const project = ctx.projects.find(
     (p) => p.template === WORKFLOW_STARTER_TEMPLATE,
   );
-  if (!project) return {};
+  if (!project) {
+    closeTailsExcept();
+    return {};
+  }
+  // Prune any tail left over from a different (renamed/removed) project.
+  closeTailsExcept(project.name);
   const running = project.running;
 
   // Node / non-DOM: publish the flag we already have, no I/O.
