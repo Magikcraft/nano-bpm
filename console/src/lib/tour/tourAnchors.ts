@@ -2,12 +2,13 @@
 //
 // A tour step highlights an element by CSS selector, and the element is tagged
 // with a matching `data-tour="..."` attribute in a view. Those two references —
-// the selector in steps.ts and the attribute in the component — are a classic
-// drift surface: rename one and the tour silently skips the step. So both derive
-// from the constants here instead of repeating literal strings.
+// the selector in a journey step and the attribute in the component — are a
+// classic drift surface: rename one and the tour silently skips the step. So both
+// derive from the constants here instead of repeating literal strings.
 //
-// Used by: steps.ts (selectors), App.tsx (rail nav + "Take a tour"),
-// Projects.tsx ("New project"), ProjectWorkspace.tsx (Run).
+// Used by: the journey files under journeys/* (selectors), App.tsx (rail nav +
+// "Take a tour"), Projects.tsx (template cards), ProjectWorkspace.tsx (Run,
+// flow editor, Model, run output).
 
 /**
  * `data-tour` value for a rail nav item, derived from its **route** (`item.to`)
@@ -52,11 +53,24 @@ export const TOUR_ANCHOR = {
   pageEditor: "page-editor",
   /** The served-app link shown while an Urban App runs — the RAD journey's payoff (opens the app on its own port). */
   servedApp: "served-app",
+  // Workspace anchors the agentic authoring journey (#408) spotlights: the flow
+  // file editor, the derived read-only Model view toggle, and the Run output.
+  flowEditor: "flow-editor",
+  modelView: "model-view",
+  runOutput: "run-output",
 } as const;
 
 export type TourAnchor = (typeof TOUR_ANCHOR)[keyof typeof TOUR_ANCHOR];
 
-/** CSS attribute selector for a `data-tour` anchor value. */
+/**
+ * CSS attribute selector for a `data-tour` anchor value.
+ *
+ * The `"` and `\` are escaped because `templateAnchor(id)` now feeds this
+ * *unconstrained* pack-contributed template ids (#411): an id containing a quote
+ * would otherwise produce an invalid selector, and driver.js would silently skip
+ * the step rather than error. Anchors enumerated in `TOUR_ANCHOR` never contain
+ * these, so this is a no-op for them.
+ */
 export function tourSelector(anchor: string): string {
-  return `[data-tour="${anchor}"]`;
+  return `[data-tour="${anchor.replace(/["\\]/g, "\\$&")}"]`;
 }
