@@ -25,9 +25,18 @@ export const TOUR_ANCHOR = {
   explorerNav: navAnchor("/explorer"),
   topologyNav: navAnchor("/topology"),
   metricsNav: navAnchor("/metrics"),
+  tracesNav: navAnchor("/traces"),
   newProject: "new-project",
   run: "run",
   takeATour: "take-a-tour",
+  /**
+   * The Explorer view's instance list — what journey 1 spotlights as "where you
+   * look when something breaks". Distinct from `explorerNav` (the rail item):
+   * this anchors the debugging surface itself, not the link to it.
+   */
+  explorerInstances: "explorer-instances",
+  /** The Explorer affordance that copies the Camunda-compatible `/v2` base URL. */
+  explorerBaseUrl: "explorer-base-url",
 } as const;
 
 export type TourAnchor = (typeof TOUR_ANCHOR)[keyof typeof TOUR_ANCHOR];

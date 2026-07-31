@@ -21,6 +21,7 @@ import { allJourneys } from "./registry.ts";
 import type { Journey } from "./types.ts";
 // Import for the registration side effect.
 import "./journeys/overview.ts";
+import "./journeys/localdev.ts";
 
 const KNOWN_SELECTORS = new Set(
   Object.values(TOUR_ANCHOR).map((a) => tourSelector(a)),
@@ -37,6 +38,8 @@ const RENDERS_IN = {
     TOUR_ANCHOR.topologyNav,
     TOUR_ANCHOR.explorerNav,
     TOUR_ANCHOR.metricsNav,
+    TOUR_ANCHOR.tracesNav,
+    TOUR_ANCHOR.explorerInstances,
     TOUR_ANCHOR.takeATour,
   ]),
 } as const;

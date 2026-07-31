@@ -1,12 +1,67 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { listInstances, type Instance } from "../gen";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
+import { copyText } from "../lib/clipboard";
+import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
+import {
+  markBaseUrlCopied,
+  markExplorerReached,
+  v2BaseUrl,
+} from "../lib/tour/journeys/localdev-progress";
 import InstanceDetail from "./InstanceDetail";
 import { Badge, Button } from "../components/ui";
 
 const PAGE_SIZE = 50;
+
+/**
+ * The Camunda-compatible v2 base URL, with one-click copy — the durable
+ * counterpart to journey 1's "point your client at it" handoff step. It outlives
+ * the tour: an operator debugging a headless engine wants this line at hand, tour
+ * or no tour.
+ *
+ * Uses a readonly input as the copy target so the select-and-copy fallback works
+ * where `navigator.clipboard` is unavailable — this console is routinely served
+ * over plain HTTP on a LAN address, an insecure context where the async clipboard
+ * API is absent.
+ */
+function CopyBaseUrl() {
+  const url = v2BaseUrl();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [copied, setCopied] = useState(false);
+
+  const onCopy = () => {
+    void copyText(url).then((ok) => {
+      // Record the outcome regardless of secure context: on the fallback path we
+      // pre-select the text so the user can finish with Ctrl/Cmd-C.
+      markBaseUrlCopied();
+      if (!ok) inputRef.current?.select();
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  return (
+    <div
+      data-tour={TOUR_ANCHOR.explorerBaseUrl}
+      className="mt-3 flex items-center gap-2"
+    >
+      <span className="shrink-0 text-xs text-fg-faint">v2 API</span>
+      <input
+        ref={inputRef}
+        readOnly
+        value={url}
+        onFocus={(e) => e.currentTarget.select()}
+        aria-label="Camunda-compatible v2 API base URL"
+        className="min-w-0 flex-1 rounded border border-edge bg-input px-2 py-1 font-mono text-xs text-fg"
+      />
+      <Button size="sm" onClick={onCopy}>
+        {copied ? "Copied" : "Copy"}
+      </Button>
+    </div>
+  );
+}
 
 function stateTone(
   state: string,
@@ -72,6 +127,14 @@ export default function Explorer() {
     if (page > 0 && page >= pageCount) setPage(pageCount - 1);
   }, [page, pageCount]);
 
+  // Latch "the headless user reached the debugger" for journey 1's success
+  // signal. The tour runner samples context only at start and on verify polls,
+  // so a route-based context source would miss a spotlight step landing here;
+  // a mount effect is the robust place to record it.
+  useEffect(() => {
+    markExplorerReached();
+  }, []);
+
   return (
     <div className="flex h-full">
       <div className="flex w-[28rem] shrink-0 flex-col border-r border-edge">
@@ -84,8 +147,12 @@ export default function Explorer() {
                 : `${rangeStart}–${rangeEnd} of ${total} instance(s)`
               : "Live view"}
           </p>
+          <CopyBaseUrl />
         </header>
-        <div className="min-h-0 flex-1 overflow-auto">
+        <div
+          data-tour={TOUR_ANCHOR.explorerInstances}
+          className="min-h-0 flex-1 overflow-auto"
+        >
           {isLoading && <p className="p-5 text-fg-muted">Loading…</p>}
           {error && (
             <p className="p-5 text-danger">Failed to load: {String(error)}</p>

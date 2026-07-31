@@ -35,6 +35,7 @@ import type { Journey, JourneyEvent, TourContext } from "./types";
 // own module import here; the registry itself keeps no central list, so parallel
 // slices never contend on one file.
 import { overviewJourneyId } from "./journeys/overview";
+import "./journeys/localdev";
 
 /**
  * Delay before an auto-started journey opens, letting the initial route and the
@@ -97,10 +98,18 @@ export function useProductTour(
   const navigate = useNavigate();
   const location = useLocation();
 
-  // Kept in a ref so the runner reads the live pathname without the callbacks
-  // churning on every navigation.
+  // Both the pathname and `navigate` are kept in refs so the runner reads the
+  // live router without the callbacks churning on every navigation. This matters
+  // for more than tidiness: React Router's `useNavigate` returns a NEW function
+  // identity on each navigation (it closes over the current location for
+  // relative resolution), so a `navigate` in the runner's `useMemo` deps would
+  // rebuild the runner mid-journey — and the unmount-cleanup effect below would
+  // then `dispose()` the live driver instance, silently killing any journey that
+  // navigates between steps. Ref indirection keeps the runner identity stable.
   const pathnameRef = useRef(location.pathname);
   pathnameRef.current = location.pathname;
+  const navigateRef = useRef(navigate);
+  navigateRef.current = navigate;
 
   const [activeId, setActiveId] = useState<string | undefined>(() =>
     activeJourneyId(readState()),
@@ -165,7 +174,7 @@ export function useProductTour(
   const runner = useMemo(
     () =>
       createJourneyRunner({
-        navigate: (route) => navigate(route),
+        navigate: (route) => navigateRef.current(route),
         getRoute: () => pathnameRef.current,
         getContext,
         onEvent: (event: JourneyEvent) => {
@@ -196,7 +205,7 @@ export function useProductTour(
           );
         },
       }),
-    [getContext, navigate, persist],
+    [getContext, persist],
   );
 
   const startJourney = useCallback(

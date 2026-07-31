@@ -27,6 +27,7 @@ import type {
   TourContext,
 } from "./types";
 import { resolveSteps, type ResolvedStep } from "./registry.ts";
+import { copyText } from "../clipboard.ts";
 
 /** How long to wait for a step's target to mount before skipping it. */
 const WAIT_FOR_ELEMENT_MS = 5000;
@@ -339,43 +340,6 @@ export function createJourneyRunner(deps: RunnerDeps): JourneyRunner {
 function safePredicate(p: (ctx: TourContext) => boolean, ctx: TourContext) {
   try {
     return p(ctx);
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Copy to the clipboard, falling back when the async API is unavailable.
- *
- * `navigator.clipboard` requires a secure context, and this console is routinely
- * served over plain HTTP on a LAN address or a tunnel — exactly where a handoff
- * step matters most. Returns false when nothing could be copied, so the caller
- * can fall back to selecting the text for the user.
- */
-export async function copyText(text: string): Promise<boolean> {
-  try {
-    // The DOM lib types `navigator.clipboard` as always present, but it is
-    // genuinely absent outside a secure context — so probe it at runtime via
-    // `typeof` rather than a truthiness check TypeScript would call redundant.
-    const clipboard = globalThis.navigator?.clipboard;
-    if (clipboard && typeof clipboard.writeText === "function") {
-      await clipboard.writeText(text);
-      return true;
-    }
-  } catch {
-    // Fall through to the legacy path.
-  }
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    ta.setAttribute("readonly", "");
-    ta.style.position = "fixed";
-    ta.style.opacity = "0";
-    document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return ok;
   } catch {
     return false;
   }
