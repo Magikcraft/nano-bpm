@@ -1189,25 +1189,53 @@ fn project_package_json(name: &str, deps: &BTreeMap<String, String>) -> String {
     )
 }
 
-/// Parse a `deno.json` import-map value into an npm `(name, range)` dependency,
-/// mirroring **exactly** the `npm:` handling in `node-loader.mjs`: strip the
-/// `npm:` scheme, then split a trailing `@range` while preserving a leading
-/// `@scope` (`lastIndexOf('@')`, split only when the `@` is past index 0). A
-/// value with no range pins to `*`. Returns `None` for any non-`npm:` value
-/// (relative `./`/`../` paths, `jsr:`, `http(s):`) — those are not
-/// `node_modules` dependencies.
+/// Parse a `deno.json` import-map value into the **installable npm dependency**
+/// `(name, range)` it needs in `package.json` so `npm install` materialises it
+/// into `node_modules` for the Node fallback loader (issue #437).
 ///
-/// This is the lone build-time reader of the `npm:` grammar; keeping it the sole
-/// parser is what lets `package.json` **derive** its deps from `deno.json`
-/// instead of hand-mirroring them (which silently drifts — issue #437).
+/// Handles the full Deno `npm:` specifier grammar —
+/// `npm:[/]<name>[@<range>][/<subpath>]`, where `<name>` may be `@scope/pkg` —
+/// and reduces it to the coordinate `npm install` needs:
+/// * the optional leading `/` (`npm:/pkg`) is stripped;
+/// * a `/<subpath>` is dropped — `npm:lodash@^4/fp` installs `lodash`, since the
+///   loader resolves the subpath from within that package;
+/// * a missing or empty range (`npm:pkg`, `npm:pkg@`) pins to `*`.
+///
+/// For the common case (`npm:@scope/pkg@^1`) this coincides with
+/// `node-loader.mjs`'s specifier stripping, but where they differ the loader
+/// keeps the module specifier (`lodash/fp`) while `package.json` must name the
+/// installable **package** (`lodash`). Returns `None` for any non-`npm:` value
+/// (relative `./`/`../`, `jsr:`, `http(s):`) — those are not `node_modules`
+/// dependencies. This is the lone build-time reader of the `npm:` grammar, so
+/// `package.json` **derives** its deps from `deno.json` rather than hand-mirroring
+/// them (which silently drifts).
 fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
-    let bare = value.strip_prefix("npm:")?;
-    match bare.rfind('@') {
-        // A trailing `@range` (the `@` is past a leading `@scope`).
-        Some(at) if at > 0 => Some((bare[..at].to_string(), bare[at + 1..].to_string())),
-        // Leading-scope-only (`@scope/pkg`) or unscoped-no-range (`pkg`).
-        _ => Some((bare.to_string(), "*".to_string())),
+    let spec = value.strip_prefix("npm:")?;
+    // Deno accepts an optional leading slash: `npm:/pkg@range`.
+    let spec = spec.strip_prefix('/').unwrap_or(spec);
+    // The package name is the first segment (`pkg`) or first two for a scope
+    // (`@scope/pkg`); it ends at the `@` that starts the range or the `/` that
+    // starts a subpath, whichever comes first.
+    let name_len = if let Some(scoped) = spec.strip_prefix('@') {
+        let scope_slash = scoped.find('/')?;
+        let after = &scoped[scope_slash + 1..];
+        let end = after.find(['/', '@']).unwrap_or(after.len());
+        1 + scope_slash + 1 + end
+    } else {
+        spec.find(['/', '@']).unwrap_or(spec.len())
+    };
+    let name = &spec[..name_len];
+    if name.is_empty() {
+        return None;
     }
+    // Whatever follows the name is `@range`, `/subpath`, or both. The range runs
+    // from the `@` to the next `/` (subpath boundary); an empty range pins to `*`.
+    let range = spec[name_len..]
+        .strip_prefix('@')
+        .map(|r| r.split('/').next().unwrap_or(""))
+        .filter(|r| !r.is_empty())
+        .unwrap_or("*");
+    Some((name.to_string(), range.to_string()))
 }
 
 /// Parse a `deno.json`/`deno.jsonc` body into its npm dependency set, or `None`
@@ -8810,6 +8838,35 @@ mod tests {
         assert_eq!(npm_dep_from_import("../shared/lib.ts"), None);
         assert_eq!(npm_dep_from_import("jsr:@std/assert@^1"), None);
         assert_eq!(npm_dep_from_import("https://esm.sh/x"), None);
+
+        // Full Deno grammar: leading slash, subpaths, and an empty range must
+        // reduce to the installable package coordinate (never an invalid key).
+        assert_eq!(
+            npm_dep_from_import("npm:/@scope/pkg"),
+            Some(("@scope/pkg".into(), "*".into()))
+        );
+        // `@range` precedes the subpath in Deno's grammar; the subpath is dropped.
+        assert_eq!(
+            npm_dep_from_import("npm:lodash@^4/fp"),
+            Some(("lodash".into(), "^4".into()))
+        );
+        assert_eq!(
+            npm_dep_from_import("npm:@scope/pkg@^1/sub"),
+            Some(("@scope/pkg".into(), "^1".into()))
+        );
+        // A subpath with no range still installs the bare package.
+        assert_eq!(
+            npm_dep_from_import("npm:lodash/fp"),
+            Some(("lodash".into(), "*".into()))
+        );
+        // A dangling `@` is an empty range → `*`, not `""`.
+        assert_eq!(
+            npm_dep_from_import("npm:left-pad@"),
+            Some(("left-pad".into(), "*".into()))
+        );
+        // Degenerate values yield no dep rather than a `"/"`-style bad key.
+        assert_eq!(npm_dep_from_import("npm:"), None);
+        assert_eq!(npm_dep_from_import("npm:/"), None);
     }
 
     /// Red/Green repro for #437: the SDK template (`throughput-stream`) mapped
