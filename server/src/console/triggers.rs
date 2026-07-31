@@ -1079,6 +1079,13 @@ mod tests {
         workers::usable_node().is_some() || workers::find_deno().is_some()
     }
 
+    /// Grace period a withheld-pack test waits before concluding no child
+    /// launched. A safety net, not a correctness signal: a launched driver/worker
+    /// reaches out within ~1s locally, and the happy-path twins observe a launch
+    /// well inside this budget; 8s leaves ample headroom for a slow cold start on
+    /// a loaded CI runner without the per-poll cost of the (~500ms) inbox query.
+    const WITHHELD_GRACE: Duration = Duration::from_secs(8);
+
     /// Materialise a fresh Urban App project (sqlite datasource + optional
     /// `triggers[]`) under a unique projects root, and return its name.
     fn setup_app(triggers_json: &str) -> String {
@@ -1451,6 +1458,7 @@ await new Promise((r) => setTimeout(r, 60000));
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let pack = ext_root.join("nano-ide-trigger-testpack");
+        let _ = std::fs::remove_dir_all(&ext_root);
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::write(
             pack.join("nano-ide.ext.json"),
@@ -1468,6 +1476,15 @@ await new Promise((r) => setTimeout(r, 60000));
         unsafe {
             std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
         }
+        // Approve the pack so its driver may launch (#460 trust gate). The
+        // untrusted twin below asserts the withheld path.
+        super::super::extensions::save_trust(&super::super::extensions::TrustStore {
+            yolo: false,
+            approved: ["nano-ide-trigger-testpack".to_string()]
+                .into_iter()
+                .collect(),
+        })
+        .unwrap();
 
         let name = setup_app(
             r#", "triggers": [
@@ -1512,6 +1529,237 @@ await new Promise((r) => setTimeout(r, 60000));
         assert_eq!(
             pending, 2,
             "the auto-launched pack driver emitted two events over the ingress"
+        );
+    }
+
+    /// Security gate (#460): a pack that is **not** trusted must have its
+    /// out-of-process trigger driver *withheld* — nothing may reach the ingress.
+    /// The symmetric happy path above approves the pack first; this is its
+    /// negative twin, and the regression guard that an untrusted pack cannot get
+    /// code execution the moment its app runs.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pack_driver_withheld_when_untrusted() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+
+        static N: AtomicU64 = AtomicU64::new(0);
+        let ext_root = std::env::temp_dir().join(format!(
+            "nano-trig-untrusted-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let pack = ext_root.join("nano-ide-trigger-untrusted");
+        let _ = std::fs::remove_dir_all(&ext_root);
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{
+                "id": "nano-ide-trigger-untrusted",
+                "kind": "trigger",
+                "displayName": "Untrusted trigger pack",
+                "triggerSources": [
+                    { "kind": "testmqtt", "displayName": "Test MQTT", "driver": "driver.mjs" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("driver.mjs"), TEST_DRIVER_MJS).unwrap();
+        unsafe {
+            std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
+        }
+        // Deliberately do NOT approve the pack: no trust.json is written, so
+        // `is_trusted("nano-ide-trigger-untrusted")` is false.
+
+        let name = setup_app(
+            r#", "triggers": [
+                { "id": "sensor", "type": "testmqtt", "config": { "topic": "test/topic" }, "action": { "start": "p" } }
+            ]"#,
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, crate::console::test_ingress_router())
+                .await
+                .ok();
+        });
+        workers::set_gateway_port(port);
+
+        let manifest = read_manifest(&name).unwrap();
+        let handle = LoopHandle::new_running();
+        crate::console::trigger_sources::spawn_sources(&name, &manifest, handle.clone());
+
+        // Give a would-be driver the full grace period to launch + emit (a real
+        // launch posts within ~1s), then check the inbox once. A single expensive
+        // inbox query instead of a tight poll keeps the test bounded (~8s) rather
+        // than paying ~500ms per iteration across a long window.
+        tokio::time::sleep(WITHHELD_GRACE).await;
+        let pending = inbox_status(&name).await.map(|s| s.pending).unwrap_or(0);
+
+        handle.stop_for_test();
+        server.abort();
+        unsafe {
+            std::env::remove_var("NANOBPMN_EXTENSIONS_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&ext_root);
+
+        assert_eq!(
+            pending, 0,
+            "an untrusted pack's trigger driver must not launch or emit"
+        );
+    }
+
+    /// A minimal connector worker: on startup it repeatedly reaches out to the
+    /// gateway (`NANOBPMN_BASE_URL`). We don't need a real job stream — a single
+    /// TCP connection to the test server is proof the child launched.
+    const TEST_WORKER_MJS: &str = r#"
+const env = globalThis.Deno ? Deno.env.toObject() : process.env;
+const base = env.NANOBPMN_BASE_URL;
+for (let i = 0; i < 100; i++) {
+  try { await fetch(`${base}/hit`); } catch (_) {}
+  await new Promise((r) => setTimeout(r, 100));
+}
+"#;
+
+    /// Stand up a throwaway connector-worker pack (declaring `workers[]` with an
+    /// `entry`) plus an App that enables its job `type`, and a TCP server the
+    /// launched worker will connect to. Returns `(app name, ext_root, hit flag,
+    /// server task)`. `approve` writes trust for the pack when true.
+    async fn setup_worker_pack(
+        approve: bool,
+    ) -> (
+        String,
+        std::path::PathBuf,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let ext_root = std::env::temp_dir().join(format!(
+            "nano-conn-ext-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let pack = ext_root.join("nano-ide-connector-testpack");
+        let _ = std::fs::remove_dir_all(&ext_root);
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{
+                "id": "nano-ide-connector-testpack",
+                "kind": "app",
+                "displayName": "Test connector pack",
+                "workers": [
+                    { "type": "test:job", "entry": "worker.mjs", "displayName": "Test worker" }
+                ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(pack.join("worker.mjs"), TEST_WORKER_MJS).unwrap();
+        unsafe {
+            std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext_root);
+        }
+        if approve {
+            super::super::extensions::save_trust(&super::super::extensions::TrustStore {
+                yolo: false,
+                approved: ["nano-ide-connector-testpack".to_string()]
+                    .into_iter()
+                    .collect(),
+            })
+            .unwrap();
+        }
+
+        let name = setup_app(r#", "workers": [ { "type": "test:job" } ]"#);
+
+        // A TCP server on the gateway port: any accepted connection = the worker
+        // launched and reached out. Reply with a minimal 200 so `fetch` resolves.
+        let hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        workers::set_gateway_port(port);
+        let hit_srv = hit.clone();
+        let server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                hit_srv.store(true, Ordering::Relaxed);
+                use tokio::io::AsyncWriteExt;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        (name, ext_root, hit, server)
+    }
+
+    /// Class-scoped twin of the trigger-driver happy path, for the connector
+    /// **worker** edge (#460): an approved pack's worker child is launched.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pack_worker_launches_when_trusted() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let (name, ext_root, hit, server) = setup_worker_pack(true).await;
+
+        let manifest = read_manifest(&name).unwrap();
+        let handle = LoopHandle::new_running();
+        crate::console::trigger_sources::spawn_workers(&name, &manifest, handle.clone());
+
+        let mut launched = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if hit.load(Ordering::Relaxed) {
+                launched = true;
+                break;
+            }
+        }
+
+        handle.stop_for_test();
+        server.abort();
+        unsafe {
+            std::env::remove_var("NANOBPMN_EXTENSIONS_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&ext_root);
+
+        assert!(launched, "an approved pack's connector worker must launch");
+    }
+
+    /// Class-scoped twin of the trigger-driver withheld path, for the connector
+    /// **worker** edge (#460): an untrusted pack's worker child must not launch.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn pack_worker_withheld_when_untrusted() {
+        let _g = lock();
+        if !runtime_available() {
+            eprintln!("skipping: no JS runtime");
+            return;
+        }
+        let (name, ext_root, hit, server) = setup_worker_pack(false).await;
+
+        let manifest = read_manifest(&name).unwrap();
+        let handle = LoopHandle::new_running();
+        crate::console::trigger_sources::spawn_workers(&name, &manifest, handle.clone());
+
+        // Give a would-be worker the full grace period to launch + connect (the
+        // happy-path twin observes a launch well inside this budget), then check
+        // the cheap hit flag once.
+        tokio::time::sleep(WITHHELD_GRACE).await;
+        let launched = hit.load(Ordering::Relaxed);
+
+        handle.stop_for_test();
+        server.abort();
+        unsafe {
+            std::env::remove_var("NANOBPMN_EXTENSIONS_DIR");
+        }
+        let _ = std::fs::remove_dir_all(&ext_root);
+
+        assert!(
+            !launched,
+            "an untrusted pack's connector worker must not launch"
         );
     }
 

@@ -752,6 +752,9 @@ pub fn all_trigger_sources() -> Vec<TriggerSourceSpec> {
 /// 0025 phase 4). The runtime launches [`entry`](TriggerDriver::entry) with
 /// [`dir`](TriggerDriver::dir) as the working directory.
 pub struct TriggerDriver {
+    /// The pack's manifest `id` — used to consult the trust store before the
+    /// runtime launches the driver child (mirrors the toolchain gate).
+    pub id: String,
     /// The pack's directory — the driver's working dir (so its bundled
     /// `node_modules` / imports resolve).
     pub dir: PathBuf,
@@ -781,6 +784,7 @@ pub fn trigger_driver(kind: &str) -> Option<TriggerDriver> {
             return None;
         }
         return Some(TriggerDriver {
+            id: m.id,
             dir: base,
             entry: driver.to_string(),
         });
@@ -793,6 +797,9 @@ pub fn trigger_driver(kind: &str) -> Option<TriggerDriver> {
 /// [`entry`](WorkerDriver::entry) with [`dir`](WorkerDriver::dir) as the working
 /// directory (so the pack's bundled imports resolve).
 pub struct WorkerDriver {
+    /// The pack's manifest `id` — used to consult the trust store before the
+    /// runtime launches the worker child (mirrors the toolchain gate).
+    pub id: String,
     /// The pack's directory — the worker's working dir.
     pub dir: PathBuf,
     /// The worker entrypoint, pack-relative (e.g. `worker.ts`).
@@ -820,6 +827,7 @@ pub fn worker_driver(worker_type: &str) -> Option<WorkerDriver> {
             return None;
         }
         return Some(WorkerDriver {
+            id: m.id,
             dir: base,
             entry: worker_entry.to_string(),
         });
@@ -1009,7 +1017,8 @@ pub fn save_trust(t: &TrustStore) -> std::io::Result<()> {
     std::fs::write(trust_path(), format!("{json}\n"))
 }
 
-/// Whether a pack's toolchain commands may run without prompting.
+/// Whether a pack's out-of-process code — a `lang`/`app` toolchain command, or
+/// a `trigger`/connector driver/worker child — may run without prompting.
 pub fn is_trusted(id: &str) -> bool {
     let t = load_trust();
     t.yolo || t.approved.contains(id) || builtin_ids().contains(id)
