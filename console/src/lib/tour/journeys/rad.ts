@@ -199,8 +199,14 @@ export const rad: Journey = {
       kind: "spotlight",
       id: "urban-template",
       route: "/projects",
-      // Anchor owned by slice 4 (#411); the selector is written now and lights
-      // up when that lands. Until then driver.js skipMissingElement drops it.
+      // #411 has landed, so this anchor exists — but the template cards only
+      // render once the New Project gallery is OPEN, which arriving at /projects
+      // does not do. So the target is legitimately absent until the user opens the
+      // gallery, and the step is `optional` for the same reason #408's equivalent
+      // is: driver.js drops it rather than stalling, and the e2e anchor guard
+      // (#417) reports it in its coverage ledger instead of failing on a journey
+      // that is behaving correctly.
+      optional: true,
       selector: tourSelector(templateAnchor(RAD_TEMPLATE_ID)),
       title: "Start from the Urban App",
       body: "New project → the <strong>Urban App</strong> template. Urban is Nano's RAD face (ADR 0022): the position that <em>the binding is the product</em> — one artifact ties the process, the screens, the data and the code together and compiles to a single binary that runs with no external server.",

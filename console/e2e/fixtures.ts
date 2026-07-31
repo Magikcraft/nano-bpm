@@ -200,6 +200,39 @@ export async function resetTourState(page: Page): Promise<void> {
 }
 
 /**
+ * Seed journey state so a journey resumes at a chosen authored step.
+ *
+ * Walking a journey click-by-click is not viable for the workspace-heavy ones: a
+ * step whose anchor is absent costs driver.js up to `waitForElement` (5s) before it
+ * is skipped, so reaching step five through three missing anchors takes ~15s and
+ * made the repair guard look like a failure to advance. Resuming lands on the step
+ * under test directly, which is both faster and a sharper assertion — the claim is
+ * "this step renders as its repair", not "a user can click that far".
+ */
+export async function seedTourState(
+  page: Page,
+  journeyId: string,
+  stepIndex: number,
+): Promise<void> {
+  await page.addInitScript(
+    ({ journeyId, stepIndex }) => {
+      try {
+        window.localStorage.setItem(
+          "nano.tour.v2",
+          JSON.stringify({
+            version: 2,
+            journeys: { [journeyId]: { status: "active", stepIndex } },
+          }),
+        );
+      } catch {
+        /* storage disabled */
+      }
+    },
+    { journeyId, stepIndex },
+  );
+}
+
+/**
  * Fail with the actual error if a view crashed.
  *
  * The console has no error boundary, so an uncaught render error unmounts the

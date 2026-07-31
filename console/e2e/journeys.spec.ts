@@ -23,6 +23,7 @@ import type { Journey, SpotlightStep, Step } from "../src/lib/tour/types.ts";
 import {
   assertNoPageCrash,
   resetTourState,
+  seedTourState,
   stubConsoleApi,
 } from "./fixtures.ts";
 
@@ -96,7 +97,18 @@ async function walkJourney(page: Page, maxSteps: number): Promise<string[]> {
     const next = popover.locator(".driver-popover-next-btn");
     if (!(await next.isVisible().catch(() => false))) break;
     await next.click();
-    await page.waitForTimeout(200);
+    // Wait for the journey to ACTUALLY advance rather than for a fixed delay. A
+    // step whose anchor is absent takes up to driver.js's `waitForElement` (5s)
+    // before being skipped, so a short sleep re-reads the same step — which is how
+    // this helper once collected the opening title seven times and reported a
+    // missing repair step it had never reached.
+    if (title?.trim()) {
+      await expect(popover.locator(".driver-popover-title"))
+        .not.toHaveText(title.trim(), { timeout: 8000 })
+        .catch(() => {
+          /* popover closed on the last step — the visibility check ends the loop */
+        });
+    }
   }
   return titles;
 }
@@ -112,7 +124,14 @@ test.describe("journey anchors resolve", () => {
   });
 
   for (const journey of STUDIO_JOURNEYS) {
-    const assertable = spotlights(journey).filter((s) => isReachable(s.route));
+    // `optional` is the author's declaration that a step's target may legitimately
+    // be absent — #408's template step is optional because the card only renders
+    // once the New Project gallery is open, which a bare route load does not do.
+    // Enforcing those would fail correct journeys; they go in the ledger below
+    // instead, so they stay visible rather than silently unchecked.
+    const assertable = spotlights(journey).filter(
+      (s) => isReachable(s.route) && !s.optional,
+    );
 
     for (const step of assertable) {
       test(`${journey.id} / ${step.id}: ${step.selector} resolves on ${step.route}`, async ({
@@ -190,20 +209,22 @@ test.describe("preconditions", () => {
         denoAvailable: false,
         nodeAvailable: false,
       });
-      await resetTourState(page);
-      await page.goto("projects?tour=" + journey.id);
-      const popover = page.locator(".driver-popover");
-      await expect(popover).toBeVisible();
-      // Walk to the end; the repaired step must appear and the original must not.
-      const titles = await walkJourney(page, journey.steps.length + 2);
-      expect(
-        titles,
-        "the repair step must be shown when no runtime is available",
-      ).toContain(step.repair!.title);
-      expect(
-        titles,
-        "the original step promises an action that cannot work here",
-      ).not.toContain(step.title);
+      // Resume straight to the gated step instead of clicking through: these
+      // journeys pass through several workspace-only anchors, each costing
+      // driver.js up to 5s to skip, and the claim under test is about how THIS
+      // step renders — not how far a user can click.
+      await seedTourState(page, journey.id, journey.steps.indexOf(step));
+      await page.goto(`projects?tour=${journey.id}`);
+
+      const title = page.locator(".driver-popover .driver-popover-title");
+      await expect(title).toBeVisible();
+      // The repair replaces the original in place, so the gated step's authored
+      // index now renders the repair's content.
+      await expect(
+        title,
+        "with no JavaScript runtime the step must offer an install hint, never tell the user to press Run",
+      ).toHaveText(step.repair!.title);
+      await expect(title).not.toHaveText(step.title);
     });
   }
 
@@ -295,9 +316,12 @@ test("reports steps this suite deliberately does not assert", () => {
   // reads a green suite as "every anchor is checked".
   const uncovered = STUDIO_JOURNEYS.flatMap((j) =>
     spotlights(j)
-      .filter((s) => !isReachable(s.route))
+      .filter((s) => !isReachable(s.route) || s.optional)
       .map(
-        (s) => `${j.id}/${s.id} → ${s.selector} (route: ${s.route ?? "none"})`,
+        (s) =>
+          `${j.id}/${s.id} → ${s.selector} (${
+            s.optional ? "optional" : `route: ${s.route ?? "none"}`
+          })`,
       ),
   );
   console.log(
