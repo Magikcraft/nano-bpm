@@ -15,6 +15,7 @@ mod cmd_profile;
 mod coldspill;
 #[cfg(feature = "console")]
 mod console;
+mod consumers;
 mod deepthi;
 mod drain_guard;
 mod falcon;
@@ -11170,6 +11171,12 @@ impl ServerImpl {
         let max_jobs = body.max_jobs_to_activate.max(0) as usize;
         let timeout = body.timeout.max(0) as u64;
 
+        // Record this poll for the console's live consumers panel (issue #404).
+        // Best-effort observability only: a single map insert that never affects
+        // activation. REST is stateless, so this last-poll timestamp is the only
+        // signal that a worker is connected and pulling this job type.
+        crate::consumers::record_rest_poll(&job_type, &worker);
+
         // Optional projection of the job's variables: an empty or absent list
         // returns every visible variable, a non-empty list returns only the named
         // ones (names not present are simply omitted).
@@ -15742,6 +15749,10 @@ async fn main() {
     falcon::spawn_dispatcher(server.clone(), cs_registry.clone());
     let monitor_registry = cs_registry.clone();
     let monitor_server = server.clone();
+    // Captured for the /console/api/consumers route (the live "who is polling
+    // what" panel, issue #404) before `cs_registry` is moved into the cluster
+    // router below.
+    let consumers_registry = cs_registry.clone();
     let cs_router = falcon::router(server.clone(), cs_registry.clone());
 
     // Intra-cluster (`/cluster`) channel (ADR 0039): the authenticated peer
@@ -15898,6 +15909,17 @@ async fn main() {
             axum::routing::get(move || {
                 let srv = peers_dbg.clone();
                 async move { peers_debug_body(&srv) }
+            }),
+        )
+        .route(
+            // Live "who is polling what" consumers panel (issue #404): REST
+            // long-poll workers + Falcon command-stream subscribers, each with a
+            // transport-appropriate live/idle status. Served under /console/api
+            // so the console (and its Vite dev proxy) reach it same-origin.
+            "/console/api/consumers",
+            axum::routing::get(move || {
+                let reg = consumers_registry.clone();
+                async move { axum::Json(crate::consumers::snapshot(&reg)) }
             }),
         )
         .route(
