@@ -427,7 +427,8 @@ pub struct TourStepSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align: Option<String>,
     /// `handoff`: the command or URL offered for copying. Never executed — the
-    /// console renders it as inert text (see `strip_untrusted_handoffs`).
+    /// console renders it as inert text, and `visible_tours` strips handoff
+    /// steps from untrusted packs so this never reaches the client for one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
