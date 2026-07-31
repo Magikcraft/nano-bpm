@@ -29,6 +29,7 @@ export async function copyText(text: string): Promise<boolean> {
   } catch {
     // Fall through to the legacy path.
   }
+  if (typeof document === "undefined") return false;
   try {
     const ta = document.createElement("textarea");
     ta.value = text;
@@ -36,10 +37,14 @@ export async function copyText(text: string): Promise<boolean> {
     ta.style.position = "fixed";
     ta.style.opacity = "0";
     document.body.appendChild(ta);
-    ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return ok;
+    try {
+      ta.select();
+      return document.execCommand("copy");
+    } finally {
+      // Always remove the textarea, even if `execCommand` throws — otherwise a
+      // failed copy would leak a detached node into the DOM on every attempt.
+      document.body.removeChild(ta);
+    }
   } catch {
     return false;
   }

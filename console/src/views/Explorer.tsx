@@ -30,15 +30,34 @@ function CopyBaseUrl() {
   const url = v2BaseUrl();
   const inputRef = useRef<HTMLInputElement>(null);
   const [copied, setCopied] = useState(false);
+  // Held in a ref so the "Copied" reset can be cancelled if the component
+  // unmounts before it fires — otherwise the timer would setState on an
+  // unmounted component.
+  const resetTimer = useRef<number | undefined>(undefined);
+
+  useEffect(
+    () => () => {
+      if (resetTimer.current !== undefined) {
+        window.clearTimeout(resetTimer.current);
+      }
+    },
+    [],
+  );
 
   const onCopy = () => {
     void copyText(url).then((ok) => {
       // Record the outcome regardless of secure context: on the fallback path we
-      // pre-select the text so the user can finish with Ctrl/Cmd-C.
+      // focus and pre-select the text so the user can finish with Ctrl/Cmd-C.
       markBaseUrlCopied();
-      if (!ok) inputRef.current?.select();
+      if (!ok) {
+        inputRef.current?.focus();
+        inputRef.current?.select();
+      }
       setCopied(true);
-      window.setTimeout(() => setCopied(false), 2000);
+      if (resetTimer.current !== undefined) {
+        window.clearTimeout(resetTimer.current);
+      }
+      resetTimer.current = window.setTimeout(() => setCopied(false), 2000);
     });
   };
 
