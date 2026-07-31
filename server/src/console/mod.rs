@@ -379,12 +379,16 @@ fn request_base_url(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .filter(|h| !h.is_empty())
         .unwrap_or("localhost");
+    // Only honour a forwarded scheme we actually emit URLs for; a misconfigured
+    // proxy (or a hostile client) supplying anything else must not leak into the
+    // links a downstream agent might auto-follow. Normalised to canonical case.
     let scheme = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.split(',').next())
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| s.eq_ignore_ascii_case("https"))
+        .map(|_| "https")
         .unwrap_or("http");
     format!("{scheme}://{host}")
 }
@@ -407,6 +411,10 @@ async fn llms_txt(headers: HeaderMap) -> Response {
 /// when the client advertised `gzip` (these documents are regenerated per
 /// request, so they are not pre-compressed like the embedded SPA assets).
 fn serve_text(content_type: &'static str, body: String, headers: &HeaderMap) -> Response {
+    // Regenerated per request (base URL, packs, templates are node/request
+    // specific), so an intermediary must never cache and replay one host's or
+    // client's variant to another. `Vary: Accept-Encoding` is set on both branches
+    // so the encoding negotiation is honoured regardless of which we return.
     let enc = accepted_encodings(headers);
     if enc.gzip
         && let Some(gz) = gzip(body.as_bytes())
@@ -416,12 +424,21 @@ fn serve_text(content_type: &'static str, body: String, headers: &HeaderMap) -> 
                 (header::CONTENT_TYPE, content_type),
                 (header::CONTENT_ENCODING, "gzip"),
                 (header::VARY, "Accept-Encoding"),
+                (header::CACHE_CONTROL, "no-store"),
             ],
             gz,
         )
             .into_response();
     }
-    ([(header::CONTENT_TYPE, content_type)], body).into_response()
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::VARY, "Accept-Encoding"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Serves the Swagger UI shell at `/swagger`.
@@ -3688,9 +3705,21 @@ mod asset_encoding_tests {
         h.insert(header::HOST, "nano.example.test".parse().unwrap());
         // No forwarded proto → http (the console is typically plain-http/local).
         assert_eq!(request_base_url(&h), "http://nano.example.test");
-        // A proxy's X-Forwarded-Proto wins so the printed URLs are reachable.
+        // A proxy's X-Forwarded-Proto https wins so the printed URLs are reachable.
         h.insert("x-forwarded-proto", "https, http".parse().unwrap());
         assert_eq!(request_base_url(&h), "https://nano.example.test");
+    }
+
+    #[test]
+    fn request_base_url_rejects_non_http_forwarded_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "nano.example.test".parse().unwrap());
+        // A bogus/hostile scheme must not leak into emitted links — fall back to http.
+        h.insert("x-forwarded-proto", "javascript".parse().unwrap());
+        assert_eq!(request_base_url(&h), "http://nano.example.test");
+        // http is accepted and canonicalised.
+        h.insert("x-forwarded-proto", "HTTP".parse().unwrap());
+        assert_eq!(request_base_url(&h), "http://nano.example.test");
     }
 
     #[test]
@@ -3716,6 +3745,28 @@ mod asset_encoding_tests {
         // The request's host threads into the actionable import URL.
         assert!(text.contains("http://node.local:9000/console/api/projects/import"));
         assert!(text.contains("## Link it in"));
+    }
+
+    #[tokio::test]
+    async fn agent_endpoint_is_uncacheable_and_varies_on_encoding() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "node.local".parse().unwrap());
+        // Uncompressed branch (no Accept-Encoding) still carries both headers, so a
+        // proxy neither caches a per-host body nor mixes up encoding variants.
+        let resp = agent_brief_md(h).await;
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Accept-Encoding")
+        );
+        assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
     }
 
     #[tokio::test]

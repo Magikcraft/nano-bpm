@@ -13,7 +13,7 @@ import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
 import JourneyPicker from "../components/JourneyPicker";
 import DirectoryPicker from "../components/DirectoryPicker";
 import { isLocalhost } from "../lib/api";
-import { copyText } from "../lib/tour/runner";
+import { copyText } from "../lib/clipboard";
 import { CONSOLE_PROFILE } from "../lib/profile";
 import { TOUR_ANCHOR, templateAnchor } from "../lib/tour/tourAnchors";
 import { useTour } from "../lib/tour/tourContext";
