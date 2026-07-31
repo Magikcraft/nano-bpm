@@ -51,7 +51,7 @@ export type StepHandler = (job: Job) => Promise<JsonObject | void> | JsonObject 
  *  combinators carry nested `FlowNode[]` bodies. */
 export type FlowNode =
   | { kind: "run"; name: string; envelopes?: NodeEnvelopes }
-  | { kind: "task"; name: string; envelopes?: NodeEnvelopes }
+  | { kind: "task"; name: string; envelopes?: NodeEnvelopes; jobType?: string }
   | { kind: "signal"; name: string; correlationKey: string; payload?: Envelope }
   | { kind: "switch"; subject: string; cases: SwitchCase[]; default?: FlowNode[] }
   | { kind: "branch"; condition: string; then: FlowNode[]; else?: FlowNode[] }

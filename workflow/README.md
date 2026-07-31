@@ -34,7 +34,9 @@ Both compile to the same engine durability; pick per workflow.
 ### Declarative (with control flow, human-in-the-loop signals, and typed I/O)
 
 **The recommended surface.** Describe the flow as a **tree of nodes**: `w.run` (a
-locally-hosted service task), `w.task` (an external-worker service task), and
+locally-hosted service task), `w.task` (an external-worker service task — job
+type `${flowId}:${name}` by default, or pass `w.task(name, { jobType })` to
+target an existing worker pool, e.g. a `senior:pr-review` agent token), and
 `w.signal` (a durable message catch that resumes via a correlated message — the
 human-in-the-loop path), composed with control-flow combinators:
 
@@ -178,7 +180,7 @@ once.
 | `defineWorkflow(id, orchFn)` | Imperative (replayed) workflow — experimental/internal. |
 | `defineFlow(id, [contracts,] build)` | Declarative flow: `run`/`task`/`signal` + `switch`/`branch`/`loop`/`break`/`continue`, with an optional typed contracts map. |
 | `envelope(name, fields)` | A typed data envelope; lifted into the model as a `nano:shape` + `dataEnvelope` wiring. |
-| `externalJobTypes(flow)` | The derived job types of a flow's external `task` steps. |
+| `externalJobTypes(flow)` | The job types of a flow's external `task` steps (each overridable per-step via `w.task(name, { jobType })`). |
 | `WorkflowClient` | `deploy`, `start`, `signal`, `getInstance` over REST v2. |
 | `Worker` | Generic job runtime; routes job types → handlers, hosts the replay loop. |
 | `toBpmn(workflow)` | The derived BPMN XML (for inspection / deployment). |
