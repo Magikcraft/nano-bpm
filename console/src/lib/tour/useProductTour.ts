@@ -31,15 +31,19 @@ import {
   type TourState,
 } from "./state";
 import type { Journey, JourneyEvent, TourContext } from "./types";
-// Registers the built-in journeys by import side effect. A journey slice adds its
-// own module import here; the registry itself keeps no central list, so parallel
-// slices never contend on one file.
+// Registers the built-in journeys by import side effect: importing a journey
+// module runs its `registerJourney` calls (registry.ts). This import list is the
+// ONE file every journey slice shares — a slice adds a single line here and owns
+// everything else in its own module, so the contention is one line, not a merge
+// of shared journey state.
 import { overviewJourneyId } from "./journeys/overview";
 // Journey 1 (headless local dev, #409). Imported for its registration side
 // effect, eagerly, so it is offered in the picker and reachable via ?tour=
 // before its own view (Explorer, lazy-loaded) has mounted.
 import "./journeys/localdev";
 import "./journeys/rad";
+// Guided journeys 0a/0b (agentic SDLC, #408). Self-registers on load (registry.ts).
+import "./journeys/agentic";
 
 /**
  * Delay before an auto-started journey opens, letting the initial route and the
