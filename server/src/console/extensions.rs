@@ -485,19 +485,22 @@ pub struct TourSpec {
 /// trust store next to this code, and stripping before the payload is built means
 /// an untrusted pack's command string never reaches the client at all. A journey
 /// left with no steps is dropped entirely rather than offered as an empty card.
-pub fn visible_tours(m: &ExtManifest) -> Vec<TourSpec> {
-    if is_trusted(&m.id) {
-        return m.tours.clone();
-    }
+pub fn visible_tours(m: &ExtManifest, trusted: bool) -> Vec<TourSpec> {
     m.tours
         .iter()
         .filter_map(|t| {
-            let steps: Vec<TourStepSpec> = t
-                .steps
-                .iter()
-                .cloned()
-                .filter_map(sanitize_untrusted_step)
-                .collect();
+            let steps: Vec<TourStepSpec> = if trusted {
+                t.steps.clone()
+            } else {
+                t.steps
+                    .iter()
+                    .cloned()
+                    .filter_map(sanitize_untrusted_step)
+                    .collect()
+            };
+            // A journey left with no steps is dropped rather than offered as an
+            // empty card — on both paths, so a trusted pack that ships `steps: []`
+            // is treated the same as one left empty by the trust gate.
             if steps.is_empty() {
                 return None;
             }
@@ -2035,7 +2038,8 @@ mod tests {
                 ]},
                 { "id": "all-handoff", "title": "T", "blurb": "B", "steps": [
                     { "id": "paste", "kind": "handoff", "title": "T", "body": "B", "copy": "rm -rf /" }
-                ]}
+                ]},
+                { "id": "empty", "title": "T", "blurb": "B", "steps": [] }
               ]
             }"#,
         )
@@ -2043,8 +2047,12 @@ mod tests {
 
         // Untrusted: the handoff step is gone, and a journey left with nothing is
         // dropped rather than offered as an empty card.
-        let visible = visible_tours(&m);
-        assert_eq!(visible.len(), 1, "the all-handoff journey must be dropped");
+        let visible = visible_tours(&m, is_trusted(&m.id));
+        assert_eq!(
+            visible.len(),
+            1,
+            "the all-handoff and empty journeys are both dropped"
+        );
         assert_eq!(visible[0].id, "mixed");
         assert_eq!(visible[0].steps.len(), 1);
         let look = &visible[0].steps[0];
@@ -2073,9 +2081,18 @@ mod tests {
             approved: ["community-pack".to_string()].into_iter().collect(),
         })
         .unwrap();
-        let trusted = visible_tours(&m);
-        assert_eq!(trusted.len(), 2, "a trusted pack keeps both journeys");
+        let trusted = visible_tours(&m, is_trusted(&m.id));
+        assert_eq!(
+            trusted.len(),
+            2,
+            "a trusted pack keeps its non-empty journeys, but an empty-steps \
+             journey is still dropped rather than offered as an empty card"
+        );
         assert_eq!(trusted[0].steps.len(), 2);
+        assert!(
+            trusted.iter().all(|t| !t.steps.is_empty()),
+            "no empty journey may be offered, even for a trusted pack"
+        );
 
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
         let _ = std::fs::remove_dir_all(&root);

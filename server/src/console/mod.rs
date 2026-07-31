@@ -2351,6 +2351,7 @@ pub(super) fn extensions_overview() -> serde_json::Value {
 /// `toolchain_available` shells out (`<bin> --version`), so call this off the
 /// async runtime (it already runs inside sync/`spawn_blocking` contexts).
 fn extension_json(e: &extensions::ExtManifest) -> serde_json::Value {
+    let trusted = extensions::is_trusted(&e.id);
     serde_json::json!({
         "id": e.id, "kind": e.kind, "displayName": e.display_name, "builtin": e.builtin,
         "icon": e.icon,
@@ -2359,10 +2360,12 @@ fn extension_json(e: &extensions::ExtManifest) -> serde_json::Value {
         "intellisense": e.intellisense,
         "components": extensions::pack_component_templates(&e.id),
         "toolchainAvailable": extensions::toolchain_available(e),
-        "trusted": extensions::is_trusted(&e.id),
+        // Resolve trust once and reuse it for both the reported flag and the tour
+        // filtering, so the two cannot disagree and the trust store is read once.
+        "trusted": trusted,
         // Handoff steps are stripped for untrusted packs before they are ever
         // sent — see extensions::visible_tours.
-        "tours": extensions::visible_tours(e),
+        "tours": extensions::visible_tours(e, trusted),
     })
 }
 
