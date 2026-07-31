@@ -130,3 +130,25 @@
     animation: none !important;
   }
 }
+
+/* Suggested template card (#411, ADR 0049 §2 part B).
+ *
+ * When a journey spotlights a New Project template card
+ * (`data-tour="template-<id>"`), driver.js tags that element with
+ * `.driver-active-element`. We render it as *suggested* — a highlight in the
+ * accent-2 vocabulary, deliberately distinct from the user's own *selected*
+ * state (border/ring in `accent`, set in Projects.tsx). This lets the tour point
+ * at a starting template without hijacking the choice: the card is still fully
+ * clickable (driver keeps the active element interactive) and the user may pick
+ * a different one. Purely selector-driven, so a new journey needs no code here.
+ *
+ * Uses `outline` (a separate rendering layer) rather than box-shadow or the ring
+ * utilities, so it composes over a card that is *simultaneously selected* — the
+ * selected state is a Tailwind `ring`, which is itself a box-shadow, so a
+ * box-shadow here would replace that ring instead of layering on top of it. An
+ * outline sits outside the box-shadow layer and follows the card's
+ * border-radius, and tracks light/dark via the accent-2 theme token. */
+.driver-active-element[data-tour^="template-"] {
+  outline: 2px solid var(--nano-accent-2);
+  outline-offset: 2px;
+}

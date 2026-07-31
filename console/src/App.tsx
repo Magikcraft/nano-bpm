@@ -20,6 +20,7 @@ import { registerFileTypesFromOverview } from "./lib/editorLang";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 import { IS_STUDIO } from "./lib/profile";
 import { useProductTour } from "./lib/tour/useProductTour";
+import { TourContext } from "./lib/tour/tourContext";
 import { navAnchor, TOUR_ANCHOR } from "./lib/tour/tourAnchors";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
@@ -217,12 +218,17 @@ function ThemeToggle() {
 
 export default function App() {
   const location = useLocation();
-  // `autoStart` is transitional: ADR 0049 replaces it with the journey picker on
-  // the Projects/Topology empty state (#411). Keeping it until then preserves the
-  // onboarding the console has today rather than shipping a gap.
-  const { startTour, resumeJourney, activeJourney, isRunning } = useProductTour(
-    { autoStart: true },
-  );
+  // The one product-tour instance for the whole app. Published via TourContext
+  // so the rail button here AND the empty-state journey pickers (#411) drive the
+  // same runner and journey state.
+  //
+  // `autoStart` is now false: ADR 0049 replaces first-run auto-start with the
+  // journey picker on the Projects/Topology empty state (#411, landed), so a
+  // first-timer chooses one of the real outcome-shaped journeys instead of being
+  // dropped into the demoted overview. The overview stays reachable from each
+  // picker's "just show me around" link and the rail's "Take a tour".
+  const tour = useProductTour({ autoStart: false });
+  const { startTour, resumeJourney, activeJourney, isRunning } = tour;
   // Offer "Resume" only when there is an unfinished journey that is not already
   // on screen — otherwise the label would invite the user to resume the tour
   // they are looking at.
@@ -319,170 +325,172 @@ export default function App() {
   }, [location.pathname]);
 
   return (
-    <div className="flex h-full bg-app text-fg">
-      <aside className="flex w-56 shrink-0 flex-col border-r border-edge bg-panel">
-        <div className="px-5 py-4">
-          <a href="/" className="block no-underline">
-            <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-lg font-bold tracking-tight text-transparent">
-              nano BPM
-            </div>
-            <div className="text-xs text-fg-faint">single-node console</div>
-            {serverVersion && (
-              <div
-                className="mt-1 font-mono text-[10px] text-fg-faint"
-                title="Version of the running gateway (from /console/api/topology)"
-              >
-                gateway v{serverVersion}
+    <TourContext.Provider value={tour}>
+      <div className="flex h-full bg-app text-fg">
+        <aside className="flex w-56 shrink-0 flex-col border-r border-edge bg-panel">
+          <div className="px-5 py-4">
+            <a href="/" className="block no-underline">
+              <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-lg font-bold tracking-tight text-transparent">
+                nano BPM
               </div>
-            )}
-            <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
-              Advanced Research Prototype
-            </div>
-            <div className="mt-1.5 text-[10px] text-fg-faint">
-              Free for evaluation use
-            </div>
+              <div className="text-xs text-fg-faint">single-node console</div>
+              {serverVersion && (
+                <div
+                  className="mt-1 font-mono text-[10px] text-fg-faint"
+                  title="Version of the running gateway (from /console/api/topology)"
+                >
+                  gateway v{serverVersion}
+                </div>
+              )}
+              <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
+                Advanced Research Prototype
+              </div>
+              <div className="mt-1.5 text-[10px] text-fg-faint">
+                Free for evaluation use
+              </div>
+            </a>
+          </div>
+          <nav className="flex flex-col gap-1 px-3">
+            {navItems.map((item) => {
+              // The Projects item is special: it links back to wherever the user
+              // last was in that section and stays highlighted across all
+              // /projects/* routes.
+              const isProjects = item.to === "/projects";
+              const to = isProjects ? projectsRoute.current : item.to;
+              const active = isProjects
+                ? location.pathname.startsWith("/projects")
+                : location.pathname === item.to;
+              return (
+                <NavLink
+                  key={item.to}
+                  to={to}
+                  data-tour={navAnchor(item.to)}
+                  className={railItemClass(active)}
+                >
+                  <ActiveBar show={active} />
+                  {item.icon}
+                  {item.label}
+                  {item.to === "/extensions" && updateCount > 0 && (
+                    <span
+                      className="ml-auto inline-flex min-w-[18px] items-center justify-center rounded-full bg-danger px-1.5 text-[10px] font-bold leading-none text-white"
+                      style={{ height: "18px" }}
+                      title={`${updateCount} extension update${updateCount === 1 ? "" : "s"} available`}
+                      aria-label={`${updateCount} extension updates available`}
+                    >
+                      {updateCount > 99 ? "99+" : updateCount}
+                    </span>
+                  )}
+                </NavLink>
+              );
+            })}
+          </nav>
+
+          <button
+            type="button"
+            onClick={canResume ? resumeJourney : startTour}
+            data-tour={TOUR_ANCHOR.takeATour}
+            className={`mt-auto mx-3 ${railItemClass(false)}`}
+            title={
+              canResume
+                ? `Pick up “${activeJourney.title}” where you left off`
+                : "Replay the product tour"
+            }
+          >
+            <Icon>
+              <circle cx="12" cy="12" r="9" />
+              <path d="M9.1 9a3 3 0 1 1 4.3 3.2c-.8.5-1.4 1-1.4 1.9" />
+              <path d="M12 17h.01" />
+            </Icon>
+            {canResume ? "Resume tour" : "Take a tour"}
+          </button>
+
+          <a
+            href="https://github.com/jwulf/nano-ide/issues/new/choose"
+            target="_blank"
+            rel="noopener noreferrer"
+            className={`mx-3 ${railItemClass(false)}`}
+            title="Send feedback or report an issue"
+          >
+            {icons.feedback}
+            Feedback
           </a>
-        </div>
-        <nav className="flex flex-col gap-1 px-3">
-          {navItems.map((item) => {
-            // The Projects item is special: it links back to wherever the user
-            // last was in that section and stays highlighted across all
-            // /projects/* routes.
-            const isProjects = item.to === "/projects";
-            const to = isProjects ? projectsRoute.current : item.to;
-            const active = isProjects
-              ? location.pathname.startsWith("/projects")
-              : location.pathname === item.to;
-            return (
-              <NavLink
-                key={item.to}
-                to={to}
-                data-tour={navAnchor(item.to)}
-                className={railItemClass(active)}
-              >
-                <ActiveBar show={active} />
-                {item.icon}
-                {item.label}
-                {item.to === "/extensions" && updateCount > 0 && (
-                  <span
-                    className="ml-auto inline-flex min-w-[18px] items-center justify-center rounded-full bg-danger px-1.5 text-[10px] font-bold leading-none text-white"
-                    style={{ height: "18px" }}
-                    title={`${updateCount} extension update${updateCount === 1 ? "" : "s"} available`}
-                    aria-label={`${updateCount} extension updates available`}
-                  >
-                    {updateCount > 99 ? "99+" : updateCount}
-                  </span>
-                )}
-              </NavLink>
-            );
-          })}
-        </nav>
 
-        <button
-          type="button"
-          onClick={canResume ? resumeJourney : startTour}
-          data-tour={TOUR_ANCHOR.takeATour}
-          className={`mt-auto mx-3 ${railItemClass(false)}`}
-          title={
-            canResume
-              ? `Pick up “${activeJourney.title}” where you left off`
-              : "Replay the product tour"
-          }
-        >
-          <Icon>
-            <circle cx="12" cy="12" r="9" />
-            <path d="M9.1 9a3 3 0 1 1 4.3 3.2c-.8.5-1.4 1-1.4 1.9" />
-            <path d="M12 17h.01" />
-          </Icon>
-          {canResume ? "Resume tour" : "Take a tour"}
-        </button>
+          <a
+            href="/docs"
+            className={`mx-3 ${railItemClass(false)}`}
+            title="Documentation"
+          >
+            {icons.docs}
+            Documentation
+          </a>
 
-        <a
-          href="https://github.com/jwulf/nano-ide/issues/new/choose"
-          target="_blank"
-          rel="noopener noreferrer"
-          className={`mx-3 ${railItemClass(false)}`}
-          title="Send feedback or report an issue"
-        >
-          {icons.feedback}
-          Feedback
-        </a>
+          <a
+            href="/whitepaper"
+            className={`mx-3 ${railItemClass(false)}`}
+            title="Whitepaper"
+          >
+            {icons.whitepaper}
+            Whitepaper
+          </a>
 
-        <a
-          href="/docs"
-          className={`mx-3 ${railItemClass(false)}`}
-          title="Documentation"
-        >
-          {icons.docs}
-          Documentation
-        </a>
+          <NavLink
+            to="/credits"
+            className={`mx-3 ${railItemClass(location.pathname.startsWith("/credits"))}`}
+            title="Credits"
+          >
+            <ActiveBar show={location.pathname.startsWith("/credits")} />
+            {icons.credits}
+            Credits
+          </NavLink>
 
-        <a
-          href="/whitepaper"
-          className={`mx-3 ${railItemClass(false)}`}
-          title="Whitepaper"
-        >
-          {icons.whitepaper}
-          Whitepaper
-        </a>
+          <NavLink
+            to="/config"
+            className={`mx-3 mb-3 ${railItemClass(location.pathname.startsWith("/config"))}`}
+            title="Configuration"
+          >
+            <ActiveBar show={location.pathname.startsWith("/config")} />
+            {icons.config}
+            Config
+          </NavLink>
 
-        <NavLink
-          to="/credits"
-          className={`mx-3 ${railItemClass(location.pathname.startsWith("/credits"))}`}
-          title="Credits"
-        >
-          <ActiveBar show={location.pathname.startsWith("/credits")} />
-          {icons.credits}
-          Credits
-        </NavLink>
+          <ThemeToggle />
+        </aside>
 
-        <NavLink
-          to="/config"
-          className={`mx-3 mb-3 ${railItemClass(location.pathname.startsWith("/config"))}`}
-          title="Configuration"
-        >
-          <ActiveBar show={location.pathname.startsWith("/config")} />
-          {icons.config}
-          Config
-        </NavLink>
-
-        <ThemeToggle />
-      </aside>
-
-      <main className="min-w-0 flex-1 overflow-auto">
-        <Suspense
-          fallback={
-            <div className="flex h-full items-center justify-center text-sm text-fg-faint">
-              Loading…
-            </div>
-          }
-        >
-          <Routes>
-            <Route path="/" element={<Navigate to={HOME_ROUTE} replace />} />
-            {/* Studio-only routes — absent (and tree-shaken) in observe builds.
+        <main className="min-w-0 flex-1 overflow-auto">
+          <Suspense
+            fallback={
+              <div className="flex h-full items-center justify-center text-sm text-fg-faint">
+                Loading…
+              </div>
+            }
+          >
+            <Routes>
+              <Route path="/" element={<Navigate to={HOME_ROUTE} replace />} />
+              {/* Studio-only routes — absent (and tree-shaken) in observe builds.
                 RR6 ignores falsy children, so a null component drops the route. */}
-            {Projects && <Route path="/projects" element={<Projects />} />}
-            {ProjectWorkspace && (
-              <Route path="/projects/:name" element={<ProjectWorkspace />} />
-            )}
-            {Extensions && (
-              <Route path="/extensions" element={<Extensions />} />
-            )}
-            <Route path="/config" element={<Config />} />
-            <Route path="/credits" element={<Credits />} />
-            <Route path="/topology" element={<Topology />} />
-            <Route path="/metrics" element={<Metrics />} />
-            <Route
-              path="/modeler"
-              element={<Navigate to={HOME_ROUTE} replace />}
-            />
-            <Route path="/explorer" element={<Explorer />} />
-            <Route path="/traces" element={<Traces />} />
-            <Route path="/workers" element={<Workers />} />
-            <Route path="*" element={<Navigate to={HOME_ROUTE} replace />} />
-          </Routes>
-        </Suspense>
-      </main>
-    </div>
+              {Projects && <Route path="/projects" element={<Projects />} />}
+              {ProjectWorkspace && (
+                <Route path="/projects/:name" element={<ProjectWorkspace />} />
+              )}
+              {Extensions && (
+                <Route path="/extensions" element={<Extensions />} />
+              )}
+              <Route path="/config" element={<Config />} />
+              <Route path="/credits" element={<Credits />} />
+              <Route path="/topology" element={<Topology />} />
+              <Route path="/metrics" element={<Metrics />} />
+              <Route
+                path="/modeler"
+                element={<Navigate to={HOME_ROUTE} replace />}
+              />
+              <Route path="/explorer" element={<Explorer />} />
+              <Route path="/traces" element={<Traces />} />
+              <Route path="/workers" element={<Workers />} />
+              <Route path="*" element={<Navigate to={HOME_ROUTE} replace />} />
+            </Routes>
+          </Suspense>
+        </main>
+      </div>
+    </TourContext.Provider>
   );
 }

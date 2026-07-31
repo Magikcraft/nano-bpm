@@ -9,8 +9,22 @@ import {
   PageHeader,
   SectionLabel,
 } from "../components/ui";
+import JourneyPicker from "../components/JourneyPicker";
+import { CONSOLE_PROFILE, IS_STUDIO } from "../lib/profile";
+import { useTour } from "../lib/tour/tourContext";
+import { pickerJourneys } from "../lib/tour/picker";
 
 export default function Topology() {
+  // Topology is the observe build's home, so it carries the cold-arrival journey
+  // picker there (parallel to Projects in studio). In studio Topology is a
+  // secondary view, so we don't duplicate the picker. The section only renders
+  // when the registry actually offers a non-overview journey for this profile —
+  // today observe has only its overview, so nothing shows until #409 lands a
+  // real observe journey.
+  const tour = useTour();
+  const journeys = tour
+    ? pickerJourneys(tour.availableJourneys, CONSOLE_PROFILE)
+    : [];
   const { data, isLoading, error } = useQuery({
     queryKey: ["topology"],
     queryFn: async () => (await getTopology({ throwOnError: true })).data,
@@ -39,6 +53,18 @@ export default function Topology() {
           </>
         }
       />
+
+      {!IS_STUDIO && journeys.length > 0 && (
+        <section className="mb-8">
+          <JourneyPicker
+            title="Get started"
+            subtitle="Pick a guided journey — or explore the cluster on your own."
+            journeys={journeys}
+            onPick={(id) => tour?.startJourney(id)}
+            onOverview={tour ? () => tour.startTour() : undefined}
+          />
+        </section>
+      )}
 
       {isLoading && <p className="text-fg-muted">Loading…</p>}
       {error && <ErrorText>Failed to load topology: {String(error)}</ErrorText>}

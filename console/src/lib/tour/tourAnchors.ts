@@ -19,7 +19,22 @@ export function navAnchor(route: string): string {
   return `nav-${route.replace(/^\//, "").toLowerCase()}`;
 }
 
-/** Every `data-tour` anchor the tour targets, in one place. */
+/**
+ * `data-tour` value for a New Project template card, derived from the template
+ * id (#411). Journeys 0a/2 spotlight a *suggested* starting template by id
+ * (#408/#410); deriving both the attribute (Projects.tsx) and those journeys'
+ * selectors from this one function keeps them from drifting apart, exactly as
+ * `navAnchor` does for rail items. `"workflow-starter"` → `"template-workflow-starter"`.
+ */
+export function templateAnchor(id: string): string {
+  return `template-${id}`;
+}
+
+/**
+ * Every *static* `data-tour` anchor the tour targets, in one place. Per-template
+ * card anchors are dynamic (derived from the template id via `templateAnchor`)
+ * and so are intentionally not enumerated here.
+ */
 export const TOUR_ANCHOR = {
   projectsNav: navAnchor("/projects"),
   explorerNav: navAnchor("/explorer"),
