@@ -56,6 +56,25 @@ resource-constrained environments — the edge, embedded contexts, modest hardwa
 where a traditional engine cannot fit at all. Both directions open markets that were
 previously closed to us.
 
+## Dogfooding: Nano Workforce
+
+Urban — nano's application tier — earns its keep when it can express a serious, stateful,
+human-in-the-loop automation entirely from its own primitives: a process, a DMN table, forms, a
+datasource, connectors, and agent-backed workers. **Nano Workforce** is that proof, and we build it by
+turning it on ourselves first.
+
+We already develop nano with a crew of coding agents: an epic fans a dozen slices out across parallel
+git worktrees, coordinated today by a hand-run claim mutex and one agent playing coordinator. Nano
+Workforce makes that a durable Urban app — you talk to one orchestrator, and a "Crew Task" process runs
+the crew: dispatching each unit of work to an agent-as-worker in a clean worktree, holding the claim as
+an engine-leased mutex, supervising with engine timers, and escalating only real decisions to the
+captain as user tasks. The engine owns the durability, the mutex, the supervision, and the recovery
+that filesystem-and-shell agent orchestrators re-implement by hand.
+
+It is a flagship, not a toy: the state-in-motion ↔ state-at-rest story told as a shipping application,
+and the integrating pressure that keeps forms, DMN, the datasource, connectors, and the console honest
+together. See [ADR 0051](docs/adr/0051-nano-workforce.md).
+
 ## How we work
 
 nano engineering is **fast, fluid, and fun.**
