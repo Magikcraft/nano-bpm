@@ -1530,7 +1530,8 @@ fn workflow_package_json(name: &str) -> String {
   "scripts": {{
     "start": "deno task start",
     "start-instance": "deno task start-instance",
-    "approve": "deno task approve"
+    "approve": "deno task approve",
+    "job-types": "deno task job-types"
   }},
   "dependencies": {{
     "@nanobpm/workflow": "^0.3.0"
@@ -6274,6 +6275,14 @@ mod tests {
         );
         let job_types = std::fs::read_to_string(dir.join("scripts/job-types.ts")).unwrap();
         assert!(job_types.contains("externalJobTypes(prReview)"));
+        // The README instructs `deno task job-types`, so the package.json script
+        // parity must exist or the `npm run job-types` alternative silently breaks
+        // (the deno.json task itself is asserted below alongside the other tasks).
+        let package_json = std::fs::read_to_string(dir.join("package.json")).unwrap();
+        assert!(
+            package_json.contains("\"job-types\""),
+            "package.json scripts must keep parity with the deno.json job-types task"
+        );
         assert!(
             !example.contains("defineWorkflow"),
             "the scaffold must lead with the declarative surface, not imperative replay"
@@ -6297,10 +6306,11 @@ mod tests {
             approve.contains("client.signal("),
             "the approve script should correlate the human-in-the-loop signal"
         );
-        // All three Deno tasks are defined.
+        // All Deno tasks are defined (incl. the job-types task the README advertises).
         assert!(deno_json["tasks"]["start"].is_string());
         assert!(deno_json["tasks"]["start-instance"].is_string());
         assert!(deno_json["tasks"]["approve"].is_string());
+        assert!(deno_json["tasks"]["job-types"].is_string());
     }
 
     #[tokio::test]
