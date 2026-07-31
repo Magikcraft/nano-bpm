@@ -1711,8 +1711,12 @@ const WORKFLOW_APPROVE_TS: &str = r#"// Approve a parked `pr-review` instance: c
 // its prId so the flow proceeds from the durable wait to `merge`.
 //
 //   deno task start                 # the worker-host service
-//   deno task start-instance PR-42  # create an instance (parks at humanApproval)
+//   deno task start-instance PR-42  # create an instance (parks on `review`, then humanApproval)
 //   deno task approve PR-42         # resume it past the human-in-the-loop wait
+//
+// Note: the instance first parks on the external `review` w.task until a harness
+// services `pr-review:review`; only then does it reach the humanApproval wait
+// this script resumes. See the README's "external-agent seam" section.
 import { WorkflowClient } from "@nanobpm/workflow";
 import { prReview } from "../workflows/pr-review.ts";
 
