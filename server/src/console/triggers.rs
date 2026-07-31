@@ -970,8 +970,8 @@ pub(crate) fn dispatcher() -> &'static TriggerDispatcher {
 
 impl TriggerDispatcher {
     /// Start the drain loop **and the in-process source loops** for `project`
-    /// if it declares `triggers[]` and isn't already running. Called from the
-    /// project run path; idempotent.
+    /// if it declares `triggers[]` (inbound) or `workers[]` (outbound, ADR 0050)
+    /// and isn't already running. Called from the project run path; idempotent.
     pub(crate) async fn ensure_started(&self, project: &str, base_url: String) {
         // Only running Apps that actually declare triggers pay for a loop.
         let Ok(manifest) = read_manifest(project) else {
@@ -982,7 +982,15 @@ impl TriggerDispatcher {
             .and_then(Json::as_array)
             .map(|t| !t.is_empty())
             .unwrap_or(false);
-        if !has_triggers {
+        // A connector-only App (ADR 0050) enables workers[] but no triggers[];
+        // it still needs the supervised loop (to keep its workers alive), so
+        // gate on either edge being present.
+        let has_workers = manifest
+            .get("workers")
+            .and_then(Json::as_array)
+            .map(|w| !w.is_empty())
+            .unwrap_or(false);
+        if !has_triggers && !has_workers {
             return;
         }
         let mut loops = self.loops.lock().await;
@@ -998,6 +1006,9 @@ impl TriggerDispatcher {
         // sources emit via the ingress and spawn no loop. They share `handle`,
         // so `stop` tears them down with the drain loop below.
         super::trigger_sources::spawn_sources(project, &manifest, handle.clone());
+        // Spawn + supervise the outbound connector workers (ADR 0050 §4) under
+        // the same `handle`, so `stop` tears them down alongside the sources.
+        super::trigger_sources::spawn_workers(project, &manifest, handle.clone());
         let project = project.to_string();
         tokio::spawn(async move {
             while handle.is_running() {

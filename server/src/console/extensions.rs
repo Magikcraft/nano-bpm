@@ -89,6 +89,47 @@ pub enum SourceTransport {
     Webhook,
 }
 
+/// One **worker** a connector pack contributes — the outbound/compute edge of
+/// the I/O surface (ADR 0050, amending ADR 0033 §4). Where a [`TriggerSourceSpec`]
+/// is the *inbound* edge (external event → engine), a worker is the *outbound*
+/// edge (an engine job → an external effect, e.g. "post a Slack message").
+///
+/// The [`worker_type`](WorkerSpec::worker_type) is the design→runtime **seam**:
+/// it must equal the `zeebe:taskDefinition:type` of the element template (an
+/// [`ExtManifest::components`] entry) this worker backs, so a task dragged from
+/// the palette resolves to a running worker. The worker is **long-lived**
+/// (subscribes by its type, Zeebe-style via `@nanobpm/worker`'s `defineWorker`)
+/// and, when it ships an [`entry`](WorkerSpec::entry), the runtime
+/// **auto-launches + supervises** it — one child process per enabled worker,
+/// restarted with backoff on crash, killed when the App stops (ADR 0050 §4,
+/// reusing the ADR 0025 phase-4 driver supervisor).
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerSpec {
+    /// The BPMN job type this worker serves. MUST equal the backing element
+    /// template's `zeebe:taskDefinition:type` (the design→runtime seam). Serialised
+    /// as `type` (a Rust keyword, hence the rename).
+    #[serde(rename = "type")]
+    pub worker_type: String,
+    /// Pack-relative entrypoint (a Node/Deno `.ts`/`.js`/`.mjs`) calling
+    /// `@nanobpm/worker`'s `defineWorker`. When present, the runtime launches +
+    /// supervises it while an App that enables this worker runs; absent = a
+    /// declaration-only worker run out-of-band. Mirrors [`TriggerSourceSpec::driver`].
+    #[serde(default)]
+    pub entry: Option<String>,
+    /// Human label for the console.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Max concurrent in-flight jobs (maps to `defineWorker`'s `maxParallelJobs`).
+    #[serde(default)]
+    pub max_parallel_jobs: Option<u32>,
+    /// Config fields surfaced per-connector in the project config surface (e.g.
+    /// the shared API token); defaults are env pointers, never inline secrets
+    /// (ADR 0027 §5).
+    #[serde(default)]
+    pub config_fields: Vec<ConfigField>,
+}
+
 /// One console colour theme a `kind: "theme"` pack contributes. `tokens` maps
 /// the console's design-token vocabulary (see console/src/theme/themes.ts
 /// TOKEN_KEYS — "app", "panel", "accent", …) to CSS colours; unknown keys are
@@ -365,6 +406,13 @@ pub struct ExtManifest {
     /// events over the trigger ingress. This is the `nano-ide-trigger-*` axis.
     #[serde(default)]
     pub trigger_sources: Vec<TriggerSourceSpec>,
+    /// Worker **types** this pack contributes (ADR 0050 §4): the outbound edge.
+    /// Each entry declares a job `type` (the design→runtime seam with a
+    /// [`components`](ExtManifest::components) element template) and, optionally,
+    /// an `entry` the runtime auto-launches + supervises. This is the
+    /// `nano-ide-connector-*` axis, symmetric to `trigger_sources`.
+    #[serde(default)]
+    pub workers: Vec<WorkerSpec>,
 }
 
 /// Built-in language-pack icons: theme-robust lettermark tiles (a brand-coloured
@@ -412,6 +460,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             intellisense: vec![],
             components: vec![],
             trigger_sources: vec![],
+            workers: vec![],
         },
         ExtManifest {
             id: "deno-gui".into(),
@@ -435,6 +484,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             intellisense: vec![],
             components: vec![],
             trigger_sources: vec![],
+            workers: vec![],
         },
     ]
 }
@@ -531,6 +581,47 @@ pub fn trigger_driver(kind: &str) -> Option<TriggerDriver> {
         return Some(TriggerDriver {
             dir: base,
             entry: driver.to_string(),
+        });
+    }
+    None
+}
+
+/// An installed pack's out-of-process worker entry, resolved on disk (ADR 0050
+/// §4). Symmetric to [`TriggerDriver`]: the runtime launches
+/// [`entry`](WorkerDriver::entry) with [`dir`](WorkerDriver::dir) as the working
+/// directory (so the pack's bundled imports resolve).
+pub struct WorkerDriver {
+    /// The pack's directory — the worker's working dir.
+    pub dir: PathBuf,
+    /// The worker entrypoint, pack-relative (e.g. `worker.ts`).
+    pub entry: String,
+}
+
+/// Resolve the on-disk worker entry for a pack-contributed job `worker_type`
+/// (ADR 0050 §4). Returns `None` for an unknown type, a pack that declares the
+/// type but no `entry` (declaration-only — run out-of-band), or a path-escaping
+/// / missing entry file. First matching pack wins, mirroring [`trigger_driver`].
+pub fn worker_driver(worker_type: &str) -> Option<WorkerDriver> {
+    let rd = std::fs::read_dir(extensions_root()).ok()?;
+    for entry in rd.flatten() {
+        let base = entry.path();
+        let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<ExtManifest>(&txt) else {
+            continue;
+        };
+        let Some(spec) = m.workers.iter().find(|w| w.worker_type == worker_type) else {
+            continue;
+        };
+        let worker_entry = spec.entry.as_deref().filter(|e| !e.is_empty())?;
+        let path = safe_pack_path(&base, worker_entry)?;
+        if !path.is_file() {
+            return None;
+        }
+        return Some(WorkerDriver {
+            dir: base,
+            entry: worker_entry.to_string(),
         });
     }
     None
@@ -1355,6 +1446,66 @@ mod tests {
         );
         // Built-in packs (no on-disk dir) contribute nothing.
         assert!(pack_component_templates("deno").is_empty());
+    }
+
+    #[test]
+    fn worker_driver_resolves_declared_entry_first_pack_wins() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-work-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Pack A: a connector declaring a worker with a real entry, plus a
+        // second worker whose entry escapes the pack dir (must not resolve).
+        let pack_a = root.join("nanobpm__nano-ide-connector-slack");
+        std::fs::create_dir_all(&pack_a).unwrap();
+        std::fs::write(
+            pack_a.join(manifest_name()),
+            r#"{
+              "id": "connector-slack",
+              "kind": "trigger",
+              "displayName": "Slack",
+              "workers": [
+                { "type": "slack:send-message", "entry": "worker.ts", "displayName": "Send message" },
+                { "type": "slack:escape", "entry": "../evil.ts" },
+                { "type": "slack:declaration-only" }
+              ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(pack_a.join("worker.ts"), "// worker A").unwrap();
+        std::fs::write(root.join("evil.ts"), "// evil").unwrap();
+        // Pack B: re-declares the same type — first pack wins, so this must not
+        // shadow pack A's resolved entry (dir names sort A before B).
+        let pack_b = root.join("nanobpm__nano-ide-connector-slack-dupe");
+        std::fs::create_dir_all(&pack_b).unwrap();
+        std::fs::write(
+            pack_b.join(manifest_name()),
+            r#"{
+              "id": "connector-slack-dupe",
+              "kind": "trigger",
+              "displayName": "Slack Dupe",
+              "workers": [ { "type": "slack:send-message", "entry": "worker.ts" } ]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(pack_b.join("worker.ts"), "// worker B").unwrap();
+
+        // SAFETY: test-local env set, serialized on ENV_LOCK.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        let resolved = worker_driver("slack:send-message");
+        let escape = worker_driver("slack:escape");
+        let decl_only = worker_driver("slack:declaration-only");
+        let unknown = worker_driver("nope");
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A declared entry that exists inside the pack resolves, to pack A's dir.
+        let resolved = resolved.expect("slack:send-message worker resolves");
+        assert_eq!(resolved.entry, "worker.ts");
+        assert!(resolved.dir.ends_with("nanobpm__nano-ide-connector-slack"));
+        // Path-escaping, declaration-only, and unknown types do not resolve.
+        assert!(escape.is_none());
+        assert!(decl_only.is_none());
+        assert!(unknown.is_none());
     }
 
     #[test]

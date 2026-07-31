@@ -600,6 +600,182 @@ fn spawn_driver_child(
 
     Ok(child)
 }
+
+// ── Connector workers (outbound edge, ADR 0050 §4) ──────────────────────────
+//
+// The outbound sibling of [`spawn_sources`]. Where a pack source's driver
+// *ingests* events, a connector's worker *acts* on engine jobs (Zeebe-style,
+// long-lived, keyed by job `type`). We reuse this file's process-supervision
+// machinery (backoff, `LoopHandle` stop, Node-first launch) verbatim so both
+// I/O edges share one lifecycle contract.
+
+/// Extract the distinct job `type`s an App enables via its manifest `workers[]`
+/// (accepting either `taskType` or `type`, first-wins dedup). The manifest is
+/// raw JSON (there is no typed App-manifest struct); only the type is needed to
+/// resolve the backing pack via [`super::extensions::worker_driver`].
+fn parse_worker_types(manifest: &Json) -> Vec<String> {
+    let Some(arr) = manifest.get("workers").and_then(Json::as_array) else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for w in arr {
+        let Some(t) = w
+            .get("taskType")
+            .and_then(Json::as_str)
+            .or_else(|| w.get("type").and_then(Json::as_str))
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        if seen.insert(t.to_string()) {
+            out.push(t.to_string());
+        }
+    }
+    out
+}
+
+/// Launch + supervise the out-of-process workers an App enables (ADR 0050 §4),
+/// the outbound-edge sibling of [`spawn_sources`]. For each `workers[]` entry
+/// whose job `type` resolves to an installed pack shipping a worker `entry`,
+/// auto-launch that worker under the shared `handle`; a `type` with no pack
+/// worker (a project-local worker, or an `llm`) is left to its own path.
+pub(crate) fn spawn_workers(project: &str, manifest: &Json, handle: Arc<LoopHandle>) {
+    for task_type in parse_worker_types(manifest) {
+        let Some(driver) = super::extensions::worker_driver(&task_type) else {
+            continue;
+        };
+        let (project, handle) = (project.to_string(), handle.clone());
+        tokio::spawn(run_pack_worker(project, task_type, driver, handle));
+    }
+}
+
+/// Supervise one connector worker's out-of-process child (ADR 0050 §4): launch
+/// it (Node-first, ADR 0038), pipe its logs, and on crash restart with capped
+/// exponential backoff — until [`LoopHandle::stopped`] fires, at which point the
+/// child is killed. The worker subscribes to its job `type` over the base URL
+/// using `@nanobpm/worker`; this function owns only its lifecycle. Mirrors
+/// [`run_pack_driver`].
+async fn run_pack_worker(
+    project: String,
+    task_type: String,
+    driver: super::extensions::WorkerDriver,
+    handle: Arc<LoopHandle>,
+) {
+    let port = super::workers::gateway_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    // Activation identity used by the worker for job streaming/logging.
+    let worker_name = format!("{project}:{task_type}");
+
+    let mut backoff = DRIVER_BACKOFF_MIN;
+    while handle.is_running() {
+        match spawn_worker_child(&driver, &base_url, &project, &task_type, &worker_name) {
+            Ok(mut child) => {
+                let pid = child.id().unwrap_or(0);
+                tracing::info!(project, worker = task_type, pid, "connector worker started");
+                let stopped = tokio::select! {
+                    _ = handle.stopped() => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        true
+                    }
+                    status = child.wait() => {
+                        tracing::warn!(
+                            project, worker = task_type,
+                            "connector worker exited (status {status:?}); restarting"
+                        );
+                        false
+                    }
+                };
+                if stopped {
+                    break;
+                }
+                backoff = DRIVER_BACKOFF_MIN;
+            }
+            Err(e) => {
+                tracing::error!(
+                    project,
+                    worker = task_type,
+                    "failed to launch connector worker: {e}"
+                );
+            }
+        }
+        if !sleep_or_stop(&handle, backoff).await {
+            break;
+        }
+        backoff = (backoff * 2).min(DRIVER_BACKOFF_MAX);
+    }
+}
+
+/// Build + spawn the worker child, selecting the runtime Node-first (ADR 0038)
+/// and stripping TS types for a `.ts` entrypoint, streaming its logs. The child
+/// inherits the host env (so the connector's configured token env pointers flow
+/// through) plus the base URL + worker name. Mirrors [`spawn_driver_child`].
+fn spawn_worker_child(
+    driver: &super::extensions::WorkerDriver,
+    base_url: &str,
+    project: &str,
+    task_type: &str,
+    worker_name: &str,
+) -> Result<tokio::process::Child, String> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::Command;
+
+    let entry = &driver.entry;
+    let is_ts = entry.ends_with(".ts") || entry.ends_with(".mts") || entry.ends_with(".cts");
+
+    let mut cmd;
+    if let Some(node) = super::workers::usable_node() {
+        cmd = Command::new(node);
+        cmd.current_dir(&driver.dir);
+        if is_ts {
+            cmd.arg("--experimental-strip-types").arg("--no-warnings");
+        }
+        cmd.arg(entry);
+    } else if let Some(deno) = super::workers::find_deno() {
+        cmd = Command::new(deno);
+        cmd.current_dir(&driver.dir)
+            .arg("run")
+            .arg("--no-prompt")
+            .arg("--allow-net")
+            .arg("--allow-env")
+            .arg(format!("--allow-read={}", driver.dir.display()))
+            .arg(entry);
+    } else {
+        return Err("no JS runtime (Node >=22.6 or Deno) available".to_string());
+    }
+
+    cmd.env("NO_COLOR", "1")
+        .env("NANOBPMN_BASE_URL", base_url)
+        .env("NANOBPMN_WORKER_NAME", worker_name)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+
+    if let Some(out) = child.stdout.take() {
+        let (project, task_type) = (project.to_string(), task_type.to_string());
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(out).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!(project, worker = task_type, stream = "out", "{line}");
+            }
+        });
+    }
+    if let Some(err) = child.stderr.take() {
+        let (project, task_type) = (project.to_string(), task_type.to_string());
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(err).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                tracing::info!(project, worker = task_type, stream = "err", "{line}");
+            }
+        });
+    }
+
+    Ok(child)
+}
 /// keyed `<id>:<fireEpochSecond>` (deterministic, §3 — a given instant enqueues
 /// once). On boot it applies `on_missed` to instants between the last-known and
 /// now, then schedules forward.
@@ -717,6 +893,25 @@ async fn sleep_or_stop(handle: &Arc<LoopHandle>, dur: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_worker_types_dedups_and_accepts_both_keys() {
+        let manifest = serde_json::json!({
+            "workers": [
+                { "taskType": "slack:send-message" },
+                { "type": "http:call" },
+                { "taskType": "slack:send-message" },
+                { "taskType": "" },
+                { "name": "no-type" }
+            ]
+        });
+        assert_eq!(
+            parse_worker_types(&manifest),
+            vec!["slack:send-message".to_string(), "http:call".to_string()]
+        );
+        // No workers[] at all → empty, not a panic.
+        assert!(parse_worker_types(&serde_json::json!({})).is_empty());
+    }
 
     fn ts(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> i64 {
         use chrono::{TimeZone, Utc};
