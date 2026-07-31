@@ -22,6 +22,7 @@ import { IS_STUDIO } from "./lib/profile";
 import { useProductTour } from "./lib/tour/useProductTour";
 import { TourContext } from "./lib/tour/tourContext";
 import { navAnchor, TOUR_ANCHOR } from "./lib/tour/tourAnchors";
+import { RouteErrorBoundary } from "./components/RouteErrorBoundary";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -464,30 +465,41 @@ export default function App() {
               </div>
             }
           >
-            <Routes>
-              <Route path="/" element={<Navigate to={HOME_ROUTE} replace />} />
-              {/* Studio-only routes — absent (and tree-shaken) in observe builds.
-                RR6 ignores falsy children, so a null component drops the route. */}
-              {Projects && <Route path="/projects" element={<Projects />} />}
-              {ProjectWorkspace && (
-                <Route path="/projects/:name" element={<ProjectWorkspace />} />
-              )}
-              {Extensions && (
-                <Route path="/extensions" element={<Extensions />} />
-              )}
-              <Route path="/config" element={<Config />} />
-              <Route path="/credits" element={<Credits />} />
-              <Route path="/topology" element={<Topology />} />
-              <Route path="/metrics" element={<Metrics />} />
-              <Route
-                path="/modeler"
-                element={<Navigate to={HOME_ROUTE} replace />}
-              />
-              <Route path="/explorer" element={<Explorer />} />
-              <Route path="/traces" element={<Traces />} />
-              <Route path="/workers" element={<Workers />} />
-              <Route path="*" element={<Navigate to={HOME_ROUTE} replace />} />
-            </Routes>
+            <RouteErrorBoundary resetKey={location.pathname}>
+              <Routes>
+                <Route
+                  path="/"
+                  element={<Navigate to={HOME_ROUTE} replace />}
+                />
+                {/* Studio-only routes — absent (and tree-shaken) in observe builds.
+                  RR6 ignores falsy children, so a null component drops the route. */}
+                {Projects && <Route path="/projects" element={<Projects />} />}
+                {ProjectWorkspace && (
+                  <Route
+                    path="/projects/:name"
+                    element={<ProjectWorkspace />}
+                  />
+                )}
+                {Extensions && (
+                  <Route path="/extensions" element={<Extensions />} />
+                )}
+                <Route path="/config" element={<Config />} />
+                <Route path="/credits" element={<Credits />} />
+                <Route path="/topology" element={<Topology />} />
+                <Route path="/metrics" element={<Metrics />} />
+                <Route
+                  path="/modeler"
+                  element={<Navigate to={HOME_ROUTE} replace />}
+                />
+                <Route path="/explorer" element={<Explorer />} />
+                <Route path="/traces" element={<Traces />} />
+                <Route path="/workers" element={<Workers />} />
+                <Route
+                  path="*"
+                  element={<Navigate to={HOME_ROUTE} replace />}
+                />
+              </Routes>
+            </RouteErrorBoundary>
           </Suspense>
         </main>
       </div>
