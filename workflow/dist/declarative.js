@@ -34,7 +34,7 @@
 // Typed data envelopes are LIFTED into the model (nano:shape + dataEnvelope
 // zeebe:property), so the generated .bpmn is ejectable to model-first with its
 // typed contracts intact.
-import { assertIdent, escapeXml, jobType, messageName } from "./xml.js";
+import { assertIdent, assertJobType, escapeXml, jobType, messageName } from "./xml.js";
 /** Ids the emitter generates for structural nodes / flows / messages. A step
  *  name that collides with one of these would produce a duplicate BPMN id and an
  *  invalid model, so reject them at authoring time. */
@@ -77,9 +77,12 @@ function makeBuilder(id, out, ctx) {
             out.push({ kind: "run", name, envelopes: contractEnvelopes(ctx, name) });
             return b;
         },
-        task(name) {
+        task(name, opts) {
             claimName(ctx, id, name);
-            out.push({ kind: "task", name, envelopes: contractEnvelopes(ctx, name) });
+            const override = opts?.jobType;
+            if (override !== undefined)
+                assertJobType("task jobType", override);
+            out.push({ kind: "task", name, envelopes: contractEnvelopes(ctx, name), jobType: override });
             return b;
         },
         signal(name, opts) {
@@ -181,13 +184,22 @@ export function walkNodes(nodes, visit) {
         }
     }
 }
-/** The derived job types of a flow's external `task` steps (anywhere in the
- *  tree) — the contract workers outside this program must subscribe to. */
+/** The job types of a flow's external `task` steps (anywhere in the tree) — the
+ *  contract workers outside this program must subscribe to. Each is the derived
+ *  `<flowId>:<stepName>` unless the step overrode it via `w.task(name,
+ *  { jobType })`. Deduplicated (preserving first-seen order) since several steps
+ *  may intentionally share one override token. */
 export function externalJobTypes(flow) {
+    const seen = new Set();
     const types = [];
     walkNodes(flow.steps, (n) => {
-        if (n.kind === "task")
-            types.push(jobType(flow.id, n.name));
+        if (n.kind !== "task")
+            return;
+        const type = n.jobType ?? jobType(flow.id, n.name);
+        if (seen.has(type))
+            return;
+        seen.add(type);
+        types.push(type);
     });
     return types;
 }
@@ -224,7 +236,7 @@ class Compiler {
         this.envelopes.set(env.name, env.fields);
     }
     addServiceTask(node) {
-        const type = jobType(this.flow.id, node.name);
+        const type = node.jobType ?? jobType(this.flow.id, node.name);
         this.recordEnvelope(node.envelopes?.in);
         this.recordEnvelope(node.envelopes?.out);
         const props = [];

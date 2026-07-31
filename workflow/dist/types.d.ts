@@ -46,6 +46,7 @@ export type FlowNode = {
     kind: "task";
     name: string;
     envelopes?: NodeEnvelopes;
+    jobType?: string;
 } | {
     kind: "signal";
     name: string;

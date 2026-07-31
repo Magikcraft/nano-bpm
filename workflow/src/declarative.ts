@@ -46,7 +46,7 @@ import type {
   SwitchCase,
 } from "./types.js";
 import type { Envelope, EnvelopeField } from "./envelope.js";
-import { assertIdent, escapeXml, jobType, messageName } from "./xml.js";
+import { assertIdent, assertJobType, escapeXml, jobType, messageName } from "./xml.js";
 
 // --- Authoring surface -------------------------------------------------------
 
@@ -82,12 +82,17 @@ export interface FlowBuilder<C extends FlowContracts = Record<string, never>> {
   run<K extends string>(name: K, handler: TypedHandler<VarsOf<C, K>, ResultOf<C, K>>): FlowBuilder<C>;
   /**
    * A durable activity served by a worker OUTSIDE this program (a BPMN service
-   * task with the derived job type `${flowId}:${name}`, but no locally-hosted
-   * handler). Use `externalJobTypes(flow)` to list the contract those workers
-   * must poll. Its contract envelopes (if any) type the model, not a local
-   * handler.
+   * task, but no locally-hosted handler). Its job type defaults to the derived
+   * `${flowId}:${name}`; pass `{ jobType }` to override it with an explicit
+   * worker token (e.g. a `rank:capability` token like `senior:pr-review` that a
+   * `c8ctl nano work` matrix subscribes to) so an existing pool of agents can
+   * service it without renaming the flow. The step name stays the BPMN element
+   * id; only the emitted `zeebe:taskDefinition` type changes. Use
+   * `externalJobTypes(flow)` to list the (possibly overridden) types those
+   * workers must poll. Its contract envelopes (if any) type the model, not a
+   * local handler.
    */
-  task<K extends string>(name: K): FlowBuilder<C>;
+  task<K extends string>(name: K, opts?: { jobType?: string }): FlowBuilder<C>;
   /**
    * A durable wait for an external/human event, correlated on a process
    * variable (a BPMN message intermediate catch event). Resume it with
@@ -173,9 +178,11 @@ function makeBuilder<C extends FlowContracts>(id: string, out: FlowNode[], ctx: 
       out.push({ kind: "run", name, envelopes: contractEnvelopes(ctx, name) });
       return b as unknown as FlowBuilder<C>;
     },
-    task(name: string): FlowBuilder<C> {
+    task(name: string, opts?: { jobType?: string }): FlowBuilder<C> {
       claimName(ctx, id, name);
-      out.push({ kind: "task", name, envelopes: contractEnvelopes(ctx, name) });
+      const override = opts?.jobType;
+      if (override !== undefined) assertJobType("task jobType", override);
+      out.push({ kind: "task", name, envelopes: contractEnvelopes(ctx, name), jobType: override });
       return b as unknown as FlowBuilder<C>;
     },
     signal(name: string, opts: { correlationKey: string }): FlowBuilder<C> {
@@ -286,12 +293,20 @@ export function walkNodes(nodes: FlowNode[], visit: (n: FlowNode) => void): void
   }
 }
 
-/** The derived job types of a flow's external `task` steps (anywhere in the
- *  tree) — the contract workers outside this program must subscribe to. */
+/** The job types of a flow's external `task` steps (anywhere in the tree) — the
+ *  contract workers outside this program must subscribe to. Each is the derived
+ *  `<flowId>:<stepName>` unless the step overrode it via `w.task(name,
+ *  { jobType })`. Deduplicated (preserving first-seen order) since several steps
+ *  may intentionally share one override token. */
 export function externalJobTypes(flow: DeclarativeFlow): string[] {
+  const seen = new Set<string>();
   const types: string[] = [];
   walkNodes(flow.steps, (n) => {
-    if (n.kind === "task") types.push(jobType(flow.id, n.name));
+    if (n.kind !== "task") return;
+    const type = n.jobType ?? jobType(flow.id, n.name);
+    if (seen.has(type)) return;
+    seen.add(type);
+    types.push(type);
   });
   return types;
 }
@@ -352,8 +367,8 @@ class Compiler {
     this.envelopes.set(env.name, env.fields);
   }
 
-  private addServiceTask(node: { name: string; envelopes?: NodeEnvelopes }): void {
-    const type = jobType(this.flow.id, node.name);
+  private addServiceTask(node: { name: string; envelopes?: NodeEnvelopes; jobType?: string }): void {
+    const type = node.jobType ?? jobType(this.flow.id, node.name);
     this.recordEnvelope(node.envelopes?.in);
     this.recordEnvelope(node.envelopes?.out);
     const props: string[] = [];
