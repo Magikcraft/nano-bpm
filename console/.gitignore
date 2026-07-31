@@ -21,3 +21,6 @@ public/docs/
 # Whitepaper page, generated at build time from ../docs/whitepaper.md
 # (see scripts/build-whitepaper.mjs).
 public/whitepaper/
+test-results/
+playwright-report/
+blob-report/
