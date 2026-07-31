@@ -1261,7 +1261,9 @@ fn heal_package_json_npm_deps(dir: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let pkg_path = dir.join("package.json");
-    let (Ok(raw), true) = (std::fs::read_to_string(&pkg_path), pkg_path.exists()) else {
+    // `read_to_string` already fails on a missing file, so this both loads the
+    // manifest and skips the no-`package.json` case (Rust/Java packs) in one step.
+    let Ok(raw) = std::fs::read_to_string(&pkg_path) else {
         return Ok(());
     };
     let Ok(serde_json::Value::Object(mut root)) = serde_json::from_str::<serde_json::Value>(&raw)
@@ -3206,8 +3208,11 @@ pub fn create_project(
     // — the SDK templates in the branch above overwrite `deno.json`, so read it
     // back as the single source of truth (issue #437) rather than hand-mirroring.
     // Every `npm:` specifier the Node loader strips is declared here so
-    // `npm install` can materialise it into `node_modules`.
-    let deno_json = std::fs::read_to_string(dir.join("deno.json")).unwrap_or_default();
+    // `npm install` can materialise it into `node_modules`. `deno.json` was just
+    // written above, so a read failure is unexpected — surface it rather than
+    // silently emit a depless manifest (which would reintroduce the crash).
+    let deno_json = std::fs::read_to_string(dir.join("deno.json"))
+        .map_err(|e| format!("read deno.json: {e}"))?;
     w(
         dir.join("package.json"),
         &project_package_json(name, &npm_deps_from_deno_json(&deno_json)),
