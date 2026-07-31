@@ -14,7 +14,8 @@
     "build:assets": "npm run gen:api && node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && node scripts/build-whitepaper.mjs && tsc",
     "build": "npm run build:assets && vite build && node scripts/precompress.mjs dist",
     "build:observe": "npm run build:assets && VITE_CONSOLE_PROFILE=observe vite build --outDir dist-observe --emptyOutDir && node scripts/precompress.mjs dist-observe",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:e2e": "playwright test"
   },
   "dependencies": {
     "@bpmn-io/form-js": "^1.21.3",
@@ -45,6 +46,7 @@
   "devDependencies": {
     "@apidevtools/swagger-parser": "^10.1.1",
     "@hey-api/openapi-ts": "^0.99.0",
+    "@playwright/test": "^1.50.0",
     "@tailwindcss/vite": "^4.0.0",
     "@types/markdown-it": "^14.1.2",
     "@types/node": "^24.13.3",

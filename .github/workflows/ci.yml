@@ -65,6 +65,7 @@ jobs:
       pull-requests: read
     outputs:
       processos: ${{ steps.filter.outputs.processos }}
+      console: ${{ steps.filter.outputs.console }}
     steps:
       - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
@@ -78,6 +79,10 @@ jobs:
             processos:
               - 'processos/**'
               - 'engine-core/**'
+              - '.github/workflows/ci.yml'
+            console:
+              - 'console/**'
+              - 'spec-console/**'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -459,6 +464,46 @@ jobs:
         run: git diff --exit-code -- src/gen
       - name: Test (node:test unit tests)
         run: npm test
+
+  console-e2e:
+    name: console (journey e2e)
+    # Browser guards for the guided journeys (ADR 0049, #417): they catch anchor
+    # rot, which no other gate can see — nothing in a build or unit test fails when
+    # a `data-tour` attribute is renamed. Change-gated on the console so unrelated
+    # PRs never pay for a browser download; a skipped required check counts as
+    # success for branch protection (see the `changes` job).
+    needs: changes
+    if: needs.changes.outputs.console == 'true'
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: console
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install (locked)
+        run: npm ci
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # Keyed on the resolved @playwright/test version so a bump refetches.
+          key: playwright-${{ runner.os }}-${{ hashFiles('console/package-lock.json') }}
+      - name: Install Chromium
+        # Only chromium: the suite asserts DOM structure and app behaviour, not
+        # cross-browser rendering, so more engines would triple the run for nothing.
+        run: npx playwright install --with-deps chromium
+      - name: Journey e2e
+        run: npm run test:e2e
+      - name: Upload trace on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-traces
+          path: console/test-results/
+          retention-days: 7
 
   console-deno:
     name: console (deno typecheck + test)
