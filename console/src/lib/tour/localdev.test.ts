@@ -6,6 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { enrichContext } from "./context.ts";
 import { resolveSteps } from "./registry.ts";
 import type { TourContext } from "./types.ts";
 import {
@@ -14,6 +15,9 @@ import {
   SCRATCH_EXPLORER_REACHED,
   localdev,
   localdevSucceeded,
+  markBaseUrlCopied,
+  markExplorerReached,
+  resetLocaldevSignals,
   swaggerUrl,
   v2BaseUrl,
 } from "./journeys/localdev.ts";
@@ -122,4 +126,50 @@ test("the journey is profile-agnostic and deliberately terminal", () => {
     localdev.steps.length <= 5,
     "ADR 0049 caps a journey at five steps",
   );
+});
+
+// Regression (issue #440): the journey's own flow must be able to satisfy
+// `successEvent`. `successEvent` needs the base-URL-taken signal, but that was
+// only latched by the Explorer durable affordance — a path a user following the
+// journey never touches. The handoff step's copy must latch it too, or success
+// is unreachable via the tour. This guards the whole class: the flow that the
+// journey walks must reach its own success.
+test("issue #440: following the journey flow (handoff copy + reach Explorer) satisfies successEvent", async () => {
+  // Stub localStorage so the persisted signals actually round-trip in Node.
+  const store = new Map<string, string>();
+  const stub = {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => void store.set(k, v),
+    removeItem: (k: string) => void store.delete(k),
+    clear: () => store.clear(),
+    key: () => null,
+    length: 0,
+  };
+  Reflect.set(globalThis, "localStorage", stub);
+  try {
+    resetLocaldevSignals();
+
+    const handoff = localdev.steps.find((s) => s.kind === "handoff");
+    assert.ok(handoff && handoff.kind === "handoff", "journey 1 has a handoff");
+    assert.equal(
+      handoff.onCopied,
+      markBaseUrlCopied,
+      "the handoff latches the base-URL-taken signal on copy",
+    );
+
+    // Walk the journey's own flow: copy in the handoff popover, reach Explorer.
+    handoff.onCopied?.();
+    markExplorerReached();
+
+    // Enrich a bare context through the registered sources, exactly as the
+    // runner does at completion, then evaluate the real success predicate.
+    const enriched = await enrichContext(ctx());
+    assert.equal(enriched.scratch[SCRATCH_BASE_URL_COPIED], true);
+    assert.equal(enriched.scratch[SCRATCH_EXPLORER_REACHED], true);
+    assert.equal(localdevSucceeded(enriched), true);
+
+    resetLocaldevSignals();
+  } finally {
+    Reflect.deleteProperty(globalThis, "localStorage");
+  }
 });

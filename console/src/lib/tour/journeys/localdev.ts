@@ -214,6 +214,11 @@ export const localdev: Journey = {
       // connect, so this is self-reported ("I've done it").
       copy: v2BaseUrl(origin),
       copyLabel: "Copy base URL",
+      // Latch "the base URL was taken" (ADR 0049 §4, journey 1's success signal)
+      // from the real copy here in the journey flow — the Explorer durable
+      // affordance is an alternate path a user following the tour need never
+      // touch, so relying on it alone leaves `successEvent` unreachable.
+      onCopied: markBaseUrlCopied,
       body: `Your existing Camunda 8 client works unchanged — this is the only line you change. Point it at the base URL above and everything else stays the same. The exact spec this binary serves is at its offline <a href="${swaggerUrl(
         origin,
       )}" target="_blank" rel="noreferrer noopener">Swagger UI</a>.`,

@@ -171,6 +171,7 @@ export function createJourneyRunner(deps: RunnerDeps): JourneyRunner {
     button.textContent = step.copyLabel ?? "Copy";
     button.addEventListener("click", () => {
       void copyText(step.copy).then((ok) => {
+        if (ok) step.onCopied?.();
         button.textContent = ok ? "Copied" : "Select and copy";
         if (!ok) selectText(code);
         window.setTimeout(() => {
