@@ -158,7 +158,7 @@ export const agenticHire: Journey = {
       kind: "handoff",
       id: "hire-harness",
       title: "Hire a harness for the job",
-      body: "In a terminal, hire a coding-agent harness and point it at the loop. The rank × capability you give it (senior × review) IS the job type the w.task step emits — for this template, pr-review:review. `hire` registers the worker; `work` starts it polling.",
+      body: "In a terminal, hire a coding-agent harness and point it at the loop. The rank and capability you give it map to the job type the w.task step emits — for this template that job type is pr-review:review. `hire` registers the worker; `work` starts it polling.",
       copy: 'c8ctl nano hire --name coder --rank senior --command "claude" && c8ctl nano work coder',
       copyLabel: "Copy commands",
     },
