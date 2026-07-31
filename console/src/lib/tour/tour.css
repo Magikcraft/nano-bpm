@@ -142,11 +142,13 @@
  * clickable (driver keeps the active element interactive) and the user may pick
  * a different one. Purely selector-driven, so a new journey needs no code here.
  *
- * Uses box-shadow (not border/ring utilities) so it composes over a card that is
- * simultaneously selected, and tracks light/dark via the same theme tokens. */
+ * Uses `outline` (a separate rendering layer) rather than box-shadow or the ring
+ * utilities, so it composes over a card that is *simultaneously selected* — the
+ * selected state is a Tailwind `ring`, which is itself a box-shadow, so a
+ * box-shadow here would replace that ring instead of layering on top of it. An
+ * outline sits outside the box-shadow layer and follows the card's
+ * border-radius, and tracks light/dark via the accent-2 theme token. */
 .driver-active-element[data-tour^="template-"] {
-  border-radius: 12px;
-  box-shadow:
-    0 0 0 2px var(--nano-accent-2),
-    0 0 0 6px color-mix(in srgb, var(--nano-accent-2) 30%, transparent);
+  outline: 2px solid var(--nano-accent-2);
+  outline-offset: 2px;
 }
