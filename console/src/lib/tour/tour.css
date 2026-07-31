@@ -74,3 +74,59 @@
 .driver-popover.nano-tour .driver-popover-close-btn:hover {
   color: var(--nano-text);
 }
+
+/* ── Handoff steps ────────────────────────────────────────────────────────────
+ * A handoff step points outside the console: a terminal command to run, or a URL
+ * to open. The command is rendered as inert, explicitly-copied text — nothing
+ * here is ever executed (the console has no shell), which also keeps a
+ * pack-contributed handoff step from becoming an execution vector (ADR 0049 §7).
+ */
+.driver-popover.nano-tour .nano-tour-handoff {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+  padding: 8px;
+  border: 1px solid var(--nano-edge);
+  border-radius: 8px;
+  background-color: var(--nano-inset, var(--nano-panel));
+}
+
+.driver-popover.nano-tour .nano-tour-handoff code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  font-family: var(--nano-font-mono, ui-monospace, monospace);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--nano-text);
+  white-space: pre;
+  /* The command must never be visually clipped into something different from
+   * what gets copied — scroll it rather than truncate it. */
+  text-overflow: clip;
+}
+
+.driver-popover.nano-tour .nano-tour-copy {
+  flex: none;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--nano-text-muted);
+  background-color: transparent;
+  border: 1px solid var(--nano-edge-strong);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.driver-popover.nano-tour .nano-tour-copy:hover {
+  color: var(--nano-text);
+  background-color: var(--nano-hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .driver-popover.nano-tour,
+  .driver-popover.nano-tour * {
+    transition: none !important;
+    animation: none !important;
+  }
+}

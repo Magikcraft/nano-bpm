@@ -1,58 +1,93 @@
-// First-run product tour (driver.js — chosen over @reactour/tour via the #393 A/B).
+// The React seam for guided journeys (ADR 0049).
 //
-// Why driver.js: the journey spans react-router routes and targets elements
-// that mount asynchronously over CSS-transformed canvases (bpmn-js/monaco). An
-// imperative runner we drive in lockstep with the router — plus driver.js's
-// built-in `waitForElement` (wait for a target to appear) and
-// `skipMissingElement` (skip absent targets) — fits that better than a
-// declarative step list fighting lazy targets. The popover is themed with the
-// app's own CSS tokens (src/lib/tour/tour.css) so it tracks dark/light mode.
+// Everything hard lives elsewhere and is unit-tested without a browser: the
+// contract (types.ts), resolution (registry.ts), persistence (state.ts), context
+// assembly (context.ts), deep links (deepLink.ts) and the driver.js adapter
+// (runner.ts). This hook only wires them to React — the router, one data fetch,
+// and the rail button's label.
 //
-// The hook owns three things: (1) a profile-aware step list, (2) route
-// navigation between steps (driver.js can't touch the router), and (3) a
-// localStorage "seen" flag so it auto-starts only on first run.
+// It replaces the spike's profile-keyed step list: the build profile is now just
+// a filter over the journey registry, because `studio` vs `observe` is a
+// build-time split while the users who matter most all land in the same studio
+// build wanting different first sessions.
 
-import { useCallback, useEffect, useMemo, useRef } from "react";
-import { useNavigate, useLocation } from "react-router-dom";
-import { driver, type Driver, type DriveStep } from "driver.js";
-import "driver.js/dist/driver.css";
-import "./tour.css";
-import { getTourSteps, type TourStep } from "./steps";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { listProjects } from "../../gen";
+import { CONSOLE_PROFILE } from "../profile";
+import { buildContext } from "./context";
+import type { ProjectsSnapshot } from "./context";
+import { readTourParam, stripTourParam } from "./deepLink";
+import { getJourney, journeysFor } from "./registry";
+import { createJourneyRunner } from "./runner";
+import {
+  activeJourneyId,
+  hasCompleted,
+  readState,
+  recordFor,
+  resetState,
+  withJourney,
+  writeState,
+  type TourState,
+} from "./state";
+import type { Journey, JourneyEvent, TourContext } from "./types";
+// Registers the built-in journeys by import side effect. A journey slice adds its
+// own module import here; the registry itself keeps no central list, so parallel
+// slices never contend on one file.
+import { overviewJourneyId } from "./journeys/overview";
 
-/** Bump the version suffix to re-show the tour to everyone after a big change. */
-const SEEN_KEY = "nano.tour.v1.seen";
+/**
+ * Delay before an auto-started journey opens, letting the initial route and the
+ * sidebar render before the first anchored step is highlighted.
+ */
+const AUTOSTART_DELAY_MS = 800;
 
-/** How long driver.js waits for a step's target to mount before skipping it. */
-const WAIT_FOR_ELEMENT_MS = 5000;
-
-function hasSeenTour(): boolean {
-  try {
-    return localStorage.getItem(SEEN_KEY) === "1";
-  } catch {
-    return false;
-  }
-}
-
-function markTourSeen(): void {
-  try {
-    localStorage.setItem(SEEN_KEY, "1");
-  } catch {
-    /* private mode / storage disabled — just re-show next time */
-  }
-}
+/**
+ * How long a `listProjects()` context snapshot is reused before refetching.
+ *
+ * Kept under the runner's 2s verify cadence, so a handoff poll tick still reads
+ * reasonably fresh state, while the burst of `getContext()` calls around a single
+ * step transition share one request instead of each hitting the backend.
+ */
+const SNAPSHOT_TTL_MS = 1500;
 
 export interface UseProductTourOptions {
-  /** Auto-start once on first run (when the "seen" flag is unset). */
+  /**
+   * Auto-start the profile's overview journey once, on first run.
+   *
+   * TRANSITIONAL. ADR 0049 replaces auto-start with the journey picker on the
+   * Projects/Topology empty state (#411): a first-timer should choose one of the
+   * three real journeys, not be dropped into an orientation tour that serves
+   * none of them. Until that picker exists, auto-starting the overview preserves
+   * the discoverability the console has today — removing it first would ship a
+   * window with no onboarding at all.
+   *
+   * #411 flips this to `false` (and may then delete it) once the picker lands.
+   */
   autoStart?: boolean;
 }
 
 export interface ProductTour {
-  /** Start (or restart) the tour immediately. */
+  /** Start a specific journey by id. Unknown ids are ignored. */
+  startJourney: (journeyId: string) => void;
+  /** Start the overview for this profile — what the rail's "Take a tour" runs. */
   startTour: () => void;
-  /** Clear the "seen" flag so the tour auto-starts again next load. */
+  /** Resume the interrupted journey, if there is one. */
+  resumeJourney: () => void;
+  /** Journeys offerable in this profile right now (drives the picker in #411). */
+  availableJourneys: Journey[];
+  /** The interrupted journey, when one was left mid-flight. */
+  activeJourney: Journey | undefined;
+  /**
+   * Whether a journey is on screen right now.
+   *
+   * Distinct from `activeJourney`, which stays set while a journey is merely
+   * *unfinished*. Callers offering a "Resume" affordance want both: there is
+   * something to resume, and it is not already showing.
+   */
+  isRunning: boolean;
+  /** Forget all journey state so onboarding can be seen again. */
   resetTour: () => void;
-  /** Whether the current build profile has a tour defined. */
-  hasTour: boolean;
 }
 
 export function useProductTour(
@@ -61,115 +96,189 @@ export function useProductTour(
   const { autoStart = false } = options;
   const navigate = useNavigate();
   const location = useLocation();
-  // Kept in a ref so goToRoute can read the live pathname without taking
-  // location as a dependency (which would churn the callback every navigation).
+
+  // Kept in a ref so the runner reads the live pathname without the callbacks
+  // churning on every navigation.
   const pathnameRef = useRef(location.pathname);
   pathnameRef.current = location.pathname;
-  const driverRef = useRef<Driver | null>(null);
-  const steps = useMemo(() => getTourSteps(), []);
 
-  // Navigate to a step's route (if any) before it is shown; driver.js's
-  // waitForElement then handles the async mount on the new route. Skip the
-  // navigation when we're already on that route — consecutive same-route steps
-  // (e.g. projects-nav → new-project, both on /projects) would otherwise push
-  // redundant history entries and break the tour's Back button.
-  const goToRoute = useCallback(
-    (step: TourStep | undefined) => {
-      if (step?.route && step.route !== pathnameRef.current) {
-        navigate(step.route);
-      }
-    },
-    [navigate],
+  const [activeId, setActiveId] = useState<string | undefined>(() =>
+    activeJourneyId(readState()),
+  );
+  const [available, setAvailable] = useState<Journey[]>(() =>
+    journeysFor(CONSOLE_PROFILE),
+  );
+  const [running, setRunning] = useState(false);
+
+  const persist = useCallback((next: TourState) => {
+    writeState(next);
+    setActiveId(activeJourneyId(next));
+  }, []);
+
+  /**
+   * Fetch a context snapshot. One `listProjects()` call supplies the base; any
+   * registered context source then merges its own fields in. A failed fetch still
+   * yields a usable context whose runtime flags read false, so a Run step
+   * repairs into an install hint rather than promising something unverified.
+   *
+   * The `listProjects()` payload (projects + runtime flags + template menu +
+   * extensions) is cached for a short window and its in-flight request is shared,
+   * so the several `getContext()` calls that cluster around one step transition
+   * (resolve, render, finish) — and the handoff `verify` poll — do not each fire
+   * a fresh, potentially heavy request. The window is under the 2s verify cadence,
+   * so a poll tick still re-reads reasonably fresh state. #404 is the structural
+   * fix: once the consumer panel polls, verify reads its data via a registered
+   * context source instead of driving its own fetch.
+   */
+  const snapshotCache = useRef<{
+    at: number;
+    snapshot: ProjectsSnapshot | null;
+  } | null>(null);
+  const snapshotInflight = useRef<Promise<ProjectsSnapshot | null> | null>(
+    null,
+  );
+  const getContext = useCallback(async (): Promise<TourContext> => {
+    const now = Date.now();
+    const cached = snapshotCache.current;
+    let snapshot: ProjectsSnapshot | null;
+    if (cached && now - cached.at < SNAPSHOT_TTL_MS) {
+      snapshot = cached.snapshot;
+    } else {
+      snapshot = await (snapshotInflight.current ??= (async () => {
+        try {
+          return (await listProjects({ throwOnError: true })).data ?? null;
+        } catch {
+          return null;
+        } finally {
+          snapshotInflight.current = null;
+        }
+      })());
+      snapshotCache.current = { at: Date.now(), snapshot };
+    }
+    return buildContext({
+      profile: CONSOLE_PROFILE,
+      route: pathnameRef.current,
+      snapshot,
+    });
+  }, []);
+
+  const runner = useMemo(
+    () =>
+      createJourneyRunner({
+        navigate: (route) => navigate(route),
+        getRoute: () => pathnameRef.current,
+        getContext,
+        onEvent: (event: JourneyEvent) => {
+          // Analytics sink. Step ids are stable, so per-step drop-off is
+          // measurable the moment something listens here; this is the one
+          // documented place to attach it.
+          if (import.meta.env.DEV) console.debug("[tour]", event);
+          if (event.type === "start") setRunning(true);
+          if (event.type === "complete" || event.type === "abandon") {
+            setRunning(false);
+          }
+        },
+        onStep: (journeyId, authoredIndex) => {
+          persist(
+            withJourney(readState(), journeyId, {
+              status: "active",
+              stepIndex: authoredIndex,
+            }),
+          );
+        },
+        onFinish: (journeyId, outcome, detail) => {
+          persist(
+            withJourney(readState(), journeyId, {
+              status: outcome === "complete" ? "completed" : "abandoned",
+              stepIndex: outcome === "complete" ? 0 : detail.authoredIndex,
+              ...(outcome === "complete" ? { completedAt: Date.now() } : {}),
+            }),
+          );
+        },
+      }),
+    [getContext, navigate, persist],
   );
 
-  const toDriveStep = useCallback(
-    (step: TourStep, index: number): DriveStep => ({
-      // Omit `element` entirely for anchorless (centered "welcome") steps — a
-      // present `element: undefined` key works today but driver.js's contract
-      // is that a centered step has no element at all, so keep to that shape.
-      ...(step.selector ? { element: step.selector } : {}),
-      popover: {
-        title: step.title,
-        description: step.body,
-        side: step.side,
-        align: step.align,
-        // We own navigation, so we override next/prev to move the router in
-        // step with driver.js. driverRef.current is populated by the time a
-        // button is clicked. On the last step, moveNext() ends the tour.
-        onNextClick: () => {
-          goToRoute(steps[index + 1]);
-          driverRef.current?.moveNext();
-        },
-        onPrevClick: () => {
-          goToRoute(steps[index - 1]);
-          driverRef.current?.movePrevious();
-        },
-      },
-    }),
-    [goToRoute, steps],
+  const startJourney = useCallback(
+    (journeyId: string) => {
+      const journey = getJourney(journeyId);
+      if (!journey) return;
+      const record = recordFor(readState(), journeyId);
+      const from = record.status === "active" ? record.stepIndex : 0;
+      void runner.start(journey, from);
+    },
+    [runner],
   );
 
   const startTour = useCallback(() => {
-    if (steps.length === 0) return;
-    if (driverRef.current?.isActive()) return;
+    startJourney(overviewJourneyId(CONSOLE_PROFILE));
+  }, [startJourney]);
 
-    const instance = driver({
-      showProgress: true,
-      allowClose: true,
-      overlayOpacity: 0.55,
-      stagePadding: 6,
-      stageRadius: 8,
-      waitForElement: WAIT_FOR_ELEMENT_MS,
-      skipMissingElement: true,
-      popoverClass: "nano-tour",
-      nextBtnText: "Next",
-      prevBtnText: "Back",
-      doneBtnText: "Done",
-      steps: steps.map(toDriveStep),
-      onDestroyed: () => {
-        // driver.js fires onDestroyed both when the user finishes/dismisses the
-        // tour AND when we tear it down on unmount (see the cleanup effect).
-        // Only the former should count as "seen": the unmount cleanup clears
-        // driverRef.current *before* calling destroy(), so a mid-tour refresh,
-        // HMR reload or StrictMode remount doesn't suppress the first-run
-        // auto-start. Guard on identity so a stale teardown can't mark it seen.
-        if (driverRef.current !== instance) return;
-        markTourSeen();
-        driverRef.current = null;
-      },
-    });
-    driverRef.current = instance;
-    goToRoute(steps[0]);
-    instance.drive();
-  }, [steps, toDriveStep, goToRoute]);
+  const resumeJourney = useCallback(() => {
+    if (activeId) startJourney(activeId);
+  }, [activeId, startJourney]);
 
   const resetTour = useCallback(() => {
-    try {
-      localStorage.removeItem(SEEN_KEY);
-    } catch {
-      /* ignore */
-    }
+    resetState();
+    setActiveId(undefined);
   }, []);
 
-  // First-run auto-start. The short delay lets the initial route and its
-  // sidebar render before we highlight the first anchored step.
+  // Recompute which journeys are offerable once real context exists: a
+  // journey-level precondition can only be evaluated against a snapshot, and
+  // until it arrives we optimistically list everything for the profile.
   useEffect(() => {
-    if (!autoStart || steps.length === 0 || hasSeenTour()) return;
-    const id = window.setTimeout(startTour, 800);
+    let cancelled = false;
+    void getContext().then((ctx) => {
+      if (!cancelled) setAvailable(journeysFor(CONSOLE_PROFILE, ctx));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [getContext]);
+
+  // `?tour=<id>` beats auto-start: a deep link is explicit intent, so it runs
+  // even for a journey already completed. The param is stripped afterwards so a
+  // refresh does not restart it.
+  const deepLinked = useRef(false);
+  useEffect(() => {
+    if (deepLinked.current) return;
+    const requested = readTourParam(window.location.search);
+    if (!requested) return;
+    deepLinked.current = true;
+    const url = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    const cleaned = stripTourParam(url);
+    if (cleaned !== url) window.history.replaceState(null, "", cleaned);
+    startJourney(requested);
+  }, [startJourney]);
+
+  // First-run auto-start (transitional — see UseProductTourOptions.autoStart).
+  // An abandoned overview is not re-forced: someone who dismissed it once has
+  // answered the question.
+  useEffect(() => {
+    if (!autoStart || deepLinked.current) return;
+    const overview = overviewJourneyId(CONSOLE_PROFILE);
+    const state = readState();
+    if (hasCompleted(state, overview)) return;
+    if (recordFor(state, overview).status === "abandoned") return;
+    const id = window.setTimeout(
+      () => startJourney(overview),
+      AUTOSTART_DELAY_MS,
+    );
     return () => window.clearTimeout(id);
-  }, [autoStart, steps.length, startTour]);
+  }, [autoStart, startJourney]);
 
-  // Tear down if the app unmounts mid-tour. Clear the ref *before* destroy() so
-  // the onDestroyed handler recognises this as an app-initiated teardown and
-  // does NOT mark the tour seen — an unfinished tour should auto-start again.
-  useEffect(
-    () => () => {
-      const instance = driverRef.current;
-      driverRef.current = null;
-      instance?.destroy();
-    },
-    [],
-  );
+  // Tear down if the app unmounts mid-journey. dispose() (not stop()) so an
+  // unmount, HMR reload or StrictMode remount is not recorded as an abandon — an
+  // interrupted journey should stay resumable.
+  useEffect(() => () => runner.dispose(), [runner]);
 
-  return { startTour, resetTour, hasTour: steps.length > 0 };
+  return {
+    startJourney,
+    startTour,
+    resumeJourney,
+    availableJourneys: available,
+    activeJourney: activeId ? getJourney(activeId) : undefined,
+    isRunning: running,
+    resetTour,
+  };
 }
