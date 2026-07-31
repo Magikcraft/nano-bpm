@@ -723,15 +723,6 @@ Two more views — **Config** (appearance, theme packs, and server settings) and
 **Credits** — are reachable by route but do not live on the navigation rail. Each
 tab is described below.
 
-The console is also **extensible**: an agentic SDLC pack, language support, app
-templates, example apps, event triggers, and themes are shipped as **extension
-packs** — plain npm packages discovered by the `nano-ide-ext` keyword and
-installed from the console UI. The
-console can install any pack carrying that keyword; the **first-party** packs live
-in the [`nano-ide`](https://github.com/jwulf/nano-ide) repo, and their manifest
-schema is defined here in `server/src/console/extensions.rs`. See
-[`docs/nano-repositories.md`](docs/nano-repositories.md) for how the pieces relate.
-
 
 ### Topology
 
@@ -815,6 +806,18 @@ To run a test and inspect the trace:
 5. Watch tokens move on the diagram, and read the **execution trace** — the
    ordered list of elements visited, jobs created/completed, and variable
    snapshots — to confirm the model behaves as intended before deploying anything.
+
+### Extensions
+
+The console is **extensible**: an agentic SDLC pack, language support, app
+templates, example apps, event triggers, and themes are shipped as **extension
+packs** — plain npm packages discovered by the `nano-ide-ext` keyword and
+installed from the console UI. The console can install any pack carrying that
+keyword; the **first-party** packs live in the
+[`nano-ide`](https://github.com/jwulf/nano-ide) repo, and their manifest schema is
+defined here in `server/src/console/extensions.rs`. See
+[`docs/nano-repositories.md`](docs/nano-repositories.md) for how the pieces
+relate. (This is a Studio-profile authoring tab.)
 
 ### Explorer
 
