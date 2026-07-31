@@ -1552,8 +1552,9 @@ fn workflow_package_json(name: &str) -> String {
 ///   discipline);
 /// - `w.task(name)` — the **agentic seam** (ADR 0046 "agent-as-worker"): a
 ///   service task with a derived job type serviced by a worker **outside** this
-///   program (a coding-agent harness). Its I/O contract is a typed envelope,
-///   surfaced by `externalJobTypes(flow)`;
+///   program (a coding-agent harness). Its I/O is a typed envelope pair (the
+///   `contracts` passed to `defineFlow`); its worker-subscription contract —
+///   the derived job type string — is surfaced by `externalJobTypes(flow)`;
 /// - `w.signal(name, { correlationKey })` — a durable human-in-the-loop wait (a
 ///   correlated message catch event).
 ///
@@ -1774,8 +1775,20 @@ running):
 
 ```sh
 deno task start-instance PR-42     # kicks off one pr-review instance
+```
+
+The instance first parks on the **`review`** step — an external `w.task` (see
+below) — and stays there until an external worker completes the `pr-review:review`
+job. Only then does it advance to the human-in-the-loop wait, which you resume
+with:
+
+```sh
 deno task approve PR-42            # resume it past the human-in-the-loop wait
 ```
+
+> If nothing seems to happen after `start-instance`, that's expected: the
+> instance is durably parked on `review` waiting for an external agent. See
+> **The external-agent seam** below to service it.
 
 ## The external-agent seam (`w.task`)
 
