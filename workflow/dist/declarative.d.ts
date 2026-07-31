@@ -96,8 +96,11 @@ export declare function defineFlow(id: string, build: (w: FlowBuilder) => void):
 /** Depth-first visit of every node in a flow tree (structural combinators
  *  recurse into their bodies). */
 export declare function walkNodes(nodes: FlowNode[], visit: (n: FlowNode) => void): void;
-/** The derived job types of a flow's external `task` steps (anywhere in the
- *  tree) — the contract workers outside this program must subscribe to. */
+/** The job types of a flow's external `task` steps (anywhere in the tree) — the
+ *  contract workers outside this program must subscribe to. Each is the derived
+ *  `<flowId>:<stepName>` unless the step overrode it via `w.task(name,
+ *  { jobType })`. Deduplicated (preserving first-seen order) since several steps
+ *  may intentionally share one override token. */
 export declare function externalJobTypes(flow: DeclarativeFlow): string[];
 /** Derive an executable BPMN model from a declarative flow. */
 export declare function declarativeToBpmn(flow: DeclarativeFlow): string;

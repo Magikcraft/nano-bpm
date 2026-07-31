@@ -39,9 +39,13 @@ function assertNodeNames(nodes) {
     for (const node of nodes) {
         switch (node.kind) {
             case "run":
-            case "task":
             case "signal":
                 assertIdent("step name", node.name);
+                break;
+            case "task":
+                assertIdent("step name", node.name);
+                if (node.jobType !== undefined)
+                    assertJobType("job type", node.jobType);
                 break;
             case "switch":
                 for (const c of node.cases)

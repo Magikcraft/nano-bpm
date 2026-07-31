@@ -184,13 +184,22 @@ export function walkNodes(nodes, visit) {
         }
     }
 }
-/** The derived job types of a flow's external `task` steps (anywhere in the
- *  tree) — the contract workers outside this program must subscribe to. */
+/** The job types of a flow's external `task` steps (anywhere in the tree) — the
+ *  contract workers outside this program must subscribe to. Each is the derived
+ *  `<flowId>:<stepName>` unless the step overrode it via `w.task(name,
+ *  { jobType })`. Deduplicated (preserving first-seen order) since several steps
+ *  may intentionally share one override token. */
 export function externalJobTypes(flow) {
+    const seen = new Set();
     const types = [];
     walkNodes(flow.steps, (n) => {
-        if (n.kind === "task")
-            types.push(n.jobType ?? jobType(flow.id, n.name));
+        if (n.kind !== "task")
+            return;
+        const type = n.jobType ?? jobType(flow.id, n.name);
+        if (seen.has(type))
+            return;
+        seen.add(type);
+        types.push(type);
     });
     return types;
 }

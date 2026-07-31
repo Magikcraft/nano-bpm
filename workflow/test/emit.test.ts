@@ -238,6 +238,24 @@ test("declarative task: an invalid jobType override is rejected at authoring tim
   );
 });
 
+test("toBpmn re-validates jobType overrides on a workflow mutated outside the builder", () => {
+  const flow = defineFlow("f", (w) => w.task("t", { jobType: "ok:type" }));
+  // Simulate a workflow object built/mutated outside defineFlow's authoring
+  // guard: toBpmn must still reject the invalid override, not emit bad XML.
+  const task = (flow.steps as { kind: string; jobType?: string }[]).find((n) => n.kind === "task");
+  task!.jobType = "bad token";
+  assert.throws(() => toBpmn(flow), /not a valid job type/);
+});
+
+test("externalJobTypes dedupes tasks that share one override token, preserving order", () => {
+  const flow = defineFlow("f", (w) => {
+    w.task("a", { jobType: "senior:pr-review" });
+    w.task("b", { jobType: "senior:triage" });
+    w.task("c", { jobType: "senior:pr-review" });
+  });
+  assert.deepEqual(externalJobTypes(flow), ["senior:pr-review", "senior:triage"]);
+});
+
 test("declarative task: a duplicate task/run step name is rejected", () => {
   assert.throws(
     () =>
