@@ -23,10 +23,20 @@ import type { Journey } from "./types.ts";
 import "./journeys/overview.ts";
 import "./journeys/localdev.ts";
 import "./journeys/rad.ts";
+import "./journeys/agentic.ts";
 
 const KNOWN_SELECTORS = new Set(
   Object.values(TOUR_ANCHOR).map((a) => tourSelector(a)),
 );
+
+/**
+ * A `template-<id>` anchor (`templateAnchor`, #411) is a New-project template
+ * card. Its id is derived, not enumerated in `TOUR_ANCHOR`, so the guard accepts
+ * the whole family by shape rather than pinning every template id here — and the
+ * cards render on the studio-only Projects route, so they count as studio anchors.
+ */
+const isTemplateAnchor = (anchor: string): boolean =>
+  /^template-[a-z0-9][a-z0-9-]*$/.test(anchor);
 
 /**
  * Anchors that actually render per profile. Projects, the New-project button and
@@ -49,12 +59,6 @@ const RENDERS_IN = {
 
 const anchorOf = (selector: string): string =>
   selector.slice('[data-tour="'.length, -2);
-
-// Template cards (`data-tour="template-<id>"`, slice 4 / #411) are derived
-// dynamically via `templateAnchor()`, so they are not in `TOUR_ANCHOR`. They are
-// studio-only (the Projects/New-project surface the observe build strips).
-const isTemplateAnchor = (anchor: string): boolean =>
-  anchor.startsWith("template-");
 
 const journeys = allJourneys();
 
@@ -116,6 +120,7 @@ for (const journey of journeys) {
       for (const s of eachStep(journey)) {
         if (s.kind !== "spotlight") continue;
         const anchor = anchorOf(s.selector);
+        // Template cards render on the studio-only Projects route.
         if (isTemplateAnchor(anchor)) {
           assert.equal(
             profile,

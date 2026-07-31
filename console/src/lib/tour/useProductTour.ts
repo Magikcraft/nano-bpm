@@ -40,6 +40,8 @@ import { overviewJourneyId } from "./journeys/overview";
 // before its own view (Explorer, lazy-loaded) has mounted.
 import "./journeys/localdev";
 import "./journeys/rad";
+// Guided journeys 0a/0b (agentic SDLC, #408). Self-registers on load (registry.ts).
+import "./journeys/agentic";
 
 /**
  * Delay before an auto-started journey opens, letting the initial route and the

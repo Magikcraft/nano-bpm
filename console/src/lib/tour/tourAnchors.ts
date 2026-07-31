@@ -52,6 +52,11 @@ export const TOUR_ANCHOR = {
   pageEditor: "page-editor",
   /** The served-app link shown while an Urban App runs — the RAD journey's payoff (opens the app on its own port). */
   servedApp: "served-app",
+  // Workspace anchors the agentic authoring journey (#408) spotlights: the flow
+  // file editor, the derived read-only Model view toggle, and the Run output.
+  flowEditor: "flow-editor",
+  modelView: "model-view",
+  runOutput: "run-output",
 } as const;
 
 export type TourAnchor = (typeof TOUR_ANCHOR)[keyof typeof TOUR_ANCHOR];
