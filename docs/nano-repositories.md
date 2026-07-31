@@ -76,6 +76,10 @@ console; it is not a running service.
 **Direction of dependency:** `nano-ide` → `nano-bpm` (targets its manifest
 contract). Nano BPM's console consumes these packs **at runtime, from npm**.
 
+> **Authoring packs.** The [**Extensions authoring & publishing
+> guide**](extensions.md) documents the manifest, every pack kind with a minimal
+> example, the install/trust model, and how to publish.
+
 ---
 
 ## 3. c8ctl Nano plugin — run + manage + agentic workers (`jwulf/c8ctl-plugin-nano`)
