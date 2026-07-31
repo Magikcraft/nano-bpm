@@ -892,6 +892,54 @@ impl Registry {
             .cloned()
             .collect()
     }
+
+    /// Snapshot of live push consumers: one entry per `(connection, job type)`
+    /// subscription, carrying the lease-owner worker name and the connection's
+    /// last-activity timestamp. Powers the console "who is polling what" panel
+    /// (issue #404). Snapshots the connection list under `conns` and releases it
+    /// before locking each connection's `subs`, so this 2s UI poll never holds
+    /// `conns` while touching `subs` and can't contend with the dispatcher /
+    /// register / unregister on the hot path. The reaper independently evicts
+    /// silent connections, so a reaped consumer simply stops appearing here.
+    #[cfg(feature = "console")]
+    pub fn consumers(&self) -> Vec<FalconConsumer> {
+        let mut out = Vec::new();
+        for conn in self.all_connections() {
+            let last_seen_ms = conn.last_seen_ms.load(Ordering::Relaxed);
+            let subs = conn.subs.lock().expect("registry poisoned");
+            for (job_type, sub) in subs.iter() {
+                out.push(FalconConsumer {
+                    job_type: job_type.clone(),
+                    worker: sub.worker.clone(),
+                    last_seen_ms,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// One live Falcon (command-stream) job consumer — a single `(connection, job
+/// type)` subscription. Returned by [`Registry::consumers`] for the console
+/// consumers panel.
+#[cfg(feature = "console")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FalconConsumer {
+    /// The job type this subscription pulls.
+    pub job_type: String,
+    /// The lease-owner worker name for the subscription.
+    pub worker: String,
+    /// Wall-clock (epoch millis) of the connection's last inbound frame.
+    pub last_seen_ms: u64,
+}
+
+/// The Falcon connection-liveness deadline (millis) the reaper enforces (default
+/// [`LIVENESS_TIMEOUT_MS`], overridable via `NANOBPMN_STREAM_LIVENESS_MS`). The
+/// consumers panel reuses it so its notion of a "stale" Falcon consumer matches
+/// the engine's own reap threshold.
+#[cfg(feature = "console")]
+pub fn falcon_liveness_timeout_ms() -> u64 {
+    liveness_timeout_ms()
 }
 
 // ----------------------------------------------------------------------------
@@ -3124,6 +3172,48 @@ mod registry_tests {
         assert!(
             !registry.unregister(999),
             "unregistering an unknown id is a no-op too"
+        );
+    }
+
+    #[cfg(feature = "console")]
+    #[test]
+    fn consumers_lists_one_row_per_subscription_with_worker_and_last_seen() {
+        // A hired Falcon agent = a connection with a job subscription. `consumers`
+        // must surface it as (job type, lease-owner worker, last-seen) so the
+        // console panel can render it — the core of issue #404.
+        let registry = Registry::new();
+        let conn = test_connection(11);
+        conn.last_seen_ms
+            .store(1_700_000_000_000, Ordering::Relaxed);
+        conn.subs.lock().unwrap().insert(
+            "convergence-loop:review-round".to_string(),
+            Arc::new(Subscription {
+                worker: "review-agent".to_string(),
+                timeout: 0,
+                fetch_variable: None,
+                credits: AtomicI64::new(0),
+            }),
+        );
+        registry.register(conn);
+
+        let got = registry.consumers();
+        assert_eq!(got.len(), 1, "one subscription ⇒ one consumer row");
+        assert_eq!(got[0].job_type, "convergence-loop:review-round");
+        assert_eq!(got[0].worker, "review-agent");
+        assert_eq!(
+            got[0].last_seen_ms, 1_700_000_000_000,
+            "carries the connection's last-seen timestamp"
+        );
+    }
+
+    #[cfg(feature = "console")]
+    #[test]
+    fn consumers_is_empty_with_no_subscriptions() {
+        let registry = Registry::new();
+        registry.register(test_connection(12)); // connected but not subscribed
+        assert!(
+            registry.consumers().is_empty(),
+            "a connection with no subscriptions is not a job consumer"
         );
     }
 
