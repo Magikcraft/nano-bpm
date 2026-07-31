@@ -152,40 +152,42 @@ So: **agent-as-worker = supported today; engine-native `AgentInstance` = planned
 
 The whole Orchestration Cluster v2 surface is **routable**; operations not wired to
 the engine return `501 Not Implemented` through a shared handler
-(`server/src/main.rs:14168`). The generated stub file
-(`server/src/stub_impls.rs`) is the authoritative registry: a method either
-delegates to a real `*_impl` (served) or returns `Err(())` → 501. The served set,
-extracted directly from those delegations:
+(`server/src/main.rs:14168`). The authoritative, **checked-in** registry of served
+operations is the `OVERRIDES` map in the stub generator
+(`scripts/gen-stub-server.py:35-74`): at build time it generates
+`server/src/stub_impls.rs` (git-ignored), where each REST trait method either
+delegates to a real `*_impl` handler (served) or returns `Err(())` → 501. The
+served set below is the `OVERRIDES` map; the cited line numbers are the checked-in
+`*_impl` handlers in `server/src/main.rs`.
 
 ### Served (wired to `engine-core`)
 
 | Group | Operations served | Notes |
 |---|---|---|
-| **Deployment** | `createDeployment` (deploy BPMN/DMN resources) | Idempotent redeploy (byte-identical → version reuse), mirroring Zeebe. `main.rs:8290`. |
+| **Deployment** | `createDeployment` (deploy BPMN/DMN resources) | Idempotent redeploy (byte-identical → version reuse), mirroring Zeebe. `main.rs:8290` (`OVERRIDES` module `resource`). |
 | **Process instances** | `createProcessInstance` (incl. `awaitCompletion` create-with-result), `cancelProcessInstance`, `getProcessInstance`, `searchProcessInstances` | `main.rs:3622`, `3684` (awaitCompletion + `fetchVariables`). **Deviation:** on `awaitCompletion` timeout Nano returns `200` + `processCompleted:false` (poll), not Camunda's `504`. |
 | **Jobs** | `activateJobs` (long-poll), `completeJob`, `failJob`, `throwError`, `updateJob`, `searchJobs` | `main.rs:1111`+. |
 | **Messages** | `publishMessage`, `correlateMessage` | `main.rs:1331`, `6687`. |
 | **Incidents** | `getIncident`, `resolveIncident`, `searchIncidents` | `main.rs:1045`+. |
 | **Decisions** | `evaluateDecision`, get definition + **XML**, get requirements + **XML**, get instance, delete instance, search (definitions / requirements / instances) | `main.rs:6996`+; DMN evaluated in-engine. |
-| **Process definitions** | get **XML**, `searchProcessDefinitions` | `stub_impls.rs:1457`, `1481`. |
+| **Process definitions** | get **XML**, `searchProcessDefinitions` | `main.rs` `get_process_definition_xml_impl` / `search_process_definitions_impl`. |
 | **Element instances** | set/create variables, `getVariable`, `searchVariables` | `main.rs:8092`+. |
 | **User tasks** | get, search, `assign`, `unassign`, `complete`, `update` | `main.rs:7523`+. |
-| **Cluster** | `getTopology` | `get_topology_impl`. |
+| **Cluster** | `getTopology` | `get_topology_impl` (`OVERRIDES` module `cluster`). |
 
 ### Stubbed (501) or absent
 
 | Group | Operation(s) | Status |
 |---|---|---|
-| Process instances | `migrate`, `modify`, batch operations | **stubbed (501)** (`stub_impls.rs:1495`) |
+| Process instances | `migrate`, `modify`, batch operations | **stubbed (501)** (not in `OVERRIDES`) |
 | Signals | `broadcastSignal` | **stubbed (501)** — note the *engine* handles signal catch/boundary events; only the REST **broadcast** endpoint is unwired. |
 | Process definitions | get definition (non-XML), start form, all statistics | **stubbed (501)** |
 | Jobs | all statistics endpoints | **stubbed (501)** |
 | User tasks | search user-task variables | **stubbed (501)** |
 | Messages | message-subscription search | **stubbed (501)** |
-| Resources / Documents | get resource, create/link documents | **stubbed (501)** |
+| Resources | `getResource`, `getResourceContent`, `getResourceContentBinary`, `searchResources`, `deleteResource` (`spec/deployments.yaml`) | **stubbed (501)** — only `createDeployment` in this spec area is served. |
 | Authentication | `me` | **stubbed (501)** |
-| Identity — Authorizations, Roles, Groups, Tenants, Users | all | **stubbed (501)** (`stub_impls.rs`) — see §6. |
-| Deployments | search / get deployment | **unverified** (no served handler found). |
+| Identity — Authorizations, Roles, Groups, Tenants, Users | all | **stubbed (501)** (not in `OVERRIDES`) — see §6. |
 
 ---
 
@@ -249,7 +251,8 @@ Camunda 8 platform. The following are intentionally not present:
   is no Elasticsearch dependency and no Camunda exporter protocol.
 - **Identity, authorization, multi-tenancy.** The C8 identity-management endpoints
   (Authorizations, Roles, Groups, Tenants, Users) and `authentication/me` are
-  **stubbed (501)** (`server/src/stub_impls.rs`). There is no engine-level tenancy
+  **stubbed (501)** (absent from the `OVERRIDES` map in
+  `scripts/gen-stub-server.py`). There is no engine-level tenancy
   model; treat Nano as single-tenant.
 - **Zeebe gRPC.** Nano serves the **v2 REST** API (and a Falcon WebSocket command
   stream), not the legacy Zeebe gRPC gateway protocol.
