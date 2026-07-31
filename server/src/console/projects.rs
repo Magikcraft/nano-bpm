@@ -1494,7 +1494,7 @@ const WORKFLOW_DENO_JSON: &str = r#"{
     "start": "deno run --allow-net --allow-read --allow-env main.ts",
     "start-instance": "deno run --allow-net --allow-read --allow-env scripts/start-instance.ts",
     "approve": "deno run --allow-net --allow-read --allow-env scripts/approve.ts",
-    "job-types": "deno run scripts/job-types.ts"
+    "job-types": "deno run --allow-net --allow-read --allow-env scripts/job-types.ts"
   }
 }
 "#;
@@ -1742,8 +1742,9 @@ const types = externalJobTypes(prReview);
 if (types.length === 0) {
   console.log("no external (w.task) steps — every step is hosted in-process");
 } else {
-  console.log("external job types (host a worker for each):");
-  for (const t of types) console.log(`  ${t}`);
+  // One bare job type per line, so `deno task job-types` output is exactly what
+  // the README tells you to hire against (copy/paste straight into a harness).
+  for (const t of types) console.log(t);
 }
 "#;
 
