@@ -305,9 +305,15 @@ registerContextSource(async (ctx): Promise<Partial<TourContext>> => {
     return {};
   }
 
-  const project = ctx.projects.find(
+  const candidates = ctx.projects.filter(
     (p) => p.template === WORKFLOW_STARTER_TEMPLATE,
   );
+  // `listProjects()` order is filesystem-dependent, so when several starter
+  // projects exist, pick a stable, intent-aligned one: the running project the
+  // journey is about, else the most recently touched.
+  const project =
+    candidates.find((p) => p.running) ??
+    [...candidates].sort((a, b) => b.updatedMs - a.updatedMs)[0];
   if (!project) {
     closeTailsExcept();
     return {};

@@ -61,7 +61,15 @@ export const TOUR_ANCHOR = {
 
 export type TourAnchor = (typeof TOUR_ANCHOR)[keyof typeof TOUR_ANCHOR];
 
-/** CSS attribute selector for a `data-tour` anchor value. */
+/**
+ * CSS attribute selector for a `data-tour` anchor value.
+ *
+ * The `"` and `\` are escaped because `templateAnchor(id)` now feeds this
+ * *unconstrained* pack-contributed template ids (#411): an id containing a quote
+ * would otherwise produce an invalid selector, and driver.js would silently skip
+ * the step rather than error. Anchors enumerated in `TOUR_ANCHOR` never contain
+ * these, so this is a no-op for them.
+ */
 export function tourSelector(anchor: string): string {
-  return `[data-tour="${anchor}"]`;
+  return `[data-tour="${anchor.replace(/["\\]/g, "\\$&")}"]`;
 }
