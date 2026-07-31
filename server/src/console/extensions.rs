@@ -1147,6 +1147,33 @@ pub fn installed_version(pkg: &str) -> Option<String> {
 /// example}`.
 pub const MARKETPLACE_KEYWORD: &str = "nano-ide-ext";
 
+/// How many search hits to request from `npm search`.
+///
+/// `npm search` defaults to **20** results (`--searchlimit`). The marketplace
+/// lists *every* pack carrying [`MARKETPLACE_KEYWORD`], so once the ecosystem
+/// grows past 20 packs the default silently truncates the tail — npm ranks by
+/// popularity, so brand-new / low-download packs (exactly the ones a user is
+/// hunting for) drop off the list first. `250` is the registry search
+/// endpoint's (`/-/v1/search`) hard per-request cap, so this requests the
+/// largest single page npm will serve. If the tagged ecosystem ever exceeds
+/// 250 packs the *next* boundary is real pagination (`from`/`size`); until then
+/// one maxed-out page keeps the whole catalogue visible.
+pub const MARKETPLACE_SEARCH_LIMIT: usize = 250;
+
+/// The exact `npm search` argument vector the marketplace shells out with.
+///
+/// Factored out as the single source of truth so the [`MARKETPLACE_SEARCH_LIMIT`]
+/// guard can assert the `--searchlimit` is present and sufficient without
+/// spawning `npm` (see the `marketplace_search_args_cap_the_result_page` test).
+fn marketplace_search_args() -> Vec<String> {
+    vec![
+        "search".to_string(),
+        format!("keywords:{MARKETPLACE_KEYWORD}"),
+        "--json".to_string(),
+        format!("--searchlimit={MARKETPLACE_SEARCH_LIMIT}"),
+    ]
+}
+
 /// One npm package surfaced in the marketplace.
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1257,11 +1284,7 @@ fn is_official(name: &str) -> bool {
 pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
     let npm = find_program("npm").ok_or("npm not found on PATH")?;
     let out = std::process::Command::new(&npm)
-        .args([
-            "search",
-            &format!("keywords:{MARKETPLACE_KEYWORD}"),
-            "--json",
-        ])
+        .args(marketplace_search_args())
         .output()
         .map_err(|e| format!("npm search: {e}"))?;
     if !out.status.success() {
@@ -1581,6 +1604,33 @@ mod tests {
             classify_category(&[MARKETPLACE_KEYWORD.to_string()]),
             "other"
         );
+    }
+
+    #[test]
+    fn marketplace_search_args_cap_the_result_page() {
+        // Defect-class guard: `npm search` defaults to 20 hits, so once more
+        // than 20 packs carry the marketplace keyword the tail is silently
+        // dropped and low-popularity packs vanish from the console. The search
+        // invocation MUST pin an explicit, large `--searchlimit`.
+        let args = marketplace_search_args();
+        assert_eq!(args.first().map(String::as_str), Some("search"));
+        assert!(
+            args.iter().any(|a| a == "--json"),
+            "search must request --json output"
+        );
+        let limit = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--searchlimit="))
+            .expect("marketplace search must pin an explicit --searchlimit");
+        let limit: usize = limit
+            .parse()
+            .expect("--searchlimit must be a positive integer");
+        // Well clear of npm's default of 20 — request the registry's max page.
+        assert!(
+            limit >= 250,
+            "--searchlimit={limit} is too small; the marketplace truncates the catalogue as it grows"
+        );
+        assert_eq!(limit, MARKETPLACE_SEARCH_LIMIT);
     }
 
     #[test]
