@@ -1210,31 +1210,46 @@ fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
     }
 }
 
-/// Derive the npm dependencies a project's Node fallback needs from a `deno.json`
-/// import map — the single source of truth (issue #437). Every `npm:`-mapped
-/// specifier the loader strips must exist in `node_modules`, so it must be a
-/// `package.json` dependency; non-`npm:` entries (relative/jsr/http) are skipped.
-fn npm_deps_from_deno_json(deno_json: &str) -> BTreeMap<String, String> {
+/// Parse a `deno.json`/`deno.jsonc` body into its npm dependency set, or `None`
+/// when the body does not parse as a JSON object. `Some(empty)` means "parsed,
+/// but no `npm:` imports" — distinct from a parse failure, so callers can mirror
+/// `node-loader.mjs`, which falls through to the next candidate file only on a
+/// read/parse error, not on a valid-but-import-less map.
+fn parse_npm_deps(deno_json: &str) -> Option<BTreeMap<String, String>> {
+    let serde_json::Value::Object(root) = serde_json::from_str(deno_json).ok()? else {
+        return None;
+    };
     let mut deps = BTreeMap::new();
-    if let Ok(serde_json::Value::Object(root)) =
-        serde_json::from_str::<serde_json::Value>(deno_json)
-        && let Some(serde_json::Value::Object(imports)) = root.get("imports")
-    {
+    if let Some(serde_json::Value::Object(imports)) = root.get("imports") {
         for value in imports.values() {
             if let Some((name, range)) = value.as_str().and_then(npm_dep_from_import) {
                 deps.insert(name, range);
             }
         }
     }
-    deps
+    Some(deps)
 }
 
-/// Read the npm deps a project requires from its on-disk `deno.json`/`deno.jsonc`
-/// (mirrors `node-loader.mjs`'s file lookup). Missing/unparseable → empty.
+/// Derive the npm dependencies a project's Node fallback needs from a `deno.json`
+/// import map — the single source of truth (issue #437). Every `npm:`-mapped
+/// specifier the loader strips must exist in `node_modules`, so it must be a
+/// `package.json` dependency; non-`npm:` entries (relative/jsr/http) are skipped.
+/// A body that does not parse yields no deps.
+fn npm_deps_from_deno_json(deno_json: &str) -> BTreeMap<String, String> {
+    parse_npm_deps(deno_json).unwrap_or_default()
+}
+
+/// Read the npm deps a project requires from its on-disk `deno.json`/`deno.jsonc`,
+/// mirroring `node-loader.mjs`'s file lookup **exactly**: try each candidate in
+/// order and fall through to the next on a read **or parse** failure, stopping at
+/// the first that parses (even to an import-less map). Neither present/parseable
+/// → empty.
 fn required_npm_deps(dir: &Path) -> BTreeMap<String, String> {
     for name in ["deno.json", "deno.jsonc"] {
-        if let Ok(raw) = std::fs::read_to_string(dir.join(name)) {
-            return npm_deps_from_deno_json(&raw);
+        if let Ok(raw) = std::fs::read_to_string(dir.join(name))
+            && let Some(deps) = parse_npm_deps(&raw)
+        {
+            return deps;
         }
     }
     BTreeMap::new()
@@ -8948,6 +8963,37 @@ mod tests {
         assert_eq!(
             after, original,
             "a dep covered via devDependencies must not be re-added, nor the file reformatted"
+        );
+    }
+
+    /// `required_npm_deps` must mirror `node-loader.mjs`'s file lookup: an
+    /// unparseable `deno.json` falls through to a valid `deno.jsonc` (rather than
+    /// stopping at the first readable-but-broken file and dropping deps).
+    #[test]
+    fn required_npm_deps_falls_through_a_broken_deno_json_to_deno_jsonc() {
+        let _g = lock();
+        let root = temp_root();
+        let dir = root.join("mixed");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("deno.json"), "{ not valid json ").unwrap();
+        std::fs::write(
+            dir.join("deno.jsonc"),
+            r#"{"imports":{"@nanobpm/nano-sdk":"npm:@nanobpm/nano-sdk@^1"}}"#,
+        )
+        .unwrap();
+        let deps = required_npm_deps(&dir);
+        assert_eq!(
+            deps.get("@nanobpm/nano-sdk").map(String::as_str),
+            Some("^1"),
+            "a broken deno.json must fall through to a valid deno.jsonc"
+        );
+
+        // A valid-but-import-less deno.json STOPS the lookup (mirrors the loader's
+        // `?? {}`): it does not fall through to deno.jsonc.
+        std::fs::write(dir.join("deno.json"), r#"{"tasks":{}}"#).unwrap();
+        assert!(
+            required_npm_deps(&dir).is_empty(),
+            "a valid import-less deno.json must not fall through to deno.jsonc"
         );
     }
 }
