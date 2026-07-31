@@ -37,6 +37,7 @@ use crate::backpressure::SlaMode;
 
 pub mod agent_brief;
 pub mod config;
+pub mod connectors;
 mod envelope_scan;
 pub mod extensions;
 mod generated_api;
@@ -3323,6 +3324,23 @@ pub(super) async fn project_trigger_add(
     triggers::triggers_overview(name)
         .await
         .map_err(trigger_error)
+}
+
+/// `GET /console/api/projects/{name}/connectors` — enabled connectors + registry.
+pub(super) fn project_connectors(name: &str) -> ApiResult {
+    connectors::connectors_overview(name).map_err(trigger_error)
+}
+
+/// `POST /console/api/projects/{name}/connectors` — enable a connector, then
+/// return the refreshed overview.
+pub(super) fn project_connector_add(
+    name: &str,
+    task_type: &str,
+    connection: Option<&str>,
+    config: &std::collections::BTreeMap<String, String>,
+) -> ApiResult {
+    connectors::add_connector(name, task_type, connection, config).map_err(trigger_error)?;
+    connectors::connectors_overview(name).map_err(trigger_error)
 }
 
 /// `DELETE /console/api/projects/{name}/file?path=...` — remove a file or folder.

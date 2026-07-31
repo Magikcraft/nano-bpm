@@ -32,6 +32,7 @@ import {
   createProjectPath,
   deleteProjectPath,
   getProject,
+  getConnectors,
   getDataSchema,
   getDataSources,
   listProjectFiles,
@@ -75,6 +76,7 @@ import {
   loadProjectComponents,
   loadPackComponents,
   combineComponents,
+  filterEnabledPackComponents,
   type ElementTemplate,
 } from "../lib/projectComponents";
 import {
@@ -96,6 +98,7 @@ import {
 const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
 const DataPanel = lazy(() => import("../components/DataPanel"));
 const TriggersPanel = lazy(() => import("../components/TriggersPanel"));
+const ConnectorsPanel = lazy(() => import("../components/ConnectorsPanel"));
 const DerivedModelPanel = lazy(() => import("../components/DerivedModelPanel"));
 const BpmnModeler = lazy(() => import("../components/BpmnModeler"));
 const DmnModeler = lazy(() => import("../components/DmnModeler"));
@@ -134,6 +137,7 @@ export default function ProjectWorkspace() {
   const [showCompile, setShowCompile] = useState(false);
   const [showData, setShowData] = useState(false);
   const [showTriggers, setShowTriggers] = useState(false);
+  const [showConnectors, setShowConnectors] = useState(false);
   const [showModel, setShowModel] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
   const [consoleHeight, setConsoleHeight] = useState(() => {
@@ -462,6 +466,7 @@ export default function ProjectWorkspace() {
             onClick={() => {
               setShowData((v) => !v);
               setShowTriggers(false);
+              setShowConnectors(false);
               setShowModel(false);
             }}
             kind={showData ? "primary" : undefined}
@@ -474,11 +479,25 @@ export default function ProjectWorkspace() {
             onClick={() => {
               setShowTriggers((v) => !v);
               setShowData(false);
+              setShowConnectors(false);
               setShowModel(false);
             }}
             kind={showTriggers ? "primary" : undefined}
           >
             Triggers
+          </ToolbarButton>
+        )}
+        {isUrbanApp && (
+          <ToolbarButton
+            onClick={() => {
+              setShowConnectors((v) => !v);
+              setShowData(false);
+              setShowTriggers(false);
+              setShowModel(false);
+            }}
+            kind={showConnectors ? "primary" : undefined}
+          >
+            Connectors
           </ToolbarButton>
         )}
         {isWorkflowProject && (
@@ -487,6 +506,7 @@ export default function ProjectWorkspace() {
               setShowModel((v) => !v);
               setShowData(false);
               setShowTriggers(false);
+              setShowConnectors(false);
             }}
             kind={showModel ? "primary" : undefined}
             dataTour={TOUR_ANCHOR.modelView}
@@ -576,6 +596,18 @@ export default function ProjectWorkspace() {
               }
             >
               <TriggersPanel name={name} />
+            </Suspense>
+          </div>
+        ) : showConnectors ? (
+          <div className="flex min-w-0 flex-1 flex-col">
+            <Suspense
+              fallback={
+                <div className="p-8 text-sm text-fg-faint">
+                  Loading Connectors panel…
+                </div>
+              }
+            >
+              <ConnectorsPanel name={name} />
             </Suspense>
           </div>
         ) : showModel ? (
@@ -1393,11 +1425,19 @@ function EditorPane({
       listProjectFiles({ path: { name }, throwOnError: true }).then((res) =>
         loadProjectComponents(name, res.data.files),
       ),
+      // The project's enabled connectors gate which pack connector components
+      // belong in the palette (ADR 0050, amending ADR 0033 §2). A project with
+      // no manifest / no connectors yields an empty enabled set, so only design-
+      // only pack components (and the project's own) show.
+      getConnectors({ path: { name }, throwOnError: true })
+        .then((res) => res.data.connectors.map((c) => c.taskType))
+        .catch(() => [] as string[]),
     ])
-      .then(
-        ([pack, project]) =>
-          alive && setComponents(combineComponents(pack, project)),
-      )
+      .then(([pack, project, enabledTaskTypes]) => {
+        if (!alive) return;
+        const gatedPack = filterEnabledPackComponents(pack, enabledTaskTypes);
+        setComponents(combineComponents(gatedPack, project));
+      })
       .catch(() => alive && setComponents([]));
     return () => {
       alive = false;

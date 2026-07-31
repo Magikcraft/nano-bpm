@@ -55,7 +55,7 @@
     "workers": {
       "type": "array",
       "items": { "$ref": "#/$defs/worker" },
-      "description": "Service-task handlers: referenced files or an llm binding (ADR 0022 §E)."
+      "description": "Service-task handlers: referenced files, an llm binding, or a connector supplied by an installed pack (ADR 0022 §E, ADR 0050)."
     },
     "llm": {
       "type": "object",
@@ -342,10 +342,11 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["taskType"],
-      "description": "A service-task worker: either a referenced handler file or an llm binding (ADR 0022 §E).",
+      "description": "A service-task worker: a referenced handler file, an llm binding, or a connector supplied by an installed pack (ADR 0022 §E, ADR 0050).",
       "oneOf": [
         { "required": ["handler"] },
-        { "required": ["llm"] }
+        { "required": ["llm"] },
+        { "required": ["connector"] }
       ],
       "properties": {
         "taskType": { "type": "string", "minLength": 1 },
@@ -356,6 +357,14 @@
         "llm": {
           "type": "string",
           "description": "Name of an llm[] binding used as the worker (LLM-as-worker)."
+        },
+        "connector": {
+          "type": "string",
+          "description": "Id of the installed pack (`nano-ide.ext.json` `id`) that supplies this worker's out-of-process handler, enabled into the project rather than authored in it (ADR 0050 — the outbound I/O edge). The host resolves + supervises the pack's worker `entry` by `taskType`; the pack's element template (its `zeebe:taskDefinition:type` = this `taskType`) is the design-time face. Mutually exclusive with `handler`/`llm`."
+        },
+        "connection": {
+          "type": "string",
+          "description": "Optional named `connections[]` entry supplying this worker's shared credential/endpoint (ADR 0025 §1), symmetric to `trigger.connection`. Its secrets stay env pointers (ADR 0027 §5)."
         },
         "inputType": {
           "$ref": "#/$defs/slug",

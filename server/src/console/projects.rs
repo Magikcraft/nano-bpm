@@ -37,7 +37,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{Mutex, Notify, broadcast};
 
-use super::{triggers, worker_export, workers, workspace};
+use super::{connectors, triggers, worker_export, workers, workspace};
 
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 const LLM_WORKER_TS: &str = include_str!("llm_worker.ts");
@@ -4903,6 +4903,10 @@ impl ProjectSupervisor {
             return Err("no such project".into());
         }
         let cfg = read_config(name).ok_or("no such project")?;
+        // Boot gate (ADR 0027 §4 / ADR 0050 §2 seam): fail closed if the manifest
+        // enables a connector whose pack is uninstalled, unlaunchable, or missing
+        // its backing component — otherwise the task would parse but hang.
+        connectors::validate_connector_seam(name)?;
         // Start this project's trigger dispatcher (ADR 0025) if it declares
         // triggers[]. Idempotent and no-op for projects without triggers, so it
         // covers both the toolchain and built-in run paths below without paying

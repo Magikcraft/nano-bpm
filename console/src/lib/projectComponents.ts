@@ -162,3 +162,8 @@ export function combineComponents(
 ): ElementTemplate[] {
   return mergeComponentsById([pack, project]);
 }
+
+export {
+  componentTaskType,
+  filterEnabledPackComponents,
+} from "./connectorPalette";

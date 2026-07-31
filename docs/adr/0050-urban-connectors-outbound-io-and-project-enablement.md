@@ -186,10 +186,18 @@ is an authoring-time error with a pointer, not a silent runtime no-op. (The `nan
    wired into the App run loop beside the trigger source supervisor (`projects.rs`).
 3. **enablement** — enable-into-project writes `workers[]`/`connections[]`/active components to
    `nano.app.json`; the palette derives from the enabled set (amends ADR 0033 §2/inc 6).
+   *(Realized: `console/connectors.rs` `add_connector` writes the pack-backed worker + named
+   connection; `ProjectWorkspace` gates pack connector components on the enabled set via
+   `filterEnabledPackComponents`.)*
 4. **config-projection** — the "Add connector" panel projecting `configFields` into the project
    config surface with env-pointer defaults (mirror ADR 0025 §7).
+   *(Realized: `ConnectorsPanel.tsx` renders each connector's `configFields`; values persist as
+   env pointers on the named `connections[]` entry — never inline secrets.)*
 5. **validation** — the §2 seam invariant at the ADR 0027 §4 boot gate (a component with no backing
    worker fails closed).
+   *(Realized: `connectors::validate_connector_seam`, called from `projects::run()`, fails closed
+   when an enabled connector has no launchable worker or no backing component. The reverse direction
+   — a service task placed for a connector not yet enabled — is deferred to a follow-up.)*
 
 ## Open questions
 
