@@ -95,7 +95,7 @@ export default function DerivedModelPanel({ name }: { name: string }) {
           <div className="flex h-full items-center justify-center px-6 text-center text-sm text-fg-faint">
             No workflows found. Export a workflow from{" "}
             <code className="mx-1">workflows/*.ts</code> (e.g.{" "}
-            <code>export const prReview = defineWorkflow(…)</code>).
+            <code>export const prReview = defineFlow(…)</code>).
           </div>
         ) : (
           <BpmnViewer key={current?.id ?? active} xml={current?.xml ?? null} />
