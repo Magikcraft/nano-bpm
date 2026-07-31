@@ -2360,6 +2360,9 @@ fn extension_json(e: &extensions::ExtManifest) -> serde_json::Value {
         "components": extensions::pack_component_templates(&e.id),
         "toolchainAvailable": extensions::toolchain_available(e),
         "trusted": extensions::is_trusted(&e.id),
+        // Handoff steps are stripped for untrusted packs before they are ever
+        // sent — see extensions::visible_tours.
+        "tours": extensions::visible_tours(e),
     })
 }
 

