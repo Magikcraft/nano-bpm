@@ -240,7 +240,10 @@ box — no manual dependency wrangling.
 
 Nano serves the Camunda 8 Orchestration Cluster **v2 REST API**, so existing
 Camunda 8 clients and tooling work against it unchanged. Browse the full,
-interactive API at **`/swagger`** (served offline).
+interactive API at **`/swagger`** (served offline). For the precise supported
+subset — which BPMN elements execute, which endpoints are served, and the
+behavioural differences to expect — see the
+[**Camunda compatibility subset**](docs/camunda-compatibility.md).
 
 You have two ways to drive the engine:
 
