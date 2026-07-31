@@ -1301,9 +1301,10 @@ pub(crate) fn program_file_candidates(
         .map(|e| e.to_ascii_lowercase())
         .collect();
     // If the name already ends with one of these extensions, use it verbatim.
-    let already_has_ext = exts
-        .iter()
-        .any(|e| name.to_ascii_lowercase().ends_with(&e.to_ascii_lowercase()));
+    // `exts` is already lowercased, so compare against a single lowercased copy
+    // of the name rather than re-lowercasing per extension.
+    let name_lower = name.to_ascii_lowercase();
+    let already_has_ext = exts.iter().any(|e| name_lower.ends_with(e.as_str()));
     if already_has_ext {
         return vec![name.to_string()];
     }
