@@ -821,6 +821,12 @@ defined here in `server/src/console/extensions.rs`. See
 [`docs/nano-repositories.md`](docs/nano-repositories.md) for how the pieces
 relate. (This is a Studio-profile authoring tab.)
 
+**Authoring a pack.** See the [**Extensions authoring & publishing
+guide**](docs/extensions.md) for the `nano-ide.ext.json` manifest, every pack
+kind (language, app template, example, agentic-SDLC app, trigger, connector, and
+theme) with a minimal example, the install/trust model, and how to publish to
+npm.
+
 ### Explorer
 
 A live process-instance explorer (variables, jobs, incidents) with BPMN XML for
