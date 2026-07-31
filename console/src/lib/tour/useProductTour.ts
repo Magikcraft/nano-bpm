@@ -35,6 +35,7 @@ import type { Journey, JourneyEvent, TourContext } from "./types";
 // own module import here; the registry itself keeps no central list, so parallel
 // slices never contend on one file.
 import { overviewJourneyId } from "./journeys/overview";
+import { registerPackTours } from "./journeys/fromPack.ts";
 // Journey 1 (headless local dev, #409). Imported for its registration side
 // effect, eagerly, so it is offered in the picker and reachable via ?tour=
 // before its own view (Explorer, lazy-loaded) has mounted.
@@ -231,10 +232,19 @@ export function useProductTour(
   // Recompute which journeys are offerable once real context exists: a
   // journey-level precondition can only be evaluated against a snapshot, and
   // until it arrives we optimistically list everything for the profile.
+  //
+  // Pack-contributed journeys (ADR 0049 §7) are registered here rather than by a
+  // module import, because they arrive as data on the extensions payload the
+  // context already carries — so registering them costs no extra request, and it
+  // must happen BEFORE `journeysFor` runs or the picker would miss them on first
+  // paint. Registration is idempotent (the registry is keyed by id), so repeating
+  // it on every refresh replaces rather than duplicates.
   useEffect(() => {
     let cancelled = false;
     void getContext().then((ctx) => {
-      if (!cancelled) setAvailable(journeysFor(CONSOLE_PROFILE, ctx));
+      if (cancelled) return;
+      registerPackTours(ctx.extensions);
+      setAvailable(journeysFor(CONSOLE_PROFILE, ctx));
     });
     return () => {
       cancelled = true;
