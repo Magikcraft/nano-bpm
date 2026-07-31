@@ -182,14 +182,23 @@ ${body}
 function homeHtml() {
   // Quote-safe line array (no backticks / ${…}) so it can't collide with this
   // module's own template literals; syntax-highlighted at build time by highlightTs().
+  // The Code-first tab: the SAME urban-pr-review convergence loop the Model-first
+  // tab runs live — authored as code (same task ids / signal / correlation key).
   const heroCode = [
     'import { defineWorkflow } from "@nanobpm/workflow";',
     "",
-    'export const prReview = defineWorkflow("pr-review", (w) => {',
-    '  w.run("fetchDiff",  async (job) => ({ diff: await gh.diff(job.variables.prId) }));',
-    '  w.run("autoReview", async (job) => ({ findings: await llm.review(job.variables.diff) }));',
-    '  w.signal("humanApproval", { correlationKey: "prId" }); // durable wait — survives a reboot',
-    '  w.run("merge",      async (job) => ({ merged: await gh.merge(job.variables.prId) }));',
+    "// urban-pr-review — an agentic convergence loop, authored as code.",
+    "// The same app the Model-first tab runs live on the wasm engine.",
+    'export const prReview = defineWorkflow("urban-pr-review", (w) => {',
+    '  w.run("fetchDiff", async (job) => ({ diff: await gh.diff(job.variables.prKey) }));',
+    "",
+    "  // A hired coding agent (c8ctl nano hire copilot) reviews as a durable worker.",
+    '  w.run("senior:pr-review", async (job) => ({ verdict: await agent.review(job.variables.diff) }));',
+    "",
+    "  // Durable wait — survives a crash or forced reboot, resumes on the signal.",
+    '  w.signal("review-ready", { correlationKey: "prKey" });',
+    "",
+    '  w.run("merge", async (job) => ({ merged: await gh.merge(job.variables.prKey) }));',
     "});",
   ].join("\n");
 
@@ -202,82 +211,187 @@ function homeHtml() {
 </header>
 
 <section class="hero">
-  <p class="eyebrow">Durable · Load-bearing · Agentic</p>
-  <h1>The load-bearing runtime<br><span class="grad">for agentic systems.</span></h1>
-  <p class="lede">Orchestrate your coding agents in a runtime that survives crashes and
-  forced reboots, resumes exactly where it left off, and scales from your laptop to your
-  team's backbone. Author workflows as code — no diagram, no task-queue wiring.</p>
+  <p class="eyebrow"><span class="arp">Advanced Research Prototype</span></p>
+  <h1>Agentic Orchestration<br>for the <span class="grad">Developer Workstation.</span></h1>
+  <p class="lede">A RAAD — Rapid Agentic Application Development — environment that runs on
+  your machine. Compose coding agents, tools, and human approvals into durable workflows.
+  Code-first or Model-first, provider-agnostic, and small enough to start on a Raspberry Pi.</p>
   <div class="cta">
-    <a class="btn primary" href="/demo/">Try it in your browser →</a>
+    <a class="btn primary" href="#try">See it live ↓</a>
+    <a class="btn ghost" href="/demo/">Open the browser demo →</a>
   </div>
-  <div class="install"><code>npm install @nanobpm/workflow</code></div>
+  <div class="install multi" aria-label="Install and start Nano">
+    <code>npm i -g @camunda8/cli</code>
+    <code>c8ctl load plugin c8ctl-plugin-nano</code>
+    <code>c8ctl nano start</code>
+  </div>
+</section>
 
-  <figure class="code">
-    <figcaption>A durable agent workflow, authored as code.</figcaption>
-    <pre><code>${highlightTs(heroCode)}</code></pre>
-    <p class="code-note">Nano derives the model, the job types, the worker, and the
-    human-approval wait. You write steps and handlers — nothing else.</p>
-  </figure>
+<section id="try" class="demo-tabs wrap">
+  <h2 class="tabs-title">Code-first <span class="grad">or</span> Model-first.</h2>
+  <p class="tabs-sub">One app — <code>urban-pr-review</code> — two authoring surfaces, the same engine.</p>
+  <div class="tablist" role="tablist" aria-label="Authoring surface">
+    <button class="tab" role="tab" id="tab-code" aria-controls="panel-code" aria-selected="true" tabindex="0">Code-first</button>
+    <button class="tab" role="tab" id="tab-model" aria-controls="panel-model" aria-selected="false" tabindex="-1">Model-first</button>
+  </div>
+
+  <div class="tabpanel" id="panel-code" role="tabpanel" aria-labelledby="tab-code">
+    <figure class="code pop">
+      <figcaption>The convergence loop, authored as code.</figcaption>
+      <pre><code>${highlightTs(heroCode)}</code></pre>
+      <p class="code-note">Nano derives the executable model, the job types, the message
+      correlation, and a generic worker. You write steps and handlers — nothing else.</p>
+    </figure>
+  </div>
+
+  <div class="tabpanel" id="panel-model" role="tabpanel" aria-labelledby="tab-model" hidden>
+    <iframe class="demo-frame" title="Live Model-first urban-pr-review demo on the wasm engine"
+      data-src="/demo/" loading="lazy" allow="fullscreen" allowfullscreen></iframe>
+    <p class="tab-note">The real <code>urban-pr-review</code> BPMN model, executing live on the
+    WebAssembly build of the engine — no server. Or <a href="/demo/">open it full-page →</a></p>
+  </div>
 </section>
 
 <section class="band problem">
   <div class="wrap">
-    <h2>Your agent loops deserve a real runtime.</h2>
-    <p>You're already running agents to write, review, and test code. But the orchestration
-    is a pile of shell scripts and retries. When your laptop reboots overnight — a crash, or an
-    IT-forced update you didn't choose — the run dies. You lose the state, re-run the expensive
-    steps, re-spend the tokens, and have no idea what the agent actually did.</p>
+    <h2>New levels of abstraction demand new primitives.</h2>
+    <p>You're already orchestrating agents to write, review, and test code — but the wiring is a
+    pile of shell scripts and retries. When the machine reboots overnight — a crash, or an
+    IT-forced update — the run dies, the state is gone, and the tokens are re-spent. Agentic
+    systems need durable, inspectable primitives, not more glue.</p>
   </div>
 </section>
 
 <section class="pillars wrap">
   <article>
-    <h3>Durable</h3>
-    <p>Survives crashes and forced reboots. On restart, a workflow resumes at the exact step it
-    left off — completed activities aren't re-run and tokens aren't re-spent.</p>
-    <p class="proof">SIGKILL → cold restart → exactly-once. Proven, with a negative control.</p>
+    <h3>DRY your agentic SDLC</h3>
+    <p>Declare durable steps with <code>w.run</code> and durable waits with <code>w.signal</code>.
+    Nano derives the model, job types, correlation, and workers — one source of truth, no copy-paste
+    orchestration across every workflow.</p>
+    <p class="proof">Author once. Nano derives the rest.</p>
   </article>
   <article>
-    <h3>Load-bearing</h3>
-    <p>The same runtime that ran your laptop loop runs your team's backbone. A single binary
-    today; scale out when it gets real — no rewrite, no re-platforming.</p>
-    <p class="proof">Small enough to go anywhere. Strong enough to build on.</p>
+    <h3>Code-first or Model-first</h3>
+    <p>Write the workflow as code, or draw it as BPMN — the same durable engine runs both. Switch
+    surfaces without re-platforming; the model and the code are two views of one runtime.</p>
+    <p class="proof">Same engine. Same app. Your choice of surface.</p>
   </article>
   <article>
-    <h3>Agentic</h3>
-    <p>Coding agents, tools, and human approvals in one inspectable model — not a bash script you
-    can't see into. A durable wait for human sign-off is a single line.</p>
-    <p class="proof"><code>w.signal("humanApproval", …)</code> — one line, fully durable.</p>
+    <h3>Durable by default</h3>
+    <p>Survives crashes and forced reboots. On restart a workflow resumes at the exact step it left
+    off — completed activities aren't re-run and tokens aren't re-spent.</p>
+    <p class="proof">SIGKILL → cold restart → exactly-once. With a negative control.</p>
   </article>
 </section>
 
+<section class="band providers">
+  <div class="wrap">
+    <h2>Provider-agnostic. <span class="grad">Mix frontier with local.</span></h2>
+    <p>Blend frontier models with local LLMs — on one workstation or across many. Route the expensive
+    steps to a frontier model and keep the rest private and free. Bring the coding harness you already use:</p>
+    <div class="provs" aria-label="Supported agent harnesses">
+      <span>GitHub Copilot</span>
+      <span>Claude Code</span>
+      <span>Pi</span>
+      <span>Open Coder</span>
+      <span>Little Coder</span>
+      <span class="more">and more</span>
+    </div>
+  </div>
+</section>
+
+<section class="band polyglot">
+  <div class="wrap">
+    <h2>Polyglot by design. <span class="grad">Meet your stack.</span></h2>
+    <p>Drive workflows and workers from the language your team already ships in — one durable engine,
+    first-class SDKs across the stack:</p>
+    <div class="provs langs" aria-label="Supported SDK languages">
+      <span>TypeScript</span>
+      <span>Java</span>
+      <span>Rust</span>
+      <span>Python</span>
+      <span>C#</span>
+    </div>
+  </div>
+</section>
+
 <section class="how wrap">
-  <h2>No ceremony. Nano derives the wiring.</h2>
+  <h2>Add an agent + coding harness to your workforce.</h2>
+  <p class="how-sub">Turn any interactive CLI agent harness into a durable Nano job worker.
+  <b>Hire</b> persists an agent profile; <b>work</b> polls the cluster and runs jobs through it.</p>
+  <div class="install multi" aria-label="Hire and run an agent worker">
+    <code>c8ctl nano hire copilot</code>
+    <code>c8ctl nano work copilot</code>
+  </div>
   <ol class="steps">
-    <li><span>1</span><div><b>Author as code.</b> Declare durable steps with <code>w.run</code> and
-      durable waits with <code>w.signal</code>. That's the whole surface.</div></li>
-    <li><span>2</span><div><b>Nano derives the rest.</b> The executable model, the job types, the
-      message correlation, and a generic worker — all generated. No diagram, no task queues, no
-      registration.</div></li>
-    <li><span>3</span><div><b>It just resumes.</b> Every run is an ordinary, durable Nano instance.
-      You never think about the journal — crash-resume is implicit.</div></li>
+    <li><span>1</span><div><b>Hire.</b> Persist an agent profile — a name, a rank, and the CLI
+      command (e.g. <code>copilot</code>) that backs it.</div></li>
+    <li><span>2</span><div><b>Work.</b> The harness polls for jobs and runs them, so a coding agent
+      becomes a first-class, durable worker in your orchestration.</div></li>
+    <li><span>3</span><div><b>It just resumes.</b> Every run is an ordinary durable Nano instance —
+      crash-resume is implicit, and you never think about the journal.</div></li>
   </ol>
 </section>
 
 <section class="band backbone">
   <div class="wrap">
-    <h2>Starts on your laptop.<br>Becomes your <span class="grad">backbone.</span></h2>
+    <h2>RAAD.<br><span class="grad">Rapid Agentic Application Development.</span></h2>
+    <p class="raad-sub">An Advanced Research Prototype for agentic orchestration on the developer
+    workstation. Start in three lines.</p>
+    <div class="install multi center" aria-label="Get started">
+      <code>npm i -g @camunda8/cli</code>
+      <code>c8ctl load plugin c8ctl-plugin-nano</code>
+      <code>c8ctl nano start</code>
+    </div>
     <div class="cta">
-      <a class="btn primary" href="/demo/">Watch a run survive a crash →</a>
+      <a class="btn primary" href="/demo/">Try it in your browser →</a>
     </div>
   </div>
 </section>
 
 <footer class="site-foot wrap">
   <p><a href="/demo/">Browser demo</a> · <a href="/schemas/">Published schemas</a></p>
-</footer>`;
+  <p class="muted">Nano is an Advanced Research Prototype. Free for evaluation use.</p>
+</footer>
 
-  return homePage("nanobpm.io — the load-bearing runtime for agentic systems", body);
+<script>
+// Accessible tabs for the Code-first / Model-first panel. Lazy-loads the demo
+// iframe (data-src -> src) only when the Model-first tab is first selected, so
+// the home page never eagerly loads /demo/ (keeps first paint light).
+(function () {
+  var tabs = Array.prototype.slice.call(document.querySelectorAll(".demo-tabs .tab"));
+  if (!tabs.length) return;
+  function select(tab) {
+    tabs.forEach(function (t) {
+      var on = t === tab;
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
+      var panel = document.getElementById(t.getAttribute("aria-controls"));
+      if (panel) panel.hidden = !on;
+    });
+    var panel = document.getElementById(tab.getAttribute("aria-controls"));
+    if (panel) {
+      var frame = panel.querySelector("iframe[data-src]");
+      if (frame) {
+        frame.setAttribute("src", frame.getAttribute("data-src"));
+        frame.removeAttribute("data-src");
+      }
+    }
+  }
+  tabs.forEach(function (tab, i) {
+    tab.addEventListener("click", function () { select(tab); });
+    tab.addEventListener("keydown", function (e) {
+      if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        e.preventDefault();
+        var n = e.key === "ArrowRight" ? (i + 1) % tabs.length : (i - 1 + tabs.length) % tabs.length;
+        tabs[n].focus(); select(tabs[n]);
+      }
+    });
+  });
+})();
+</script>`;
+
+  return homePage("nanobpm.io — Agentic Orchestration for the Developer Workstation", body);
 }
 
 // Minimal, dependency-free TS/JS highlighter for the fixed hero snippet. Ordered
@@ -318,7 +432,7 @@ function homePage(title, body) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<meta name="description" content="Nano is the load-bearing runtime for agentic systems: durable, code-first workflow orchestration that survives crashes and reboots, resumes exactly where it left off, and runs anywhere from your laptop to a cluster.">
+<meta name="description" content="Nano is an Advanced Research Prototype for agentic orchestration on the developer workstation: a RAAD — Rapid Agentic Application Development — environment that composes coding agents, tools, and human approvals into durable, code-first or model-first workflows, provider-agnostic across frontier and local LLMs.">
 <style>
   :root {
     --bg: #08080a; --panel: rgba(22,24,30,.55); --line: rgba(120,130,150,.16);
@@ -387,6 +501,55 @@ function homePage(title, body) {
     padding: .55rem .9rem; border-radius: 8px; font-size: .95rem; display: inline-block;
   }
   .install code::before { content: "$ "; color: var(--muted); }
+  .install.multi { display: flex; flex-direction: column; gap: .5rem; align-items: flex-start; max-width: max-content; margin-inline: auto; }
+  .install.multi.center { align-items: center; }
+  .install.multi code { text-align: left; }
+
+  .arp {
+    display: inline-block; border: 1px solid rgba(56,189,248,.4); border-radius: 999px;
+    padding: .28rem .8rem; background: rgba(56,189,248,.10); color: var(--sky);
+  }
+
+  .demo-tabs { padding-top: 3.5rem; text-align: center; }
+  .tabs-title { font-size: clamp(1.6rem, 3.6vw, 2.2rem); margin: 0 0 .4rem; }
+  .tabs-sub { color: var(--muted); margin: 0 auto 1.4rem; font-size: 1rem; }
+  .tabs-sub code, .how-sub code, .raad-sub code, .band.providers code { background: rgba(255,255,255,.05); padding: .08em .35em; border-radius: 5px; font-size: .9em; color: var(--sky); }  .tablist { display: inline-flex; gap: .5rem; padding: .3rem; border: 1px solid var(--line); border-radius: 12px; background: rgba(255,255,255,.03); margin-bottom: 1.4rem; }
+  .tab {
+    padding: .55rem 1.15rem; border-radius: 9px; border: 1px solid transparent; cursor: pointer;
+    background: transparent; color: var(--muted); font-weight: 600; font-size: .95rem; font-family: inherit;
+    transition: background .12s, color .12s, box-shadow .12s;
+  }
+  .tab:hover { color: var(--ink); }
+  .tab[aria-selected="true"] {
+    color: #052e1a; border-color: transparent;
+    background: linear-gradient(135deg, var(--emerald), var(--sky));
+    box-shadow: 0 8px 24px rgba(56,189,248,.28);
+  }
+  .tabpanel[hidden] { display: none; }
+  .demo-frame {
+    width: 100%; height: 560px; border: 1px solid rgba(120,130,150,.2); border-radius: var(--radius);
+    background: var(--code-bg); box-shadow: 0 24px 60px -24px rgba(0,0,0,.7); display: block;
+  }
+  .tab-note { font-size: .92rem; color: var(--muted); margin: .8rem .2rem 0; }
+  figure.code.pop pre {
+    border-color: rgba(56,189,248,.35);
+    box-shadow: 0 24px 60px -20px rgba(56,189,248,.35), 0 0 0 1px rgba(52,211,153,.12) inset;
+  }
+
+  .band.providers { background: var(--panel); border-block: 1px solid var(--line); backdrop-filter: blur(6px); text-align: center; }
+  .band.polyglot { text-align: center; }
+  .band.providers h2, .band.polyglot h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); margin: 0 0 .8rem; }
+  .band.providers p, .band.polyglot p { color: var(--muted); font-size: 1.06rem; max-width: 44rem; margin: 0 auto; }
+  .provs { display: flex; flex-wrap: wrap; gap: .6rem; justify-content: center; margin-top: 1.3rem; }
+  .provs span {
+    border: 1px solid var(--line); background: rgba(255,255,255,.04); padding: .42rem .85rem;
+    border-radius: 999px; font-size: .92rem; color: var(--ink); font-weight: 500;
+  }
+  .provs span.more { color: var(--muted); font-style: italic; }
+  .how-sub { color: var(--muted); max-width: 46rem; margin: 0 0 1.2rem; }
+  .how .install.multi { margin: 0 0 1.8rem; }
+  .band.backbone .raad-sub { color: var(--muted); max-width: 40rem; margin: 0 auto 1.4rem; font-size: 1.05rem; }
+  .band.backbone .install.multi { margin-bottom: 1.6rem; }
 
   figure.code { margin: 2.8rem auto 0; max-width: 52rem; text-align: left; }
   figure.code figcaption { font-size: .9rem; color: var(--muted); margin: 0 0 .5rem .2rem; }
@@ -447,7 +610,7 @@ function homePage(title, body) {
   .site-foot .muted, .muted { color: var(--muted); }
   .site-foot .muted { font-size: .9rem; max-width: 42rem; }
 
-  @media (max-width: 800px) { .pillars { grid-template-columns: 1fr; } }
+  @media (max-width: 800px) { .pillars { grid-template-columns: 1fr; } .demo-frame { height: 460px; } }
   @media (prefers-reduced-motion: reduce) { #field { display: none; } }
 </style>
 </head>
