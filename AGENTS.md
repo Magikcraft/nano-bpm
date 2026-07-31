@@ -118,6 +118,14 @@ PR — by then the duplicate work already happened.
   assignee, or an open PR — do **not** start. Stop and flag it to the user with a
   link. Never work a task in parallel with an untracked, unclaimed, or
   already-claimed item.
+- **Then check the code, not just the issue.** An unclaimed issue does not mean
+  unfinished work: at this velocity a slice can land while its issue stays open,
+  and it is worse for a **cross-repo** slice, where the diff lands somewhere the
+  issue does not live. So before claiming, confirm the work is actually absent —
+  `git fetch` and look for the file, the field, the flag; check the other repo's
+  `main`; check remote branches. Two of these have already been claimed after they
+  were done. Claiming a finished task wastes an agent and, worse, tells everyone
+  else the task is being handled when it needs nothing.
 - **Nothing tracked yet → create it, then claim it.** Open the issue before
   writing any code, so the work is visible at the velocity this repo moves at.
 - **Claim it by commenting your worktree name.** The comment is the canonical
