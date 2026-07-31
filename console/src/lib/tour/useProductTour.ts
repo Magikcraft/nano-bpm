@@ -17,7 +17,7 @@ import { listProjects } from "../../gen";
 import { CONSOLE_PROFILE } from "../profile";
 import { buildContext } from "./context";
 import type { ProjectsSnapshot } from "./context";
-import { readTourParam, stripTourParam } from "./deepLink";
+import { stripTourParam, consumeDeepLinkTourParam } from "./deepLink";
 import { getJourney, journeysFor } from "./registry";
 import { createJourneyRunner } from "./runner";
 import {
@@ -35,6 +35,10 @@ import type { Journey, JourneyEvent, TourContext } from "./types";
 // own module import here; the registry itself keeps no central list, so parallel
 // slices never contend on one file.
 import { overviewJourneyId } from "./journeys/overview";
+// Journey 1 (headless local dev, #409). Imported for its registration side
+// effect, eagerly, so it is offered in the picker and reachable via ?tour=
+// before its own view (Explorer, lazy-loaded) has mounted.
+import "./journeys/localdev";
 
 /**
  * Delay before an auto-started journey opens, letting the initial route and the
@@ -237,14 +241,18 @@ export function useProductTour(
   }, [getContext]);
 
   // `?tour=<id>` beats auto-start: a deep link is explicit intent, so it runs
-  // even for a journey already completed. The param is stripped afterwards so a
-  // refresh does not restart it.
+  // even for a journey already completed. Read from the module-load snapshot,
+  // not the live location: the console's index route redirects `/` to the home
+  // route with a search-less `<Navigate>` whose effect fires before this one, so
+  // the live `?tour=` would already be gone. c8ctl prints that very root URL.
   const deepLinked = useRef(false);
   useEffect(() => {
     if (deepLinked.current) return;
-    const requested = readTourParam(window.location.search);
+    const requested = consumeDeepLinkTourParam();
     if (!requested) return;
     deepLinked.current = true;
+    // Best-effort strip in case the param survived to the live URL (a deep link
+    // onto a non-redirecting route), so a refresh does not restart the journey.
     const url = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     const cleaned = stripTourParam(url);
     if (cleaned !== url) window.history.replaceState(null, "", cleaned);

@@ -21,6 +21,7 @@ import { allJourneys } from "./registry.ts";
 import type { Journey } from "./types.ts";
 // Import for the registration side effect.
 import "./journeys/overview.ts";
+import "./journeys/localdev.ts";
 
 const KNOWN_SELECTORS = new Set(
   Object.values(TOUR_ANCHOR).map((a) => tourSelector(a)),
@@ -38,6 +39,10 @@ const RENDERS_IN = {
     TOUR_ANCHOR.explorerNav,
     TOUR_ANCHOR.metricsNav,
     TOUR_ANCHOR.takeATour,
+    // The localdev journey is profile-agnostic (#409); Explorer and Traces both
+    // render on the lean observe build, so their anchors are valid there too.
+    TOUR_ANCHOR.explorerInspect,
+    TOUR_ANCHOR.tracesNav,
   ]),
 } as const;
 

@@ -5,6 +5,13 @@ import { listInstances, type Instance } from "../gen";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import InstanceDetail from "./InstanceDetail";
 import { Badge, Button } from "../components/ui";
+import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
+import {
+  markBaseUrlCopied,
+  markExplorerReached,
+  swaggerUrl,
+  v2BaseUrl,
+} from "../lib/tour/journeys/localdev";
 
 const PAGE_SIZE = 50;
 
@@ -45,6 +52,15 @@ export default function Explorer() {
   // Live: the SSE feed invalidates the list whenever the read model advances.
   // The prefix `["instances"]` invalidates every page query.
   useLiveInvalidation(["instances"]);
+
+  // Reaching Explorer is half of the headless-local-dev journey's outcome (the
+  // other half is taking the v2 base URL below). Record it on mount so the
+  // journey's successEvent can tell "walked the steps" from "actually debugged
+  // here". Harmless outside a tour.
+  useEffect(() => {
+    markExplorerReached();
+  }, []);
+
   const { data, isLoading, error } = useQuery({
     queryKey: ["instances", page],
     queryFn: async () =>
@@ -75,7 +91,10 @@ export default function Explorer() {
   return (
     <div className="flex h-full">
       <div className="flex w-[28rem] shrink-0 flex-col border-r border-edge">
-        <header className="border-b border-edge px-5 py-4">
+        <header
+          data-tour={TOUR_ANCHOR.explorerInspect}
+          className="border-b border-edge px-5 py-4"
+        >
           <h1 className="text-xl font-semibold text-fg">Process instances</h1>
           <p className="text-xs text-fg-faint">
             {data
@@ -84,6 +103,7 @@ export default function Explorer() {
                 : `${rangeStart}–${rangeEnd} of ${total} instance(s)`
               : "Live view"}
           </p>
+          <BaseUrlAffordance />
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
           {isLoading && <p className="p-5 text-fg-muted">Loading…</p>}
@@ -154,4 +174,95 @@ export default function Explorer() {
       </div>
     </div>
   );
+}
+
+/**
+ * The v2 base URL affordance — a durable feature, not a tour-only element.
+ *
+ * A headless user's whole integration is "point my Camunda 8 client at one URL",
+ * so the console surfaces that URL where they land to debug, with a copy button
+ * and a link to the offline Swagger UI. The URL is derived from the live origin
+ * (never a hardcoded port), and copy falls back to selecting the text because
+ * `navigator.clipboard` is unavailable over the plain-HTTP LAN origins where a
+ * local engine is typically reached.
+ */
+function BaseUrlAffordance() {
+  const origin =
+    typeof window !== "undefined" && window.location?.origin
+      ? window.location.origin
+      : "http://127.0.0.1:8080";
+  const base = v2BaseUrl(origin);
+  const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  const onCopy = async () => {
+    const ok = await copyToClipboard(base);
+    if (ok) {
+      markBaseUrlCopied();
+      setCopied(true);
+      setFailed(false);
+      window.setTimeout(() => setCopied(false), 1500);
+    } else {
+      // Could not write the clipboard (insecure context): select the text so the
+      // user can copy it by hand, and still count it as taken.
+      markBaseUrlCopied();
+      setFailed(true);
+    }
+  };
+
+  return (
+    <div className="mt-3 flex items-center gap-2">
+      <input
+        readOnly
+        value={base}
+        aria-label="Camunda 8 v2 base URL"
+        onFocus={(e) => e.currentTarget.select()}
+        className={`min-w-0 flex-1 rounded-md border bg-inset px-2 py-1 font-mono text-xs text-fg outline-none ${
+          failed ? "border-accent" : "border-edge"
+        }`}
+      />
+      <Button size="sm" onClick={onCopy} title="Copy the Camunda 8 v2 base URL">
+        {copied ? "Copied" : failed ? "Select & copy" : "Copy v2 URL"}
+      </Button>
+      <a
+        href={swaggerUrl(origin)}
+        target="_blank"
+        rel="noreferrer noopener"
+        className="text-xs text-accent-strong hover:underline"
+      >
+        Swagger
+      </a>
+    </div>
+  );
+}
+
+/**
+ * Copy text, falling back when the async clipboard API is unavailable.
+ * `navigator.clipboard` needs a secure context, which a LAN/plain-HTTP engine
+ * origin is not — return false so the caller can select the text instead.
+ */
+async function copyToClipboard(text: string): Promise<boolean> {
+  try {
+    const clipboard = globalThis.navigator?.clipboard;
+    if (clipboard && typeof clipboard.writeText === "function") {
+      await clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall through to the legacy path.
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
 }
