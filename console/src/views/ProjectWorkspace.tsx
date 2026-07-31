@@ -60,6 +60,12 @@ import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
+  forgetServedAppUrl,
+  rememberServedAppUrl,
+  servedAppPort,
+  servedAppUrl,
+} from "../lib/servedApp";
+import {
   processFeelVariables,
   componentOutputFeelVariables,
   type ComponentOutput,
@@ -346,6 +352,23 @@ export default function ProjectWorkspace() {
     (f) => f.kind === "file" && f.name === "nano.app.json",
   );
 
+  // While an Urban App runs, publish its served URL (on its real configured
+  // port) so the RAD guided journey's success probe hits the actual app, not a
+  // guessed default — and clear it when it stops or the workspace unmounts. The
+  // "Open app" link below computes the same URL.
+  const servedUrl =
+    running && isUrbanApp
+      ? servedAppUrl(window.location.origin, servedAppPort(detail.config))
+      : null;
+  useEffect(() => {
+    if (servedUrl) {
+      rememberServedAppUrl(servedUrl);
+      return () => forgetServedAppUrl();
+    }
+    forgetServedAppUrl();
+    return undefined;
+  }, [servedUrl]);
+
   // Code-first workflow projects (ADR 0045) have no authored `.bpmn`; their model
   // is DERIVED from `workflows/*.ts`. Offer a read-only "Model" view for them.
   const isWorkflowProject = hasTopLevelDir(detail.files, "workflows");
@@ -370,6 +393,18 @@ export default function ProjectWorkspace() {
           <span className="inline-flex items-center gap-1 rounded-full bg-ok/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ok">
             <span className="h-1.5 w-1.5 rounded-full bg-ok" /> running
           </span>
+        )}
+        {running && isUrbanApp && servedUrl && (
+          <a
+            data-tour={TOUR_ANCHOR.servedApp}
+            href={servedUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="inline-flex items-center gap-1 rounded-md border border-edge-strong bg-bg-subtle px-2 py-0.5 text-xs font-medium text-fg hover:bg-hover"
+            title="Open the running app on its own port"
+          >
+            Open app ↗
+          </a>
         )}
         {compiling && (
           <span className="rounded-full bg-info/15 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-info">
@@ -712,7 +747,10 @@ function FileBrowser({
   };
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-edge bg-panel">
+    <aside
+      data-tour={TOUR_ANCHOR.fileTree}
+      className="flex w-64 shrink-0 flex-col border-r border-edge bg-panel"
+    >
       <div className="flex items-center justify-between px-3 py-2 text-xs uppercase tracking-wider text-fg-faint">
         <span>Files</span>
         <div className="flex gap-1">
@@ -2314,15 +2352,17 @@ function EditorPane({
           </Suspense>
         )}
         {kind === "page" && (
-          <PageComposer
-            ref={pageRef}
-            onChange={() => setDirty(true)}
-            entities={composerEntities}
-            processes={pageProcessIds}
-          />
+          <div data-tour={TOUR_ANCHOR.pageEditor} className="h-full">
+            <PageComposer
+              ref={pageRef}
+              onChange={() => setDirty(true)}
+              entities={composerEntities}
+              processes={pageProcessIds}
+            />
+          </div>
         )}
         {kind === "form" && (
-          <div className="relative h-full">
+          <div data-tour={TOUR_ANCHOR.pageEditor} className="relative h-full">
             {/*
               Keep the form editor mounted while the JSON tab is active so schema
               state survives toggling. The JSON editor is layered above via
