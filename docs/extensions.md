@@ -328,9 +328,11 @@ missing keys fall back to the base appearance.
 ### `trigger` — an inbound event source
 
 Contributes one or more trigger source **kinds** (the *inbound* edge: external
-event → process start). Each entry declares a `type` string, the config the
-console renders, and an optional out-of-process **driver** the runtime
-auto-launches and supervises while an app using that trigger runs.
+event → process start). Each entry declares a `kind` (the trigger type string a
+BPMN manifest trigger references, e.g. `mqtt` — note the field is `kind`, whereas
+`workers[]` uses `type`), the config the console renders, and an optional
+out-of-process **driver** the runtime auto-launches and supervises while an app
+using that trigger runs.
 
 ```jsonc
 {
