@@ -179,6 +179,28 @@ ${body}
 `;
 }
 
+// Official language logos (devicon originals) for the Polyglot section. Read from
+// website/logos/*.svg at build time and inlined, so the page stays zero-dependency
+// and renders offline (no external icon CDN). Rust's mark is monochrome and given
+// a light root fill in the source SVG so it reads on the dark band.
+function langChips() {
+  const langs = [
+    ["typescript", "TypeScript"],
+    ["java", "Java"],
+    ["rust", "Rust"],
+    ["python", "Python"],
+    ["csharp", "C#"],
+  ];
+  return langs
+    .map(([id, label]) => {
+      const svg = readFileSync(join(here, "logos", `${id}.svg`), "utf8")
+        .trim()
+        .replace(/^<svg /, '<svg aria-hidden="true" focusable="false" ');
+      return `      <span class="lang lang-${id}">${svg}${label}</span>`;
+    })
+    .join("\n");
+}
+
 function homeHtml() {
   // Quote-safe line array (no backticks / ${…}) so it can't collide with this
   // module's own template literals; syntax-highlighted at build time by highlightTs().
@@ -229,7 +251,7 @@ function homeHtml() {
 
 <section id="try" class="demo-tabs wrap">
   <h2 class="tabs-title">Code-first <span class="grad">or</span> Model-first.</h2>
-  <p class="tabs-sub">One app — <code>urban-pr-review</code> — two authoring surfaces, the same engine.</p>
+  <p class="tabs-sub">One app — two authoring surfaces, the same engine.</p>
   <div class="tablist" role="tablist" aria-label="Authoring surface">
     <button class="tab" role="tab" id="tab-code" aria-controls="panel-code" aria-selected="true" tabindex="0">Code-first</button>
     <button class="tab" role="tab" id="tab-model" aria-controls="panel-model" aria-selected="false" tabindex="-1">Model-first</button>
@@ -237,7 +259,7 @@ function homeHtml() {
 
   <div class="tabpanel" id="panel-code" role="tabpanel" aria-labelledby="tab-code">
     <figure class="code pop">
-      <figcaption>The convergence loop, authored as code.</figcaption>
+      <figcaption>A loop where local coding agents iterate to convergence against GitHub Copilot’s adversarial PR reviews — authored as code.</figcaption>
       <pre><code>${highlightTs(heroCode)}</code></pre>
       <p class="code-note">Nano derives the executable model, the job types, the message
       correlation, and a generic worker. You write steps and handlers — nothing else.</p>
@@ -246,7 +268,7 @@ function homeHtml() {
 
   <div class="tabpanel" id="panel-model" role="tabpanel" aria-labelledby="tab-model" hidden>
     <iframe class="demo-frame" title="Live Model-first urban-pr-review demo on the wasm engine"
-      data-src="/demo/" loading="lazy" allow="fullscreen" allowfullscreen></iframe>
+      data-src="/demo/?embed=1" loading="lazy" allow="fullscreen" allowfullscreen></iframe>
     <p class="tab-note">The real <code>urban-pr-review</code> BPMN model, executing live on the
     WebAssembly build of the engine — no server. Or <a href="/demo/">open it full-page →</a></p>
   </div>
@@ -306,11 +328,7 @@ function homeHtml() {
     <p>Drive workflows and workers from the language your team already ships in — one durable engine,
     first-class SDKs across the stack:</p>
     <div class="provs langs" aria-label="Supported SDK languages">
-      <span>TypeScript</span>
-      <span>Java</span>
-      <span>Rust</span>
-      <span>Python</span>
-      <span>C#</span>
+${langChips()}
     </div>
   </div>
 </section>
@@ -546,6 +564,8 @@ function homePage(title, body) {
     border-radius: 999px; font-size: .92rem; color: var(--ink); font-weight: 500;
   }
   .provs span.more { color: var(--muted); font-style: italic; }
+  .provs.langs span.lang { display: inline-flex; align-items: center; gap: .5rem; }
+  .provs.langs span.lang > svg { flex: none; width: 1.2rem; height: 1.2rem; display: block; }
   .how-sub { color: var(--muted); max-width: 46rem; margin: 0 0 1.2rem; }
   .how .install.multi { margin: 0 0 1.8rem; }
   .band.backbone .raad-sub { color: var(--muted); max-width: 40rem; margin: 0 auto 1.4rem; font-size: 1.05rem; }
