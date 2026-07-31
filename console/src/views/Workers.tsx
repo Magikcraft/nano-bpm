@@ -25,10 +25,16 @@ import {
   type WorkerPhase,
   type WorkerSummary,
 } from "../gen";
-import { exportWorkersApp, type WorkerLogLine } from "../lib/api";
+import {
+  exportWorkersApp,
+  getConsumers,
+  type Consumer,
+  type ConsumerTransport,
+  type WorkerLogLine,
+} from "../lib/api";
 import { languageForFile } from "../lib/editorLang";
 import type { ExtraModel } from "../components/CodeEditor";
-import { Button, PageHeader } from "../components/ui";
+import { Button, PageHeader, SectionLabel } from "../components/ui";
 import { IS_STUDIO } from "../lib/profile";
 
 type CodeEditorProps = {
@@ -453,6 +459,7 @@ function RunningTab({
 }) {
   return (
     <div className="min-h-0 flex-1 overflow-auto p-6">
+      <LiveConsumersPanel />
       <table className="w-full text-left text-sm">
         <thead className="text-xs uppercase tracking-wide text-fg-faint">
           <tr className="border-b border-edge">
@@ -535,6 +542,161 @@ function RunningTab({
         </div>
       )}
     </div>
+  );
+}
+
+function fmtAge(ms: number): string {
+  if (ms < 0) return "—";
+  const s = Math.floor(ms / 1000);
+  if (s < 1) return "just now";
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s ago`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m ago`;
+}
+
+const TRANSPORTS: {
+  key: ConsumerTransport;
+  label: string;
+  hint: string;
+}[] = [
+  {
+    key: "rest",
+    label: "REST",
+    hint: "activateJobs long-poll",
+  },
+  {
+    key: "falcon",
+    label: "Falcon",
+    hint: "command-stream WebSocket",
+  },
+];
+
+/**
+ * Live "who is polling what" panel (issue #404). The table above lists
+ * console-*authored* worker directories; this shows the live consumers the
+ * engine actually sees — a "hired" agent that connects over the SDK and polls a
+ * job type, e.g. `convergence-loop:review-round`. Split by transport (REST vs
+ * Falcon) because their liveness models differ. Polls every 2s so a freshly
+ * hired agent appears within a couple of seconds.
+ */
+function LiveConsumersPanel() {
+  const { data, error } = useQuery({
+    queryKey: ["consumers"],
+    queryFn: getConsumers,
+    refetchInterval: 2000,
+  });
+
+  const consumers = data?.consumers ?? [];
+  const byTransport = (t: ConsumerTransport): Consumer[] =>
+    consumers.filter((c) => c.transport === t);
+
+  const restStaleS = data ? Math.round(data.restStaleMs / 1000) : null;
+  const falconLivenessS = data
+    ? Math.round(data.falconLivenessMs / 1000)
+    : null;
+
+  return (
+    <section className="mb-6">
+      <div className="mb-2 flex items-baseline justify-between">
+        <SectionLabel>Live consumers</SectionLabel>
+        <span className="text-xs text-fg-faint">
+          who is polling the engine right now · refreshes every 2s
+        </span>
+      </div>
+      <p className="mb-3 text-xs text-fg-muted">
+        Agents connected over the SDK that are actively polling a job type —
+        distinct from the authored worker directories below. A row appears as
+        soon as an agent starts polling.
+      </p>
+      {error && (
+        <div className="mb-3 rounded border border-danger/30 bg-danger/10 px-3 py-2 text-xs text-danger">
+          Couldn't load consumers: {(error as Error).message}
+        </div>
+      )}
+      <div className="grid gap-4 md:grid-cols-2">
+        {TRANSPORTS.map(({ key, label, hint }) => {
+          const rows = byTransport(key);
+          const staleNote =
+            key === "rest"
+              ? restStaleS != null
+                ? `idle after ${restStaleS}s`
+                : null
+              : falconLivenessS != null
+                ? `idle after ${falconLivenessS}s`
+                : null;
+          return (
+            <div
+              key={key}
+              className="rounded border border-edge bg-raised/40"
+              data-testid={`consumers-${key}`}
+            >
+              <div className="flex items-baseline justify-between border-b border-edge px-3 py-2">
+                <span className="text-sm font-medium">
+                  {label}{" "}
+                  <span className="text-xs font-normal text-fg-faint">
+                    {hint}
+                  </span>
+                </span>
+                <span className="text-xs text-fg-faint">
+                  {rows.length > 0 ? `${rows.length} active` : "none"}
+                  {staleNote ? ` · ${staleNote}` : ""}
+                </span>
+              </div>
+              {rows.length === 0 ? (
+                <div className="px-3 py-4 text-xs text-fg-faint">
+                  No {label} consumers connected.
+                </div>
+              ) : (
+                <table className="w-full text-left text-sm">
+                  <thead className="text-xs uppercase tracking-wide text-fg-faint">
+                    <tr className="border-b border-edge/60">
+                      <th className="py-1.5 pl-3 pr-4">Job type</th>
+                      <th className="py-1.5 pr-4">Worker</th>
+                      <th className="py-1.5 pr-3">Last seen</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((c) => (
+                      <tr
+                        key={`${c.transport}:${c.jobType}:${c.worker}`}
+                        className="border-b border-edge/40 last:border-0"
+                      >
+                        <td className="py-1.5 pl-3 pr-4 font-mono text-xs">
+                          {c.jobType}
+                        </td>
+                        <td className="py-1.5 pr-4">{c.worker}</td>
+                        <td className="py-1.5 pr-3 whitespace-nowrap">
+                          <span className="inline-flex items-center gap-1.5">
+                            <span
+                              aria-hidden="true"
+                              className={`inline-block h-1.5 w-1.5 rounded-full ${
+                                c.status === "live" ? "bg-ok" : "bg-fg-faint"
+                              }`}
+                            />
+                            <span
+                              className={
+                                c.status === "live"
+                                  ? "text-fg-muted"
+                                  : "text-fg-faint"
+                              }
+                            >
+                              {c.status === "live" ? "Live" : "Idle"} ·{" "}
+                              {fmtAge(c.ageMs)}
+                            </span>
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </section>
   );
 }
 

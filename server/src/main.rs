@@ -15,6 +15,8 @@ mod cmd_profile;
 mod coldspill;
 #[cfg(feature = "console")]
 mod console;
+#[cfg(feature = "console")]
+mod consumers;
 mod deepthi;
 mod drain_guard;
 mod falcon;
@@ -11190,6 +11192,19 @@ impl ServerImpl {
         };
         let deadline = long_poll_until.map(|d| tokio::time::Instant::now() + d);
 
+        // Record this poll for the console's live consumers panel (issue #404).
+        // Best-effort observability only, and only in console builds: a single
+        // map upsert that never affects activation. REST is stateless, so this
+        // poll — carrying the effective long-poll window so an in-flight long
+        // poll reads "live", not "idle" — is the only signal that a worker is
+        // connected and pulling this job type.
+        #[cfg(feature = "console")]
+        crate::consumers::record_rest_poll(
+            &job_type,
+            &worker,
+            long_poll_until.map(|d| d.as_millis() as u64).unwrap_or(0),
+        );
+
         // Remote nodes to draw the shortfall from once local partitions are
         // drained (REST job aggregation, the analog of the stream dispatcher's
         // peer pull). Empty on a single-node cluster ⇒ the whole peer path is
@@ -15742,6 +15757,12 @@ async fn main() {
     falcon::spawn_dispatcher(server.clone(), cs_registry.clone());
     let monitor_registry = cs_registry.clone();
     let monitor_server = server.clone();
+    // Captured for the /console/api/consumers route (the live "who is polling
+    // what" panel, issue #404) before `cs_registry` is moved into the cluster
+    // router below. Console builds only — the route is mounted inside the
+    // console block so it inherits the feature + runtime-enable gating.
+    #[cfg(feature = "console")]
+    let consumers_registry = cs_registry.clone();
     let cs_router = falcon::router(server.clone(), cs_registry.clone());
 
     // Intra-cluster (`/cluster`) channel (ADR 0039): the authenticated peer
@@ -15960,6 +15981,24 @@ async fn main() {
             // methods (GET is hand-wired; PUT/POST/DELETE are generated), so
             // there is no collision.
             let mut console = console_router.merge(gen_console_router);
+            // Live "who is polling what" consumers panel (issue #404): REST
+            // long-poll workers + Falcon command-stream subscribers, each with a
+            // transport-appropriate live/idle status. A GET observability read,
+            // so it is served in observe (read-only) mode too — added before the
+            // guard layer, alongside the other `/console/api/*` reads, so it is
+            // gated by the console feature + `console_enabled()` and 404s on a
+            // headless / non-console gateway rather than leaking job types and
+            // worker names.
+            {
+                let reg = consumers_registry.clone();
+                console = console.route(
+                    "/console/api/consumers",
+                    axum::routing::get(move || {
+                        let reg = reg.clone();
+                        async move { axum::Json(crate::consumers::snapshot(&reg)) }
+                    }),
+                );
+            }
             if obs_config.console_read_only() {
                 // Runtime read-only gate: refuse authoring (mutating) API
                 // requests while still serving the observability views.

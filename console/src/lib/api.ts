@@ -485,3 +485,45 @@ export function projectLogs(
   });
   return src;
 }
+
+// --- Live consumers panel (issue #404) --------------------------------------
+
+/// Transport a live job consumer arrived on. `rest` = `activateJobs` long-poll;
+/// `falcon` = the `/falcon` command-stream WebSocket.
+export type ConsumerTransport = "rest" | "falcon";
+
+/// One live consumer (a "hired agent" polling a job type), as reported by the
+/// engine's `/console/api/consumers` endpoint — distinct from a console-authored
+/// worker directory.
+export interface Consumer {
+  jobType: string;
+  worker: string;
+  transport: ConsumerTransport;
+  /** Wall-clock (epoch millis) of the consumer's most recent activity. */
+  lastSeenMs: number;
+  /** Age of `lastSeenMs` relative to the response's `nowMs`. */
+  ageMs: number;
+  /** `live` while within its transport's liveness window, else `idle`. */
+  status: "live" | "idle";
+}
+
+/// The engine's consumers snapshot: the live rows plus the liveness windows used
+/// to compute their status (so the UI can label the thresholds it shows).
+export interface ConsumersResponse {
+  nowMs: number;
+  restStaleMs: number;
+  falconLivenessMs: number;
+  consumers: Consumer[];
+}
+
+/// Fetches the live "who is polling what" consumers snapshot. Hand-written (not
+/// spec-first) because it reads a gateway-level engine endpoint, not the
+/// console's own CRUD API.
+export async function getConsumers(): Promise<ConsumersResponse> {
+  const res = await fetch("/console/api/consumers");
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `consumers → HTTP ${res.status}`);
+  }
+  return (await res.json()) as ConsumersResponse;
+}
