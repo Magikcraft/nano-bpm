@@ -205,8 +205,10 @@ documented in the sections below.
 
 Nano BPM serves the Camunda 8 Orchestration Cluster **v2 REST API**. The whole
 API surface is routable; operations not yet wired into the engine respond with
-`501 Not Implemented`. The following are backed by the embedded `engine-core`
-BPMN engine:
+`501 Not Implemented`. For the honest, element-by-element boundary of what
+executes and what is served — and where the edges are — see the
+[**Camunda compatibility subset**](docs/camunda-compatibility.md). The following
+are backed by the embedded `engine-core` BPMN engine:
 
 - `POST /v2/deployments` (`createDeployment`) parses the uploaded BPMN 2.0 XML
   resources and deploys them, assigning each process a key and a per-id version.
