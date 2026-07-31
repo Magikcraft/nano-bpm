@@ -214,6 +214,30 @@ test("declarative task: external step emits a service task + job type but is NOT
   assert.equal(worker.servedTypes.includes("pr-review:signPdf"), false);
 });
 
+test("declarative task: an explicit jobType override replaces the derived type but keeps the element id", () => {
+  const flow = defineFlow("convergence-loop", (w) => {
+    w.run("persist-round", async () => ({}));
+    w.task("review-round", { jobType: "senior:pr-review" });
+  });
+  const xml = toBpmn(flow);
+  // The step name stays the BPMN element id...
+  assert.match(xml, /<bpmn:serviceTask id="review-round" name="review-round">/);
+  // ...but the emitted job type is the override, not `convergence-loop:review-round`.
+  assert.match(xml, /<zeebe:taskDefinition type="senior:pr-review" \/>/);
+  assert.doesNotMatch(xml, /type="convergence-loop:review-round"/);
+  // externalJobTypes reports the override so external workers poll the right type.
+  assert.deepEqual(externalJobTypes(flow), ["senior:pr-review"]);
+  // A `run` step is unaffected and keeps its derived type.
+  assert.match(xml, /<zeebe:taskDefinition type="convergence-loop:persist-round" \/>/);
+});
+
+test("declarative task: an invalid jobType override is rejected at authoring time", () => {
+  assert.throws(
+    () => defineFlow("f", (w) => w.task("t", { jobType: "bad token" })),
+    /not a valid job type/,
+  );
+});
+
 test("declarative task: a duplicate task/run step name is rejected", () => {
   assert.throws(
     () =>

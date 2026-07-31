@@ -19,6 +19,16 @@ export function assertIdent(kind, value) {
         throw new Error(`${kind} "${value}" is not a valid BPMN identifier (expected an NCName)`);
     }
 }
+/** An explicit job type override (e.g. a `rank:capability` worker token like
+ *  `senior:pr-review`). Unlike a step name it is NOT a BPMN element id, so it may
+ *  carry the `:`/`+` token delimiters a `c8ctl nano work` matrix uses; it only
+ *  has to be a non-empty, whitespace-free token. */
+const JOB_TYPE = /^[A-Za-z0-9_][A-Za-z0-9_.:+-]*$/;
+export function assertJobType(kind, value) {
+    if (typeof value !== "string" || !JOB_TYPE.test(value)) {
+        throw new Error(`${kind} "${value}" is not a valid job type (expected a non-empty token of letters, digits, and _ . : + -)`);
+    }
+}
 export function assertWorkflowIds(wf) {
     assertIdent("workflow id", wf.id);
     if (wf.kind === "declarative") {
