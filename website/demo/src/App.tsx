@@ -33,6 +33,16 @@ export function App() {
   const [running, setRunning] = useState(true);
   const [log, setLog] = useState<LogEntry[]>([]);
 
+  // Embed mode (`/demo/?embed=1`): render just the live loop demo — no topbar,
+  // hero or footer — so the landing page's Model-first tab can iframe the running
+  // demo section alone rather than the whole standalone page.
+  const embed = useMemo(
+    () =>
+      typeof window !== "undefined" &&
+      new URLSearchParams(window.location.search).has("embed"),
+    [],
+  );
+
   const runningRef = useRef(running);
   runningRef.current = running;
   const processIdRef = useRef<string>(PROCESS_ID);
@@ -134,35 +144,39 @@ export function App() {
   const vars = snapshot?.instances?.[0]?.variables ?? {};
 
   return (
-    <div className="page">
+    <div className={embed ? "page embed" : "page"}>
       <ParticleField />
 
-      <header className="topbar">
-        <a className="brand" href="/">
-          <span className="logo" aria-hidden>
-            ◆
-          </span>
-          nanobpm<span className="brand-io">.io</span>
-        </a>
-        <nav className="topnav">
-          <a href="/">Home</a>
-          <a href="/schemas/">Schemas</a>
-        </nav>
-      </header>
+      {!embed && (
+        <>
+          <header className="topbar">
+            <a className="brand" href="/">
+              <span className="logo" aria-hidden>
+                ◆
+              </span>
+              nanobpm<span className="brand-io">.io</span>
+            </a>
+            <nav className="topnav">
+              <a href="/">Home</a>
+              <a href="/schemas/">Schemas</a>
+            </nav>
+          </header>
 
-      <section className="hero">
-        <h1>
-          The engine,
-          <br />
-          <span className="grad">running in your browser.</span>
-        </h1>
-        <p className="sub">
-          nanobpm is the load-bearing runtime for agentic systems — a from-scratch process
-          orchestration engine in a single Rust binary. The workflow below is the real{" "}
-          <code>urban-pr-review</code> convergence loop, executing live on the WebAssembly build of
-          the very same engine — no server, no mocks in the runtime.
-        </p>
-      </section>
+          <section className="hero">
+            <h1>
+              The engine,
+              <br />
+              <span className="grad">running in your browser.</span>
+            </h1>
+            <p className="sub">
+              nanobpm is the load-bearing runtime for agentic systems — a from-scratch process
+              orchestration engine in a single Rust binary. The workflow below is the real{" "}
+              <code>urban-pr-review</code> convergence loop, executing live on the WebAssembly build
+              of the very same engine — no server, no mocks in the runtime.
+            </p>
+          </section>
+        </>
+      )}
 
       <section className="demo">
         <div className="demo-head">
@@ -226,11 +240,13 @@ export function App() {
         </div>
       </section>
 
-      <footer className="foot">
-        Running <code>@nanobpm/engine-wasm</code> via the Bojtos in-browser framework.
-        The reviewer here is a scripted stand-in for the real <code>senior:pr-review</code>{" "}
-        agent; every token move, gateway, message and variable update is the actual engine.
-      </footer>
+      {!embed && (
+        <footer className="foot">
+          Running <code>@nanobpm/engine-wasm</code> via the Bojtos in-browser framework.
+          The reviewer here is a scripted stand-in for the real <code>senior:pr-review</code>{" "}
+          agent; every token move, gateway, message and variable update is the actual engine.
+        </footer>
+      )}
     </div>
   );
 }

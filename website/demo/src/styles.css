@@ -45,6 +45,15 @@ body {
   padding: 0 24px 64px;
 }
 
+/* Embed mode (?embed): the demo section is the only content, so drop the page
+   chrome's vertical rhythm and let it sit flush inside the iframe. */
+.page.embed {
+  padding: 20px 24px;
+}
+.page.embed .demo {
+  margin-top: 0;
+}
+
 /* Top bar */
 .topbar {
   display: flex;
