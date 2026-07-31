@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { listInstances, type Instance } from "../gen";
@@ -192,6 +192,7 @@ function BaseUrlAffordance() {
       ? window.location.origin
       : "http://127.0.0.1:8080";
   const base = v2BaseUrl(origin);
+  const inputRef = useRef<HTMLInputElement>(null);
   const [copied, setCopied] = useState(false);
   const [failed, setFailed] = useState(false);
 
@@ -203,16 +204,22 @@ function BaseUrlAffordance() {
       setFailed(false);
       window.setTimeout(() => setCopied(false), 1500);
     } else {
-      // Could not write the clipboard (insecure context): select the text so the
-      // user can copy it by hand, and still count it as taken.
+      // Could not write the clipboard (insecure context): actually select the
+      // text so the user can copy it by hand, and still count it as taken.
+      // Clear `copied` too, in case this was a re-click inside the 1.5s "Copied"
+      // window — the label must reflect the fallback, not a stale success.
       markBaseUrlCopied();
+      setCopied(false);
       setFailed(true);
+      inputRef.current?.focus();
+      inputRef.current?.select();
     }
   };
 
   return (
     <div className="mt-3 flex items-center gap-2">
       <input
+        ref={inputRef}
         readOnly
         value={base}
         aria-label="Camunda 8 v2 base URL"
