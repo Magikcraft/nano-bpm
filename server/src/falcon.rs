@@ -899,6 +899,7 @@ impl Registry {
     /// (issue #404). A cheap snapshot under the `conns`/`subs` locks, off the hot
     /// path; the connection reaper independently evicts silent connections, so a
     /// reaped consumer simply stops appearing here.
+    #[cfg(feature = "console")]
     pub fn consumers(&self) -> Vec<FalconConsumer> {
         let conns = self.conns.lock().expect("registry poisoned");
         let mut out = Vec::new();
@@ -920,6 +921,7 @@ impl Registry {
 /// One live Falcon (command-stream) job consumer — a single `(connection, job
 /// type)` subscription. Returned by [`Registry::consumers`] for the console
 /// consumers panel.
+#[cfg(feature = "console")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FalconConsumer {
     /// The job type this subscription pulls.
@@ -934,6 +936,7 @@ pub struct FalconConsumer {
 /// [`LIVENESS_TIMEOUT_MS`], overridable via `NANOBPMN_STREAM_LIVENESS_MS`). The
 /// consumers panel reuses it so its notion of a "stale" Falcon consumer matches
 /// the engine's own reap threshold.
+#[cfg(feature = "console")]
 pub fn falcon_liveness_timeout_ms() -> u64 {
     liveness_timeout_ms()
 }
@@ -3171,6 +3174,7 @@ mod registry_tests {
         );
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn consumers_lists_one_row_per_subscription_with_worker_and_last_seen() {
         // A hired Falcon agent = a connection with a job subscription. `consumers`
@@ -3201,6 +3205,7 @@ mod registry_tests {
         );
     }
 
+    #[cfg(feature = "console")]
     #[test]
     fn consumers_is_empty_with_no_subscriptions() {
         let registry = Registry::new();
