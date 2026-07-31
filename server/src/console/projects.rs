@@ -1218,8 +1218,16 @@ fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
     // starts a subpath, whichever comes first.
     let name_len = if let Some(scoped) = spec.strip_prefix('@') {
         let scope_slash = scoped.find('/')?;
+        // Reject an empty scope (`@/pkg`) — the `@` must be followed by a scope.
+        if scope_slash == 0 {
+            return None;
+        }
         let after = &scoped[scope_slash + 1..];
         let end = after.find(['/', '@']).unwrap_or(after.len());
+        // Reject an empty package segment (`@scope/`, `@scope/@1`).
+        if end == 0 {
+            return None;
+        }
         1 + scope_slash + 1 + end
     } else {
         spec.find(['/', '@']).unwrap_or(spec.len())
@@ -8819,11 +8827,15 @@ mod tests {
 
     // ── Node fallback: package.json npm deps derived from deno.json (#437) ──
 
-    /// The `npm:` grammar parser must mirror `node-loader.mjs` exactly: strip the
-    /// scheme, split a trailing `@range` while preserving a leading `@scope`, and
-    /// reject non-`npm:` values (the other loader specifier classes).
+    /// `npm_dep_from_import` derives the **installable npm coordinate**
+    /// (`name`, `range`) from a Deno `npm:` import-map value. For simple specifiers
+    /// this coincides with `node-loader.mjs`'s stripping, but it diverges by design
+    /// where the loader keeps a module specifier and `package.json` needs the
+    /// installable package: subpaths are dropped (`npm:lodash@^4/fp` -> `lodash`),
+    /// the leading-slash form is normalised, empty ranges pin to `*`, and
+    /// degenerate/non-`npm:` values yield no dep.
     #[test]
-    fn npm_dep_from_import_mirrors_the_node_loader_grammar() {
+    fn npm_dep_from_import_derives_the_installable_coordinate() {
         assert_eq!(
             npm_dep_from_import("npm:@nanobpm/nano-sdk@^1"),
             Some(("@nanobpm/nano-sdk".into(), "^1".into()))
@@ -8877,6 +8889,12 @@ mod tests {
         // Degenerate values yield no dep rather than a `"/"`-style bad key.
         assert_eq!(npm_dep_from_import("npm:"), None);
         assert_eq!(npm_dep_from_import("npm:/"), None);
+        // Degenerate scoped names (empty scope or package segment) are rejected —
+        // they would otherwise emit invalid npm keys like `"@scope/"` / `"@/pkg"`.
+        assert_eq!(npm_dep_from_import("npm:@scope/"), None);
+        assert_eq!(npm_dep_from_import("npm:@/pkg"), None);
+        assert_eq!(npm_dep_from_import("npm:@"), None);
+        assert_eq!(npm_dep_from_import("npm:@scope/@1"), None);
     }
 
     /// Red/Green repro for #437: the SDK template (`throughput-stream`) mapped
