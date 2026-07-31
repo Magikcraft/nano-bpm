@@ -1571,7 +1571,9 @@ const WORKFLOW_EXAMPLE_TS: &str = r#"import { defineFlow, envelope, externalJobT
 //   merge          w.run     in-process work this app hosts itself
 //
 // A crash between a side effect and its job completion redelivers the step
-// (at-least-once), so keep each `w.run` idempotent.
+// (at-least-once), so keep every step handler idempotent — the in-process
+// `w.run` workers AND the external `w.task` harness worker (which can also see
+// redeliveries).
 
 // Typed data envelopes (ADR 0045) declare the external `review` step's I/O
 // contract IN CODE. They are lifted into the derived BPMN as a `nano:shape` +
@@ -1724,8 +1726,20 @@ const baseUrl = (Deno.env.get("NANOBPMN_BASE_URL") ?? "http://localhost:8080").r
 const prId = Deno.args[0] ?? "PR-1234";
 
 const client = new WorkflowClient({ baseUrl });
-await client.signal(prReview, "humanApproval", prId, { approvedBy: "me" });
-console.log(`approved ${prReview.id} (prId=${prId})`);
+try {
+  await client.signal(prReview, "humanApproval", prId, { approvedBy: "me" });
+  console.log(`approved ${prReview.id} (prId=${prId})`);
+} catch (err) {
+  // The most common cause is signalling before the instance has reached the
+  // humanApproval wait: it is still parked on the external `review` w.task, so
+  // there is no open `humanApproval` subscription yet (the gateway returns 404).
+  console.error(
+    `could not approve ${prReview.id} (prId=${prId}): ${err instanceof Error ? err.message : err}\n` +
+      "Is the instance still parked on `review`? Host a worker for `pr-review:review` " +
+      "(deno task job-types) so it advances to the humanApproval wait, then retry.",
+  );
+  Deno.exit(1);
+}
 "#;
 
 /// Example script that prints the flow's **external** job types — the ones a
