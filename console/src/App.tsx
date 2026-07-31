@@ -217,7 +217,16 @@ function ThemeToggle() {
 
 export default function App() {
   const location = useLocation();
-  const { startTour } = useProductTour({ autoStart: true });
+  // `autoStart` is transitional: ADR 0049 replaces it with the journey picker on
+  // the Projects/Topology empty state (#411). Keeping it until then preserves the
+  // onboarding the console has today rather than shipping a gap.
+  const { startTour, resumeJourney, activeJourney, isRunning } = useProductTour(
+    { autoStart: true },
+  );
+  // Offer "Resume" only when there is an unfinished journey that is not already
+  // on screen — otherwise the label would invite the user to resume the tour
+  // they are looking at.
+  const canResume = !!activeJourney && !isRunning;
   // Remember the last place the user was within the Projects section (the
   // project list or a specific workspace) so the rail's "Projects" item returns
   // them there after a detour through Metrics/Traces/etc. — instead of always
@@ -371,17 +380,21 @@ export default function App() {
 
         <button
           type="button"
-          onClick={startTour}
+          onClick={canResume ? resumeJourney : startTour}
           data-tour={TOUR_ANCHOR.takeATour}
           className={`mt-auto mx-3 ${railItemClass(false)}`}
-          title="Replay the product tour"
+          title={
+            canResume
+              ? `Pick up “${activeJourney.title}” where you left off`
+              : "Replay the product tour"
+          }
         >
           <Icon>
             <circle cx="12" cy="12" r="9" />
             <path d="M9.1 9a3 3 0 1 1 4.3 3.2c-.8.5-1.4 1-1.4 1.9" />
             <path d="M12 17h.01" />
           </Icon>
-          Take a tour
+          {canResume ? "Resume tour" : "Take a tour"}
         </button>
 
         <a
