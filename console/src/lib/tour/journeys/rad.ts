@@ -24,7 +24,22 @@ import { registerJourney } from "../registry.ts";
 import { registerContextSource } from "../context.ts";
 import { hasJsRuntime } from "../preconditions.ts";
 import { TOUR_ANCHOR, templateAnchor, tourSelector } from "../tourAnchors.ts";
+import {
+  URBAN_APP_DEFAULT_PORT,
+  readServedAppUrl,
+  servedAppUrl,
+} from "../../servedApp.ts";
 import type { Journey, Predicate, Step, TourContext } from "../types";
+
+// Re-exported so tests and callers can reach the pure helpers from the journey
+// module; the definitions live in the side-effect-free `lib/servedApp.ts` so the
+// workspace UI can import them without pulling in journey registration.
+export {
+  URBAN_APP_DEFAULT_PORT,
+  servedAppPort,
+  servedAppUrl,
+} from "../../servedApp.ts";
+export type { PortConfig } from "../../servedApp.ts";
 
 export const RAD_JOURNEY_ID = "rad-fullstack";
 
@@ -33,84 +48,6 @@ export const RAD_TEMPLATE_ID = "urban-starter";
 
 /** The reference app the exit teaser points at (jwulf/urban-pr-review, ADR 0022's witness). */
 const REFERENCE_APP_URL = "https://github.com/jwulf/urban-pr-review";
-
-// ---------------------------------------------------------------------------
-// The served app's URL — its OWN port, not the console's.
-//
-// A compiled Urban app is its own web server (ADR 0009 / ADR 0022 §"single
-// binary"): `main.ts` does `servePages({ port })`, and that port is the app's,
-// distinct from the console/gateway origin. So "open the served UI" cannot reuse
-// the console origin the way the headless journey's `/v2` URL does — it has to
-// point at the app's actual port, which we read from the project's config rather
-// than hardcode.
-// ---------------------------------------------------------------------------
-
-/**
- * The urban-starter scaffold's default served port. Single-sourced here with a
- * citation so the fallback is the scaffold's real default, not a magic number:
- * `URBAN_MAIN_TS` in server/src/console/projects.rs does
- * `Number(Deno.env.get("PORT") ?? 8090)` and `servePages({ port })`.
- */
-export const URBAN_APP_DEFAULT_PORT = 8090;
-
-/** The minimal shape of a project config this journey reads a port out of. */
-export interface PortConfig {
-  env?: Record<string, string> | null;
-  toolchain?: {
-    runConfigs?:
-      | { id: string; default?: boolean; env?: Record<string, string> | null }[]
-      | null;
-    activeRunConfig?: string | null;
-  } | null;
-}
-
-function portFromEnv(env?: Record<string, string> | null): number | undefined {
-  const raw = env?.PORT;
-  if (raw === undefined) return undefined;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? n : undefined;
-}
-
-/**
- * The port the served Urban app listens on, read from the project config: the
- * active run config's `PORT` env, then the project-level `PORT` env, then the
- * scaffold default. Never a hardcoded literal in the URL itself — the default is
- * the scaffold's own documented default (see `URBAN_APP_DEFAULT_PORT`).
- */
-export function servedAppPort(config: PortConfig | null | undefined): number {
-  const tc = config?.toolchain;
-  const configs = tc?.runConfigs ?? [];
-  const active =
-    (tc?.activeRunConfig
-      ? configs.find((c) => c.id === tc.activeRunConfig)
-      : undefined) ??
-    configs.find((c) => c.default) ??
-    configs[0];
-  return (
-    portFromEnv(active?.env) ??
-    portFromEnv(config?.env) ??
-    URBAN_APP_DEFAULT_PORT
-  );
-}
-
-/**
- * The served app's URL: the console's own origin (so the host/scheme match how
- * the user reached the IDE — a LAN address or a tunnel, never a hardcoded
- * `localhost`) but on the *app's* port. Pure, so it is unit-testable without a
- * browser.
- */
-export function servedAppUrl(origin: string, port: number): string {
-  try {
-    const u = new URL(origin);
-    u.port = String(port);
-    u.pathname = "/";
-    u.search = "";
-    u.hash = "";
-    return u.toString();
-  } catch {
-    return `http://127.0.0.1:${port}/`;
-  }
-}
 
 /**
  * The live origin, or a placeholder when there is no `window` (a Node unit test
@@ -134,14 +71,6 @@ function currentOrigin(): string {
 /** Scratch keys the success predicate reads; also the sources' output shape. */
 export const SCRATCH_SERVED_ANSWERED = "rad.servedAnswered";
 export const SCRATCH_INSTANCE_STARTED = "rad.instanceStarted";
-
-/**
- * Scratch key a view may set to the *actual* served URL of the running project
- * (origin + the port from that project's config), so the probe hits the real
- * port instead of the default. The workspace served-app link computes the same
- * URL via `servedAppUrl` + `servedAppPort`.
- */
-export const SCRATCH_SERVED_URL = "rad.servedUrl";
 
 /**
  * `successEvent`: the served app answered on its port AND at least one process
@@ -219,16 +148,15 @@ async function instanceSource(ctx: TourContext): Promise<Partial<TourContext>> {
 }
 
 /**
- * Surface "the served app answered" into scratch. Probes the served URL derived
- * from the run state's config when one is present (`runState` carries no port,
- * so the port comes from the project config a sibling source may attach as
- * `scratch['rad.servedUrl']`); otherwise the default-port URL for this origin.
+ * Surface "the served app answered" into scratch. The workspace publishes the
+ * running app's real served URL (its configured port) via `rememberServedAppUrl`
+ * while an Urban App runs, so the probe hits the *actual* port; when nothing is
+ * published (no app running, or a reload before the workspace re-published), fall
+ * back to the default-port URL for this origin.
  */
 async function servedSource(ctx: TourContext): Promise<Partial<TourContext>> {
   const url =
-    (typeof ctx.scratch[SCRATCH_SERVED_URL] === "string"
-      ? (ctx.scratch[SCRATCH_SERVED_URL] as string)
-      : undefined) ?? servedAppUrl(currentOrigin(), URBAN_APP_DEFAULT_PORT);
+    readServedAppUrl() ?? servedAppUrl(currentOrigin(), URBAN_APP_DEFAULT_PORT);
   const now = Date.now();
   if (!servedCache || now - servedCache.at >= PROBE_TTL_MS) {
     const answered = await (servedInflight ??= probeServed(url).finally(() => {

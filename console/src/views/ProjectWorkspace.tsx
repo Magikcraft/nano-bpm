@@ -59,7 +59,12 @@ import {
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
-import { servedAppPort, servedAppUrl } from "../lib/tour/journeys/rad";
+import {
+  forgetServedAppUrl,
+  rememberServedAppUrl,
+  servedAppPort,
+  servedAppUrl,
+} from "../lib/servedApp";
 import {
   processFeelVariables,
   componentOutputFeelVariables,
@@ -347,6 +352,23 @@ export default function ProjectWorkspace() {
     (f) => f.kind === "file" && f.name === "nano.app.json",
   );
 
+  // While an Urban App runs, publish its served URL (on its real configured
+  // port) so the RAD guided journey's success probe hits the actual app, not a
+  // guessed default — and clear it when it stops or the workspace unmounts. The
+  // "Open app" link below computes the same URL.
+  const servedUrl =
+    running && isUrbanApp
+      ? servedAppUrl(window.location.origin, servedAppPort(detail.config))
+      : null;
+  useEffect(() => {
+    if (servedUrl) {
+      rememberServedAppUrl(servedUrl);
+      return () => forgetServedAppUrl();
+    }
+    forgetServedAppUrl();
+    return undefined;
+  }, [servedUrl]);
+
   // Code-first workflow projects (ADR 0045) have no authored `.bpmn`; their model
   // is DERIVED from `workflows/*.ts`. Offer a read-only "Model" view for them.
   const isWorkflowProject = hasTopLevelDir(detail.files, "workflows");
@@ -372,13 +394,10 @@ export default function ProjectWorkspace() {
             <span className="h-1.5 w-1.5 rounded-full bg-ok" /> running
           </span>
         )}
-        {running && isUrbanApp && (
+        {running && isUrbanApp && servedUrl && (
           <a
             data-tour={TOUR_ANCHOR.servedApp}
-            href={servedAppUrl(
-              window.location.origin,
-              servedAppPort(detail.config),
-            )}
+            href={servedUrl}
             target="_blank"
             rel="noreferrer noopener"
             className="inline-flex items-center gap-1 rounded-md border border-edge-strong bg-bg-subtle px-2 py-0.5 text-xs font-medium text-fg hover:bg-hover"
