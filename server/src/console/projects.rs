@@ -8984,7 +8984,10 @@ mod tests {
     ///       `package.json` (`dependencies` ∪ `devDependencies`) — the #437 crash;
     ///   (b) every import value anywhere in the project (root + `workers/*`
     ///       `deno.json`) is Node-loader-resolvable: relative or `npm:`, never
-    ///       `jsr:`/`http(s):` (which `node-loader.mjs` throws on).
+    ///       `jsr:`/`http(s):` (which `node-loader.mjs` throws on); and every
+    ///       `npm:` import — including in a worker `deno.json` — is declared in
+    ///       the ROOT `package.json` (workers have no own manifest and resolve
+    ///       `node_modules` up-tree), so the #437 crash is guarded across workers.
     #[test]
     fn every_builtin_template_is_node_fallback_resolvable() {
         let _g = lock();
@@ -9013,7 +9016,17 @@ mod tests {
                 );
             }
 
-            // (b) no import anywhere resolves to a scheme the Node loader rejects.
+            // (b) every import ANYWHERE (root + `workers/*` `deno.json`) is
+            // Node-fallback-safe. Workers have no own `package.json`, so a worker
+            // run's `npm install` and `node_modules` resolution walk up to the
+            // project ROOT — hence a worker `npm:` import must be backed by the
+            // ROOT `package.json` too. For each import we assert:
+            //   - its scheme is Node-loader-resolvable (relative or `npm:`, never
+            //     `jsr:`/`http(s):`, which `node-loader.mjs` throws on), and
+            //   - any `npm:` value is declared in the root `package.json` — the
+            //     #437 crash, now guarded across workers, not just the root. This
+            //     also cross-checks `npm_dep_from_import` against the `declared`
+            //     set derived from `npm_deps_from_deno_json` in (a).
             let mut deno_files = vec![dir.join("deno.json")];
             let workers = dir.join("workers");
             if workers.is_dir() {
@@ -9038,6 +9051,17 @@ mod tests {
                              (must be relative or npm:, never jsr:/http:)",
                             t.id
                         );
+                        if s.starts_with("npm:") {
+                            if let Some((dep, _range)) = npm_dep_from_import(s) {
+                                assert!(
+                                    declared(&dep),
+                                    "{}: npm import `{key}` -> `{s}` in {dj:?} needs dep `{dep}` \
+                                     in the root package.json (Node fallback resolves worker \
+                                     node_modules up-tree to the project root)",
+                                    t.id
+                                );
+                            }
+                        }
                     }
                 }
             }
