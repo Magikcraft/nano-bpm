@@ -501,6 +501,14 @@ type Worker = {
 	 */
 	llm?: string;
 	/**
+	 * Id of the installed pack (`nano-ide.ext.json` `id`) that supplies this worker's out-of-process handler, enabled into the project rather than authored in it (ADR 0050 — the outbound I/O edge). The host resolves + supervises the pack's worker `entry` by `taskType`; the pack's element template (its `zeebe:taskDefinition:type` = this `taskType`) is the design-time face. Mutually exclusive with `handler`/`llm`.
+	 */
+	connector?: string;
+	/**
+	 * Optional named `connections[]` entry supplying this worker's shared credential/endpoint (ADR 0025 §1), symmetric to `trigger.connection`. Its secrets stay env pointers (ADR 0027 §5).
+	 */
+	connection?: string;
+	/**
 	 * Lowercase kebab-case slug.
 	 */
 	inputType?: string;
@@ -562,7 +570,7 @@ export interface AppManifest {
 	};
 	surfaces?: Surfaces;
 	/**
-	 * Service-task handlers: referenced files or an llm binding (ADR 0022 §E).
+	 * Service-task handlers: referenced files, an llm binding, or a connector supplied by an installed pack (ADR 0022 §E, ADR 0050).
 	 */
 	workers?: Worker[];
 	/**

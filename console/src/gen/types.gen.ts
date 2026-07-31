@@ -1135,6 +1135,100 @@ export type AddTriggerRequest = {
     };
 };
 
+/**
+ * The App's enabled connectors resolved against the connector registry (ADR 0050 — the outbound edge, the mirror of TriggersResponse).
+ *
+ */
+export type ConnectorsResponse = {
+    /**
+     * The manifest's enabled connector workers, resolved.
+     */
+    connectors: Array<ConnectorInfo>;
+    /**
+     * The full connector registry — every installed pack's declared worker types — for the console "Add connector" picker.
+     *
+     */
+    available: Array<ConnectorKindInfo>;
+    /**
+     * Per-connector coherence errors (e.g. an enabled connector whose pack was uninstalled, or whose seam component is missing).
+     *
+     */
+    errors: Array<string>;
+};
+
+export type ConnectorInfo = {
+    /**
+     * The job type this connector's worker serves (the manifest `workers[].taskType`).
+     */
+    taskType: string;
+    /**
+     * Id of the installed pack that supplies the worker (the manifest `workers[].connector`).
+     */
+    connector?: string | null;
+    /**
+     * Human label from the pack's worker declaration.
+     */
+    displayName?: string | null;
+    /**
+     * The named `connections[]` entry this worker references, if any.
+     */
+    connection?: string | null;
+    /**
+     * true if an installed pack still ships a launchable worker `entry` for this `taskType` (the seam resolves); false flags an uninstalled or declaration-only pack.
+     *
+     */
+    backed: boolean;
+    /**
+     * Whether the `taskType` is in the connector registry at all (a false value flags a stale enablement or a not-yet-installed pack).
+     *
+     */
+    recognized?: boolean;
+};
+
+export type ConnectorKindInfo = {
+    /**
+     * The job type the pack's worker serves.
+     */
+    taskType: string;
+    /**
+     * Id of the pack contributing this worker (the enablement writes it to `workers[].connector`).
+     */
+    connector: string;
+    displayName?: string | null;
+    /**
+     * true if the same pack also contributes an element-template component whose `zeebe:taskDefinition:type` equals this `taskType` (the design→ runtime seam, ADR 0050 §2). A registry entry with no component is a worker the maker wires to a hand-authored task.
+     *
+     */
+    hasComponent: boolean;
+    /**
+     * The fields the console's Add-connector form renders — the pack's declared `workers[].configFields` (env-pointer credentials/config).
+     *
+     */
+    configFields: Array<TriggerConfigField>;
+};
+
+/**
+ * A connector to enable — appended to the App manifest's workers[] (ADR 0050).
+ */
+export type AddConnectorRequest = {
+    /**
+     * The connector's `taskType` (a recognised pack worker type).
+     */
+    type: string;
+    /**
+     * Optional name for a `connections[]` entry to create/reference for this connector's shared credentials (env pointers, ADR 0027 §5).
+     *
+     */
+    connection?: string | null;
+    /**
+     * Flat map of the connector's config field values (keyed by TriggerConfigField.key) — env-pointer defaults written into the named `connection`. Never inline secrets.
+     *
+     */
+    config?: {
+        [key: string]: string;
+    } | null;
+};
+
 export type NamePath = string;
 
 /**
@@ -3019,3 +3113,65 @@ export type GetTriggerInboxResponses = {
 };
 
 export type GetTriggerInboxResponse = GetTriggerInboxResponses[keyof GetTriggerInboxResponses];
+
+export type GetConnectorsData = {
+    body?: never;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/projects/{name}/connectors';
+};
+
+export type GetConnectorsErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type GetConnectorsError = GetConnectorsErrors[keyof GetConnectorsErrors];
+
+export type GetConnectorsResponses = {
+    /**
+     * Connectors + registry
+     */
+    200: ConnectorsResponse;
+};
+
+export type GetConnectorsResponse = GetConnectorsResponses[keyof GetConnectorsResponses];
+
+export type AddConnectorData = {
+    body: AddConnectorRequest;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/projects/{name}/connectors';
+};
+
+export type AddConnectorErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type AddConnectorError = AddConnectorErrors[keyof AddConnectorErrors];
+
+export type AddConnectorResponses = {
+    /**
+     * Connector enabled; refreshed connectors + registry
+     */
+    200: ConnectorsResponse;
+};
+
+export type AddConnectorResponse = AddConnectorResponses[keyof AddConnectorResponses];

@@ -37,6 +37,8 @@ tags:
     description: Urban App datasources (DB Manager) — ADR 0024
   - name: triggers
     description: Urban App trigger runtime — the durable inbox + dispatcher (ADR 0025)
+  - name: connectors
+    description: Urban App connectors — the outbound I/O edge (element-template components + supervised workers, ADR 0050)
 
 paths:
   /topology:
@@ -1158,6 +1160,59 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/TriggerInboxResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /projects/{name}/connectors:
+    get:
+      operationId: getConnectors
+      tags: [connectors]
+      summary: Enabled connectors + available connector registry (ADR 0050)
+      description: >
+        Lists the App manifest's enabled connector workers (`workers[]` entries
+        supplied by an installed pack, ADR 0050 — the outbound edge), each
+        resolved against the connector registry: the union of every installed
+        pack's declared `workers[]`. `backed` says whether the pack still ships
+        a launchable worker for the type; `recognized` whether the type is in
+        the registry at all. Also returns the full registry so the console can
+        offer an "Add connector" picker, and any coherence errors (e.g. an
+        enabled connector whose pack was uninstalled). This is the data the
+        Connectors panel renders — the outbound mirror of `getTriggers`.
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      responses:
+        '200':
+          description: Connectors + registry
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConnectorsResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    post:
+      operationId: addConnector
+      tags: [connectors]
+      summary: Enable a connector into the App manifest (the console "Add connector" form)
+      description: >
+        Enables a pack-supplied connector by appending a worker to
+        `nano.app.json`'s `workers[]` (with `connector` naming the pack and
+        `taskType` the job type — the design→runtime seam with the pack's
+        element-template component, ADR 0050 §2). Optionally writes a named
+        `connections[]` entry (env-pointer credentials, never inline secrets,
+        ADR 0027 §5) referenced by the worker. Validates the type is a
+        recognised connector and not already enabled, writes the manifest, and
+        returns the refreshed connectors + registry. The outbound mirror of
+        `addTrigger`.
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AddConnectorRequest' }
+      responses:
+        '200':
+          description: Connector enabled; refreshed connectors + registry
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConnectorsResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
 
@@ -2718,3 +2773,102 @@ components:
           description: >
             The action to apply on each event, e.g. `{ "start": "processId" }` or
             `{ "message": "messageName" }`.
+    ConnectorsResponse:
+      type: object
+      required: [connectors, available, errors]
+      description: >
+        The App's enabled connectors resolved against the connector registry
+        (ADR 0050 — the outbound edge, the mirror of TriggersResponse).
+      properties:
+        connectors:
+          type: array
+          description: The manifest's enabled connector workers, resolved.
+          items: { $ref: '#/components/schemas/ConnectorInfo' }
+        available:
+          type: array
+          description: >
+            The full connector registry — every installed pack's declared
+            worker types — for the console "Add connector" picker.
+          items: { $ref: '#/components/schemas/ConnectorKindInfo' }
+        errors:
+          type: array
+          description: >
+            Per-connector coherence errors (e.g. an enabled connector whose pack
+            was uninstalled, or whose seam component is missing).
+          items: { type: string }
+    ConnectorInfo:
+      type: object
+      required: [taskType, backed]
+      properties:
+        taskType:
+          type: string
+          description: The job type this connector's worker serves (the manifest `workers[].taskType`).
+        connector:
+          type: string
+          nullable: true
+          description: Id of the installed pack that supplies the worker (the manifest `workers[].connector`).
+        displayName:
+          type: string
+          nullable: true
+          description: Human label from the pack's worker declaration.
+        connection:
+          type: string
+          nullable: true
+          description: The named `connections[]` entry this worker references, if any.
+        backed:
+          type: boolean
+          description: >
+            true if an installed pack still ships a launchable worker `entry` for
+            this `taskType` (the seam resolves); false flags an uninstalled or
+            declaration-only pack.
+        recognized:
+          type: boolean
+          description: >
+            Whether the `taskType` is in the connector registry at all (a false
+            value flags a stale enablement or a not-yet-installed pack).
+    ConnectorKindInfo:
+      type: object
+      required: [taskType, connector, hasComponent, configFields]
+      properties:
+        taskType:
+          type: string
+          description: The job type the pack's worker serves.
+        connector:
+          type: string
+          description: Id of the pack contributing this worker (the enablement writes it to `workers[].connector`).
+        displayName: { type: string, nullable: true }
+        hasComponent:
+          type: boolean
+          description: >
+            true if the same pack also contributes an element-template component
+            whose `zeebe:taskDefinition:type` equals this `taskType` (the design→
+            runtime seam, ADR 0050 §2). A registry entry with no component is a
+            worker the maker wires to a hand-authored task.
+        configFields:
+          type: array
+          description: >
+            The fields the console's Add-connector form renders — the pack's
+            declared `workers[].configFields` (env-pointer credentials/config).
+          items: { $ref: '#/components/schemas/TriggerConfigField' }
+    AddConnectorRequest:
+      type: object
+      required: [type]
+      description: A connector to enable — appended to the App manifest's workers[] (ADR 0050).
+      properties:
+        type:
+          type: string
+          description: The connector's `taskType` (a recognised pack worker type).
+        connection:
+          type: string
+          nullable: true
+          description: >
+            Optional name for a `connections[]` entry to create/reference for
+            this connector's shared credentials (env pointers, ADR 0027 §5).
+        config:
+          type: object
+          nullable: true
+          additionalProperties: { type: string }
+          description: >
+            Flat map of the connector's config field values (keyed by
+            TriggerConfigField.key) — env-pointer defaults written into the named
+            `connection`. Never inline secrets.

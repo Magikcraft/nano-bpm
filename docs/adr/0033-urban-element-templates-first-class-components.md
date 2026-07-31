@@ -71,6 +71,13 @@ components* — drag "Read Thermostat", "HTTP Request", or "Classify (LLM)" onto
 stamps a service task pre-bound to that template. That is the Delphi component palette, and it is where
 a maker starts: from components, not from a blank service task they must configure by hand.
 
+> **Amended by ADR 0050 §5 (connector enablement).** A *pack-contributed* component that binds a
+> `zeebe:taskDefinition:type` (a connector's design face) is shown only once that connector is
+> **enabled in the project** (its worker is in `nano.app.json`'s `workers[]`) — an installed pack no
+> longer auto-populates the palette with a task that would hang at runtime for want of a worker.
+> Design-only pack components (no task-definition binding) and the project's own components are never
+> gated. See `filterEnabledPackComponents` (`console/src/lib/connectorPalette.ts`).
+
 ### 3. Component input/output FEEL is scoped to the domain model
 
 A template's `zeebe:input` properties are FEEL expressions over process variables. They get the **same

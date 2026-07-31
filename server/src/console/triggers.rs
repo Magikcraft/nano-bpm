@@ -902,7 +902,7 @@ pub(crate) fn add_trigger(
 }
 
 /// Persist the App manifest, pretty-printed (nano.app.json is strict JSON).
-fn write_manifest(project: &str, manifest: &Json) -> Result<(), TriggerError> {
+pub(crate) fn write_manifest(project: &str, manifest: &Json) -> Result<(), TriggerError> {
     let dir = projects::project_dir(project)
         .ok_or_else(|| TriggerError::Manifest("invalid project name".to_string()))?;
     let text = serde_json::to_string_pretty(manifest)
@@ -1045,7 +1045,7 @@ impl TriggerDispatcher {
 // Manifest access
 // ---------------------------------------------------------------------------
 
-fn read_manifest(project: &str) -> Result<Json, TriggerError> {
+pub(crate) fn read_manifest(project: &str) -> Result<Json, TriggerError> {
     let dir = projects::project_dir(project)
         .ok_or_else(|| TriggerError::Manifest("invalid project name".to_string()))?;
     let path = dir.join("nano.app.json");

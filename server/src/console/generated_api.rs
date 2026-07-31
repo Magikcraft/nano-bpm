@@ -1409,3 +1409,48 @@ impl apis::triggers::Triggers for ServerImpl {
         )
     }
 }
+
+#[async_trait]
+impl apis::connectors::Connectors for ServerImpl {
+    async fn add_connector(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::AddConnectorPathParams,
+        body: &models::AddConnectorRequest,
+    ) -> Result<apis::connectors::AddConnectorResponse, ()> {
+        use apis::connectors::AddConnectorResponse as R;
+        let config: std::collections::BTreeMap<String, String> = flatten_nullable(&body.config)
+            .map(|m| m.into_iter().collect())
+            .unwrap_or_default();
+        let connection = flatten_nullable(&body.connection);
+        data_ok_or!(
+            super::project_connector_add(
+                &path_params.name,
+                &body.r_type,
+                connection.as_deref(),
+                &config,
+            ),
+            R::Status200_ConnectorEnabled,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+
+    async fn get_connectors(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::GetConnectorsPathParams,
+    ) -> Result<apis::connectors::GetConnectorsResponse, ()> {
+        use apis::connectors::GetConnectorsResponse as R;
+        data_ok_or!(
+            super::project_connectors(&path_params.name),
+            R::Status200_Connectors,
+            R::Status400_InvalidRequest,
+            R::Status404_NotFound
+        )
+    }
+}
