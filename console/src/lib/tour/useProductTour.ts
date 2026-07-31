@@ -114,6 +114,13 @@ export function useProductTour(
       doneBtnText: "Done",
       steps: steps.map(toDriveStep),
       onDestroyed: () => {
+        // driver.js fires onDestroyed both when the user finishes/dismisses the
+        // tour AND when we tear it down on unmount (see the cleanup effect).
+        // Only the former should count as "seen": the unmount cleanup clears
+        // driverRef.current *before* calling destroy(), so a mid-tour refresh,
+        // HMR reload or StrictMode remount doesn't suppress the first-run
+        // auto-start. Guard on identity so a stale teardown can't mark it seen.
+        if (driverRef.current !== instance) return;
         markTourSeen();
         driverRef.current = null;
       },
@@ -139,11 +146,14 @@ export function useProductTour(
     return () => window.clearTimeout(id);
   }, [autoStart, steps.length, startTour]);
 
-  // Tear down if the app unmounts mid-tour.
+  // Tear down if the app unmounts mid-tour. Clear the ref *before* destroy() so
+  // the onDestroyed handler recognises this as an app-initiated teardown and
+  // does NOT mark the tour seen — an unfinished tour should auto-start again.
   useEffect(
     () => () => {
-      driverRef.current?.destroy();
+      const instance = driverRef.current;
       driverRef.current = null;
+      instance?.destroy();
     },
     [],
   );
