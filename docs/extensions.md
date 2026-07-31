@@ -173,9 +173,15 @@ tours that teach the capability the pack adds, so onboarding scales with the
 ecosystem instead of a hardcoded list in the console
 ([ADR 0049](adr/0049-guided-journeys.md)). Each `tours[]` entry has an `id`,
 `title`, one-line `blurb`, optional `profiles` (`studio`/`observe`; empty ⇒
-studio only), and `steps[]`. A step is one of three `kind`s:
+studio only), optional journey-level `preconditions[]` (gates that must all hold
+for the journey to be offered) and `successWhen` (the gate that marks the journey
+as having actually worked — absent ⇒ orientation only), and `steps[]`. A step is
+one of three `kind`s:
 
-- **`spotlight`** — highlight a `data-tour` anchor named by `selector`;
+- **`spotlight`** — highlight an element by CSS `selector`. Views tag the target
+  with a `data-tour="…"` attribute, so the selector is the attribute form
+  `[data-tour="…"]` (a bare word like `workers-tab` is read as a tag selector and
+  won't match);
 - **`note`** — anchorless, centered framing;
 - **`handoff`** — offer a terminal command or URL in `copy` for the user to run.
   The console renders `copy` as **inert text and never executes it**; for an
@@ -192,7 +198,7 @@ studio only), and `steps[]`. A step is one of three `kind`s:
       "title": "Run your first worker",
       "blurb": "Wire a job type to an external worker and watch it poll.",
       "steps": [
-        { "id": "open-workers", "kind": "spotlight", "selector": "workers-tab",
+        { "id": "open-workers", "kind": "spotlight", "selector": "[data-tour=\"workers-tab\"]",
           "title": "Open Workers", "body": "This is where connected workers appear." },
         { "id": "start-worker", "kind": "handoff", "title": "Start the worker",
           "body": "Run this in your project, then come back.",
