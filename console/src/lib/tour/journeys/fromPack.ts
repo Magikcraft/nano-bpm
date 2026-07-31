@@ -184,8 +184,18 @@ function stepFrom(raw: unknown, where: string, nested: boolean): Step | null {
     warn(`${where}/${id}: a spotlight step needs a selector`);
     return null;
   }
-  const side = str(o.side) as "top" | "right" | "bottom" | "left" | undefined;
-  const align = str(o.align) as "start" | "center" | "end" | undefined;
+  const sideRaw = str(o.side);
+  if (sideRaw && !["top", "right", "bottom", "left"].includes(sideRaw)) {
+    warn(`${where}/${id}: unknown side ${sideRaw}`);
+    return null;
+  }
+  const alignRaw = str(o.align);
+  if (alignRaw && !["start", "center", "end"].includes(alignRaw)) {
+    warn(`${where}/${id}: unknown align ${alignRaw}`);
+    return null;
+  }
+  const side = sideRaw as "top" | "right" | "bottom" | "left" | undefined;
+  const align = alignRaw as "start" | "center" | "end" | undefined;
   return {
     ...base,
     kind: "spotlight",
