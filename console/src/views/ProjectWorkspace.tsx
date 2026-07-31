@@ -245,6 +245,34 @@ export default function ProjectWorkspace() {
   const running =
     runState?.status === "running" || runState?.status === "starting";
   const compiling = runState?.compiling ?? false;
+
+  // Urban App projects carry a root `nano.app.json`; only those have
+  // datasources, so the DB Manager (Data) toolbar entry is shown for them.
+  const isUrbanApp =
+    detail?.files.some(
+      (f) => f.kind === "file" && f.name === "nano.app.json",
+    ) ?? false;
+
+  // While an Urban App runs, publish its served URL (on its real configured
+  // port) so the RAD guided journey's success probe hits the actual app, not a
+  // guessed default — and clear it when it stops or the workspace unmounts. The
+  // "Open app" link below computes the same URL. This must sit ABOVE the early
+  // returns below so the hook runs on every render — otherwise hook order
+  // differs between the loading render (no `detail`) and the loaded one, which
+  // is React error #310 ("Rendered more hooks than during the previous render").
+  const servedUrl =
+    running && isUrbanApp && detail
+      ? servedAppUrl(window.location.origin, servedAppPort(detail.config))
+      : null;
+  useEffect(() => {
+    if (servedUrl) {
+      rememberServedAppUrl(servedUrl);
+      return () => forgetServedAppUrl();
+    }
+    forgetServedAppUrl();
+    return undefined;
+  }, [servedUrl]);
+
   const runConfigs = detail?.config.toolchain?.runConfigs ?? [];
   // The server resolves the same fallback (pinned → default:true → first) at
   // resolve_run_argv time, but we mirror it here so the picker's initial
@@ -345,29 +373,6 @@ export default function ProjectWorkspace() {
   if (!detail) {
     return <div className="p-8 text-sm text-fg-faint">Loading…</div>;
   }
-
-  // Urban App projects carry a root `nano.app.json`; only those have
-  // datasources, so the DB Manager (Data) toolbar entry is shown for them.
-  const isUrbanApp = detail.files.some(
-    (f) => f.kind === "file" && f.name === "nano.app.json",
-  );
-
-  // While an Urban App runs, publish its served URL (on its real configured
-  // port) so the RAD guided journey's success probe hits the actual app, not a
-  // guessed default — and clear it when it stops or the workspace unmounts. The
-  // "Open app" link below computes the same URL.
-  const servedUrl =
-    running && isUrbanApp
-      ? servedAppUrl(window.location.origin, servedAppPort(detail.config))
-      : null;
-  useEffect(() => {
-    if (servedUrl) {
-      rememberServedAppUrl(servedUrl);
-      return () => forgetServedAppUrl();
-    }
-    forgetServedAppUrl();
-    return undefined;
-  }, [servedUrl]);
 
   // Code-first workflow projects (ADR 0045) have no authored `.bpmn`; their model
   // is DERIVED from `workflows/*.ts`. Offer a read-only "Model" view for them.
