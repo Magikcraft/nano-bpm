@@ -35,6 +35,7 @@ use tokio::sync::broadcast;
 use crate::ServerImpl;
 use crate::backpressure::SlaMode;
 
+pub mod agent_brief;
 pub mod config;
 mod envelope_scan;
 pub mod extensions;
@@ -99,6 +100,15 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/docs", get(docs_index))
         .route("/docs/", get(docs_index))
         .route("/docs/{*path}", get(docs_asset))
+        // Agent authoring surface (ADR 0051): the "point your agent here" brief
+        // and its `llms.txt` discovery index. Rendered live per node (base URL
+        // from the request, projects root + packs from disk) so an agent can act
+        // with no other context. Hand-wired text responses, not in the OpenAPI
+        // spec. Under any console profile these are read-only.
+        .route("/agent", get(agent_brief_md))
+        .route("/agent/", get(agent_brief_md))
+        .route("/agent.md", get(agent_brief_md))
+        .route("/llms.txt", get(llms_txt))
         .route("/whitepaper", get(whitepaper_index))
         .route("/whitepaper/", get(whitepaper_index))
         .route(
@@ -353,6 +363,81 @@ async fn optimization() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         OPTIMIZATION_HTML,
+    )
+        .into_response()
+}
+
+/// Reconstructs the `scheme://host` base URL a client used to reach this node,
+/// from the request headers, so a served document can print URLs the caller can
+/// actually reach (through whatever proxy/host mapping is in front of us).
+///
+/// Prefers `X-Forwarded-Proto`/`Host` (set by a reverse proxy); falls back to the
+/// `Host` header with an `http` scheme, and finally to `http://localhost` when no
+/// host is advertised at all. No trailing slash.
+fn request_base_url(headers: &HeaderMap) -> String {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .filter(|h| !h.is_empty())
+        .unwrap_or("localhost");
+    // Only honour a forwarded scheme we actually emit URLs for; a misconfigured
+    // proxy (or a hostile client) supplying anything else must not leak into the
+    // links a downstream agent might auto-follow. Normalised to canonical case.
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| s.eq_ignore_ascii_case("https"))
+        .map(|_| "https")
+        .unwrap_or("http");
+    format!("{scheme}://{host}")
+}
+
+/// Serves the agent authoring brief (ADR 0051) at `/agent` (+ `/agent.md`) — the
+/// "point your agent here" Markdown, rendered live for this node.
+async fn agent_brief_md(headers: HeaderMap) -> Response {
+    let body = agent_brief::render(&request_base_url(&headers));
+    serve_text("text/markdown; charset=utf-8", body, &headers)
+}
+
+/// Serves the `/llms.txt` discovery index (ADR 0051): a short, link-first pointer
+/// at the agent brief and this node's machine-readable specs.
+async fn llms_txt(headers: HeaderMap) -> Response {
+    let body = agent_brief::render_llms_txt(&request_base_url(&headers));
+    serve_text("text/plain; charset=utf-8", body, &headers)
+}
+
+/// Serves a freshly-rendered text body with the given content type, gzipping it
+/// when the client advertised `gzip` (these documents are regenerated per
+/// request, so they are not pre-compressed like the embedded SPA assets).
+fn serve_text(content_type: &'static str, body: String, headers: &HeaderMap) -> Response {
+    // Regenerated per request (base URL, packs, templates are node/request
+    // specific), so an intermediary must never cache and replay one host's or
+    // client's variant to another. `Vary: Accept-Encoding` is set on both branches
+    // so the encoding negotiation is honoured regardless of which we return.
+    let enc = accepted_encodings(headers);
+    if enc.gzip
+        && let Some(gz) = gzip(body.as_bytes())
+    {
+        return (
+            [
+                (header::CONTENT_TYPE, content_type),
+                (header::CONTENT_ENCODING, "gzip"),
+                (header::VARY, "Accept-Encoding"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            gz,
+        )
+            .into_response();
+    }
+    (
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::VARY, "Accept-Encoding"),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
     )
         .into_response()
 }
@@ -3613,5 +3698,89 @@ mod asset_encoding_tests {
 
         let other = accept("deflate, zstd");
         assert!(!other.br && !other.gzip);
+    }
+
+    #[test]
+    fn request_base_url_prefers_forwarded_proto_and_host() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "nano.example.test".parse().unwrap());
+        // No forwarded proto → http (the console is typically plain-http/local).
+        assert_eq!(request_base_url(&h), "http://nano.example.test");
+        // A proxy's X-Forwarded-Proto https wins so the printed URLs are reachable.
+        h.insert("x-forwarded-proto", "https, http".parse().unwrap());
+        assert_eq!(request_base_url(&h), "https://nano.example.test");
+    }
+
+    #[test]
+    fn request_base_url_rejects_non_http_forwarded_scheme() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "nano.example.test".parse().unwrap());
+        // A bogus/hostile scheme must not leak into emitted links — fall back to http.
+        h.insert("x-forwarded-proto", "javascript".parse().unwrap());
+        assert_eq!(request_base_url(&h), "http://nano.example.test");
+        // http is accepted and canonicalised.
+        h.insert("x-forwarded-proto", "HTTP".parse().unwrap());
+        assert_eq!(request_base_url(&h), "http://nano.example.test");
+    }
+
+    #[test]
+    fn request_base_url_falls_back_to_localhost() {
+        // No Host header at all (e.g. a bare HTTP/1.0 probe) still yields a URL.
+        assert_eq!(request_base_url(&HeaderMap::new()), "http://localhost");
+    }
+
+    #[tokio::test]
+    async fn agent_endpoint_serves_markdown_brief() {
+        use axum::body::to_bytes;
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "node.local:9000".parse().unwrap());
+        let resp = agent_brief_md(h).await;
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/markdown; charset=utf-8")
+        );
+        let body = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        // The request's host threads into the actionable import URL.
+        assert!(text.contains("http://node.local:9000/console/api/projects/import"));
+        assert!(text.contains("## Link it in"));
+    }
+
+    #[tokio::test]
+    async fn agent_endpoint_is_uncacheable_and_varies_on_encoding() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "node.local".parse().unwrap());
+        // Uncompressed branch (no Accept-Encoding) still carries both headers, so a
+        // proxy neither caches a per-host body nor mixes up encoding variants.
+        let resp = agent_brief_md(h).await;
+        assert_eq!(
+            resp.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::VARY)
+                .and_then(|v| v.to_str().ok()),
+            Some("Accept-Encoding")
+        );
+        assert!(resp.headers().get(header::CONTENT_ENCODING).is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_endpoint_gzips_when_requested() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, "node.local".parse().unwrap());
+        h.insert(header::ACCEPT_ENCODING, "gzip".parse().unwrap());
+        let resp = agent_brief_md(h).await;
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip")
+        );
     }
 }

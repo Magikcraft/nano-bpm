@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   createProject,
@@ -13,6 +13,7 @@ import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
 import JourneyPicker from "../components/JourneyPicker";
 import DirectoryPicker from "../components/DirectoryPicker";
 import { isLocalhost } from "../lib/api";
+import { copyText, selectElementText } from "../lib/clipboard";
 import { CONSOLE_PROFILE } from "../lib/profile";
 import { TOUR_ANCHOR, templateAnchor } from "../lib/tour/tourAnchors";
 import { useTour } from "../lib/tour/tourContext";
@@ -61,6 +62,15 @@ export default function Projects() {
   const [browsing, setBrowsing] = useState(false);
   const canBrowse = useMemo(() => isLocalhost(), []);
   const [busy, setBusy] = useState(false);
+  // "Point your agent here" affordance (ADR 0051): reveals the /agent brief URL
+  // an external coding agent can be aimed at to author an app and link it in.
+  const [agentHint, setAgentHint] = useState(false);
+  const [agentCopied, setAgentCopied] = useState(false);
+  const agentUrl = useMemo(
+    () => `${globalThis.location?.origin ?? ""}/agent`,
+    [],
+  );
+  const agentUrlRef = useRef<HTMLElement>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -297,6 +307,14 @@ export default function Projects() {
             <Button
               variant="secondary"
               onClick={() => {
+                setAgentHint((v) => !v);
+              }}
+            >
+              {agentHint ? "Hide agent" : "Build with an agent"}
+            </Button>
+            <Button
+              variant="secondary"
+              onClick={() => {
                 setImporting((v) => !v);
               }}
             >
@@ -331,6 +349,58 @@ export default function Projects() {
       )}
 
       {errorBanner}
+
+      {agentHint && (
+        <Card className="mb-6 p-4">
+          <h2 className="text-sm font-semibold text-fg">
+            Build with a coding agent
+          </h2>
+          <p className="mt-1 text-sm text-fg-muted">
+            Point your coding agent (Claude Code, Copilot CLI, or any MCP-driven
+            assistant) at the URL below. It serves a live brief that teaches the
+            agent how to author a Nano app on disk and link it into this node —
+            and how Nano works, so it can explain it to you.
+          </p>
+          <div className="mt-3 flex items-center gap-2">
+            <code
+              ref={agentUrlRef}
+              className="flex-1 truncate rounded-md border border-edge bg-inset px-3 py-2 text-sm text-fg"
+            >
+              {agentUrl}
+            </code>
+            <Button
+              variant="secondary"
+              onClick={() => {
+                void copyText(agentUrl).then((ok) => {
+                  if (!ok) {
+                    // Insecure context with no clipboard access — select the URL
+                    // so the user can copy it by hand.
+                    if (agentUrlRef.current)
+                      selectElementText(agentUrlRef.current);
+                    return;
+                  }
+                  setAgentCopied(true);
+                  setTimeout(() => setAgentCopied(false), 1500);
+                });
+              }}
+            >
+              {agentCopied ? "Copied" : "Copy"}
+            </Button>
+            <a
+              href={agentUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="text-sm text-accent hover:underline"
+            >
+              Open
+            </a>
+          </div>
+          <p className="mt-2 text-xs text-fg-faint">
+            Tell the agent: <em>“Read {agentUrl} and build me an app.”</em> When
+            it finishes, the app appears here in your Projects gallery.
+          </p>
+        </Card>
+      )}
 
       {importing && (
         <Card className="mb-6 p-4">

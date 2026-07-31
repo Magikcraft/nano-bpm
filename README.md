@@ -809,6 +809,20 @@ To run a test and inspect the trace:
    ordered list of elements visited, jobs created/completed, and variable
    snapshots — to confirm the model behaves as intended before deploying anything.
 
+### Build with an agent (`/agent`)
+
+Every node serves a **live agent brief** at **`/agent`** (also `/agent.md`) — the
+"point your agent here" surface (ADR 0051). Hand the URL to any coding agent
+(Claude Code, Copilot CLI, or any MCP-driven assistant) and tell it *"read
+`<node>/agent` and build me an app"*. The brief teaches the agent, addressed to
+it directly, how to **author a Nano App on disk** and **link it into this node**
+(import by reference, ADR 0041) — and how Nano works, so it can also just
+*explain the product to you*. It is rendered per node, so it prints this node's
+real base URL, on-disk projects root, import endpoint, installed packs and
+scaffold templates: an agent needs no other context. A companion **`/llms.txt`**
+points agent tooling at the brief plus the OpenAPI, AsyncAPI and JSON-Schema
+specs. The Projects view exposes it as a **Build with an agent** button.
+
 ### Extensions
 
 The console is **extensible**: an agentic SDLC pack, language support, app
