@@ -111,6 +111,11 @@ const icons = {
       <path d="M7 4v16M17 4v16M2 8h5M2 12h5M2 16h5M17 8h5M17 12h5M17 16h5" />
     </Icon>
   ),
+  feedback: (
+    <Icon>
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+    </Icon>
+  ),
   config: (
     <Icon>
       <circle cx="12" cy="12" r="3" />
@@ -321,6 +326,9 @@ export default function App() {
             <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
               Advanced Research Prototype
             </div>
+            <div className="mt-1.5 text-[10px] text-fg-faint">
+              Free for evaluation use
+            </div>
           </a>
         </div>
         <nav className="flex flex-col gap-1 px-3">
@@ -354,8 +362,19 @@ export default function App() {
         </nav>
 
         <a
-          href="/docs"
+          href="https://github.com/jwulf/nano-ide/issues/new/choose"
+          target="_blank"
+          rel="noopener noreferrer"
           className={`mt-auto mx-3 ${railItemClass(false)}`}
+          title="Send feedback or report an issue"
+        >
+          {icons.feedback}
+          Feedback
+        </a>
+
+        <a
+          href="/docs"
+          className={`mx-3 ${railItemClass(false)}`}
           title="Documentation"
         >
           {icons.docs}
