@@ -8,7 +8,8 @@
 // driver.js waits for that selector to appear (see useProductTour) so steps can
 // target elements that mount asynchronously (lazy routes, the bpmn-js canvas).
 
-import { CONSOLE_PROFILE, type ConsoleProfile } from "../profile";
+import { CONSOLE_PROFILE, type ConsoleProfile } from "../profile.ts";
+import { TOUR_ANCHOR, tourSelector } from "./tourAnchors.ts";
 
 export interface TourStep {
   /** Stable id, handy for analytics / debugging. */
@@ -32,7 +33,7 @@ const studioSteps: TourStep[] = [
   {
     id: "projects-nav",
     route: "/projects",
-    selector: '[data-tour="nav-projects"]',
+    selector: tourSelector(TOUR_ANCHOR.projectsNav),
     title: "Projects",
     body: "Everything starts here. A project is a folder of BPMN/DMN models, forms and a pack that says how to run them.",
     side: "right",
@@ -41,7 +42,7 @@ const studioSteps: TourStep[] = [
   {
     id: "new-project",
     route: "/projects",
-    selector: '[data-tour="new-project"]',
+    selector: tourSelector(TOUR_ANCHOR.newProject),
     title: "Scaffold a project",
     body: "Pick a template — each one wires up a runnable toolchain (Node, Deno, JVM, …) so Run works with zero setup.",
     side: "bottom",
@@ -52,7 +53,7 @@ const studioSteps: TourStep[] = [
     // No route: the Run button only exists inside an open project workspace.
     // If no project is open the selector never resolves and driver.js skips it
     // (skipMissingElement) — the tour degrades gracefully on a fresh install.
-    selector: '[data-tour="run"]',
+    selector: tourSelector(TOUR_ANCHOR.run),
     title: "Run your model",
     body: "Open a project and hit Run to boot the engine and execute it. Tokens animate live on the canvas as instances progress.",
     side: "bottom",
@@ -61,7 +62,7 @@ const studioSteps: TourStep[] = [
   {
     id: "observe-nav",
     route: "/projects",
-    selector: '[data-tour="nav-explorer"]',
+    selector: tourSelector(TOUR_ANCHOR.explorerNav),
     title: "Observe everything",
     body: "Explorer, Traces, Metrics and Workers give full visibility into running instances — the operator surface is always one click away.",
     side: "right",
@@ -78,7 +79,7 @@ const observeSteps: TourStep[] = [
   {
     id: "topology-nav",
     route: "/topology",
-    selector: '[data-tour="nav-topology"]',
+    selector: tourSelector(TOUR_ANCHOR.topologyNav),
     title: "Topology",
     body: "Your nodes, partitions and their health at a glance.",
     side: "right",
@@ -87,7 +88,7 @@ const observeSteps: TourStep[] = [
   {
     id: "explorer-nav",
     route: "/topology",
-    selector: '[data-tour="nav-explorer"]',
+    selector: tourSelector(TOUR_ANCHOR.explorerNav),
     title: "Explorer",
     body: "Inspect individual process instances — their variables and current state.",
     side: "right",
@@ -96,7 +97,7 @@ const observeSteps: TourStep[] = [
   {
     id: "metrics-nav",
     route: "/topology",
-    selector: '[data-tour="nav-metrics"]',
+    selector: tourSelector(TOUR_ANCHOR.metricsNav),
     title: "Metrics",
     body: "Throughput, backlog and latency — the numbers that matter under load.",
     side: "right",

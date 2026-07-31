@@ -20,6 +20,7 @@ import { registerFileTypesFromOverview } from "./lib/editorLang";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 import { IS_STUDIO } from "./lib/profile";
 import { useProductTour } from "./lib/tour/useProductTour";
+import { navAnchor, TOUR_ANCHOR } from "./lib/tour/tourAnchors";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -339,7 +340,7 @@ export default function App() {
               <NavLink
                 key={item.to}
                 to={to}
-                data-tour={`nav-${item.label.toLowerCase()}`}
+                data-tour={navAnchor(item.label)}
                 className={railItemClass(active)}
               >
                 <ActiveBar show={active} />
@@ -363,7 +364,7 @@ export default function App() {
         <button
           type="button"
           onClick={startTour}
-          data-tour="take-a-tour"
+          data-tour={TOUR_ANCHOR.takeATour}
           className={`mt-auto mx-3 ${railItemClass(false)}`}
           title="Replay the product tour"
         >

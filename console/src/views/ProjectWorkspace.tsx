@@ -58,6 +58,7 @@ import {
 } from "../lib/api";
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
+import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
   processFeelVariables,
   componentOutputFeelVariables,
@@ -405,7 +406,7 @@ export default function ProjectWorkspace() {
             onClick={() => void run()}
             kind="primary"
             disabled={!runnable}
-            dataTour="run"
+            dataTour={TOUR_ANCHOR.run}
           >
             ▶ Run
           </ToolbarButton>

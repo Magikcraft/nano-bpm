@@ -12,6 +12,7 @@ import {
 import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
 import DirectoryPicker from "../components/DirectoryPicker";
 import { isLocalhost } from "../lib/api";
+import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
   slugifyProjectName,
   validateProjectName,
@@ -298,7 +299,7 @@ export default function Projects() {
             </Button>
             <Button
               variant="primary"
-              data-tour="new-project"
+              data-tour={TOUR_ANCHOR.newProject}
               onClick={() => {
                 setCreating(true);
                 setImporting(false);
