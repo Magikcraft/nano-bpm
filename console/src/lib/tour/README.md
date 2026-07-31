@@ -1,8 +1,9 @@
-# Product tour — driver.js spike (issue #393)
+# Product tour (driver.js)
 
 A first-run product tour for the console, built on [driver.js](https://driverjs.com)
-(MIT, zero-dep, ~5kb). This is a **spike** to evaluate driver.js against a
-`@reactour/tour` spike before we commit to one.
+(MIT, zero-dep, ~5kb). driver.js was chosen over `@reactour/tour` via an A/B
+evaluation (issue #393) — see [Chosen over @reactour/tour](#chosen-over-reactourtour-issue-393)
+below for the rationale.
 
 ## Why driver.js
 

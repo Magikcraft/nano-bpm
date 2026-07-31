@@ -1,4 +1,4 @@
-// First-run product tour, driver.js spike (issue #393).
+// First-run product tour (driver.js — chosen over @reactour/tour via the #393 A/B).
 //
 // Why driver.js: the journey spans react-router routes and targets elements
 // that mount asynchronously over CSS-transformed canvases (bpmn-js/monaco). An
