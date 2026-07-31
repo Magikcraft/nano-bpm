@@ -1239,16 +1239,26 @@ fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
 }
 
 /// Parse a `deno.json`/`deno.jsonc` body into its npm dependency set, or `None`
-/// when the body does not parse as a JSON object. `Some(empty)` means "parsed,
-/// but no `npm:` imports" — distinct from a parse failure, so callers can mirror
-/// `node-loader.mjs`, which falls through to the next candidate file only on a
-/// read/parse error, not on a valid-but-import-less map.
+/// when a caller should fall through to the next candidate file. This mirrors
+/// `node-loader.mjs`'s `JSON.parse(raw).imports ?? {}` **exactly**:
+/// * a JSON parse error → `None` (JS `JSON.parse` throws → the loader's `catch`
+///   tries the next file);
+/// * a `null` document → `None` (JS throws on `null.imports` → same `catch`);
+/// * any other parsed value **stops** the lookup — an object contributes its
+///   `imports`, anything else (array, number, …) contributes none — matching
+///   `(nonObject).imports ?? {}` returning `{}` without falling through.
+///
+/// `Some(empty)` therefore means "parsed and stops here, but no `npm:` imports",
+/// which is distinct from the fall-through `None`.
 fn parse_npm_deps(deno_json: &str) -> Option<BTreeMap<String, String>> {
-    let serde_json::Value::Object(root) = serde_json::from_str(deno_json).ok()? else {
+    let value: serde_json::Value = serde_json::from_str(deno_json).ok()?;
+    if value.is_null() {
         return None;
-    };
+    }
     let mut deps = BTreeMap::new();
-    if let Some(serde_json::Value::Object(imports)) = root.get("imports") {
+    // `Value::get` yields `None` for a non-object (mirrors `undefined.imports`),
+    // so only a real object with an `imports` object contributes deps.
+    if let Some(serde_json::Value::Object(imports)) = value.get("imports") {
         for value in imports.values() {
             if let Some((name, range)) = value.as_str().and_then(npm_dep_from_import) {
                 deps.insert(name, range);
@@ -9051,6 +9061,25 @@ mod tests {
         assert!(
             required_npm_deps(&dir).is_empty(),
             "a valid import-less deno.json must not fall through to deno.jsonc"
+        );
+
+        // A parsed-but-non-object deno.json (e.g. `[]`) also STOPS: `node-loader`
+        // does `[].imports ?? {}` → `{}` and never reaches deno.jsonc.
+        std::fs::write(dir.join("deno.json"), "[]").unwrap();
+        assert!(
+            required_npm_deps(&dir).is_empty(),
+            "a non-object deno.json must not fall through to deno.jsonc"
+        );
+
+        // A `null` deno.json DOES fall through: `node-loader` throws on
+        // `null.imports` and its `catch` tries the next candidate.
+        std::fs::write(dir.join("deno.json"), "null").unwrap();
+        assert_eq!(
+            required_npm_deps(&dir)
+                .get("@nanobpm/nano-sdk")
+                .map(String::as_str),
+            Some("^1"),
+            "a null deno.json must fall through to a valid deno.jsonc"
         );
     }
 }
