@@ -253,12 +253,50 @@ async function ensureTail(name: string, running: boolean): Promise<RunTail> {
 }
 
 /**
- * Best-effort "parked on humanApproval" detection.
+ * Job states the engine reports as still open — waiting for a worker (`Created`)
+ * or picked up and in flight (`Activated`). A `/instances/{key}` detail lists a
+ * process's jobs INCLUDING completed ones, so a state check is mandatory: without
+ * it a serviced (completed) `review` job reads as still open and the parked
+ * marker is never set. Mirrors `InstanceDetail.tsx`'s active-job filter.
+ */
+const OPEN_JOB_STATES = new Set(["Created", "Activated"]);
+
+/** Minimal shapes the pure park decision needs (a subset of the gen types). */
+interface ParkJob {
+  job_type: string;
+  state: string;
+}
+interface ParkInstance {
+  state: string;
+  has_incident: boolean;
+}
+
+/**
+ * Pure decision: has this `pr-review` instance advanced past the agent step and
+ * parked on the single downstream `humanApproval` catch event?
  *
- * REST has no active-element list, so we infer: an active `pr-review` instance
- * with no incident and no open `pr-review:review` job has advanced past the agent
- * step and can only be sitting on the single downstream catch event. Debounced so
- * a fast-polling handoff step doesn't hammer `/instances`.
+ * REST exposes no active-element list, so we infer it: the instance is still
+ * active, carries no incident, and has NO OPEN `pr-review:review` job. The
+ * open-state check is the crux — a completed review job (the harness already
+ * serviced it) is exactly the parked case, so counting it as "open" would make
+ * the marker, and therefore `agenticHireSucceeded`, unsatisfiable.
+ */
+export function isParkedOnHumanApproval(
+  instance: ParkInstance,
+  jobs: ParkJob[],
+): boolean {
+  if (/complete|terminat/i.test(instance.state)) return false;
+  if (instance.has_incident) return false;
+  const openReview = jobs.some(
+    (j) => j.job_type === PR_REVIEW_JOB_TYPE && OPEN_JOB_STATES.has(j.state),
+  );
+  return !openReview;
+}
+
+/**
+ * Best-effort "parked on humanApproval" detection against live REST. Debounced so
+ * a fast-polling handoff step doesn't hammer `/instances`; the actual decision is
+ * the pure `isParkedOnHumanApproval` above (unit tested).
  */
 async function refreshParkMarker(tail: RunTail): Promise<void> {
   const now = Date.now();
@@ -280,10 +318,7 @@ async function refreshParkMarker(tail: RunTail): Promise<void> {
       const detail = (
         await getInstance({ path: { key: inst.key }, throwOnError: true })
       ).data;
-      const openReview = (detail?.jobs ?? []).some(
-        (j) => j.job_type === PR_REVIEW_JOB_TYPE,
-      );
-      if (!openReview) {
+      if (isParkedOnHumanApproval(inst, detail?.jobs ?? [])) {
         parked = true;
         break;
       }

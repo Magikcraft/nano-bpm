@@ -2,12 +2,13 @@
 //
 // A tour step highlights an element by CSS selector, and the element is tagged
 // with a matching `data-tour="..."` attribute in a view. Those two references —
-// the selector in steps.ts and the attribute in the component — are a classic
-// drift surface: rename one and the tour silently skips the step. So both derive
-// from the constants here instead of repeating literal strings.
+// the selector in a journey step and the attribute in the component — are a
+// classic drift surface: rename one and the tour silently skips the step. So both
+// derive from the constants here instead of repeating literal strings.
 //
-// Used by: steps.ts (selectors), App.tsx (rail nav + "Take a tour"),
-// Projects.tsx ("New project"), ProjectWorkspace.tsx (Run).
+// Used by: the journey files under journeys/* (selectors), App.tsx (rail nav +
+// "Take a tour"), Projects.tsx (template cards), ProjectWorkspace.tsx (Run,
+// flow editor, Model, run output).
 
 /**
  * `data-tour` value for a rail nav item, derived from its **route** (`item.to`)

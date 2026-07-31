@@ -20,6 +20,7 @@ import {
   agenticAuthorSucceeded,
   agenticHire,
   agenticHireSucceeded,
+  isParkedOnHumanApproval,
 } from "./journeys/agentic.ts";
 import { resolveSteps } from "./registry.ts";
 import type { TourContext } from "./types.ts";
@@ -100,6 +101,55 @@ test("agenticHireSucceeded: true only once the parked-on-humanApproval marker is
       }),
     ),
     true,
+  );
+});
+
+// ── 0b parked-on-humanApproval inference (defect guard, #445 review round 3) ──
+
+const inst = (
+  over: Partial<{ state: string; has_incident: boolean }> = {},
+) => ({
+  state: "active",
+  has_incident: false,
+  ...over,
+});
+const reviewJob = (state: string) => ({
+  job_type: "pr-review:review",
+  state,
+});
+
+test("isParkedOnHumanApproval: a COMPLETED review job is the parked case, not an open one", () => {
+  // The /instances/{key} detail lists completed jobs too, so ignoring job state
+  // (the round-3 defect) made this read as still-at-review forever — the marker
+  // never set and 0b unsatisfiable. A serviced (Completed) review job with no
+  // other open job means the instance advanced to and parked on the signal.
+  assert.equal(isParkedOnHumanApproval(inst(), [reviewJob("Completed")]), true);
+});
+
+test("isParkedOnHumanApproval: an OPEN review job means still at the agent step, not parked", () => {
+  assert.equal(isParkedOnHumanApproval(inst(), [reviewJob("Created")]), false);
+  assert.equal(
+    isParkedOnHumanApproval(inst(), [reviewJob("Activated")]),
+    false,
+  );
+});
+
+test("isParkedOnHumanApproval: no jobs at all (review already cleared) is parked", () => {
+  assert.equal(isParkedOnHumanApproval(inst(), []), true);
+});
+
+test("isParkedOnHumanApproval: a completed or incident-bearing instance is never parked", () => {
+  assert.equal(
+    isParkedOnHumanApproval(inst({ state: "completed" }), []),
+    false,
+  );
+  assert.equal(
+    isParkedOnHumanApproval(inst({ state: "terminated" }), []),
+    false,
+  );
+  assert.equal(
+    isParkedOnHumanApproval(inst({ has_incident: true }), []),
+    false,
   );
 });
 
