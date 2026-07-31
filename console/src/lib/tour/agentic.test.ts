@@ -117,6 +117,10 @@ const reviewJob = (state: string) => ({
   job_type: "pr-review:review",
   state,
 });
+const mergeJob = (state: string) => ({
+  job_type: "pr-review:merge",
+  state,
+});
 
 test("isParkedOnHumanApproval: a COMPLETED review job is the parked case, not an open one", () => {
   // The /instances/{key} detail lists completed jobs too, so ignoring job state
@@ -134,8 +138,29 @@ test("isParkedOnHumanApproval: an OPEN review job means still at the agent step,
   );
 });
 
-test("isParkedOnHumanApproval: no jobs at all (review already cleared) is parked", () => {
+test("isParkedOnHumanApproval: an OPEN downstream (merge) job means the signal already resumed it, not parked", () => {
+  // The round-4 refinement: after humanApproval the merge w.run job is briefly
+  // Created/Activated. A review-only check would false-positive here; any open
+  // job means the instance is executing a task, not parked on the catch event.
+  assert.equal(
+    isParkedOnHumanApproval(inst(), [
+      reviewJob("Completed"),
+      mergeJob("Created"),
+    ]),
+    false,
+  );
+  assert.equal(isParkedOnHumanApproval(inst(), [mergeJob("Activated")]), false);
+});
+
+test("isParkedOnHumanApproval: no OPEN jobs (review cleared, nothing running) is parked", () => {
   assert.equal(isParkedOnHumanApproval(inst(), []), true);
+  assert.equal(
+    isParkedOnHumanApproval(inst(), [
+      reviewJob("Completed"),
+      mergeJob("Completed"),
+    ]),
+    true,
+  );
 });
 
 test("isParkedOnHumanApproval: a completed or incident-bearing instance is never parked", () => {

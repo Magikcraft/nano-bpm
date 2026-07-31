@@ -43,7 +43,6 @@ import type { Journey, Predicate, TourContext } from "../types";
  */
 const WORKFLOW_STARTER_TEMPLATE = "workflow-starter";
 const PR_REVIEW_FLOW = "pr-review";
-const PR_REVIEW_JOB_TYPE = "pr-review:review";
 
 // ---------------------------------------------------------------------------
 // Success predicates (pure — unit tested in agentic.test.ts).
@@ -256,8 +255,8 @@ async function ensureTail(name: string, running: boolean): Promise<RunTail> {
  * Job states the engine reports as still open — waiting for a worker (`Created`)
  * or picked up and in flight (`Activated`). A `/instances/{key}` detail lists a
  * process's jobs INCLUDING completed ones, so a state check is mandatory: without
- * it a serviced (completed) `review` job reads as still open and the parked
- * marker is never set. Mirrors `InstanceDetail.tsx`'s active-job filter.
+ * it a serviced (completed) job reads as still open. Mirrors `InstanceDetail.tsx`'s
+ * active-job filter. Anything not in this set (Completed, Failed, …) is not open.
  */
 const OPEN_JOB_STATES = new Set(["Created", "Activated"]);
 
@@ -275,11 +274,18 @@ interface ParkInstance {
  * Pure decision: has this `pr-review` instance advanced past the agent step and
  * parked on the single downstream `humanApproval` catch event?
  *
- * REST exposes no active-element list, so we infer it: the instance is still
- * active, carries no incident, and has NO OPEN `pr-review:review` job. The
- * open-state check is the crux — a completed review job (the harness already
- * serviced it) is exactly the parked case, so counting it as "open" would make
- * the marker, and therefore `agenticHireSucceeded`, unsatisfiable.
+ * REST exposes no active-element list, so we infer it structurally: a catch event
+ * has NO job, so a live instance parked on one has no open job at all. The caller
+ * scopes this to `pr-review` instances, so "active, no incident, no open job" can
+ * only be the `humanApproval` wait.
+ *
+ * Checking *any* open job (not just the `review` one) matters in both directions:
+ * an open job that is the not-yet-serviced `review` means still AT the agent step
+ * (not parked), and an open job that is the downstream `merge` `w.run` means the
+ * signal already resumed the instance (past the wait) — a review-only check would
+ * false-positive there. The job-STATE filter is equally load-bearing: the detail
+ * lists completed jobs, so a serviced `review` must read as closed or the marker,
+ * and thus `agenticHireSucceeded`, is never satisfiable.
  */
 export function isParkedOnHumanApproval(
   instance: ParkInstance,
@@ -287,10 +293,8 @@ export function isParkedOnHumanApproval(
 ): boolean {
   if (/complete|terminat/i.test(instance.state)) return false;
   if (instance.has_incident) return false;
-  const openReview = jobs.some(
-    (j) => j.job_type === PR_REVIEW_JOB_TYPE && OPEN_JOB_STATES.has(j.state),
-  );
-  return !openReview;
+  const hasOpenJob = jobs.some((j) => OPEN_JOB_STATES.has(j.state));
+  return !hasOpenJob;
 }
 
 /**
