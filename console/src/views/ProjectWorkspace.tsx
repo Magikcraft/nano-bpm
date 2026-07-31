@@ -58,6 +58,7 @@ import {
 } from "../lib/api";
 import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
+import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
   processFeelVariables,
   componentOutputFeelVariables,
@@ -405,6 +406,7 @@ export default function ProjectWorkspace() {
             onClick={() => void run()}
             kind="primary"
             disabled={!runnable}
+            dataTour={TOUR_ANCHOR.run}
           >
             ▶ Run
           </ToolbarButton>
@@ -620,11 +622,13 @@ function ToolbarButton({
   onClick,
   disabled,
   kind = "default",
+  dataTour,
 }: {
   children: React.ReactNode;
   onClick: () => void;
   disabled?: boolean;
   kind?: "default" | "primary" | "danger";
+  dataTour?: string;
 }) {
   const styles =
     kind === "primary"
@@ -636,6 +640,7 @@ function ToolbarButton({
     <button
       onClick={onClick}
       disabled={disabled}
+      data-tour={dataTour}
       className={`rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${styles}`}
     >
       {children}
