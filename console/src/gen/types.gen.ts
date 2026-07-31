@@ -698,6 +698,18 @@ export type MarketEntry = {
     installed: boolean;
     installedVersion?: string;
     updateAvailable: boolean;
+    /**
+     * Browsable source-repository URL (normalized from the package's npm `repository` field, e.g. a GitHub URL), when published. Lets users read the source and report issues upstream.
+     */
+    repository?: string;
+    /**
+     * Package homepage URL, when published.
+     */
+    homepage?: string;
+    /**
+     * The package's page on the npm registry.
+     */
+    npmUrl?: string;
 };
 
 export type Marketplace = {
