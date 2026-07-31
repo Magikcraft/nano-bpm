@@ -169,8 +169,20 @@ export function createJourneyRunner(deps: RunnerDeps): JourneyRunner {
     button.type = "button";
     button.className = "nano-tour-copy";
     button.textContent = step.copyLabel ?? "Copy";
+    // Latch the first-party outcome hook at most once per rendered handoff, and
+    // never let it break the copy UX: `onCopied` is a first-party latch (packs
+    // are data and cannot supply one), but onboarding is not worth throwing over.
+    let notifiedCopied = false;
     button.addEventListener("click", () => {
       void copyText(step.copy).then((ok) => {
+        if (ok && !notifiedCopied) {
+          notifiedCopied = true;
+          try {
+            step.onCopied?.();
+          } catch {
+            /* a latch failing just reads as not-yet-achieved */
+          }
+        }
         button.textContent = ok ? "Copied" : "Select and copy";
         if (!ok) selectText(code);
         window.setTimeout(() => {

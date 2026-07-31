@@ -126,6 +126,17 @@ export interface HandoffStep extends StepBase {
   /** Button label; defaults to "Copy". */
   copyLabel?: string;
   /**
+   * Fired at most once per rendered handoff, after the user actually copies
+   * `copy` (a successful copy, not a mere step advance). Lets a first-party
+   * journey latch its outcome signal — e.g. journey 1's "the base URL was
+   * taken" — from the real copy action in the journey flow rather than
+   * depending on a separate affordance. Absent from pack-contributed handoff
+   * steps by construction: those arrive as JSON data and cannot carry a
+   * function, so this is never a pack execution vector. The renderer swallows
+   * any throw, so a latch failing never breaks the copy UX.
+   */
+  onCopied?: () => void;
+  /**
    * When present, the step auto-advances as soon as this becomes true (polled
    * while the step is showing). When absent, the user self-reports via
    * "I've done it" — honest, since the console cannot observe a terminal.
