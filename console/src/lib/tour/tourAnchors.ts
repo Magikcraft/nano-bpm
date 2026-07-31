@@ -30,7 +30,11 @@ export function templateAnchor(id: string): string {
   return `template-${id}`;
 }
 
-/** Every `data-tour` anchor the tour targets, in one place. */
+/**
+ * Every *static* `data-tour` anchor the tour targets, in one place. Per-template
+ * card anchors are dynamic (derived from the template id via `templateAnchor`)
+ * and so are intentionally not enumerated here.
+ */
 export const TOUR_ANCHOR = {
   projectsNav: navAnchor("/projects"),
   explorerNav: navAnchor("/explorer"),
