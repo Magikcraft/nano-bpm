@@ -140,6 +140,11 @@ test.describe("journey anchors resolve", () => {
         const noCrash = assertNoPageCrash(page);
         await stubConsoleApi(page);
         await resetTourState(page);
+        // #464 adds a startup persona panel that opens on console load unless a
+        // journey is running or resumable — which is the case here, since this test
+        // starts none. The assertion below is DOM-presence (`toHaveCount`), so an
+        // overlay does not affect it, but when #464 lands this test should suppress
+        // the panel explicitly rather than pass because of that detail.
         // Route is absolute under the router basename; baseURL already ends in
         // /console/, so strip the leading slash.
         await page.goto(step.route!.replace(/^\//, ""));
@@ -162,8 +167,13 @@ test.describe("?tour= deep links", () => {
   }) => {
     await stubConsoleApi(page);
     await resetTourState(page);
-    // A deep link is explicit intent: it runs even for a completed journey, and
-    // it is how c8ctl hands a persona its journey (#413).
+    // A deep link is explicit intent: it runs even for a completed journey.
+    //
+    // #464 revises #413 — c8ctl no longer prints `?tour=` links (they sprayed
+    // console URLs across every command's output), and the console's own startup
+    // persona panel becomes the front door. Consuming a deep link is an explicit
+    // non-goal of that change, so this guard stays valid: the entry point is no
+    // longer advertised, but it still works and still needs guarding.
     await page.goto("metrics?tour=overview");
     await expect(page.locator(".driver-popover")).toBeVisible();
     await expect(page).toHaveURL(/\/console\/metrics$/);
