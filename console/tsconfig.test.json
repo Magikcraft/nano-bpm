@@ -6,6 +6,9 @@
   "compilerOptions": {
     "types": ["node"]
   },
-  "include": ["src/**/*.test.ts", "src/vite-env.d.ts"],
+  // Also covers the Playwright specs in e2e/: Playwright transpiles without
+  // typechecking, so without this a broken guard file would only fail at run time
+  // — and a guard nobody can trust is worse than none.
+  "include": ["src/**/*.test.ts", "src/vite-env.d.ts", "e2e/**/*.ts"],
   "exclude": []
 }
