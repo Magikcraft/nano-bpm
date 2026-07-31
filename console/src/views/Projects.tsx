@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   createProject,
@@ -13,7 +13,7 @@ import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
 import JourneyPicker from "../components/JourneyPicker";
 import DirectoryPicker from "../components/DirectoryPicker";
 import { isLocalhost } from "../lib/api";
-import { copyText } from "../lib/clipboard";
+import { copyText, selectElementText } from "../lib/clipboard";
 import { CONSOLE_PROFILE } from "../lib/profile";
 import { TOUR_ANCHOR, templateAnchor } from "../lib/tour/tourAnchors";
 import { useTour } from "../lib/tour/tourContext";
@@ -70,6 +70,7 @@ export default function Projects() {
     () => `${globalThis.location?.origin ?? ""}/agent`,
     [],
   );
+  const agentUrlRef = useRef<HTMLElement>(null);
 
   const reload = useCallback(async () => {
     try {
@@ -361,14 +362,23 @@ export default function Projects() {
             and how Nano works, so it can explain it to you.
           </p>
           <div className="mt-3 flex items-center gap-2">
-            <code className="flex-1 truncate rounded-md border border-edge bg-inset px-3 py-2 text-sm text-fg">
+            <code
+              ref={agentUrlRef}
+              className="flex-1 truncate rounded-md border border-edge bg-inset px-3 py-2 text-sm text-fg"
+            >
               {agentUrl}
             </code>
             <Button
               variant="secondary"
               onClick={() => {
                 void copyText(agentUrl).then((ok) => {
-                  if (!ok) return;
+                  if (!ok) {
+                    // Insecure context with no clipboard access — select the URL
+                    // so the user can copy it by hand.
+                    if (agentUrlRef.current)
+                      selectElementText(agentUrlRef.current);
+                    return;
+                  }
                   setAgentCopied(true);
                   setTimeout(() => setAgentCopied(false), 1500);
                 });

@@ -106,6 +106,7 @@ pub fn router(server: ServerImpl) -> Router {
         // with no other context. Hand-wired text responses, not in the OpenAPI
         // spec. Under any console profile these are read-only.
         .route("/agent", get(agent_brief_md))
+        .route("/agent/", get(agent_brief_md))
         .route("/agent.md", get(agent_brief_md))
         .route("/llms.txt", get(llms_txt))
         .route("/whitepaper", get(whitepaper_index))

@@ -37,3 +37,22 @@ export async function copyText(text: string): Promise<boolean> {
     return false;
   }
 }
+
+/**
+ * Select an element's text, so the user can copy it manually when
+ * {@link copyText} could not (an insecure context with no `execCommand`). A
+ * best-effort visual affordance — silently a no-op where the Selection API is
+ * unavailable.
+ */
+export function selectElementText(node: HTMLElement): void {
+  try {
+    const sel = globalThis.getSelection?.();
+    if (!sel) return;
+    const range = document.createRange();
+    range.selectNodeContents(node);
+    sel.removeAllRanges();
+    sel.addRange(range);
+  } catch {
+    // No Selection API (or a detached node) — nothing more we can do.
+  }
+}
