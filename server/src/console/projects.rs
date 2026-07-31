@@ -5502,6 +5502,7 @@ mod tests {
         // Regression guard for "No workflows found" — see derive_models: a map in
         // .deno-cache/ made `./nano-generated/*` resolve to the wrong dir and
         // every workflow importing a generated module was silently skipped.
+        let _g = lock();
         let dir = temp_root();
         std::fs::write(
             dir.join("deno.json"),
