@@ -3918,9 +3918,20 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     // exactly like `generate_models` — synthesize an import map that merges the
     // project's own imports and defaults in the SDK + layout dep, and pass it via
     // `--import-map --no-config` (Deno forbids a map from both a discovered
-    // `deno.json` and the flag). It lives in the cache dir, the only writable scope.
+    // `deno.json` and the flag).
+    //
+    // Write it at the PROJECT ROOT (like the driver below), NOT in `.deno-cache`:
+    // Deno resolves an import map's relative values against the map file's own
+    // URL, and a code-first project's `deno.json` maps its generated local
+    // modules with relative specifiers (e.g. `"@nanobpm/domain":
+    // "./nano-generated/domain.ts"`). From `.deno-cache/` those resolve to
+    // `<project>/.deno-cache/nano-generated/...` (missing), so every workflow
+    // that imports a generated module fails to load and is silently skipped —
+    // the derivation returns `[]` and the panel shows "No workflows found".
+    // Rooted at the project dir, the relative specifiers resolve exactly as they
+    // do for the project's own `deno.json`, spaces in the path and all.
     let map_name = format!(".nano-derivemap-{}-{}.json", std::process::id(), seq);
-    let map_path = cache.join(&map_name);
+    let map_path = dir.join(&map_name);
     std::fs::write(&map_path, synthesize_generate_import_map(&dir))
         .map_err(|e| format!("write import map: {e}"))?;
 
@@ -4224,10 +4235,16 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
 
     let seq = DERIVE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-    // The synthesized import map lives in the cache dir (the only writable scope);
-    // `--no-config` disables `deno.json` discovery so the flag map is the sole map.
+    // Synthesized import map, written at the PROJECT ROOT (not `.deno-cache`) so
+    // its relative values resolve against the project dir — a code-first
+    // project's `deno.json` maps generated local modules with relative specifiers
+    // (`"@nanobpm/domain": "./nano-generated/domain.ts"`), and Deno resolves an
+    // import map's relative values against the MAP FILE's own URL. From the cache
+    // dir they would resolve to `<project>/.deno-cache/nano-generated/...`
+    // (missing), silently skipping every workflow that imports one. `--no-config`
+    // disables `deno.json` discovery so the flag map is the sole map.
     let map_name = format!(".nano-genmap-{}-{}.json", std::process::id(), seq);
-    let map_path = cache.join(&map_name);
+    let map_path = dir.join(&map_name);
     std::fs::write(&map_path, synthesize_generate_import_map(&dir))
         .map_err(|e| format!("write import map: {e}"))?;
 
@@ -5474,6 +5491,76 @@ mod tests {
             std::env::set_var("NANOBPMN_PROJECTS_DIR", &p);
         }
         p
+    }
+
+    #[test]
+    fn synthesize_import_map_keeps_relative_specifiers_and_adds_defaults() {
+        // A code-first project's deno.json maps its generated local modules with
+        // RELATIVE specifiers. The synthesized map must preserve them verbatim
+        // (the map is written at the project root, so they resolve there) and add
+        // the SDK + layout defaults only when the project didn't declare them.
+        // Regression guard for "No workflows found" — see derive_models: a map in
+        // .deno-cache/ made `./nano-generated/*` resolve to the wrong dir and
+        // every workflow importing a generated module was silently skipped.
+        let dir = temp_root();
+        std::fs::write(
+            dir.join("deno.json"),
+            r#"{ "imports": {
+                "@nanobpm/workflow": "npm:@nanobpm/workflow@^0.4.0",
+                "@nanobpm/domain": "./nano-generated/domain.ts",
+                "@nanobpm/data": "./nano-generated/data-sdk.ts"
+            } }"#,
+        )
+        .unwrap();
+
+        let map: serde_json::Value =
+            serde_json::from_str(&synthesize_generate_import_map(&dir)).unwrap();
+        let imports = map.get("imports").and_then(|v| v.as_object()).unwrap();
+
+        // Relative specifiers preserved exactly (NOT rewritten into the cache dir).
+        assert_eq!(
+            imports["@nanobpm/domain"].as_str(),
+            Some("./nano-generated/domain.ts")
+        );
+        assert_eq!(
+            imports["@nanobpm/data"].as_str(),
+            Some("./nano-generated/data-sdk.ts")
+        );
+        // The project's own SDK pin wins over the default.
+        assert_eq!(
+            imports["@nanobpm/workflow"].as_str(),
+            Some("npm:@nanobpm/workflow@^0.4.0")
+        );
+        // The layout peer dep, undeclared by the project, is defaulted in.
+        assert!(
+            imports["bpmn-auto-layout"]
+                .as_str()
+                .unwrap()
+                .starts_with("npm:bpmn-auto-layout@")
+        );
+    }
+
+    #[test]
+    fn synthesize_import_map_defaults_sdk_when_project_omits_it() {
+        // A project with no deno.json imports still gets both defaults so the
+        // derivation driver's own `@nanobpm/workflow` + `bpmn-auto-layout` imports
+        // resolve.
+        let dir = temp_root();
+        let map: serde_json::Value =
+            serde_json::from_str(&synthesize_generate_import_map(&dir)).unwrap();
+        let imports = map.get("imports").and_then(|v| v.as_object()).unwrap();
+        assert!(
+            imports["@nanobpm/workflow"]
+                .as_str()
+                .unwrap()
+                .starts_with("npm:@nanobpm/workflow@")
+        );
+        assert!(
+            imports["bpmn-auto-layout"]
+                .as_str()
+                .unwrap()
+                .starts_with("npm:bpmn-auto-layout@")
+        );
     }
 
     #[test]
