@@ -670,10 +670,10 @@ function LiveConsumersPanel() {
                         <td className="py-1.5 pr-3 whitespace-nowrap">
                           <span className="inline-flex items-center gap-1.5">
                             <span
+                              aria-hidden="true"
                               className={`inline-block h-1.5 w-1.5 rounded-full ${
                                 c.status === "live" ? "bg-ok" : "bg-fg-faint"
                               }`}
-                              title={c.status === "live" ? "Live" : "Idle"}
                             />
                             <span
                               className={
@@ -682,6 +682,7 @@ function LiveConsumersPanel() {
                                   : "text-fg-faint"
                               }
                             >
+                              {c.status === "live" ? "Live" : "Idle"} ·{" "}
                               {fmtAge(c.ageMs)}
                             </span>
                           </span>
