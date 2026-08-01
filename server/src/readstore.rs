@@ -2586,7 +2586,14 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         }
 
         // A correlated or cancelled subscription is no longer waiting: drop it.
+        // `RemoteMessageCorrelation` is the multi-partition counterpart of
+        // `MessageCorrelated` — when the process instance lives on another
+        // partition, the message partition settles the canonical subscription
+        // with this event instead, so it must clear the row too.
         Event::MessageCorrelated {
+            subscription_key, ..
+        }
+        | Event::RemoteMessageCorrelation {
             subscription_key, ..
         }
         | Event::MessageSubscriptionCanceled {
@@ -4140,6 +4147,34 @@ mod element_instance_tests {
         assert_eq!(store.message_subscriptions().len(), 1);
         store
             .export(&[&Event::ProcessInstanceTerminated { instance_key: INST }])
+            .unwrap();
+        assert!(store.message_subscriptions().is_empty());
+
+        // A remote correlation (multi-partition: the instance lives elsewhere)
+        // settles the canonical subscription with RemoteMessageCorrelation and
+        // must also clear the row.
+        store
+            .export(&[&Event::MessageSubscriptionCreated {
+                subscription_key: 3004,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+                message_name: "OrderPlaced".to_string(),
+                correlation_key: "A3".to_string(),
+                kind: MessageSubscriptionKind::IntermediateCatch,
+            }])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1);
+        store
+            .export(&[&Event::RemoteMessageCorrelation {
+                subscription_key: 3004,
+                message_key: 10,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+                kind: MessageSubscriptionKind::IntermediateCatch,
+                variables: std::collections::HashMap::new(),
+            }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
     }
