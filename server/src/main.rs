@@ -7541,7 +7541,7 @@ impl ServerImpl {
                 None => true,
                 Some(f) => {
                     let state_str = element_instance_state_enum(ei.state).to_string();
-                    let name = ei.element_name.as_deref().unwrap_or("");
+                    let name = ei.element_name.as_deref().unwrap_or(ei.element_id.as_str());
                     f.element_instance_key
                         .as_ref()
                         .is_none_or(|k| k.0 == ei.element_instance_key.to_string())
@@ -7588,7 +7588,11 @@ impl ServerImpl {
                 }
                 "processDefinitionId" => query::SortVal::Str(ei.process_definition_id.clone()),
                 "elementId" => query::SortVal::Str(ei.element_id.clone()),
-                "elementName" => query::SortVal::Str(ei.element_name.clone().unwrap_or_default()),
+                "elementName" => query::SortVal::Str(
+                    ei.element_name
+                        .clone()
+                        .unwrap_or_else(|| ei.element_id.clone()),
+                ),
                 "type" => query::SortVal::Str(ei.element_type.clone()),
                 "state" => query::SortVal::Str(element_instance_state_enum(ei.state).to_string()),
                 "startDate" => query::SortVal::Num(ei.start_date_ms as i64),

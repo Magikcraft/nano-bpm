@@ -912,7 +912,9 @@ impl ReadStore {
                  DROP TABLE IF EXISTS incidents;
              DROP TABLE IF EXISTS user_tasks;
                  DROP TABLE IF EXISTS variables;
-                 DROP TABLE IF EXISTS meta;",
+             DROP TABLE IF EXISTS definition_elements;
+             DROP TABLE IF EXISTS element_instances;
+             DROP TABLE IF EXISTS meta;",
             )?;
         }
         self.ensure_schema()?;
