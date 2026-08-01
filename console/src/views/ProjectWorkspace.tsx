@@ -91,6 +91,15 @@ import {
   debug,
   type DebugEntry,
 } from "../lib/debugBus";
+import {
+  type DirState,
+  collectDirPaths,
+  isDirOpen,
+  loadDirState,
+  pruneDirState,
+  serializeDirState,
+  toggleDir,
+} from "./explorerDirState";
 
 // All route-level lazy chunks + their shared fallback. Declared here, below the
 // full import block, so every `import` stays contiguous at the top of the module
@@ -744,6 +753,63 @@ function FileBrowser({
   onChanged: () => void;
 }) {
   const [newFileOpen, setNewFileOpen] = useState(false);
+  // Persist which directories are collapsed/expanded, per project, so the tree
+  // reopens as the user left it across navigation, live refetches, and reloads.
+  // Divergences from the depth-based default are stored under this key; folders
+  // absent from the map use the default (top two levels open). See
+  // explorerDirState.ts.
+  const dirStateKey = `nano.project.${name}.explorerDirs`;
+  const [dirState, setDirState] = useState<DirState>(() => {
+    try {
+      return loadDirState(localStorage.getItem(dirStateKey));
+    } catch {
+      // Reading localStorage itself can throw (blocked storage, sandboxed
+      // frame); fall back to the in-memory default rather than crash the
+      // workspace.
+      return loadDirState(null);
+    }
+  });
+  // Mirror the latest state in a ref so the toggle/prune handlers can compute
+  // the next value and persist it *outside* the state updater — React updaters
+  // must stay pure (StrictMode/concurrent may re-invoke or discard them), so
+  // the localStorage write can't live inside `setDirState(...)`. Mirrors the
+  // existing `consoleHeightRef` pattern in this component.
+  const dirStateRef = useRef(dirState);
+  dirStateRef.current = dirState;
+  const persistDirState = useCallback(
+    (next: DirState) => {
+      try {
+        localStorage.setItem(dirStateKey, serializeDirState(next));
+      } catch {
+        // localStorage may be unavailable/full; the in-memory state still works
+        // for this session, so a write failure must not break the explorer.
+      }
+    },
+    [dirStateKey],
+  );
+  const commitDirState = useCallback(
+    (next: DirState) => {
+      dirStateRef.current = next;
+      setDirState(next);
+      persistDirState(next);
+    },
+    [persistDirState],
+  );
+  const onToggleDir = useCallback(
+    (path: string, depth: number) => {
+      commitDirState(toggleDir(dirStateRef.current, path, depth));
+    },
+    [commitDirState],
+  );
+  // Drop overrides for directories that no longer exist (renamed/deleted), so
+  // stale entries don't accumulate in localStorage. FileBrowser only renders
+  // once `detail` has loaded, so an empty `files` means a genuinely empty
+  // project (not "still loading") — pruning against an empty set then correctly
+  // clears any leftover overrides.
+  useEffect(() => {
+    const pruned = pruneDirState(dirStateRef.current, collectDirPaths(files));
+    if (pruned !== dirStateRef.current) commitDirState(pruned);
+  }, [files, commitDirState]);
   const newFolder = async () => {
     const base = prompt("New folder path (project-relative):", "resources/");
     if (!base) return;
@@ -816,6 +882,8 @@ function FileBrowser({
           nodes={files}
           depth={0}
           selected={selected}
+          dirState={dirState}
+          onToggleDir={onToggleDir}
           onSelect={onSelect}
           onDelete={del}
           onContextMenu={openMenu}
@@ -1196,6 +1264,8 @@ function FileTree({
   nodes,
   depth,
   selected,
+  dirState,
+  onToggleDir,
   onSelect,
   onDelete,
   onContextMenu,
@@ -1203,6 +1273,8 @@ function FileTree({
   nodes: FileNode[];
   depth: number;
   selected: string | null;
+  dirState: DirState;
+  onToggleDir: (path: string, depth: number) => void;
   onSelect: (p: string) => void;
   onDelete: (p: string) => void;
   onContextMenu: (e: React.MouseEvent, node: FileNode) => void;
@@ -1215,6 +1287,8 @@ function FileTree({
           node={node}
           depth={depth}
           selected={selected}
+          dirState={dirState}
+          onToggleDir={onToggleDir}
           onSelect={onSelect}
           onDelete={onDelete}
           onContextMenu={onContextMenu}
@@ -1228,6 +1302,8 @@ function TreeNode({
   node,
   depth,
   selected,
+  dirState,
+  onToggleDir,
   onSelect,
   onDelete,
   onContextMenu,
@@ -1235,18 +1311,20 @@ function TreeNode({
   node: FileNode;
   depth: number;
   selected: string | null;
+  dirState: DirState;
+  onToggleDir: (path: string, depth: number) => void;
   onSelect: (p: string) => void;
   onDelete: (p: string) => void;
   onContextMenu: (e: React.MouseEvent, node: FileNode) => void;
 }) {
-  const [open, setOpen] = useState(depth < 2);
   const pad = { paddingLeft: `${depth * 12 + 8}px` };
   if (node.kind === "dir") {
+    const open = isDirOpen(dirState, node.path, depth);
     return (
       <li>
         <div
           style={pad}
-          onClick={() => setOpen((v) => !v)}
+          onClick={() => onToggleDir(node.path, depth)}
           onContextMenu={(e) => onContextMenu(e, node)}
           className="group flex cursor-pointer items-center gap-1 rounded py-1 pr-2 text-sm text-fg-muted hover:bg-hover"
         >
@@ -1258,6 +1336,8 @@ function TreeNode({
             nodes={node.children}
             depth={depth + 1}
             selected={selected}
+            dirState={dirState}
+            onToggleDir={onToggleDir}
             onSelect={onSelect}
             onDelete={onDelete}
             onContextMenu={onContextMenu}
