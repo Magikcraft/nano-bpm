@@ -611,6 +611,7 @@ pub enum ReadKind {
     Incident,
     UserTask,
     Variable,
+    ElementInstance,
 }
 
 /// The user-task mutation a [`ClientFrame::ForwardUserTask`] carries.

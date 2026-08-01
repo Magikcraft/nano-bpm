@@ -171,7 +171,7 @@ served set below is the `OVERRIDES` map; the cited line numbers are the checked-
 | **Incidents** | `getIncident`, `resolveIncident`, `searchIncidents` | `main.rs:1045`+. |
 | **Decisions** | `evaluateDecision`, get definition + **XML**, get requirements + **XML**, get instance, delete instance, search (definitions / requirements / instances) | `main.rs:6996`+; DMN evaluated in-engine. |
 | **Process definitions** | get **XML**, `searchProcessDefinitions` | `main.rs` `get_process_definition_xml_impl` / `search_process_definitions_impl`. |
-| **Element instances** | set/create variables, `getVariable`, `searchVariables` | `main.rs:8092`+. |
+| **Element instances** | `getElementInstance`, `searchElementInstances`, set/create variables, `getVariable`, `searchVariables` | `main.rs` `get_element_instance_impl` / `search_element_instances_impl`. Element instances are projected into the read model from the engine's per-element lifecycle events (`ElementActivating`/`ElementActivated`/`ElementCompleted`; process-scope `ProcessInstanceTerminated` terminates still-active elements). **Deviations:** `startDate`/`endDate` are stamped at projection time (the lifecycle events carry no engine-authored timestamp, so a full read-model rebuild re-dates them); `rootProcessInstanceKey` is always null (call-activity hierarchy not yet tracked); inlined call-activity child elements resolve to `type = UNKNOWN`. |
 | **User tasks** | get, search, `assign`, `unassign`, `complete`, `update` | `main.rs:7523`+. |
 | **Cluster** | `getTopology` | `get_topology_impl` (`OVERRIDES` module `cluster`). |
 

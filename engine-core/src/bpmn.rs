@@ -964,6 +964,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
 struct NodeAcc {
     id: String,
     kind: NodeKind,
+    /// The element's BPMN `name` attribute, if present. Purely descriptive;
+    /// surfaced by read models (the element-instance search API's `elementName`).
+    name: Option<String>,
     /// For service tasks: the resolved job type (defaults to the id at build).
     job_type: Option<String>,
     /// For call activities: the `calledElement` / `zeebe:calledElement processId`
@@ -1137,6 +1140,7 @@ impl ProcessAcc {
         self.nodes.push(NodeAcc {
             id: id.to_string(),
             kind,
+            name: attr(attrs, "name").map(str::to_string),
             job_type: None,
             called_process_id: None,
             job_priority: None,
@@ -1376,6 +1380,8 @@ impl ProcessAcc {
             let mi_id = node.id.clone();
             let listeners_id = node.id.clone();
             let task_listeners_id = node.id.clone();
+            let name_id = node.id.clone();
+            let node_name = node.name.clone();
             let node_start_listeners = node.start_listeners.clone();
             let node_end_listeners = node.end_listeners.clone();
             let node_task_listeners = node.task_listeners.clone();
@@ -1535,6 +1541,9 @@ impl ProcessAcc {
             }
             if !node_task_listeners.is_empty() {
                 builder = builder.with_task_listeners(task_listeners_id, node_task_listeners);
+            }
+            if let Some(name) = node_name {
+                builder = builder.with_name(name_id, name);
             }
         }
         for boundary in self.boundaries {
@@ -1853,6 +1862,37 @@ mod tests {
             }
         );
         assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
+    }
+
+    #[test]
+    fn should_capture_the_element_name_attribute() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                  xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+  <bpmn:process id="named" isExecutable="true">
+    <bpmn:startEvent id="s" name="Start Here" />
+    <bpmn:serviceTask id="charge" name="Charge Card">
+      <bpmn:extensionElements>
+        <zeebe:taskDefinition type="payment" />
+      </bpmn:extensionElements>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="charge" />
+    <bpmn:sequenceFlow id="f2" sourceRef="charge" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(
+            def.element("s").unwrap().name.as_deref(),
+            Some("Start Here")
+        );
+        assert_eq!(
+            def.element("charge").unwrap().name.as_deref(),
+            Some("Charge Card")
+        );
+        // An element with no `name` attribute leaves it unset.
+        assert_eq!(def.element("e").unwrap().name, None);
     }
 
     #[test]

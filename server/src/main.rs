@@ -5541,6 +5541,10 @@ impl ServerImpl {
                 .store
                 .variable(key)
                 .map(|v| serde_json::to_value(variable_result(&v))),
+            ReadKind::ElementInstance => self
+                .store
+                .element_instance(key)
+                .map(|x| serde_json::to_value(element_instance_result(&x))),
         };
         match body {
             Some(Ok(v)) => (200, Some(v)),
@@ -7520,6 +7524,158 @@ impl ServerImpl {
         Ok(Resp::Status200_TheJobSearchResult(
             models::JobSearchQueryResult::new(page.response, items),
         ))
+    }
+
+    async fn search_element_instances_impl(
+        &self,
+        body: &Option<models::ElementInstanceSearchQuery>,
+    ) -> Result<apis::element_instance::SearchElementInstancesResponse, ()> {
+        use apis::element_instance::SearchElementInstancesResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let rows = self.store.element_instances();
+
+        let mut matched: Vec<&readstore::ElementInstanceRow> = rows
+            .iter()
+            .filter(|ei| match filter {
+                None => true,
+                Some(f) => {
+                    let state_str = element_instance_state_enum(ei.state).to_string();
+                    let name = ei.element_name.as_deref().unwrap_or("");
+                    f.element_instance_key
+                        .as_ref()
+                        .is_none_or(|k| k.0 == ei.element_instance_key.to_string())
+                        && f.process_instance_key
+                            .as_ref()
+                            .is_none_or(|k| k.0 == ei.instance_key.to_string())
+                        && f.process_definition_key
+                            .as_ref()
+                            .is_none_or(|k| k.0 == ei.process_definition_key)
+                        && f.process_definition_id
+                            .as_deref()
+                            .is_none_or(|v| v == ei.process_definition_id)
+                        && query::match_element_id(&f.element_id, &ei.element_id)
+                        && query::match_string(&f.element_name, name)
+                        && f.r_type.as_deref().is_none_or(|v| v == ei.element_type)
+                        && query::match_element_instance_state(&f.state, &state_str)
+                        && f.has_incident.is_none_or(|want| want == ei.has_incident)
+                        && f.element_instance_scope_key
+                            .as_deref()
+                            .is_none_or(|v| v == ei.scope_key.to_string())
+                        && f.tenant_id.as_deref().is_none_or(|v| {
+                            let t = if ei.tenant_id.is_empty() {
+                                "<default>"
+                            } else {
+                                ei.tenant_id.as_str()
+                            };
+                            v == t
+                        })
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::ElementInstanceSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |ei, field| match field {
+                "processInstanceKey" => query::SortVal::Num(ei.instance_key as i64),
+                "processDefinitionKey" => {
+                    query::SortVal::Num(ei.process_definition_key.parse().unwrap_or(0))
+                }
+                "processDefinitionId" => query::SortVal::Str(ei.process_definition_id.clone()),
+                "elementId" => query::SortVal::Str(ei.element_id.clone()),
+                "elementName" => query::SortVal::Str(ei.element_name.clone().unwrap_or_default()),
+                "type" => query::SortVal::Str(ei.element_type.clone()),
+                "state" => query::SortVal::Str(element_instance_state_enum(ei.state).to_string()),
+                "startDate" => query::SortVal::Num(ei.start_date_ms as i64),
+                "endDate" => query::SortVal::Num(ei.end_date_ms.unwrap_or(0) as i64),
+                _ => query::SortVal::Num(ei.element_instance_key as i64),
+            },
+            |ei| ei.element_instance_key,
+        );
+
+        let sorted: Vec<(u64, &readstore::ElementInstanceRow)> = matched
+            .into_iter()
+            .map(|ei| (ei.element_instance_key, ei))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::ElementInstanceResult> = page
+            .items
+            .into_iter()
+            .map(element_instance_result)
+            .collect();
+
+        Ok(Resp::Status200_TheElementInstanceSearchResult(
+            models::ElementInstanceSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    async fn get_element_instance_impl(
+        &self,
+        path_params: &models::GetElementInstancePathParams,
+    ) -> Result<apis::element_instance::GetElementInstanceResponse, ()> {
+        use apis::element_instance::GetElementInstanceResponse as Resp;
+
+        let key: u64 = match path_params.element_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
+                        "Element instance not found",
+                        404,
+                        format!(
+                            "Element instance key '{}' is not a valid key.",
+                            path_params.element_instance_key
+                        ),
+                    )),
+                );
+            }
+        };
+
+        let result = self.store.element_instance(key);
+        if result.is_none()
+            && let Some(node) = self.read_route(key)
+        {
+            let (status, body) = self
+                .forward_get(node, crate::falcon::ReadKind::ElementInstance, key)
+                .await;
+            return Ok(match (status, body) {
+                (200, Some(b)) => match serde_json::from_value(b) {
+                    Ok(r) => Resp::Status200_TheElementInstanceIsSuccessfullyReturned(r),
+                    Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                        problem("Peer error", 500, e.to_string()),
+                    ),
+                },
+                (404, _) => Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
+                    "Element instance not found",
+                    404,
+                    format!("No element instance with key {key}."),
+                )),
+                (s, _) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Peer error",
+                        500,
+                        format!("peer node {node} returned status {s}"),
+                    ))
+                }
+            });
+        }
+        match result {
+            Some(row) => Ok(Resp::Status200_TheElementInstanceIsSuccessfullyReturned(
+                element_instance_result(&row),
+            )),
+            None => Ok(
+                Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
+                    "Element instance not found",
+                    404,
+                    format!("No element instance with key {key}."),
+                )),
+            ),
+        }
     }
 
     async fn search_user_tasks_impl(
@@ -13767,6 +13923,64 @@ fn process_instance_state_enum(state: ProcessInstanceState) -> models::ProcessIn
     }
 }
 
+/// Maps a read-model [`readstore::ElementInstanceState`] to the REST element
+/// instance state enum.
+fn element_instance_state_enum(
+    state: readstore::ElementInstanceState,
+) -> models::ElementInstanceStateEnum {
+    match state {
+        readstore::ElementInstanceState::Active => models::ElementInstanceStateEnum::Active,
+        readstore::ElementInstanceState::Completed => models::ElementInstanceStateEnum::Completed,
+        readstore::ElementInstanceState::Terminated => models::ElementInstanceStateEnum::Terminated,
+    }
+}
+
+/// Projects an [`ElementInstanceRow`] into the generated `ElementInstanceResult`.
+/// `elementName` falls back to the element id when the deployed model carried no
+/// `name` attribute; `rootProcessInstanceKey` is not yet tracked (call-activity
+/// hierarchy is a follow-up) and always projects null.
+fn element_instance_result(row: &readstore::ElementInstanceRow) -> models::ElementInstanceResult {
+    let start_date =
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.start_date_ms as i64)
+            .unwrap_or_else(epoch);
+    let end_date = match row.end_date_ms {
+        Some(ms) => chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+            .map(types::Nullable::Present)
+            .unwrap_or(types::Nullable::Null),
+        None => types::Nullable::Null,
+    };
+    let element_name = row
+        .element_name
+        .clone()
+        .unwrap_or_else(|| row.element_id.clone());
+    let incident_key = match row.incident_key {
+        Some(k) => types::Nullable::Present(models::IncidentKey(k.to_string())),
+        None => types::Nullable::Null,
+    };
+    let tenant_id = if row.tenant_id.is_empty() {
+        "<default>".to_string()
+    } else {
+        row.tenant_id.clone()
+    };
+
+    models::ElementInstanceResult::new(
+        row.process_definition_id.clone(),
+        start_date,
+        end_date,
+        row.element_id.clone(),
+        element_name,
+        row.element_type.clone(),
+        element_instance_state_enum(row.state),
+        row.has_incident,
+        tenant_id,
+        models::ElementInstanceKey(row.element_instance_key.to_string()),
+        models::ProcessInstanceKey(row.instance_key.to_string()),
+        types::Nullable::Null,
+        models::ProcessDefinitionKey(row.process_definition_key.clone()),
+        incident_key,
+    )
+}
+
 /// Maps an engine [`nanobpmn_engine_core::JobState`] to the REST job state enum.
 /// The engine's transient `Activated` (locked to a worker) has no distinct wire
 /// state, so it projects to `CREATED` like any other activatable job.
@@ -18417,6 +18631,113 @@ mod clustered_startup_tests {
             ),
             "an unknown decision instance id is a 404"
         );
+    }
+
+    #[tokio::test]
+    async fn user_task_element_instance_is_queryable_via_search_and_get() {
+        // Element-instance parity: the engine's per-element lifecycle events are
+        // projected into a queryable element-instance read model, surfaced by the
+        // searchElementInstances + getElementInstance endpoints.
+        use apis::element_instance::GetElementInstanceResponse as GetResp;
+        use apis::element_instance::SearchElementInstancesResponse as SearchResp;
+        let server = ServerImpl::default();
+
+        // A process that parks on a user task, so its element instance stays
+        // ACTIVE while we query it.
+        let proc = ProcessBuilder::new("approval")
+            .start_event("s")
+            .user_task("review")
+            .with_name("review", "Review Request")
+            .end_event("e")
+            .connect("s", "review")
+            .connect("review", "e")
+            .build()
+            .expect("valid user-task process");
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("approval".to_string(), "approval.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &proc_names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let (instance_key, _completed) = server
+            .create_for_stream(
+                Some("approval".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create the approval instance");
+
+        // Poll the search endpoint until the user-task element is projected.
+        let mut found = None;
+        for _ in 0..200 {
+            let resp = server
+                .search_element_instances_impl(&None)
+                .await
+                .expect("search returns a response");
+            let SearchResp::Status200_TheElementInstanceSearchResult(result) = resp else {
+                panic!("expected a 200 search result");
+            };
+            if let Some(item) = result.items.into_iter().find(|i| i.element_id == "review") {
+                found = Some(item);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let item = found.expect("the user-task element instance is projected");
+        assert_eq!(item.element_name, "Review Request");
+        assert_eq!(item.r_type, "USER_TASK");
+        assert_eq!(item.state, models::ElementInstanceStateEnum::Active);
+        assert_eq!(item.process_instance_key.0, instance_key.to_string());
+        assert!(!item.has_incident);
+
+        // Fetch the same element instance by its key.
+        let key = item.element_instance_key.0.clone();
+        let path = models::GetElementInstancePathParams {
+            element_instance_key: key.clone(),
+        };
+        let resp = server
+            .get_element_instance_impl(&path)
+            .await
+            .expect("get returns a response");
+        let GetResp::Status200_TheElementInstanceIsSuccessfullyReturned(got) = resp else {
+            panic!("expected a 200 get result");
+        };
+        assert_eq!(got.element_id, "review");
+        assert_eq!(got.element_instance_key.0, key);
+
+        // A non-numeric key is a 404, not a 500.
+        let bad = models::GetElementInstancePathParams {
+            element_instance_key: "not-a-key".to_string(),
+        };
+        let resp = server
+            .get_element_instance_impl(&bad)
+            .await
+            .expect("get returns a response");
+        assert!(matches!(
+            resp,
+            GetResp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(_)
+        ));
+
+        // An unknown numeric key is a 404.
+        let missing = models::GetElementInstancePathParams {
+            element_instance_key: "999999999".to_string(),
+        };
+        let resp = server
+            .get_element_instance_impl(&missing)
+            .await
+            .expect("get returns a response");
+        assert!(matches!(
+            resp,
+            GetResp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(_)
+        ));
     }
 
     #[tokio::test]
