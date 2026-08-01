@@ -6904,6 +6904,327 @@ impl ServerImpl {
         ))
     }
 
+    /// Searches incidents scoped to a single "root" element instance (path
+    /// parameter): the element instance itself plus every element instance
+    /// contained transitively within its variable/token scope subtree (embedded
+    /// sub-processes, multi-instance bodies). Nano expands call activities inline
+    /// at deploy time, so this subtree — not a separate child process instance —
+    /// is where a call activity's incidents live. Reuses the incident read model
+    /// and the same `IncidentSearchQuery` filter algebra as `searchIncidents`,
+    /// intersecting matches with the scope subtree. Returns 404 when the path
+    /// element instance is unknown to this node's read model.
+    async fn search_element_instance_incidents_impl(
+        &self,
+        path_params: &models::SearchElementInstanceIncidentsPathParams,
+        body: &models::IncidentSearchQuery,
+    ) -> Result<apis::element_instance::SearchElementInstanceIncidentsResponse, ()> {
+        use apis::element_instance::SearchElementInstanceIncidentsResponse as Resp;
+
+        let root_key: u64 = match path_params.element_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
+                        "Element instance not found",
+                        404,
+                        format!(
+                            "Element instance key '{}' is not a valid key.",
+                            path_params.element_instance_key
+                        ),
+                    )),
+                );
+            }
+        };
+
+        let element_instances = self.store.element_instances();
+        let Some(root) = element_instances
+            .iter()
+            .find(|ei| ei.element_instance_key == root_key)
+        else {
+            return Ok(
+                Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(problem(
+                    "Element instance not found",
+                    404,
+                    format!("No element instance with key {root_key}."),
+                )),
+            );
+        };
+
+        // Transitive scope-subtree closure rooted at `root_key`: an element
+        // instance is contained if it *is* the root or its enclosing scope is
+        // already contained. All descendants share the root's process instance,
+        // so only that instance's rows are considered. Iterate to a fixpoint
+        // (rows are unordered, so one pass is insufficient for deep nesting).
+        let mut contained: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        contained.insert(root_key);
+        loop {
+            let mut grew = false;
+            for ei in &element_instances {
+                if ei.instance_key != root.instance_key {
+                    continue;
+                }
+                if !contained.contains(&ei.element_instance_key)
+                    && contained.contains(&ei.scope_key)
+                {
+                    contained.insert(ei.element_instance_key);
+                    grew = true;
+                }
+            }
+            if !grew {
+                break;
+            }
+        }
+
+        let filter = body.filter.as_ref();
+        let incidents = self.store.incidents();
+        let mut matched: Vec<&readstore::IncidentRow> = incidents
+            .iter()
+            .filter(|inc| contained.contains(&inc.element_instance_key))
+            .filter(|inc| match filter {
+                None => true,
+                Some(f) => {
+                    query::match_basic_string(&f.incident_key, &inc.key.to_string())
+                        && query::match_process_instance_key(
+                            &f.process_instance_key,
+                            &inc.instance_key.to_string(),
+                        )
+                        && query::match_element_instance_key(
+                            &f.element_instance_key,
+                            &inc.element_instance_key.to_string(),
+                        )
+                        && query::match_process_definition_key(
+                            &f.process_definition_key,
+                            &inc.process_definition_key,
+                        )
+                        && match &f.job_key {
+                            None => true,
+                            some => query::match_job_key(
+                                some,
+                                &inc.job_key.map(|k| k.to_string()).unwrap_or_default(),
+                            ),
+                        }
+                        && query::match_incident_state(
+                            &f.state,
+                            &incident_state_enum(inc.state).to_string(),
+                        )
+                        && query::match_incident_error_type(
+                            &f.error_type,
+                            &incident_error_type_enum(inc.kind).to_string(),
+                        )
+                        && query::match_string(&f.element_id, &inc.element_id)
+                        && query::match_string(&f.error_message, &inc.reason)
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.sort.as_ref(),
+            |r: &models::IncidentSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |inc, field| match field {
+                "creationTime" => query::SortVal::Num(inc.created_at_ms as i64),
+                "state" => query::SortVal::Str(incident_state_enum(inc.state).to_string()),
+                "errorType" => query::SortVal::Str(incident_error_type_enum(inc.kind).to_string()),
+                "processInstanceKey" => query::SortVal::Num(inc.instance_key as i64),
+                "elementId" => query::SortVal::Str(inc.element_id.clone()),
+                _ => query::SortVal::Num(inc.key as i64),
+            },
+            |inc| inc.key,
+        );
+
+        let sorted: Vec<(u64, &readstore::IncidentRow)> =
+            matched.into_iter().map(|inc| (inc.key, inc)).collect();
+        let page = query::paginate(sorted, body.page.as_ref());
+        let items: Vec<models::IncidentResult> =
+            page.items.into_iter().map(incident_result).collect();
+
+        Ok(Resp::Status200_TheElementInstanceIncidentSearchResult(
+            models::IncidentSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    /// Searches element-instance wait states: element instances currently parked
+    /// waiting on an external interaction. Two sources feed it — active jobs
+    /// (`JOB`, waiting for a worker) from the jobs read model, and open message
+    /// subscriptions (`MESSAGE`, waiting for a correlated message) from the
+    /// message-subscription read model. `rootProcessInstanceKey` equals
+    /// `processInstanceKey` (Nano self-roots every instance; see
+    /// `element_instance_result`). Local read-model scan, matching the other
+    /// `search*` endpoints.
+    async fn search_element_instance_wait_states_impl(
+        &self,
+        body: &Option<models::ElementInstanceWaitStateQuery>,
+    ) -> Result<apis::element_instance::SearchElementInstanceWaitStatesResponse, ()> {
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+
+        // `elementType` and `tenantId` are resolved from the element-instance
+        // read model (the jobs/subscriptions rows do not carry them).
+        let element_instances = self.store.element_instances();
+        let ei_by_key: std::collections::HashMap<u64, &readstore::ElementInstanceRow> =
+            element_instances
+                .iter()
+                .map(|e| (e.element_instance_key, e))
+                .collect();
+        let resolve = |eik: u64, fallback_element_id: &str| -> (String, String, String) {
+            match ei_by_key.get(&eik) {
+                Some(ei) => (
+                    ei.element_type.clone(),
+                    if ei.tenant_id.is_empty() {
+                        "<default>".to_string()
+                    } else {
+                        ei.tenant_id.clone()
+                    },
+                    ei.element_id.clone(),
+                ),
+                None => (
+                    "UNKNOWN".to_string(),
+                    "<default>".to_string(),
+                    fallback_element_id.to_string(),
+                ),
+            }
+        };
+
+        struct WaitState {
+            element_instance_key: u64,
+            process_instance_key: u64,
+            element_id: String,
+            element_type: String,
+            tenant_id: String,
+            wait_state_type: models::WaitStateTypeEnum,
+            job: Option<models::JobWaitStateDetails>,
+            message: Option<models::MessageWaitStateDetails>,
+        }
+
+        let mut states: Vec<WaitState> = Vec::new();
+
+        // JOB wait states: an element instance parked on an activatable/locked
+        // job (`Created`/`Activated`). Failed/terminal jobs are not wait states.
+        for job in self.store.jobs() {
+            use nanobpmn_engine_core::JobState;
+            if !matches!(job.state, JobState::Created | JobState::Activated) {
+                continue;
+            }
+            let (element_type, tenant_id, element_id) =
+                resolve(job.element_instance_key, &job.element_id);
+            let (job_kind, listener_event_type_enum) = job_kind_enums(&job.kind);
+            // `listenerEventType` is only meaningful for listener jobs.
+            let listener_event_type = if matches!(job_kind, models::JobKindEnum::BpmnElement) {
+                types::Nullable::Null
+            } else {
+                types::Nullable::Present(listener_event_type_enum)
+            };
+            states.push(WaitState {
+                element_instance_key: job.element_instance_key,
+                process_instance_key: job.instance_key,
+                element_id,
+                element_type,
+                tenant_id,
+                wait_state_type: models::WaitStateTypeEnum::Job,
+                job: Some(models::JobWaitStateDetails::new(
+                    models::JobKey(job.key.to_string()),
+                    job.job_type.clone(),
+                    job_kind,
+                    listener_event_type,
+                    types::Nullable::Present(job.retries),
+                )),
+                message: None,
+            });
+        }
+
+        // MESSAGE wait states: an element instance parked on an open message
+        // subscription. Correlation key is null for start events (never tracked
+        // here) so an empty stored key projects as null.
+        for sub in self.store.message_subscriptions() {
+            let (element_type, tenant_id, element_id) =
+                resolve(sub.element_instance_key, &sub.element_id);
+            let correlation_key = if sub.correlation_key.is_empty() {
+                types::Nullable::Null
+            } else {
+                types::Nullable::Present(sub.correlation_key.clone())
+            };
+            states.push(WaitState {
+                element_instance_key: sub.element_instance_key,
+                process_instance_key: sub.instance_key,
+                element_id,
+                element_type,
+                tenant_id,
+                wait_state_type: models::WaitStateTypeEnum::Message,
+                job: None,
+                message: Some(models::MessageWaitStateDetails::new(
+                    sub.message_name.clone(),
+                    correlation_key,
+                )),
+            });
+        }
+
+        let mut matched: Vec<WaitState> = states
+            .into_iter()
+            .filter(|ws| match filter {
+                None => true,
+                Some(f) => {
+                    query::match_element_instance_key(
+                        &f.element_instance_key,
+                        &ws.element_instance_key.to_string(),
+                    ) && query::match_process_instance_key(
+                        &f.process_instance_key,
+                        &ws.process_instance_key.to_string(),
+                    ) && query::match_process_instance_key(
+                        &f.root_process_instance_key,
+                        &ws.process_instance_key.to_string(),
+                    ) && query::match_element_id(&f.element_id, &ws.element_id)
+                        && query::match_wait_state_element_type(&f.element_type, &ws.element_type)
+                        && query::match_wait_state_type(
+                            &f.wait_state_type,
+                            &ws.wait_state_type.to_string(),
+                        )
+                }
+            })
+            .collect();
+
+        // No sort field on the wait-state query; order by element instance key
+        // for stable cursor pagination.
+        matched.sort_by_key(|ws| ws.element_instance_key);
+        let sorted: Vec<(u64, WaitState)> = matched
+            .into_iter()
+            .map(|ws| (ws.element_instance_key, ws))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::ElementInstanceWaitStateResult> = page
+            .items
+            .into_iter()
+            .map(|ws| {
+                models::ElementInstanceWaitStateResult::new(
+                    ws.wait_state_type,
+                    types::Nullable::Present(models::ProcessInstanceKey(
+                        ws.process_instance_key.to_string(),
+                    )),
+                    models::ProcessInstanceKey(ws.process_instance_key.to_string()),
+                    models::ElementInstanceKey(ws.element_instance_key.to_string()),
+                    ws.element_id,
+                    wait_state_element_type(&ws.element_type),
+                    ws.tenant_id,
+                    match ws.job {
+                        Some(d) => types::Nullable::Present(d),
+                        None => types::Nullable::Null,
+                    },
+                    match ws.message {
+                        Some(d) => types::Nullable::Present(d),
+                        None => types::Nullable::Null,
+                    },
+                )
+            })
+            .collect();
+
+        Ok(Resp::Status200_TheElementInstanceWaitStateSearchResult(
+            models::ElementInstanceWaitStateQueryResult::new(page.response, items),
+        ))
+    }
+
     /// Returns a single decision instance by its `<decisionEvaluationKey>-<index>`
     /// id from the read model. A pure read; scans every owned shard because the
     /// composite id does not encode a partition.
@@ -7539,38 +7860,7 @@ impl ServerImpl {
             .iter()
             .filter(|ei| match filter {
                 None => true,
-                Some(f) => {
-                    let state_str = element_instance_state_enum(ei.state).to_string();
-                    let name = ei.element_name.as_deref().unwrap_or(ei.element_id.as_str());
-                    f.element_instance_key
-                        .as_ref()
-                        .is_none_or(|k| k.0 == ei.element_instance_key.to_string())
-                        && f.process_instance_key
-                            .as_ref()
-                            .is_none_or(|k| k.0 == ei.instance_key.to_string())
-                        && f.process_definition_key
-                            .as_ref()
-                            .is_none_or(|k| k.0 == ei.process_definition_key)
-                        && f.process_definition_id
-                            .as_deref()
-                            .is_none_or(|v| v == ei.process_definition_id)
-                        && query::match_element_id(&f.element_id, &ei.element_id)
-                        && query::match_string(&f.element_name, name)
-                        && f.r_type.as_deref().is_none_or(|v| v == ei.element_type)
-                        && query::match_element_instance_state(&f.state, &state_str)
-                        && f.has_incident.is_none_or(|want| want == ei.has_incident)
-                        && f.element_instance_scope_key
-                            .as_deref()
-                            .is_none_or(|v| v == ei.scope_key.to_string())
-                        && f.tenant_id.as_deref().is_none_or(|v| {
-                            let t = if ei.tenant_id.is_empty() {
-                                "<default>"
-                            } else {
-                                ei.tenant_id.as_str()
-                            };
-                            v == t
-                        })
-                }
+                Some(f) => match_element_instance_filter(ei, f),
             })
             .collect();
 
@@ -13927,6 +14217,92 @@ fn process_instance_state_enum(state: ProcessInstanceState) -> models::ProcessIn
     }
 }
 
+/// Tests one element-instance row against a single set of element-instance
+/// filter fields (the shared field set of `ElementInstanceFilter` and its `$or`
+/// clause type `ElementInstanceFilterFields`). Callers combine the top-level
+/// fields with the `$or` clauses (AND of top-level, OR across clauses).
+fn match_element_instance_fields(
+    ei: &readstore::ElementInstanceRow,
+    f: &models::ElementInstanceFilterFields,
+) -> bool {
+    let state_str = element_instance_state_enum(ei.state).to_string();
+    let name = ei.element_name.as_deref().unwrap_or(ei.element_id.as_str());
+    f.element_instance_key
+        .as_ref()
+        .is_none_or(|k| k.0 == ei.element_instance_key.to_string())
+        && f.process_instance_key
+            .as_ref()
+            .is_none_or(|k| k.0 == ei.instance_key.to_string())
+        && f.process_definition_key
+            .as_ref()
+            .is_none_or(|k| k.0 == ei.process_definition_key)
+        && f.process_definition_id
+            .as_deref()
+            .is_none_or(|v| v == ei.process_definition_id)
+        && query::match_element_id(&f.element_id, &ei.element_id)
+        && query::match_string(&f.element_name, name)
+        && f.r_type.as_deref().is_none_or(|v| v == ei.element_type)
+        && query::match_element_instance_state(&f.state, &state_str)
+        && f.has_incident.is_none_or(|want| want == ei.has_incident)
+        && f.incident_key
+            .as_ref()
+            .is_none_or(|k| ei.incident_key.is_some_and(|ik| k.0 == ik.to_string()))
+        && f.element_instance_scope_key
+            .as_deref()
+            .is_none_or(|v| v == ei.scope_key.to_string())
+        && f.tenant_id.as_deref().is_none_or(|v| {
+            let t = if ei.tenant_id.is_empty() {
+                "<default>"
+            } else {
+                ei.tenant_id.as_str()
+            };
+            v == t
+        })
+}
+
+/// Copies the shared filter fields out of a top-level `ElementInstanceFilter`
+/// into an `ElementInstanceFilterFields` so the top-level base match reuses the
+/// same predicate as each `$or` clause. `startDate`/`endDate` date-time filters
+/// are not yet honoured (no date matcher) and are ignored by the predicate.
+fn element_instance_filter_base(
+    f: &models::ElementInstanceFilter,
+) -> models::ElementInstanceFilterFields {
+    models::ElementInstanceFilterFields {
+        process_definition_id: f.process_definition_id.clone(),
+        state: f.state.clone(),
+        r_type: f.r_type.clone(),
+        element_id: f.element_id.clone(),
+        element_name: f.element_name.clone(),
+        has_incident: f.has_incident,
+        tenant_id: f.tenant_id.clone(),
+        element_instance_key: f.element_instance_key.clone(),
+        process_instance_key: f.process_instance_key.clone(),
+        process_definition_key: f.process_definition_key.clone(),
+        incident_key: f.incident_key.clone(),
+        start_date: f.start_date.clone(),
+        end_date: f.end_date.clone(),
+        element_instance_scope_key: f.element_instance_scope_key.clone(),
+    }
+}
+
+/// Full element-instance filter match: the top-level fields must all match AND,
+/// when a non-empty `$or` list is present, at least one of its clauses must
+/// match (each clause is itself an AND of its fields).
+fn match_element_instance_filter(
+    ei: &readstore::ElementInstanceRow,
+    f: &models::ElementInstanceFilter,
+) -> bool {
+    if !match_element_instance_fields(ei, &element_instance_filter_base(f)) {
+        return false;
+    }
+    match &f.dollar_or {
+        Some(clauses) if !clauses.is_empty() => {
+            clauses.iter().any(|c| match_element_instance_fields(ei, c))
+        }
+        _ => true,
+    }
+}
+
 /// Maps a read-model [`readstore::ElementInstanceState`] to the REST element
 /// instance state enum.
 fn element_instance_state_enum(
@@ -13939,10 +14315,21 @@ fn element_instance_state_enum(
     }
 }
 
+/// Parses an element type's wire spelling (e.g. `SERVICE_TASK`) into the
+/// `WaitStateElementTypeEnum`, leaning on serde's rename map. Falls back to
+/// `Unknown` for any type the read model stored that the enum doesn't cover.
+fn wait_state_element_type(wire: &str) -> models::WaitStateElementTypeEnum {
+    serde_json::from_str(&format!("\"{wire}\""))
+        .unwrap_or(models::WaitStateElementTypeEnum::Unknown)
+}
+
 /// Projects an [`ElementInstanceRow`] into the generated `ElementInstanceResult`.
 /// `elementName` falls back to the element id when the deployed model carried no
-/// `name` attribute; `rootProcessInstanceKey` is not yet tracked (call-activity
-/// hierarchy is a follow-up) and always projects null.
+/// `name` attribute. `rootProcessInstanceKey` equals `processInstanceKey`: Nano
+/// expands call activities inline at deploy time (`inline_call_activities`) and
+/// never spawns a separate child process instance, so every element instance
+/// lives in a self-rooted tree — matching Camunda's `root == self` for a
+/// top-level instance.
 fn element_instance_result(row: &readstore::ElementInstanceRow) -> models::ElementInstanceResult {
     let start_date =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.start_date_ms as i64)
@@ -13979,7 +14366,7 @@ fn element_instance_result(row: &readstore::ElementInstanceRow) -> models::Eleme
         tenant_id,
         models::ElementInstanceKey(row.element_instance_key.to_string()),
         models::ProcessInstanceKey(row.instance_key.to_string()),
-        types::Nullable::Null,
+        types::Nullable::Present(models::ProcessInstanceKey(row.instance_key.to_string())),
         models::ProcessDefinitionKey(row.process_definition_key.clone()),
         incident_key,
     )
@@ -18741,6 +19128,470 @@ mod clustered_startup_tests {
         assert!(matches!(
             resp,
             GetResp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn wait_states_surface_parked_jobs_and_message_subscriptions() {
+        // Element-instance parity: searchElementInstanceWaitStates reports element
+        // instances parked on an external interaction — an activatable job (JOB) or
+        // an open message subscription (MESSAGE).
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        let server = ServerImpl::default();
+
+        // One process parks a service-task job; another parks a message catch.
+        let charger = ProcessBuilder::new("charger")
+            .start_event("s")
+            .service_task("charge", "pay")
+            .end_event("e")
+            .connect("s", "charge")
+            .connect("charge", "e")
+            .build()
+            .expect("valid service-task process");
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("charger".to_string(), "charger.bpmn".to_string());
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![charger, waiter],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let (charger_key, _) = server
+            .create_for_stream(
+                Some("charger".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create charger");
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
+        let (waiter_key, _) = server
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create waiter");
+
+        // Poll until both wait states are projected.
+        let items = loop_until_wait_states(&server, None, 2).await;
+        let job = items
+            .iter()
+            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::Job)
+            .expect("a JOB wait state");
+        let msg = items
+            .iter()
+            .find(|w| w.wait_state_type == models::WaitStateTypeEnum::Message)
+            .expect("a MESSAGE wait state");
+
+        // JOB wait state: the service-task element parked on its activatable job.
+        assert_eq!(job.element_id, "charge");
+        assert_eq!(
+            job.element_type,
+            models::WaitStateElementTypeEnum::ServiceTask
+        );
+        assert_eq!(job.process_instance_key.0, charger_key.to_string());
+        // rootProcessInstanceKey is populated and equals the process instance key.
+        assert_eq!(
+            job.root_process_instance_key,
+            types::Nullable::Present(models::ProcessInstanceKey(charger_key.to_string()))
+        );
+        let jd = match &job.job_details {
+            types::Nullable::Present(d) => d,
+            types::Nullable::Null => panic!("JOB wait state carries job details"),
+        };
+        assert_eq!(jd.job_type, "pay");
+        assert_eq!(jd.job_kind, models::JobKindEnum::BpmnElement);
+        // An ordinary element job has no listener event type.
+        assert_eq!(jd.listener_event_type, types::Nullable::Null);
+        assert!(matches!(job.message_details, types::Nullable::Null));
+
+        // MESSAGE wait state: the message catch parked on its open subscription.
+        assert_eq!(msg.element_id, "await");
+        assert_eq!(
+            msg.element_type,
+            models::WaitStateElementTypeEnum::IntermediateCatchEvent
+        );
+        assert_eq!(msg.process_instance_key.0, waiter_key.to_string());
+        let md = match &msg.message_details {
+            types::Nullable::Present(d) => d,
+            types::Nullable::Null => panic!("MESSAGE wait state carries message details"),
+        };
+        assert_eq!(md.message_name, "OrderPlaced");
+        assert_eq!(
+            md.correlation_key,
+            types::Nullable::Present("A1".to_string())
+        );
+        assert!(matches!(msg.job_details, types::Nullable::Null));
+
+        // Filter by waitStateType = MESSAGE yields only the message wait state.
+        let only_msg_filter = models::ElementInstanceWaitStateFilter {
+            wait_state_type: Some(models::WaitStateTypeFilterProperty::WaitStateTypeEnum(
+                models::WaitStateTypeEnum::Message,
+            )),
+            ..models::ElementInstanceWaitStateFilter::new()
+        };
+        let resp = server
+            .search_element_instance_wait_states_impl(&Some(
+                models::ElementInstanceWaitStateQuery {
+                    page: None,
+                    filter: Some(only_msg_filter),
+                },
+            ))
+            .await
+            .expect("filtered search returns");
+        let Resp::Status200_TheElementInstanceWaitStateSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].wait_state_type,
+            models::WaitStateTypeEnum::Message
+        );
+
+        // Filter by processInstanceKey = charger yields only its JOB wait state.
+        let only_charger = models::ElementInstanceWaitStateFilter {
+            process_instance_key: Some(
+                models::ProcessInstanceKeyFilterProperty::ProcessInstanceKey(
+                    models::ProcessInstanceKey(charger_key.to_string()),
+                ),
+            ),
+            ..models::ElementInstanceWaitStateFilter::new()
+        };
+        let resp = server
+            .search_element_instance_wait_states_impl(&Some(
+                models::ElementInstanceWaitStateQuery {
+                    page: None,
+                    filter: Some(only_charger),
+                },
+            ))
+            .await
+            .expect("filtered search returns");
+        let Resp::Status200_TheElementInstanceWaitStateSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    /// Polls `searchElementInstanceWaitStates` until at least `want` items are
+    /// projected *and* every item's element type has resolved (the element
+    /// instance and message/job read models are separate, correlation-hash-placed
+    /// shards, so the type can briefly lag as `UNKNOWN`), returning them.
+    async fn loop_until_wait_states(
+        server: &ServerImpl,
+        filter: Option<models::ElementInstanceWaitStateFilter>,
+        want: usize,
+    ) -> Vec<models::ElementInstanceWaitStateResult> {
+        use apis::element_instance::SearchElementInstanceWaitStatesResponse as Resp;
+        for _ in 0..200 {
+            let resp = server
+                .search_element_instance_wait_states_impl(&Some(
+                    models::ElementInstanceWaitStateQuery {
+                        page: None,
+                        filter: filter.clone(),
+                    },
+                ))
+                .await
+                .expect("wait-state search returns");
+            let Resp::Status200_TheElementInstanceWaitStateSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            if result.items.len() >= want
+                && result
+                    .items
+                    .iter()
+                    .all(|w| w.element_type != models::WaitStateElementTypeEnum::Unknown)
+            {
+                return result.items;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("wait states never reached {want} resolved items");
+    }
+
+    #[tokio::test]
+    async fn search_element_instances_supports_or_filter() {
+        // Follow-up #4: the $or filter returns element instances matching ANY of
+        // its clauses (each clause an AND), on top of the top-level AND.
+        use apis::element_instance::SearchElementInstancesResponse as SearchResp;
+        let server = ServerImpl::default();
+
+        // A parallel fork parks two user tasks simultaneously.
+        let proc = ProcessBuilder::new("fork")
+            .start_event("s")
+            .parallel_gateway("split")
+            .user_task("a")
+            .user_task("b")
+            .parallel_gateway("join")
+            .end_event("e")
+            .connect("s", "split")
+            .connect("split", "a")
+            .connect("split", "b")
+            .connect("a", "join")
+            .connect("b", "join")
+            .connect("join", "e")
+            .build()
+            .expect("valid parallel process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("fork".to_string(), "fork.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let (instance_key, _) = server
+            .create_for_stream(Some("fork".into()), None, std::collections::HashMap::new())
+            .await
+            .expect("create the fork instance");
+
+        // Wait until both user-task element instances are projected.
+        let mut ok = false;
+        for _ in 0..200 {
+            let SearchResp::Status200_TheElementInstanceSearchResult(result) =
+                server.search_element_instances_impl(&None).await.unwrap()
+            else {
+                panic!("expected 200");
+            };
+            let n = result
+                .items
+                .iter()
+                .filter(|i| i.element_id == "a" || i.element_id == "b")
+                .count();
+            if n == 2 {
+                // rootProcessInstanceKey is populated and equals the instance key.
+                for item in &result.items {
+                    assert_eq!(
+                        item.root_process_instance_key,
+                        types::Nullable::Present(models::ProcessInstanceKey(
+                            instance_key.to_string()
+                        ))
+                    );
+                }
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(ok, "both user-task element instances project");
+
+        // $or over element ids a/b returns both.
+        let or_filter = models::ElementInstanceFilter {
+            dollar_or: Some(vec![
+                models::ElementInstanceFilterFields {
+                    element_id: Some(models::ElementIdFilterProperty::String("a".to_string())),
+                    ..models::ElementInstanceFilterFields::new()
+                },
+                models::ElementInstanceFilterFields {
+                    element_id: Some(models::ElementIdFilterProperty::String("b".to_string())),
+                    ..models::ElementInstanceFilterFields::new()
+                },
+            ]),
+            process_instance_key: Some(models::ProcessInstanceKey(instance_key.to_string())),
+            ..models::ElementInstanceFilter::new()
+        };
+        let matched = search_ei_with_filter(&server, or_filter).await;
+        let mut ids: Vec<String> = matched.iter().map(|i| i.element_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+
+        // Top-level AND still constrains the $or: elementId=a AND $or(a,b) → just a.
+        let and_or = models::ElementInstanceFilter {
+            element_id: Some(models::ElementIdFilterProperty::String("a".to_string())),
+            dollar_or: Some(vec![
+                models::ElementInstanceFilterFields {
+                    element_id: Some(models::ElementIdFilterProperty::String("a".to_string())),
+                    ..models::ElementInstanceFilterFields::new()
+                },
+                models::ElementInstanceFilterFields {
+                    element_id: Some(models::ElementIdFilterProperty::String("b".to_string())),
+                    ..models::ElementInstanceFilterFields::new()
+                },
+            ]),
+            process_instance_key: Some(models::ProcessInstanceKey(instance_key.to_string())),
+            ..models::ElementInstanceFilter::new()
+        };
+        let matched = search_ei_with_filter(&server, and_or).await;
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].element_id, "a");
+    }
+
+    /// Runs `searchElementInstances` with the given filter, returning the items.
+    async fn search_ei_with_filter(
+        server: &ServerImpl,
+        filter: models::ElementInstanceFilter,
+    ) -> Vec<models::ElementInstanceResult> {
+        use apis::element_instance::SearchElementInstancesResponse as SearchResp;
+        let query = models::ElementInstanceSearchQuery {
+            page: None,
+            sort: None,
+            filter: Some(filter),
+        };
+        let SearchResp::Status200_TheElementInstanceSearchResult(result) = server
+            .search_element_instances_impl(&Some(query))
+            .await
+            .expect("search returns")
+        else {
+            panic!("expected 200");
+        };
+        result.items
+    }
+
+    #[tokio::test]
+    async fn element_instance_incidents_scope_subtree_and_404() {
+        // Follow-up #5: searchElementInstanceIncidents returns incidents of the
+        // element instance and its scope-subtree descendants; unknown key → 404.
+        // A sub-process gives a real parent scope: the inner service task's
+        // incident must surface when querying the enclosing sub-process instance.
+        use apis::element_instance::SearchElementInstanceIncidentsResponse as Resp;
+        use apis::element_instance::SearchElementInstancesResponse as SearchResp;
+        let server = ServerImpl::default();
+
+        let proc = ProcessBuilder::new("failer")
+            .start_event("s")
+            .sub_process("sub", "sub_start")
+            .start_event("sub_start")
+            .contained_in("sub_start", "sub")
+            .service_task("work", "do-work")
+            .contained_in("work", "sub")
+            .end_event("sub_end")
+            .contained_in("sub_end", "sub")
+            .end_event("e")
+            .connect("s", "sub")
+            .connect("sub_start", "work")
+            .connect("work", "sub_end")
+            .connect("sub", "e")
+            .build()
+            .expect("valid sub-process definition");
+        let mut names = std::collections::HashMap::new();
+        names.insert("failer".to_string(), "failer.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("failer".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create the failer instance");
+
+        // Activate the inner job and fail it with no retries → raises an incident.
+        let jobs = server
+            .activate_for_stream("do-work", "w", 10, 60_000, None)
+            .await;
+        assert_eq!(jobs.len(), 1, "one service-task job is parked");
+        let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
+        server
+            .fail_job_for_stream(job_key, 0, "boom".to_string())
+            .await
+            .expect("fail the job")
+            .wait()
+            .await;
+
+        // Find the inner work element instance (with its incident) and its
+        // enclosing sub-process element instance.
+        let mut found = None;
+        for _ in 0..200 {
+            let SearchResp::Status200_TheElementInstanceSearchResult(result) =
+                server.search_element_instances_impl(&None).await.unwrap()
+            else {
+                panic!("expected 200");
+            };
+            let work = result
+                .items
+                .iter()
+                .find(|i| i.element_id == "work" && i.has_incident);
+            let sub = result.items.iter().find(|i| i.element_id == "sub");
+            if let (Some(w), Some(s)) = (work, sub) {
+                found = Some((
+                    w.element_instance_key.0.clone(),
+                    s.element_instance_key.0.clone(),
+                ));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (work_ei, sub_ei) =
+            found.expect("inner task incident and sub-process instance project");
+
+        let empty_query = models::IncidentSearchQuery {
+            page: None,
+            sort: None,
+            filter: None,
+        };
+
+        // Querying the inner work element instance itself returns its own incident.
+        let path = models::SearchElementInstanceIncidentsPathParams {
+            element_instance_key: work_ei.clone(),
+        };
+        let Resp::Status200_TheElementInstanceIncidentSearchResult(result) = server
+            .search_element_instance_incidents_impl(&path, &empty_query)
+            .await
+            .expect("incidents search returns")
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(
+            result.items[0].process_instance_key.0,
+            instance_key.to_string()
+        );
+
+        // Querying the enclosing sub-process element instance includes the inner
+        // task's incident via the scope-subtree closure.
+        let path = models::SearchElementInstanceIncidentsPathParams {
+            element_instance_key: sub_ei.clone(),
+        };
+        let Resp::Status200_TheElementInstanceIncidentSearchResult(result) = server
+            .search_element_instance_incidents_impl(&path, &empty_query)
+            .await
+            .expect("incidents search returns")
+        else {
+            panic!("expected 200");
+        };
+        assert_eq!(
+            result.items.len(),
+            1,
+            "the sub-process scope sees its descendant's incident"
+        );
+
+        // An unknown element instance key is a 404.
+        let path = models::SearchElementInstanceIncidentsPathParams {
+            element_instance_key: "999999999".to_string(),
+        };
+        let resp = server
+            .search_element_instance_incidents_impl(&path, &empty_query)
+            .await
+            .expect("incidents search returns");
+        assert!(matches!(
+            resp,
+            Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(_)
         ));
     }
 

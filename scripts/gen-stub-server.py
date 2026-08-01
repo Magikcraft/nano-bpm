@@ -62,6 +62,8 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("element_instance", "create_element_instance_variables"): "self.create_element_instance_variables_impl(path_params, body).await",
     ("element_instance", "get_element_instance"): "self.get_element_instance_impl(path_params).await",
     ("element_instance", "search_element_instances"): "self.search_element_instances_impl(body).await",
+    ("element_instance", "search_element_instance_incidents"): "self.search_element_instance_incidents_impl(path_params, body).await",
+    ("element_instance", "search_element_instance_wait_states"): "self.search_element_instance_wait_states_impl(body).await",
     ("message", "publish_message"): "self.publish_message_impl(body).await",
     ("message", "correlate_message"): "self.correlate_message_impl(body).await",
     ("variable", "search_variables"): "self.search_variables_impl(query_params, body).await",
