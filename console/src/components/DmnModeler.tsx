@@ -49,6 +49,10 @@ interface DmnModelerProps {
   /// manifest's domain-type binding (ADR 0029 §5). Called with the active
   /// decision id; returns the variables to add to dmn-js's own inferred set.
   getVariables?: (decisionId: string | undefined) => FeelVariable[];
+  /// Called once the modeler has mounted and finished its initial (blank) load,
+  /// so a parent that fetched a document before the lazy chunk mounted can retry
+  /// the import (mirrors BpmnModeler.onReady).
+  onReady?: () => void;
 }
 
 const EMPTY_DMN = `<?xml version="1.0" encoding="UTF-8"?>
@@ -73,7 +77,7 @@ const EMPTY_DMN = `<?xml version="1.0" encoding="UTF-8"?>
 </definitions>`;
 
 const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
-  function DmnModeler({ onChange, getVariables }, ref) {
+  function DmnModeler({ onChange, getVariables, onReady }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
     // Set once the modeler has been destroyed, so async work already in flight
@@ -86,6 +90,8 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
     const suppressTimerRef = useRef<number | null>(null);
     const onChangeRef = useRef(onChange);
     onChangeRef.current = onChange;
+    const onReadyRef = useRef(onReady);
+    onReadyRef.current = onReady;
     // The bound-type FEEL variable source and the id of the decision currently
     // shown, read live by the variable-resolver provider (ADR 0029 §5).
     const getVariablesRef = useRef(getVariables);
@@ -211,7 +217,9 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
       };
 
       modeler.on("views.changed", handleViewsChanged);
-      void runLoad((m) => m.importXML(EMPTY_DMN));
+      void runLoad((m) => m.importXML(EMPTY_DMN)).finally(() =>
+        onReadyRef.current?.(),
+      );
 
       return () => {
         disposedRef.current = true;
