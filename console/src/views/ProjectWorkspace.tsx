@@ -760,9 +760,16 @@ function FileBrowser({
   // absent from the map use the default (top two levels open). See
   // explorerDirState.ts.
   const dirStateKey = `nano.project.${name}.explorerDirs`;
-  const [dirState, setDirState] = useState<DirState>(() =>
-    loadDirState(localStorage.getItem(dirStateKey)),
-  );
+  const [dirState, setDirState] = useState<DirState>(() => {
+    try {
+      return loadDirState(localStorage.getItem(dirStateKey));
+    } catch {
+      // Reading localStorage itself can throw (blocked storage, sandboxed
+      // frame); fall back to the in-memory default rather than crash the
+      // workspace.
+      return loadDirState(null);
+    }
+  });
   const persistDirState = useCallback(
     (next: DirState) => {
       try {

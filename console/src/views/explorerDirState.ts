@@ -19,6 +19,18 @@
 export type DirState = Record<string, boolean>;
 
 /**
+ * A fresh, empty {@link DirState} with a **null prototype**. Directory paths are
+ * user-controlled (a folder can be named anything, including `__proto__` or
+ * `constructor`), and they become keys of this map. A null-prototype object has
+ * no accessors to trip over, so assigning such a key is a plain data write —
+ * never a prototype-pollution hazard or a throw. All DirState maps are built
+ * this way.
+ */
+function emptyDirState(): DirState {
+  return Object.create(null);
+}
+
+/**
  * Directories at depth 0 and 1 (top two levels) default to open; everything
  * deeper defaults to collapsed. This preserves the original first-open UX.
  */
@@ -36,17 +48,17 @@ export function defaultDirOpen(depth: number): boolean {
  * kept; anything else in the object is ignored.
  */
 export function loadDirState(raw: string | null): DirState {
-  if (!raw) return {};
+  if (!raw) return emptyDirState();
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return {};
+    return emptyDirState();
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return {};
+    return emptyDirState();
   }
-  const out: DirState = {};
+  const out: DirState = emptyDirState();
   for (const [key, value] of Object.entries(parsed)) {
     if (typeof value === "boolean") out[key] = value;
   }
@@ -84,7 +96,7 @@ export function toggleDir(
   depth: number,
 ): DirState {
   const nextOpen = !isDirOpen(state, path, depth);
-  const next = { ...state };
+  const next: DirState = Object.assign(emptyDirState(), state);
   if (nextOpen === defaultDirOpen(depth)) {
     delete next[path];
   } else {
@@ -124,7 +136,7 @@ export function pruneDirState(
   state: DirState,
   validPaths: Set<string>,
 ): DirState {
-  const kept: DirState = {};
+  const kept: DirState = emptyDirState();
   let changed = false;
   for (const [key, value] of Object.entries(state)) {
     if (validPaths.has(key)) {
