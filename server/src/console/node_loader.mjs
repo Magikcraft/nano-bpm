@@ -81,9 +81,17 @@ export function npmBareSpecifier(mapped) {
   // starts the range or the `/` that starts a subpath.
   let nameEnd;
   if (spec.startsWith("@")) {
+    // Scoped `@scope/pkg`. Reject every degenerate form Rust's
+    // `npm_dep_from_import` also rejects (→ None), so the loader throws a clear
+    // error instead of handing `next()` an unresolvable specifier:
+    //   `@scope` / `@`     — no scope/package separator;
+    //   `@/pkg`            — empty scope;
+    //   `@scope/`, `@scope/@1` — empty package segment.
     const scopeSlash = spec.indexOf("/", 1);
-    if (scopeSlash < 1) return ""; // malformed scope (`@scope`, `@`) — reject, matching Rust
-    const rel = spec.slice(scopeSlash + 1).search(/[/@]/);
+    if (scopeSlash <= 1) return ""; // no `/`, or empty scope (`@/pkg`)
+    const after = spec.slice(scopeSlash + 1);
+    const rel = after.search(/[/@]/);
+    if (after === "" || rel === 0) return ""; // empty package (`@scope/`, `@scope/@1`)
     nameEnd = rel < 0 ? spec.length : scopeSlash + 1 + rel;
   } else {
     const rel = spec.search(/[/@]/);
