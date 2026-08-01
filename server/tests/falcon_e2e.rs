@@ -755,3 +755,99 @@ fn a_heartbeating_client_is_not_reaped() {
         Some(200)
     );
 }
+
+#[test]
+fn a_drained_peer_does_not_starve_a_live_worker_under_the_governor() {
+    // Issue #468: under the worker-concurrency governor (a narrow per-job-type
+    // active dispatch width), a subscriber whose credits have drained to zero — a
+    // worker that died or wedged and stopped replenishing — must not consume the
+    // scarce per-pass width and starve a live, credited worker. Pin a fixed active
+    // width of 1 so every dispatch pass has exactly one slot to spend, park a
+    // zero-credit peer in the round-robin, and assert a live worker still drains
+    // fresh jobs promptly — well inside the ~15s heartbeat-reap window the bug
+    // used to make callers wait for. (The rigorous "never selects a zero-credit
+    // subscriber" invariant is proven at the selection layer by the unit tests in
+    // `falcon::registry_tests`; this is the end-to-end behavioural guard.)
+    let scratch = ScratchDir::new();
+    let server = ServerProcess::boot(
+        &scratch.journal_path(),
+        &[("NANOBPMN_WORKER_CONCURRENCY", "1")],
+    );
+
+    // Drained peer: subscribes with a single credit, takes exactly one job, and
+    // never completes it. Its credits are now 0 but it stays connected, parked in
+    // the width-1 rotation — the shape of a worker that died mid-flight.
+    let mut drained = WsClient::connect(server.port);
+    drained.recv_until(&["welcome"]);
+    drained.send(&json!({
+        "type": "subscribe",
+        "jobType": DEMO_JOB_TYPE,
+        "jobCredits": 1,
+    }));
+
+    let mut submitter = WsClient::connect(server.port);
+    submitter.recv_until(&["welcome"]);
+    submitter.send(&json!({
+        "type": "createInstance",
+        "corr": 1,
+        "processDefinitionId": "demo",
+    }));
+    assert_eq!(
+        submitter.recv_until(&["commandResult"])["status"].as_u64(),
+        Some(200),
+        "drain-priming create failed"
+    );
+    // The drained peer takes its one job and holds it (never completes) — credits
+    // are now exhausted.
+    let held = drained.recv_until(&["job"]);
+    assert_eq!(held["job"]["type"].as_str(), Some(DEMO_JOB_TYPE));
+
+    // A live, credited worker joins the same job type.
+    let mut live = WsClient::connect(server.port);
+    live.recv_until(&["welcome"]);
+    live.send(&json!({
+        "type": "subscribe",
+        "jobType": DEMO_JOB_TYPE,
+        "jobCredits": 10,
+    }));
+
+    // Submit several fresh instances. Despite the zero-credit peer sitting in the
+    // width-1 rotation, the live worker must receive and drain them all promptly.
+    const FRESH_JOBS: u64 = 3;
+    for corr in 2..2 + FRESH_JOBS {
+        submitter.send(&json!({
+            "type": "createInstance",
+            "corr": corr,
+            "processDefinitionId": "demo",
+        }));
+        assert_eq!(
+            submitter.recv_until(&["commandResult"])["status"].as_u64(),
+            Some(200),
+            "create {corr} failed"
+        );
+    }
+
+    for n in 0..FRESH_JOBS {
+        let job = live
+            .recv_job_within(Duration::from_secs(5))
+            .unwrap_or_else(|| {
+                panic!(
+                    "live worker starved on job {n}: a drained peer stalled the width-1 governor"
+                )
+            });
+        let job_key = job["job"]["jobKey"]
+            .as_str()
+            .expect("pushed job carries a key")
+            .to_string();
+        live.send(&json!({
+            "type": "completeJob",
+            "corr": 100 + n,
+            "jobKey": job_key,
+        }));
+        assert_eq!(
+            live.recv_until(&["commandResult"])["status"].as_u64(),
+            Some(200),
+            "complete of fresh job {n} failed"
+        );
+    }
+}
