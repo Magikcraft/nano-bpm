@@ -40,14 +40,18 @@ const esc = (s) =>
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 
-// GitHub-compatible heading slug (matches the README's own intra-doc anchors).
+// GitHub-compatible heading slug (matches the source docs' own intra-doc
+// anchors). GitHub maps each space to a hyphen WITHOUT collapsing runs, so a
+// removed punctuation char sitting between spaces (e.g. the em-dash in
+// "Connector — outbound workers") yields a double hyphen — replace ` ` per-char,
+// not `\s+`, or such anchors silently break.
 function slugify(text) {
   return String(text)
     .toLowerCase()
     .replace(/<[^>]+>/g, "")
     .replace(/[^\w\- ]+/g, "")
     .trim()
-    .replace(/\s+/g, "-");
+    .replace(/ /g, "-");
 }
 
 // H2 sections that belong in the GitHub README for contributors but NOT in the
