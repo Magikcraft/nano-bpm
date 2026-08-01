@@ -528,30 +528,3 @@ jobs:
         # it is not type-checkable in-tree and no test imports it.
         run: deno test --allow-read --allow-write --allow-env server/src/console/
 
-  workflow:
-    name: workflow (typecheck + test)
-    runs-on: ubuntu-24.04
-    defaults:
-      run:
-        working-directory: workflow
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          # `npm test` runs `node --test` with --experimental-strip-types over the
-          # `.ts` tests, so this job needs a Node with type-stripping (>= 22).
-          node-version: '24'
-      - name: Install (locked)
-        run: npm ci
-      - name: Typecheck
-        run: npm run typecheck
-      - name: Build (tsc -> dist)
-        run: npm run build
-      - name: Fail if committed dist is stale
-        # `build` re-emitted dist/ in place; fail if the committed artifact drifted
-        # from src (the maker forgot `make workflow`). dist/ is committed and is the
-        # published tarball's payload.
-        run: git diff --exit-code -- dist
-      - name: Test (node:test unit tests; integration self-skips without a gateway binary)
-        run: npm run test:ci
-

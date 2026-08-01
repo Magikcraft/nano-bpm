@@ -171,10 +171,6 @@ bojtos: console-wasm ## Rebuild the Bojtos packages (@nanobpm/bojtos-kit + @nano
 	cd $(PROJECT_ROOT)/bojtos-kit && npm install && npm run build
 	cd $(PROJECT_ROOT)/bojtos-react && npm install && npm run build
 
-.PHONY: workflow
-workflow: ## Rebuild the @nanobpm/workflow package (code-first durable orchestration, ADR 0044) from source into its committed dist/. Pure TypeScript; no wasm.
-	cd $(PROJECT_ROOT)/workflow && npm install && npm run build
-
 .PHONY: console-wasm
 console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine-wasm/pkg, the @nanobpm/engine-wasm package). Needs wasm-pack; falls back to the committed artifacts if absent.
 	@if command -v wasm-pack >/dev/null 2>&1; then \
