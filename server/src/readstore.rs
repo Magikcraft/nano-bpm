@@ -203,6 +203,15 @@ CREATE TABLE element_instances (
     tenant_id              TEXT NOT NULL DEFAULT '<default>'
 );
 CREATE INDEX idx_element_instances_instance ON element_instances(instance_key);
+CREATE TABLE message_subscriptions (
+    subscription_key       INTEGER PRIMARY KEY,
+    instance_key           INTEGER NOT NULL,
+    element_instance_key   INTEGER NOT NULL,
+    element_id             TEXT NOT NULL,
+    message_name           TEXT NOT NULL,
+    correlation_key        TEXT NOT NULL
+);
+CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
 ";
 
 // --- enum <-> integer code mappings (kept beside the engine enums) ---
@@ -479,6 +488,20 @@ pub struct ElementInstanceRow {
     pub incident_key: Option<Key>,
     pub has_incident: bool,
     pub tenant_id: String,
+}
+
+/// A projected open message subscription: a running element instance parked on a
+/// message catch (intermediate catch event, receive task or message boundary),
+/// materialized from `MessageSubscriptionCreated` and dropped on
+/// `MessageCorrelated`/`MessageSubscriptionCanceled` or instance termination.
+/// Feeds the MESSAGE variant of the element-instance wait-state API.
+pub struct MessageSubscriptionRow {
+    pub subscription_key: Key,
+    pub instance_key: Key,
+    pub element_instance_key: Key,
+    pub element_id: String,
+    pub message_name: String,
+    pub correlation_key: String,
 }
 
 pub struct ProcessDefinitionRow {
@@ -914,6 +937,7 @@ impl ReadStore {
                  DROP TABLE IF EXISTS variables;
              DROP TABLE IF EXISTS definition_elements;
              DROP TABLE IF EXISTS element_instances;
+             DROP TABLE IF EXISTS message_subscriptions;
              DROP TABLE IF EXISTS meta;",
             )?;
         }
@@ -1427,6 +1451,20 @@ impl ReadStore {
         .expect("query element_instance")
     }
 
+    /// All open message subscriptions in this shard (MESSAGE wait states).
+    pub fn message_subscriptions(&self) -> Vec<MessageSubscriptionRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {MESSAGE_SUBSCRIPTION_COLS} FROM message_subscriptions"
+            ))
+            .expect("prepare message_subscriptions");
+        let rows = stmt
+            .query_map([], map_message_subscription)
+            .expect("query message_subscriptions");
+        rows.filter_map(Result::ok).collect()
+    }
+
     /// All decision-instance rows in this shard.
     pub fn decision_instances(&self) -> Vec<DecisionInstanceRow> {
         let conn = self.conn.lock().expect("read store poisoned");
@@ -1839,6 +1877,14 @@ impl ReadModel {
             .collect()
     }
 
+    /// Every open message subscription across all shards (MESSAGE wait states).
+    pub fn message_subscriptions(&self) -> Vec<MessageSubscriptionRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.message_subscriptions())
+            .collect()
+    }
+
     /// Every decision-instance row across all shards. Decision instances live in
     /// the shard of their owning process instance (routed by `max_key`), so a
     /// full listing must concatenate across shards.
@@ -2050,6 +2096,21 @@ fn map_element_instance(r: &rusqlite::Row) -> rusqlite::Result<ElementInstanceRo
         incident_key: r.get::<_, Option<i64>>(11)?.map(|v| v as Key),
         has_incident: r.get::<_, i64>(12)? != 0,
         tenant_id: r.get(13)?,
+    })
+}
+
+/// Column list for `message_subscriptions` selects.
+const MESSAGE_SUBSCRIPTION_COLS: &str = "subscription_key, instance_key, element_instance_key, \
+     element_id, message_name, correlation_key";
+
+fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscriptionRow> {
+    Ok(MessageSubscriptionRow {
+        subscription_key: r.get::<_, i64>(0)? as Key,
+        instance_key: r.get::<_, i64>(1)? as Key,
+        element_instance_key: r.get::<_, i64>(2)? as Key,
+        element_id: r.get(3)?,
+        message_name: r.get(4)?,
+        correlation_key: r.get(5)?,
     })
 }
 
@@ -2387,6 +2448,12 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             if transitioned {
                 delta = -1;
             }
+            // A completed instance holds no open message subscriptions; drop any
+            // so they stop surfacing as MESSAGE wait states.
+            tx.cexecute(
+                "DELETE FROM message_subscriptions WHERE instance_key = ?1",
+                params![*instance_key as i64],
+            )?;
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {
@@ -2424,6 +2491,11 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     now_ms as i64,
                     element_instance_state_code(ElementInstanceState::Active),
                 ],
+            )?;
+            // A terminated instance holds no open message subscriptions.
+            tx.cexecute(
+                "DELETE FROM message_subscriptions WHERE instance_key = ?1",
+                params![*instance_key as i64],
             )?;
         }
 
@@ -2475,6 +2547,61 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     now_ms as i64,
                     element_instance_state_code(ElementInstanceState::Active),
                 ],
+            )?;
+        }
+
+        // --- Message subscriptions (MESSAGE wait states) ---------------------
+        // Only instance-scoped subscriptions (a running element instance parked
+        // on a message catch) are tracked; message-*start* subscriptions carry
+        // no element instance and are not element-instance wait states.
+        Event::MessageSubscriptionCreated {
+            subscription_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            message_name,
+            correlation_key,
+            ..
+        } => {
+            if *element_instance_key != 0 {
+                tx.cexecute(
+                    "INSERT INTO message_subscriptions (subscription_key, instance_key, \
+                     element_instance_key, element_id, message_name, correlation_key) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     ON CONFLICT(subscription_key) DO UPDATE SET \
+                     element_instance_key = excluded.element_instance_key, \
+                     element_id = excluded.element_id, \
+                     message_name = excluded.message_name, \
+                     correlation_key = excluded.correlation_key",
+                    params![
+                        *subscription_key as i64,
+                        *instance_key as i64,
+                        *element_instance_key as i64,
+                        element_id,
+                        message_name,
+                        correlation_key,
+                    ],
+                )?;
+            }
+        }
+
+        // A correlated or cancelled subscription is no longer waiting: drop it.
+        // `RemoteMessageCorrelation` is the multi-partition counterpart of
+        // `MessageCorrelated` — when the process instance lives on another
+        // partition, the message partition settles the canonical subscription
+        // with this event instead, so it must clear the row too.
+        Event::MessageCorrelated {
+            subscription_key, ..
+        }
+        | Event::RemoteMessageCorrelation {
+            subscription_key, ..
+        }
+        | Event::MessageSubscriptionCanceled {
+            subscription_key, ..
+        } => {
+            tx.cexecute(
+                "DELETE FROM message_subscriptions WHERE subscription_key = ?1",
+                params![*subscription_key as i64],
             )?;
         }
 
@@ -3949,5 +4076,106 @@ mod element_instance_tests {
         let row = store.element_instance(2002).unwrap();
         assert_eq!(row.element_type, "UNKNOWN");
         assert_eq!(row.element_name, None);
+    }
+
+    #[test]
+    fn message_subscriptions_are_projected_and_dropped_on_correlate_and_terminate() {
+        use nanobpmn_engine_core::MessageSubscriptionKind;
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+
+        // An instance-scoped subscription (element_instance_key != 0) materializes
+        // a MESSAGE wait-state row.
+        store
+            .export(&[&Event::MessageSubscriptionCreated {
+                subscription_key: 3001,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+                message_name: "OrderPlaced".to_string(),
+                correlation_key: "A1".to_string(),
+                kind: MessageSubscriptionKind::IntermediateCatch,
+            }])
+            .unwrap();
+        let subs = store.message_subscriptions();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].subscription_key, 3001);
+        assert_eq!(subs[0].element_instance_key, TASK_EI);
+        assert_eq!(subs[0].message_name, "OrderPlaced");
+        assert_eq!(subs[0].correlation_key, "A1");
+
+        // A subscription with no element instance (element_instance_key == 0,
+        // e.g. a message-start subscription) is not an element-instance wait
+        // state and must not be projected.
+        store
+            .export(&[&Event::MessageSubscriptionCreated {
+                subscription_key: 3002,
+                instance_key: INST,
+                element_instance_key: 0,
+                element_id: "start".to_string(),
+                message_name: "Kickoff".to_string(),
+                correlation_key: String::new(),
+                kind: MessageSubscriptionKind::IntermediateCatch,
+            }])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1);
+
+        // Correlation releases the token and drops the subscription.
+        store
+            .export(&[&Event::MessageCorrelated {
+                subscription_key: 3001,
+                message_key: 9,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+            }])
+            .unwrap();
+        assert!(store.message_subscriptions().is_empty());
+
+        // A subscription still open when the process terminates is cleaned up.
+        store
+            .export(&[&Event::MessageSubscriptionCreated {
+                subscription_key: 3003,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+                message_name: "OrderPlaced".to_string(),
+                correlation_key: "A2".to_string(),
+                kind: MessageSubscriptionKind::IntermediateCatch,
+            }])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1);
+        store
+            .export(&[&Event::ProcessInstanceTerminated { instance_key: INST }])
+            .unwrap();
+        assert!(store.message_subscriptions().is_empty());
+
+        // A remote correlation (multi-partition: the instance lives elsewhere)
+        // settles the canonical subscription with RemoteMessageCorrelation and
+        // must also clear the row.
+        store
+            .export(&[&Event::MessageSubscriptionCreated {
+                subscription_key: 3004,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+                message_name: "OrderPlaced".to_string(),
+                correlation_key: "A3".to_string(),
+                kind: MessageSubscriptionKind::IntermediateCatch,
+            }])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1);
+        store
+            .export(&[&Event::RemoteMessageCorrelation {
+                subscription_key: 3004,
+                message_key: 10,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+                kind: MessageSubscriptionKind::IntermediateCatch,
+                variables: std::collections::HashMap::new(),
+            }])
+            .unwrap();
+        assert!(store.message_subscriptions().is_empty());
     }
 }
