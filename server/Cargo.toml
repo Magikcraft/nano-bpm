@@ -52,6 +52,13 @@ anyhow = "1.0.102"
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 
+# Cross-platform PTY for the IDE's integrated terminal (issue #496): wezterm's
+# `portable-pty` abstracts over Unix openpty and Windows ConPTY so one code path
+# serves all hosts. Console-only + loopback-gated + opt-in (NANO_CONSOLE_TERMINAL)
+# — a full shell is arbitrary code execution, so it never widens the default
+# gateway's attack surface.
+portable-pty = { version = "0.9", optional = true }
+
 # Console-only HTTP client for the cluster-health probe: each node probes its
 # peers' always-on `GET /v2/topology` to report remote liveness/version/latency
 # in the Topology tab. hyper(-util) is already in the tree via axum, and peers
@@ -93,7 +100,7 @@ serde_json = "1"
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "tokio/process", "tokio/io-util"]
+console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:portable-pty", "tokio/process", "tokio/io-util"]
 # ADR 0034: build the console with the lean "observe" operator profile instead of
 # the full "studio" IDE. Additive over `console` — it only swaps the embedded
 # bundle from `console/dist` to `console/dist-observe` (~158KB gzip vs ~4.7MB),

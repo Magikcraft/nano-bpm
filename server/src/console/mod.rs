@@ -42,6 +42,7 @@ mod envelope_scan;
 pub mod extensions;
 mod generated_api;
 pub mod projects;
+pub(super) mod pty;
 pub mod server_update;
 pub(crate) mod standalone;
 pub mod trace;
@@ -140,6 +141,7 @@ pub fn router(server: ServerImpl) -> Router {
         // picker (ADR 0041). Hand-wired (not in the OpenAPI spec) because it
         // exposes the server's filesystem and is gated on the peer being local.
         .route("/console/api/fs/browse", get(fs_browse))
+        .route("/console/api/projects/{name}/pty", get(pty::pty_ws))
         // Trigger webhook ingress (ADR 0025 phase 2): the universal external
         // emit endpoint. Hand-wired (not in the OpenAPI spec) because it accepts
         // an arbitrary body + custom shared-secret auth and acks after persist.
@@ -2890,6 +2892,27 @@ async fn fs_browse(
     headers: HeaderMap,
     Query(q): Query<BrowseQuery>,
 ) -> Response {
+    if !request_is_loopback(&peer, &headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "filesystem browsing is available on localhost only",
+        )
+            .into_response();
+    }
+    match projects::browse_dir(q.path.as_deref()) {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// Single source of truth for the console's "local machine only" gate: the
+/// request must arrive from a loopback peer **and** carry a loopback `Host`
+/// header. Both halves matter — the peer IP proves the socket is local, and the
+/// `Host` check stops a remote page from pointing a victim's browser at
+/// `http://localhost:<port>` (DNS-rebinding / drive-by). Reused by every
+/// endpoint that touches the operator's machine directly (filesystem browsing,
+/// the integrated terminal), so the policy can never drift between them.
+pub(super) fn request_is_loopback(peer: &crate::PeerAddr, headers: &HeaderMap) -> bool {
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -2902,18 +2925,7 @@ async fn fs_browse(
         host.split(':').next().unwrap_or("")
     };
     let host_is_loopback = matches!(host_name, "localhost" | "127.0.0.1" | "::1");
-
-    if !peer.0.ip().is_loopback() || !host_is_loopback {
-        return (
-            StatusCode::FORBIDDEN,
-            "filesystem browsing is available on localhost only",
-        )
-            .into_response();
-    }
-    match projects::browse_dir(q.path.as_deref()) {
-        Ok(r) => Json(r).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
-    }
+    peer.0.ip().is_loopback() && host_is_loopback
 }
 
 pub(super) fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
