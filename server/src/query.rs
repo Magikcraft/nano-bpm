@@ -319,11 +319,23 @@ pub fn match_element_instance_key(
 
 /// Matches a `JobKeyFilterProperty` against a key's decimal string.
 pub fn match_job_key(filter: &Option<models::JobKeyFilterProperty>, value: &str) -> bool {
+    match_job_key_opt(filter, Some(value))
+}
+
+/// Matches a `JobKeyFilterProperty` against a possibly-absent job key. Passing
+/// `None` (no job key on the record) lets advanced `$exists: false` filters
+/// match, and makes any value-based operator (including a bare key) fail —
+/// unlike coercing absence to an empty string, which spuriously satisfies
+/// `$exists: true`.
+pub fn match_job_key_opt(
+    filter: &Option<models::JobKeyFilterProperty>,
+    value: Option<&str>,
+) -> bool {
     match filter {
         None => true,
-        Some(models::JobKeyFilterProperty::JobKey(k)) => k.0 == value,
+        Some(models::JobKeyFilterProperty::JobKey(k)) => value == Some(k.0.as_str()),
         Some(models::JobKeyFilterProperty::AdvancedJobKeyFilter(a)) => {
-            ops!(a, |k: &models::JobKey| k.0.clone()).matches(Some(value))
+            ops!(a, |k: &models::JobKey| k.0.clone()).matches(value)
         }
     }
 }
@@ -833,5 +845,38 @@ mod tests {
         };
         assert!(exists_false.matches(None));
         assert!(!exists_false.matches(Some("x")));
+    }
+
+    #[test]
+    fn match_job_key_opt_respects_absence() {
+        // `$exists: false` must match a record with no job key (passed as None),
+        // and reject one that has a key.
+        let exists_false = Some(models::JobKeyFilterProperty::AdvancedJobKeyFilter(
+            models::AdvancedJobKeyFilter {
+                dollar_exists: Some(false),
+                ..models::AdvancedJobKeyFilter::new()
+            },
+        ));
+        assert!(match_job_key_opt(&exists_false, None));
+        assert!(!match_job_key_opt(&exists_false, Some("42")));
+
+        // `$exists: true` is the mirror image.
+        let exists_true = Some(models::JobKeyFilterProperty::AdvancedJobKeyFilter(
+            models::AdvancedJobKeyFilter {
+                dollar_exists: Some(true),
+                ..models::AdvancedJobKeyFilter::new()
+            },
+        ));
+        assert!(match_job_key_opt(&exists_true, Some("42")));
+        assert!(!match_job_key_opt(&exists_true, None));
+
+        // A bare key filter never matches an absent job key.
+        let bare = Some(models::JobKeyFilterProperty::JobKey(models::JobKey(
+            "42".to_string(),
+        )));
+        assert!(match_job_key_opt(&bare, Some("42")));
+        assert!(!match_job_key_opt(&bare, None));
+        // No filter matches anything, present or absent.
+        assert!(match_job_key_opt(&None, None));
     }
 }

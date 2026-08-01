@@ -6853,13 +6853,10 @@ impl ServerImpl {
                             &f.process_definition_key,
                             &inc.process_definition_key,
                         )
-                        && match &f.job_key {
-                            None => true,
-                            some => query::match_job_key(
-                                some,
-                                &inc.job_key.map(|k| k.to_string()).unwrap_or_default(),
-                            ),
-                        }
+                        && query::match_job_key_opt(
+                            &f.job_key,
+                            inc.job_key.map(|k| k.to_string()).as_deref(),
+                        )
                         && query::match_incident_state(
                             &f.state,
                             &incident_state_enum(inc.state).to_string(),
@@ -6953,25 +6950,29 @@ impl ServerImpl {
         // Transitive scope-subtree closure rooted at `root_key`: an element
         // instance is contained if it *is* the root or its enclosing scope is
         // already contained. All descendants share the root's process instance,
-        // so only that instance's rows are considered. Iterate to a fixpoint
-        // (rows are unordered, so one pass is insufficient for deep nesting).
-        let mut contained: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        contained.insert(root_key);
-        loop {
-            let mut grew = false;
-            for ei in &element_instances {
-                if ei.instance_key != root.instance_key {
-                    continue;
-                }
-                if !contained.contains(&ei.element_instance_key)
-                    && contained.contains(&ei.scope_key)
-                {
-                    contained.insert(ei.element_instance_key);
-                    grew = true;
-                }
+        // so only that instance's rows are considered. Build a scope→children
+        // adjacency once (restricted to the root's process instance) and walk it
+        // with a single BFS (O(n)), rather than rescanning to a fixpoint.
+        let mut children: std::collections::HashMap<u64, Vec<u64>> =
+            std::collections::HashMap::new();
+        for ei in &element_instances {
+            if ei.instance_key == root.instance_key {
+                children
+                    .entry(ei.scope_key)
+                    .or_default()
+                    .push(ei.element_instance_key);
             }
-            if !grew {
-                break;
+        }
+        let mut contained: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut frontier = vec![root_key];
+        contained.insert(root_key);
+        while let Some(scope) = frontier.pop() {
+            if let Some(kids) = children.get(&scope) {
+                for &child in kids {
+                    if contained.insert(child) {
+                        frontier.push(child);
+                    }
+                }
             }
         }
 
@@ -6996,13 +6997,10 @@ impl ServerImpl {
                             &f.process_definition_key,
                             &inc.process_definition_key,
                         )
-                        && match &f.job_key {
-                            None => true,
-                            some => query::match_job_key(
-                                some,
-                                &inc.job_key.map(|k| k.to_string()).unwrap_or_default(),
-                            ),
-                        }
+                        && query::match_job_key_opt(
+                            &f.job_key,
+                            inc.job_key.map(|k| k.to_string()).as_deref(),
+                        )
                         && query::match_incident_state(
                             &f.state,
                             &incident_state_enum(inc.state).to_string(),
