@@ -17,6 +17,17 @@ import MarkdownIt from "markdown-it";
 
 const root = process.cwd();
 const readmePath = join(root, "..", "USERGUIDE.md");
+// Extra standalone guides bundled alongside the User Guide. Each lives in the
+// repo `docs/` dir (so its repo-relative links resolve against `docs/`, not the
+// repo root) and is shipped as one self-contained page under `/docs/<slug>`.
+const extraGuides = [
+  {
+    slug: "extensions",
+    title: "Authoring extensions",
+    path: join(root, "..", "docs", "extensions.md"),
+    linkBase: "docs",
+  },
+];
 const outDir = join(root, "public", "docs");
 
 // Repo links in the README are relative to the repo root; rewrite them to GitHub
@@ -55,7 +66,8 @@ for (const line of lines) {
   if (/^```/.test(line.trim())) inFence = !inFence;
   const h2 = !inFence && /^## (.+)$/.exec(line);
   if (h2) {
-    if (current.lines.join("").trim() || current.heading) sections.push(current);
+    if (current.lines.join("").trim() || current.heading)
+      sections.push(current);
     current = { heading: h2[1].trim(), level: 2, lines: [] };
     continue;
   }
@@ -79,6 +91,7 @@ const pages = [
     heading: h1 ? h1[1].trim() : "Overview",
     markdown: preamble.lines.join("\n"),
     href: "/docs",
+    linkBase: "",
   },
   ...visibleSections.map((s) => {
     const slug = slugify(s.heading);
@@ -89,8 +102,19 @@ const pages = [
       // Re-prepend the H2 so it renders (with an id) at the top of its page.
       markdown: `## ${s.heading}\n${s.lines.join("\n")}`,
       href: `/docs/${slug}`,
+      linkBase: "",
     };
   }),
+  // Standalone guides shipped as their own single page (rendered verbatim,
+  // keeping their own H1). Their repo-relative links resolve against `linkBase`.
+  ...extraGuides.map((g) => ({
+    slug: g.slug,
+    title: g.title,
+    heading: g.title,
+    markdown: readFileSync(g.path, "utf8"),
+    href: `/docs/${g.slug}`,
+    linkBase: g.linkBase,
+  })),
 ];
 
 // --- 2. Map every heading slug to the page that owns it ---------------------
@@ -115,27 +139,49 @@ md.renderer.rules.heading_open = (tokens, idx, options, _env, self) => {
   return self.renderToken(tokens, idx, options);
 };
 
-// Rewrite README link targets for the standalone, multi-page docs site.
-function rewriteHref(href) {
+// Resolve a repo-relative link (optionally with `../`/`./` segments) against the
+// source file's directory into a repo-root-relative path, for the GitHub blob URL.
+function repoRelative(base, path) {
+  const baseParts = base ? base.split("/").filter(Boolean) : [];
+  const out = [...baseParts];
+  for (const seg of path.replace(/^\.\//, "").split("/")) {
+    if (seg === "..") out.pop();
+    else if (seg !== "." && seg !== "") out.push(seg);
+  }
+  return out.join("/");
+}
+
+// Rewrite README link targets for the standalone, multi-page docs site. `base`
+// is the source file's dir relative to the repo root (e.g. "" for USERGUIDE.md,
+// "docs" for docs/extensions.md) so repo-relative links resolve correctly.
+function rewriteHref(href, base) {
   if (!href) return href;
   if (/^(https?:|mailto:)/i.test(href)) return href;
   if (href.startsWith("#")) {
     const anchor = href.slice(1);
     const page = anchorToPage.get(anchor);
-    if (page) return page.slug === "index" ? `/docs#${anchor}` : `${page.href}#${anchor}`;
+    if (page)
+      return page.slug === "index"
+        ? `/docs#${anchor}`
+        : `${page.href}#${anchor}`;
     return href; // unknown anchor — leave as-is
   }
   // Repo-relative path (optionally with its own #fragment) -> GitHub blob URL.
-  return REPO_BLOB + href.replace(/^\.\//, "");
+  const [path, frag] = href.split("#");
+  return REPO_BLOB + repoRelative(base, path) + (frag ? `#${frag}` : "");
 }
 
 const defaultLinkOpen =
   md.renderer.rules.link_open ||
-  ((tokens, idx, options, _env, self) => self.renderToken(tokens, idx, options));
+  ((tokens, idx, options, _env, self) =>
+    self.renderToken(tokens, idx, options));
 md.renderer.rules.link_open = (tokens, idx, options, env, self) => {
   const hrefIdx = tokens[idx].attrIndex("href");
   if (hrefIdx >= 0) {
-    tokens[idx].attrs[hrefIdx][1] = rewriteHref(tokens[idx].attrs[hrefIdx][1]);
+    tokens[idx].attrs[hrefIdx][1] = rewriteHref(
+      tokens[idx].attrs[hrefIdx][1],
+      env?.linkBase ?? "",
+    );
   }
   return defaultLinkOpen(tokens, idx, options, env, self);
 };
@@ -151,7 +197,7 @@ function navList(activeSlug) {
 }
 
 function shell(page) {
-  const body = md.render(page.markdown);
+  const body = md.render(page.markdown, { linkBase: page.linkBase ?? "" });
   const subtitle = page.slug === "index" ? "Documentation" : esc(page.title);
   return `<!doctype html>
 <html lang="en">

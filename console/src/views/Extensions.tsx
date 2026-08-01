@@ -23,10 +23,11 @@ import {
   PageHeader,
 } from "../components/ui";
 
-// The in-repo authoring & publishing guide (docs/extensions.md), linked from the
-// marketplace header so authors can find out how to build and ship their own pack.
-const EXTENSION_AUTHORING_GUIDE_URL =
-  "https://github.com/Magikcraft/nano-bpm/blob/main/docs/extensions.md";
+// The extension authoring & publishing guide, bundled into the offline docs site
+// (built from docs/extensions.md by console/scripts/build-docs.mjs) and served by
+// the gateway at /docs/extensions. Linked from the marketplace header so authors
+// can find out how to build and ship their own pack — no repo access required.
+const EXTENSION_AUTHORING_GUIDE_URL = "/docs/extensions";
 
 const CATEGORIES = [
   { id: "agentic-sdlc", label: "Agentic SDLC" },
