@@ -3241,6 +3241,7 @@ fn apply_edit_op(
                         job_type: job_type.to_string(),
                         priority: None,
                     },
+                    name: None,
                     outgoing: moved,
                     parent,
                     io: Default::default(),
@@ -3294,6 +3295,7 @@ fn apply_edit_op(
                         attached_to: task.to_string(),
                         error_code: error_code.to_string(),
                     },
+                    name: None,
                     outgoing: vec![SequenceFlow {
                         to: target.to_string(),
                         condition: None,
@@ -3462,6 +3464,7 @@ fn apply_edit_op(
                 Element {
                     id: id.to_string(),
                     kind: ElementKind::ExclusiveGateway,
+                    name: None,
                     outgoing,
                     parent,
                     io: Default::default(),
@@ -3939,7 +3942,17 @@ mod tests {
     fn assert_same_structure(a: &ProcessDefinition, b: &ProcessDefinition) {
         assert_eq!(a.id, b.id, "process id");
         assert_eq!(a.start_event, b.start_event, "start event");
-        assert_eq!(a.elements, b.elements, "elements");
+        // The serializer synthesizes humanized `name=` diagram labels that are
+        // not part of the structural model, so compare elements ignoring the
+        // (display-only) `name` field.
+        let strip = |els: &std::collections::HashMap<String, Element>| {
+            let mut m = els.clone();
+            for el in m.values_mut() {
+                el.name = None;
+            }
+            m
+        };
+        assert_eq!(strip(&a.elements), strip(&b.elements), "elements");
     }
 
     /// Serialize with no operator label overrides (humanized fallbacks only).

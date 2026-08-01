@@ -1062,6 +1062,7 @@ mod tests {
                 job_type: "worker".into(),
                 priority: None,
             },
+            name: None,
             outgoing: Vec::new(),
             parent,
             retries,

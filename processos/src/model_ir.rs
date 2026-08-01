@@ -882,6 +882,10 @@ impl<'a> Parser<'a> {
         let element = Element {
             id: id.clone(),
             kind,
+            // processos tracks display names in its own `names` map (returned
+            // alongside), not on `Element.name`, so leave it unset to keep the
+            // XML round-trip identity stable.
+            name: None,
             outgoing: Vec::new(),
             parent,
             io: IoMapping {
@@ -1540,6 +1544,18 @@ mod tests {
     #[test]
     fn corpus_models_survive_the_ir_roundtrip() {
         use std::path::PathBuf;
+        // processos tracks display names in a side `names` map, not on
+        // `Element.name` (which engine-core's parser now populates from `name=`);
+        // compare the structural model with that display-only field cleared.
+        fn strip_names(
+            els: &std::collections::HashMap<String, Element>,
+        ) -> std::collections::HashMap<String, Element> {
+            let mut m = els.clone();
+            for el in m.values_mut() {
+                el.name = None;
+            }
+            m
+        }
         fn collect(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
             for e in std::fs::read_dir(dir).unwrap() {
                 let p = e.unwrap().path();
@@ -1582,7 +1598,8 @@ mod tests {
                     def.id
                 );
                 assert_eq!(
-                    parsed.definition.elements, def.elements,
+                    strip_names(&parsed.definition.elements),
+                    strip_names(&def.elements),
                     "IR round-trip changed elements for {name} [{}]",
                     def.id
                 );
@@ -1606,7 +1623,8 @@ mod tests {
                     def.id
                 );
                 assert_eq!(
-                    r.elements, def.elements,
+                    strip_names(&r.elements),
+                    strip_names(&def.elements),
                     "full pipeline changed elements for {name} [{}]",
                     def.id
                 );

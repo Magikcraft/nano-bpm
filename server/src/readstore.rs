@@ -179,6 +179,30 @@ CREATE TABLE decision_instances (
     rules_json                TEXT NOT NULL,
     tenant_id                 TEXT NOT NULL
 );
+CREATE TABLE definition_elements (
+    process_definition_key INTEGER NOT NULL,
+    element_id             TEXT NOT NULL,
+    element_type           TEXT NOT NULL,
+    element_name           TEXT,
+    PRIMARY KEY (process_definition_key, element_id)
+);
+CREATE TABLE element_instances (
+    element_instance_key   INTEGER PRIMARY KEY,
+    instance_key           INTEGER NOT NULL,
+    process_definition_id  TEXT NOT NULL,
+    process_definition_key TEXT NOT NULL,
+    element_id             TEXT NOT NULL,
+    element_name           TEXT,
+    element_type           TEXT NOT NULL,
+    state                  INTEGER NOT NULL,
+    start_date_ms          INTEGER NOT NULL,
+    end_date_ms            INTEGER,
+    scope_key              INTEGER NOT NULL DEFAULT 0,
+    incident_key           INTEGER,
+    has_incident           INTEGER NOT NULL DEFAULT 0,
+    tenant_id              TEXT NOT NULL DEFAULT '<default>'
+);
+CREATE INDEX idx_element_instances_instance ON element_instances(instance_key);
 ";
 
 // --- enum <-> integer code mappings (kept beside the engine enums) ---
@@ -223,6 +247,40 @@ fn job_state_from(code: i64) -> JobState {
         5 => JobState::Canceled,
         _ => JobState::Created,
     }
+}
+
+/// Lifecycle state of an element (flow-node) instance, mirroring Camunda 8's
+/// `ElementInstanceStateEnum`. Stored as the integer code below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ElementInstanceState {
+    Active,
+    Completed,
+    Terminated,
+}
+
+fn element_instance_state_code(s: ElementInstanceState) -> i64 {
+    match s {
+        ElementInstanceState::Active => 0,
+        ElementInstanceState::Completed => 1,
+        ElementInstanceState::Terminated => 2,
+    }
+}
+fn element_instance_state_from(code: i64) -> ElementInstanceState {
+    match code {
+        1 => ElementInstanceState::Completed,
+        2 => ElementInstanceState::Terminated,
+        _ => ElementInstanceState::Active,
+    }
+}
+
+/// Wall-clock milliseconds since the Unix epoch, used to stamp element-instance
+/// start/end dates at projection time (the lifecycle events carry no
+/// engine-authored timestamp — see [`ElementInstanceRow`]).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Encodes a [`JobKind`] into the `(job_kind, listener_event_type)` column pair
@@ -392,6 +450,35 @@ pub struct IncidentRow {
     pub created_at_ms: u64,
     pub process_definition_id: String,
     pub process_definition_key: String,
+}
+
+/// A projected element (flow-node) instance record, materialized from the
+/// engine's per-element lifecycle events (`ElementActivating`/`ElementActivated`
+/// /`ElementCompleted`) for the element-instance query API. One row per element
+/// instance the engine activates.
+///
+/// `start_date_ms`/`end_date_ms` are stamped at projection time (the lifecycle
+/// events carry no engine-authored timestamp), so a full read-model rebuild from
+/// the journal re-dates them; engine-authored element timestamps are a follow-up.
+pub struct ElementInstanceRow {
+    pub element_instance_key: Key,
+    pub instance_key: Key,
+    pub process_definition_id: String,
+    pub process_definition_key: String,
+    pub element_id: String,
+    pub element_name: Option<String>,
+    /// Camunda element `type` spelling (e.g. `SERVICE_TASK`), resolved from the
+    /// deployed model via `definition_elements`; `UNKNOWN` when unresolved.
+    pub element_type: String,
+    pub state: ElementInstanceState,
+    pub start_date_ms: u64,
+    pub end_date_ms: Option<u64>,
+    /// The scope-owning element instance (enclosing sub-process/multi-instance
+    /// body), or `0` for the process-level scope.
+    pub scope_key: Key,
+    pub incident_key: Option<Key>,
+    pub has_incident: bool,
+    pub tenant_id: String,
 }
 
 pub struct ProcessDefinitionRow {
@@ -825,7 +912,9 @@ impl ReadStore {
                  DROP TABLE IF EXISTS incidents;
              DROP TABLE IF EXISTS user_tasks;
                  DROP TABLE IF EXISTS variables;
-                 DROP TABLE IF EXISTS meta;",
+             DROP TABLE IF EXISTS definition_elements;
+             DROP TABLE IF EXISTS element_instances;
+             DROP TABLE IF EXISTS meta;",
             )?;
         }
         self.ensure_schema()?;
@@ -851,8 +940,9 @@ impl ReadStore {
         let tx = conn.transaction()?;
         let mut terminal_keys = Vec::new();
         let mut inflight_delta: i64 = 0;
+        let now = now_ms();
         for &event in events {
-            let d = project(&tx, event)?;
+            let d = project(&tx, event, now)?;
             inflight_delta += d;
             // Collect only GENUINE terminal transitions (d < 0) for hot-state
             // eviction; a re-delivered terminal (d == 0) was already evicted.
@@ -939,7 +1029,13 @@ impl ReadStore {
             tx.commit()?;
             return Ok(0);
         }
-        for table in ["variables", "jobs", "incidents", "user_tasks"] {
+        for table in [
+            "variables",
+            "jobs",
+            "incidents",
+            "user_tasks",
+            "element_instances",
+        ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE instance_key IN (SELECT key FROM _evict)"),
                 [],
@@ -1303,6 +1399,34 @@ impl ReadStore {
         .expect("query incident")
     }
 
+    /// All element-instance rows in this shard.
+    pub fn element_instances(&self) -> Vec<ElementInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {ELEMENT_INSTANCE_COLS} FROM element_instances"
+            ))
+            .expect("prepare element_instances");
+        let rows = stmt
+            .query_map([], map_element_instance)
+            .expect("query element_instances");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// A single element instance by its key.
+    pub fn element_instance(&self, key: Key) -> Option<ElementInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!(
+                "SELECT {ELEMENT_INSTANCE_COLS} FROM element_instances WHERE element_instance_key = ?1"
+            ),
+            params![key as i64],
+            map_element_instance,
+        )
+        .optional()
+        .expect("query element_instance")
+    }
+
     /// All decision-instance rows in this shard.
     pub fn decision_instances(&self) -> Vec<DecisionInstanceRow> {
         let conn = self.conn.lock().expect("read store poisoned");
@@ -1596,6 +1720,10 @@ impl ReadModel {
         self.shard_for(key)?.incident(key)
     }
 
+    pub fn element_instance(&self, key: Key) -> Option<ElementInstanceRow> {
+        self.shard_for(key)?.element_instance(key)
+    }
+
     pub fn variable(&self, key: Key) -> Option<VariableRow> {
         self.shard_for(key)?.variable(key)
     }
@@ -1702,6 +1830,13 @@ impl ReadModel {
 
     pub fn incidents(&self) -> Vec<IncidentRow> {
         self.shards.iter().flat_map(|s| s.incidents()).collect()
+    }
+
+    pub fn element_instances(&self) -> Vec<ElementInstanceRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.element_instances())
+            .collect()
     }
 
     /// Every decision-instance row across all shards. Decision instances live in
@@ -1894,6 +2029,30 @@ fn map_variable(r: &rusqlite::Row) -> rusqlite::Result<VariableRow> {
     })
 }
 
+/// Column list for `element_instances` selects, shared by scan and point lookup.
+const ELEMENT_INSTANCE_COLS: &str = "element_instance_key, instance_key, process_definition_id, \
+     process_definition_key, element_id, element_name, element_type, state, start_date_ms, \
+     end_date_ms, scope_key, incident_key, has_incident, tenant_id";
+
+fn map_element_instance(r: &rusqlite::Row) -> rusqlite::Result<ElementInstanceRow> {
+    Ok(ElementInstanceRow {
+        element_instance_key: r.get::<_, i64>(0)? as Key,
+        instance_key: r.get::<_, i64>(1)? as Key,
+        process_definition_id: r.get(2)?,
+        process_definition_key: r.get(3)?,
+        element_id: r.get(4)?,
+        element_name: r.get(5)?,
+        element_type: r.get(6)?,
+        state: element_instance_state_from(r.get(7)?),
+        start_date_ms: r.get::<_, i64>(8)? as u64,
+        end_date_ms: r.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+        scope_key: r.get::<_, i64>(10)? as Key,
+        incident_key: r.get::<_, Option<i64>>(11)?.map(|v| v as Key),
+        has_incident: r.get::<_, i64>(12)? != 0,
+        tenant_id: r.get(13)?,
+    })
+}
+
 /// Column list for `decision_instances` selects, shared by scan and point lookup.
 const DECISION_INSTANCE_COLS: &str = "eval_instance_key, decision_evaluation_key, idx, decision_id, \
      decision_key, decision_name, decision_type, version, decision_requirements_id, \
@@ -2047,6 +2206,55 @@ fn instance_def(tx: &rusqlite::Transaction, instance_key: Key) -> (String, Strin
     .unwrap_or_default()
 }
 
+/// Inserts (or refreshes) an ACTIVE element-instance row, resolving its owning
+/// process definition and its `type`/`elementName` from `definition_elements`.
+/// `scope` (from `ElementActivated`) is stamped when known; a re-delivery keeps
+/// the row's terminal state (only `scope_key` is refreshed).
+fn upsert_element_instance(
+    tx: &rusqlite::Transaction,
+    now_ms: u64,
+    instance_key: Key,
+    element_instance_key: Key,
+    element_id: &str,
+    scope: Option<Key>,
+) -> rusqlite::Result<()> {
+    let (def_id, def_key) = instance_def(tx, instance_key);
+    let def_key_int: i64 = def_key.parse().unwrap_or(-1);
+    let (element_type, element_name): (String, Option<String>) = tx
+        .cquery_row(
+            "SELECT element_type, element_name FROM definition_elements \
+             WHERE process_definition_key = ?1 AND element_id = ?2",
+            params![def_key_int, element_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| ("UNKNOWN".to_string(), None));
+    tx.cexecute(
+        "INSERT INTO element_instances (element_instance_key, instance_key, process_definition_id, \
+         process_definition_key, element_id, element_name, element_type, state, start_date_ms, \
+         end_date_ms, scope_key, incident_key, has_incident) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, 0) \
+         ON CONFLICT(element_instance_key) DO UPDATE SET \
+         scope_key = CASE WHEN ?11 THEN excluded.scope_key ELSE element_instances.scope_key END",
+        params![
+            element_instance_key as i64,
+            instance_key as i64,
+            def_id,
+            def_key,
+            element_id,
+            element_name,
+            element_type,
+            element_instance_state_code(ElementInstanceState::Active),
+            now_ms as i64,
+            scope.unwrap_or(0) as i64,
+            scope.is_some(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// The deployed version of the definition behind an instance (defaults to 1
 /// when the instance row is not yet present).
 fn instance_version(tx: &rusqlite::Transaction, instance_key: Key) -> i32 {
@@ -2071,7 +2279,7 @@ fn instance_version(tx: &rusqlite::Transaction, instance_key: Key) -> i32 {
 /// and `0` otherwise — crucially including idempotent re-deliveries, which must
 /// not move the gauge (they were the source of the historical `active_backlog`
 /// drift where re-delivered creates permanently inflated the counter).
-fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
+fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::Result<i64> {
     let mut delta: i64 = 0;
     match event {
         Event::ProcessDeployed {
@@ -2090,6 +2298,24 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
                  ON CONFLICT(process_id) DO UPDATE SET key = excluded.key, version = excluded.version, xml = excluded.xml",
                 params![process.id, *process_definition_key as i64, version, process.xml],
             )?;
+            // Element metadata (type + BPMN name) keyed by (definition, element
+            // id): the per-element lifecycle events carry only an element id, so
+            // the element-instance read model resolves `type`/`elementName` here,
+            // from the deployed model (the single source of truth).
+            for (element_id, element) in &process.elements {
+                tx.cexecute(
+                    "INSERT INTO definition_elements (process_definition_key, element_id, element_type, element_name) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT(process_definition_key, element_id) DO UPDATE SET \
+                     element_type = excluded.element_type, element_name = excluded.element_name",
+                    params![
+                        *process_definition_key as i64,
+                        element_id,
+                        element.kind.type_name(),
+                        element.name.as_ref(),
+                    ],
+                )?;
+            }
         }
 
         Event::ProcessInstanceCreated {
@@ -2184,6 +2410,70 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
                     *instance_key as i64,
                     incident_state_code(IncidentState::Resolved),
                     incident_state_code(IncidentState::Active),
+                ],
+            )?;
+            // Every element instance still ACTIVE when the process is terminated
+            // transitions to TERMINATED (the engine emits no per-element terminate
+            // event — termination is a process-scope event).
+            tx.cexecute(
+                "UPDATE element_instances SET state = ?2, end_date_ms = ?3, has_incident = 0, \
+                 incident_key = NULL WHERE instance_key = ?1 AND state = ?4",
+                params![
+                    *instance_key as i64,
+                    element_instance_state_code(ElementInstanceState::Terminated),
+                    now_ms as i64,
+                    element_instance_state_code(ElementInstanceState::Active),
+                ],
+            )?;
+        }
+
+        Event::ElementActivating {
+            instance_key,
+            element_instance_key,
+            element_id,
+        } => {
+            upsert_element_instance(
+                tx,
+                now_ms,
+                *instance_key,
+                *element_instance_key,
+                element_id,
+                None,
+            )?;
+        }
+
+        Event::ElementActivated {
+            instance_key,
+            element_instance_key,
+            element_id,
+            scope,
+        } => {
+            // `ElementActivating` may have been pruned/spilled or never observed
+            // (older journals); upsert so the row exists, and stamp the scope.
+            upsert_element_instance(
+                tx,
+                now_ms,
+                *instance_key,
+                *element_instance_key,
+                element_id,
+                Some(*scope),
+            )?;
+        }
+
+        Event::ElementCompleted {
+            element_instance_key,
+            ..
+        } => {
+            // Only a genuine Active->Completed transition stamps an end date; a
+            // re-delivery finds the row already terminal and is a no-op.
+            tx.cexecute(
+                "UPDATE element_instances SET state = ?2, end_date_ms = ?3 \
+                 WHERE element_instance_key = ?1 AND state = ?4",
+                params![
+                    *element_instance_key as i64,
+                    element_instance_state_code(ElementInstanceState::Completed),
+                    now_ms as i64,
+                    element_instance_state_code(ElementInstanceState::Active),
                 ],
             )?;
         }
@@ -2483,6 +2773,12 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
                 "UPDATE process_instances SET has_incident = 1 WHERE key = ?1",
                 params![*instance_key as i64],
             )?;
+            // Surface the incident on its element instance too.
+            tx.cexecute(
+                "UPDATE element_instances SET has_incident = 1, incident_key = ?2 \
+                 WHERE element_instance_key = ?1",
+                params![*element_instance_key as i64, *incident_key as i64],
+            )?;
         }
 
         Event::IncidentResolved {
@@ -2511,6 +2807,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event) -> rusqlite::Result<i64> {
             tx.cexecute(
                 "UPDATE process_instances SET has_incident = ?2 WHERE key = ?1",
                 params![*instance_key as i64, i64::from(active > 0)],
+            )?;
+            // Clear the incident flag on the element instance it was raised on
+            // (only when this incident is the one currently referenced there).
+            tx.cexecute(
+                "UPDATE element_instances SET has_incident = 0, incident_key = NULL \
+                 WHERE incident_key = ?1",
+                params![*incident_key as i64],
             )?;
             // A recoverable job-incident returns its parked job to the pool.
             if let Some(job_key) = job_key {
@@ -3486,5 +3789,165 @@ mod decision_deletion_tests {
             .unwrap();
 
         assert!(store.decision_instances_by_evaluation_key(100).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod element_instance_tests {
+    use std::collections::HashMap;
+
+    use nanobpmn_engine_core::{Event, ProcessBuilder};
+
+    use super::{ElementInstanceState, ReadStore};
+
+    const DEF_KEY: u64 = 500;
+    const INST: u64 = 1000;
+    const TASK_EI: u64 = 1001;
+
+    /// Deploys a process `p` with a named service task `t`, so the projector can
+    /// resolve the task's `type`/`elementName` from `definition_elements`.
+    fn deploy() -> Event {
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .service_task("t", "worker")
+            .with_name("t", "My Task")
+            .end_event("e")
+            .connect("s", "t")
+            .connect("t", "e")
+            .build()
+            .unwrap();
+        Event::ProcessDeployed {
+            deployment_key: 1,
+            process_definition_key: DEF_KEY,
+            version: 1,
+            process: def,
+        }
+    }
+
+    fn created() -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key: INST,
+            process_id: "p".to_string(),
+            variables: HashMap::new(),
+            created_at: 1,
+            tags: Vec::new(),
+            business_id: None,
+        }
+    }
+
+    #[test]
+    fn projects_activate_complete_terminate_and_incident_linkage() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+
+        // Activation materializes an ACTIVE row with resolved type + name.
+        store
+            .export(&[
+                &Event::ElementActivating {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                },
+                &Event::ElementActivated {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    scope: 0,
+                },
+            ])
+            .unwrap();
+
+        let row = store.element_instance(TASK_EI).expect("row exists");
+        assert_eq!(row.instance_key, INST);
+        assert_eq!(row.element_id, "t");
+        assert_eq!(row.element_name.as_deref(), Some("My Task"));
+        assert_eq!(row.element_type, "SERVICE_TASK");
+        assert_eq!(row.state, ElementInstanceState::Active);
+        assert_eq!(row.process_definition_key, DEF_KEY.to_string());
+        assert!(row.end_date_ms.is_none());
+        assert!(!row.has_incident);
+
+        // An incident on the element links back by key and flips has_incident.
+        store
+            .export(&[&Event::IncidentRaised {
+                incident_key: 7,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "t".to_string(),
+                kind: nanobpmn_engine_core::IncidentKind::JobNoRetries,
+                reason: "boom".to_string(),
+                job_key: Some(42),
+                created_at: 5,
+            }])
+            .unwrap();
+        let row = store.element_instance(TASK_EI).unwrap();
+        assert!(row.has_incident);
+        assert_eq!(row.incident_key, Some(7));
+
+        // Resolving the incident clears the flag.
+        store
+            .export(&[&Event::IncidentResolved {
+                incident_key: 7,
+                instance_key: INST,
+                job_key: Some(42),
+                resolved_at: 6,
+                operation_reference: None,
+            }])
+            .unwrap();
+        let row = store.element_instance(TASK_EI).unwrap();
+        assert!(!row.has_incident);
+        assert_eq!(row.incident_key, None);
+
+        // Completion transitions to COMPLETED and stamps an end date.
+        store
+            .export(&[&Event::ElementCompleted {
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "t".to_string(),
+            }])
+            .unwrap();
+        let row = store.element_instance(TASK_EI).unwrap();
+        assert_eq!(row.state, ElementInstanceState::Completed);
+        assert!(row.end_date_ms.is_some());
+    }
+
+    #[test]
+    fn terminating_the_process_terminates_still_active_elements() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store
+            .export(&[&Event::ElementActivated {
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "t".to_string(),
+                scope: 0,
+            }])
+            .unwrap();
+
+        store
+            .export(&[&Event::ProcessInstanceTerminated { instance_key: INST }])
+            .unwrap();
+        let row = store.element_instance(TASK_EI).unwrap();
+        assert_eq!(row.state, ElementInstanceState::Terminated);
+        assert!(row.end_date_ms.is_some());
+    }
+
+    #[test]
+    fn unresolved_element_type_falls_back_to_unknown() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        // An element id not present in the deployed model (e.g. an inlined
+        // call-activity child) resolves to UNKNOWN with no name.
+        store
+            .export(&[&Event::ElementActivated {
+                instance_key: INST,
+                element_instance_key: 2002,
+                element_id: "mystery".to_string(),
+                scope: 0,
+            }])
+            .unwrap();
+        let row = store.element_instance(2002).unwrap();
+        assert_eq!(row.element_type, "UNKNOWN");
+        assert_eq!(row.element_name, None);
     }
 }

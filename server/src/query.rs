@@ -175,6 +175,54 @@ pub fn match_string(filter: &Option<models::StringFilterProperty>, value: &str) 
     }
 }
 
+/// Matches an `ElementIdFilterProperty` (bare string or `$like` advanced
+/// filter) against an element id. Its advanced filter mixes `String` (`$eq`/
+/// `$neq`) and `ElementId` (`$in`/`$notIn`) field types, so the `Ops` matcher is
+/// assembled by hand rather than via the single-`conv` `ops!` macro.
+pub fn match_element_id(filter: &Option<models::ElementIdFilterProperty>, value: &str) -> bool {
+    match filter {
+        None => true,
+        Some(models::ElementIdFilterProperty::String(s)) => s == value,
+        Some(models::ElementIdFilterProperty::AdvancedElementIdFilter(a)) => Ops {
+            eq: a.dollar_eq.clone(),
+            neq: a.dollar_neq.clone(),
+            exists: a.dollar_exists,
+            in_: a
+                .dollar_in
+                .as_ref()
+                .map(|v| v.iter().map(|e| e.0.clone()).collect()),
+            not_in: a
+                .dollar_not_in
+                .as_ref()
+                .map(|v| v.iter().map(|e| e.0.clone()).collect()),
+            like: a.dollar_like.clone(),
+        }
+        .matches(Some(value)),
+    }
+}
+
+/// Matches an `ElementInstanceStateFilterProperty` against a state's wire
+/// spelling (`ACTIVE`/`COMPLETED`/`TERMINATED`).
+pub fn match_element_instance_state(
+    filter: &Option<models::ElementInstanceStateFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::ElementInstanceStateFilterProperty::ElementInstanceStateEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(models::ElementInstanceStateFilterProperty::AdvancedElementInstanceStateFilter(a)) => {
+            ops!(
+                a,
+                |e: &models::ElementInstanceStateEnum| e.to_string(),
+                like_no_notin
+            )
+            .matches(Some(value))
+        }
+    }
+}
+
 /// Matches a `BasicStringFilterProperty` (bare string or basic filter — no
 /// `$like`) against a value.
 pub fn match_basic_string(filter: &Option<models::BasicStringFilterProperty>, value: &str) -> bool {

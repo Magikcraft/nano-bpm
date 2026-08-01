@@ -649,6 +649,40 @@ impl ElementKind {
                 | ElementKind::TimerStartEvent { .. }
         )
     }
+
+    /// Maps this element kind to the Camunda 8 element-instance `type` enum value
+    /// (`ElementInstanceResult.type` / the search filter's `type`). Boundary and
+    /// intermediate-catch variants collapse to the single BPMN category the REST
+    /// API exposes; message/timer *start* events are `START_EVENT`. Kept exhaustive
+    /// so a new [`ElementKind`] must be classified here rather than silently
+    /// defaulting.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ElementKind::StartEvent
+            | ElementKind::MessageStartEvent { .. }
+            | ElementKind::TimerStartEvent { .. } => "START_EVENT",
+            ElementKind::EndEvent => "END_EVENT",
+            ElementKind::IntermediateThrowEvent => "INTERMEDIATE_THROW_EVENT",
+            ElementKind::TimerIntermediateCatchEvent { .. }
+            | ElementKind::MessageIntermediateCatchEvent { .. }
+            | ElementKind::SignalIntermediateCatchEvent { .. }
+            | ElementKind::ConditionalIntermediateCatchEvent { .. } => "INTERMEDIATE_CATCH_EVENT",
+            ElementKind::ErrorBoundaryEvent { .. }
+            | ElementKind::TimerBoundaryEvent { .. }
+            | ElementKind::MessageBoundaryEvent { .. }
+            | ElementKind::SignalBoundaryEvent { .. }
+            | ElementKind::ConditionalBoundaryEvent { .. } => "BOUNDARY_EVENT",
+            ElementKind::ServiceTask { .. } => "SERVICE_TASK",
+            ElementKind::BusinessRuleTask { .. } => "BUSINESS_RULE_TASK",
+            ElementKind::ScriptTask { .. } => "SCRIPT_TASK",
+            ElementKind::UserTask(_) => "USER_TASK",
+            ElementKind::ExclusiveGateway => "EXCLUSIVE_GATEWAY",
+            ElementKind::ParallelGateway => "PARALLEL_GATEWAY",
+            ElementKind::EventBasedGateway => "EVENT_BASED_GATEWAY",
+            ElementKind::SubProcess { .. } => "SUB_PROCESS",
+            ElementKind::CallActivity { .. } => "CALL_ACTIVITY",
+        }
+    }
 }
 
 /// A single BPMN flow node and its outgoing sequence flows.
@@ -657,6 +691,13 @@ impl ElementKind {
 pub struct Element {
     pub id: ElementId,
     pub kind: ElementKind,
+    /// The element's BPMN `name` attribute, if present. Purely descriptive — the
+    /// engine never dispatches on it — but carried so read models (the
+    /// element-instance search API's `elementName`) can surface the modeller's
+    /// label. `None` (the default) for elements with no `name` and for
+    /// definitions serialized before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub name: Option<String>,
     /// Outgoing sequence flows, in declaration order.
     pub outgoing: Vec<SequenceFlow>,
     /// Id of the embedded sub-process that contains this element, or `None` for
@@ -1055,6 +1096,7 @@ fn splice_call_activities(
                     kind: ElementKind::SubProcess {
                         start_event: inner_start,
                     },
+                    name: el.name.clone(),
                     outgoing,
                     parent: new_parent,
                     io: el.io.clone(),
@@ -1082,6 +1124,7 @@ fn splice_call_activities(
                 Element {
                     id: new_id,
                     kind: remap_kind_ids(&el.kind, &pfx),
+                    name: el.name.clone(),
                     outgoing,
                     parent: new_parent,
                     io: el.io.clone(),
@@ -1203,6 +1246,10 @@ pub struct ProcessBuilder {
     ///
     /// [`build`]: ProcessBuilder::build
     task_listeners: Vec<(ElementId, Vec<TaskListener>)>,
+    /// Recorded `(element id, BPMN name)` declarations, applied in [`build`].
+    ///
+    /// [`build`]: ProcessBuilder::build
+    names: Vec<(ElementId, String)>,
 }
 
 impl ProcessBuilder {
@@ -1219,6 +1266,7 @@ impl ProcessBuilder {
             multi_instances: Vec::new(),
             listeners: Vec::new(),
             task_listeners: Vec::new(),
+            names: Vec::new(),
         }
     }
 
@@ -1226,6 +1274,7 @@ impl ProcessBuilder {
         self.elements.push(Element {
             id: id.into(),
             kind,
+            name: None,
             outgoing: Vec::new(),
             parent: None,
             io: IoMapping::default(),
@@ -1429,6 +1478,14 @@ impl ProcessBuilder {
     /// sub-process and so the process-level start event can be identified.
     pub fn contained_in(mut self, child: impl Into<String>, parent: impl Into<String>) -> Self {
         self.parents.push((child.into(), parent.into()));
+        self
+    }
+
+    /// Attaches a BPMN `name` (the modeller's label) to a previously-added
+    /// element. Purely descriptive — surfaced by read models such as the
+    /// element-instance search API. Applied in [`build`](ProcessBuilder::build).
+    pub fn with_name(mut self, id: impl Into<String>, name: impl Into<String>) -> Self {
+        self.names.push((id.into(), name.into()));
         self
     }
 
@@ -1926,6 +1983,14 @@ impl ProcessBuilder {
             }
         }
 
+        // Attach BPMN names (modeller labels) to their elements.
+        for (id, name) in &self.names {
+            match elements.get_mut(id) {
+                Some(element) => element.name = Some(name.clone()),
+                None => return Err(BuildError::UnknownNameElement(id.clone())),
+            }
+        }
+
         // The process-level start event is the unique start event that is not
         // contained in any sub-process (sub-process inner start events have a
         // parent and start their own scope, not the instance).
@@ -1985,6 +2050,8 @@ pub enum BuildError {
     UnknownMultiInstanceElement(ElementId),
     /// A `with_listeners` referenced an element that does not exist.
     UnknownListenerElement(ElementId),
+    /// A `with_name` referenced an element that does not exist.
+    UnknownNameElement(ElementId),
 }
 
 impl std::fmt::Display for BuildError {
@@ -2034,6 +2101,9 @@ impl std::fmt::Display for BuildError {
             }
             BuildError::UnknownListenerElement(id) => {
                 write!(f, "execution listeners declared on unknown element {id}")
+            }
+            BuildError::UnknownNameElement(id) => {
+                write!(f, "name declared on unknown element {id}")
             }
         }
     }
