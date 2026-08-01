@@ -151,7 +151,7 @@ function repoRelative(base, path) {
   return out.join("/");
 }
 
-// Rewrite README link targets for the standalone, multi-page docs site. `base`
+// Rewrite a source link target for the standalone, multi-page docs site. `base`
 // is the source file's dir relative to the repo root (e.g. "" for USERGUIDE.md,
 // "docs" for docs/extensions.md) so repo-relative links resolve correctly.
 function rewriteHref(href, base) {
