@@ -61,6 +61,11 @@ import { Button, inputClass } from "../components/ui";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
+  type ActivePanel,
+  togglePanel,
+  selectFile,
+} from "../lib/workspacePanel";
+import {
   forgetServedAppUrl,
   rememberServedAppUrl,
   servedAppPort,
@@ -135,10 +140,16 @@ export default function ProjectWorkspace() {
   const [logs, setLogs] = useState<ProjectLogLine[]>([]);
   const [showConfig, setShowConfig] = useState(false);
   const [showCompile, setShowCompile] = useState(false);
-  const [showData, setShowData] = useState(false);
-  const [showTriggers, setShowTriggers] = useState(false);
-  const [showConnectors, setShowConnectors] = useState(false);
-  const [showModel, setShowModel] = useState(false);
+  // Single source of truth for the mutually-exclusive auxiliary panels; `null`
+  // means the file-content editor is showing. Opening a file clears it (#485).
+  const [activePanel, setActivePanel] = useState<ActivePanel>(null);
+  const openFile = useCallback(
+    (path: string) => {
+      setSelected(path);
+      setActivePanel(selectFile);
+    },
+    [setSelected],
+  );
   const logRef = useRef<HTMLDivElement>(null);
   const [consoleHeight, setConsoleHeight] = useState(() => {
     const saved = Number(localStorage.getItem("nano.consoleHeight"));
@@ -464,12 +475,9 @@ export default function ProjectWorkspace() {
         {isUrbanApp && (
           <ToolbarButton
             onClick={() => {
-              setShowData((v) => !v);
-              setShowTriggers(false);
-              setShowConnectors(false);
-              setShowModel(false);
+              setActivePanel((p) => togglePanel(p, "data"));
             }}
-            kind={showData ? "primary" : undefined}
+            kind={activePanel === "data" ? "primary" : undefined}
           >
             Data
           </ToolbarButton>
@@ -477,12 +485,9 @@ export default function ProjectWorkspace() {
         {isUrbanApp && (
           <ToolbarButton
             onClick={() => {
-              setShowTriggers((v) => !v);
-              setShowData(false);
-              setShowConnectors(false);
-              setShowModel(false);
+              setActivePanel((p) => togglePanel(p, "triggers"));
             }}
-            kind={showTriggers ? "primary" : undefined}
+            kind={activePanel === "triggers" ? "primary" : undefined}
           >
             Triggers
           </ToolbarButton>
@@ -490,12 +495,9 @@ export default function ProjectWorkspace() {
         {isUrbanApp && (
           <ToolbarButton
             onClick={() => {
-              setShowConnectors((v) => !v);
-              setShowData(false);
-              setShowTriggers(false);
-              setShowModel(false);
+              setActivePanel((p) => togglePanel(p, "connectors"));
             }}
-            kind={showConnectors ? "primary" : undefined}
+            kind={activePanel === "connectors" ? "primary" : undefined}
           >
             Connectors
           </ToolbarButton>
@@ -503,12 +505,9 @@ export default function ProjectWorkspace() {
         {isWorkflowProject && (
           <ToolbarButton
             onClick={() => {
-              setShowModel((v) => !v);
-              setShowData(false);
-              setShowTriggers(false);
-              setShowConnectors(false);
+              setActivePanel((p) => togglePanel(p, "model"));
             }}
-            kind={showModel ? "primary" : undefined}
+            kind={activePanel === "model" ? "primary" : undefined}
             dataTour={TOUR_ANCHOR.modelView}
           >
             Model
@@ -569,12 +568,12 @@ export default function ProjectWorkspace() {
           files={detail.files}
           rootPath={detail.rootPath}
           selected={selected}
-          onSelect={setSelected}
+          onSelect={openFile}
           onChanged={reloadFiles}
         />
 
         {/* Editor + console — or the DB Manager (Data) / Triggers panel when toggled */}
-        {showData ? (
+        {activePanel === "data" ? (
           <div className="flex min-w-0 flex-1 flex-col">
             <Suspense
               fallback={
@@ -586,7 +585,7 @@ export default function ProjectWorkspace() {
               <DataPanel name={name} />
             </Suspense>
           </div>
-        ) : showTriggers ? (
+        ) : activePanel === "triggers" ? (
           <div className="flex min-w-0 flex-1 flex-col">
             <Suspense
               fallback={
@@ -598,7 +597,7 @@ export default function ProjectWorkspace() {
               <TriggersPanel name={name} />
             </Suspense>
           </div>
-        ) : showConnectors ? (
+        ) : activePanel === "connectors" ? (
           <div className="flex min-w-0 flex-1 flex-col">
             <Suspense
               fallback={
@@ -610,7 +609,7 @@ export default function ProjectWorkspace() {
               <ConnectorsPanel name={name} />
             </Suspense>
           </div>
-        ) : showModel ? (
+        ) : activePanel === "model" ? (
           <div className="flex min-w-0 flex-1 flex-col">
             <Suspense
               fallback={
