@@ -1,11 +1,12 @@
 # ADR 0044 — Code-first durable orchestration for the single-user SDLC (Camunda Nano)
 
-Status: **Proposed.** The authoring façade is now built and published-ready as the
-`@nanobpm/workflow` package (`workflow/`): both surfaces (`defineWorkflow` imperative
+Status: **Proposed.** The authoring façade is built and published as the
+`@nanobpm/workflow` package: both surfaces (`defineWorkflow` imperative
 replay + `defineFlow` declarative with signals), a `WorkflowClient` and generic
-`Worker` over REST v2, unit + integration tests (crash-resume + signal), CI gate, and
-OIDC publishing (`release-workflow-npm.yml`, `docs/releasing-workflow-npm.md`).
-Date: 2026-07-29.
+`Worker` over REST v2, unit + integration tests (crash-resume + signal), a CI gate, and
+OIDC publishing. The package **now lives in `jwulf/nano-ide`** (`packages/workflow`),
+not in this repo — see the relocation update below.
+Date: 2026-07-29 (relocated 2026-08-01).
 
 > **Relocation update (2026-08-01) — `@nanobpm/workflow` moved to the nano-ide repo.**
 > `@nanobpm/workflow` is a self-contained REST v2 client SDK with no coupling to the engine,
