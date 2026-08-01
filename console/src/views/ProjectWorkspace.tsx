@@ -803,9 +803,11 @@ function FileBrowser({
     [commitDirState],
   );
   // Drop overrides for directories that no longer exist (renamed/deleted), so
-  // stale entries don't accumulate in localStorage.
+  // stale entries don't accumulate in localStorage. FileBrowser only renders
+  // once `detail` has loaded, so an empty `files` means a genuinely empty
+  // project (not "still loading") — pruning against an empty set then correctly
+  // clears any leftover overrides.
   useEffect(() => {
-    if (files.length === 0) return;
     const pruned = pruneDirState(dirStateRef.current, collectDirPaths(files));
     if (pruned !== dirStateRef.current) commitDirState(pruned);
   }, [files, commitDirState]);
