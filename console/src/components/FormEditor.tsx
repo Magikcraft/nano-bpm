@@ -37,6 +37,10 @@ interface FormEditorProps {
   /// dropdown (ADR 0024 §5). Read lazily so a project switch reflects the right
   /// list. Absent → no datasources (the inspector still shows, just empty).
   getDataSources?: () => string[];
+  /// Called once the editor has mounted and finished its initial (blank) load,
+  /// so a parent that fetched a schema before the lazy chunk mounted can retry
+  /// the import (mirrors BpmnModeler.onReady).
+  onReady?: () => void;
 }
 
 const createEmptySchema = (): FormSchema => ({
@@ -54,7 +58,7 @@ const parseSchema = (json: string): FormSchema => {
 };
 
 const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
-  function FormEditor({ onChange, getDataSources }, ref) {
+  function FormEditor({ onChange, getDataSources, onReady }, ref) {
     const containerRef = useRef<HTMLDivElement>(null);
     const editorRef = useRef<FormJsEditor | null>(null);
     // Keep the datasource accessor in a ref so the editor (built once) always
@@ -71,6 +75,8 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
     const suppressTimerRef = useRef<number | null>(null);
     const onChangeRef = useRef(onChange);
     onChangeRef.current = onChange;
+    const onReadyRef = useRef(onReady);
+    onReadyRef.current = onReady;
 
     const clearSuppressTimer = () => {
       if (suppressTimerRef.current === null) return;
@@ -123,7 +129,14 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
       };
 
       editor.on("changed", handleChanged);
-      void runLoad((e) => e.importSchema(createEmptySchema()));
+      // Fire `onReady` after the initial load settles (success OR failure) so a
+      // parent waiting to import a fetched schema is never left waiting — but not
+      // if the editor was torn down mid-load (e.g. a rapid file switch), which
+      // would signal readiness for a destroyed editor and setState on an
+      // unmounted parent.
+      void runLoad((e) => e.importSchema(createEmptySchema())).finally(() => {
+        if (!disposedRef.current) onReadyRef.current?.();
+      });
 
       return () => {
         disposedRef.current = true;

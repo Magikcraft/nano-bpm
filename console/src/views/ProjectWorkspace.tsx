@@ -1316,6 +1316,14 @@ function EditorPane({
   const bpmnRef = useRef<BpmnModelerHandle>(null);
   const dmnRef = useRef<DmnModelerHandle>(null);
   const formRef = useRef<FormEditorHandle>(null);
+  // The graphical editors (BPMN/DMN/Form) are lazy-loaded, so the imperative
+  // ref they expose may still be null when the fetched `content` first arrives.
+  // This flag flips once the active editor has mounted and finished its initial
+  // load (its `onReady`), and is a dependency of the content-import effect below
+  // so the import RETRIES the moment the editor is ready. Without it, a `content`
+  // that lands before the lazy chunk mounts is dropped and the canvas stays on
+  // bpmn-js's blank default — the "model looks wiped on first open" bug.
+  const [editorReady, setEditorReady] = useState(false);
   const pageRef = useRef<PageComposerHandle>(null);
   const [testXml, setTestXml] = useState<string | null>(null);
   // Markdown files open in a rendered Preview tab; the user can switch to Edit.
@@ -1931,9 +1939,11 @@ function EditorPane({
     } else if (kind === "page" && pageRef.current) {
       pageRef.current.setPageJson(content);
     }
-    // Only when the document first arrives for this path.
+    // Only when the document first arrives for this path — or once the lazy
+    // editor becomes ready, whichever is later (`editorReady` guarantees the
+    // ref above is populated so the import isn't silently dropped).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [content, kind]);
+  }, [content, kind, editorReady]);
 
   const save = useCallback(async () => {
     setSaving(true);
@@ -2315,6 +2325,7 @@ function EditorPane({
               <Suspense fallback={modelerFallback}>
                 <BpmnModeler
                   ref={bpmnRef}
+                  onReady={() => setEditorReady(true)}
                   onChange={onBpmnChange}
                   getVariables={bpmnGetVariables}
                   components={components}
@@ -2396,6 +2407,7 @@ function EditorPane({
           <Suspense fallback={modelerFallback}>
             <DmnModeler
               ref={dmnRef}
+              onReady={() => setEditorReady(true)}
               onChange={() => setDirty(true)}
               getVariables={dmnGetVariables}
             />
@@ -2424,6 +2436,7 @@ function EditorPane({
               <Suspense fallback={modelerFallback}>
                 <FormEditor
                   ref={formRef}
+                  onReady={() => setEditorReady(true)}
                   onChange={() => setDirty(true)}
                   getDataSources={formGetDataSources}
                 />
