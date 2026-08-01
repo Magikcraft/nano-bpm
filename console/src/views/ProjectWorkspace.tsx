@@ -770,6 +770,13 @@ function FileBrowser({
       return loadDirState(null);
     }
   });
+  // Mirror the latest state in a ref so the toggle/prune handlers can compute
+  // the next value and persist it *outside* the state updater — React updaters
+  // must stay pure (StrictMode/concurrent may re-invoke or discard them), so
+  // the localStorage write can't live inside `setDirState(...)`. Mirrors the
+  // existing `consoleHeightRef` pattern in this component.
+  const dirStateRef = useRef(dirState);
+  dirStateRef.current = dirState;
   const persistDirState = useCallback(
     (next: DirState) => {
       try {
@@ -781,27 +788,27 @@ function FileBrowser({
     },
     [dirStateKey],
   );
-  const onToggleDir = useCallback(
-    (path: string, depth: number) => {
-      setDirState((prev) => {
-        const next = toggleDir(prev, path, depth);
-        persistDirState(next);
-        return next;
-      });
+  const commitDirState = useCallback(
+    (next: DirState) => {
+      dirStateRef.current = next;
+      setDirState(next);
+      persistDirState(next);
     },
     [persistDirState],
+  );
+  const onToggleDir = useCallback(
+    (path: string, depth: number) => {
+      commitDirState(toggleDir(dirStateRef.current, path, depth));
+    },
+    [commitDirState],
   );
   // Drop overrides for directories that no longer exist (renamed/deleted), so
   // stale entries don't accumulate in localStorage.
   useEffect(() => {
     if (files.length === 0) return;
-    setDirState((prev) => {
-      const pruned = pruneDirState(prev, collectDirPaths(files));
-      if (pruned === prev) return prev;
-      persistDirState(pruned);
-      return pruned;
-    });
-  }, [files, persistDirState]);
+    const pruned = pruneDirState(dirStateRef.current, collectDirPaths(files));
+    if (pruned !== dirStateRef.current) commitDirState(pruned);
+  }, [files, commitDirState]);
   const newFolder = async () => {
     const base = prompt("New folder path (project-relative):", "resources/");
     if (!base) return;
