@@ -217,9 +217,14 @@ const DmnModeler = forwardRef<DmnModelerHandle, DmnModelerProps>(
       };
 
       modeler.on("views.changed", handleViewsChanged);
-      void runLoad((m) => m.importXML(EMPTY_DMN)).finally(() =>
-        onReadyRef.current?.(),
-      );
+      // Fire `onReady` after the initial blank load settles (success OR failure)
+      // so a parent waiting to import a fetched document is never left waiting —
+      // but not if the modeler was torn down mid-load (e.g. a rapid file switch),
+      // which would signal readiness for a destroyed modeler and setState on an
+      // unmounted parent.
+      void runLoad((m) => m.importXML(EMPTY_DMN)).finally(() => {
+        if (!disposedRef.current) onReadyRef.current?.();
+      });
 
       return () => {
         disposedRef.current = true;

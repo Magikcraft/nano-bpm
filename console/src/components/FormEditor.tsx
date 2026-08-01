@@ -130,10 +130,13 @@ const FormEditor = forwardRef<FormEditorHandle, FormEditorProps>(
 
       editor.on("changed", handleChanged);
       // Fire `onReady` after the initial load settles (success OR failure) so a
-      // parent waiting to import a fetched schema is never left waiting.
-      void runLoad((e) => e.importSchema(createEmptySchema())).finally(() =>
-        onReadyRef.current?.(),
-      );
+      // parent waiting to import a fetched schema is never left waiting — but not
+      // if the editor was torn down mid-load (e.g. a rapid file switch), which
+      // would signal readiness for a destroyed editor and setState on an
+      // unmounted parent.
+      void runLoad((e) => e.importSchema(createEmptySchema())).finally(() => {
+        if (!disposedRef.current) onReadyRef.current?.();
+      });
 
       return () => {
         disposedRef.current = true;
