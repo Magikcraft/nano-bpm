@@ -82,7 +82,7 @@ export function npmBareSpecifier(mapped) {
   let nameEnd;
   if (spec.startsWith("@")) {
     const scopeSlash = spec.indexOf("/", 1);
-    if (scopeSlash < 1) return spec; // malformed scope — best effort, unchanged
+    if (scopeSlash < 1) return ""; // malformed scope (`@scope`, `@`) — reject, matching Rust
     const rel = spec.slice(scopeSlash + 1).search(/[/@]/);
     nameEnd = rel < 0 ? spec.length : scopeSlash + 1 + rel;
   } else {
