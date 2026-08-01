@@ -98,6 +98,10 @@ export function npmBareSpecifier(mapped) {
     nameEnd = rel < 0 ? spec.length : rel;
   }
   const name = spec.slice(0, nameEnd);
+  // No package name (e.g. `npm://pkg` -> `/pkg`, an empty first segment) — reject,
+  // mirroring Rust's `npm_dep_from_import` `name.is_empty()` guard, so `resolve()`
+  // throws a clear error instead of Node resolving a stray absolute/subpath.
+  if (name === "") return "";
   const rest = spec.slice(nameEnd); // "" | "@range" | "/subpath" | "@range/subpath"
   let subpath = "";
   if (rest.startsWith("@")) {
