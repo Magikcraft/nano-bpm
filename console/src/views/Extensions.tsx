@@ -23,6 +23,11 @@ import {
   PageHeader,
 } from "../components/ui";
 
+// The in-repo authoring & publishing guide (docs/extensions.md), linked from the
+// marketplace header so authors can find out how to build and ship their own pack.
+const EXTENSION_AUTHORING_GUIDE_URL =
+  "https://github.com/Magikcraft/nano-bpm/blob/main/docs/extensions.md";
+
 const CATEGORIES = [
   { id: "agentic-sdlc", label: "Agentic SDLC" },
   { id: "lang", label: "Languages" },
@@ -295,7 +300,21 @@ export default function Extensions() {
     <div className="mx-auto max-w-4xl p-6">
       <PageHeader
         title="Extensions"
-        subtitle="Language, app-template, example-app, and theme packs drive editor grammars, project scaffolds, the run/compile toolchain, and the console's look. Toolchain commands run on your machine."
+        subtitle={
+          <>
+            Language, app-template, example-app, and theme packs drive editor
+            grammars, project scaffolds, the run/compile toolchain, and the
+            console's look. Toolchain commands run on your machine.{" "}
+            <a
+              href={EXTENSION_AUTHORING_GUIDE_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-accent hover:underline"
+            >
+              Publish your own extension →
+            </a>
+          </>
+        }
       />
 
       <Input
