@@ -48,7 +48,7 @@ Where each piece lives:
 | `engine-wasm/` + `clients/nano-bernd/` | The engine compiled to WASM and wrapped as an **embeddable library** with two hosts: `@nanobpm/nano-bernd` (npm) and `io.github.jwulf:nano-bernd` (JVM / Maven Central). |
 | `bojtos-kit/` + `bojtos-react/` | **Bojtos** — a publishable in-browser BPMN demo framework built on the same wasm engine: `@nanobpm/bojtos-kit` (framework-agnostic) and `@nanobpm/bojtos-react` (React bindings), both npm (ADR 0043). |
 | `clients/` | Client transports (e.g. the `node-stream` command-stream client). |
-| `processos/` | ProcessOS — a companion binary built from the same engine, with its own release train. |
+| `processos/` | ProcessOS — a companion binary built from the same engine; it ships in the same `v*` release train as the gateway (see below). |
 | `spec/`, `spec-app/`, `spec-console/` | JSON Schemas / OpenAPI specs, published to `nanobpm.io`. |
 
 > **Note.** The code-first workflow SDK (`@nanobpm/workflow`) originated here under
