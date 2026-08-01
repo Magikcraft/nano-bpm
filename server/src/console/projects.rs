@@ -1218,8 +1218,16 @@ fn npm_dep_from_import(value: &str) -> Option<(String, String)> {
     // starts a subpath, whichever comes first.
     let name_len = if let Some(scoped) = spec.strip_prefix('@') {
         let scope_slash = scoped.find('/')?;
+        // Reject an empty scope (`@/pkg`) — the `@` must be followed by a scope.
+        if scope_slash == 0 {
+            return None;
+        }
         let after = &scoped[scope_slash + 1..];
         let end = after.find(['/', '@']).unwrap_or(after.len());
+        // Reject an empty package segment (`@scope/`, `@scope/@1`).
+        if end == 0 {
+            return None;
+        }
         1 + scope_slash + 1 + end
     } else {
         spec.find(['/', '@']).unwrap_or(spec.len())
@@ -8959,6 +8967,18 @@ mod tests {
         // Degenerate values yield no dep rather than a `"/"`-style bad key.
         assert_eq!(npm_dep_from_import("npm:"), None);
         assert_eq!(npm_dep_from_import("npm:/"), None);
+        // An empty package name (`npm://pkg` -> `/pkg`) is rejected, not treated
+        // as an absolute path.
+        assert_eq!(npm_dep_from_import("npm://pkg"), None);
+        // Degenerate scoped names (empty scope or empty package segment) are
+        // rejected — they would otherwise emit invalid npm keys like `"@scope/"`
+        // or `"@/pkg"`. These MUST stay in lockstep with `npmBareSpecifier` in
+        // node_loader.mjs, which rejects the same forms.
+        assert_eq!(npm_dep_from_import("npm:@scope/"), None);
+        assert_eq!(npm_dep_from_import("npm:@/pkg"), None);
+        assert_eq!(npm_dep_from_import("npm:@scope"), None);
+        assert_eq!(npm_dep_from_import("npm:@"), None);
+        assert_eq!(npm_dep_from_import("npm:@scope/@1"), None);
     }
 
     /// Red/Green repro for #437: the SDK template (`throughput-stream`) mapped
@@ -8988,7 +9008,10 @@ mod tests {
     ///       `package.json` (`dependencies` ∪ `devDependencies`) — the #437 crash;
     ///   (b) every import value anywhere in the project (root + `workers/*`
     ///       `deno.json`) is Node-loader-resolvable: relative or `npm:`, never
-    ///       `jsr:`/`http(s):` (which `node-loader.mjs` throws on).
+    ///       `jsr:`/`http(s):` (which `node-loader.mjs` throws on); and every
+    ///       `npm:` import — including in a worker `deno.json` — is declared in
+    ///       the ROOT `package.json` (workers have no own manifest and resolve
+    ///       `node_modules` up-tree), so the #437 crash is guarded across workers.
     #[test]
     fn every_builtin_template_is_node_fallback_resolvable() {
         let _g = lock();
@@ -9017,7 +9040,17 @@ mod tests {
                 );
             }
 
-            // (b) no import anywhere resolves to a scheme the Node loader rejects.
+            // (b) every import ANYWHERE (root + `workers/*` `deno.json`) is
+            // Node-fallback-safe. Workers have no own `package.json`, so a worker
+            // run's `npm install` and `node_modules` resolution walk up to the
+            // project ROOT — hence a worker `npm:` import must be backed by the
+            // ROOT `package.json` too. For each import we assert:
+            //   - its scheme is Node-loader-resolvable (relative or `npm:`, never
+            //     `jsr:`/`http(s):`, which `node-loader.mjs` throws on), and
+            //   - any `npm:` value is declared in the root `package.json` — the
+            //     #437 crash, now guarded across workers, not just the root. This
+            //     also cross-checks `npm_dep_from_import` against the `declared`
+            //     set derived from `npm_deps_from_deno_json` in (a).
             let mut deno_files = vec![dir.join("deno.json")];
             let workers = dir.join("workers");
             if workers.is_dir() {
@@ -9042,6 +9075,28 @@ mod tests {
                              (must be relative or npm:, never jsr:/http:)",
                             t.id
                         );
+                        if s.starts_with("npm:") {
+                            // Parsing is mandatory: a worker/root `npm:` import
+                            // the loader will strip MUST reduce to a valid package
+                            // coordinate AND be declared in the root package.json,
+                            // or Node fallback fails at runtime with
+                            // ERR_MODULE_NOT_FOUND. A malformed `npm:` value is a
+                            // template defect — fail loudly rather than skip.
+                            let (dep, _range) = npm_dep_from_import(s).unwrap_or_else(|| {
+                                panic!(
+                                    "{}: import `{key}` -> `{s}` in {dj:?} is not a valid npm: \
+                                     specifier (the Node loader could not resolve it)",
+                                    t.id
+                                )
+                            });
+                            assert!(
+                                declared(&dep),
+                                "{}: npm import `{key}` -> `{s}` in {dj:?} needs dep `{dep}` \
+                                 in the root package.json (Node fallback resolves worker \
+                                 node_modules up-tree to the project root)",
+                                t.id
+                            );
+                        }
                     }
                 }
             }
