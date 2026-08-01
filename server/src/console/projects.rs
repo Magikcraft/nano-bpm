@@ -9052,15 +9052,26 @@ mod tests {
                             t.id
                         );
                         if s.starts_with("npm:") {
-                            if let Some((dep, _range)) = npm_dep_from_import(s) {
-                                assert!(
-                                    declared(&dep),
-                                    "{}: npm import `{key}` -> `{s}` in {dj:?} needs dep `{dep}` \
-                                     in the root package.json (Node fallback resolves worker \
-                                     node_modules up-tree to the project root)",
+                            // Parsing is mandatory: a worker/root `npm:` import
+                            // the loader will strip MUST reduce to a valid package
+                            // coordinate AND be declared in the root package.json,
+                            // or Node fallback fails at runtime with
+                            // ERR_MODULE_NOT_FOUND. A malformed `npm:` value is a
+                            // template defect — fail loudly rather than skip.
+                            let (dep, _range) = npm_dep_from_import(s).unwrap_or_else(|| {
+                                panic!(
+                                    "{}: import `{key}` -> `{s}` in {dj:?} is not a valid npm: \
+                                     specifier (the Node loader could not resolve it)",
                                     t.id
-                                );
-                            }
+                                )
+                            });
+                            assert!(
+                                declared(&dep),
+                                "{}: npm import `{key}` -> `{s}` in {dj:?} needs dep `{dep}` \
+                                 in the root package.json (Node fallback resolves worker \
+                                 node_modules up-tree to the project root)",
+                                t.id
+                            );
                         }
                     }
                 }

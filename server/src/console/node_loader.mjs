@@ -48,7 +48,17 @@ export async function resolve(specifier, context, next) {
     // subpath (`npm:lodash@^4/fp` -> `lodash/fp`). `npm install` provides the
     // package — its `package.json` dependency is derived from this SAME grammar by
     // `npm_dep_from_import` in projects.rs (keep the two in lockstep).
-    return next(npmBareSpecifier(mapped), context);
+    const bare = npmBareSpecifier(mapped);
+    // A degenerate value (`npm:`, `npm:/`) reduces to an empty specifier, which
+    // Rust's `npm_dep_from_import` also rejects (returns None). Fail early with a
+    // clear message instead of handing `next()` an empty string.
+    if (!bare) {
+      throw new Error(
+        `Node worker runtime cannot resolve '${specifier}' -> '${mapped}': ` +
+          `malformed npm: specifier (no package name).`,
+      );
+    }
+    return next(bare, context);
   }
   if (mapped.startsWith("jsr:") || mapped.startsWith("http:") || mapped.startsWith("https:")) {
     throw new Error(
