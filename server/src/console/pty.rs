@@ -283,6 +283,10 @@ mod tests {
     /// lingers and, crucially, does **not** kill it: an inline `child.wait()`
     /// would block the caller for the child's whole lifetime, whereas
     /// [`detach_wait`] must return effectively immediately.
+    // Unix-gated: it spawns `sleep` to model a shell that outlives its socket,
+    // and `sleep` isn't guaranteed on Windows. The defect and fix are
+    // platform-agnostic; this reproduction just needs a portable "linger".
+    #[cfg(unix)]
     #[tokio::test]
     async fn detach_wait_does_not_block_the_async_worker() {
         use std::time::{Duration, Instant};
@@ -295,23 +299,29 @@ mod tests {
                 pixel_height: 0,
             })
             .expect("openpty");
+        // A long-lived child so a *blocking* inline `wait()` would hold the
+        // worker for seconds, while the correct `spawn_blocking` enqueue
+        // returns in sub-millisecond time — a gap far wider than any CI
+        // scheduling jitter, so the bound can't flake.
         let mut cmd = CommandBuilder::new("sleep");
-        cmd.arg("1");
+        cmd.arg("30");
         let child = pair.slave.spawn_command(cmd).expect("spawn sleep");
         drop(pair.slave);
+        // Keep an independent killer so we can reap the lingering child once
+        // the measurement is done (the detached `wait()` then returns).
+        let mut killer = child.clone_killer();
 
         let start = Instant::now();
         detach_wait(child);
         let elapsed = start.elapsed();
 
+        // Stop the lingering child regardless of the assertion outcome.
+        let _ = killer.kill();
+
         assert!(
-            elapsed < Duration::from_millis(300),
+            elapsed < Duration::from_secs(1),
             "PTY reap blocked the async worker for {elapsed:?}; a blocking \
              waitpid on a scheduler worker can wedge the whole runtime (#500)"
         );
-
-        // Let the lingering child exit and be reaped so the test leaves no
-        // stray process behind.
-        tokio::time::sleep(Duration::from_millis(1300)).await;
     }
 }
