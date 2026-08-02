@@ -63,6 +63,14 @@ test("unknown connection, llm agent and datasource are rejected", async () => {
   assert.deepEqual(codesFor(result, "/data/default"), ["unknown-datasource"]);
 });
 
+test("a pages surface sourceName must name a declared datasource (ADR 0027 §4)", () => {
+  const m = manifest();
+  m.surfaces.pages = { enabled: true, sourceName: "elsewhere" }; // datasource undeclared
+  const result = validateManifest(m); // intra-manifest rule; no index needed
+  assert.equal(result.ok, false);
+  assert.deepEqual(codesFor(result, "/surfaces/pages/sourceName"), ["unknown-datasource"]);
+});
+
 test("manifest-only mode (no index) skips model rules but keeps intra-manifest rules", () => {
   const m = manifest();
   m.triggers[0].action.start = "does-not-exist"; // model rule — skipped without an index

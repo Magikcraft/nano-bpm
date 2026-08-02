@@ -138,6 +138,18 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     push("/surfaces/chat/agent", `chat agent "${agent}" is not declared in llm`, "unknown-llm");
   }
 
+  // surfaces.pages.sourceName names a declared datasource (ADR 0027 §4): the page
+  // runtime reads /app/data/<source> from this alias, so an unknown one is a
+  // dangling reference just like data.default or a form field's dataSource.
+  const pagesSource = manifest.surfaces?.pages?.sourceName;
+  if (pagesSource != null && !sourceNames.has(pagesSource)) {
+    push(
+      "/surfaces/pages/sourceName",
+      `pages datasource "${pagesSource}" is not declared in data.sources`,
+      "unknown-datasource",
+    );
+  }
+
   // workers[].llm names a declared llm; workers[].outputType names a declared type.
   const workers: any[] = manifest.workers ?? [];
   workers.forEach((w, i) => {
