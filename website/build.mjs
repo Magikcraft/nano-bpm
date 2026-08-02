@@ -216,7 +216,7 @@ function readSnippetRegion(relPath, region) {
   const src = readFileSync(join(here, relPath), "utf8");
   const lines = src.split("\n");
   const start = lines.findIndex((l) => l.trim() === `//#region ${region}`);
-  const end = lines.findIndex((l) => l.trim() === `//#endregion ${region}`);
+  const end = lines.findIndex((l, i) => i > start && l.trim() === `//#endregion ${region}`);
   if (start === -1 || end === -1 || end <= start) {
     throw new Error(`snippet region "${region}" not found in ${relPath}`);
   }
