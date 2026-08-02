@@ -91,7 +91,10 @@ export default defineConfig({
     // Start a backing gateway first (e.g. with `c8ctl` on :8080), then run
     // `npm run dev` and open the printed http://localhost:<port>/console/ URL.
     proxy: {
-      "/console/api": { target: backend, changeOrigin: true },
+      // `ws: true` so the integrated terminal's PTY WebSocket
+      // (`/console/api/projects/{name}/pty`, issue #496) is proxied to the
+      // gateway too, not just the plain-HTTP JSON/SSE surface.
+      "/console/api": { target: backend, changeOrigin: true, ws: true },
       "/v2": { target: backend, changeOrigin: true },
     },
   },

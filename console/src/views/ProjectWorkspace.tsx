@@ -9,6 +9,7 @@ import {
 } from "react";
 import { Link, useParams } from "react-router-dom";
 import CodeEditor, { languageForFile } from "../components/CodeEditor";
+import TerminalPane from "../components/TerminalPane";
 import MarkdownPreview from "../components/MarkdownPreview";
 import type {
   BpmnModelerHandle,
@@ -664,6 +665,7 @@ export default function ProjectWorkspace() {
               title="Drag to resize console"
             />
             <RunConsole
+              name={name}
               logs={logs}
               forwardRef={logRef}
               onClear={() => setLogs([])}
@@ -2585,19 +2587,21 @@ function EditorPane({
 // --- Run console -----------------------------------------------------------
 
 function RunConsole({
+  name,
   logs,
   forwardRef,
   onClear,
   height,
   dataTour,
 }: {
+  name: string;
   logs: ProjectLogLine[];
   forwardRef: React.RefObject<HTMLDivElement>;
   onClear: () => void;
   height: number;
   dataTour?: string;
 }) {
-  const [tab, setTab] = useState<"output" | "debug">("output");
+  const [tab, setTab] = useState<"output" | "debug" | "terminal">("output");
   const [debugLog, setDebugLog] = useState<DebugEntry[]>(() => debugSnapshot());
   const debugRef = useRef<HTMLDivElement>(null);
 
@@ -2643,19 +2647,27 @@ function RunConsole({
           >
             Debug{debugLog.length ? ` · ${debugLog.length}` : ""}
           </button>
+          <button
+            className={tabCls(tab === "terminal")}
+            onClick={() => setTab("terminal")}
+          >
+            Terminal
+          </button>
         </div>
-        <button
-          onClick={() => {
-            if (tab === "output") onClear();
-            else {
-              clearDebug();
-              setDebugLog([]);
-            }
-          }}
-          className="rounded px-1.5 py-0.5 text-xs uppercase tracking-wider text-fg-faint hover:bg-hover hover:text-fg-muted"
-        >
-          Clear
-        </button>
+        {tab !== "terminal" && (
+          <button
+            onClick={() => {
+              if (tab === "output") onClear();
+              else {
+                clearDebug();
+                setDebugLog([]);
+              }
+            }}
+            className="rounded px-1.5 py-0.5 text-xs uppercase tracking-wider text-fg-faint hover:bg-hover hover:text-fg-muted"
+          >
+            Clear
+          </button>
+        )}
       </div>
       {tab === "output" ? (
         <div
@@ -2683,7 +2695,7 @@ function RunConsole({
             ))
           )}
         </div>
-      ) : (
+      ) : tab === "debug" ? (
         <div
           ref={debugRef}
           className="min-h-0 flex-1 overflow-auto px-3 py-2 font-mono text-xs leading-relaxed"
@@ -2697,6 +2709,8 @@ function RunConsole({
             debugLog.map((e) => <DebugRow key={e.id} entry={e} />)
           )}
         </div>
+      ) : (
+        <TerminalPane name={name} active={tab === "terminal"} />
       )}
     </div>
   );
