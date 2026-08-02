@@ -7,16 +7,32 @@ import {
   setTerminalConfig,
   type TerminalConfig,
 } from "../lib/api";
+import {
+  terminalPaneState,
+  terminalTheme,
+  type TerminalThemeColors,
+} from "../lib/terminalPane";
 
 /**
- * Integrated terminal (issues #496, #500): an xterm.js front end wired to the
- * server's PTY WebSocket at `/console/api/projects/{name}/pty`.
+ * Integrated terminal (issues #496, #500, #504): an xterm.js front end wired to
+ * the server's PTY WebSocket at `/console/api/projects/{name}/pty`.
  *
  * The terminal is a console-managed, persisted setting (server-enforced). This
  * pane first reads `/console/api/config/terminal` and renders the appropriate
  * state — an actionable "turn it on" panel when it is off, a lock notice when
  * `NANO_CONSOLE_TERMINAL` disabled it, or the live shell — rather than always
  * dialing a socket and collapsing every failure into a bare "shell exited".
+ *
+ * The render decision lives in `../lib/terminalPane` so its two #504 invariants
+ * are unit-tested: (a) the pane stays mounted across tab switches so the shell
+ * session survives, and (b) the xterm foreground is derived from the app theme
+ * (legible in light mode, not xterm's default white).
+ *
+ * Because the parent keeps this component mounted on every bottom-panel tab, the
+ * pane must contribute NO layout when its tab isn't selected — otherwise it
+ * would split the height with the visible output/debug pane. It renders
+ * `display:none` when inactive, which keeps the live terminal mounted (session
+ * alive) while taking zero space.
  *
  * Wire protocol (mirrors `server/src/console/pty.rs`):
  *   - Binary frames both ways carry raw terminal bytes.
@@ -58,83 +74,102 @@ export default function TerminalPane({
       .finally(() => setBusy(false));
   }, []);
 
-  if (!active) return <Frame />;
+  const state = terminalPaneState(active, cfg, cfgErr);
 
-  if (cfgErr) {
-    return (
-      <Frame>
-        <Notice>
-          <p>Couldn't read the terminal setting: {cfgErr}</p>
-          <ActionButton onClick={refresh}>Retry</ActionButton>
-        </Notice>
-      </Frame>
-    );
-  }
+  const body = (() => {
+    switch (state.kind) {
+      case "idle":
+        return <Frame />;
+      case "error":
+        return (
+          <Frame>
+            <Notice>
+              <p>Couldn't read the terminal setting: {cfgErr}</p>
+              <ActionButton onClick={refresh}>Retry</ActionButton>
+            </Notice>
+          </Frame>
+        );
+      case "loading":
+        return (
+          <Frame>
+            <Notice>Checking terminal availability…</Notice>
+          </Frame>
+        );
+      case "locked":
+        return (
+          <Frame>
+            <Notice>
+              The integrated terminal is disabled by{" "}
+              <code>NANO_CONSOLE_TERMINAL</code> and can't be enabled from the
+              console.
+            </Notice>
+          </Frame>
+        );
+      case "off-local":
+        return (
+          <Frame>
+            <Notice>
+              <p>The integrated terminal is turned off.</p>
+              <ActionButton onClick={enable} disabled={busy}>
+                {busy ? "Enabling…" : "Enable terminal"}
+              </ActionButton>
+            </Notice>
+          </Frame>
+        );
+      case "off-remote":
+        return (
+          <Frame>
+            <Notice>
+              <p>The integrated terminal is turned off.</p>
+              <p className="text-fg-faint">
+                Enable it from the machine running Nano (it opens a shell there,
+                so it's local-only).
+              </p>
+            </Notice>
+          </Frame>
+        );
+      case "remote":
+        return (
+          <Frame>
+            <Notice>
+              The integrated terminal opens a shell on the machine hosting Nano,
+              so it isn't available from this remote browser.
+            </Notice>
+          </Frame>
+        );
+      case "live":
+        return (
+          <LiveTerminal
+            name={name}
+            visible={!state.hidden}
+            onDisabled={refresh}
+          />
+        );
+    }
+  })();
 
-  if (!cfg) {
-    return (
-      <Frame>
-        <Notice>Checking terminal availability…</Notice>
-      </Frame>
-    );
-  }
-
-  if (cfg.locked) {
-    return (
-      <Frame>
-        <Notice>
-          The integrated terminal is disabled by{" "}
-          <code>NANO_CONSOLE_TERMINAL</code> and can't be enabled from the
-          console.
-        </Notice>
-      </Frame>
-    );
-  }
-
-  if (!cfg.enabled) {
-    return (
-      <Frame>
-        <Notice>
-          <p>The integrated terminal is turned off.</p>
-          {cfg.local ? (
-            <ActionButton onClick={enable} disabled={busy}>
-              {busy ? "Enabling…" : "Enable terminal"}
-            </ActionButton>
-          ) : (
-            <p className="text-fg-faint">
-              Enable it from the machine running Nano (it opens a shell there,
-              so it's local-only).
-            </p>
-          )}
-        </Notice>
-      </Frame>
-    );
-  }
-
-  if (!cfg.local) {
-    return (
-      <Frame>
-        <Notice>
-          The integrated terminal opens a shell on the machine hosting Nano, so
-          it isn't available from this remote browser.
-        </Notice>
-      </Frame>
-    );
-  }
-
-  // Enabled and local → dial the PTY.
-  return <LiveTerminal name={name} onDisabled={refresh} />;
+  return (
+    // Zero-footprint when the terminal tab isn't selected, but still mounted so
+    // a live shell keeps running. Never unmount on tab switch (#504).
+    <div className={active ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
+      {body}
+    </div>
+  );
 }
 
 /** The active xterm.js ↔ PTY connection. Mounted only when the terminal is on. */
 function LiveTerminal({
   name,
+  visible,
   onDisabled,
 }: {
   name: string;
+  visible: boolean;
   onDisabled: () => void;
 }) {
   const hostRef = useRef<HTMLDivElement>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const fitRef = useRef<FitAddon | null>(null);
   const [generation, setGeneration] = useState(0);
   const [status, setStatus] = useState<
     "connecting" | "open" | "exited" | "failed"
@@ -148,12 +183,15 @@ function LiveTerminal({
     // server disabled the terminal) from a real shell exit (closed after open).
     let everOpened = false;
 
+    const readVar = (n: string): string =>
+      getComputedStyle(document.documentElement).getPropertyValue(n);
+
     const term = new Terminal({
       cursorBlink: true,
       fontFamily:
         '"JetBrains Mono Variable", ui-monospace, SFMono-Regular, monospace',
       fontSize: 13,
-      theme: { background: "#00000000" },
+      theme: toXtermTheme(terminalTheme(readVar)),
       allowProposedApi: true,
     });
     const fit = new FitAddon();
@@ -161,6 +199,18 @@ function LiveTerminal({
     term.open(host);
     fit.fit();
     term.focus();
+    termRef.current = term;
+    fitRef.current = fit;
+
+    // Keep the foreground legible when the user flips the console appearance
+    // (`:root[data-appearance="light|dark"]`) while the terminal is open (#504).
+    const themeObserver = new MutationObserver(() => {
+      term.options.theme = toXtermTheme(terminalTheme(readVar));
+    });
+    themeObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-appearance"],
+    });
 
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     const ws = new WebSocket(
@@ -210,6 +260,7 @@ function LiveTerminal({
     ro.observe(host);
 
     return () => {
+      themeObserver.disconnect();
       ro.disconnect();
       dataSub.dispose();
       resizeSub.dispose();
@@ -220,8 +271,22 @@ function LiveTerminal({
       ws.onmessage = null;
       ws.close();
       term.dispose();
+      termRef.current = null;
+      fitRef.current = null;
     };
   }, [name, generation, onDisabled]);
+
+  // While hidden (`display:none` on the parent) xterm can't measure the host,
+  // so re-fit and restore focus when the tab becomes visible again (#504).
+  useEffect(() => {
+    if (!visible) return;
+    try {
+      fitRef.current?.fit();
+    } catch {
+      // element not laid out yet; the ResizeObserver will fit shortly.
+    }
+    termRef.current?.focus();
+  }, [visible]);
 
   return (
     <Frame>
@@ -245,6 +310,16 @@ function LiveTerminal({
       )}
     </Frame>
   );
+}
+
+/** Adapt our theme tokens to xterm's `ITheme` shape (drops undefined keys). */
+function toXtermTheme(c: TerminalThemeColors) {
+  return {
+    background: c.background,
+    foreground: c.foreground,
+    cursor: c.cursor,
+    ...(c.cursorAccent ? { cursorAccent: c.cursorAccent } : {}),
+  };
 }
 
 function Frame({ children }: { children?: React.ReactNode }) {
