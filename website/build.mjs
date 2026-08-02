@@ -201,28 +201,42 @@ function langChips() {
     .join("\n");
 }
 
+/**
+ * Extract a `//#region NAME … //#endregion NAME` block from a source file,
+ * stripping the marker lines and any common leading indentation. Used to render
+ * real, type-checked snippets on the site verbatim (see website/snippets/), so
+ * the marketing code can never drift from the API it demonstrates.
+ *
+ * Blank lines immediately adjacent to the markers are dropped (they're just
+ * breathing room around the region tags), but every code line is kept
+ * byte-for-byte after de-indentation — so what's rendered is exactly what CI
+ * type-checks.
+ */
+function readSnippetRegion(relPath, region) {
+  const src = readFileSync(join(here, relPath), "utf8");
+  const lines = src.split("\n");
+  const start = lines.findIndex((l) => l.trim() === `//#region ${region}`);
+  const end = lines.findIndex((l, i) => i > start && l.trim() === `//#endregion ${region}`);
+  if (start === -1 || end === -1 || end <= start) {
+    throw new Error(`snippet region "${region}" not found in ${relPath}`);
+  }
+  const body = lines.slice(start + 1, end);
+  const indent = Math.min(
+    ...body.filter((l) => l.trim() !== "").map((l) => l.match(/^ */)[0].length),
+  );
+  const out = body.map((l) => l.slice(indent));
+  while (out.length && out[0].trim() === "") out.shift();
+  while (out.length && out[out.length - 1].trim() === "") out.pop();
+  return out.join("\n");
+}
+
 function homeHtml() {
-  // Quote-safe line array (no backticks / ${…}) so it can't collide with this
-  // module's own template literals; syntax-highlighted at build time by highlightTs().
-  // The Code-first tab: the SAME urban-pr-review convergence loop the Model-first
-  // tab runs live — authored as code (same task ids / signal / correlation key).
-  const heroCode = [
-    'import { defineWorkflow } from "@nanobpm/workflow";',
-    "",
-    "// urban-pr-review — an agentic convergence loop, authored as code.",
-    "// The same app the Model-first tab runs live on the wasm engine.",
-    'export const prReview = defineWorkflow("urban-pr-review", (w) => {',
-    '  w.run("fetchDiff", async (job) => ({ diff: await gh.diff(job.variables.prKey) }));',
-    "",
-    "  // A hired coding agent (c8ctl nano hire copilot) reviews as a durable worker.",
-    '  w.run("senior:pr-review", async (job) => ({ verdict: await agent.review(job.variables.diff) }));',
-    "",
-    "  // Durable wait — survives a crash or forced reboot, resumes on the signal.",
-    '  w.signal("review-ready", { correlationKey: "prKey" });',
-    "",
-    '  w.run("merge", async (job) => ({ merged: await gh.merge(job.variables.prKey) }));',
-    "});",
-  ].join("\n");
+  // The Code-first tab renders the `hero` region of website/snippets/hero-pr-review.ts
+  // VERBATIM — a real, compilable `defineFlow` example type-checked against the
+  // published @nanobpm/workflow in CI ("website snippet (typecheck)" job), so the
+  // landing hero can never drift from the actual API. It's the SAME urban-pr-review
+  // convergence loop the Model-first tab runs live (same task ids / signal / key).
+  const heroCode = readSnippetRegion("snippets/hero-pr-review.ts", "hero");
 
   const body = `<header class="nav">
   <a class="brand" href="/">nanobpm<span class="dim">.io</span></a>

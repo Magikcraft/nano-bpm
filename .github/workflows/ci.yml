@@ -317,6 +317,22 @@ jobs:
         # green PR here guarantees the site publishes cleanly.
         run: node website/build.mjs
 
+  website-snippet:
+    name: website snippet (typecheck)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Typecheck landing-hero snippet against published @nanobpm/workflow
+        # The landing hero (website/build.mjs) renders the `hero` region of
+        # website/snippets/hero-pr-review.ts VERBATIM. This job compiles that
+        # snippet against the published @nanobpm/workflow so the marketing
+        # example can never drift from the real defineFlow API.
+        run: npm ci && npm run typecheck
+        working-directory: website/snippets
+
   processos:
     name: processos (clippy + test)
     runs-on: ubuntu-24.04
