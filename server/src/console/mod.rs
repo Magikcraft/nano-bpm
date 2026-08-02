@@ -45,6 +45,7 @@ pub mod projects;
 pub(super) mod pty;
 pub mod server_update;
 pub(crate) mod standalone;
+pub(super) mod terminal_settings;
 pub mod trace;
 pub mod trigger_sources;
 pub mod triggers;
@@ -142,6 +143,13 @@ pub fn router(server: ServerImpl) -> Router {
         // exposes the server's filesystem and is gated on the peer being local.
         .route("/console/api/fs/browse", get(fs_browse))
         .route("/console/api/projects/{name}/pty", get(pty::pty_ws))
+        // Terminal enablement: read (informational, ungated) + toggle (loopback
+        // -gated, since it turns on a shell). Hand-wired like the other peer-
+        // gated endpoints rather than living in the typed OpenAPI spec.
+        .route(
+            "/console/api/config/terminal",
+            get(config_terminal).put(config_terminal_set),
+        )
         // Trigger webhook ingress (ADR 0025 phase 2): the universal external
         // emit endpoint. Hand-wired (not in the OpenAPI spec) because it accepts
         // an arbitrary body + custom shared-secret auth and acks after persist.
@@ -2902,6 +2910,53 @@ async fn fs_browse(
     match projects::browse_dir(q.path.as_deref()) {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
+}
+
+/// `GET /console/api/config/terminal` — the integrated terminal's enablement
+/// (`enabled`, env `locked`, whether this caller is `local`, and the `source`).
+/// Ungated: it only reports state, and the pty upgrade is gated regardless.
+async fn config_terminal(
+    ConnectInfo(peer): ConnectInfo<crate::PeerAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let local = request_is_loopback(&peer, &headers);
+    Json(terminal_settings::status_json(local)).into_response()
+}
+
+#[derive(Deserialize)]
+struct TerminalToggle {
+    enabled: bool,
+}
+
+/// `PUT /console/api/config/terminal` — enable/disable the terminal and persist
+/// it. Loopback-gated (turning on a shell is local-operator-only); `409` when
+/// `NANO_CONSOLE_TERMINAL` has locked it off.
+async fn config_terminal_set(
+    ConnectInfo(peer): ConnectInfo<crate::PeerAddr>,
+    headers: HeaderMap,
+    Json(body): Json<TerminalToggle>,
+) -> Response {
+    if !request_is_loopback(&peer, &headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "the integrated terminal can only be configured on localhost",
+        )
+            .into_response();
+    }
+    match terminal_settings::gate().map(|g| g.set(body.enabled)) {
+        Some(Ok(())) => Json(terminal_settings::status_json(true)).into_response(),
+        Some(Err(_)) => (
+            StatusCode::CONFLICT,
+            "the integrated terminal is locked off by NANO_CONSOLE_TERMINAL and \
+             cannot be enabled from the console",
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "terminal settings are not initialised",
+        )
+            .into_response(),
     }
 }
 

@@ -109,6 +109,49 @@ export async function browseFilesystem(path?: string): Promise<BrowseResult> {
   return (await res.json()) as BrowseResult;
 }
 
+// --- Integrated terminal enablement (issue #500) ---------------------------
+
+/// The integrated terminal's current enablement, as reported by the server.
+export interface TerminalConfig {
+  /// Effective: whether the terminal is on right now.
+  enabled: boolean;
+  /// `NANO_CONSOLE_TERMINAL` has hard-disabled it; the console cannot enable it.
+  locked: boolean;
+  /// Whether *this* client is on the local machine and could actually use it.
+  local: boolean;
+  /// How the value was decided: env-locked | env-default | console | default.
+  source: string;
+}
+
+/// Reads the integrated terminal's enablement. Informational (ungated); used by
+/// the Config toggle and the terminal pane to render the right state.
+export async function getTerminalConfig(): Promise<TerminalConfig> {
+  const res = await fetch("/console/api/config/terminal");
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `terminal config → HTTP ${res.status}`);
+  }
+  return (await res.json()) as TerminalConfig;
+}
+
+/// Enables or disables the integrated terminal and persists it server-side.
+/// Loopback-only server-side; throws with the server's text on 403 (off
+/// localhost) or 409 (locked off by `NANO_CONSOLE_TERMINAL`).
+export async function setTerminalConfig(
+  enabled: boolean,
+): Promise<TerminalConfig> {
+  const res = await fetch("/console/api/config/terminal", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ enabled }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(detail || `terminal config → HTTP ${res.status}`);
+  }
+  return (await res.json()) as TerminalConfig;
+}
+
 /// A single line of a worker's run log stream, delivered over SSE.
 export interface WorkerLogLine {
   tsMs: number;
