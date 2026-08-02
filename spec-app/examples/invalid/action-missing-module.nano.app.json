@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "id": "action-missing-module",
+  "name": "Action missing module",
+  "actions": [
+    { "path": "/app/actions/cancel" }
+  ]
+}

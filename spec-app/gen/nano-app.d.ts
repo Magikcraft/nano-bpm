@@ -157,6 +157,10 @@ export interface AppManifest {
   };
   surfaces?: Surfaces;
   /**
+   * App-authored action handler overrides (ADR 0055 §3): each binds a route to a handler module that wraps the generic pages start/cancel/message actions. Mounted before the generic routes, so an exact override shadows the generic one.
+   */
+  actions?: ActionDecl[];
+  /**
    * Service-task handlers: referenced files, an llm binding, or a connector supplied by an installed pack (ADR 0022 §E, ADR 0050).
    */
   workers?: Worker[];
@@ -305,6 +309,7 @@ export interface Connection {
 export interface Surfaces {
   taskInbox?: TaskInboxSurface;
   chat?: ChatSurface;
+  pages?: PagesSurface;
 }
 /**
  * Generic task inbox: lists open user tasks and renders their .form to claim/complete (ADR 0026).
@@ -323,6 +328,49 @@ export interface ChatSurface {
    * Name of an llm[] binding backing this chat (cross-reference rule, ADR 0027 §4).
    */
   agent?: string;
+}
+/**
+ * Schema-driven page runtime (ADR 0042): serves pages/<homePage>.page.json at / and the generic /app/actions + /app/data routes over the named datasource, with no hand-written frontend.
+ */
+export interface PagesSurface {
+  enabled?: boolean;
+  /**
+   * Directory of *.page.json composed pages, relative to the app root.
+   */
+  pagesDir?: string;
+  /**
+   * Id of the page served at / (loaded as <pagesDir>/<homePage>.page.json).
+   */
+  homePage?: string;
+  /**
+   * Maximum rows a dataGrid fetch returns.
+   */
+  rowLimit?: number;
+  /**
+   * Name of the data[] source the page runtime reads (cross-reference rule, ADR 0027 §4).
+   */
+  sourceName?: string;
+}
+/**
+ * An app-authored action handler override (ADR 0055 §3): binds a route to a handler module that default-exports an ActionHandler.
+ */
+export interface ActionDecl {
+  /**
+   * Route path to serve, e.g. "/app/actions/cancel" or "/app/actions/start/convergence-loop".
+   */
+  path: string;
+  /**
+   * Handler module path relative to the app root; default-exports an ActionHandler (or a named `handler`).
+   */
+  module: string;
+  /**
+   * HTTP method to match.
+   */
+  method?: string;
+  /**
+   * Match `path` as a prefix rather than exactly.
+   */
+  prefix?: boolean;
 }
 export interface LlmBinding {
   /**

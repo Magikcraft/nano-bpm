@@ -71,8 +71,15 @@
 
   "surfaces": {
     "taskInbox": { "enabled": true, "path": "/tasks" },
-    "chat": { "enabled": true, "path": "/chat", "agent": "concierge" }
+    "chat": { "enabled": true, "path": "/chat", "agent": "concierge" },
+    "pages": { "enabled": true, "pagesDir": "pages", "homePage": "home", "rowLimit": 200, "sourceName": "app" }
   },
+
+  "actions": [
+    { "path": "/app/actions/start/heating-cycle", "module": "actions/start.ts" },
+    { "path": "/app/actions/cancel", "module": "actions/cancel.ts" },
+    { "path": "/hooks/submit", "module": "actions/webhook-submit.ts", "method": "POST", "prefix": true }
+  ],
 
   "workers": [
     { "taskType": "read-thermostat", "handler": "workers/thermostat.ts" },
