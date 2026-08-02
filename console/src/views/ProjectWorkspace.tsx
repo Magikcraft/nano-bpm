@@ -2709,9 +2709,11 @@ function RunConsole({
             debugLog.map((e) => <DebugRow key={e.id} entry={e} />)
           )}
         </div>
-      ) : (
-        <TerminalPane name={name} active={tab === "terminal"} />
-      )}
+      ) : null}
+      {/* Terminal stays mounted across every bottom-panel tab so its shell
+          session survives a tab switch (#504); it renders zero-footprint
+          (display:none) when the terminal tab isn't selected. */}
+      <TerminalPane name={name} active={tab === "terminal"} />
     </div>
   );
 }
