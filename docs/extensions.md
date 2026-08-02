@@ -5,11 +5,13 @@ templates, example apps, agentic-SDLC apps, event triggers, outbound
 connectors, and colour themes are all shipped as **extension packs** — plain
 npm packages the console discovers, installs, and wires in at runtime.
 
-This guide covers two things:
+This guide covers three things:
 
 1. [**Extensions and the marketplace**](#extensions-and-the-marketplace) — what a
    pack is, how discovery/install/trust work, and where packs live on disk.
-2. [**Creating and publishing extensions**](#creating-and-publishing-extensions) —
+2. [**Using an extension**](#using-an-extension) — how to find, install, trust,
+   update, and remove a pack from the console, as a consumer.
+3. [**Creating and publishing extensions**](#creating-and-publishing-extensions) —
    the package layout, the `nano-ide.ext.json` manifest, every pack kind with a
    minimal example, and how to publish.
 
@@ -117,6 +119,60 @@ nothing).
 > pack's **driver/worker child process** (withheld until the contributing pack is
 > approved). Prefer official (`@nanobpm/`) packs, and only approve packs whose
 > driver/worker/toolchain code you trust.
+
+---
+
+## Using an extension
+
+This section is for people who **install and run** extensions. To author a pack,
+read [Creating and publishing extensions](#creating-and-publishing-extensions).
+
+### Before you begin
+
+Install Node.js on the console host. The console runs `npm` to fetch and install
+every pack. Built-in packs need no install. To run Nano itself, see the
+[User Guide](../USERGUIDE.md#get-started-with-c8ctl).
+
+### Find an extension
+
+1. Open the console.
+2. Select the **Extensions** tab.
+3. Browse the list. The marketplace shows every public pack that carries the
+   `nano-ide-ext` keyword.
+4. Read each pack's category and source. An **official** pack uses the `@nanobpm/`
+   scope. A **community** pack does not.
+
+### Install an extension
+
+1. Select a pack.
+2. Select **Install**. The console fetches the pack with `npm pack` and extracts it
+   into your workspace.
+3. Wait for the install to finish.
+
+The install runs no pack scripts. A pack is inert content, not code that the host
+runs at install time.
+
+### Trust an extension
+
+Some packs run code on your machine. A `lang` or `app` pack runs toolchain
+commands. A `trigger` or connector pack runs a supervised child process.
+
+The console blocks pack code until you approve it. To approve a pack:
+
+1. Run the pack's action. For example, compile a project or start a trigger.
+2. Read the trust prompt.
+3. Approve the pack. The console records your choice in
+   `<workspace>/extensions/trust.json`.
+
+Approve only packs whose code you trust. Prefer official (`@nanobpm/`) packs.
+
+### Update or remove an extension
+
+The console compares the installed version against the latest published version. A
+newer version shows an **Update** action. Select **Update** to replace the pack
+cleanly.
+
+To remove a pack, select **Remove**. You cannot remove a built-in pack.
 
 ---
 
