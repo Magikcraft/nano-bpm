@@ -52,6 +52,11 @@
       "additionalProperties": { "$ref": "#/$defs/connection" }
     },
     "surfaces": { "$ref": "#/$defs/surfaces" },
+    "actions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/actionDecl" },
+      "description": "App-authored action handler overrides (ADR 0055 §3): each binds a route to a handler module that wraps the generic pages start/cancel/message actions. Mounted before the generic routes, so an exact override shadows the generic one."
+    },
     "workers": {
       "type": "array",
       "items": { "$ref": "#/$defs/worker" },
@@ -313,7 +318,8 @@
       "description": "Batteries-included human surfaces generated from the manifest (ADR 0026).",
       "properties": {
         "taskInbox": { "$ref": "#/$defs/taskInboxSurface" },
-        "chat": { "$ref": "#/$defs/chatSurface" }
+        "chat": { "$ref": "#/$defs/chatSurface" },
+        "pages": { "$ref": "#/$defs/pagesSurface" }
       }
     },
     "taskInboxSurface": {
@@ -335,6 +341,61 @@
         "agent": {
           "type": "string",
           "description": "Name of an llm[] binding backing this chat (cross-reference rule, ADR 0027 §4)."
+        }
+      }
+    },
+    "pagesSurface": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Schema-driven page runtime (ADR 0042): serves pages/<homePage>.page.json at / and the generic /app/actions + /app/data routes over the named datasource, with no hand-written frontend.",
+      "properties": {
+        "enabled": { "type": "boolean", "default": false },
+        "pagesDir": {
+          "type": "string",
+          "default": "pages",
+          "description": "Directory of *.page.json composed pages, relative to the app root."
+        },
+        "homePage": {
+          "type": "string",
+          "default": "home",
+          "description": "Id of the page served at / (loaded as <pagesDir>/<homePage>.page.json)."
+        },
+        "rowLimit": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 200,
+          "description": "Maximum rows a dataGrid fetch returns."
+        },
+        "sourceName": {
+          "type": "string",
+          "default": "app",
+          "description": "Name of the data[] source the page runtime reads (cross-reference rule, ADR 0027 §4)."
+        }
+      }
+    },
+    "actionDecl": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "module"],
+      "description": "An app-authored action handler override (ADR 0055 §3): binds a route to a handler module that default-exports an ActionHandler.",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Route path to serve, e.g. \"/app/actions/cancel\" or \"/app/actions/start/convergence-loop\"."
+        },
+        "module": {
+          "type": "string",
+          "description": "Handler module path relative to the app root; default-exports an ActionHandler (or a named `handler`)."
+        },
+        "method": {
+          "type": "string",
+          "default": "POST",
+          "description": "HTTP method to match."
+        },
+        "prefix": {
+          "type": "boolean",
+          "default": false,
+          "description": "Match `path` as a prefix rather than exactly."
         }
       }
     },

@@ -570,6 +570,10 @@ export interface AppManifest {
 	};
 	surfaces?: Surfaces;
 	/**
+	 * App-authored action handler overrides (ADR 0055 §3): each binds a route to a handler module that wraps the generic pages start/cancel/message actions. Mounted before the generic routes, so an exact override shadows the generic one.
+	 */
+	actions?: ActionDecl[];
+	/**
 	 * Service-task handlers: referenced files, an llm binding, or a connector supplied by an installed pack (ADR 0022 §E, ADR 0050).
 	 */
 	workers?: Worker[];
@@ -697,6 +701,7 @@ interface Connection {
 interface Surfaces {
 	taskInbox?: TaskInboxSurface;
 	chat?: ChatSurface;
+	pages?: PagesSurface;
 }
 interface TaskInboxSurface {
 	enabled?: boolean;
@@ -709,6 +714,43 @@ interface ChatSurface {
 	 * Name of an llm[] binding backing this chat (cross-reference rule, ADR 0027 §4).
 	 */
 	agent?: string;
+}
+interface PagesSurface {
+	enabled?: boolean;
+	/**
+	 * Directory of *.page.json composed pages, relative to the app root.
+	 */
+	pagesDir?: string;
+	/**
+	 * Id of the page served at / (loaded as <pagesDir>/<homePage>.page.json).
+	 */
+	homePage?: string;
+	/**
+	 * Maximum rows a dataGrid fetch returns.
+	 */
+	rowLimit?: number;
+	/**
+	 * Name of the data[] source the page runtime reads (cross-reference rule, ADR 0027 §4).
+	 */
+	sourceName?: string;
+}
+interface ActionDecl {
+	/**
+	 * Route path to serve, e.g. "/app/actions/cancel" or "/app/actions/start/convergence-loop".
+	 */
+	path: string;
+	/**
+	 * Handler module path relative to the app root; default-exports an ActionHandler (or a named `handler`).
+	 */
+	module: string;
+	/**
+	 * HTTP method to match.
+	 */
+	method?: string;
+	/**
+	 * Match `path` as a prefix rather than exactly.
+	 */
+	prefix?: boolean;
 }
 interface LlmBinding {
 	/**
