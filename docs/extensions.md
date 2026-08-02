@@ -1,4 +1,4 @@
-# Extensions — authoring & publishing guide
+# Extensions — using, authoring & publishing guide
 
 The Nano BPM console (the RAD IDE) is **extensible**. Language support, project
 templates, example apps, agentic-SDLC apps, event triggers, outbound
@@ -146,7 +146,7 @@ every pack. Built-in packs need no install. To run Nano itself, see the
 
 1. Select a pack.
 2. Select **Install**. The console fetches the pack with `npm pack` and extracts it
-   into your workspace.
+   into `<workspace>/extensions/<scope__name>/`.
 3. Wait for the install to finish.
 
 The install runs no pack scripts. A pack is inert content, not code that the host
