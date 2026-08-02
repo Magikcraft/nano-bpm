@@ -192,7 +192,7 @@ Common configuration:
 | `PORT=<n>` | HTTP listen port (default `8080`). |
 | `NANOBPMN_DATA_DIR=<dir>` | Durable event-log + read-model directory. Without it the server runs fully in-memory (ephemeral). |
 | `DEBUG_REST=1` | Log every REST request/response (method, URI, status, latency, body preview). Leave off in production. |
-| `NANO_CONSOLE_TERMINAL=1` | **Opt-in, off by default.** Enables the IDE's integrated terminal (a full shell in the project directory). Only ever reachable from **loopback** (local peer IP + loopback `Host`), since a shell is arbitrary code execution — never enable it on a network-exposed server. Requires the `console` feature. |
+| `NANO_CONSOLE_TERMINAL` | Controls the IDE's integrated terminal (a full shell in the project directory). **Enable it in the console** (Config → Server → Integrated terminal); the setting persists in `<NANOBPMN_DATA_DIR>/console-settings.json`. This env var is a **hard lock**: set it to `0`/`false`/`off` to force the terminal off and prevent the console from enabling it (for shared / network-exposed servers). Set to `1`/`true`/`on` to default it on. Only ever reachable from **loopback** (local peer IP + loopback `Host`), since a shell is arbitrary code execution. Requires the `console` feature. |
 
 ```text
 INFO rest: --> POST /v2/process-instances [53 bytes] {"processDefinitionId":"demo","tenantId":"<default>"}

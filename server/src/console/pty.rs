@@ -15,13 +15,13 @@
 //! Two independent gates, both required, are checked **before** the upgrade:
 //! 1. **Loopback only** — same [`super::request_is_loopback`] gate as the
 //!    filesystem browser: local peer IP *and* a loopback `Host` header.
-//! 2. **Explicit opt-in** — the `NANO_CONSOLE_TERMINAL` env var must be truthy
-//!    (`1`/`true`/`yes`/`on`). Off by default, so a stock server never exposes a
-//!    shell even to a local user.
+//! 2. **Enabled** — the [`super::terminal_settings`] gate. Off by default; the
+//!    operator turns it on in the console (persisted), unless
+//!    `NANO_CONSOLE_TERMINAL` explicitly disabled it (a hard lock). See #500.
 //!
 //! Un-gated this would be a trivial RCE for anyone who can reach the port; see
-//! the issue for the full threat model. Hardening (session limits, audit,
-//! opt-in UX) is tracked as follow-up — this is a happy-path prototype.
+//! the issue for the full threat model. Hardening (session limits, audit) is
+//! tracked as follow-up.
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -37,19 +37,13 @@ use axum::{
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
-/// `true` when the operator has explicitly opted into the integrated terminal.
-/// Default-off: a full shell must never be reachable by accident.
+/// `true` when the integrated terminal is enabled — the console setting,
+/// subject to the `NANO_CONSOLE_TERMINAL` hard-lock. Resolved and persisted by
+/// [`super::terminal_settings`]; default-off, and `false` before boot init.
 pub(super) fn terminal_enabled() -> bool {
-    is_truthy(&std::env::var("NANO_CONSOLE_TERMINAL").unwrap_or_default())
-}
-
-/// Parses the opt-in env var. Accepts the usual truthy spellings, case- and
-/// whitespace-insensitive; everything else (including unset/empty) is `false`.
-fn is_truthy(raw: &str) -> bool {
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
+    super::terminal_settings::gate()
+        .map(super::terminal_settings::Gate::effective)
+        .unwrap_or(false)
 }
 
 /// The shell to spawn for a fresh terminal. Honours `$SHELL` on Unix and
@@ -80,7 +74,8 @@ pub(super) async fn pty_ws(
     if !terminal_enabled() {
         return (
             StatusCode::FORBIDDEN,
-            "the integrated terminal is disabled; set NANO_CONSOLE_TERMINAL=1 to enable it",
+            "the integrated terminal is disabled; enable it in the console (Config) \
+             unless NANO_CONSOLE_TERMINAL has locked it off",
         )
             .into_response();
     }
@@ -231,33 +226,38 @@ async fn run_pty(socket: WebSocket, dir: PathBuf) {
         }
     }
 
-    // Tear down: end both bridge threads and reap the shell. Dropping the
-    // output receiver unblocks the reader thread if it is parked in
-    // `blocking_send`, so teardown can't hang on a slow-exiting child.
+    // Tear down: end both bridge threads, signal the shell, then reap it
+    // *off* the async runtime. Dropping the output receiver unblocks the
+    // reader thread if it is parked in `blocking_send`. `kill()` is a
+    // non-blocking signal so it stays inline, but `wait()` is a blocking
+    // `waitpid`: run inline on a scheduler worker it blocks that worker until
+    // the child is reaped, and enough concurrent PTY teardowns can starve
+    // every worker and wedge the whole server (observed live: a worker stuck
+    // in `__wait4` here, #500). `detach_wait` moves the reap to the blocking
+    // pool so this async teardown returns immediately.
     drop(in_tx);
     drop(out_rx);
     let _ = child.kill();
-    let _ = child.wait();
+    detach_wait(child);
+}
+
+/// Reap a spawned shell without blocking the async runtime.
+///
+/// [`portable_pty::Child::wait`] is a blocking `waitpid`. Calling it inline on
+/// a Tokio worker holds that worker until the child exits; under enough
+/// concurrent PTY teardowns this starves every worker and wedges the entire
+/// server (observed live: a scheduler worker stuck in `__wait4` at teardown,
+/// #500). Moving the wait to the blocking pool via [`tokio::task::spawn_blocking`]
+/// lets the async teardown return immediately while the child is still reaped.
+fn detach_wait(mut child: Box<dyn portable_pty::Child + Send + Sync>) {
+    tokio::task::spawn_blocking(move || {
+        let _ = child.wait();
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn opt_in_accepts_truthy_spellings() {
-        for s in ["1", "true", "TRUE", "yes", "On", "  on  "] {
-            assert!(is_truthy(s), "{s:?} should enable the terminal");
-        }
-    }
-
-    #[test]
-    fn opt_in_rejects_everything_else() {
-        // Default-off is the whole point: unset/empty/garbage must not open a shell.
-        for s in ["", "0", "false", "no", "off", "enabled", "2", " "] {
-            assert!(!is_truthy(s), "{s:?} must not enable the terminal");
-        }
-    }
 
     #[test]
     fn resize_control_frame_parses() {
@@ -272,5 +272,56 @@ mod tests {
         // the protocol keeps input on Binary frames and control on Text.
         assert!(serde_json::from_str::<Control>("ls -la\n").is_err());
         assert!(serde_json::from_str::<Control>(r#"{"type":"bogus"}"#).is_err());
+    }
+
+    /// Regression guard for the runtime-wedge defect class (#500): a PTY
+    /// teardown must never run the blocking `waitpid` on the async worker.
+    ///
+    /// A live worker was captured stuck in `__wait4` inside the teardown reap,
+    /// which — repeated across sessions — wedged the whole tokio runtime (every
+    /// HTTP route stopped responding). This test spawns a real PTY child that
+    /// lingers and, crucially, does **not** kill it: an inline `child.wait()`
+    /// would block the caller for the child's whole lifetime, whereas
+    /// [`detach_wait`] must return effectively immediately.
+    // Unix-gated: it spawns `sleep` to model a shell that outlives its socket,
+    // and `sleep` isn't guaranteed on Windows. The defect and fix are
+    // platform-agnostic; this reproduction just needs a portable "linger".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detach_wait_does_not_block_the_async_worker() {
+        use std::time::{Duration, Instant};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .expect("openpty");
+        // A long-lived child so a *blocking* inline `wait()` would hold the
+        // worker for seconds, while the correct `spawn_blocking` enqueue
+        // returns in sub-millisecond time — a gap far wider than any CI
+        // scheduling jitter, so the bound can't flake.
+        let mut cmd = CommandBuilder::new("sleep");
+        cmd.arg("30");
+        let child = pair.slave.spawn_command(cmd).expect("spawn sleep");
+        drop(pair.slave);
+        // Keep an independent killer so we can reap the lingering child once
+        // the measurement is done (the detached `wait()` then returns).
+        let mut killer = child.clone_killer();
+
+        let start = Instant::now();
+        detach_wait(child);
+        let elapsed = start.elapsed();
+
+        // Stop the lingering child regardless of the assertion outcome.
+        let _ = killer.kill();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "PTY reap blocked the async worker for {elapsed:?}; a blocking \
+             waitpid on a scheduler worker can wedge the whole runtime (#500)"
+        );
     }
 }

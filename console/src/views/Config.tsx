@@ -12,6 +12,11 @@ import {
 import { useTheme } from "../theme/ThemeProvider";
 import { TOKEN_KEYS, type ThemeSpec } from "../theme/themes";
 import {
+  getTerminalConfig,
+  setTerminalConfig,
+  type TerminalConfig,
+} from "../lib/api";
+import {
   Button,
   Card,
   ErrorText,
@@ -329,10 +334,76 @@ function ServerPane() {
       </div>
 
       {mode === "basic" ? (
-        <SlaPedal sla={cfg.slaMode} onApplied={setCfg} />
+        <>
+          <SlaPedal sla={cfg.slaMode} onApplied={setCfg} />
+          <TerminalToggle />
+        </>
       ) : (
         <AdvancedParams cfg={cfg} />
       )}
+    </div>
+  );
+}
+
+// The integrated-terminal enablement toggle (issue #500). A shell is arbitrary
+// code execution, so it is off by default and gated server-side; this persists
+// the console-managed setting. When `NANO_CONSOLE_TERMINAL` has locked it off,
+// the control is disabled and explains why.
+function TerminalToggle() {
+  const [cfg, setCfg] = useState<TerminalConfig | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    getTerminalConfig()
+      .then(setCfg)
+      .catch((e) => setErr(String(e)));
+  }, []);
+
+  const toggle = (next: boolean) => {
+    setBusy(true);
+    setErr(null);
+    setTerminalConfig(next)
+      .then(setCfg)
+      .catch((e) => setErr(e instanceof Error ? e.message : String(e)))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="mt-6 rounded-md border border-edge bg-panel p-4">
+      <div className="flex items-center justify-between gap-4">
+        <div>
+          <SectionLabel>Integrated terminal</SectionLabel>
+          <p className="mt-1 max-w-prose text-sm text-fg-muted">
+            Adds a shell to the IDE bottom pane on this machine. It's arbitrary
+            code execution, so it's off by default and only reachable from
+            localhost.
+          </p>
+        </div>
+        <button
+          role="switch"
+          aria-checked={cfg?.enabled ?? false}
+          aria-label="Integrated terminal"
+          disabled={!cfg || cfg.locked || busy}
+          onClick={() => cfg && toggle(!cfg.enabled)}
+          className={`relative h-6 w-11 shrink-0 rounded-full transition-colors disabled:opacity-40 ${
+            cfg?.enabled ? "bg-accent" : "bg-edge"
+          }`}
+        >
+          <span
+            className={`absolute top-0.5 h-5 w-5 rounded-full bg-white transition-transform ${
+              cfg?.enabled ? "translate-x-[22px]" : "translate-x-0.5"
+            }`}
+          />
+        </button>
+      </div>
+      {cfg?.locked && (
+        <p className="mt-2 text-xs text-fg-faint">
+          Locked off by <code>NANO_CONSOLE_TERMINAL</code>; it can't be enabled
+          from the console.
+        </p>
+      )}
+      {err && <ErrorText>{err}</ErrorText>}
     </div>
   );
 }

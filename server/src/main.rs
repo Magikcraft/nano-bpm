@@ -16417,6 +16417,8 @@ async fn main() {
     // router. Feature-gated; the default gateway build never includes it and the
     // non-console path keeps consuming `server` directly (byte-identical).
     #[cfg(feature = "console")]
+    crate::console::terminal_settings::init_from_env();
+    #[cfg(feature = "console")]
     let console_router = crate::console::router(server.clone());
     // Build the generated (spec-first) console router while `server` is still
     // available — it is moved into the gateway router below.
