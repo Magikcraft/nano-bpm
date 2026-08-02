@@ -10,4 +10,7 @@ export * from "./manifest-completion.ts";
 export * from "./validate.ts";
 export * from "./form-data-binding.ts";
 export * from "./data-query.ts";
-export type { AppManifest } from "../gen/nano-app.d.ts";
+// Re-export the full generated type module (AppManifest + every sub-interface:
+// Surfaces, PagesSurface, ActionDecl, DataSource, …) so downstream consumers
+// (e.g. @nanobpm/urban) need not reconstruct sub-types via indexed access.
+export type * from "../gen/nano-app.d.ts";
