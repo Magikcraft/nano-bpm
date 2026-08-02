@@ -129,8 +129,9 @@ read [Creating and publishing extensions](#creating-and-publishing-extensions).
 
 ### Before you begin
 
-Install Node.js on the console host. The console runs `npm` to fetch and install
-every pack. Built-in packs need no install. To run Nano itself, see the
+Install Node.js 22.18 or later on the console host. Put `npm` on the host `PATH`.
+The console runs `npm` to fetch and install every pack. Built-in packs need no
+install. To run Nano itself, see the
 [User Guide](../USERGUIDE.md#get-started-with-c8ctl).
 
 ### Find an extension
