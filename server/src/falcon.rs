@@ -841,6 +841,19 @@ impl Registry {
     /// that keep the drain saturated, parking the rest — and because the round-robin
     /// cursor advances every pass, the parked subset rotates, so no subscriber is
     /// starved. Snapshotted under the locks; all engine work then happens lock-free.
+    ///
+    /// **Selection is credit-aware (issue #468).** A target is built only for a
+    /// subscription that can actually take a job right now: the connection is not
+    /// closed and the subscription has outstanding credits (`> 0`). A worker that
+    /// dies ungracefully stops replenishing credits, so its credits drain to zero
+    /// and it drops out of the rotation within a pass or two — new jobs route to
+    /// live, credited workers instead of stalling on a dead subscriber until the
+    /// heartbeat reaper evicts it (~seconds later). Just as importantly, a
+    /// zero-credit / dead subscription never consumes one of the scarce
+    /// `per_type_cap` governor-width slots, so a narrowed active width is spent on
+    /// workers that keep the drain moving. (Jobs already leased to a now-dead worker
+    /// are untouched here: they redeliver on lock expiry, preserving at-least-once —
+    /// no job is lost, only delayed.)
     fn dispatch_plan(&self, per_type_cap: usize) -> Vec<(String, Vec<DispatchTarget>)> {
         let conns = self.conns.lock().expect("registry poisoned");
         let by_type = self.by_type.lock().expect("registry poisoned");
@@ -854,7 +867,9 @@ impl Registry {
             let start = *cursor % ids.len();
             *cursor = start + 1;
             // How many of this type's subscribers to service this pass: the whole
-            // roster unless the governor has narrowed the active width.
+            // roster unless the governor has narrowed the active width. The width
+            // counts only *selectable* (live, credited) subscribers, so a dead or
+            // zero-credit one never displaces a live worker under a narrow cap.
             let width = if per_type_cap == 0 {
                 ids.len()
             } else {
@@ -867,6 +882,11 @@ impl Registry {
                 }
                 let id = ids[(start + offset) % ids.len()];
                 let Some(conn) = conns.get(&id) else { continue };
+                // Skip a connection already marked dead (reaped but not yet
+                // unindexed): the round-robin must never lease to it.
+                if conn.closed.load(Ordering::Relaxed) {
+                    continue;
+                }
                 let sub = conn
                     .subs
                     .lock()
@@ -874,6 +894,13 @@ impl Registry {
                     .get(job_type)
                     .cloned();
                 if let Some(sub) = sub {
+                    // Credit-aware selection: a subscription with no outstanding
+                    // demand cannot take a job this pass, so it is not a target. A
+                    // dead subscriber never replenishes credits, so this is what
+                    // drops it from the rotation on its own.
+                    if sub.credits.load(Ordering::Relaxed) <= 0 {
+                        continue;
+                    }
                     targets.push((conn.clone(), sub));
                 }
             }
@@ -3273,6 +3300,111 @@ mod registry_tests {
             conn.submission_outstanding.load(Ordering::Relaxed),
             5,
             "a delivered grant accounts exactly n"
+        );
+    }
+
+    /// Registers `conn` and indexes a `job`-type subscription on it with `credits`
+    /// outstanding demand, mirroring what a `Subscribe` frame sets up.
+    fn subscribe(registry: &Arc<Registry>, conn: &Arc<Connection>, job: &str, credits: i64) {
+        conn.subs.lock().unwrap().insert(
+            job.to_string(),
+            Arc::new(Subscription {
+                worker: format!("w{}", conn.id),
+                timeout: 0,
+                fetch_variable: None,
+                credits: AtomicI64::new(credits),
+            }),
+        );
+        registry.register(conn.clone());
+        registry.index(job, conn.id);
+    }
+
+    #[test]
+    fn dispatch_plan_never_targets_a_zero_credit_subscriber() {
+        // Issue #468: a subscriber that dies mid-flight stops replenishing credits,
+        // so its credits drain to zero. The round-robin must PROVABLY never build a
+        // dispatch target for a zero-credit subscription — otherwise jobs leased to
+        // it stall until the ~15s heartbeat reaper evicts it. Jobs must route only
+        // to live, credited workers.
+        let registry = Registry::new();
+        let job = "demo-work";
+        let live = test_connection_with_rx(1, 8).0;
+        let dead = test_connection_with_rx(2, 8).0; // killed mid-flight: credits drained
+        subscribe(&registry, &live, job, 5);
+        subscribe(&registry, &dead, job, 0);
+
+        // Many passes so the round-robin cursor visits both ring positions.
+        for _ in 0..6 {
+            let plan = registry.dispatch_plan(0);
+            let targets = &plan.iter().find(|(t, _)| t == job).expect("job planned").1;
+            assert!(
+                targets.iter().all(|(c, _)| c.id == live.id),
+                "the zero-credit (dead) subscriber must never be a dispatch target"
+            );
+            assert_eq!(
+                targets.len(),
+                1,
+                "only the live, credited subscriber is served"
+            );
+        }
+    }
+
+    #[test]
+    fn dispatch_plan_never_targets_a_closed_connection() {
+        // A connection the reaper marked dead but has not yet unindexed must not be
+        // selected: the round-robin skips `closed` connections up front.
+        let registry = Registry::new();
+        let job = "demo-work";
+        let live = test_connection_with_rx(1, 8).0;
+        let dead = test_connection_with_rx(2, 8).0;
+        subscribe(&registry, &live, job, 5);
+        subscribe(&registry, &dead, job, 5); // still has credits, but the socket died
+        dead.closed.store(true, Ordering::Relaxed);
+
+        for _ in 0..6 {
+            let plan = registry.dispatch_plan(0);
+            let targets = &plan.iter().find(|(t, _)| t == job).expect("job planned").1;
+            assert!(
+                targets.iter().all(|(c, _)| c.id == live.id),
+                "a closed connection must never be a dispatch target"
+            );
+        }
+    }
+
+    #[test]
+    fn governor_width_is_spent_on_live_credited_subscribers_not_a_dead_one() {
+        // Under the worker governor (`per_type_cap`), a scarce active-width slot must
+        // not be wasted on a dead/zero-credit subscriber sitting in the rotation: the
+        // cap should select a LIVE, credited subscriber so a narrow width keeps the
+        // drain saturated instead of stalling every time the cursor lands on the dead
+        // one. Two live subs (ids 1, 3) straddle a dead one (id 2, no credits).
+        let registry = Registry::new();
+        let job = "demo-work";
+        let a = test_connection_with_rx(1, 8).0;
+        let dead = test_connection_with_rx(2, 8).0;
+        let b = test_connection_with_rx(3, 8).0;
+        subscribe(&registry, &a, job, 5);
+        subscribe(&registry, &dead, job, 0);
+        subscribe(&registry, &b, job, 5);
+
+        // Width 1: every pass must yield exactly one LIVE target, never the dead one,
+        // and over the ring both live subscribers must be reachable (fair rotation).
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..9 {
+            for (_, targets) in registry.dispatch_plan(1) {
+                assert_eq!(targets.len(), 1, "width 1 ⇒ exactly one live target");
+                for (conn, _) in targets {
+                    assert_ne!(
+                        conn.id, dead.id,
+                        "the governor width must skip the dead subscriber"
+                    );
+                    seen.insert(conn.id);
+                }
+            }
+        }
+        assert!(
+            seen.contains(&a.id) && seen.contains(&b.id),
+            "both live subscribers are reachable under rotation: {seen:?}"
         );
     }
 }
