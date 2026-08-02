@@ -77,6 +77,29 @@ export default defineConfig({
     // the warning threshold above those known-large on-demand chunks so the
     // signal flags genuinely new regressions instead of firing on every build.
     chunkSizeWarningLimit: 4000,
+    rollupOptions: {
+      // The agentic tour journeys (src/lib/tour/journeys/agentic.ts) reach the
+      // generated fetch API client (`src/gen`) and the SSE/EventSource client
+      // (`src/lib/api.ts`) through dynamic `import()` on purpose: it keeps those
+      // browser-only clients out of module scope so the Node tour guard tests can
+      // import the journey module without dragging fetch/EventSource into Node
+      // (see the header comment in agentic.ts). Both modules are also statically
+      // imported across the app, so Rollup emits a benign reporter notice that the
+      // dynamic import cannot move them into their own chunk. Silence only those
+      // two intentional cases; every other warning (including a NEW accidental
+      // static+dynamic split elsewhere) still surfaces.
+      onwarn(warning, defaultHandler) {
+        const msg = warning.message ?? "";
+        const intentionalMixedImport =
+          msg.includes(
+            "dynamic import will not move module into another chunk",
+          ) &&
+          (msg.includes("src/gen/index.ts is dynamically imported by") ||
+            msg.includes("src/lib/api.ts is dynamically imported by"));
+        if (intentionalMixedImport) return;
+        defaultHandler(warning);
+      },
+    },
   },
   server: {
     port,
