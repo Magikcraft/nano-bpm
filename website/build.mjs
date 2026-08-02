@@ -206,6 +206,11 @@ function langChips() {
  * stripping the marker lines and any common leading indentation. Used to render
  * real, type-checked snippets on the site verbatim (see website/snippets/), so
  * the marketing code can never drift from the API it demonstrates.
+ *
+ * Blank lines immediately adjacent to the markers are dropped (they're just
+ * breathing room around the region tags), but every code line is kept
+ * byte-for-byte after de-indentation — so what's rendered is exactly what CI
+ * type-checks.
  */
 function readSnippetRegion(relPath, region) {
   const src = readFileSync(join(here, relPath), "utf8");
@@ -219,7 +224,10 @@ function readSnippetRegion(relPath, region) {
   const indent = Math.min(
     ...body.filter((l) => l.trim() !== "").map((l) => l.match(/^ */)[0].length),
   );
-  return body.map((l) => l.slice(indent)).join("\n").trim();
+  const out = body.map((l) => l.slice(indent));
+  while (out.length && out[0].trim() === "") out.shift();
+  while (out.length && out[out.length - 1].trim() === "") out.pop();
+  return out.join("\n");
 }
 
 function homeHtml() {
