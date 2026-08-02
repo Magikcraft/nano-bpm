@@ -443,12 +443,37 @@ export interface PreResolvedForm {
  * breaks the whole preview.
  */
 export declare function preResolveFormSchema(schema: unknown, resolve: DataQueryResolver): Promise<PreResolvedForm>;
-type GlobList = string[];
-type GlobList1 = string[];
-type GlobList2 = string[];
-type EnvTemplate = string;
-type Slug = string;
-type TriggerAction = {
+/**
+ * GENERATED — do not edit by hand.
+ *
+ * TypeScript types for the Urban App manifest (nano.app.json), generated from
+ * spec-app/nano-app.schema.json (ADR 0027). Regenerate with:  npm run gen
+ * (from spec-app/) or  make generate-app-manifest  (from the repo root).
+ */
+/**
+ * BPMN process globs.
+ */
+export type GlobList = string[];
+/**
+ * DMN decision globs.
+ */
+export type GlobList1 = string[];
+/**
+ * form-js form globs.
+ */
+export type GlobList2 = string[];
+/**
+ * A ${VAR} or ${VAR:-default} boot-time substitution reference (ADR 0027 §5). Resolved at App boot / IDE Run, never persisted. The validator checks the reference shape, not the resolved value.
+ */
+export type EnvTemplate = string;
+/**
+ * Lowercase kebab-case slug.
+ */
+export type Slug = string;
+/**
+ * Maps an event to exactly one engine call (ADR 0025 §1): start a process, or publish a CorrelateMessage.
+ */
+export type TriggerAction = {
 	/**
 	 * Process id/name to start; variables seeded by a FEEL expression over the event body.
 	 */
@@ -466,10 +491,13 @@ type TriggerAction = {
 	 */
 	correlationKey?: string;
 } & TriggerAction1;
-type TriggerAction1 = {
+export type TriggerAction1 = {
 	[k: string]: unknown;
 };
-type Binding = {
+/**
+ * Binds one model — a form, a decision, OR a process — to the domain type in scope for its FEEL (ADR 0029 §5, ADR 0030). Exactly one of form/decision/process.
+ */
+export type Binding = {
 	/**
 	 * form-js form id (schema.id) whose default-value FEEL is scoped to `type`.
 	 */
@@ -487,10 +515,13 @@ type Binding = {
 	 */
 	type: string;
 } & Binding1;
-type Binding1 = {
+export type Binding1 = {
 	[k: string]: unknown;
 };
-type Worker = {
+/**
+ * A service-task worker: a referenced handler file, an llm binding, or a connector supplied by an installed pack (ADR 0022 §E, ADR 0050).
+ */
+export type Worker = {
 	taskType: string;
 	/**
 	 * Path to a handler file (language via ADR 0008 packs).
@@ -517,10 +548,10 @@ type Worker = {
 	 */
 	outputType?: string;
 } & Worker1;
-type Worker1 = {
+export type Worker1 = {
 	[k: string]: unknown;
 };
-type SecurityMode = "none" | "local" | "oidc";
+export type SecurityMode = "none" | "local" | "oidc";
 /**
  * Urban App manifest (nano.app.json) — the declared-data binding of an Urban RAD application (ADR 0027). Owns the envelope + cross-reference rules; each block's detail is owned by its ADR (data=0024, triggers=0025, surfaces=0026, security=0028, workers/llm=0022 §E). This file is the source of truth: TypeScript types are generated from it (scripts/generate-app-manifest.sh) and it doubles as the $schema editors use for nano.app.json autocompletion.
  */
@@ -585,19 +616,28 @@ export interface AppManifest {
 	};
 	security?: Security;
 }
-interface Runtime {
+/**
+ * The shipping topology of the compiled App (ADR 0005). Distinct from the IDE dev-loop deployTarget, which lives in nanobpm.project.json (ADR 0027 §1).
+ */
+export interface Runtime {
 	/**
 	 * How the App reaches the engine at runtime.
 	 */
 	engine?: "embedded" | "remote" | "cluster";
 	node?: "single" | "cluster";
 }
-interface Models {
+/**
+ * Glob references to the models the editors produce (ADR 0027 §2). Each glob must resolve to at least one file (cross-reference rule, ADR 0027 §4).
+ */
+export interface Models {
 	processes?: GlobList;
 	decisions?: GlobList1;
 	forms?: GlobList2;
 }
-interface Data {
+/**
+ * Named datasources — the BDE-alias abstraction (ADR 0024). Consumers bind by name, never by driver, so the same bundle runs on SQLite in the IDE and Postgres in production by flipping env only.
+ */
+export interface Data {
 	/**
 	 * Name of the datasource used when a consumer names none.
 	 */
@@ -606,7 +646,7 @@ interface Data {
 		[k: string]: DataSource;
 	};
 }
-interface DataSource {
+export interface DataSource {
 	/**
 	 * Driver id. May be an env template so deployment flips SQLite to Postgres without a source change (ADR 0024 §1).
 	 */
@@ -620,7 +660,10 @@ interface DataSource {
 	 */
 	migrations?: string;
 }
-interface DomainType {
+/**
+ * A named domain record type (ADR 0029 §4, ADR 0031). Its map key is the stable id; matching is nominal (by id), consistent with model reference pickers.
+ */
+export interface DomainType {
 	/**
 	 * Human-readable label. The map key remains the stable id every reference uses.
 	 */
@@ -640,7 +683,10 @@ interface DomainType {
 		[k: string]: DomainField;
 	};
 }
-interface DomainField {
+/**
+ * A single field of a domain type.
+ */
+export interface DomainField {
 	/**
 	 * A primitive type, or the id of another domain type in the registry (nominal reference). Primitive ids take precedence over an identically named type.
 	 */
@@ -654,7 +700,7 @@ interface DomainField {
 	 */
 	list?: boolean;
 }
-interface Trigger {
+export interface Trigger {
 	id: Slug;
 	/**
 	 * Source kind. Core (in-binary): cron | webhook | file. Pack sources add imap, mqtt, cloud, … (ADR 0025 §1).
@@ -692,22 +738,34 @@ interface Trigger {
 	bodyType?: string;
 	action: TriggerAction;
 }
-interface Connection {
+/**
+ * A named connection (credentials/endpoint). Shape is source-specific; secrets should be env templates, never inline literals (ADR 0025 §1).
+ */
+export interface Connection {
 	/**
 	 * Connection kind (e.g. imap, mqtt, hmac).
 	 */
 	type: string;
 }
-interface Surfaces {
+/**
+ * Batteries-included human surfaces generated from the manifest (ADR 0026).
+ */
+export interface Surfaces {
 	taskInbox?: TaskInboxSurface;
 	chat?: ChatSurface;
 	pages?: PagesSurface;
 }
-interface TaskInboxSurface {
+/**
+ * Generic task inbox: lists open user tasks and renders their .form to claim/complete (ADR 0026).
+ */
+export interface TaskInboxSurface {
 	enabled?: boolean;
 	path?: string;
 }
-interface ChatSurface {
+/**
+ * Conversational surface whose LLM agent drives the action API via its tools (ADR 0026).
+ */
+export interface ChatSurface {
 	enabled?: boolean;
 	path?: string;
 	/**
@@ -715,7 +773,10 @@ interface ChatSurface {
 	 */
 	agent?: string;
 }
-interface PagesSurface {
+/**
+ * Schema-driven page runtime (ADR 0042): serves pages/<homePage>.page.json at / and the generic /app/actions + /app/data routes over the named datasource, with no hand-written frontend.
+ */
+export interface PagesSurface {
 	enabled?: boolean;
 	/**
 	 * Directory of *.page.json composed pages, relative to the app root.
@@ -734,7 +795,10 @@ interface PagesSurface {
 	 */
 	sourceName?: string;
 }
-interface ActionDecl {
+/**
+ * An app-authored action handler override (ADR 0055 §3): binds a route to a handler module that default-exports an ActionHandler.
+ */
+export interface ActionDecl {
 	/**
 	 * Route path to serve, e.g. "/app/actions/cancel" or "/app/actions/start/convergence-loop".
 	 */
@@ -752,7 +816,7 @@ interface ActionDecl {
 	 */
 	prefix?: boolean;
 }
-interface LlmBinding {
+export interface LlmBinding {
 	/**
 	 * LLM provider selector (e.g. 'env' to resolve from environment).
 	 */
@@ -775,7 +839,10 @@ interface LlmBinding {
 	 */
 	tools?: string[];
 }
-interface Security {
+/**
+ * App-user auth/identity/authorization policy (ADR 0028). Default (block absent) is single-user, unsecured. Secrets are env templates resolved at boot, never persisted.
+ */
+export interface Security {
 	/**
 	 * Enabled auth tier(s): none (default), local (username/password), oidc (social). A list combines them.
 	 */
@@ -798,7 +865,7 @@ interface Security {
 		};
 	};
 }
-interface SecurityProvider {
+export interface SecurityProvider {
 	id: string;
 	/**
 	 * oidc: social/generic OIDC (Authorization Code + PKCE). password: local username/password.
@@ -815,7 +882,10 @@ interface SecurityProvider {
 	 */
 	signup?: "open" | "invite" | "closed";
 }
-interface RoleMap {
+/**
+ * Maps a pattern (e.g. 'start/*') to the list of roles permitted.
+ */
+export interface RoleMap {
 	[k: string]: string[];
 }
 
