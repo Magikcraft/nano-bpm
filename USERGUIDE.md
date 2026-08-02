@@ -22,6 +22,24 @@ the **[c8ctl](https://github.com/camunda/c8ctl)** CLI with the
 plugin ships a prebuilt Nano binary for your platform and installs it for you, so
 there is nothing to compile.
 
+### Prerequisites
+
+Install these tools before you start.
+
+- **Node.js 22.18 or later.** The Camunda 8 CLI runs on Node.js. Download Node.js
+  from [nodejs.org](https://nodejs.org).
+- **The Camunda 8 CLI.** Install the CLI with `npm i -g @camunda8/cli`. This
+  package provides the `c8ctl` command.
+
+Verify each tool:
+
+```bash
+node --version
+c8ctl --version
+```
+
+Then manage Nano with `c8ctl`:
+
 ```bash
 # Load the plugin (installs the matching prebuilt binary for your OS/arch)
 c8ctl load plugin c8ctl-plugin-nano
