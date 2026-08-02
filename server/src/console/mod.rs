@@ -2905,27 +2905,121 @@ async fn fs_browse(
     }
 }
 
-/// Single source of truth for the console's "local machine only" gate: the
-/// request must arrive from a loopback peer **and** carry a loopback `Host`
-/// header. Both halves matter — the peer IP proves the socket is local, and the
-/// `Host` check stops a remote page from pointing a victim's browser at
-/// `http://localhost:<port>` (DNS-rebinding / drive-by). Reused by every
-/// endpoint that touches the operator's machine directly (filesystem browsing,
-/// the integrated terminal), so the policy can never drift between them.
+/// True when a raw authority (`host`, `host:port`, `[v6]`, or `[v6]:port`)
+/// names a loopback host. Shared by the `Host` and `Origin` checks so their
+/// parsing can never drift.
+fn authority_is_loopback(authority: &str) -> bool {
+    let host_name = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else if authority.matches(':').count() > 1 {
+        authority
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    matches!(host_name, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Single source of truth for the console's "local machine only" gate. All of:
+///   1. the request arrives from a loopback peer (the socket is local),
+///   2. it carries a loopback `Host` header (blocks a remote page pointing a
+///      victim's browser at `http://localhost:<port>` via DNS-rebinding), and
+///   3. if an `Origin` header is present, it is a loopback origin.
+///
+/// The `Origin` check closes Cross-Site WebSocket Hijacking / cross-site fetch:
+/// a page on `https://evil.example` can open `ws://localhost:<port>/…` in the
+/// victim's browser, which satisfies the peer-IP and `Host` gates, but the
+/// browser stamps its own (non-loopback) `Origin` on the request. Non-browser
+/// clients (curl, our tooling) send no `Origin` and stay allowed. Reused by
+/// every endpoint that touches the operator's machine directly (filesystem
+/// browsing, the integrated terminal) so the policy can never drift.
 pub(super) fn request_is_loopback(peer: &crate::PeerAddr, headers: &HeaderMap) -> bool {
+    if !peer.0.ip().is_loopback() {
+        return false;
+    }
     let host = headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let host_name = if let Some(rest) = host.strip_prefix('[') {
-        rest.split(']').next().unwrap_or("")
-    } else if host.matches(':').count() > 1 {
-        host
-    } else {
-        host.split(':').next().unwrap_or("")
-    };
-    let host_is_loopback = matches!(host_name, "localhost" | "127.0.0.1" | "::1");
-    peer.0.ip().is_loopback() && host_is_loopback
+    if !authority_is_loopback(host) {
+        return false;
+    }
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        // Strip the scheme; `null` (opaque origins) and any remote host fail
+        // the loopback check and are rejected.
+        let authority = origin.split_once("://").map(|(_, a)| a).unwrap_or(origin);
+        if !authority_is_loopback(authority) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod loopback_gate_tests {
+    use std::net::SocketAddr;
+
+    use super::*;
+
+    fn req(peer_ip: &str, host: &str, origin: Option<&str>) -> bool {
+        let peer = crate::PeerAddr(SocketAddr::new(peer_ip.parse().unwrap(), 12345));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, host.parse().unwrap());
+        if let Some(o) = origin {
+            headers.insert(header::ORIGIN, o.parse().unwrap());
+        }
+        request_is_loopback(&peer, &headers)
+    }
+
+    #[test]
+    fn allows_loopback_peer_host_and_no_origin() {
+        // Non-browser clients (curl, our own tooling) send no Origin.
+        assert!(req("127.0.0.1", "localhost:8080", None));
+        assert!(req("127.0.0.1", "127.0.0.1:8080", None));
+        assert!(req("::1", "[::1]:8080", None));
+    }
+
+    #[test]
+    fn allows_loopback_origin() {
+        assert!(req(
+            "127.0.0.1",
+            "localhost:5173",
+            Some("http://localhost:5173")
+        ));
+        assert!(req(
+            "127.0.0.1",
+            "127.0.0.1",
+            Some("https://127.0.0.1:8443")
+        ));
+    }
+
+    #[test]
+    fn rejects_non_loopback_peer() {
+        assert!(!req("203.0.113.7", "localhost:8080", None));
+    }
+
+    #[test]
+    fn rejects_non_loopback_host() {
+        assert!(!req("127.0.0.1", "evil.example", None));
+    }
+
+    #[test]
+    fn rejects_cross_site_origin_cswsh() {
+        // The CSWSH case: a page on evil.example opens ws://localhost from the
+        // victim's browser — peer + Host look local, but the browser stamps its
+        // real Origin, which must be rejected.
+        assert!(!req(
+            "127.0.0.1",
+            "localhost:8080",
+            Some("https://evil.example")
+        ));
+        assert!(!req(
+            "127.0.0.1",
+            "localhost:8080",
+            Some("http://attacker.localhost.evil.com")
+        ));
+        // Opaque origins (sandboxed iframe, file://) present as "null".
+        assert!(!req("127.0.0.1", "localhost:8080", Some("null")));
+    }
 }
 
 pub(super) fn project_file_save(name: &str, rel: &str, body: &str) -> ApiResult {
