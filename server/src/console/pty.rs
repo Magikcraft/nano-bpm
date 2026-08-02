@@ -221,6 +221,9 @@ async fn run_pty(socket: WebSocket, dir: PathBuf) {
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
+                    // A receive error means the socket is broken: stop so the
+                    // PTY and child get torn down instead of spinning.
+                    Some(Err(_)) => break,
                     // Ping/Pong handled by axum; ignore the rest.
                     _ => {}
                 }
@@ -228,8 +231,11 @@ async fn run_pty(socket: WebSocket, dir: PathBuf) {
         }
     }
 
-    // Tear down: end the writer thread and reap the shell.
+    // Tear down: end both bridge threads and reap the shell. Dropping the
+    // output receiver unblocks the reader thread if it is parked in
+    // `blocking_send`, so teardown can't hang on a slow-exiting child.
     drop(in_tx);
+    drop(out_rx);
     let _ = child.kill();
     let _ = child.wait();
 }

@@ -34,6 +34,11 @@ export default function TerminalPane({
     const host = hostRef.current;
     if (!host) return;
 
+    // A fresh effect run (project switch or Restart) is always a new
+    // connection attempt, so reset the overlay rather than leaving a stale
+    // "shell exited" while the next socket is opening.
+    setStatus("connecting");
+
     const term = new Terminal({
       cursorBlink: true,
       fontFamily:
@@ -93,6 +98,11 @@ export default function TerminalPane({
       ro.disconnect();
       dataSub.dispose();
       resizeSub.dispose();
+      // Detach handlers before closing so a late open/close event can't call
+      // setStatus after unmount (React would warn on the detached component).
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onmessage = null;
       ws.close();
       term.dispose();
     };
