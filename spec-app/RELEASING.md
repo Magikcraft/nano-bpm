@@ -45,7 +45,7 @@ secret. Provenance stays disabled (it requires a public source repository).
 ## Cutting a release
 
 1. Update `spec-app/package.json` `"version"` to the new release version.
-2. Run `npm install` in `spec-app/` so `package-lock.json` stays in sync (CI verifies).
+2. Run `npm install` in `spec-app/` so `package-lock.json` stays in sync.
 3. Merge to `main`.
 4. Tag from `main`:
    ```bash
