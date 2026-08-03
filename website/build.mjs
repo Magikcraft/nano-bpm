@@ -79,6 +79,14 @@ try {
 rmSync(outDir, { recursive: true, force: true });
 mkdirSync(outDir, { recursive: true });
 
+// Whether the bundled docs (console/public/docs) were generated for this build.
+// Computed up-front so the landing nav + footer only advertise /docs/ when the
+// docs are actually shipped — the zero-dep schemas CI run of build.mjs skips the
+// docs build, and pages.yml (the real deploy) builds them first.
+const docsPresent = existsSync(
+  join(repoRoot, "console", "public", "docs", "index.html"),
+);
+
 const published = [];
 
 // --- 1. Urban App manifest JSON Schema (spec-app/nano-app.schema.json) --------
@@ -138,7 +146,7 @@ write(join(outDir, "schemas", "index.html"), schemasHtml(published));
 // been built (e.g. the zero-dep `schemas` CI drift check runs build.mjs alone),
 // /docs is simply omitted — same graceful pattern as the demo dist below.
 const docsDist = join(repoRoot, "console", "public", "docs");
-if (existsSync(join(docsDist, "index.html"))) {
+if (docsPresent) {
   cpSync(docsDist, join(outDir, "docs"), { recursive: true });
 }
 
@@ -256,7 +264,7 @@ function homeHtml() {
   <a class="brand" href="/">nanobpm<span class="dim">.io</span></a>
   <nav>
     <a href="/demo/">Demo</a>
-    <a href="/docs/">Docs</a>
+    ${docsPresent ? '<a href="/docs/">Docs</a>' : ""}
     <a href="/schemas/">Schemas</a>
   </nav>
 </header>
@@ -397,7 +405,7 @@ ${langChips()}
 </section>
 
 <footer class="site-foot wrap">
-  <p><a href="/demo/">Browser demo</a> · <a href="/docs/">Documentation</a> · <a href="/schemas/">Published schemas</a></p>
+  <p><a href="/demo/">Browser demo</a>${docsPresent ? ' · <a href="/docs/">Documentation</a>' : ""} · <a href="/schemas/">Published schemas</a></p>
   <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
 </footer>
 
