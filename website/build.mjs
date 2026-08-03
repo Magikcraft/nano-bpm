@@ -783,10 +783,13 @@ function mdInline(s) {
       }
       return esc(part)
         .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-        .replace(
-          /\[([^\]]+)\]\(([^)]+)\)/g,
-          (_m, text, href) => `<a href="${href}">${text}</a>`,
-        );
+        .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, text, href) => {
+          // Allowlist safe URL schemes only: http(s), mailto, and relative /
+          // fragment links. This blocks `javascript:` / `data:` URLs from a
+          // stray Markdown link becoming an executable link on nanobpm.io.
+          const safe = /^(https?:|mailto:|[/#.])/i.test(href.trim());
+          return safe ? `<a href="${href}">${text}</a>` : text;
+        });
     })
     .join("");
 }

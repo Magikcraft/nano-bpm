@@ -35,10 +35,11 @@ Goal: run an app that another author built.
 
 ### Pathway A — Nano Studio
 
-1. Open the console. Open Studio.
-2. Import the app by reference, or open the shared project.
-3. Deploy the app.
-4. Observe the instances in the Explorer.
+1. Open the console.
+2. Open Studio.
+3. Import the app by reference, or open the shared project.
+4. Deploy the app.
+5. Observe the instances in the Explorer.
 
 ### Pathway B — Your own IDE or CLI
 
@@ -62,13 +63,14 @@ Goal: build a new app.
 
 Nano Studio provides a first-class **New Urban App** affordance. Studio delivers the Urban toolkit through the extensions marketplace. On first use, Studio installs the toolkit. The first install needs network access once.
 
-1. Open the console. Open Studio.
-2. Select **New Urban App**.
-3. Select the **model-first** card, or the **code-first** card.
-4. Select the runtime. Choose **Node**, or choose **Deno**.
-5. Create the app. Studio scaffolds the app from the toolkit.
-6. Deploy the app.
-7. Observe the instances in the Explorer.
+1. Open the console.
+2. Open Studio.
+3. Select **New Urban App**.
+4. Select the **model-first** card, or the **code-first** card.
+5. Select the runtime. Choose **Node**, or choose **Deno**.
+6. Create the app. Studio scaffolds the app from the toolkit.
+7. Deploy the app.
+8. Observe the instances in the Explorer.
 
 The Deno option needs Deno on the machine. If Deno is absent, the Deno option stays disabled. To enable the Deno option, install Deno from `deno.com`.
 
