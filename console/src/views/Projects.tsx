@@ -361,9 +361,8 @@ export default function Projects() {
             <p className="mt-4 rounded-md border border-edge bg-subtle px-3 py-2 text-xs text-fg-muted">
               This is an Urban app. The{" "}
               <span className="font-medium text-fg">@nanobpm/urban</span>{" "}
-              toolkit isn’t installed yet — you can still create the project
-              now; Studio installs the toolkit automatically the first time you
-              generate types or run it.
+              toolkit scaffolds it, and isn’t installed yet — Studio will set it
+              up for you as part of creating the project.
             </p>
           )}
         </Card>
