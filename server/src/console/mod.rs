@@ -3202,7 +3202,8 @@ async fn regenerate_domain_types(name: &str) {
             Err(msg) => {
                 tracing::debug!(
                     project = name,
-                    "urban gen delegation failed, falling back to embedded codegen: {msg}"
+                    error = %msg,
+                    "urban gen delegation failed, falling back to embedded codegen"
                 );
             }
         }

@@ -2915,7 +2915,19 @@ async fn gen_with_urban(name: &str, urban: &Path) -> Result<(), String> {
         } else {
             detail
         };
-        return Err(format!("urban gen failed: {detail}"));
+        // Keep the exit status even when the child wrote nothing to either stream
+        // (a bare non-zero exit), so a failure is never reported as an empty
+        // `"urban gen failed: "`.
+        let status = output
+            .status
+            .code()
+            .map(|c| format!("exit {c}"))
+            .unwrap_or_else(|| "terminated by signal".into());
+        return Err(if detail.is_empty() {
+            format!("urban gen failed ({status}, no output)")
+        } else {
+            format!("urban gen failed ({status}): {detail}")
+        });
     }
     Ok(())
 }
@@ -8321,6 +8333,31 @@ mod tests {
         assert!(
             err.contains("manifest not found"),
             "stderr not surfaced: {err}"
+        );
+    }
+
+    /// A bare non-zero exit with no stderr/stdout must still report the exit
+    /// status — never a bare, undiagnosable `"urban gen failed: "` (the defect
+    /// class Copilot flagged on #530).
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn gen_with_urban_failure_without_output_still_reports_exit_status() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "silentfail";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stub = root.join("urban-silent.sh");
+        write_urban_stub(&stub, "exit 3\n");
+
+        let err = gen_with_urban(name, &stub).await.expect_err("should fail");
+        assert!(err.contains("urban gen failed"), "unexpected error: {err}");
+        assert!(err.contains("exit 3"), "exit status not reported: {err}");
+        assert!(
+            !err.trim_end().ends_with("failed:"),
+            "empty-output failure left an undiagnosable message: {err}"
         );
     }
 
