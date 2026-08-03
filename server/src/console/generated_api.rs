@@ -816,7 +816,8 @@ impl apis::projects::Projects for ServerImpl {
     ) -> Result<apis::projects::CreateProjectResponse, ()> {
         let description = body.description.clone().unwrap_or_default();
         let template = flatten_nullable(&body.template).unwrap_or_else(|| "starter".to_string());
-        match super::project_create(&body.name, &description, &template) {
+        let options = flatten_nullable(&body.options).unwrap_or_default();
+        match super::project_create(&body.name, &description, &template, &options) {
             Ok(v) => {
                 // Code-first projects (ADR 0048): generate the initial laid-out
                 // `resources/processes/*.bpmn` from the scaffolded `workflows/*.ts`

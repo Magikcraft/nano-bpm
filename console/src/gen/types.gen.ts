@@ -523,6 +523,38 @@ export type ProjectTemplate = {
      * Contributing extension pack id; present only when source is "pack".
      */
     pack?: string;
+    /**
+     * Per-template creation options the New Project picker renders as controls on the selected card (e.g. a Node/Deno runtime toggle). Generic: any built-in or pack template may declare options; the console renders each control and echoes the chosen values back in `CreateProjectRequest.options`. Absent or empty for templates with no options.
+     */
+    options?: Array<TemplateOption>;
+};
+
+export type TemplateOption = {
+    /**
+     * Stable option key echoed back in `CreateProjectRequest.options` (e.g. "runtime").
+     */
+    id: string;
+    /**
+     * Human-facing control label rendered on the card.
+     */
+    label: string;
+    /**
+     * The selectable values for this option.
+     */
+    choices: Array<TemplateOptionChoice>;
+    /**
+     * Value pre-selected when the card opens. Falls back to the first choice when absent.
+     */
+    default?: string | null;
+};
+
+export type TemplateOptionChoice = {
+    value: string;
+    label: string;
+    /**
+     * Host capability this choice requires; the console disables the choice (with an install hint) when the capability is absent. Recognised: "deno" (gated on `denoAvailable`), "node" (gated on `nodeAvailable`). Absent = always selectable.
+     */
+    requires?: string | null;
 };
 
 export type ProjectDetail = {
@@ -582,6 +614,12 @@ export type CreateProjectRequest = {
     name: string;
     description?: string;
     template?: string | null;
+    /**
+     * Chosen values for the selected template's declared options, keyed by `TemplateOption.id` (e.g. {"runtime":"deno"}). Omitted keys fall back to each option's `default`. Ignored for templates that declare no options.
+     */
+    options?: {
+        [key: string]: string;
+    } | null;
 };
 
 export type ImportProjectRequest = {
