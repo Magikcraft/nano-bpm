@@ -1,37 +1,41 @@
 # Getting Started with Urban
 
-Urban builds agentic apps on your workstation. This guide explains Urban. Then it shows two journeys and three pathways.
+Welcome. Urban is the fastest way to build agentic apps that run on your own machine. This guide introduces Urban, then walks you through two journeys — consuming an app, and authoring one — across three pathways. Pick whichever fits the way you like to work.
 
 ## What is Urban
 
-Urban is a RAAD environment. RAAD means Rapid Agentic Application Development. Urban runs on the developer workstation.
+Urban is a framework for writing agentic orchestration applications with Nano, in TypeScript. It runs on your workstation, with no cloud required.
 
-Urban composes coding agents, tools, and human approvals into durable workflows. A durable workflow survives a crash. After a restart, the workflow resumes at the exact step.
+With Urban you compose coding agents, tools, and human approvals into durable workflows. "Durable" means a workflow survives a crash — after a restart it resumes at the exact step it reached, so no work repeats and no tokens are re-spent.
 
-Urban supports two styles. You write the workflow as code, or you draw it as a model. The same engine runs both.
+You can author the same app two ways: write the workflow as TypeScript, or draw it as a model. One engine runs both.
 
-Urban is provider-agnostic. Urban runs on a Raspberry Pi.
+Urban is provider-agnostic, and small enough to start on a Raspberry Pi.
+
+### Urban and Nano Studio
+
+Nano Studio is the RAAD — the Rapid Agentic Application Development environment. It gives you the full integrated experience: scaffold, edit, deploy, and observe your Urban apps in one place. Bring your own IDE if you prefer, or work entirely inside Nano Studio.
 
 ## Prerequisites
 
-Complete these steps once.
+You only need this setup once.
 
 - Install Node.js. Nano needs Node.js version 22.6 or later.
 - Install the CLI. Run `npm i -g @camunda8/cli`.
 - Load the Nano plugin. Run `c8ctl load plugin c8ctl-plugin-nano`.
 - Start a node. Run `c8ctl nano start`.
 
-A node is one Nano process. The node serves the console, the engine, and the agent endpoint.
+A node is a single Nano process. It serves the console, the engine, and the agent endpoint.
 
 ## Two journeys
 
-Urban has two journeys. You consume an app that another author built. You author a new app.
+There are two journeys in Urban. In the first, you consume an app that someone else built. In the second, you author a brand-new app of your own.
 
-Each journey has three pathways. A pathway is a surface. The three surfaces are Nano Studio, your own IDE or CLI, and the agent endpoint. Pick the pathway that fits your tools. Every pathway ends at the same place: a deployed app, observed in Studio.
+Each journey offers three pathways — think of them as surfaces: Nano Studio, your own IDE or CLI, and the agent endpoint. Choose the one that suits your tools. Whichever you pick, you land in the same place: a deployed app you can watch run in Studio.
 
 ## Journey 1 — Consume an existing app
 
-Goal: run an app that another author built.
+Your goal: run an app that another author built.
 
 ### Pathway A — Nano Studio
 
@@ -57,11 +61,11 @@ Goal: run an app that another author built.
 
 ## Journey 2 — Author a new app
 
-Goal: build a new app.
+Your goal: build a new app of your own.
 
 ### Pathway A — Nano Studio
 
-Nano Studio provides a first-class **New Urban App** affordance. Studio delivers the Urban toolkit through the extensions marketplace. On first use, Studio installs the toolkit. The first install needs network access once.
+Nano Studio gives you a first-class **New Urban App** button. The Urban toolkit arrives through the extensions marketplace, so Studio installs it the first time you need it. That first install needs network access, once.
 
 1. Open the console.
 2. Open Studio.
@@ -72,11 +76,11 @@ Nano Studio provides a first-class **New Urban App** affordance. Studio delivers
 7. Deploy the app.
 8. Observe the instances in the Explorer.
 
-The Deno option needs Deno on the machine. If Deno is absent, the Deno option stays disabled. To enable the Deno option, install Deno from `deno.com`.
+The Deno option needs Deno on your machine. When Deno is absent, that option stays disabled — install Deno from `deno.com` to enable it.
 
 ### Pathway B — Your own IDE or CLI
 
-Nano derives the executable model, the job types, the message correlation, and a generic worker. You write the steps and the handlers.
+Here you write TypeScript, and Nano does the rest. Nano derives the executable model, the job types, the message correlation, and a generic worker — you write only the steps and the handlers.
 
 1. Scaffold the app. Run `npm create urban-app@latest my-app`.
 2. To author code-first, add `--style code`. The default style is model-first.
@@ -90,7 +94,7 @@ Nano derives the executable model, the job types, the message correlation, and a
 
 ### Pathway C — The agent endpoint
 
-The agent endpoint teaches an external coding agent to author an app.
+The agent endpoint hands an external coding agent everything it needs to author an app for you.
 
 1. Give the agent the address `http://<node>/agent`.
 2. The agent reads the brief. The brief describes the App schema and the run steps.
@@ -100,5 +104,6 @@ The agent endpoint teaches an external coding agent to author an app.
 
 ## Next steps
 
-- Read the published schemas at [nanobpm.io/schemas](/schemas/).
-- Open the browser demo at [nanobpm.io/demo](/demo/).
+- Explore the published schemas at [nanobpm.io/schemas](https://nanobpm.io/schemas/).
+- Try the engine live in the [browser demo](https://nanobpm.io/demo/).
+- Browse the other guides in the sidebar.

@@ -480,6 +480,11 @@ jobs:
         run: git diff --exit-code -- src/gen
       - name: Test (node:test unit tests)
         run: npm test
+      - name: Build bundled docs (guard)
+        # Fail PR-time if USERGUIDE.md or any docs/*.md guide breaks the docs
+        # generator that feeds both /docs in the app and nanobpm.io/docs, rather
+        # than discovering it only at Pages-deploy time.
+        run: node scripts/build-docs.mjs
 
   console-e2e:
     name: console (journey e2e)

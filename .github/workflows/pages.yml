@@ -15,7 +15,9 @@ on:
     branches: [main]
     paths:
       - 'website/**'
-      - 'docs/getting-started-urban.md'
+      - 'USERGUIDE.md'
+      - 'docs/**'
+      - 'console/scripts/build-docs.mjs'
       - 'spec-app/nano-app.schema.json'
       - 'console/src/moddle/nanoShapes.ts'
       - '.github/workflows/pages.yml'
@@ -52,6 +54,15 @@ jobs:
         run: |
           npm ci
           npm run build
+      - name: Build bundled docs (served at /docs on nanobpm.io)
+        # The same generator the gateway uses to embed /docs in the app. It
+        # renders USERGUIDE.md + docs/*.md into console/public/docs/*.html, which
+        # website/build.mjs then copies into _site/docs. One generator, two
+        # surfaces (the app at :8080 and nanobpm.io) — no docs fragmentation.
+        working-directory: console
+        run: |
+          npm ci
+          node scripts/build-docs.mjs
       - name: Build site
         run: node website/build.mjs
       - uses: actions/upload-pages-artifact@v3

@@ -22,6 +22,12 @@ const readmePath = join(root, "..", "USERGUIDE.md");
 // repo root) and is shipped as one self-contained page under `/docs/<slug>`.
 const extraGuides = [
   {
+    slug: "getting-started-urban",
+    title: "Getting Started with Urban",
+    path: join(root, "..", "docs", "getting-started-urban.md"),
+    linkBase: "docs",
+  },
+  {
     slug: "extensions",
     title: "Authoring extensions",
     path: join(root, "..", "docs", "extensions.md"),
