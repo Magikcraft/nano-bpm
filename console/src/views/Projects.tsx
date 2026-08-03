@@ -8,6 +8,7 @@ import {
   renameProject,
   type ProjectSummary,
   type ProjectTemplate,
+  type TemplateOption,
 } from "../gen";
 import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
 import JourneyPicker from "../components/JourneyPicker";
@@ -51,6 +52,12 @@ export default function Projects() {
   const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
   const [langMeta, setLangMeta] = useState<Record<string, LangMeta>>({});
   const [newTemplate, setNewTemplate] = useState("starter");
+  // Chosen values for each template's declared creation options, keyed
+  // templateId → optionId → value. Missing entries fall back to the option's
+  // `default` (then its first choice). Echoed back in the createProject body.
+  const [optionSel, setOptionSel] = useState<
+    Record<string, Record<string, string>>
+  >({});
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -103,6 +110,39 @@ export default function Projects() {
   const selectedTemplate =
     templates.find((t) => t.id === newTemplate) ?? templates[0];
 
+  // Whether a host capability named by a choice's `requires` is present.
+  // Unknown/absent capability = always selectable.
+  const capabilityOk = useCallback(
+    (requires: string | null | undefined): boolean => {
+      if (!requires) return true;
+      if (requires === "deno") return denoAvailable;
+      if (requires === "node") return nodeAvailable;
+      return true;
+    },
+    [denoAvailable, nodeAvailable],
+  );
+
+  // Effective value for one of a template's options: the user's pick, else the
+  // declared default, else the first choice.
+  const optionValue = useCallback(
+    (templateId: string, opt: TemplateOption): string =>
+      optionSel[templateId]?.[opt.id] ??
+      opt.default ??
+      opt.choices[0]?.value ??
+      "",
+    [optionSel],
+  );
+
+  // The chosen values for the selected template's options as a flat map, for
+  // the createProject request body. Empty when the template declares none.
+  const selectedOptions = useMemo<Record<string, string>>(() => {
+    const t = selectedTemplate;
+    if (!t?.options?.length) return {};
+    const out: Record<string, string> = {};
+    for (const opt of t.options) out[opt.id] = optionValue(t.id, opt);
+    return out;
+  }, [selectedTemplate, optionValue]);
+
   const create = async () => {
     const name = newName.trim();
     if (!name || nameError) return;
@@ -113,6 +153,9 @@ export default function Projects() {
           name,
           description: newDesc.trim(),
           template: selectedTemplate?.id ?? "starter",
+          ...(Object.keys(selectedOptions).length
+            ? { options: selectedOptions }
+            : {}),
         },
         throwOnError: true,
       });
@@ -268,6 +311,50 @@ export default function Projects() {
               </span>
             )}
           </div>
+          {selectedTemplate?.options?.map((opt) => (
+            <div key={opt.id} className="mt-4">
+              <label className="mb-1 block text-xs font-medium text-fg-muted">
+                {opt.label}
+              </label>
+              <div className="inline-flex rounded-md border border-edge p-0.5">
+                {opt.choices.map((choice) => {
+                  const enabled = capabilityOk(choice.requires);
+                  const active =
+                    optionValue(selectedTemplate.id, opt) === choice.value;
+                  return (
+                    <button
+                      key={choice.value}
+                      type="button"
+                      disabled={!enabled}
+                      title={
+                        enabled
+                          ? undefined
+                          : `${choice.label} needs ${choice.requires} — not detected on this host`
+                      }
+                      onClick={() =>
+                        setOptionSel((prev) => ({
+                          ...prev,
+                          [selectedTemplate.id]: {
+                            ...prev[selectedTemplate.id],
+                            [opt.id]: choice.value,
+                          },
+                        }))
+                      }
+                      className={[
+                        "rounded px-3 py-1 text-sm transition-colors",
+                        active
+                          ? "bg-accent text-accent-fg"
+                          : "text-fg-muted hover:bg-subtle",
+                        enabled ? "" : "cursor-not-allowed opacity-40",
+                      ].join(" ")}
+                    >
+                      {choice.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
         </Card>
 
         {loading ? (

@@ -2484,8 +2484,13 @@ fn extension_json(e: &extensions::ExtManifest) -> serde_json::Value {
 }
 
 /// `POST /console/api/projects` — scaffold a new project.
-pub(super) fn project_create(name: &str, description: &str, template: &str) -> ApiResult {
-    match projects::create_project(name, description, template) {
+pub(super) fn project_create(
+    name: &str,
+    description: &str,
+    template: &str,
+    options: &std::collections::HashMap<String, String>,
+) -> ApiResult {
+    match projects::create_project_with_options(name, description, template, options) {
         Ok(cfg) => Ok(serde_json::to_value(cfg).unwrap()),
         Err(e) if e.contains("already exists") => Err((StatusCode::CONFLICT, e)),
         Err(e) if e.contains("invalid") => Err((StatusCode::BAD_REQUEST, e)),

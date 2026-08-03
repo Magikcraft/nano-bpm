@@ -249,13 +249,62 @@ pub const PLATFORMS: &[&str] = &[
 
 /// A built-in scaffold template the New Project picker can render as a card:
 /// short title (`label`), one-line `description`, and the language pack id the
-/// scaffolded project runs on (drives the card's language icon).
+/// scaffolded project runs on (drives the card's language icon). `options`
+/// declares per-template creation controls the picker renders on the selected
+/// card (e.g. a Node/Deno runtime toggle) — see [`TemplateOptionSpec`].
 pub struct BuiltinTemplate {
     pub id: &'static str,
     pub label: &'static str,
     pub description: &'static str,
     pub lang: &'static str,
+    pub options: &'static [TemplateOptionSpec],
 }
+
+/// A single creation option a template declares (e.g. `runtime`). The console
+/// renders one control per option on the selected card and echoes the chosen
+/// value back in `CreateProjectRequest.options[id]`. Mirrors the `TemplateOption`
+/// wire schema in `spec-console/console-api.yaml`.
+pub struct TemplateOptionSpec {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub choices: &'static [TemplateChoice],
+    /// Value pre-selected when the card opens; the console falls back to the
+    /// first choice when `None`.
+    pub default: Option<&'static str>,
+}
+
+/// One selectable value of a [`TemplateOptionSpec`]. `requires` names a host
+/// capability the choice needs (`deno`/`node`); the console disables the choice
+/// when that capability is absent.
+pub struct TemplateChoice {
+    pub value: &'static str,
+    pub label: &'static str,
+    pub requires: Option<&'static str>,
+}
+
+/// Shared "no creation options" for templates that declare none.
+const NO_OPTIONS: &[TemplateOptionSpec] = &[];
+
+/// The Node/Deno runtime toggle offered by Urban templates. Node is the
+/// default (always available, ADR 0038); the Deno choice is gated on
+/// `denoAvailable` so the console disables it when Deno isn't installed.
+const RUNTIME_OPTIONS: &[TemplateOptionSpec] = &[TemplateOptionSpec {
+    id: "runtime",
+    label: "Runtime",
+    choices: &[
+        TemplateChoice {
+            value: "node",
+            label: "Node",
+            requires: None,
+        },
+        TemplateChoice {
+            value: "deno",
+            label: "Deno",
+            requires: Some("deno"),
+        },
+    ],
+    default: Some("node"),
+}];
 
 /// The project templates the scaffolder can stamp out.
 pub const TEMPLATES: &[BuiltinTemplate] = &[
@@ -264,38 +313,75 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         label: "Starter app",
         description: "One process, one worker",
         lang: "deno",
+        options: NO_OPTIONS,
     },
     BuiltinTemplate {
         id: "throughput",
         label: "Throughput (REST)",
         description: "30s ramp benchmark over the HTTP API",
         lang: "deno",
+        options: NO_OPTIONS,
     },
     BuiltinTemplate {
         id: "throughput-stream",
         label: "Throughput (falcon)",
         description: "Same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
         lang: "deno",
+        options: NO_OPTIONS,
     },
     BuiltinTemplate {
         id: "gui-starter",
         label: "GUI app",
         description: "Served-UI binary (Deno.serve) for a process application",
         lang: "deno",
+        options: NO_OPTIONS,
     },
     BuiltinTemplate {
         id: "urban-starter",
         label: "Urban App",
         description: "A RAD application (nano.app.json) with models, data, triggers & surfaces",
         lang: "deno",
+        options: RUNTIME_OPTIONS,
     },
     BuiltinTemplate {
         id: "workflow-starter",
         label: "Code-first workflow",
         description: "Durable orchestration authored as code (@nanobpm/workflow), model derived",
         lang: "deno",
+        options: NO_OPTIONS,
     },
 ];
+
+/// Serialise a template's declared creation options to the `TemplateOption[]`
+/// wire shape (`spec-console/console-api.yaml`). Empty for templates that
+/// declare none.
+fn template_options_json(options: &[TemplateOptionSpec]) -> Vec<serde_json::Value> {
+    options
+        .iter()
+        .map(|o| {
+            let choices: Vec<serde_json::Value> = o
+                .choices
+                .iter()
+                .map(|c| {
+                    let mut cj = serde_json::json!({ "value": c.value, "label": c.label });
+                    if let Some(req) = c.requires {
+                        cj["requires"] = serde_json::json!(req);
+                    }
+                    cj
+                })
+                .collect();
+            let mut oj = serde_json::json!({
+                "id": o.id,
+                "label": o.label,
+                "choices": choices,
+            });
+            if let Some(def) = o.default {
+                oj["default"] = serde_json::json!(def);
+            }
+            oj
+        })
+        .collect()
+}
 
 /// The scaffolder's full template menu: the offline built-ins from [`TEMPLATES`]
 /// merged with templates contributed by installed extension packs. Built-ins win
@@ -330,6 +416,7 @@ pub fn project_templates() -> Vec<serde_json::Value> {
                 "description": t.description,
                 "lang": t.lang,
                 "source": "builtin",
+                "options": template_options_json(t.options),
             })
         })
         .collect();
@@ -847,6 +934,13 @@ pub struct ProjectConfig {
     /// projects scaffolded before this was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template: Option<String>,
+    /// The runtime the project was created to target, chosen from the
+    /// template's `runtime` creation option at scaffold time (`node` or
+    /// `deno`). Provenance today; the forthcoming `create-urban-app`
+    /// delegation reads it to pass `--deno`. Absent when the template
+    /// declares no runtime option or the choice defaulted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
     #[serde(default)]
     pub created_ms: u64,
     #[serde(default)]
@@ -978,6 +1072,7 @@ impl ProjectConfig {
             toolchain: None,
             scaffolded_from: None,
             template: None,
+            runtime: None,
             created_ms: ts,
             updated_ms: ts,
         }
@@ -2978,11 +3073,39 @@ fn name_taken_ci(
 
 /// `template` selects which starter content to stamp out ("starter" default, or
 /// "throughput" for the benchmark demo). Unknown templates fall back to starter.
+///
+/// No-options shorthand for [`create_project_with_options`]; used by tests.
+#[cfg(test)]
 pub fn create_project(
     name: &str,
     description: &str,
     template: &str,
 ) -> Result<ProjectConfig, String> {
+    create_project_with_options(
+        name,
+        description,
+        template,
+        &std::collections::HashMap::new(),
+    )
+}
+
+/// Scaffold a new project, honouring the chosen values for the selected
+/// template's declared creation options (`options`, keyed by
+/// [`TemplateOptionSpec::id`]). Currently records the `runtime` choice as
+/// provenance on the project config; the forthcoming `create-urban-app`
+/// delegation will consume it. [`create_project`] is the no-options shorthand.
+pub fn create_project_with_options(
+    name: &str,
+    description: &str,
+    template: &str,
+    options: &std::collections::HashMap<String, String>,
+) -> Result<ProjectConfig, String> {
+    // The chosen runtime (from the template's `runtime` option), recorded on
+    // the project config as scaffold-time provenance.
+    let runtime = options
+        .get("runtime")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     // The caller-supplied name is the human-facing display name and may
     // contain spaces. Everything on disk uses its directory-safe slug — the
     // name flows into filenames, BPMN ids and package.json names below, which
@@ -3090,6 +3213,7 @@ pub fn create_project(
             version: super::extensions::pack_version(&m.id),
         });
         cfg.template = Some(template.to_string());
+        cfg.runtime = runtime.clone();
         write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
         return Ok(cfg);
     }
@@ -3129,6 +3253,7 @@ pub fn create_project(
         cfg.app = "console".to_string();
         cfg.main = "main.ts".to_string();
         cfg.template = Some("workflow-starter".to_string());
+        cfg.runtime = runtime.clone();
         write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
         return Ok(cfg);
     }
@@ -3289,6 +3414,7 @@ pub fn create_project(
         }
         .to_string(),
     );
+    cfg.runtime = runtime.clone();
     write_config(name, &cfg).map_err(|e| format!("write config: {e}"))?;
     Ok(cfg)
 }
@@ -6483,6 +6609,57 @@ mod tests {
                 .expect("component template parses");
         assert_eq!(comp["id"], "io.nanobpm.urban.read-thermostat");
         assert_eq!(comp["appliesTo"][0], "bpmn:Task");
+    }
+
+    #[test]
+    fn urban_template_exposes_runtime_option_only() {
+        // The urban-starter template declares the Node/Deno runtime toggle via
+        // `options`; every other builtin declares none. The wire projection
+        // carries the option id, its choices, and the Deno choice's `requires`
+        // capability so the console can gate it on `denoAvailable`.
+        let templates = project_templates();
+        let urban = templates
+            .iter()
+            .find(|t| t["id"] == "urban-starter")
+            .expect("urban-starter template present");
+        let options = urban["options"].as_array().expect("options array");
+        assert_eq!(options.len(), 1, "urban-starter has one option");
+        let runtime = &options[0];
+        assert_eq!(runtime["id"], "runtime");
+        assert_eq!(runtime["default"], "node");
+        let choices = runtime["choices"].as_array().expect("choices array");
+        let node = choices.iter().find(|c| c["value"] == "node").unwrap();
+        assert!(
+            node.get("requires").is_none(),
+            "Node is always available (no `requires`)"
+        );
+        let deno = choices.iter().find(|c| c["value"] == "deno").unwrap();
+        assert_eq!(deno["requires"], "deno");
+
+        // A non-Urban builtin declares no options.
+        let starter = templates
+            .iter()
+            .find(|t| t["id"] == "gui-starter")
+            .expect("gui-starter present");
+        assert!(
+            starter["options"].as_array().unwrap().is_empty(),
+            "gui-starter declares no options"
+        );
+    }
+
+    #[test]
+    fn create_project_with_options_records_runtime_choice() {
+        let _g = lock();
+        let _root = temp_root();
+        let mut opts = std::collections::HashMap::new();
+        opts.insert("runtime".to_string(), "deno".to_string());
+        let cfg = create_project_with_options("runtime_demo", "", "urban-starter", &opts)
+            .expect("create");
+        assert_eq!(
+            cfg.runtime.as_deref(),
+            Some("deno"),
+            "the chosen runtime is recorded on the project config"
+        );
     }
 
     #[test]

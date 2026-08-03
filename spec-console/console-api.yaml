@@ -2010,6 +2010,53 @@ components:
           description: >-
             Contributing extension pack id; present only when source is
             "pack".
+        options:
+          type: array
+          description: >-
+            Per-template creation options the New Project picker renders as
+            controls on the selected card (e.g. a Node/Deno runtime toggle).
+            Generic: any built-in or pack template may declare options; the
+            console renders each control and echoes the chosen values back in
+            `CreateProjectRequest.options`. Absent or empty for templates with
+            no options.
+          items: { $ref: '#/components/schemas/TemplateOption' }
+    TemplateOption:
+      type: object
+      required: [id, label, choices]
+      properties:
+        id:
+          type: string
+          description: >-
+            Stable option key echoed back in `CreateProjectRequest.options`
+            (e.g. "runtime").
+        label:
+          type: string
+          description: Human-facing control label rendered on the card.
+        choices:
+          type: array
+          minItems: 1
+          description: The selectable values for this option.
+          items: { $ref: '#/components/schemas/TemplateOptionChoice' }
+        default:
+          type: string
+          nullable: true
+          description: >-
+            Value pre-selected when the card opens. Falls back to the first
+            choice when absent.
+    TemplateOptionChoice:
+      type: object
+      required: [value, label]
+      properties:
+        value: { type: string }
+        label: { type: string }
+        requires:
+          type: string
+          nullable: true
+          description: >-
+            Host capability this choice requires; the console disables the
+            choice (with an install hint) when the capability is absent.
+            Recognised: "deno" (gated on `denoAvailable`), "node" (gated on
+            `nodeAvailable`). Absent = always selectable.
     ProjectDetail:
       type: object
       required: [config, files, runState, denoAvailable, nodeAvailable, urbanAvailable, runnable, platforms, rootPath]
@@ -2102,6 +2149,15 @@ components:
             original spelling is kept as `displayName` when it differs.
         description: { type: string }
         template: { type: string, nullable: true }
+        options:
+          type: object
+          nullable: true
+          additionalProperties: { type: string }
+          description: >-
+            Chosen values for the selected template's declared options, keyed by
+            `TemplateOption.id` (e.g. {"runtime":"deno"}). Omitted keys fall back
+            to each option's `default`. Ignored for templates that declare no
+            options.
     ImportProjectRequest:
       type: object
       required: [name, path]
