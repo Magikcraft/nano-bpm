@@ -69,7 +69,10 @@ export default function ChangelogPanel({
               The changelog isn't available for this build.
             </p>
           )}
-          {!loadError && versions.length === 0 && (
+          {!loadError && doc === null && (
+            <p className="text-sm text-fg-faint">Loading…</p>
+          )}
+          {!loadError && doc !== null && versions.length === 0 && (
             <p className="text-sm text-fg-faint">No changes recorded yet.</p>
           )}
 

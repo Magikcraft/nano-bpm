@@ -339,9 +339,13 @@ export default function App() {
   }, []);
 
   const changelogHasUnseen = hasUnseenSince(changelog, lastSeenChangelog);
-  const openChangelog = () => {
-    setChangelogOpen(true);
-    // Opening acknowledges the newest version, clearing the dot.
+  const openChangelog = () => setChangelogOpen(true);
+  const closeChangelog = () => {
+    setChangelogOpen(false);
+    // Closing acknowledges the newest version, clearing the dot. Persist on
+    // close (not open) so opening before changelog.json has loaded still marks
+    // the release seen once it arrives, and update state so the dot clears
+    // without a reload.
     const newest = changelog?.versions[0]?.version;
     if (newest) {
       localStorage.setItem("nano.changelog.lastSeen", newest);
@@ -426,7 +430,7 @@ export default function App() {
             {/* Version chrome doubles as the "What's new" entry point. It sits
                 outside the home <a> (a button can't nest in an anchor) and wears
                 a dot until the newest release has been opened. */}
-            {(serverVersion || (!changelogError && changelog)) && (
+            {(serverVersion || changelog || changelogError) && (
               <button
                 type="button"
                 onClick={openChangelog}
@@ -627,7 +631,7 @@ export default function App() {
         <ChangelogPanel
           doc={changelog}
           loadError={changelogError}
-          onClose={() => setChangelogOpen(false)}
+          onClose={closeChangelog}
         />
       )}
     </TourContext.Provider>
