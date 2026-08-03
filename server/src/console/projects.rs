@@ -258,6 +258,12 @@ pub struct BuiltinTemplate {
     pub description: &'static str,
     pub lang: &'static str,
     pub options: &'static [TemplateOptionSpec],
+    /// True when the scaffolded app relies on the `@nanobpm/urban` toolkit for
+    /// its codegen/run lifecycle (Urban apps). Surfaced as `needsUrban` so the
+    /// New Project picker can show a non-blocking install hint when the toolkit
+    /// is absent — creation itself uses the embedded scaffolder and does not
+    /// require it.
+    pub needs_urban: bool,
 }
 
 /// A single creation option a template declares (e.g. `runtime`). The console
@@ -314,6 +320,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         description: "One process, one worker",
         lang: "deno",
         options: NO_OPTIONS,
+        needs_urban: false,
     },
     BuiltinTemplate {
         id: "throughput",
@@ -321,6 +328,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         description: "30s ramp benchmark over the HTTP API",
         lang: "deno",
         options: NO_OPTIONS,
+        needs_urban: false,
     },
     BuiltinTemplate {
         id: "throughput-stream",
@@ -328,6 +336,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         description: "Same benchmark via @nanobpm/nano-sdk (A/B vs REST)",
         lang: "deno",
         options: NO_OPTIONS,
+        needs_urban: false,
     },
     BuiltinTemplate {
         id: "gui-starter",
@@ -335,6 +344,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         description: "Served-UI binary (Deno.serve) for a process application",
         lang: "deno",
         options: NO_OPTIONS,
+        needs_urban: false,
     },
     BuiltinTemplate {
         id: "urban-starter",
@@ -342,6 +352,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         description: "A RAD application (nano.app.json) with models, data, triggers & surfaces",
         lang: "deno",
         options: RUNTIME_OPTIONS,
+        needs_urban: true,
     },
     BuiltinTemplate {
         id: "workflow-starter",
@@ -349,6 +360,7 @@ pub const TEMPLATES: &[BuiltinTemplate] = &[
         description: "Durable orchestration authored as code (@nanobpm/workflow), model derived",
         lang: "deno",
         options: NO_OPTIONS,
+        needs_urban: false,
     },
 ];
 
@@ -417,6 +429,7 @@ pub fn project_templates() -> Vec<serde_json::Value> {
                 "lang": t.lang,
                 "source": "builtin",
                 "options": template_options_json(t.options),
+                "needsUrban": t.needs_urban,
             })
         })
         .collect();
@@ -6635,8 +6648,11 @@ mod tests {
         );
         let deno = choices.iter().find(|c| c["value"] == "deno").unwrap();
         assert_eq!(deno["requires"], "deno");
+        // Urban apps flag their reliance on the @nanobpm/urban toolkit so the
+        // picker can surface the install hint.
+        assert_eq!(urban["needsUrban"], true);
 
-        // A non-Urban builtin declares no options.
+        // A non-Urban builtin declares no options and does not need the toolkit.
         let starter = templates
             .iter()
             .find(|t| t["id"] == "gui-starter")
@@ -6645,6 +6661,7 @@ mod tests {
             starter["options"].as_array().unwrap().is_empty(),
             "gui-starter declares no options"
         );
+        assert_eq!(starter["needsUrban"], false);
     }
 
     #[test]

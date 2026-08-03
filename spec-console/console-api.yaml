@@ -2020,6 +2020,14 @@ components:
             `CreateProjectRequest.options`. Absent or empty for templates with
             no options.
           items: { $ref: '#/components/schemas/TemplateOption' }
+        needsUrban:
+          type: boolean
+          description: >-
+            True when the scaffolded app relies on the `@nanobpm/urban` toolkit
+            for its codegen/run lifecycle (Urban apps). The New Project picker
+            uses this together with `urbanAvailable` to surface a non-blocking
+            "the toolkit will be installed on first use" hint — creation itself
+            does not require the toolkit. Absent/false for non-Urban templates.
     TemplateOption:
       type: object
       required: [id, label, choices]
@@ -2120,7 +2128,7 @@ components:
           description: Official install page for the missing toolchain.
     ProjectsResponse:
       type: object
-      required: [projects, denoAvailable, nodeAvailable, platforms]
+      required: [projects, denoAvailable, nodeAvailable, urbanAvailable, platforms]
       properties:
         projects:
           type: array
@@ -2129,6 +2137,9 @@ components:
         denoAvailable: { type: boolean }
         # Node >= 22.6 present — the primary Run runtime.
         nodeAvailable: { type: boolean }
+        # `@nanobpm/urban` CLI present — gates Urban-app affordances (the New
+        # Project picker offers to install the first-party pack when absent).
+        urbanAvailable: { type: boolean }
         platforms:
           type: array
           items: { type: string }

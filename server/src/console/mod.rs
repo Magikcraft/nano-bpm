@@ -2443,6 +2443,7 @@ pub(super) async fn projects_list() -> ApiResult {
         "projects": out,
         "denoAvailable": sup.deno_available(),
         "nodeAvailable": sup.node_available(),
+        "urbanAvailable": urban::urban_available(),
         "platforms": projects::PLATFORMS,
         "templates": projects::project_templates(),
         "extensions": extensions_overview(),

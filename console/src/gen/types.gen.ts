@@ -527,6 +527,10 @@ export type ProjectTemplate = {
      * Per-template creation options the New Project picker renders as controls on the selected card (e.g. a Node/Deno runtime toggle). Generic: any built-in or pack template may declare options; the console renders each control and echoes the chosen values back in `CreateProjectRequest.options`. Absent or empty for templates with no options.
      */
     options?: Array<TemplateOption>;
+    /**
+     * True when the scaffolded app relies on the `@nanobpm/urban` toolkit for its codegen/run lifecycle (Urban apps). The New Project picker uses this together with `urbanAvailable` to surface a non-blocking "the toolkit will be installed on first use" hint — creation itself does not require the toolkit. Absent/false for non-Urban templates.
+     */
+    needsUrban?: boolean;
 };
 
 export type TemplateOption = {
@@ -602,6 +606,7 @@ export type ProjectsResponse = {
     projects: Array<ProjectSummary>;
     denoAvailable: boolean;
     nodeAvailable: boolean;
+    urbanAvailable: boolean;
     platforms: Array<string>;
     templates?: Array<ProjectTemplate>;
     extensions?: ExtensionsOverview;
