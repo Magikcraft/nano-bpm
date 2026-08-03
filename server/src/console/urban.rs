@@ -139,7 +139,16 @@ pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, bool>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
-    if let Some(hit) = cache.lock().unwrap().get(urban).copied() {
+    // Recover from a poisoned mutex rather than propagating the panic: the lock
+    // only guards a tiny insert/get (no user code runs under it), so a poisoned
+    // guard carries a valid map — matching this module's poison-recovery pattern
+    // keeps the capability gate robust instead of taking down urban delegation.
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(urban)
+        .copied()
+    {
         return hit;
     }
     let supported = tokio::process::Command::new(urban)
@@ -155,7 +164,10 @@ pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
             help_indicates_derive(&help)
         })
         .unwrap_or(false);
-    cache.lock().unwrap().insert(urban.to_path_buf(), supported);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(urban.to_path_buf(), supported);
     supported
 }
 
