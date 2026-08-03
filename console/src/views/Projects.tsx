@@ -49,6 +49,7 @@ export default function Projects() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [denoAvailable, setDenoAvailable] = useState(true);
   const [nodeAvailable, setNodeAvailable] = useState(true);
+  const [urbanAvailable, setUrbanAvailable] = useState(true);
   const [templates, setTemplates] = useState<ProjectTemplate[]>([]);
   const [langMeta, setLangMeta] = useState<Record<string, LangMeta>>({});
   const [newTemplate, setNewTemplate] = useState("starter");
@@ -85,6 +86,7 @@ export default function Projects() {
       setProjects(res.projects);
       setDenoAvailable(res.denoAvailable);
       setNodeAvailable(res.nodeAvailable);
+      setUrbanAvailable(res.urbanAvailable);
       setTemplates(res.templates ?? []);
       const meta: Record<string, LangMeta> = {};
       for (const e of res.extensions?.extensions ?? []) {
@@ -355,6 +357,15 @@ export default function Projects() {
               </div>
             </div>
           ))}
+          {selectedTemplate?.needsUrban && !urbanAvailable && (
+            <p className="mt-4 rounded-md border border-edge bg-subtle px-3 py-2 text-xs text-fg-muted">
+              This is an Urban app. The{" "}
+              <span className="font-medium text-fg">@nanobpm/urban</span>{" "}
+              toolkit isn’t installed yet — you can still create the project
+              now; Studio installs the toolkit automatically the first time you
+              generate types or run it.
+            </p>
+          )}
         </Card>
 
         {loading ? (
