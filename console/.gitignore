@@ -21,6 +21,10 @@ public/docs/
 # Whitepaper page, generated at build time from ../docs/whitepaper.md
 # (see scripts/build-whitepaper.mjs).
 public/whitepaper/
+
+# Changelog ("What's new"), generated at build time from the git history
+# (see scripts/build-changelog.mjs).
+public/changelog.json
 test-results/
 playwright-report/
 blob-report/
