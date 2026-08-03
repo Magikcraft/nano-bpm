@@ -483,8 +483,13 @@ jobs:
       - name: Build bundled docs (guard)
         # Fail PR-time if USERGUIDE.md or any docs/*.md guide breaks the docs
         # generator that feeds both /docs in the app and nanobpm.io/docs, rather
-        # than discovering it only at Pages-deploy time.
-        run: node scripts/build-docs.mjs
+        # than discovering it only at Pages-deploy time. Exercise BOTH variants:
+        # the default in-app build and the DOCS_SITE_BUILD=1 path pages.yml uses
+        # to publish (it omits app-only top-bar links), so neither can silently
+        # break the deploy after merge.
+        run: |
+          node scripts/build-docs.mjs
+          DOCS_SITE_BUILD=1 node scripts/build-docs.mjs
 
   console-e2e:
     name: console (journey e2e)
