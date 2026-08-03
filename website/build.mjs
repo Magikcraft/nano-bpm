@@ -806,9 +806,11 @@ function mdToHtml(md) {
       continue;
     }
 
-    // Fenced code block
-    const fence = line.match(/^```(\w*)\s*$/);
-    if (fence) {
+    // Fenced code block. Treat ANY line that starts with ``` as an opener
+    // (the info string after the fence is ignored). A strict opener regex would
+    // let a non-matching ```-line (e.g. an info string with a space) fall
+    // through every branch without advancing `i`, which would loop forever.
+    if (/^```/.test(line)) {
       const body = [];
       i += 1;
       while (i < lines.length && !/^```\s*$/.test(lines[i])) {
