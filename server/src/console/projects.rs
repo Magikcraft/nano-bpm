@@ -2924,11 +2924,19 @@ async fn gen_with_urban(name: &str, urban: &Path) -> Result<(), String> {
         // Keep the exit status even when the child wrote nothing to either stream
         // (a bare non-zero exit), so a failure is never reported as an empty
         // `"urban gen failed: "`.
-        let status = output
-            .status
-            .code()
-            .map(|c| format!("exit {c}"))
-            .unwrap_or_else(|| "terminated by signal".into());
+        let status = output.status.code().map(|c| format!("exit {c}"));
+        // On Unix a `None` exit code means a signal killed the child; surface the
+        // signal number so SIGKILL/SIGTERM failures are debuggable from logs.
+        #[cfg(unix)]
+        let status = status.unwrap_or_else(|| {
+            use std::os::unix::process::ExitStatusExt;
+            match output.status.signal() {
+                Some(sig) => format!("terminated by signal {sig}"),
+                None => "terminated by signal".into(),
+            }
+        });
+        #[cfg(not(unix))]
+        let status = status.unwrap_or_else(|| "terminated by signal".into());
         return Err(if detail.is_empty() {
             format!("urban gen failed ({status}, no output)")
         } else {
