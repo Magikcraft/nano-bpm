@@ -25,6 +25,9 @@ import { TourContext } from "./lib/tour/tourContext";
 import { navAnchor, TOUR_ANCHOR } from "./lib/tour/tourAnchors";
 import { pickerJourneys } from "./lib/tour/picker";
 import StartupJourneyPanel from "./components/StartupJourneyPanel";
+import ChangelogPanel from "./components/ChangelogPanel";
+import type { ChangelogDoc } from "./lib/changelog";
+import { hasUnseenSince, normalizeVersion } from "./lib/changelog";
 import { RouteErrorBoundary } from "./components/RouteErrorBoundary";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
@@ -329,6 +332,51 @@ export default function App() {
     };
   }, []);
 
+  // "What's new" changelog. The document is a static asset generated at build
+  // time from the git history (console/scripts/build-changelog.mjs) and served
+  // at `${BASE_URL}changelog.json`; we fetch it once and keep an unobtrusive
+  // "new" dot on the version chrome until the user opens the panel. The last
+  // acknowledged version is persisted so the dot only reappears after a genuine
+  // upgrade. Offline-soft: a missing/failed asset simply hides the affordance's
+  // badge and shows a graceful message if the panel is opened.
+  const [changelog, setChangelog] = useState<ChangelogDoc | null>(null);
+  const [changelogError, setChangelogError] = useState(false);
+  const [changelogOpen, setChangelogOpen] = useState(false);
+  const [lastSeenChangelog, setLastSeenChangelog] = useState<string | null>(
+    () => localStorage.getItem("nano.changelog.lastSeen"),
+  );
+  useEffect(() => {
+    let cancelled = false;
+    fetch(`${import.meta.env.BASE_URL}changelog.json`, {
+      headers: { accept: "application/json" },
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error("not ok"))))
+      .then((doc: ChangelogDoc) => {
+        if (!cancelled) setChangelog(doc);
+      })
+      .catch(() => {
+        if (!cancelled) setChangelogError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const changelogHasUnseen = hasUnseenSince(changelog, lastSeenChangelog);
+  const openChangelog = () => setChangelogOpen(true);
+  const closeChangelog = () => {
+    setChangelogOpen(false);
+    // Closing acknowledges the newest version, clearing the dot. Persist on
+    // close (not open) so an open that happened before changelog.json finished
+    // loading still records the release once its data is present at close time,
+    // and update state so the dot clears without a reload.
+    const newest = changelog?.versions[0]?.version;
+    if (newest) {
+      localStorage.setItem("nano.changelog.lastSeen", newest);
+      setLastSeenChangelog(newest);
+    }
+  };
+
   // Marketplace update poll (30s cadence) so the Extensions rail item can wear
   // a badge with the current available-updates count on every page — the user
   // doesn't have to open Extensions to notice a freshly-published fix. Skipped
@@ -412,14 +460,6 @@ export default function App() {
                   <div className="text-xs text-fg-faint">
                     single-node console
                   </div>
-                  {serverVersion && (
-                    <div
-                      className="mt-1 font-mono text-[10px] text-fg-faint"
-                      title="Version of the running gateway (from /console/api/topology)"
-                    >
-                      gateway v{serverVersion}
-                    </div>
-                  )}
                   <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
                     Advanced Research Prototype
                   </div>
@@ -429,6 +469,39 @@ export default function App() {
                 </>
               )}
             </a>
+            {/* Version chrome doubles as the "What's new" entry point. It sits
+                outside the home <a> (a button can't nest in an anchor) and wears
+                a dot until the newest release has been opened. Hidden while the
+                rail is collapsed (no room in the narrow rail). */}
+            {!railCollapsed &&
+              (serverVersion || changelog || changelogError) && (
+                <button
+                  type="button"
+                  onClick={openChangelog}
+                  title="See what's new in Nano"
+                  className="mt-1 flex items-center gap-1.5 rounded font-mono text-[10px] text-fg-faint outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-accent"
+                >
+                  <span>
+                    {serverVersion
+                      ? `gateway v${normalizeVersion(serverVersion) ?? serverVersion}`
+                      : "What's new"}
+                  </span>
+                  {serverVersion && (
+                    <span className="underline decoration-dotted underline-offset-2">
+                      What's new
+                    </span>
+                  )}
+                  {changelogHasUnseen && (
+                    <>
+                      <span className="sr-only">New changes available</span>
+                      <span
+                        className="inline-block h-1.5 w-1.5 rounded-full bg-accent"
+                        aria-hidden="true"
+                      />
+                    </>
+                  )}
+                </button>
+              )}
           </div>
           <nav className="flex flex-col gap-1 px-3">
             {navItems.map((item) => {
@@ -630,6 +703,13 @@ export default function App() {
             startTour();
           }}
           onClose={() => setStartupOpen(false)}
+        />
+      )}
+      {changelogOpen && (
+        <ChangelogPanel
+          doc={changelog}
+          loadError={changelogError}
+          onClose={closeChangelog}
         />
       )}
     </TourContext.Provider>

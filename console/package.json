@@ -11,7 +11,7 @@
     "test": "node --experimental-strip-types --test",
     "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
     "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\"",
-    "build:assets": "npm run gen:api && node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && node scripts/build-whitepaper.mjs && tsc",
+    "build:assets": "npm run gen:api && node scripts/copy-swagger.mjs && node scripts/copy-asyncapi.mjs && node scripts/build-docs.mjs && node scripts/build-whitepaper.mjs && node scripts/build-changelog.mjs && tsc",
     "build": "npm run build:assets && vite build && node scripts/precompress.mjs dist",
     "build:observe": "npm run build:assets && VITE_CONSOLE_PROFILE=observe vite build --outDir dist-observe --emptyOutDir && node scripts/precompress.mjs dist-observe",
     "preview": "vite preview",
