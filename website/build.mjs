@@ -128,6 +128,19 @@ const published = [];
 write(join(outDir, "index.html"), homeHtml());
 write(join(outDir, "schemas", "index.html"), schemasHtml(published));
 
+// --- Prose guide: docs/getting-started-urban.md -> /guide/getting-started/ ----
+// Rendered from the in-repo Markdown source of truth on every deploy (same
+// no-drift discipline as the schemas): the published page is derived from the
+// Markdown, never a hand-copied HTML duplicate. The output path is derived from
+// the page's declared identity (GUIDE_URL) and asserted to resolve to this
+// domain via outFor(), exactly like a schema $id.
+{
+  const GUIDE_URL = `${ORIGIN}/guide/getting-started/`;
+  const src = join(repoRoot, "docs", "getting-started-urban.md");
+  const md = readFileSync(src, "utf8");
+  write(outFor(GUIDE_URL, { indexHtml: true }), guideHtml(md));
+}
+
 const demoDist = join(here, "demo", "dist");
 if (existsSync(join(demoDist, "index.html"))) {
   cpSync(demoDist, join(outDir, "demo"), { recursive: true });
@@ -242,6 +255,7 @@ function homeHtml() {
   <a class="brand" href="/">nanobpm<span class="dim">.io</span></a>
   <nav>
     <a href="/demo/">Demo</a>
+    <a href="/guide/getting-started/">Guide</a>
     <a href="/schemas/">Schemas</a>
   </nav>
 </header>
@@ -382,7 +396,7 @@ ${langChips()}
 </section>
 
 <footer class="site-foot wrap">
-  <p><a href="/demo/">Browser demo</a> · <a href="/schemas/">Published schemas</a></p>
+  <p><a href="/demo/">Browser demo</a> · <a href="/guide/getting-started/">Getting Started</a> · <a href="/schemas/">Published schemas</a></p>
   <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
 </footer>
 
@@ -751,6 +765,120 @@ each deploy, so it never drifts from the artifact it names.</p>
 <tr><th>Identifier</th><th>Description</th></tr>
 ${rows}
 </table>`,
+  );
+}
+
+// --- Minimal Markdown renderer (zero-dependency) ------------------------------
+// A deliberately small block/inline renderer for the prose guide, so
+// `node website/build.mjs` stays dependency-free (the CI `schemas` job runs it
+// with no npm install). It supports exactly the subset the guide uses: ATX
+// headings, paragraphs, unordered + ordered lists, fenced code, thematic breaks,
+// and inline code / bold / links. Everything is HTML-escaped via esc().
+function mdInline(s) {
+  return s
+    .split(/(`[^`]+`)/g)
+    .map((part) => {
+      if (part.startsWith("`") && part.endsWith("`")) {
+        return `<code>${esc(part.slice(1, -1))}</code>`;
+      }
+      return esc(part)
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(
+          /\[([^\]]+)\]\(([^)]+)\)/g,
+          (_m, text, href) => `<a href="${href}">${text}</a>`,
+        );
+    })
+    .join("");
+}
+
+function mdToHtml(md) {
+  const lines = md.replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i];
+
+    if (line.trim() === "") {
+      i += 1;
+      continue;
+    }
+
+    // Fenced code block
+    const fence = line.match(/^```(\w*)\s*$/);
+    if (fence) {
+      const body = [];
+      i += 1;
+      while (i < lines.length && !/^```\s*$/.test(lines[i])) {
+        body.push(lines[i]);
+        i += 1;
+      }
+      i += 1; // skip closing fence
+      out.push(`<pre><code>${esc(body.join("\n"))}</code></pre>`);
+      continue;
+    }
+
+    // Thematic break
+    if (/^---+\s*$/.test(line)) {
+      out.push("<hr>");
+      i += 1;
+      continue;
+    }
+
+    // ATX heading
+    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    if (heading) {
+      const level = heading[1].length;
+      out.push(`<h${level}>${mdInline(heading[2].trim())}</h${level}>`);
+      i += 1;
+      continue;
+    }
+
+    // Unordered list
+    if (/^[-*]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^[-*]\s+/.test(lines[i])) {
+        items.push(`<li>${mdInline(lines[i].replace(/^[-*]\s+/, ""))}</li>`);
+        i += 1;
+      }
+      out.push(`<ul>\n${items.join("\n")}\n</ul>`);
+      continue;
+    }
+
+    // Ordered list
+    if (/^\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+        items.push(`<li>${mdInline(lines[i].replace(/^\d+\.\s+/, ""))}</li>`);
+        i += 1;
+      }
+      out.push(`<ol>\n${items.join("\n")}\n</ol>`);
+      continue;
+    }
+
+    // Paragraph: gather consecutive plain lines
+    const para = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== "" &&
+      !/^(#{1,6})\s+/.test(lines[i]) &&
+      !/^[-*]\s+/.test(lines[i]) &&
+      !/^\d+\.\s+/.test(lines[i]) &&
+      !/^```/.test(lines[i]) &&
+      !/^---+\s*$/.test(lines[i])
+    ) {
+      para.push(lines[i]);
+      i += 1;
+    }
+    out.push(`<p>${mdInline(para.join(" "))}</p>`);
+  }
+  return out.join("\n");
+}
+
+function guideHtml(md) {
+  const title = (md.match(/^#\s+(.*)$/m)?.[1] ?? "Guide").trim();
+  return page(
+    `nanobpm.io — ${title}`,
+    `<p><a href="/">← nanobpm.io</a></p>\n${mdToHtml(md)}`,
   );
 }
 
