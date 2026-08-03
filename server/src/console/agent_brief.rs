@@ -91,6 +91,7 @@ the *binding* is the product.
 | Console (human UI) | `{base_url}/console` |
 | Projects root (on this host's disk) | `{projects_root}` |
 | Import endpoint (link an app in) | `POST {import_url}` |
+| Engine REST (Camunda 8 v2 API) | `{base_url}/v2` |
 | App manifest JSON Schema | `{APP_SCHEMA_URL}` |
 | OpenAPI (console API) | `{base_url}/swagger` |
 | AsyncAPI (command stream) | `{base_url}/asyncapi` |
@@ -159,27 +160,13 @@ manifest — pure declared data, no code in the manifest. The manifest binds:
   bound to process starts.
 - **`models`** — globs pointing at the BPMN/DMN/form files the editors produce.
 - **`workers` / `llm`** — service-task handlers (referenced files) and LLM bindings.
+- **`actions`** — named app entrypoints (referenced handler files) that start or signal
+  a process — invoked from a button, webhook or trigger.
 - **`surfaces` / `pages`** — forms and Page-Composer pages over the domain.
 
 The manifest is the source of truth; the TypeScript types and the `$schema` an
 editor uses for autocompletion are generated from it. Point your `$schema` at
 `{APP_SCHEMA_URL}` for validation and completion.
-
-### Directory layout
-
-```
-my-app/
-  nano.app.json                    # the manifest (declared binding)
-  main.ts                          # entrypoint (deno run main.ts) — for a runnable App
-  resources/
-    processes/*.bpmn               # BPMN 2.0 models (Zeebe extension elements)
-    decisions/*.dmn                # DMN decision tables (evaluated natively)
-    forms/*.form                   # form-js forms
-  pages/*.page.json                # Page-Composer pages
-```
-
-A directory counts as a Nano app/project when it contains **`nano.app.json`**
-(Urban App) **or** **`nanobpm.project.json`** (an IDE project). Either is importable.
 
 ### A minimal manifest
 
@@ -189,32 +176,111 @@ A directory counts as a Nano app/project when it contains **`nano.app.json`**
   "schemaVersion": 1,
   "id": "my-app",
   "name": "My App",
-  "models": {{
-    "processes": ["resources/processes/*.bpmn"]
-  }}
+  "models": {{ "processes": ["processes/*.bpmn"] }}
 }}
 ```
+
+A directory counts as a Nano app/project when it contains **`nano.app.json`**
+(Urban App) **or** **`nanobpm.project.json`** (an IDE project). Either is importable.
 
 ---
 
 ## Author an app (outside the IDE)
 
-1. Create the directory layout above somewhere on **this host's filesystem** (the
-   node reads it live, so it must be on the same machine as the node).
-2. Write `nano.app.json` with the `$schema` line so your editor validates it.
-3. Author the models:
-   - **BPMN**: a `<bpmn:process isExecutable="true">` with Zeebe extension elements
-     (`zeebe:taskDefinition type="..."` on a `serviceTask`, `zeebe:calledDecision` on
-     a `businessRuleTask`, `zeebe:taskHeaders`, timers as ISO-8601 / cron). The
-     engine is Zeebe-compatible, so anything you know from Camunda 8 modelling applies.
-   - **DMN**: standard DMN 1.3 decision tables; inputs/outputs use **FEEL**. They run
-     on the cluster's native Rust decision engine — no JVM.
-   - **FEEL**: expressions are conventionally `=`-prefixed. Same dialect as Camunda 8.
-4. **Validate before linking**: the surest check is to link the app in (below) and
-   open it in the console, or run it with `deno run main.ts` if it has an entrypoint.
+**`@nanobpm/urban` is the one toolchain** that scaffolds, derives, validates and runs
+an Urban app; this node's console is a thin host over it (the manifest is the contract,
+`urban` is the single interpreter). Don't start from a blank directory — scaffold with
+**`create-urban-app`**. It emits a **Node** app by default (Node is guaranteed present;
+Deno is not) — pass `--deno` to additionally emit a `deno.json`.
 
-Tip: fetch `{APP_SCHEMA_URL}` and use it to drive completion/validation of the
-manifest as you write it.
+### 1. Scaffold — `create-urban-app`
+
+Pick an authoring style:
+
+**Model-first (default)** — the process is an authored `processes/*.bpmn`, served by `urban run`:
+
+```
+npm create urban-app@latest my-app
+# or:  deno run -A npm:create-urban-app my-app
+```
+
+**Code-first** — the process is authored in TypeScript with `defineFlow` in `workflows/*.ts`
+(`defineFlow` is the blessed path; `defineWorkflow` is the low-level escape hatch):
+
+```
+npm create urban-app@latest my-app --code-first
+```
+
+Flags: `--dir <path>`, `--id <slug>`, `--preset full|headless`,
+`--style model|code` (`--code-first` is shorthand for `--style code`), `--deno`.
+
+What you get — **model-first `my-app/`**:
+
+```
+  nano.app.json                # the manifest (declared binding)
+  main.ts                      # entrypoint (npm start → urban run)
+  processes/greet.bpmn         # BPMN 2.0 (Zeebe extension elements)
+  forms/greeting.form          # form-js form
+  workers/greet.ts             # service-task handler (referenced by the manifest)
+  db/migrations/001_init.sql   # SQLite schema (also derivable with `urban gen`)
+  package.json                 # scripts: check / gen / start / dev / deploy
+```
+
+…or **code-first `my-app/`**:
+
+```
+  nano.app.json                # the manifest
+  main.ts                      # entrypoint (npm start → node main.ts)
+  workflows/greet.ts           # the process, authored with defineFlow (blessed path)
+  scripts/greet.ts             # start an instance (npm run greet -- Adam)
+  db/migrations/001_init.sql
+  package.json                 # scripts: check / gen / start / dev / greet
+```
+
+### 2. Author the models
+
+- **BPMN** (model-first): a `<bpmn:process isExecutable="true">` with Zeebe extension
+  elements (`zeebe:taskDefinition type="..."` on a `serviceTask`, `zeebe:calledDecision`
+  on a `businessRuleTask`, `zeebe:taskHeaders`, timers as ISO-8601 / cron). The engine is
+  Zeebe-compatible, so anything you know from Camunda 8 modelling applies.
+- **defineFlow** (code-first): `defineFlow(id, envelopes, (w) => ...)` in `workflows/*.ts`
+  builds the same BPMN under the hood and can run workers in-process; eject to model-first
+  any time.
+- **DMN**: standard DMN 1.3 decision tables; inputs/outputs use **FEEL**. They run on the
+  cluster's native Rust decision engine — no JVM.
+- **FEEL**: expressions are conventionally `=`-prefixed. Same dialect as Camunda 8.
+- **Service-task handlers**: destructure `job.variables` and return result variables; the
+  DataLayer owns column type defaults, so returning `undefined` for a key omits it on write
+  (the column `DEFAULT`/`NULL` governs) — keep `null` distinct, and don't hand-coerce.
+
+---
+
+## Local development loop (validate before you link)
+
+The scaffolded app's npm scripts wrap the `urban` CLI — **this is the loop that validates
+the app end-to-end.** Point the toolchain at **this node's** engine so instances run here:
+
+```bash
+cd my-app
+export CAMUNDA_REST_ADDRESS={base_url}/v2
+
+npm install
+npm run check      # urban check — validate the manifest
+npm run gen        # urban gen — derive artifacts (SQLite migrations, worker-IO types)
+npm run dev        # hot-reload: watch sources, re-derive + reload on change
+npm start          # run once (model-first: urban run; code-first: node main.ts)
+```
+
+- `npm run gen:check` (`urban gen --check`) is the **drift gate** — it fails when the
+  derived artifacts are stale; run it in CI.
+- `urban stubs --write` scaffolds write-once handler stubs for each service task in the
+  model and wires them into the manifest.
+- `check` proves the manifest, `gen` proves the derivation, `dev`/`start` run it against
+  this node's engine at `$CAMUNDA_REST_ADDRESS` (default `http://localhost:8080/v2`). Once
+  it runs clean, **link it in** (below) so it appears in the Projects gallery.
+
+Tip: fetch `{APP_SCHEMA_URL}` and use it to drive completion/validation of the manifest
+as you write it.
 
 ---
 
@@ -300,7 +366,7 @@ Development face (\"Urban\"). This node can author and run BPMN/DMN apps.\n\n\
 Point your agent at the authoring brief below: it explains how to author a Nano \
 App on disk and link it into this running node, and how the engine works.\n\n\
 ## Agent\n\n\
-- [Agent authoring brief]({base_url}/agent): author a Nano App and link it into this node; how Nano works.\n\n\
+- [Agent authoring brief]({base_url}/agent): scaffold a Nano App with create-urban-app, validate it with the urban CLI, and link it into this node; how Nano works.\n\n\
 ## Specs\n\n\
 - [App manifest JSON Schema]({APP_SCHEMA_URL}): schema for `nano.app.json`.\n\
 - [Console REST API (OpenAPI)]({base_url}/swagger): every console endpoint.\n\
@@ -325,6 +391,17 @@ mod tests {
         assert!(md.contains("## Author an app"));
         assert!(md.contains("## Link it in"));
         assert!(md.contains("## How Nano works"));
+        // The blessed scaffold + validate loop: create-urban-app and the urban CLI.
+        assert!(md.contains("npm create urban-app@latest"));
+        assert!(md.contains("--code-first"));
+        assert!(md.contains("## Local development loop"));
+        assert!(md.contains("urban check"));
+        assert!(md.contains("urban gen --check"));
+        // Node-first hosting is the blessed path — the old Deno entrypoint must not drift back.
+        assert!(!md.contains("deno run main.ts"));
+        // The engine REST address the toolchain must target on this node.
+        assert!(md.contains("CAMUNDA_REST_ADDRESS"));
+        assert!(md.contains("https://nano.example.test/v2"));
         // It points at the schema for manifest validation/authoring.
         assert!(md.contains(APP_SCHEMA_URL));
         // The on-disk projects root (where a ref file may be dropped) is disclosed.
