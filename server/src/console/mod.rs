@@ -49,6 +49,7 @@ pub(super) mod terminal_settings;
 pub mod trace;
 pub mod trigger_sources;
 pub mod triggers;
+pub mod urban;
 pub mod worker_export;
 pub mod workers;
 pub mod workspace;
@@ -2655,6 +2656,10 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
         "runState": sup.run_state(name).await,
         "denoAvailable": sup.deno_available(),
         "nodeAvailable": sup.node_available(),
+        // Presence of the `@nanobpm/urban` CLI (epic #514 host dry-out). The
+        // Studio gates urban-app affordances on this; the binary is delivered
+        // by the marketplace pack in #520. See console::urban.
+        "urbanAvailable": urban::urban_available(),
         "runnable": runnable,
         "missingToolchain": missing_toolchain,
         "platforms": projects::PLATFORMS,

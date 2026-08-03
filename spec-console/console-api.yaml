@@ -2012,7 +2012,7 @@ components:
             "pack".
     ProjectDetail:
       type: object
-      required: [config, files, runState, denoAvailable, nodeAvailable, runnable, platforms, rootPath]
+      required: [config, files, runState, denoAvailable, nodeAvailable, urbanAvailable, runnable, platforms, rootPath]
       properties:
         config: { $ref: '#/components/schemas/ProjectConfig' }
         files:
@@ -2031,6 +2031,10 @@ components:
         denoAvailable: { type: boolean }
         # Node >= 22.6 present — the primary Run runtime.
         nodeAvailable: { type: boolean }
+        # `@nanobpm/urban` CLI present — gates urban-app affordances in the
+        # Studio (epic #514 host dry-out). Delivered by the marketplace pack
+        # (#520); resolved host-side via console::urban::find_urban.
+        urbanAvailable: { type: boolean }
         runnable: { type: boolean }
         missingToolchain:
           allOf: [ { $ref: '#/components/schemas/MissingToolchain' } ]

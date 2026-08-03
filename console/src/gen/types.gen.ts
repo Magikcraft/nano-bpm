@@ -535,6 +535,7 @@ export type ProjectDetail = {
     rootPath: string;
     denoAvailable: boolean;
     nodeAvailable: boolean;
+    urbanAvailable: boolean;
     runnable: boolean;
     /**
      * Present only when `runnable` is false. Names exactly what the server probed for (and could not find) so the Console can tell the user which tool to install, instead of a generic "toolchain missing".
