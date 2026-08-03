@@ -22,6 +22,7 @@ import {
   copyFileSync,
   cpSync,
   existsSync,
+  readdirSync,
   rmSync,
   readFileSync,
 } from "node:fs";
@@ -147,7 +148,23 @@ write(join(outDir, "schemas", "index.html"), schemasHtml(published));
 // /docs is simply omitted — same graceful pattern as the demo dist below.
 const docsDist = join(repoRoot, "console", "public", "docs");
 if (docsPresent) {
-  cpSync(docsDist, join(outDir, "docs"), { recursive: true });
+  const docsOut = join(outDir, "docs");
+  cpSync(docsDist, docsOut, { recursive: true });
+  // The sidebar links between doc pages are extensionless (`/docs/usage`). The
+  // in-app gateway resolves those by appending `.html` (see server docs_asset).
+  // GitHub Pages does NOT append `.html` for us, so mirror each `<slug>.html`
+  // as `<slug>/index.html` — a directory index resolves the extensionless link
+  // reliably on Pages (via the standard trailing-slash redirect). `index.html`
+  // is skipped (it already serves `/docs/`). The pages are self-contained with
+  // only absolute links, so serving from a subdirectory changes nothing.
+  for (const entry of readdirSync(docsDist, { withFileTypes: true })) {
+    if (!entry.isFile() || !entry.name.endsWith(".html")) continue;
+    if (entry.name === "index.html") continue;
+    const slug = entry.name.slice(0, -".html".length);
+    const dir = join(docsOut, slug);
+    mkdirSync(dir, { recursive: true });
+    copyFileSync(join(docsDist, entry.name), join(dir, "index.html"));
+  }
 }
 
 const demoDist = join(here, "demo", "dist");
