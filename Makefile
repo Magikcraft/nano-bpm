@@ -162,6 +162,50 @@ release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimize
 	cd $(PROJECT_ROOT)/server && cargo build --release
 	@echo "Built API-only gateway: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 
+# ---------------------------------------------------------------------------
+# Local cross-compilation of the gateway for Linux targets — the same recipe CI
+# uses in .github/workflows/publish-c8ctl-binaries.yml (cargo-zigbuild + a glibc
+# floor), so you can produce dev builds for a Linux x86-64 box or a Raspberry Pi
+# (ARMv7) from any host without Docker. Needs zig + cargo-zigbuild (the script
+# checks and prints install hints). Output lands in dist/ (git-ignored).
+#
+#   make cross-linux-x64      -> Linux x86-64  (x86_64-unknown-linux-gnu)
+#   make cross-linux-armv7    -> Raspberry Pi  (armv7-unknown-linux-gnueabihf)
+#   make cross-linux-arm64    -> Linux ARM64   (aarch64-unknown-linux-gnu)
+#   make cross-linux-armv6    -> ARMv6 (Pi 1/Zero)  (arm-unknown-linux-gnueabihf)
+#   make cross-linux          -> x64 + armv7 (the two you test on)
+#   make cross TARGET=<triple> [GLIBC=2.31] [CROSS_ARGS=--no-console]  -> generic
+#
+# These share `release`'s prerequisites, so the REST layer + embedded console are
+# (re)generated first; pass CROSS_ARGS=--no-console for a faster API-only binary.
+GLIBC ?= 2.31
+CROSS_ARGS ?=
+CROSS_PREREQS := $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend
+
+.PHONY: cross
+cross: $(CROSS_PREREQS) ## Cross-compile the gateway for TARGET=<rust-triple> (GLIBC floor default 2.31; extra flags via CROSS_ARGS, e.g. --no-console)
+	@test -n "$(TARGET)" || { echo "Set TARGET=<rust-triple>, e.g. make cross TARGET=armv7-unknown-linux-gnueabihf" >&2; exit 2; }
+	$(PROJECT_ROOT)/scripts/cross-build.sh "$(TARGET)" --glibc "$(GLIBC)" $(CROSS_ARGS)
+
+.PHONY: cross-linux-x64
+cross-linux-x64: $(CROSS_PREREQS) ## Cross-compile the gateway (release, embedded console) for Linux x86-64 -> dist/
+	$(PROJECT_ROOT)/scripts/cross-build.sh x86_64-unknown-linux-gnu --glibc "$(GLIBC)" $(CROSS_ARGS)
+
+.PHONY: cross-linux-armv7
+cross-linux-armv7: $(CROSS_PREREQS) ## Cross-compile the gateway (release, embedded console) for Raspberry Pi ARMv7 -> dist/
+	$(PROJECT_ROOT)/scripts/cross-build.sh armv7-unknown-linux-gnueabihf --glibc "$(GLIBC)" $(CROSS_ARGS)
+
+.PHONY: cross-linux-arm64
+cross-linux-arm64: $(CROSS_PREREQS) ## Cross-compile the gateway (release, embedded console) for Linux ARM64 -> dist/
+	$(PROJECT_ROOT)/scripts/cross-build.sh aarch64-unknown-linux-gnu --glibc "$(GLIBC)" $(CROSS_ARGS)
+
+.PHONY: cross-linux-armv6
+cross-linux-armv6: $(CROSS_PREREQS) ## Cross-compile the gateway (release, embedded console) for ARMv6 (Pi 1/Zero) -> dist/
+	$(PROJECT_ROOT)/scripts/cross-build.sh arm-unknown-linux-gnueabihf --glibc "$(GLIBC)" $(CROSS_ARGS)
+
+.PHONY: cross-linux
+cross-linux: cross-linux-x64 cross-linux-armv7 ## Cross-compile the gateway for both Linux x86-64 and Raspberry Pi ARMv7 -> dist/
+
 .PHONY: console-frontend
 console-frontend: console-wasm ## Build the web console SPA (console/ -> console/dist)
 	cd $(CONSOLE_DIR) && npm install && npm run build
@@ -277,5 +321,5 @@ clean: ## Remove all generated artifacts
 
 .PHONY: help
 help: ## Show this help
-	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+	@grep -hE '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
 		| awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-16s\033[0m %s\n", $$1, $$2}'
