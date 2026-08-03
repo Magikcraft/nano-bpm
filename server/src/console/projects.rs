@@ -2858,6 +2858,68 @@ pub enum DataError {
     Op(String),
 }
 
+/// Whether `name` resolves to an **Urban-shaped app** — one carrying a
+/// `nano.app.json` manifest (ADR 0027). This is the shape the shared
+/// `@nanobpm/urban` toolkit understands (`urban gen` reads `nano.app.json` + the
+/// `models.processes` globs), so it is the gate for delegating code generation
+/// out-of-process instead of running the console's embedded emitters (#514
+/// dry-out). A legacy `nanobpm.project.json`/`deno.json` project is *not*
+/// Urban-shaped and keeps the embedded path.
+pub fn is_urban_app(name: &str) -> bool {
+    project_dir(name).is_some_and(|d| d.join("nano.app.json").is_file())
+}
+
+/// Delegate artifact generation to the out-of-process `@nanobpm/urban` toolkit
+/// (`urban gen`) for an Urban-shaped app — the console's half of the #514
+/// dry-out (ADR 0052/0053/0054). Rather than run its embedded Rust + TS emitters,
+/// the host spawns the shared toolkit so the manifest is the single contract and
+/// `@nanobpm/urban` is the one deriver; hosts (CLI, IDE, console) become
+/// interchangeable front-ends over the same library instead of parallel
+/// re-implementations of it.
+///
+/// The binary is resolved through the single [`super::urban::find_urban`] seam;
+/// `gen` runs with the project directory as CWD (urban reads `nano.app.json` and
+/// resolves the `models.processes` globs + writes `nano-generated/` relative to
+/// it). Returns an error when urban is unavailable or `gen` fails, so the caller
+/// can fall back or surface a prompt to install the pack.
+pub async fn gen_via_urban(name: &str) -> Result<(), String> {
+    let urban = super::urban::find_urban().ok_or("urban CLI not available")?;
+    gen_with_urban(name, &urban).await
+}
+
+/// Pure-ish core of [`gen_via_urban`]: run a resolved `urban` binary's `gen`
+/// subcommand for `name`. Split out from the [`super::urban::find_urban`] lookup
+/// so the spawn + CWD + error mapping can be unit-tested with a stub binary,
+/// without depending on a real `urban` install or mutating the global
+/// `NANOBPMN_URBAN_BIN`/`PATH` environment.
+async fn gen_with_urban(name: &str, urban: &Path) -> Result<(), String> {
+    let dir = project_dir(name).ok_or("invalid project name")?;
+    if !dir.is_dir() {
+        return Err("no such project".into());
+    }
+    // Canonicalize so the CWD urban resolves relative paths against matches the
+    // dir we intend (e.g. macOS /tmp -> /private/tmp), mirroring `run_data_op`.
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+    let output = Command::new(urban)
+        .current_dir(&dir)
+        .arg("gen")
+        .output()
+        .await
+        .map_err(|e| format!("spawn urban: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = stderr.trim();
+        let detail = if detail.is_empty() {
+            stdout.trim()
+        } else {
+            detail
+        };
+        return Err(format!("urban gen failed: {detail}"));
+    }
+    Ok(())
+}
+
 /// Run one datasource operation for `project` by invoking the materialised
 /// `nano-generated/data-cli.ts` under Deno (or the Node >= 22.6 fallback, ADR 0036/
 /// 0037; ADR 0024 §4). The panel's every read/write
@@ -8161,6 +8223,120 @@ mod tests {
 </bpmn:definitions>"#
         );
         std::fs::write(procs.join("shapes.bpmn"), xml).unwrap();
+    }
+
+    /// A stub `urban` binary (POSIX shell) that records the subcommand it was
+    /// invoked with and its working directory into `urban-ran.txt` under the CWD.
+    /// Lets us assert the delegation spawns `urban gen` in the project dir without
+    /// a real `@nanobpm/urban` install.
+    #[cfg(unix)]
+    fn write_urban_stub(path: &std::path::Path, extra: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$1\" > urban-ran.txt\npwd >> urban-ran.txt\n{extra}"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// `is_urban_app` gates delegation on the `nano.app.json` manifest (ADR 0027):
+    /// present ⇒ Urban-shaped (delegate to `urban gen`); absent ⇒ legacy shape
+    /// (keep the embedded emitters).
+    #[test]
+    fn is_urban_app_detects_nano_app_manifest() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "shapecheck";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // No manifest yet ⇒ not Urban-shaped.
+        assert!(!is_urban_app(name));
+        // A `nanobpm.project.json` is a legacy project, not an Urban app.
+        std::fs::write(dir.join("nanobpm.project.json"), "{}").unwrap();
+        assert!(!is_urban_app(name));
+        // The `nano.app.json` manifest marks it Urban-shaped.
+        std::fs::write(dir.join("nano.app.json"), "{}").unwrap();
+        assert!(is_urban_app(name));
+    }
+
+    /// The delegation primitive spawns `urban gen` with the project directory as
+    /// CWD, so urban resolves `nano.app.json` + the `models.processes` globs and
+    /// writes `nano-generated/` relative to the project — the #514 dry-out cutover.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn gen_with_urban_spawns_gen_in_the_project_dir() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "urbanapp";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"urbanapp"}"#,
+        )
+        .unwrap();
+
+        let stub = root.join("urban-stub.sh");
+        write_urban_stub(&stub, "");
+
+        gen_with_urban(name, &stub)
+            .await
+            .expect("gen_with_urban should succeed");
+
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
+        assert!(
+            sentinel.lines().next() == Some("gen"),
+            "urban not invoked with `gen`: {sentinel:?}"
+        );
+        // The recorded PWD is the (canonicalized) project dir.
+        let canon = dunce::canonicalize(&dir).unwrap();
+        assert!(
+            sentinel.contains(&*canon.to_string_lossy()),
+            "urban gen ran in the wrong CWD: {sentinel:?} (want {})",
+            canon.display()
+        );
+    }
+
+    /// A failing `urban gen` surfaces its stderr in the error (best-effort
+    /// callers log it), and never panics.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn gen_with_urban_maps_a_failure_to_an_error_with_stderr() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "failapp";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stub = root.join("urban-fail.sh");
+        write_urban_stub(&stub, "echo 'manifest not found' 1>&2\nexit 1\n");
+
+        let err = gen_with_urban(name, &stub).await.expect_err("should fail");
+        assert!(err.contains("urban gen failed"), "unexpected error: {err}");
+        assert!(
+            err.contains("manifest not found"),
+            "stderr not surfaced: {err}"
+        );
+    }
+
+    /// A missing project directory is an error, not a spawn against a bogus CWD.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn gen_with_urban_errors_when_the_project_is_absent() {
+        let _g = lock();
+        let _root = temp_root();
+        let stub = _root.join("urban-stub.sh");
+        write_urban_stub(&stub, "");
+        let err = gen_with_urban("no-such-project", &stub)
+            .await
+            .expect_err("absent project should error");
+        assert!(err.contains("no such project"), "unexpected error: {err}");
     }
 
     #[tokio::test]

@@ -3187,6 +3187,26 @@ fn sql_is_ddl(sql: &str) -> bool {
 /// after a structural change. Failure is logged, never surfaced — the maker's
 /// operation already succeeded and the types are an authoring-time contract only.
 async fn regenerate_domain_types(name: &str) {
+    // #514 dry-out: an Urban-shaped app (`nano.app.json`) delegates artifact
+    // generation to the shared `@nanobpm/urban` toolkit (`urban gen`) when the
+    // binary is available, instead of running the console's embedded emitters —
+    // the manifest is the single contract and urban is the one deriver (ADR
+    // 0052/0053/0054). Delegation is best-effort like the embedded path: on
+    // failure we fall through to the embedded op so a project is never left worse
+    // off than before urban was reachable (the derived artifacts are always
+    // regenerable). Legacy-shaped projects (no `nano.app.json`) always take the
+    // embedded path.
+    if projects::is_urban_app(name) && urban::urban_available() {
+        match projects::gen_via_urban(name).await {
+            Ok(()) => return,
+            Err(msg) => {
+                tracing::debug!(
+                    project = name,
+                    "urban gen delegation failed, falling back to embedded codegen: {msg}"
+                );
+            }
+        }
+    }
     if let Err((_, msg)) = project_data_op(name, serde_json::json!({ "op": "domaintypes" })).await {
         tracing::debug!(project = name, "domain-rows.d.ts regen skipped: {msg}");
     }
