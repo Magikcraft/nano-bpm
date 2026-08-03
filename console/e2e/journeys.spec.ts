@@ -188,7 +188,7 @@ test.describe("?tour= deep links", () => {
     const errors: string[] = [];
     page.on("pageerror", (e) => errors.push(e.message));
     await page.goto("projects?tour=no-such-journey");
-    await expect(page.getByText("Projects").first()).toBeVisible();
+    await expect(page.getByText("Studio").first()).toBeVisible();
     expect(errors, "an unknown ?tour= must not throw").toEqual([]);
   });
 });

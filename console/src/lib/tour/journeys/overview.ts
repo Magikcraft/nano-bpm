@@ -41,7 +41,7 @@ export const overviewStudio: Journey = {
       id: "projects-nav",
       route: "/projects",
       selector: tourSelector(TOUR_ANCHOR.projectsNav),
-      title: "Projects",
+      title: "Studio",
       body: "Everything starts here. A project is a folder of BPMN/DMN models, forms and a pack that says how to run them.",
       side: "right",
       align: "start",

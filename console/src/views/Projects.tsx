@@ -300,7 +300,7 @@ export default function Projects() {
   return (
     <div className="mx-auto max-w-6xl p-8">
       <PageHeader
-        title="Projects"
+        title="Studio"
         subtitle="Self-contained applications — processes, decisions, forms, workers and shared libraries. Author, run, compile and export from one place."
         actions={
           <div className="flex gap-2">

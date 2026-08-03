@@ -760,13 +760,13 @@ exposes when a node is pressed against a capacity ceiling:
 All are published ~1 Hz off the hot path (relaxed atomic reads + cheap
 low-priority scans), so scraping them never touches the create/complete path.
 
-### Projects (RAD IDE)
+### Nano Studio (RAD IDE)
 
-**Projects** is the home of Nano's **Rapid Application Development** environment
-and replaces the old standalone "Modeler" tab. A project is a self-contained,
-runnable Deno application directory (see [Workspace vs cluster
-data](#workspace-vs-cluster-data)); the Projects view is a tile gallery with a
-**New project** template picker, and opening a project drops you into its
+**Nano Studio** (the **Studio** tab) is the home of Nano's **Rapid Application
+Development** environment and replaces the old standalone "Modeler" tab. A
+project is a self-contained, runnable Deno application directory (see [Workspace
+vs cluster data](#workspace-vs-cluster-data)); the Studio view is a tile gallery
+with a **New project** template picker, and opening a project drops you into its
 workspace. First-party project templates and example apps are themselves shipped
 as extension packs.
 
@@ -822,7 +822,7 @@ it directly, how to **author a Nano App on disk** and **link it into this node**
 real base URL, on-disk projects root, import endpoint, installed packs and
 scaffold templates: an agent needs no other context. A companion **`/llms.txt`**
 points agent tooling at the brief plus the OpenAPI, AsyncAPI and JSON-Schema
-specs. The Projects view exposes it as a **Build with an agent** button.
+specs. The Studio view exposes it as a **Build with an agent** button.
 
 ### Extensions
 
