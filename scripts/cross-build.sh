@@ -28,8 +28,11 @@
 #                    "bullseye" / Ubuntu 20.04 — matches CI). Use "" to disable.
 #   --no-console     build the API-only gateway (skip the embedded web console);
 #                    faster, and does not require console/dist.
+#   --console        build with the embedded web console (the default; provided
+#                    as the explicit inverse of --no-console).
 #   --out <path>     output path for the staged binary (default:
-#                    dist/nanobpm-gateway-rest-server-<os>-<arch>).
+#                    dist/nanobpm-gateway-rest-server-<os>-<arch>). A relative
+#                    path is resolved against the current directory.
 #
 # Final line is machine-parseable: "BUILD_OK <target> <path> (<secs>s)".
 set -euo pipefail
