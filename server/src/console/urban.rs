@@ -21,8 +21,9 @@
 //! first-party marketplace App pack (`nano-ide-app-urban`), lazy-installed under
 //! `<workspace>/extensions/<pkg>/node_modules/.bin/urban`. That pack-relative
 //! lookup plugs in **here**, at the marked `#520 seam`, between the
-//! explicit-env override and the `PATH` probe — resolution order is
-//! `NANOBPMN_URBAN_BIN` → pack → `PATH`. Do not add a second resolver
+//! explicit-env override and the `PATH` probe — making the resolution order
+//! `NANOBPMN_URBAN_BIN` → pack → `PATH` (today, before that seam is filled, it
+//! is simply `NANOBPMN_URBAN_BIN` → `PATH`). Do not add a second resolver
 //! elsewhere — extend this one.
 
 use std::ffi::OsStr;
@@ -32,16 +33,17 @@ use std::path::PathBuf;
 /// shim on Windows).
 const URBAN_EXE: &str = if cfg!(windows) { "urban.cmd" } else { "urban" };
 
-/// Locates the `urban` CLI binary, mirroring [`super::workers::find_deno`]:
-/// `NANOBPMN_URBAN_BIN` (explicit override), then the #520 marketplace-pack bin,
-/// then `PATH`.
+/// Locates the `urban` CLI binary, mirroring [`super::workers::find_deno`].
+/// Today the resolution order is `NANOBPMN_URBAN_BIN` (explicit override) →
+/// `PATH`; a reserved `#520` seam sits between them where the marketplace-pack
+/// bin lookup will slot in, making the eventual order `env → pack → PATH`.
 ///
 /// Returns `None` when no binary is found; callers then report
 /// `urbanAvailable: false` so the Studio can prompt the user to install the
-/// pack. The resolution order is deliberately `env → pack → PATH` (agreed on
-/// #520/#522): an explicit override always wins, the first-party pack is
-/// preferred over an ambient `PATH` install, and there is no `npx` fallback —
-/// the pack is the real-machine acquisition path.
+/// pack. The order is deliberate (agreed on #520/#522): an explicit override
+/// always wins, the first-party pack (once #520 lands) is preferred over an
+/// ambient `PATH` install, and there is no `npx` fallback — the pack is the
+/// real-machine acquisition path.
 ///
 /// The actual matching is delegated to the pure [`resolve_urban`] so it can be
 /// unit-tested without mutating the global process environment (which is UB
@@ -53,8 +55,10 @@ pub(crate) fn find_urban() -> Option<PathBuf> {
 }
 
 /// Pure core of [`find_urban`]: given the `NANOBPMN_URBAN_BIN` override and the
-/// `PATH` value, applies the `env → pack → PATH` resolution order. Kept free of
-/// any global-env reads so it is deterministic and testable in parallel.
+/// `PATH` value, applies the current `env → PATH` resolution (the `#520` pack
+/// lookup slots in at the marked seam to make it `env → pack → PATH`). Kept
+/// free of any global-env reads so it is deterministic and testable in
+/// parallel.
 fn resolve_urban(bin_override: Option<&str>, path: Option<&OsStr>) -> Option<PathBuf> {
     if let Some(p) = bin_override
         && !p.is_empty()
