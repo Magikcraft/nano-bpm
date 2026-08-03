@@ -121,6 +121,70 @@ pub(crate) fn urban_available() -> bool {
     find_urban().is_some()
 }
 
+/// Whether a resolved `urban` binary supports **model derivation** — the
+/// `urban derive [--stdout]` subcommand + the `urban gen --no-models` flag
+/// (nano-ide#92, ADR 0045/0048). This is a **capability probe, not a version
+/// check** (agreed on #522): probing `urban --help` survives forks, backports
+/// and out-of-band installs, and keeps correctness console-owned rather than
+/// coupled to parsing `urbanVersion` (#529, kept for telemetry only).
+///
+/// The delegation call sites (`derive_models`/`generate_models` →
+/// `urban derive --stdout`; `regenerate_domain_types` → `urban gen --no-models`)
+/// gate on this so an older toolkit that predates derivation falls back to the
+/// console's embedded Deno driver / bare `urban gen` — additive + non-regressing,
+/// exactly like #530. The result is memoised per binary path since a given
+/// binary's help output is stable for the process lifetime (a pack upgrade
+/// installs a new path, or the server restarts).
+pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, bool>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    // Recover from a poisoned mutex rather than propagating the panic: the lock
+    // only guards a tiny insert/get (no user code runs under it), so a poisoned
+    // guard carries a valid map — matching this module's poison-recovery pattern
+    // keeps the capability gate robust instead of taking down urban delegation.
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(urban)
+        .copied()
+    {
+        return hit;
+    }
+    let supported = tokio::process::Command::new(urban)
+        .arg("--help")
+        .env("NO_COLOR", "1")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .ok()
+        .map(|o| {
+            let mut help = String::from_utf8_lossy(&o.stdout).into_owned();
+            help.push_str(&String::from_utf8_lossy(&o.stderr));
+            help_indicates_derive(&help)
+        })
+        .unwrap_or(false);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(urban.to_path_buf(), supported);
+    supported
+}
+
+/// Pure predicate over `urban --help` text: does this toolkit expose model
+/// derivation? Requires **both** capabilities this gate fronts — the
+/// `gen --no-models` flag AND the `derive` subcommand (its `--stdout` flag or
+/// usage line) — since a single \[`urban_supports_derive`\] gate guards call
+/// sites that use each, and the two ship as a unit (nano-ide#92). An OR could
+/// mis-detect a toolkit exposing only one and then invoke the other, unsupported.
+/// A bare `"derive"` substring is deliberately NOT a marker: the pre-derivation
+/// help already contains "derive" in its `gen` description (`urban gen … derive
+/// artifacts (migrations, worker-io)`), so it would false-positive on every old
+/// toolkit.
+fn help_indicates_derive(help: &str) -> bool {
+    help.contains("--no-models") && (help.contains("--stdout") || help.contains("urban derive"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +258,38 @@ mod tests {
         assert_eq!(resolve_urban(None, None, None), None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn help_indicates_derive_discriminates_new_from_old_toolkit() {
+        // The pre-derivation toolkit: `derive` appears only inside the `gen`
+        // description, so a bare `contains("derive")` would false-positive.
+        let old_help = "\
+urban — build and run Urban apps (nano.app.json)
+  urban gen [--check]               derive artifacts (migrations, worker-io)
+  urban run                         materialize + serve the app";
+        assert!(
+            !help_indicates_derive(old_help),
+            "old help must not be read as derivation-capable"
+        );
+
+        // The derivation-capable toolkit (nano-ide#92) lists the `derive`
+        // subcommand + the `--no-models`/`--stdout` flags.
+        let new_help = "\
+urban — build and run Urban apps (nano.app.json)
+  urban gen [--check] [--no-models]   derive artifacts (migrations, worker-io)
+  urban derive [--check|--stdout]     derive executable BPMN from workflows";
+        assert!(help_indicates_derive(new_help));
+        // Both capabilities must be present: the `gen --no-models` flag AND a
+        // `derive`-subcommand marker (`--stdout` or the `urban derive` usage
+        // line). A partial help exposing only ONE is NOT derivation-capable — the
+        // gate fronts both, so an OR would let the console invoke an unsupported
+        // flag/subcommand.
+        assert!(!help_indicates_derive("  urban derive [--stdout]"));
+        assert!(!help_indicates_derive("gen [--no-models]"));
+        // Both markers together ⇒ capable.
+        assert!(help_indicates_derive(
+            "gen [--no-models]\nurban derive [--stdout]"
+        ));
     }
 }
