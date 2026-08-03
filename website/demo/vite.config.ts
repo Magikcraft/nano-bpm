@@ -13,9 +13,9 @@ export default defineConfig({
   base: "/demo/",
   plugins: [react()],
   resolve: {
-    // The `@nanobpm/*` file: deps re-export each other transitively
-    // (bojtos-react → bojtos-kit → engine-wasm) and are symlinked here with no
-    // per-package node_modules, so resolve via the symlink path rooted here.
+    // `@nanobpm/engine-wasm` is a `file:` dep symlinked here (no per-package
+    // node_modules); the npm `@nanobpm/bojtos-*` packages import it
+    // transitively, so resolve via the symlink path rooted here.
     preserveSymlinks: true,
     dedupe: ["react", "react-dom"],
   },

@@ -262,44 +262,6 @@ jobs:
         # build (the maker forgot `npm run build` / `make generate-app-manifest`).
         run: git diff --exit-code -- dist
 
-  bojtos:
-    name: bojtos-kit + bojtos-react (build + drift)
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: '24'
-      # The kit is built first: bojtos-react depends on the kit's committed
-      # dist/ (types + runtime) through a `file:` link.
-      - name: Install bojtos-kit (locked)
-        working-directory: bojtos-kit
-        run: npm ci
-      - name: Typecheck + build bojtos-kit
-        working-directory: bojtos-kit
-        run: npm run build
-      - name: Test bojtos-kit (worker dispatch loop)
-        # Runs the dispatch-loop e2e tests against the dist built by the previous
-        # step with the real wasm engine (Node loads the binary via the `wasm`
-        # source escape hatch). Uses `test:ci` (no rebuild) so tsc doesn't run
-        # twice — the build step above already produced the dist. Node 24
-        # type-strips the TS test sources.
-        working-directory: bojtos-kit
-        run: npm run test:ci
-      - name: Install bojtos-react (locked)
-        working-directory: bojtos-react
-        run: npm ci
-      - name: Typecheck + build bojtos-react
-        working-directory: bojtos-react
-        run: npm run build
-      - name: Fail if committed dist/ is stale
-        # bojtos-kit/dist and bojtos-react/dist (tsc-emitted JS + .d.ts) are
-        # committed and imported by the console via `file:` deps, so `npm ci`
-        # needs no build-on-install step. They are build artifacts, so fail if
-        # the committed output drifted from a fresh build (the maker forgot
-        # `npm run build` / `make bojtos`).
-        run: git diff --exit-code -- bojtos-kit/dist bojtos-react/dist
-
   schemas:
     name: schemas (nanobpm.io publish build)
     runs-on: ubuntu-24.04

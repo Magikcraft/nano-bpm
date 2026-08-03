@@ -83,15 +83,15 @@ one parity test):**
 - Regenerate the grammar artifact: `cd processos && cargo run -- emit-gbnf --out
   assets/ir.gbnf` (commit the result — it is a checked-in derived artifact).
 
-**3. `engine-wasm` + `bojtos-kit` — thin pass-throughs, but regenerate the
-committed artifacts (silent):**
+**3. `engine-wasm` — thin pass-through, but regenerate the committed
+artifacts (silent):**
 
 - `engine-core/src/ffi.rs` and `engine-wasm/src/lib.rs` enumerate no element
   types (JSON snapshots), so no code change — **but** the compiled wasm and its
   generated `.d.ts`/`.js` are committed. Rebuild: `make console-wasm`
-  (regenerates `engine-wasm/pkg/`) and `make bojtos` (rebuilds
-  `bojtos-kit/dist/` + `bojtos-react/dist/`). `bojtos-kit/src/types.ts`'s
-  `Snapshot` is element-type-agnostic and needs no change.
+  (regenerates `engine-wasm/pkg/`). The Bojtos framework packages that consume
+  it (`@nanobpm/bojtos-kit` / `-react`) live in the separate `nanobpm/bojtos`
+  repo and are element-type-agnostic, so they need no change here.
 
 **4. `console` — only if the element needs modeller/palette support:**
 
@@ -100,9 +100,9 @@ committed artifacts (silent):**
   no change; only bespoke `nano:` shapes do.
 
 **Verify end-to-end** by deploying a model using the new element through the
-freshly-built wasm (a Node probe: `createBojtosSession({ wasm: bytes })` →
-`session.deploy(xml)`), not just the Rust unit tests — that is the surface Play
-and the console actually consume.
+freshly-built wasm (a Node probe against `@nanobpm/engine-wasm`'s `TestEngine`:
+`engine.deploy(xml)` → `engine.createInstance(...)`), not just the Rust unit
+tests — that is the surface the console (and Bojtos) actually consume.
 
 ## Claim Your Task Before You Start
 
