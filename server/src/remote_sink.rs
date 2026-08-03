@@ -684,9 +684,17 @@ mod tests {
             transport.send(i, format!("[{{\"n\":{i}}}]").into_bytes());
         }
         // Serial (concurrency 1) would take ~8*150ms=1.2s; concurrency 4 ~300ms.
-        // Poll for all deliveries with generous slack for CI scheduling.
+        // Poll for full delivery AND drain with generous slack for CI scheduling.
+        // The mock server bumps `delivered` just *before* it writes the 204,
+        // whereas `queued()` only decrements once the client has received that
+        // 204 and the delivery task runs its `fetch_sub`. Gating solely on
+        // `delivered == 8` therefore races the `queued() == 0` assertion below:
+        // the last batch can be counted delivered while its response is still
+        // in flight. Gate on both so the drain assertion is deterministic.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while delivered.load(Ordering::SeqCst) < 8 && std::time::Instant::now() < deadline {
+        while (delivered.load(Ordering::SeqCst) < 8 || transport.queued() != 0)
+            && std::time::Instant::now() < deadline
+        {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         assert_eq!(delivered.load(Ordering::SeqCst), 8, "all batches delivered");
