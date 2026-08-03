@@ -53,7 +53,7 @@ while [ $# -gt 0 ]; do
     --no-console) CONSOLE=0; shift ;;
     --console)    CONSOLE=1; shift ;;
     --out)        need_val "$@"; OUT="$2"; shift 2 ;;
-    -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help)    awk 'NR==1{next} /^#/{print; next} {exit}' "$0"; exit 0 ;;
     -*)           die "unknown flag: $1" ;;
     *)            if [ -z "$TARGET" ]; then TARGET="$1"; else die "unexpected arg: $1"; fi; shift ;;
   esac
