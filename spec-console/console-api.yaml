@@ -135,6 +135,33 @@ paths:
                 type: array
                 items: { $ref: '#/components/schemas/TraceSummary' }
 
+  /traces/config:
+    get:
+      operationId: getTraceConfig
+      tags: [traces]
+      summary: Trace-capture configuration and in-memory ring state
+      responses:
+        '200':
+          description: Trace configuration
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TraceConfig' }
+    put:
+      operationId: setTraceConfig
+      tags: [traces]
+      summary: Toggle variable / stimulus capture at runtime (node-local, non-persistent)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TraceConfigUpdate' }
+      responses:
+        '200':
+          description: Updated trace configuration
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TraceConfig' }
+
   /traces/{key}:
     get:
       operationId: getTrace
@@ -1461,6 +1488,31 @@ components:
         path:
           type: array
           items: { type: string }
+
+    TraceConfig:
+      type: object
+      description: >-
+        Trace-capture configuration and current in-memory ring state. Base
+        traces are always collected in a console build but are held in a bounded
+        in-memory ring (not persisted): they reset on restart and evict past
+        `capacity`. Variable and stimulus capture are opt-in.
+      required: [captureVariables, captureStimuli, capacity, varsMaxBytes, stimuliMax, tracedInstances]
+      properties:
+        captureVariables: { type: boolean }
+        captureStimuli: { type: boolean }
+        capacity: { type: integer, format: int32 }
+        varsMaxBytes: { type: integer, format: int64 }
+        stimuliMax: { type: integer, format: int32 }
+        tracedInstances: { type: integer, format: int32 }
+    TraceConfigUpdate:
+      type: object
+      description: >-
+        Partial update of the runtime capture flags. Omitted fields are left
+        unchanged. Stimulus capture implies variable capture; clearing variable
+        capture also clears stimulus capture.
+      properties:
+        captureVariables: { type: boolean, nullable: true }
+        captureStimuli: { type: boolean, nullable: true }
 
     # ---- Metrics (camelCase wire fields) ---------------------------------
     MetricsSnapshot:

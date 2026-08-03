@@ -159,6 +159,26 @@ export type InstanceTrace = {
     path: Array<string>;
 };
 
+/**
+ * Trace-capture configuration and current in-memory ring state. Base traces are always collected in a console build but are held in a bounded in-memory ring (not persisted): they reset on restart and evict past `capacity`. Variable and stimulus capture are opt-in.
+ */
+export type TraceConfig = {
+    captureVariables: boolean;
+    captureStimuli: boolean;
+    capacity: number;
+    varsMaxBytes: number;
+    stimuliMax: number;
+    tracedInstances: number;
+};
+
+/**
+ * Partial update of the runtime capture flags. Omitted fields are left unchanged. Stimulus capture implies variable capture; clearing variable capture also clears stimulus capture.
+ */
+export type TraceConfigUpdate = {
+    captureVariables?: boolean | null;
+    captureStimuli?: boolean | null;
+};
+
 export type MetricsSnapshot = {
     timestampMs: number;
     activeInstances: number;
@@ -1368,6 +1388,38 @@ export type ListTracesResponses = {
 };
 
 export type ListTracesResponse = ListTracesResponses[keyof ListTracesResponses];
+
+export type GetTraceConfigData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/traces/config';
+};
+
+export type GetTraceConfigResponses = {
+    /**
+     * Trace configuration
+     */
+    200: TraceConfig;
+};
+
+export type GetTraceConfigResponse = GetTraceConfigResponses[keyof GetTraceConfigResponses];
+
+export type SetTraceConfigData = {
+    body: TraceConfigUpdate;
+    path?: never;
+    query?: never;
+    url: '/traces/config';
+};
+
+export type SetTraceConfigResponses = {
+    /**
+     * Updated trace configuration
+     */
+    200: TraceConfig;
+};
+
+export type SetTraceConfigResponse = SetTraceConfigResponses[keyof SetTraceConfigResponses];
 
 export type GetTraceData = {
     body?: never;

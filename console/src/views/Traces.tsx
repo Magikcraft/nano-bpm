@@ -1,10 +1,13 @@
 import { useState } from "react";
 import type { ReactNode } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   getTrace,
+  getTraceConfig,
   listTraces,
+  setTraceConfig,
   type InstanceTrace,
+  type TraceConfigUpdate,
   type TraceOutcome,
   type TraceSummary,
 } from "../gen";
@@ -46,6 +49,7 @@ export default function Traces() {
             {data ? `${data.length} trace(s)` : "Live view"} · folded from the
             engine event stream
           </p>
+          <CaptureControls />
         </header>
         <div className="min-h-0 flex-1 overflow-auto">
           {isLoading && <p className="p-5 text-fg-muted">Loading…</p>}
@@ -99,6 +103,99 @@ export default function Traces() {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+function CaptureControls() {
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
+  const [mutError, setMutError] = useState<string | null>(null);
+  const { data: cfg, error } = useQuery({
+    queryKey: ["trace-config"],
+    queryFn: async () => (await getTraceConfig({ throwOnError: true })).data,
+  });
+
+  // Hide the controls when the node doesn't expose the config endpoint (older
+  // build) or the fetch failed — the trace list still works without them.
+  if (error || !cfg) return null;
+
+  const apply = (body: TraceConfigUpdate) => {
+    setBusy(true);
+    setMutError(null);
+    setTraceConfig({ body, throwOnError: true })
+      .then(({ data }) => {
+        qc.setQueryData(["trace-config"], data);
+        // Re-derive capture may change what future traces carry.
+        qc.invalidateQueries({ queryKey: ["traces"] });
+      })
+      .catch((e) => setMutError(String(e)))
+      .finally(() => setBusy(false));
+  };
+
+  return (
+    <div className="mt-3 space-y-2 rounded-md border border-edge bg-inset px-3 py-2 text-xs">
+      <p
+        className="text-fg-muted"
+        title="Traces are held in a bounded in-memory ring — not persisted. They reset when the node restarts (unlike the explorer's read model) and evict past capacity."
+      >
+        In-memory ring · {cfg.tracedInstances}/{cfg.capacity} · not persisted,
+        resets on restart
+      </p>
+      <Toggle
+        label="Variable capture"
+        on={cfg.captureVariables}
+        disabled={busy}
+        onChange={(on) => apply({ captureVariables: on })}
+      />
+      <Toggle
+        label="Stimulus capture"
+        hint="implies variables"
+        on={cfg.captureStimuli}
+        disabled={busy}
+        onChange={(on) => apply({ captureStimuli: on })}
+      />
+      {mutError && <ErrorText>{mutError}</ErrorText>}
+    </div>
+  );
+}
+
+function Toggle({
+  label,
+  hint,
+  on,
+  disabled,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  on: boolean;
+  disabled?: boolean;
+  onChange: (on: boolean) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between">
+      <span className="text-fg">
+        {label}
+        {hint && <span className="ml-1 text-fg-faint">({hint})</span>}
+      </span>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={on}
+        aria-label={label}
+        disabled={disabled}
+        onClick={() => onChange(!on)}
+        className={`relative h-5 w-9 shrink-0 rounded-full transition-colors disabled:opacity-50 ${
+          on ? "bg-accent" : "bg-edge-strong"
+        }`}
+      >
+        <span
+          className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-transform ${
+            on ? "translate-x-4" : "translate-x-0.5"
+          }`}
+        />
+      </button>
     </div>
   );
 }
