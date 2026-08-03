@@ -39,14 +39,17 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN_NAME="nanobpm-gateway-rest-server"
 
 die() { echo "cross-build: $*" >&2; exit 1; }
+# Guard optional-value flags so a missing value fails with a clear message rather
+# than a cryptic `set -u` "$2: unbound variable". Call as `need_val "$@"`.
+need_val() { [ $# -ge 2 ] || die "flag $1 needs a value (e.g. $1 <value>)"; }
 
 TARGET=""; GLIBC="2.31"; CONSOLE=1; OUT=""
 while [ $# -gt 0 ]; do
   case "$1" in
-    --glibc)      GLIBC="$2"; shift 2 ;;
+    --glibc)      need_val "$@"; GLIBC="$2"; shift 2 ;;
     --no-console) CONSOLE=0; shift ;;
     --console)    CONSOLE=1; shift ;;
-    --out)        OUT="$2"; shift 2 ;;
+    --out)        need_val "$@"; OUT="$2"; shift 2 ;;
     -h|--help)    sed -n '2,40p' "$0"; exit 0 ;;
     -*)           die "unknown flag: $1" ;;
     *)            if [ -z "$TARGET" ]; then TARGET="$1"; else die "unexpected arg: $1"; fi; shift ;;

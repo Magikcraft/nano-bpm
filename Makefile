@@ -177,10 +177,16 @@ release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimize
 #   make cross TARGET=<triple> [GLIBC=2.31] [CROSS_ARGS=--no-console]  -> generic
 #
 # These share `release`'s prerequisites, so the REST layer + embedded console are
-# (re)generated first; pass CROSS_ARGS=--no-console for a faster API-only binary.
+# (re)generated first; pass CROSS_ARGS=--no-console for a faster API-only binary
+# (which also drops the console prerequisites below, so nothing console is built).
 GLIBC ?= 2.31
 CROSS_ARGS ?=
-CROSS_PREREQS := $(GENERATED_DIR)/Cargo.toml $(CONSOLE_GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) console-frontend
+# The console prerequisites (built web SPA + generated-console crate) are only
+# needed for the default `--features console` build. When CROSS_ARGS opts out
+# with --no-console, drop them so an API-only cross-build doesn't build the SPA.
+CROSS_CONSOLE_PREREQS := $(CONSOLE_GENERATED_DIR)/Cargo.toml console-frontend
+CROSS_PREREQS := $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) \
+	$(if $(filter --no-console,$(CROSS_ARGS)),,$(CROSS_CONSOLE_PREREQS))
 
 .PHONY: cross
 cross: $(CROSS_PREREQS) ## Cross-compile the gateway for TARGET=<rust-triple> (GLIBC floor default 2.31; extra flags via CROSS_ARGS, e.g. --no-console)
@@ -188,19 +194,19 @@ cross: $(CROSS_PREREQS) ## Cross-compile the gateway for TARGET=<rust-triple> (G
 	$(PROJECT_ROOT)/scripts/cross-build.sh "$(TARGET)" --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux-x64
-cross-linux-x64: $(CROSS_PREREQS) ## Cross-compile the gateway (release, embedded console) for Linux x86-64 -> dist/
+cross-linux-x64: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for Linux x86-64 -> dist/
 	$(PROJECT_ROOT)/scripts/cross-build.sh x86_64-unknown-linux-gnu --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux-armv7
-cross-linux-armv7: $(CROSS_PREREQS) ## Cross-compile the gateway (release, embedded console) for Raspberry Pi ARMv7 -> dist/
+cross-linux-armv7: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for Raspberry Pi ARMv7 -> dist/
 	$(PROJECT_ROOT)/scripts/cross-build.sh armv7-unknown-linux-gnueabihf --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux-arm64
-cross-linux-arm64: $(CROSS_PREREQS) ## Cross-compile the gateway (release, embedded console) for Linux ARM64 -> dist/
+cross-linux-arm64: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for Linux ARM64 -> dist/
 	$(PROJECT_ROOT)/scripts/cross-build.sh aarch64-unknown-linux-gnu --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux-armv6
-cross-linux-armv6: $(CROSS_PREREQS) ## Cross-compile the gateway (release, embedded console) for ARMv6 (Pi 1/Zero) -> dist/
+cross-linux-armv6: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for ARMv6 (Pi 1/Zero) -> dist/
 	$(PROJECT_ROOT)/scripts/cross-build.sh arm-unknown-linux-gnueabihf --glibc "$(GLIBC)" $(CROSS_ARGS)
 
 .PHONY: cross-linux
