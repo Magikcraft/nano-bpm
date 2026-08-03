@@ -2910,15 +2910,22 @@ pub async fn gen_via_urban(name: &str) -> Result<(), String> {
         return Err("not an Urban-shaped app (no nano.app.json)".into());
     }
     let urban = super::urban::find_urban().ok_or("urban CLI not available")?;
-    gen_with_urban(name, &urban).await
+    // A derivation-capable toolkit (nano-ide#92) folds code→BPMN model
+    // derivation into `gen`, so a bare `urban gen` would ALSO (re)write
+    // `resources/processes/*.bpmn` as a side effect of a type-contract regen.
+    // `regenerate_domain_types` wants type-contracts only, so pass `--no-models`
+    // when supported; an older toolkit (no such flag) takes bare `gen`.
+    let no_models = super::urban::urban_supports_derive(&urban).await;
+    gen_with_urban(name, &urban, no_models).await
 }
 
 /// Pure-ish core of [`gen_via_urban`]: run a resolved `urban` binary's `gen`
 /// subcommand for `name`. Split out from the [`super::urban::find_urban`] lookup
 /// so the spawn + CWD + error mapping can be unit-tested with a stub binary,
 /// without depending on a real `urban` install or mutating the global
-/// `NANOBPMN_URBAN_BIN`/`PATH` environment.
-async fn gen_with_urban(name: &str, urban: &Path) -> Result<(), String> {
+/// `NANOBPMN_URBAN_BIN`/`PATH` environment. `no_models` adds `--no-models` so a
+/// derivation-capable toolkit emits type-contracts only (no `.bpmn` write/sweep).
+async fn gen_with_urban(name: &str, urban: &Path, no_models: bool) -> Result<(), String> {
     let dir = project_dir(name).ok_or("invalid project name")?;
     if !dir.is_dir() {
         return Err("no such project".into());
@@ -2926,9 +2933,12 @@ async fn gen_with_urban(name: &str, urban: &Path) -> Result<(), String> {
     // Canonicalize so the CWD urban resolves relative paths against matches the
     // dir we intend (e.g. macOS /tmp -> /private/tmp), mirroring `run_data_op`.
     let dir = dunce::canonicalize(&dir).unwrap_or(dir);
-    let output = Command::new(urban)
-        .current_dir(&dir)
-        .arg("gen")
+    let mut cmd = Command::new(urban);
+    cmd.current_dir(&dir).arg("gen");
+    if no_models {
+        cmd.arg("--no-models");
+    }
+    let output = cmd
         // Mirror `run_data_op`'s subprocess hygiene: `NO_COLOR` keeps ANSI escapes
         // out of captured stderr/stdout (so the error detail is clean), and
         // `kill_on_drop` reaps the child if this task is cancelled (shutdown,
@@ -3950,6 +3960,87 @@ struct GenerateResult {
     incomplete: bool,
 }
 
+/// Resolve a derivation-capable `urban` binary for `name`, or `None` to fall back
+/// to the embedded Deno driver. All three conditions must hold: the project is
+/// Urban-shaped (`nano.app.json`), a binary resolves, and it supports the
+/// `derive` surface (nano-ide#92). Gating on all three keeps the delegation
+/// **additive + non-regressing** (issue #522): a legacy project, a missing
+/// toolkit, or an older toolkit all take the pre-existing path unchanged.
+async fn urban_derive_capable(name: &str) -> Option<PathBuf> {
+    if !is_urban_app(name) {
+        return None;
+    }
+    let urban = super::urban::find_urban()?;
+    if super::urban::urban_supports_derive(&urban).await {
+        Some(urban)
+    } else {
+        None
+    }
+}
+
+/// Derive a project's executable BPMN models by spawning `urban derive --stdout`
+/// (nano-ide#92), returning the same [`GenerateResult`] the embedded Deno driver
+/// produces — the contract JSON `{"models":[{"id","kind","xml"}],"incomplete"}`
+/// (frozen on #522) maps byte-for-byte onto it, so no downstream code cares which
+/// deriver ran. `--stdout` is non-writing: the console remains the single writer
+/// of the scan surface via [`finalize_generated_models`]. `dir` must already be
+/// canonicalized (urban resolves the manifest + relative model globs against its
+/// CWD).
+async fn derive_via_urban(dir: &Path, urban: &Path) -> Result<GenerateResult, String> {
+    let output = Command::new(urban)
+        .current_dir(dir)
+        .arg("derive")
+        .arg("--stdout")
+        // Same subprocess hygiene as `gen_with_urban`: keep ANSI escapes out of
+        // captured output, and reap the child if this task is cancelled.
+        .env("NO_COLOR", "1")
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|e| format!("spawn urban: {e}"))?;
+
+    // Parse the contract JSON FIRST, regardless of exit code. `urban derive
+    // --stdout` exits NON-ZERO when the derivation is `incomplete` (a workflow
+    // failed to derive) yet still prints the well-formed `{models,incomplete}`
+    // body — and `incomplete` is a first-class, non-fatal signal here (it makes
+    // `finalize_generated_models` write the partial models but SKIP the stale
+    // sweep), exactly as it is for the embedded Deno driver. So a parseable body
+    // is authoritative; only a missing/garbage body is a hard error. Take the
+    // last `{`-prefixed stdout line so a leading diagnostic can't corrupt the
+    // parse.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(json) = stdout
+        .lines()
+        .rev()
+        .find(|l| l.trim_start().starts_with('{'))
+        && let Ok(result) = serde_json::from_str::<GenerateResult>(json)
+    {
+        return Ok(result);
+    }
+
+    // No parseable body: a genuine failure (bad manifest, not a workflow project,
+    // signal). Surface a rich, diagnosable error rather than a bare exit code.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    let detail = if detail.is_empty() {
+        stdout.trim()
+    } else {
+        detail
+    };
+    let status = output.status.code().map(|c| format!("exit {c}"));
+    #[cfg(unix)]
+    let status = status.unwrap_or_else(|| {
+        use std::os::unix::process::ExitStatusExt;
+        match output.status.signal() {
+            Some(sig) => format!("terminated by signal {sig}"),
+            None => "terminated by signal".into(),
+        }
+    });
+    #[cfg(not(unix))]
+    let status = status.unwrap_or_else(|| "terminated by signal".into());
+    Err(format!("urban derive failed ({status}): {detail}"))
+}
+
 /// Process-wide sequence used to give each concurrent `derive_models` call a
 /// unique temporary driver filename (see the collision note there).
 static DERIVE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -4139,6 +4230,35 @@ pub async fn derive_models(name: &str) -> Result<Vec<DerivedModel>, String> {
     }
     let dir = dunce::canonicalize(&dir).unwrap_or(dir);
     let proc_dir = dir.join("resources").join("processes");
+
+    // Delegate to `urban derive --stdout` when the project is Urban-shaped and the
+    // toolkit supports derivation (nano-ide#92): it returns the same
+    // `{id,kind,xml}` models this preview serves, with a diagram (urban lays out).
+    // Non-writing, so it's safe for a read-only viewer refresh. A failure falls
+    // through to the on-disk models (below), then the embedded Deno path, so the
+    // panel still renders — additive + non-regressing (#522).
+    if let Some(urban) = urban_derive_capable(name).await {
+        match derive_via_urban(&dir, &urban).await {
+            Ok(result) if !result.models.is_empty() => return Ok(result.models),
+            Ok(_) => {
+                // Derivation succeeded but yielded nothing (no exported workflows
+                // yet) — prefer any on-disk generated models over an empty panel.
+                let disk = ondisk_generated_models(&proc_dir);
+                if !disk.is_empty() {
+                    return Ok(disk);
+                }
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                tracing::debug!(project = name, error = %e, "urban derive failed; falling back");
+                let disk = ondisk_generated_models(&proc_dir);
+                if !disk.is_empty() {
+                    return Ok(disk);
+                }
+                // else fall through to the embedded Deno derivation below.
+            }
+        }
+    }
 
     // If the Deno toolchain is missing we can't re-derive live, but the on-disk
     // auto-laid-out models (ADR 0048) already carry a `bpmndi:` diagram, so serve
@@ -4474,10 +4594,24 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
     if !wf_dir.is_dir() {
         return Err("not a code-first workflow project (no workflows/ directory)".into());
     }
-    let deno = super::extensions::find_program("deno").ok_or("deno toolchain not found on PATH")?;
 
-    // Canonicalize so the --allow-read scope matches the path Deno resolves.
+    // Canonicalize so the --allow-read scope (and urban's CWD) matches the path
+    // the subprocess resolves.
     let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+
+    // Delegate model derivation to `urban derive --stdout` when the project is
+    // Urban-shaped and the toolkit supports derivation (nano-ide#92). The parsed
+    // `GenerateResult` feeds the SAME write+sweep tail (`finalize_generated_models`)
+    // as the Deno path, so the console keeps its provenance marking, filename-
+    // collision handling and stale sweep — one canonical writer for the scan
+    // surface, no drift onto urban's own writer. An older toolkit or a legacy
+    // project falls through to the embedded Deno driver below.
+    if let Some(urban) = urban_derive_capable(name).await {
+        let result = derive_via_urban(&dir, &urban).await?;
+        return finalize_generated_models(name, &dir, result);
+    }
+
+    let deno = super::extensions::find_program("deno").ok_or("deno toolchain not found on PATH")?;
     let cache = dir.join(".deno-cache");
     let _ = std::fs::create_dir_all(&cache);
 
@@ -4548,6 +4682,22 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
         )
     })?;
 
+    finalize_generated_models(name, &dir, result)
+}
+
+/// Persist a [`GenerateResult`] (from either the Deno driver or `urban derive
+/// --stdout`) onto the model-first scan surface and return the ids written. This
+/// is the SINGLE canonical writer for `resources/processes/*.bpmn`: it stamps the
+/// [`PROVENANCE_MARKER`], skips ids that sanitize to a colliding filename, and —
+/// unless the derivation was `incomplete` — sweeps stale models WE previously
+/// generated. Keeping this host-side (rather than trusting urban's own writer)
+/// preserves the console's provenance/collision/sweep semantics regardless of
+/// which deriver produced the models.
+fn finalize_generated_models(
+    name: &str,
+    dir: &Path,
+    result: GenerateResult,
+) -> Result<Vec<String>, String> {
     // Write each laid-out model to the model-first scan surface. `resources/
     // processes/` is exactly where `envelope_scan::scan_project` reads, so these
     // generated `.bpmn` become a first-class scan surface: worker/message I/O and
@@ -8291,7 +8441,7 @@ mod tests {
         std::fs::write(
             path,
             format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$1\" > urban-ran.txt\npwd >> urban-ran.txt\n{extra}"
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > urban-ran.txt\npwd >> urban-ran.txt\n{extra}"
             ),
         )
         .unwrap();
@@ -8339,7 +8489,7 @@ mod tests {
         let stub = root.join("urban-stub.sh");
         write_urban_stub(&stub, "");
 
-        gen_with_urban(name, &stub)
+        gen_with_urban(name, &stub, false)
             .await
             .expect("gen_with_urban should succeed");
 
@@ -8354,6 +8504,150 @@ mod tests {
             sentinel.contains(&*canon.to_string_lossy()),
             "urban gen ran in the wrong CWD: {sentinel:?} (want {})",
             canon.display()
+        );
+    }
+
+    /// When the toolkit is derivation-capable, `regenerate_domain_types`'
+    /// `gen_via_urban` passes `--no-models` so a type-contract regen does NOT
+    /// also rewrite `resources/processes/*.bpmn`. `gen_with_urban(_, _, true)`
+    /// is the seam that carries that flag through to the spawned process.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn gen_with_urban_passes_no_models_when_requested() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "urbanapp-nomodels";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let stub = root.join("urban-nomodels.sh");
+        write_urban_stub(&stub, "");
+
+        gen_with_urban(name, &stub, true)
+            .await
+            .expect("gen_with_urban should succeed");
+
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
+        let argline = sentinel.lines().next().unwrap_or_default();
+        assert!(
+            argline.contains("gen") && argline.contains("--no-models"),
+            "urban not invoked with `gen --no-models`: {sentinel:?}"
+        );
+    }
+
+    /// A unique, env-free temp directory for tests that pass explicit paths and
+    /// therefore must NOT mutate the shared `NANOBPMN_PROJECTS_DIR` (unlike
+    /// [`temp_root`]) — mutating that global would race the env-dependent tests.
+    fn isolated_tmp(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "nano-derive-test-{}-{}-{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, AOrd::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// A stub `urban` whose `derive --stdout` prints `body` on stdout and exits
+    /// with `code`. Lets us exercise `derive_via_urban`'s parse-first contract
+    /// without a real `@nanobpm/urban` install.
+    #[cfg(unix)]
+    fn write_urban_derive_stub(path: &std::path::Path, body: &str, code: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        // Single-quote the body so shell metacharacters in the JSON are inert;
+        // escape any embedded single quotes.
+        let escaped = body.replace('\'', "'\\''");
+        std::fs::write(
+            path,
+            format!("#!/bin/sh\nprintf '%s\\n' '{escaped}'\nexit {code}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The happy path: `urban derive --stdout` exits 0 with the contract JSON, and
+    /// `derive_via_urban` parses it into a `GenerateResult` (the JSON maps
+    /// byte-for-byte onto the struct the Deno driver produces — no drift).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn derive_via_urban_parses_the_contract_json() {
+        let root = isolated_tmp("derive-ok");
+        let dir = root.join("app");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = root.join("urban-derive.sh");
+        write_urban_derive_stub(
+            &stub,
+            r#"{"models":[{"id":"greet","kind":"declarative","xml":"<x/>"}],"incomplete":false}"#,
+            0,
+        );
+
+        let result = derive_via_urban(&dir, &stub)
+            .await
+            .expect("derive should parse");
+        assert!(!result.incomplete);
+        assert_eq!(result.models.len(), 1);
+        assert_eq!(result.models[0].id, "greet");
+        assert_eq!(result.models[0].kind, "declarative");
+        assert_eq!(result.models[0].xml, "<x/>");
+    }
+
+    /// Contract nuance verified against the real `@nanobpm/urban@0.18.0`:
+    /// `urban derive --stdout` exits **non-zero** when the derivation is
+    /// `incomplete`, yet still prints the well-formed `{models,incomplete}` body.
+    /// `incomplete` is a non-fatal signal (it makes `finalize_generated_models`
+    /// write the partial models but skip the destructive sweep), so a parseable
+    /// body must be authoritative regardless of exit code — NOT swallowed into a
+    /// hard error that would drop the models and mis-drive the sweep.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn derive_via_urban_honors_incomplete_despite_nonzero_exit() {
+        let root = isolated_tmp("derive-incomplete");
+        let dir = root.join("app");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = root.join("urban-derive-incomplete.sh");
+        write_urban_derive_stub(
+            &stub,
+            r#"{"models":[{"id":"ok","kind":"imperative","xml":"<x/>"}],"incomplete":true}"#,
+            1,
+        );
+
+        let result = derive_via_urban(&dir, &stub)
+            .await
+            .expect("a parseable body is authoritative even on non-zero exit");
+        assert!(result.incomplete, "incomplete flag must be honored");
+        assert_eq!(result.models.len(), 1, "partial models must be preserved");
+    }
+
+    /// A genuine failure — non-zero exit with NO parseable JSON body (bad
+    /// manifest, not a workflow project) — surfaces a rich, diagnosable error
+    /// carrying the exit status and stderr, never a panic or a silent empty
+    /// result.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn derive_via_urban_errors_on_a_bodyless_failure() {
+        let root = isolated_tmp("derive-fail");
+        let dir = root.join("app");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stub = root.join("urban-derive-fail.sh");
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&stub, "#!/bin/sh\necho 'manifest not found' 1>&2\nexit 2\n").unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = derive_via_urban(&dir, &stub)
+            .await
+            .expect_err("a bodyless failure must error");
+        assert!(
+            err.contains("urban derive failed"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("exit 2"), "exit status not reported: {err}");
+        assert!(
+            err.contains("manifest not found"),
+            "stderr not surfaced: {err}"
         );
     }
 
@@ -8372,7 +8666,9 @@ mod tests {
         let stub = root.join("urban-fail.sh");
         write_urban_stub(&stub, "echo 'manifest not found' 1>&2\nexit 1\n");
 
-        let err = gen_with_urban(name, &stub).await.expect_err("should fail");
+        let err = gen_with_urban(name, &stub, false)
+            .await
+            .expect_err("should fail");
         assert!(err.contains("urban gen failed"), "unexpected error: {err}");
         assert!(
             err.contains("manifest not found"),
@@ -8396,7 +8692,9 @@ mod tests {
         let stub = root.join("urban-silent.sh");
         write_urban_stub(&stub, "exit 3\n");
 
-        let err = gen_with_urban(name, &stub).await.expect_err("should fail");
+        let err = gen_with_urban(name, &stub, false)
+            .await
+            .expect_err("should fail");
         assert!(err.contains("urban gen failed"), "unexpected error: {err}");
         assert!(err.contains("exit 3"), "exit status not reported: {err}");
         assert!(
@@ -8414,7 +8712,7 @@ mod tests {
         let _root = temp_root();
         let stub = _root.join("urban-stub.sh");
         write_urban_stub(&stub, "");
-        let err = gen_with_urban("no-such-project", &stub)
+        let err = gen_with_urban("no-such-project", &stub, false)
             .await
             .expect_err("absent project should error");
         assert!(err.contains("no such project"), "unexpected error: {err}");
