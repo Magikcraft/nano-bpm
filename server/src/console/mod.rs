@@ -3195,11 +3195,36 @@ fn sql_is_ddl(sql: &str) -> bool {
     s.starts_with("CREATE ") || s.starts_with("ALTER ") || s.starts_with("DROP ")
 }
 
-/// Best-effort regeneration of `nano-generated/domain-rows.d.ts` from the default
-/// datasource's live schema (ADR 0029 §4.1/§6), so typed workers track the DB
-/// after a structural change. Failure is logged, never surfaced — the maker's
+/// Best-effort regeneration of a project's derived type artifacts after a
+/// structural change, so typed workers track the current shape (ADR 0029 §4.1/§6).
+/// The path depends on the project shape: an **Urban-shaped app** (`nano.app.json`)
+/// delegates to `urban gen` (which derives the full `nano-generated/*` artifact set
+/// from the manifest, #514 dry-out) when `urban` is available; a legacy-shaped
+/// project regenerates `domain-rows.d.ts` from the default datasource's live schema
+/// via the embedded emitter. Failure is logged, never surfaced — the maker's
 /// operation already succeeded and the types are an authoring-time contract only.
 async fn regenerate_domain_types(name: &str) {
+    // #514 dry-out: an Urban-shaped app (`nano.app.json`) delegates artifact
+    // generation to the shared `@nanobpm/urban` toolkit (`urban gen`) when the
+    // binary is available, instead of running the console's embedded emitters —
+    // the manifest is the single contract and urban is the one deriver (ADR
+    // 0052/0053/0054). Delegation is best-effort like the embedded path: on
+    // failure we fall through to the embedded op so a project is never left worse
+    // off than before urban was reachable (the derived artifacts are always
+    // regenerable). Legacy-shaped projects (no `nano.app.json`) always take the
+    // embedded path.
+    if projects::is_urban_app(name) && urban::urban_available() {
+        match projects::gen_via_urban(name).await {
+            Ok(()) => return,
+            Err(msg) => {
+                tracing::debug!(
+                    project = name,
+                    error = %msg,
+                    "urban gen delegation failed, falling back to embedded codegen"
+                );
+            }
+        }
+    }
     if let Err((_, msg)) = project_data_op(name, serde_json::json!({ "op": "domaintypes" })).await {
         tracing::debug!(project = name, "domain-rows.d.ts regen skipped: {msg}");
     }
