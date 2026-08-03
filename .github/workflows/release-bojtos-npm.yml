@@ -1,15 +1,19 @@
 name: release-bojtos-npm
 
 # Triggered by tags of the form `bojtos-npm-v0.1.0`. Builds & publishes the
-# three Bojtos framework packages, in dependency order, to the npm registry:
+# @nanobpm/engine-wasm package (the wasm-pack build of the Rust in-browser
+# engine) to the npm registry.
 #
-#   @nanobpm/engine-wasm  →  @nanobpm/bojtos-kit  →  @nanobpm/bojtos-react
+# The Bojtos framework packages that consume it — @nanobpm/bojtos-kit and
+# @nanobpm/bojtos-react — were extracted to their own repo (nanobpm/bojtos) and
+# are published from there; only engine-wasm, whose source lives here, is
+# published by this workflow.
 #
-# Authentication is npm OIDC trusted publishing — NO NPM_TOKEN. Each package
+# Authentication is npm OIDC trusted publishing — NO NPM_TOKEN. engine-wasm
 # must have a Trusted Publisher configured on npmjs.com pointing at this repo +
 # this workflow file (see docs/releasing-bojtos-npm.md). The very first publish
-# of each package is done locally by a maintainer (it creates the package so the
-# Trusted Publisher can be configured); thereafter this workflow publishes on tag.
+# was done locally by a maintainer (it created the package so the Trusted
+# Publisher could be configured); thereafter this workflow publishes on tag.
 #
 # Note: npm provenance is intentionally disabled (NPM_CONFIG_PROVENANCE=false) —
 # provenance requires a public source repository, and nano-bpm is private.
@@ -22,7 +26,7 @@ on:
 
 jobs:
   publish:
-    name: Publish Bojtos packages
+    name: Publish engine-wasm
     runs-on: ubuntu-24.04
     permissions:
       # id-token: write is what lets npm exchange the GitHub OIDC token for a
@@ -58,32 +62,17 @@ jobs:
       - name: Build engine-wasm (make console-wasm)
         run: make console-wasm
 
-      - name: Build & test bojtos-kit
-        working-directory: bojtos-kit
-        run: |
-          npm ci
-          npm run build
-          npm run test:ci
-
-      - name: Build bojtos-react
-        working-directory: bojtos-react
-        run: |
-          npm ci
-          npm run build
-
-      - name: Verify tag matches package versions
+      - name: Verify tag matches package version
         run: |
           tag_version="${GITHUB_REF_NAME#bojtos-npm-v}"
-          for dir in engine-wasm/pkg bojtos-kit bojtos-react; do
-            pkg_version=$(node -p "require('./$dir/package.json').version")
-            if [[ "$pkg_version" != "$tag_version" ]]; then
-              echo "::error::tag $tag_version does not match $dir version $pkg_version"
-              exit 1
-            fi
-          done
-          echo "releasing Bojtos packages $tag_version"
+          pkg_version=$(node -p "require('./engine-wasm/pkg/package.json').version")
+          if [[ "$pkg_version" != "$tag_version" ]]; then
+            echo "::error::tag $tag_version does not match engine-wasm/pkg version $pkg_version"
+            exit 1
+          fi
+          echo "releasing @nanobpm/engine-wasm $tag_version"
 
-      - name: Publish (dependency order, OIDC)
+      - name: Publish (OIDC)
         env:
           NPM_CONFIG_PROVENANCE: 'false'
         run: node scripts/bojtos-release.mjs

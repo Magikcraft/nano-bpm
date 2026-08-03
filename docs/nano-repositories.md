@@ -1,14 +1,15 @@
 # Nano repositories — how the pieces fit
 
-Nano is developed across **four repositories**. This is the map: what each one
+Nano is developed across **five repositories**. This is the map: what each one
 is, where each piece lives, and how they depend on one another.
 
 | Repo | Product name | Role |
 | --- | --- | --- |
-| [`Magikcraft/nano-bpm`](https://github.com/Magikcraft/nano-bpm) | **Nano BPM** | The core product: engine, gateway server, web console, embeddable engine libraries (`nano-bernd`, Bojtos), and schemas. The source of truth. |
+| [`Magikcraft/nano-bpm`](https://github.com/Magikcraft/nano-bpm) | **Nano BPM** | The core product: engine, gateway server, web console, embeddable engine libraries (`nano-bernd`, `engine-wasm`), and schemas. The source of truth. |
 | [`jwulf/nano-ide`](https://github.com/jwulf/nano-ide) | **Nano IDE** | Console extension packs (languages, app templates, examples, themes, triggers/connectors) **and** the published code-first stack: the Urban app runtime (`@nanobpm/urban`), the `create-urban-app` scaffolder, and the code-first workflow SDK (`@nanobpm/workflow`). Published to npm. |
 | [`jwulf/nano-sdk-js`](https://github.com/jwulf/nano-sdk-js) | **Nano SDK (JS)** | `@nanobpm/nano-sdk` — the **engine-transport spine**: a drop-in replacement for `@camunda8/orchestration-cluster-api` that transparently upgrades the hot paths to Nano's **Falcon** protocol (and offers an in-process `embedded` transport). Cross-runtime (Node, Deno, Bun). Published to npm. |
 | [`jwulf/c8ctl-plugin-nano`](https://github.com/jwulf/c8ctl-plugin-nano) | **c8ctl Nano plugin** | A `c8ctl` CLI plugin that installs, runs, and manages a local Nano BPM cluster; ships the prebuilt gateway binary; and turns CLI agents into job workers. |
+| [`nanobpm/bojtos`](https://github.com/nanobpm/bojtos) | **Bojtos** | The publishable in-browser BPMN demo framework: `@nanobpm/bojtos-kit` (framework-agnostic) and `@nanobpm/bojtos-react` (React bindings), built on `@nanobpm/engine-wasm`. Extracted from nano-bpm (ADR 0043); public, published to npm. |
 
 At a glance, the dependency direction is one-way into Nano BPM:
 
@@ -25,6 +26,8 @@ At a glance, the dependency direction is one-way into Nano BPM:
                                                              │  gateway binary (release)  ▲
                                                              ▼                            │
                           c8ctl-plugin-nano ──(prebuilt binary + `c8ctl nano`)────────────┘
+
+   bojtos (@nanobpm/bojtos-kit, -react) ──(consumes @nanobpm/engine-wasm, npm)──▶ Nano BPM
 ```
 
 ---
@@ -34,7 +37,7 @@ At a glance, the dependency direction is one-way into Nano BPM:
 A Rust + TypeScript monorepo that produces the `nanobpmn` gateway binary and the
 embeddable engine. It owns the REST contract, the Falcon protocol, the console,
 the extension-manifest schema, and the engine release pipeline. **Everything else
-depends on it; it depends on nothing in the other three repos.**
+depends on it; it depends on nothing in the other four repos.**
 
 Where each piece lives:
 
@@ -45,8 +48,7 @@ Where each piece lives:
 | `server/src/console/extensions.rs` | The **authoritative extension-manifest schema** that Nano IDE packs target (see repo 2). |
 | `server/src/console/agent_brief.rs` | The **agent authoring surface**: `GET /agent` (+ `/agent.md`, `/llms.txt`) serves a live per-node brief that teaches an external agent how Nano works and how to author + link in an Urban app (ADR 0051). "Point your agent here." |
 | `console/` | The built-in web console SPA — the **RAD IDE** (Projects: BPMN, DMN, forms, and Page Composer authoring), Extensions, Explorer, **Traces** (per-instance execution timelines), Workers, guided journeys, and Topology/Metrics. See the console tour in [`README.md`](../README.md#web-console) and [`USERGUIDE.md`](../USERGUIDE.md#tour-the-web-console). |
-| `engine-wasm/` + `clients/nano-bernd/` | The engine compiled to WASM and wrapped as an **embeddable library** with two hosts: `@nanobpm/nano-bernd` (npm) and `io.github.jwulf:nano-bernd` (JVM / Maven Central). |
-| `bojtos-kit/` + `bojtos-react/` | **Bojtos** — a publishable in-browser BPMN demo framework built on the same wasm engine: `@nanobpm/bojtos-kit` (framework-agnostic) and `@nanobpm/bojtos-react` (React bindings), both npm (ADR 0043). |
+| `engine-wasm/` + `clients/nano-bernd/` | The engine compiled to WASM and wrapped as an **embeddable library** with two hosts: `@nanobpm/nano-bernd` (npm) and `io.github.jwulf:nano-bernd` (JVM / Maven Central). `@nanobpm/engine-wasm` (the wasm-pack build) is published to npm and consumed by the **Bojtos** framework (repo `nanobpm/bojtos`). |
 | `clients/` | Client transports (e.g. the `node-stream` command-stream client). |
 | `processos/` | ProcessOS — a companion binary built from the same engine; it ships in the same `v*` release train as the gateway (see below). |
 | `spec/`, `spec-app/`, `spec-console/` | JSON Schemas / OpenAPI specs, published to `nanobpm.io`. |
@@ -68,8 +70,11 @@ engine trains are cut from the same `main` commit:
 
 A further npm train publishes on its own cadence from this repo:
 
-- **Bojtos** — `@nanobpm/bojtos-kit` + `@nanobpm/bojtos-react`
+- **`@nanobpm/engine-wasm`** — the wasm engine build
   (`release-bojtos-npm.yml`, OIDC; see [`docs/releasing-bojtos-npm.md`](releasing-bojtos-npm.md)).
+  The Bojtos framework packages (`@nanobpm/bojtos-kit` + `@nanobpm/bojtos-react`)
+  that consume it are published from the separate
+  [`nanobpm/bojtos`](https://github.com/nanobpm/bojtos) repo.
 
 ---
 

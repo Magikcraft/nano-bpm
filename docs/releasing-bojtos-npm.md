@@ -1,85 +1,66 @@
-# Releasing the Bojtos npm packages
+# Releasing `@nanobpm/engine-wasm`
 
-Publishes the three packages of the Bojtos in-browser BPMN demo framework
-(ADR 0043) to npm, in dependency order:
+Publishes **`@nanobpm/engine-wasm`** — the wasm-pack (`--target web`) build of
+the Rust in-browser engine — to npm.
 
-```
-@nanobpm/engine-wasm  →  @nanobpm/bojtos-kit  →  @nanobpm/bojtos-react
-```
-
-Once published, anyone can build their own Bojtos demo outside this monorepo
-(see the quickstart in `bojtos-react/README.md`).
+> **The Bojtos framework packages moved.** `@nanobpm/bojtos-kit` and
+> `@nanobpm/bojtos-react` were extracted to the standalone public repo
+> [`nanobpm/bojtos`](https://github.com/nanobpm/bojtos) and are published from
+> there (see that repo's `docs/releasing.md`). They consume `@nanobpm/engine-wasm`
+> from npm. This repo only publishes `engine-wasm`, whose source lives here
+> (built from the Rust engine via `make console-wasm`).
 
 ## How it works
 
-- In the repo the inter-package dependencies are local `file:` links so in-tree
-  builds, the console, and `website/demo` resolve them with no registry. npm
-  cannot publish `file:` deps, so **`scripts/bojtos-release.mjs`** rewrites each
-  internal `@nanobpm/*` dependency to `^<version>` at publish time and restores
-  the committed `file:` link afterwards.
+- `@nanobpm/engine-wasm` ships the prebuilt wasm + generated `.d.ts`/`.js`. The
+  publish is driven by **`scripts/bojtos-release.mjs`**, which packs and publishes
+  the single `engine-wasm/pkg` package.
 - Authentication is **npm OIDC trusted publishing** — there is no `NPM_TOKEN`.
-  CI mints a short-lived publish token from GitHub OIDC; the package must be
-  bound to this repo + workflow on npmjs.com (one-time, below).
+  CI mints a short-lived publish token from GitHub OIDC; the package is bound to
+  this repo + workflow on npmjs.com (one-time, below).
 - Provenance is disabled (`NPM_CONFIG_PROVENANCE=false`) — it requires a public
   source repository, and nano-bpm is private.
 
-## One-time setup (per package)
+## One-time setup
 
-A Trusted Publisher can only be configured on a package that already exists, so
-the first publish of each package is done locally by a maintainer with
-`@nanobpm` publish rights.
+A Trusted Publisher can only be configured on a package that already exists;
+`@nanobpm/engine-wasm` is already published, so this is done. For reference, on
+npmjs.com for `@nanobpm/engine-wasm`: **Settings → Trusted Publisher → GitHub
+Actions**:
 
-1. Build and publish all three locally:
-
-   ```bash
-   make bojtos                    # builds the engine wasm + both dists from source
-   npm login                      # if not already authenticated
-   node scripts/bojtos-release.mjs --dry-run   # sanity-check what will be packed
-   node scripts/bojtos-release.mjs             # real publish, dependency order
-   ```
-
-2. On npmjs.com, for **each** of `@nanobpm/engine-wasm`, `@nanobpm/bojtos-kit`
-   and `@nanobpm/bojtos-react`: **Settings → Trusted Publisher → GitHub
-   Actions**:
-
-   | Field               | Value                     |
-   |---------------------|---------------------------|
-   | Organization / user | `Magikcraft`              |
-   | Repository          | `nano-bpm`                |
-   | Workflow filename   | `release-bojtos-npm.yml`  |
-   | Environment         | *(leave blank)*           |
+| Field               | Value                     |
+|---------------------|---------------------------|
+| Organization / user | `Magikcraft`              |
+| Repository          | `nano-bpm`                |
+| Workflow filename   | `release-bojtos-npm.yml`  |
+| Environment         | *(leave blank)*           |
 
 After that, tagged releases publish automatically with no secret.
 
 ## Cutting a release
 
-1. Bump the version in all three packages to the same value:
-   - `engine-wasm/pkg.package.json` (source of truth for `@nanobpm/engine-wasm`;
-     `make console-wasm` copies it into `engine-wasm/pkg/package.json`)
-   - `bojtos-kit/package.json`
-   - `bojtos-react/package.json`
-2. `make bojtos` — rebuilds the wasm + both dists so the committed artifacts
-   match the new version.
+1. Bump the version in `engine-wasm/pkg.package.json` (the source of truth for
+   `@nanobpm/engine-wasm`; `make console-wasm` copies it into
+   `engine-wasm/pkg/package.json`).
+2. `make console-wasm` — rebuilds the wasm so the committed artifact matches the
+   new version.
 3. Commit, open a PR, merge to `main`.
 4. Tag from `main` and push:
    ```bash
    git tag bojtos-npm-v0.1.0
    git push origin bojtos-npm-v0.1.0
    ```
-5. The `release-bojtos-npm` workflow builds the wasm from source, builds/tests
-   both dists, verifies the tag matches all three versions, and publishes them
-   in dependency order via OIDC.
+5. The `release-bojtos-npm` workflow builds the wasm from source, verifies the
+   tag matches the package version, and publishes via OIDC.
 6. Verify on npmjs.com:
    - <https://www.npmjs.com/package/@nanobpm/engine-wasm>
-   - <https://www.npmjs.com/package/@nanobpm/bojtos-kit>
-   - <https://www.npmjs.com/package/@nanobpm/bojtos-react>
 
 ## Manual dry-run (local, no publish)
 
 ```bash
-make bojtos
+make console-wasm
 node scripts/bojtos-release.mjs --dry-run
 ```
 
-This runs `npm publish --dry-run` for each package (with deps temporarily pinned
-to `^version`) and prints the tarball contents without publishing.
+This runs `npm publish --dry-run` for `engine-wasm/pkg` and prints the tarball
+contents without publishing.

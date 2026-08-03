@@ -3,8 +3,10 @@
 The live landing page for **nanobpm.io**: a from-scratch BPMN engine running
 _in your browser_. It executes the real `urban-pr-review` **convergence loop**
 on the WebAssembly build of the engine (`@nanobpm/engine-wasm`) via the
-[Bojtos](../../docs/adr/0043-bojtos-in-browser-demo-framework.md) in-browser
-framework — no server, no backend calls in the runtime.
+[Bojtos](../../docs/adr/0043-bojtos-demo-framework.md) in-browser
+framework (`@nanobpm/bojtos-kit` / `@nanobpm/bojtos-react`, published from the
+[`nanobpm/bojtos`](https://github.com/nanobpm/bojtos) repo) — no server, no
+backend calls in the runtime.
 
 ## What's real vs. scripted
 

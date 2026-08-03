@@ -2,6 +2,14 @@
 
 Status: **Proposed.**
 Date: 2026-07-28.
+
+> **Extraction update (2026-08).** The `bojtos-kit` and `bojtos-react` packages
+> described here were extracted from this monorepo into the standalone public
+> repo [`nanobpm/bojtos`](https://github.com/nanobpm/bojtos) and are published
+> from there; they consume `@nanobpm/engine-wasm` from npm. `@nanobpm/engine-wasm`
+> continues to be built (`make console-wasm`) and published from this repo. The
+> design below is retained as the original record.
+
 Relates to:
 ADR 0005 (`0005-embedded-u-nano.md`, Bernd — the embedded engine this wraps), the in-browser
 test-run substrate (`console/src/components/TestRunPanel.tsx` — loads the wasm `TestEngine`, deploys

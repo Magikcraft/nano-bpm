@@ -1,7 +1,0 @@
-node_modules/
-
-# dist/ is a committed build artifact (the tsc-emitted JS + .d.ts the console
-# imports without re-bundling). Re-include it against the repo-root `dist/`
-# ignore, which targets the wasm FFI tree, not this package.
-!dist/
-!dist/**
