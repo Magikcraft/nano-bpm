@@ -426,20 +426,20 @@ impl TraceStore {
         let mut inner = self.inner.lock().unwrap();
         let mut vars = variables.unwrap_or(inner.capture_vars);
         let mut stim = stimuli.unwrap_or(inner.capture_stimuli);
-        // Explicit requests take precedence over carried-over values: clearing
-        // the base (variables) clears the dependent (stimuli); enabling the
-        // dependent enables the base.
-        if variables == Some(false) {
-            stim = false;
-        }
-        if stimuli == Some(true) {
-            vars = true;
-        }
-        // Repair any residual invariant violation from carried-over values so
-        // `stimuli ⇒ variables` always holds.
+        // Enabling the dependent (stimuli) implies the base (variables)...
         if stim {
             vars = true;
         }
+        // ...but an explicit request to disable the base dominates: clearing
+        // variable capture also clears stimulus capture (the documented rule).
+        // This resolves a contradictory request — `{variables:false,
+        // stimuli:true}` — deterministically to both-off rather than a
+        // surprising both-on-then-off state.
+        if variables == Some(false) {
+            vars = false;
+        }
+        // Final invariant repair for any residual carried-over combination so
+        // `stimuli ⇒ variables` always holds.
         if !vars {
             stim = false;
         }
@@ -451,13 +451,19 @@ impl TraceStore {
 
 impl Inner {
     fn config(&self) -> TraceConfigDto {
+        // Saturating conversions: the OpenAPI model is signed `int32`/`int64`,
+        // so clamp to the signed max to avoid both truncation and a panic on
+        // the DTO → generated-model round-trip. These counts are tiny in
+        // practice (ring capacity, live instance count), so clamping is inert.
+        let i32_max = i32::MAX as usize;
+        let i64_max = i64::MAX as usize;
         TraceConfigDto {
             capture_variables: self.capture_vars,
             capture_stimuli: self.capture_stimuli,
-            capacity: self.capacity as u32,
-            vars_max_bytes: self.vars_max_bytes as u64,
-            stimuli_max: self.stimuli_max as u32,
-            traced_instances: self.instances.len() as u32,
+            capacity: self.capacity.min(i32_max) as u32,
+            vars_max_bytes: self.vars_max_bytes.min(i64_max) as u64,
+            stimuli_max: self.stimuli_max.min(i32_max) as u32,
+            traced_instances: self.instances.len().min(i32_max) as u32,
         }
     }
 
@@ -1325,6 +1331,13 @@ mod tests {
 
         // Clearing variables also clears stimuli.
         let c = store.set_capture(Some(false), None);
+        assert!(!c.capture_variables && !c.capture_stimuli);
+
+        // A contradictory request resolves deterministically to both-off: an
+        // explicit variables=false dominates (clearing the base clears the
+        // dependent), matching the documented rule.
+        store.set_capture(Some(true), Some(true));
+        let c = store.set_capture(Some(false), Some(true));
         assert!(!c.capture_variables && !c.capture_stimuli);
     }
 
