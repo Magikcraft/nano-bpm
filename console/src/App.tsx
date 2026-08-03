@@ -464,7 +464,7 @@ export default function App() {
                     Advanced Research Prototype
                   </div>
                   <div className="mt-1.5 text-[10px] text-fg-faint">
-                    Free for evaluation use
+                    Free for personal or evaluation use
                   </div>
                 </>
               )}

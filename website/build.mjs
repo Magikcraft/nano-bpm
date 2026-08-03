@@ -383,7 +383,7 @@ ${langChips()}
 
 <footer class="site-foot wrap">
   <p><a href="/demo/">Browser demo</a> · <a href="/schemas/">Published schemas</a></p>
-  <p class="muted">Nano is an Advanced Research Prototype. Free for evaluation use.</p>
+  <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
 </footer>
 
 <script>
