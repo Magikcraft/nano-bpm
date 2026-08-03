@@ -106,9 +106,13 @@ function subjectsInRange(range) {
   return out.split("\n").filter(Boolean);
 }
 
-/** Short author date (YYYY-MM-DD) of a ref, or null. */
+/**
+ * Creation date (YYYY-MM-DD) of a tag, or null. Uses the tag's own
+ * `creatordate` — the same key `buildVersions` sorts on — so an annotated or
+ * late-created tag displays when it was cut, not its underlying commit's date.
+ */
 function tagDate(ref) {
-  return git(["log", "-1", "--format=%as", ref]);
+  return git(["tag", "--list", ref, "--format=%(creatordate:short)"]);
 }
 
 /** Builds the ordered list of ChangelogVersion entries from the git history. */
@@ -163,7 +167,7 @@ function main() {
     0,
   );
   console.log(
-    `build-changelog: wrote ${doc.versions.length} version(s), ${total} entrie(s) to public/changelog.json`,
+    `build-changelog: wrote ${doc.versions.length} version(s), ${total} entries to public/changelog.json`,
   );
 }
 

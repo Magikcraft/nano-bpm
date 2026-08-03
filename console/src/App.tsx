@@ -444,10 +444,13 @@ export default function App() {
                   </span>
                 )}
                 {changelogHasUnseen && (
-                  <span
-                    className="inline-block h-1.5 w-1.5 rounded-full bg-accent"
-                    aria-label="New changes available"
-                  />
+                  <>
+                    <span className="sr-only">New changes available</span>
+                    <span
+                      className="inline-block h-1.5 w-1.5 rounded-full bg-accent"
+                      aria-hidden="true"
+                    />
+                  </>
                 )}
               </button>
             )}

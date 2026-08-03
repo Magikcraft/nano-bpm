@@ -95,5 +95,11 @@ export function hasUnseenSince(
   // First run: invite a look only if there is real release history — never nag
   // on a dev build whose sole section is "Unreleased".
   if (!lastSeen) return versions.some((v) => v.version !== UNRELEASED);
+  // Upgrade from a dev build: if the user last opened the panel when the top
+  // section was "Unreleased" (persisted as lastSeen), a subsequent tagged build
+  // whose newest section is a real release IS new to them. A plain
+  // compareVersions would mis-order this (Unreleased sorts above any semver) and
+  // wrongly suppress the badge, so handle it explicitly.
+  if (lastSeen === UNRELEASED) return newest !== UNRELEASED;
   return compareVersions(newest, lastSeen) > 0;
 }

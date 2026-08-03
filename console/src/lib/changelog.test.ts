@@ -55,3 +55,15 @@ test("hasUnseenSince: Unreleased badges once a real version was seen", () => {
   const doc = docWith([UNRELEASED, "0.0.11"]);
   assert.equal(hasUnseenSince(doc, "0.0.11"), true);
 });
+
+test("hasUnseenSince: re-badges after a real release ships over a seen dev build", () => {
+  // The user opened the panel on a dev build whose top section was "Unreleased"
+  // (so lastSeen === UNRELEASED). A later tagged build promotes a real release
+  // to the top with no Unreleased section — that release is genuinely new.
+  assert.equal(hasUnseenSince(docWith(["0.0.12", "0.0.11"]), UNRELEASED), true);
+  // But if the newest section is still just "Unreleased", nothing tagged is new.
+  assert.equal(
+    hasUnseenSince(docWith([UNRELEASED, "0.0.11"]), UNRELEASED),
+    false,
+  );
+});
