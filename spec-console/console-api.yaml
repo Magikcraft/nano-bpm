@@ -1081,6 +1081,26 @@ paths:
         '204': { description: Removed }
         '400': { $ref: '#/components/responses/BadRequest' }
 
+  /urban/install:
+    post:
+      operationId: installUrbanToolkit
+      tags: [extensions]
+      summary: Ensure the Urban toolkit (urban CLI + create-urban-app) is present
+      description: >
+        Install-before-create hook (issue #520). Idempotently ensures the
+        first-party `nano-ide-app-urban` marketplace pack and its runtime
+        dependencies (`@nanobpm/urban`, which provides the `urban` CLI, and
+        `create-urban-app`, the scaffolder the console delegates to) are
+        installed, so the Studio can scaffold an Urban app. Cheap no-op when the
+        `urban` CLI already resolves. Returns whether it resolves after the call.
+      responses:
+        '200':
+          description: Urban toolkit availability after ensuring installation
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UrbanToolkitStatus' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
   /extensions/trust:
     post:
       operationId: trustExtension
@@ -2465,6 +2485,16 @@ components:
       required: [pkg]
       properties:
         pkg: { type: string }
+    UrbanToolkitStatus:
+      type: object
+      required: [available]
+      properties:
+        available:
+          type: boolean
+          description: >
+            Whether the `urban` CLI resolves after the ensure call (already
+            present or freshly installed). False means the install ran but the
+            binary still did not resolve.
     TrustRequest:
       type: object
       properties:

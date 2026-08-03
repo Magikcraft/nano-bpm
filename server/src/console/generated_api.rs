@@ -258,6 +258,24 @@ impl apis::extensions::Extensions for ServerImpl {
         }
     }
 
+    async fn install_urban_toolkit(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+    ) -> Result<apis::extensions::InstallUrbanToolkitResponse, ()> {
+        match super::ensure_urban_toolkit().await {
+            Ok(available) => Ok(
+                apis::extensions::InstallUrbanToolkitResponse::Status200_UrbanToolkitAvailabilityAfterEnsuringInstallation(
+                    models::UrbanToolkitStatus { available },
+                ),
+            ),
+            Err((_, msg)) => Ok(
+                apis::extensions::InstallUrbanToolkitResponse::Status400_InvalidRequest(msg),
+            ),
+        }
+    }
+
     async fn remove_extension(
         &self,
         _method: &Method,

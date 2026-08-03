@@ -2592,6 +2592,18 @@ pub(super) async fn extensions_install(pkg: String) -> ApiResult {
     }
 }
 
+/// `POST /console/api/urban/install` — install-before-create hook (#520).
+/// Idempotently ensures the Urban toolkit (`nano-ide-app-urban` pack + its
+/// `urban`/`create-urban-app` deps) is present, then reports whether the CLI
+/// resolves. Runs on the blocking pool (npm + fs work).
+pub(super) async fn ensure_urban_toolkit() -> Result<bool, (StatusCode, String)> {
+    match tokio::task::spawn_blocking(extensions::ensure_urban_toolkit).await {
+        Ok(Ok(available)) => Ok(available),
+        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
 /// `POST /console/api/extensions/remove` — uninstall an installed pack.
 pub(super) fn extensions_remove(pkg: &str) -> ApiResult {
     match extensions::remove(pkg) {

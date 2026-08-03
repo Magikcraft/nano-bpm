@@ -19,7 +19,7 @@
 //! *yolo* mode, both off by default.
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -602,6 +602,20 @@ pub struct ExtManifest {
     /// field keeps parsing unchanged — a pack in the wild must never break.
     #[serde(default)]
     pub tours: Vec<TourSpec>,
+    /// Opt-in: this pack ships a `package.json` whose **runtime** dependencies
+    /// must be `npm install`ed under the pack before its bundled CLIs resolve
+    /// (issue #520). An `npm pack` tarball carries the sources + `package.json`
+    /// but **not** `node_modules`, so a pack that fronts an npm CLI (the
+    /// first-party `nano-ide-app-urban` pack depends on `@nanobpm/urban`, whose
+    /// `urban`/`create-urban-app` bins are the Studio's Urban toolchain) needs a
+    /// second, guarded install step to materialise `node_modules/.bin/*`.
+    /// Default `false` keeps every existing declaration-only pack a pure
+    /// pack+extract (no network `npm install`, no lifecycle-script surface).
+    /// See [`install_pack_deps`] for the guardrails (`--omit=dev`,
+    /// `--ignore-scripts` unless the pack is trusted, lockfile-pinned when
+    /// present).
+    #[serde(default)]
+    pub install_deps: bool,
 }
 
 /// Built-in language-pack icons: theme-robust lettermark tiles (a brand-coloured
@@ -651,6 +665,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             trigger_sources: vec![],
             workers: vec![],
             tours: vec![],
+            install_deps: false,
         },
         ExtManifest {
             id: "deno-gui".into(),
@@ -676,6 +691,7 @@ pub fn builtin_extensions() -> Vec<ExtManifest> {
             trigger_sources: vec![],
             workers: vec![],
             tours: vec![],
+            install_deps: false,
         },
     ]
 }
@@ -1120,7 +1136,108 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
     let txt =
         std::fs::read_to_string(&mf).map_err(|_| "package has no nano-ide.ext.json".to_string())?;
     let m: ExtManifest = serde_json::from_str(&txt).map_err(|e| format!("bad manifest: {e}"))?;
+    // Second, guarded step for packs that front an npm CLI (issue #520): an
+    // `npm pack` tarball carries `package.json` but not `node_modules`, so a
+    // pack whose bundled bins live in its dependencies (e.g. the
+    // `nano-ide-app-urban` pack → `@nanobpm/urban`'s `urban`/`create-urban-app`)
+    // must have its runtime deps installed to materialise
+    // `node_modules/.bin/*`. Gated on the opt-in manifest flag so every existing
+    // declaration-only pack stays a pure pack+extract with no network install.
+    if m.install_deps {
+        // Lifecycle scripts run only for a pack the user has already trusted;
+        // a freshly-installed pack is untrusted, so its install is
+        // `--ignore-scripts` by default (supply-chain guardrail). npm still
+        // writes the `.bin/*` shims without running scripts, so the CLI resolves.
+        install_pack_deps(&dir, is_trusted(&m.id))?;
+    }
     Ok(m)
+}
+
+/// The npm package name of the first-party Urban App marketplace pack (issue
+/// #520). Its `package.json` depends on `@nanobpm/urban` (the `urban` CLI) and
+/// `create-urban-app` (the scaffolder #522 delegates to), so once the pack is
+/// installed **with its deps** (`install_deps: true`) the Studio's Urban
+/// toolchain lives at `<pack>/node_modules/.bin/{urban,create-urban-app}`.
+///
+/// Unscoped so [`safe_pkg_dir`] maps it to the directory `nano-ide-app-urban`,
+/// which is exactly the dir the resolver in [`super::urban`] probes — keeping
+/// the install target and the lookup target the *same* path with no second
+/// spelling to drift.
+pub const URBAN_PACK_PKG: &str = "nano-ide-app-urban";
+
+/// Public spelling of [`safe_pkg_dir`]: the on-disk install directory of a
+/// marketplace pack given its npm package name, or `None` for a name that fails
+/// validation. Lets callers outside this module (e.g. the `urban` resolver, the
+/// install-before-create flow) agree on a pack's location without re-deriving
+/// the `@scope/name → scope__name` mapping.
+pub fn pack_install_dir(pkg: &str) -> Option<PathBuf> {
+    safe_pkg_dir(pkg)
+}
+
+/// Build the argv for the guarded pack-dependency install (issue #520). Kept
+/// pure (no filesystem or process access beyond the two inputs) so the guardrail
+/// policy is unit-testable without a live npm.
+///
+/// Policy:
+/// - `ci` when a lockfile is present (reproducible, pinned), else `install`.
+/// - `--omit=dev` — headless/CI installs must not pull the pack's **dev**
+///   dependencies (the Urban toolkit's dev/test packages are large and
+///   irrelevant to running it), addressing "don't want to pull in Urban dev
+///   packages".
+/// - `--ignore-scripts` unless the pack is already trusted — lifecycle scripts
+///   are arbitrary code; a freshly-installed, not-yet-trusted pack must not run
+///   them. The `.bin/*` shims are still written, so the toolchain resolves.
+/// - `--no-audit --no-fund --loglevel=error` — quiet, no extraneous network.
+fn npm_install_argv(trusted: bool, has_lockfile: bool) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    a.push(if has_lockfile { "ci" } else { "install" }.into());
+    a.push("--omit=dev".into());
+    if !trusted {
+        a.push("--ignore-scripts".into());
+    }
+    a.push("--no-audit".into());
+    a.push("--no-fund".into());
+    a.push("--loglevel=error".into());
+    a
+}
+
+/// Run the guarded `npm install`/`npm ci` inside an already-extracted pack dir
+/// to materialise its `node_modules` (issue #520). Requires `npm` on PATH.
+/// `trusted` selects whether lifecycle scripts may run (see [`npm_install_argv`]).
+fn install_pack_deps(dir: &Path, trusted: bool) -> Result<(), String> {
+    let npm = find_program("npm").ok_or("npm not found on PATH")?;
+    let has_lockfile = dir.join("package-lock.json").is_file();
+    let args = npm_install_argv(trusted, has_lockfile);
+    let out = std::process::Command::new(&npm)
+        .args(&args)
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("npm install: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "npm install failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Ensure the first-party Urban toolkit is present on this host, installing the
+/// [`URBAN_PACK_PKG`] marketplace pack (with its deps) if the `urban` CLI cannot
+/// already be resolved (issue #520 — the "install-before-create" hook the Studio
+/// calls before delegating a scaffold to `create-urban-app`, which #522 owns).
+///
+/// Idempotent and cheap when already satisfied: it first asks the single
+/// resolver [`super::urban::urban_available`] and only shells out to npm on a
+/// miss. Returns `Ok(true)` when the toolkit ends up available (already present
+/// or freshly installed), `Ok(false)` if the install ran but the CLI still does
+/// not resolve, and `Err` if the install itself failed.
+pub fn ensure_urban_toolkit() -> Result<bool, String> {
+    if super::urban::urban_available() {
+        return Ok(true);
+    }
+    install_from_npm(URBAN_PACK_PKG)?;
+    Ok(super::urban::urban_available())
 }
 
 /// Uninstall a non-builtin extension. Accepts either the npm package name
@@ -1590,6 +1707,67 @@ mod tests {
     /// each other's temp dirs. Use `let _guard = ENV_LOCK.lock().unwrap();`
     /// at the top of any such test.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn install_deps_defaults_false_and_round_trips() {
+        // A manifest written before `installDeps` existed must keep parsing and
+        // default to false (pure pack+extract, no npm install).
+        let old = r#"{"id":"x","kind":"app","displayName":"X"}"#;
+        let m: ExtManifest = serde_json::from_str(old).unwrap();
+        assert!(!m.install_deps, "absent installDeps must default to false");
+
+        // The opt-in flag round-trips through serde.
+        let on = r#"{"id":"u","kind":"app","displayName":"Urban","installDeps":true}"#;
+        let m: ExtManifest = serde_json::from_str(on).unwrap();
+        assert!(m.install_deps);
+        let back: ExtManifest = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert!(back.install_deps);
+    }
+
+    #[test]
+    fn npm_install_argv_untrusted_ignores_scripts_and_omits_dev() {
+        // Untrusted (the default for a freshly-installed pack): no lifecycle
+        // scripts, no dev deps, and `install` (no lockfile).
+        let a = npm_install_argv(false, false);
+        assert_eq!(a.first().map(String::as_str), Some("install"));
+        assert!(a.iter().any(|x| x == "--omit=dev"), "must omit dev deps");
+        assert!(
+            a.iter().any(|x| x == "--ignore-scripts"),
+            "untrusted install must block lifecycle scripts"
+        );
+    }
+
+    #[test]
+    fn npm_install_argv_trusted_runs_scripts_and_ci_with_lockfile() {
+        // Trusted + lockfile present: reproducible `ci`, and lifecycle scripts
+        // are permitted (the user has accepted this pack's code).
+        let a = npm_install_argv(true, true);
+        assert_eq!(a.first().map(String::as_str), Some("ci"));
+        assert!(a.iter().any(|x| x == "--omit=dev"));
+        assert!(
+            !a.iter().any(|x| x == "--ignore-scripts"),
+            "trusted install may run lifecycle scripts"
+        );
+    }
+
+    #[test]
+    fn urban_pack_pkg_maps_to_resolver_dir() {
+        // The install target and the `urban` resolver's lookup target must be
+        // the SAME directory, or a lazy install would never be found. The
+        // resolver (super::urban) probes `<extensions>/nano-ide-app-urban`, so
+        // pack_install_dir(URBAN_PACK_PKG) must end in that exact dir name.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-urbanpkg-{}", std::process::id()));
+        // SAFETY: test-local env set, serialized on ENV_LOCK.
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        let dir = pack_install_dir(URBAN_PACK_PKG).expect("valid pack name");
+        assert_eq!(
+            dir.file_name().and_then(|s| s.to_str()),
+            Some("nano-ide-app-urban")
+        );
+        assert_eq!(dir, extensions_root().join("nano-ide-app-urban"));
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
 
     #[test]
     fn builtins_cover_deno_and_gui() {

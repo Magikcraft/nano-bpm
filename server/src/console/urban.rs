@@ -33,20 +33,20 @@ use std::path::{Path, PathBuf};
 /// shim on Windows).
 const URBAN_EXE: &str = if cfg!(windows) { "urban.cmd" } else { "urban" };
 
-/// Install directory name of the first-party Urban marketplace App pack under
-/// [`super::extensions::extensions_root`]. The `urban` CLI is a dependency of
-/// this pack, so once it (and its `node_modules`) are installed the binary
-/// lives at `<pack>/node_modules/.bin/urban` — see [`pack_urban_bin`].
-const URBAN_PACK_DIR: &str = "nano-ide-app-urban";
-
 /// The pack-relative `urban` binary path: `<extensions>/nano-ide-app-urban/
 /// node_modules/.bin/urban`. This is the Studio-managed acquisition path — the
 /// pack is lazy-installed on first Urban use (#520) — and is preferred over an
 /// ambient `PATH` install so a Studio-pinned `urban` wins. Returns the
 /// candidate path unconditionally (existence is checked by [`resolve_urban`]).
+///
+/// The pack directory is resolved through [`super::extensions::pack_install_dir`]
+/// from the canonical [`super::extensions::URBAN_PACK_PKG`] name, so the install
+/// target (the installer) and the lookup target (here) are guaranteed to be the
+/// same path — one spelling, no drift. Falls back to the bare extensions root if
+/// the pack name ever fails validation (it will not: it is a compile-time const).
 fn pack_urban_bin() -> PathBuf {
-    super::extensions::extensions_root()
-        .join(URBAN_PACK_DIR)
+    super::extensions::pack_install_dir(super::extensions::URBAN_PACK_PKG)
+        .unwrap_or_else(super::extensions::extensions_root)
         .join("node_modules")
         .join(".bin")
         .join(URBAN_EXE)
