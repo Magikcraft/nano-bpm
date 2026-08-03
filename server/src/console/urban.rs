@@ -160,13 +160,17 @@ pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
 }
 
 /// Pure predicate over `urban --help` text: does this toolkit expose model
-/// derivation? Keyed off the `--no-models` / `--stdout` flags (and the
-/// `urban derive` usage line) rather than a bare `"derive"` substring — the
-/// pre-derivation help already contains the word "derive" in the `gen`
-/// description (`urban gen … derive artifacts (migrations, worker-io)`), so a
-/// naive contains-check would false-positive on every old toolkit.
+/// derivation? Requires **both** capabilities this gate fronts — the
+/// `gen --no-models` flag AND the `derive` subcommand (its `--stdout` flag or
+/// usage line) — since a single \[`urban_supports_derive`\] gate guards call
+/// sites that use each, and the two ship as a unit (nano-ide#92). An OR could
+/// mis-detect a toolkit exposing only one and then invoke the other, unsupported.
+/// A bare `"derive"` substring is deliberately NOT a marker: the pre-derivation
+/// help already contains "derive" in its `gen` description (`urban gen … derive
+/// artifacts (migrations, worker-io)`), so it would false-positive on every old
+/// toolkit.
 fn help_indicates_derive(help: &str) -> bool {
-    help.contains("--no-models") || help.contains("--stdout") || help.contains("urban derive")
+    help.contains("--no-models") && (help.contains("--stdout") || help.contains("urban derive"))
 }
 
 #[cfg(test)]
@@ -264,8 +268,16 @@ urban — build and run Urban apps (nano.app.json)
   urban gen [--check] [--no-models]   derive artifacts (migrations, worker-io)
   urban derive [--check|--stdout]     derive executable BPMN from workflows";
         assert!(help_indicates_derive(new_help));
-        // Any one of the three markers is sufficient.
-        assert!(help_indicates_derive("  urban derive [--stdout]"));
-        assert!(help_indicates_derive("gen [--no-models]"));
+        // Both capabilities must be present: the `gen --no-models` flag AND a
+        // `derive`-subcommand marker (`--stdout` or the `urban derive` usage
+        // line). A partial help exposing only ONE is NOT derivation-capable — the
+        // gate fronts both, so an OR would let the console invoke an unsupported
+        // flag/subcommand.
+        assert!(!help_indicates_derive("  urban derive [--stdout]"));
+        assert!(!help_indicates_derive("gen [--no-models]"));
+        // Both markers together ⇒ capable.
+        assert!(help_indicates_derive(
+            "gen [--no-models]\nurban derive [--stdout]"
+        ));
     }
 }

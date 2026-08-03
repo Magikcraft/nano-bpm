@@ -4604,11 +4604,22 @@ pub async fn generate_models(name: &str) -> Result<Vec<String>, String> {
     // `GenerateResult` feeds the SAME write+sweep tail (`finalize_generated_models`)
     // as the Deno path, so the console keeps its provenance marking, filename-
     // collision handling and stale sweep — one canonical writer for the scan
-    // surface, no drift onto urban's own writer. An older toolkit or a legacy
-    // project falls through to the embedded Deno driver below.
+    // surface, no drift onto urban's own writer. A failed `urban derive` logs and
+    // falls THROUGH to the embedded Deno driver below (additive + non-regressing,
+    // like `derive_models`): a broken/older toolkit must never leave the user
+    // worse off than the pre-delegation path. An older toolkit or a legacy
+    // project skips the branch entirely (`urban_derive_capable` → None).
     if let Some(urban) = urban_derive_capable(name).await {
-        let result = derive_via_urban(&dir, &urban).await?;
-        return finalize_generated_models(name, &dir, result);
+        match derive_via_urban(&dir, &urban).await {
+            Ok(result) => return finalize_generated_models(name, &dir, result),
+            Err(e) => {
+                tracing::debug!(
+                    project = name,
+                    error = %e,
+                    "urban derive failed; falling back to the embedded deno driver"
+                );
+            }
+        }
     }
 
     let deno = super::extensions::find_program("deno").ok_or("deno toolchain not found on PATH")?;
