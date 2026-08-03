@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 /// shim on Windows).
 const URBAN_EXE: &str = if cfg!(windows) { "urban.cmd" } else { "urban" };
 
-/// The pack-relative `urban` binary path: `<extensions>/nano-ide-app-urban/
+/// The pack-relative `urban` binary path: `<extensions>/nanobpm__nano-ide-app-urban/
 /// node_modules/.bin/urban`. This is the Studio-managed acquisition path — the
 /// pack is lazy-installed on first Urban use (#520) — and is preferred over an
 /// ambient `PATH` install so a Studio-pinned `urban` wins. Returns the
