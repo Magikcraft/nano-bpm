@@ -1080,6 +1080,21 @@ fn builtin_ids() -> BTreeSet<String> {
     builtin_extensions().into_iter().map(|e| e.id).collect()
 }
 
+/// Whether a **freshly downloaded** marketplace pack may run npm lifecycle
+/// scripts during its guarded dependency install ([`install_pack_deps`]).
+///
+/// Pure over an explicit [`TrustStore`] so the supply-chain policy is unit
+/// testable without a live trust file. Unlike [`is_trusted`], it deliberately
+/// omits the built-in-id shortcut: a pack fetched from npm is by definition
+/// **not** one of the bundled built-ins, so honouring a self-declared built-in
+/// id here would let any third-party pack spoof a built-in id (e.g. `deno`) in
+/// its manifest and gain implicit trust to execute arbitrary install scripts.
+/// Trust therefore comes only from explicit user consent — the global `yolo`
+/// bypass or a prior approve-always of this exact pack id.
+fn install_scripts_trusted(trust: &TrustStore, id: &str) -> bool {
+    trust.yolo || trust.approved.contains(id)
+}
+
 // ---------------------------------------------------------------------------
 // Install / remove
 // ---------------------------------------------------------------------------
@@ -1148,7 +1163,15 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
         // a freshly-installed pack is untrusted, so its install is
         // `--ignore-scripts` by default (supply-chain guardrail). npm still
         // writes the `.bin/*` shims without running scripts, so the CLI resolves.
-        install_pack_deps(&dir, is_trusted(&m.id))?;
+        //
+        // Trust is decided by [`install_scripts_trusted`], NOT [`is_trusted`]:
+        // `m.id` is self-declared by the just-downloaded manifest, and
+        // `is_trusted` treats any built-in id as trusted — so a third-party pack
+        // could spoof a built-in id (e.g. `deno`) to gain implicit trust and run
+        // arbitrary npm lifecycle scripts. A pack fetched from npm is by
+        // definition never a bundled built-in, so that shortcut must not apply
+        // here; only explicit consent (yolo / a prior approve of this id) counts.
+        install_pack_deps(&dir, install_scripts_trusted(&load_trust(), &m.id))?;
     }
     Ok(m)
 }
@@ -1794,6 +1817,37 @@ mod tests {
     fn builtins_are_always_trusted() {
         assert!(is_trusted("deno"));
         assert!(is_trusted("deno-gui"));
+    }
+
+    #[test]
+    fn install_scripts_trust_ignores_builtin_id_spoof() {
+        // A pack fetched from npm is never a bundled built-in, so a self-declared
+        // built-in id must NOT grant implicit trust to run lifecycle scripts —
+        // otherwise a third-party pack could ship `"id": "deno"` and, with
+        // `installDeps: true`, execute arbitrary npm install scripts. Contrast
+        // `is_trusted`, which DOES honour the built-in shortcut (unchanged).
+        let none = TrustStore::default();
+        assert!(is_trusted("deno"), "built-in id trusted via is_trusted");
+        assert!(
+            !install_scripts_trusted(&none, "deno"),
+            "a downloaded pack spoofing a built-in id must not be install-trusted"
+        );
+
+        // The global yolo bypass still trusts everything.
+        let yolo = TrustStore {
+            yolo: true,
+            approved: BTreeSet::new(),
+        };
+        assert!(install_scripts_trusted(&yolo, "deno"));
+
+        // An explicit approve-always of this exact pack id trusts it; a
+        // different id (including a built-in one) stays untrusted.
+        let approved = TrustStore {
+            yolo: false,
+            approved: ["evil-pack".to_string()].into_iter().collect(),
+        };
+        assert!(install_scripts_trusted(&approved, "evil-pack"));
+        assert!(!install_scripts_trusted(&approved, "deno"));
     }
 
     #[test]
