@@ -2883,6 +2883,13 @@ pub fn is_urban_app(name: &str) -> bool {
 /// it). Returns an error when urban is unavailable or `gen` fails, so the caller
 /// can fall back or surface a prompt to install the pack.
 pub async fn gen_via_urban(name: &str) -> Result<(), String> {
+    // Belt-and-suspenders shape gate: this is a public entrypoint, so guard the
+    // `nano.app.json` shape here too (not only at the `regenerate_domain_types`
+    // call site). Spawning `urban gen` against a legacy-shaped project would
+    // clobber its `nano-generated/` with Urban outputs it doesn't expect.
+    if !is_urban_app(name) {
+        return Err("not an Urban-shaped app (no nano.app.json)".into());
+    }
     let urban = super::urban::find_urban().ok_or("urban CLI not available")?;
     gen_with_urban(name, &urban).await
 }
@@ -8388,6 +8395,30 @@ mod tests {
             .await
             .expect_err("absent project should error");
         assert!(err.contains("no such project"), "unexpected error: {err}");
+    }
+
+    /// `gen_via_urban` is a public entrypoint, so it guards the `nano.app.json`
+    /// shape itself: a legacy-shaped project is rejected before any `urban gen`
+    /// spawn, so its `nano-generated/` is never clobbered with Urban outputs.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn gen_via_urban_rejects_a_legacy_shaped_project() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "legacyapp";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A legacy project (no nano.app.json) must not be delegated to urban.
+        std::fs::write(dir.join("nanobpm.project.json"), "{}").unwrap();
+
+        let err = gen_via_urban(name)
+            .await
+            .expect_err("legacy-shaped project should be rejected");
+        assert!(
+            err.contains("not an Urban-shaped app"),
+            "unexpected error: {err}"
+        );
     }
 
     #[tokio::test]
