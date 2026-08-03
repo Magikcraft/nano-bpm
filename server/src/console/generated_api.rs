@@ -384,6 +384,36 @@ impl apis::traces::Traces for ServerImpl {
             from_dto(dtos),
         ))
     }
+
+    async fn get_trace_config(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+    ) -> Result<apis::traces::GetTraceConfigResponse, ()> {
+        Ok(
+            apis::traces::GetTraceConfigResponse::Status200_TraceConfiguration(from_dto(
+                super::trace_config(self),
+            )),
+        )
+    }
+
+    async fn set_trace_config(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        body: &models::TraceConfigUpdate,
+    ) -> Result<apis::traces::SetTraceConfigResponse, ()> {
+        let variables = flatten_nullable(&body.capture_variables);
+        let stimuli = flatten_nullable(&body.capture_stimuli);
+        let dto = super::set_trace_config(self, variables, stimuli);
+        Ok(
+            apis::traces::SetTraceConfigResponse::Status200_UpdatedTraceConfiguration(from_dto(
+                dto,
+            )),
+        )
+    }
 }
 
 // --- models ---------------------------------------------------------------

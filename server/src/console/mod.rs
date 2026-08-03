@@ -1711,6 +1711,23 @@ pub(super) fn trace_otel(server: &ServerImpl, key: &str) -> Option<serde_json::V
     server.trace_store.otel(key)
 }
 
+/// `GET /console/api/traces/config` — the capture configuration and in-memory
+/// ring state of this node's [`trace::TraceStore`].
+pub(super) fn trace_config(server: &ServerImpl) -> trace::TraceConfigDto {
+    server.trace_store.config()
+}
+
+/// `PUT /console/api/traces/config` — toggle variable / stimulus capture at
+/// runtime. Node-local and non-persistent (resets to the `NANOBPMN_TRACE_*`
+/// env defaults on restart). Returns the resulting configuration.
+pub(super) fn set_trace_config(
+    server: &ServerImpl,
+    variables: Option<bool>,
+    stimuli: Option<bool>,
+) -> trace::TraceConfigDto {
+    server.trace_store.set_capture(variables, stimuli)
+}
+
 /// `GET /console/api/stream` — Server-Sent Events feed for live updates.
 ///
 /// Emits an `instances` event whenever the read model's exported position

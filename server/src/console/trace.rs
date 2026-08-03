@@ -409,9 +409,64 @@ impl TraceStore {
         let inner = self.inner.lock().unwrap();
         inner.instances.get(&instance_key).map(InstanceTrace::otel)
     }
+
+    /// The current capture configuration and in-memory ring state.
+    pub fn config(&self) -> TraceConfigDto {
+        let inner = self.inner.lock().unwrap();
+        inner.config()
+    }
+
+    /// Toggles variable / stimulus capture at runtime. Omitted (`None`) fields
+    /// are left unchanged. Enforces the same implication as [`from_env`]:
+    /// stimulus capture requires variable capture (a complete replay record),
+    /// and clearing variable capture also clears stimulus capture. Returns the
+    /// resulting configuration. Node-local and not persisted — a restart resets
+    /// capture to the `NANOBPMN_TRACE_*` env defaults.
+    pub fn set_capture(&self, variables: Option<bool>, stimuli: Option<bool>) -> TraceConfigDto {
+        let mut inner = self.inner.lock().unwrap();
+        let mut vars = variables.unwrap_or(inner.capture_vars);
+        let mut stim = stimuli.unwrap_or(inner.capture_stimuli);
+        // Enabling the dependent (stimuli) implies the base (variables)...
+        if stim {
+            vars = true;
+        }
+        // ...but an explicit request to disable the base dominates: clearing
+        // variable capture also clears stimulus capture (the documented rule).
+        // This resolves a contradictory request — `{variables:false,
+        // stimuli:true}` — deterministically to both-off rather than a
+        // surprising both-on-then-off state.
+        if variables == Some(false) {
+            vars = false;
+        }
+        // Final invariant repair for any residual carried-over combination so
+        // `stimuli ⇒ variables` always holds.
+        if !vars {
+            stim = false;
+        }
+        inner.capture_vars = vars;
+        inner.capture_stimuli = stim;
+        inner.config()
+    }
 }
 
 impl Inner {
+    fn config(&self) -> TraceConfigDto {
+        // Saturating conversions: the OpenAPI model is signed `int32`/`int64`,
+        // so clamp to the signed max to avoid both truncation and a panic on
+        // the DTO → generated-model round-trip. These counts are tiny in
+        // practice (ring capacity, live instance count), so clamping is inert.
+        let i32_max = i32::MAX as usize;
+        let i64_max = i64::MAX as usize;
+        TraceConfigDto {
+            capture_variables: self.capture_vars,
+            capture_stimuli: self.capture_stimuli,
+            capacity: self.capacity.min(i32_max) as u32,
+            vars_max_bytes: self.vars_max_bytes.min(i64_max) as u64,
+            stimuli_max: self.stimuli_max.min(i32_max) as u32,
+            traced_instances: self.instances.len().min(i32_max) as u32,
+        }
+    }
+
     fn apply(&mut self, ev: &Event, now: u64) {
         match ev {
             Event::ProcessDeployed {
@@ -1090,6 +1145,17 @@ fn attr_int(key: &str, value: i64) -> serde_json::Value {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct TraceConfigDto {
+    pub capture_variables: bool,
+    pub capture_stimuli: bool,
+    pub capacity: u32,
+    pub vars_max_bytes: u64,
+    pub stimuli_max: u32,
+    pub traced_instances: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TraceSummaryDto {
     pub instance_key: String,
     pub process_id: String,
@@ -1241,6 +1307,49 @@ mod tests {
         let dto = store.get(1).unwrap();
         assert!(dto.creation_variables.is_none());
         assert!(dto.incidents[0].variables.is_none());
+    }
+
+    #[test]
+    fn set_capture_toggles_flags_and_enforces_implication() {
+        let store = TraceStore::new(8);
+        // Defaults: everything off.
+        let c = store.config();
+        assert!(!c.capture_variables && !c.capture_stimuli);
+        assert_eq!(c.capacity, 8);
+
+        // Enabling variables alone leaves stimuli off.
+        let c = store.set_capture(Some(true), None);
+        assert!(c.capture_variables && !c.capture_stimuli);
+
+        // Enabling stimuli implies variables even if variables is not sent.
+        let c = store.set_capture(None, Some(true));
+        assert!(c.capture_variables && c.capture_stimuli);
+
+        // Omitted fields are left unchanged.
+        let c = store.set_capture(None, None);
+        assert!(c.capture_variables && c.capture_stimuli);
+
+        // Clearing variables also clears stimuli.
+        let c = store.set_capture(Some(false), None);
+        assert!(!c.capture_variables && !c.capture_stimuli);
+
+        // A contradictory request resolves deterministically to both-off: an
+        // explicit variables=false dominates (clearing the base clears the
+        // dependent), matching the documented rule.
+        store.set_capture(Some(true), Some(true));
+        let c = store.set_capture(Some(false), Some(true));
+        assert!(!c.capture_variables && !c.capture_stimuli);
+    }
+
+    #[test]
+    fn set_capture_takes_effect_on_subsequent_ingest() {
+        let store = TraceStore::new(8);
+        store.ingest(&[&created(1, &[("amount", Value::Int(5))])], 1000);
+        assert!(store.get(1).unwrap().creation_variables.is_none());
+
+        store.set_capture(Some(true), None);
+        store.ingest(&[&created(2, &[("amount", Value::Int(9))])], 2000);
+        assert!(store.get(2).unwrap().creation_variables.is_some());
     }
 
     #[test]
