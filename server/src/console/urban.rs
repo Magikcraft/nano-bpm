@@ -25,6 +25,7 @@
 //! `NANOBPMN_URBAN_BIN` → pack → `PATH`. Do not add a second resolver
 //! elsewhere — extend this one.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 /// Name of the `urban` executable, platform-adjusted (npm installs a `.cmd`
@@ -41,8 +42,21 @@ const URBAN_EXE: &str = if cfg!(windows) { "urban.cmd" } else { "urban" };
 /// #520/#522): an explicit override always wins, the first-party pack is
 /// preferred over an ambient `PATH` install, and there is no `npx` fallback —
 /// the pack is the real-machine acquisition path.
+///
+/// The actual matching is delegated to the pure [`resolve_urban`] so it can be
+/// unit-tested without mutating the global process environment (which is UB
+/// under parallel `cargo test`).
 pub(crate) fn find_urban() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("NANOBPMN_URBAN_BIN")
+    let bin_override = std::env::var("NANOBPMN_URBAN_BIN").ok();
+    let path = std::env::var_os("PATH");
+    resolve_urban(bin_override.as_deref(), path.as_deref())
+}
+
+/// Pure core of [`find_urban`]: given the `NANOBPMN_URBAN_BIN` override and the
+/// `PATH` value, applies the `env → pack → PATH` resolution order. Kept free of
+/// any global-env reads so it is deterministic and testable in parallel.
+fn resolve_urban(bin_override: Option<&str>, path: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(p) = bin_override
         && !p.is_empty()
     {
         let pb = PathBuf::from(p);
@@ -52,8 +66,8 @@ pub(crate) fn find_urban() -> Option<PathBuf> {
     }
     // #520 seam: resolve `<workspace>/extensions/<pkg>/node_modules/.bin/urban`
     // here, before falling through to PATH. Owned by #520.
-    if let Ok(path) = std::env::var("PATH") {
-        for dir in std::env::split_paths(&path) {
+    if let Some(path) = path {
+        for dir in std::env::split_paths(path) {
             let cand = dir.join(URBAN_EXE);
             if cand.is_file() {
                 return Some(cand);
@@ -77,24 +91,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_urban_honors_explicit_bin_env() {
-        // A non-existent override is ignored; a real file is returned.
+    fn resolve_urban_prefers_explicit_override() {
+        // A real override file is returned; a non-existent one is ignored.
         let dir = std::env::temp_dir().join(format!("nbpm-urban-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join(URBAN_EXE);
         std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
-        // SAFETY: single-threaded test; scoped env mutation on a var unique to
-        // this test (mirrors workers::find_node_honors_explicit_bin_env).
-        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &fake) };
-        assert_eq!(find_urban(), Some(fake));
-        assert!(urban_available());
-        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", "/nonexistent/definitely/not/urban") };
-        // Falls through to PATH; just assert it doesn't return the bogus path.
-        assert_ne!(
-            find_urban(),
-            Some(PathBuf::from("/nonexistent/definitely/not/urban"))
+
+        // Override wins outright, without consulting PATH.
+        assert_eq!(
+            resolve_urban(Some(fake.to_str().unwrap()), None),
+            Some(fake.clone())
         );
-        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+        // A bogus override falls through (here: to an empty PATH → None), and
+        // never returns the bogus path itself.
+        assert_eq!(
+            resolve_urban(Some("/nonexistent/definitely/not/urban"), None),
+            None
+        );
+        // An empty override is treated as unset.
+        assert_eq!(resolve_urban(Some(""), None), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_urban_falls_through_to_path() {
+        // With no override, a `urban` binary on PATH is discovered.
+        let dir = std::env::temp_dir().join(format!("nbpm-urban-path-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join(URBAN_EXE);
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+
+        let path = std::env::join_paths([dir.as_os_str()]).unwrap();
+        assert_eq!(resolve_urban(None, Some(path.as_os_str())), Some(bin));
+        // Nothing on PATH, no override → not available.
+        assert_eq!(resolve_urban(None, None), None);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }
