@@ -22,6 +22,12 @@ const readmePath = join(root, "..", "USERGUIDE.md");
 // repo root) and is shipped as one self-contained page under `/docs/<slug>`.
 const extraGuides = [
   {
+    slug: "getting-started-urban",
+    title: "Getting Started with Urban",
+    path: join(root, "..", "docs", "getting-started-urban.md"),
+    linkBase: "docs",
+  },
+  {
     slug: "extensions",
     title: "Authoring extensions",
     path: join(root, "..", "docs", "extensions.md"),
@@ -29,6 +35,12 @@ const extraGuides = [
   },
 ];
 const outDir = join(root, "public", "docs");
+
+// When publishing the docs to the static nanobpm.io site (via pages.yml), the
+// app-only top-bar links (/swagger, /asyncapi, /console) have no counterpart:
+// they are live routes on a running Nano node only. Omit them off-node so the
+// published docs carry no dead links. The in-app build (Vite) leaves them on.
+const SITE_BUILD = process.env.DOCS_SITE_BUILD === "1";
 
 // Repo links in the README are relative to the repo root; rewrite them to GitHub
 // blob URLs so they resolve from the shipped, standalone docs site.
@@ -283,9 +295,13 @@ function shell(page) {
       <span class="badge">Advanced Research Prototype</span>
       <span class="sub">${subtitle}</span>
       <span class="spacer"></span>
-      <a class="x" href="/swagger">REST API</a>
+      ${
+        SITE_BUILD
+          ? ""
+          : `<a class="x" href="/swagger">REST API</a>
       <a class="x" href="/asyncapi">Falcon protocol</a>
-      <a class="x" href="/console">Web console</a>
+      <a class="x" href="/console">Web console</a>`
+      }
     </div>
     <div class="layout">
       <nav class="sidebar">
