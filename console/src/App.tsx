@@ -447,6 +447,7 @@ export default function App() {
                   data-tour={navAnchor(item.to)}
                   className={railItemClass(active, railCollapsed)}
                   title={railCollapsed ? item.label : undefined}
+                  aria-label={railCollapsed ? item.label : undefined}
                 >
                   <ActiveBar show={active} />
                   {item.icon}
@@ -480,6 +481,13 @@ export default function App() {
                 ? `Pick up “${activeJourney.title}” where you left off`
                 : "Replay the product tour"
             }
+            aria-label={
+              railCollapsed
+                ? canResume
+                  ? "Resume tour"
+                  : "Take a tour"
+                : undefined
+            }
           >
             <Icon>
               <circle cx="12" cy="12" r="9" />
@@ -495,6 +503,7 @@ export default function App() {
             rel="noopener noreferrer"
             className={`mx-3 ${railItemClass(false, railCollapsed)}`}
             title="Send feedback or report an issue"
+            aria-label={railCollapsed ? "Feedback" : undefined}
           >
             {icons.feedback}
             {!railCollapsed && "Feedback"}
@@ -504,6 +513,7 @@ export default function App() {
             href="/docs"
             className={`mx-3 ${railItemClass(false, railCollapsed)}`}
             title="Documentation"
+            aria-label={railCollapsed ? "Documentation" : undefined}
           >
             {icons.docs}
             {!railCollapsed && "Documentation"}
@@ -513,6 +523,7 @@ export default function App() {
             href="/whitepaper"
             className={`mx-3 ${railItemClass(false, railCollapsed)}`}
             title="Whitepaper"
+            aria-label={railCollapsed ? "Whitepaper" : undefined}
           >
             {icons.whitepaper}
             {!railCollapsed && "Whitepaper"}
@@ -522,6 +533,7 @@ export default function App() {
             to="/credits"
             className={`mx-3 ${railItemClass(location.pathname.startsWith("/credits"), railCollapsed)}`}
             title="Credits"
+            aria-label={railCollapsed ? "Credits" : undefined}
           >
             <ActiveBar show={location.pathname.startsWith("/credits")} />
             {icons.credits}
@@ -532,6 +544,7 @@ export default function App() {
             to="/config"
             className={`mx-3 mb-3 ${railItemClass(location.pathname.startsWith("/config"), railCollapsed)}`}
             title="Configuration"
+            aria-label={railCollapsed ? "Config" : undefined}
           >
             <ActiveBar show={location.pathname.startsWith("/config")} />
             {icons.config}
@@ -544,7 +557,7 @@ export default function App() {
             className={`mx-3 mb-1 ${railItemClass(false, railCollapsed)}`}
             title={railCollapsed ? "Expand sidebar" : "Collapse sidebar"}
             aria-label={railCollapsed ? "Expand sidebar" : "Collapse sidebar"}
-            aria-pressed={railCollapsed}
+            aria-expanded={!railCollapsed}
           >
             <span
               className={`inline-flex ${railCollapsed ? "rotate-180" : ""}`}
