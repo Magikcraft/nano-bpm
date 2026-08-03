@@ -119,6 +119,15 @@ verbatim in shape:
 Per-task spawn is explicitly rejected: it would pay cold-start per job, discard the job-stream +
 `maxParallelJobs` backpressure the SDK already implements, and duplicate the supervisor.
 
+> **Note (2026-08-04) — in-process hosting for now.** The `@nanobpm/urban` Node runtime
+> (jwulf/nano-ide) currently hosts connector workers **in-process** — they run inside the App
+> process via an ESM `module.register` hook that aliases `@nanobpm/worker` to an in-process shim,
+> not as supervised child processes. This diverges from the out-of-process supervision described
+> above and **gives up process isolation** (a connector fault can affect the App process). The
+> deliberate trade-off is **reduced memory use**: one process instead of N supervised children.
+> Revisit if isolation becomes necessary; the supervised out-of-process design in this section
+> remains the target for that case.
+
 ### 5. Project-enablement — the palette is the *enabled* set (amends ADR 0033 §2)
 
 ADR 0033 §2/increment 6 populates the palette directly from *every installed pack*. This ADR narrows
