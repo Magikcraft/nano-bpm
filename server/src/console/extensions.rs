@@ -1159,11 +1159,16 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
 /// installed **with its deps** (`install_deps: true`) the Studio's Urban
 /// toolchain lives at `<pack>/node_modules/.bin/{urban,create-urban-app}`.
 ///
-/// Unscoped so [`safe_pkg_dir`] maps it to the directory `nano-ide-app-urban`,
-/// which is exactly the dir the resolver in [`super::urban`] probes — keeping
-/// the install target and the lookup target the *same* path with no second
+/// Scoped `@nanobpm/` like every published pack (`nano-ide-app-workflow`,
+/// `nano-ide-app-embedded-nano`, …): the marketplace flags a pack **official**
+/// only when its name carries that scope (see [`is_official`]), and the whole
+/// `@nanobpm/nano-ide-{lang,app,example,…}-*` namespace is scoped. This settles
+/// ADR 0052 Q4 in line with the live registry. [`safe_pkg_dir`] maps it to the
+/// directory `nanobpm__nano-ide-app-urban`; both the installer here and the
+/// resolver in [`super::urban`] derive that dir from *this* constant, so the
+/// install target and the lookup target stay the *same* path with no second
 /// spelling to drift.
-pub const URBAN_PACK_PKG: &str = "nano-ide-app-urban";
+pub const URBAN_PACK_PKG: &str = "@nanobpm/nano-ide-app-urban";
 
 /// Public spelling of [`safe_pkg_dir`]: the on-disk install directory of a
 /// marketplace pack given its npm package name, or `None` for a name that fails
@@ -1754,7 +1759,8 @@ mod tests {
     fn urban_pack_pkg_maps_to_resolver_dir() {
         // The install target and the `urban` resolver's lookup target must be
         // the SAME directory, or a lazy install would never be found. The
-        // resolver (super::urban) probes `<extensions>/nano-ide-app-urban`, so
+        // scoped pack name maps through `safe_pkg_dir` (`@scope/name →
+        // scope__name`) to `<extensions>/nanobpm__nano-ide-app-urban`, so
         // pack_install_dir(URBAN_PACK_PKG) must end in that exact dir name.
         let _guard = ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!("nano-ext-urbanpkg-{}", std::process::id()));
@@ -1763,9 +1769,12 @@ mod tests {
         let dir = pack_install_dir(URBAN_PACK_PKG).expect("valid pack name");
         assert_eq!(
             dir.file_name().and_then(|s| s.to_str()),
-            Some("nano-ide-app-urban")
+            Some("nanobpm__nano-ide-app-urban")
         );
-        assert_eq!(dir, extensions_root().join("nano-ide-app-urban"));
+        assert_eq!(dir, extensions_root().join("nanobpm__nano-ide-app-urban"));
+        // The pack is first-party, so it must be flagged official in the
+        // marketplace — which keys off the `@nanobpm/` scope.
+        assert!(is_official(URBAN_PACK_PKG), "urban pack must be official");
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 
