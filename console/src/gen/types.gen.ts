@@ -843,6 +843,14 @@ export type ExtPkgRequest = {
     pkg: string;
 };
 
+export type UrbanToolkitStatus = {
+    /**
+     * Whether the `urban` CLI resolves after the ensure call (already present or freshly installed). False means the install ran but the binary still did not resolve.
+     *
+     */
+    available: boolean;
+};
+
 export type TrustRequest = {
     yolo?: boolean | null;
     approve?: string | null;
@@ -3064,6 +3072,31 @@ export type RemoveExtensionResponses = {
 };
 
 export type RemoveExtensionResponse = RemoveExtensionResponses[keyof RemoveExtensionResponses];
+
+export type InstallUrbanToolkitData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/urban/install';
+};
+
+export type InstallUrbanToolkitErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+};
+
+export type InstallUrbanToolkitError = InstallUrbanToolkitErrors[keyof InstallUrbanToolkitErrors];
+
+export type InstallUrbanToolkitResponses = {
+    /**
+     * Urban toolkit availability after ensuring installation
+     */
+    200: UrbanToolkitStatus;
+};
+
+export type InstallUrbanToolkitResponse = InstallUrbanToolkitResponses[keyof InstallUrbanToolkitResponses];
 
 export type TrustExtensionData = {
     body: TrustRequest;
