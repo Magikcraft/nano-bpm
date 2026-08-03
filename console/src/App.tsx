@@ -27,7 +27,7 @@ import { pickerJourneys } from "./lib/tour/picker";
 import StartupJourneyPanel from "./components/StartupJourneyPanel";
 import ChangelogPanel from "./components/ChangelogPanel";
 import type { ChangelogDoc } from "./lib/changelog";
-import { hasUnseenSince, normalizeVersion } from "./lib/changelog";
+import { hasUnseenSince, displayVersion } from "./lib/changelog";
 import { RouteErrorBoundary } from "./components/RouteErrorBoundary";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
@@ -481,9 +481,9 @@ export default function App() {
                   title="See what's new in Nano"
                   className="mt-1 flex items-center gap-1.5 rounded font-mono text-[10px] text-fg-faint outline-none transition-colors hover:text-fg focus-visible:ring-2 focus-visible:ring-accent"
                 >
-                  <span>
+                  <span title={serverVersion ?? undefined}>
                     {serverVersion
-                      ? `gateway v${normalizeVersion(serverVersion) ?? serverVersion}`
+                      ? `gateway v${displayVersion(serverVersion) ?? serverVersion}`
                       : "What's new"}
                   </span>
                   {serverVersion && (

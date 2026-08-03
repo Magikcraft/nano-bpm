@@ -75,6 +75,30 @@ export function normalizeVersion(v: string | null | undefined): string | null {
 }
 
 /**
+ * A short, friendly label for the running gateway version, for the sidebar
+ * chrome. The gateway is stamped with `git describe --tags --always --dirty`
+ * (server/build.rs), so a value can carry build metadata past its released
+ * `x.y.z` prefix. This collapses that to a legible tag while still flagging a
+ * non-release build so a local dev binary is distinguishable at a glance:
+ *   - `0.0.11`                      -> `0.0.11`        (clean tagged release)
+ *   - `0.0.11-3-g8b71af4-dirty`     -> `0.0.11-dirty`  (uncommitted changes)
+ *   - `0.0.11-3-g8b71af4`           -> `0.0.11-dev`    (commits past the tag)
+ *   - `0.0.11-rc.1`                 -> `0.0.11-rc.1`   (clean prerelease tag)
+ *   - `8b71af4` / `dev`             -> shown verbatim  (untagged fallback)
+ * The full, unabbreviated build id stays available on the Topology page and via
+ * `c8 nano status`.
+ */
+export function displayVersion(v: string | null | undefined): string | null {
+  if (!v) return null;
+  const raw = v.trim();
+  const bare = normalizeVersion(raw);
+  if (!bare) return raw; // non-semver (bare sha / "dev") — show verbatim
+  if (/-dirty$/.test(raw)) return `${bare}-dirty`; // dirty working tree
+  if (/-\d+-g[0-9a-f]+/.test(raw)) return `${bare}-dev`; // ahead of the tag
+  return raw.replace(/^v/, ""); // clean release (keeps prerelease suffixes)
+}
+
+/**
  * Is there a changelog entry newer than what the user last acknowledged?
  *
  * `lastSeen` is the bare version the user most recently opened the panel at

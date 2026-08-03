@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   compareVersions,
   normalizeVersion,
+  displayVersion,
   hasUnseenSince,
   UNRELEASED,
   type ChangelogDoc,
@@ -27,6 +28,24 @@ test("normalizeVersion extracts the released prefix", () => {
   assert.equal(normalizeVersion("0.0.11-3-gabc123"), "0.0.11");
   assert.equal(normalizeVersion(null), null);
   assert.equal(normalizeVersion("dev"), null);
+});
+
+test("displayVersion flags non-release builds", () => {
+  // Clean tagged release: shown bare.
+  assert.equal(displayVersion("0.0.11"), "0.0.11");
+  assert.equal(displayVersion("v0.0.11"), "0.0.11");
+  // Dirty working tree wins even when also ahead of the tag.
+  assert.equal(displayVersion("0.0.11-3-g8b71af4-dirty"), "0.0.11-dirty");
+  assert.equal(displayVersion("0.0.11-dirty"), "0.0.11-dirty");
+  // Commits past the tag, clean tree.
+  assert.equal(displayVersion("0.0.11-3-g8b71af4"), "0.0.11-dev");
+  // Clean prerelease tag keeps its suffix (not a dev build).
+  assert.equal(displayVersion("0.0.11-rc.1"), "0.0.11-rc.1");
+  assert.equal(displayVersion("v0.0.11-rc.1"), "0.0.11-rc.1");
+  // Untagged fallbacks (git describe --always / literal) shown verbatim.
+  assert.equal(displayVersion("8b71af4"), "8b71af4");
+  assert.equal(displayVersion("dev"), "dev");
+  assert.equal(displayVersion(null), null);
 });
 
 const docWith = (versions: string[]): ChangelogDoc => ({
