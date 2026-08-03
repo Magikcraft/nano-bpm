@@ -66,6 +66,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0051](0051-nano-workforce.md) | Nano Workforce: a durable agent-crew orchestrator as an Urban app | Proposed | 2026-07-31 |
 | [0052](0052-urban-runtime-decoupled-manifest-interpreter.md) | The Urban runtime: a decoupled manifest interpreter (`@nanobpm/urban-runtime`), a scaffolder, and interchangeable hosts | Proposed | 2026-07-31 |
 | [0056](0056-agent-relay-command-stream-plane.md) | The agent relay: a durable command-stream plane for observing and steering agent-workers | Proposed | 2026-08-04 |
+| [0057](0057-console-app-view-embedded-urban-apps.md) | Console App View: mounting bespoke Urban app UIs (iframe-sandboxed) | Proposed | 2026-08-04 |
 
 ## Reading paths
 
