@@ -62,7 +62,7 @@ jobs:
         working-directory: console
         run: |
           npm ci
-          node scripts/build-docs.mjs
+          DOCS_SITE_BUILD=1 node scripts/build-docs.mjs
       - name: Build site
         run: node website/build.mjs
       - uses: actions/upload-pages-artifact@v3
