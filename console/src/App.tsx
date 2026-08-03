@@ -1,6 +1,7 @@
 import {
   lazy,
   Suspense,
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -141,6 +142,9 @@ const icons = {
       <path d="M8 21h8M12 17v4" />
     </Icon>
   ),
+  // Chevrons-left: points left to "collapse"; rotated 180° to point right for
+  // "expand" when the rail is already collapsed.
+  collapse: <Icon d="M11 17l-5-5 5-5M18 17l-5-5 5-5" />,
 } as const;
 
 const navItems: {
@@ -149,7 +153,7 @@ const navItems: {
   icon: ReactNode;
   studio?: boolean;
 }[] = [
-  { to: "/projects", label: "Projects", icon: icons.projects, studio: true },
+  { to: "/projects", label: "Studio", icon: icons.projects, studio: true },
   {
     to: "/extensions",
     label: "Extensions",
@@ -163,12 +167,14 @@ const navItems: {
   { to: "/workers", label: "Workers", icon: icons.workers },
 ].filter((i) => IS_STUDIO || !i.studio);
 
-// Where "home" lands: the maker starts in Projects; the operator ("observe"
-// build, no Projects route) starts on Topology.
+// Where "home" lands: the maker starts in Studio; the operator ("observe"
+// build, no Studio route) starts on Topology.
 const HOME_ROUTE = IS_STUDIO ? "/projects" : "/topology";
 
-function railItemClass(active: boolean): string {
-  return `relative flex items-center gap-2.5 rounded-md px-3 py-2 text-sm no-underline transition-colors ${
+function railItemClass(active: boolean, collapsed = false): string {
+  return `relative flex items-center ${
+    collapsed ? "justify-center px-2" : "gap-2.5 px-3"
+  } rounded-md py-2 text-sm no-underline transition-colors ${
     active
       ? "bg-accent/10 font-medium text-accent-strong"
       : "text-fg-muted hover:bg-hover hover:text-fg"
@@ -185,7 +191,7 @@ function ActiveBar({ show }: { show: boolean }) {
 
 /** Sidebar segmented control cycling the appearance: light / dark / system.
  * Theme packs and imports are picked in Config → Appearance. */
-function ThemeToggle() {
+function ThemeToggle({ collapsed = false }: { collapsed?: boolean }) {
   const { selection, select } = useTheme();
   const modes = [
     { mode: "light", icon: icons.sun, title: "Light" },
@@ -193,7 +199,11 @@ function ThemeToggle() {
     { mode: "system", icon: icons.system, title: "Follow system" },
   ] as const;
   return (
-    <div className="mx-3 mb-3 flex rounded-lg border border-edge bg-inset p-0.5">
+    <div
+      className={`mb-3 flex rounded-lg border border-edge bg-inset p-0.5 ${
+        collapsed ? "mx-2 flex-col gap-0.5" : "mx-3"
+      }`}
+    >
       {modes.map((m) => {
         const active = selection.mode === m.mode;
         return (
@@ -271,8 +281,8 @@ export default function App() {
     }, STARTUP_PANEL_DELAY_MS);
     return () => window.clearTimeout(id);
   }, [tour.showStartupPanel, isRunning, activeJourney]);
-  // Remember the last place the user was within the Projects section (the
-  // project list or a specific workspace) so the rail's "Projects" item returns
+  // Remember the last place the user was within the Studio section (the
+  // project list or a specific workspace) so the rail's "Studio" item returns
   // them there after a detour through Metrics/Traces/etc. — instead of always
   // dropping back at the root list.
   const projectsRoute = useRef(
@@ -284,6 +294,20 @@ export default function App() {
       localStorage.setItem("nano.projectsRoute", location.pathname);
     }
   }, [location.pathname]);
+
+  // Collapsible left rail (#511). Persist the collapsed/expanded choice in
+  // localStorage — same convention as `nano.projectsRoute` above — so it
+  // survives reloads.
+  const [railCollapsed, setRailCollapsed] = useState<boolean>(
+    () => localStorage.getItem("nano.railCollapsed") === "1",
+  );
+  const toggleRail = useCallback(() => {
+    setRailCollapsed((prev) => {
+      const next = !prev;
+      localStorage.setItem("nano.railCollapsed", next ? "1" : "0");
+      return next;
+    });
+  }, []);
 
   // The running gateway's version, shown in the sidebar chrome so it's visible
   // on every page — useful when bouncing between dev builds and staged releases
@@ -365,32 +389,50 @@ export default function App() {
   return (
     <TourContext.Provider value={tour}>
       <div className="flex h-full bg-app text-fg">
-        <aside className="flex w-56 shrink-0 flex-col border-r border-edge bg-panel">
-          <div className="px-5 py-4">
-            <a href="/" className="block no-underline">
-              <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-lg font-bold tracking-tight text-transparent">
-                nano BPM
-              </div>
-              <div className="text-xs text-fg-faint">single-node console</div>
-              {serverVersion && (
-                <div
-                  className="mt-1 font-mono text-[10px] text-fg-faint"
-                  title="Version of the running gateway (from /console/api/topology)"
-                >
-                  gateway v{serverVersion}
+        <aside
+          className={`flex shrink-0 flex-col border-r border-edge bg-panel transition-[width] duration-150 ${
+            railCollapsed ? "w-14" : "w-56"
+          }`}
+        >
+          <div className={railCollapsed ? "px-2 py-4" : "px-5 py-4"}>
+            <a
+              href="/"
+              className="block no-underline"
+              title="nano BPM — single-node console"
+            >
+              {railCollapsed ? (
+                <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-center text-xl font-bold tracking-tight text-transparent">
+                  n
                 </div>
+              ) : (
+                <>
+                  <div className="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-lg font-bold tracking-tight text-transparent">
+                    nano BPM
+                  </div>
+                  <div className="text-xs text-fg-faint">
+                    single-node console
+                  </div>
+                  {serverVersion && (
+                    <div
+                      className="mt-1 font-mono text-[10px] text-fg-faint"
+                      title="Version of the running gateway (from /console/api/topology)"
+                    >
+                      gateway v{serverVersion}
+                    </div>
+                  )}
+                  <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
+                    Advanced Research Prototype
+                  </div>
+                  <div className="mt-1.5 text-[10px] text-fg-faint">
+                    Free for evaluation use
+                  </div>
+                </>
               )}
-              <div className="mt-2 inline-block rounded-full border border-accent/40 bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent-strong">
-                Advanced Research Prototype
-              </div>
-              <div className="mt-1.5 text-[10px] text-fg-faint">
-                Free for evaluation use
-              </div>
             </a>
           </div>
           <nav className="flex flex-col gap-1 px-3">
             {navItems.map((item) => {
-              // The Projects item is special: it links back to wherever the user
+              // The Studio item is special: it links back to wherever the user
               // last was in that section and stays highlighted across all
               // /projects/* routes.
               const isProjects = item.to === "/projects";
@@ -403,14 +445,19 @@ export default function App() {
                   key={item.to}
                   to={to}
                   data-tour={navAnchor(item.to)}
-                  className={railItemClass(active)}
+                  className={railItemClass(active, railCollapsed)}
+                  title={railCollapsed ? item.label : undefined}
                 >
                   <ActiveBar show={active} />
                   {item.icon}
-                  {item.label}
+                  {!railCollapsed && item.label}
                   {item.to === "/extensions" && updateCount > 0 && (
                     <span
-                      className="ml-auto inline-flex min-w-[18px] items-center justify-center rounded-full bg-danger px-1.5 text-[10px] font-bold leading-none text-white"
+                      className={`inline-flex min-w-[18px] items-center justify-center rounded-full bg-danger px-1.5 text-[10px] font-bold leading-none text-white ${
+                        railCollapsed
+                          ? "absolute -right-0.5 -top-0.5"
+                          : "ml-auto"
+                      }`}
                       style={{ height: "18px" }}
                       title={`${updateCount} extension update${updateCount === 1 ? "" : "s"} available`}
                       aria-label={`${updateCount} extension updates available`}
@@ -427,7 +474,7 @@ export default function App() {
             type="button"
             onClick={canResume ? resumeJourney : startTour}
             data-tour={TOUR_ANCHOR.takeATour}
-            className={`mt-auto mx-3 ${railItemClass(false)}`}
+            className={`mt-auto mx-3 ${railItemClass(false, railCollapsed)}`}
             title={
               canResume
                 ? `Pick up “${activeJourney.title}” where you left off`
@@ -439,59 +486,75 @@ export default function App() {
               <path d="M9.1 9a3 3 0 1 1 4.3 3.2c-.8.5-1.4 1-1.4 1.9" />
               <path d="M12 17h.01" />
             </Icon>
-            {canResume ? "Resume tour" : "Take a tour"}
+            {!railCollapsed && (canResume ? "Resume tour" : "Take a tour")}
           </button>
 
           <a
             href="https://github.com/jwulf/nano-ide/issues/new/choose"
             target="_blank"
             rel="noopener noreferrer"
-            className={`mx-3 ${railItemClass(false)}`}
+            className={`mx-3 ${railItemClass(false, railCollapsed)}`}
             title="Send feedback or report an issue"
           >
             {icons.feedback}
-            Feedback
+            {!railCollapsed && "Feedback"}
           </a>
 
           <a
             href="/docs"
-            className={`mx-3 ${railItemClass(false)}`}
+            className={`mx-3 ${railItemClass(false, railCollapsed)}`}
             title="Documentation"
           >
             {icons.docs}
-            Documentation
+            {!railCollapsed && "Documentation"}
           </a>
 
           <a
             href="/whitepaper"
-            className={`mx-3 ${railItemClass(false)}`}
+            className={`mx-3 ${railItemClass(false, railCollapsed)}`}
             title="Whitepaper"
           >
             {icons.whitepaper}
-            Whitepaper
+            {!railCollapsed && "Whitepaper"}
           </a>
 
           <NavLink
             to="/credits"
-            className={`mx-3 ${railItemClass(location.pathname.startsWith("/credits"))}`}
+            className={`mx-3 ${railItemClass(location.pathname.startsWith("/credits"), railCollapsed)}`}
             title="Credits"
           >
             <ActiveBar show={location.pathname.startsWith("/credits")} />
             {icons.credits}
-            Credits
+            {!railCollapsed && "Credits"}
           </NavLink>
 
           <NavLink
             to="/config"
-            className={`mx-3 mb-3 ${railItemClass(location.pathname.startsWith("/config"))}`}
+            className={`mx-3 mb-3 ${railItemClass(location.pathname.startsWith("/config"), railCollapsed)}`}
             title="Configuration"
           >
             <ActiveBar show={location.pathname.startsWith("/config")} />
             {icons.config}
-            Config
+            {!railCollapsed && "Config"}
           </NavLink>
 
-          <ThemeToggle />
+          <button
+            type="button"
+            onClick={toggleRail}
+            className={`mx-3 mb-1 ${railItemClass(false, railCollapsed)}`}
+            title={railCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            aria-label={railCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            aria-pressed={railCollapsed}
+          >
+            <span
+              className={`inline-flex ${railCollapsed ? "rotate-180" : ""}`}
+            >
+              {icons.collapse}
+            </span>
+            {!railCollapsed && "Collapse"}
+          </button>
+
+          <ThemeToggle collapsed={railCollapsed} />
         </aside>
 
         <main className="min-w-0 flex-1 overflow-auto">
