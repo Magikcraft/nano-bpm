@@ -27,7 +27,7 @@ import { pickerJourneys } from "./lib/tour/picker";
 import StartupJourneyPanel from "./components/StartupJourneyPanel";
 import ChangelogPanel from "./components/ChangelogPanel";
 import type { ChangelogDoc } from "./lib/changelog";
-import { hasUnseenSince, displayVersion } from "./lib/changelog";
+import { hasUnseenSince, gatewayLabel } from "./lib/changelog";
 import { RouteErrorBoundary } from "./components/RouteErrorBoundary";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
@@ -483,7 +483,7 @@ export default function App() {
                 >
                   <span title={serverVersion ?? undefined}>
                     {serverVersion
-                      ? `gateway v${displayVersion(serverVersion) ?? serverVersion}`
+                      ? `gateway ${gatewayLabel(serverVersion) ?? serverVersion}`
                       : "What's new"}
                   </span>
                   {serverVersion && (
