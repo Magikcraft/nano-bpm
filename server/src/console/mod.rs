@@ -3182,9 +3182,13 @@ fn sql_is_ddl(sql: &str) -> bool {
     s.starts_with("CREATE ") || s.starts_with("ALTER ") || s.starts_with("DROP ")
 }
 
-/// Best-effort regeneration of `nano-generated/domain-rows.d.ts` from the default
-/// datasource's live schema (ADR 0029 §4.1/§6), so typed workers track the DB
-/// after a structural change. Failure is logged, never surfaced — the maker's
+/// Best-effort regeneration of a project's derived type artifacts after a
+/// structural change, so typed workers track the current shape (ADR 0029 §4.1/§6).
+/// The path depends on the project shape: an **Urban-shaped app** (`nano.app.json`)
+/// delegates to `urban gen` (which derives the full `nano-generated/*` artifact set
+/// from the manifest, #514 dry-out) when `urban` is available; a legacy-shaped
+/// project regenerates `domain-rows.d.ts` from the default datasource's live schema
+/// via the embedded emitter. Failure is logged, never surfaced — the maker's
 /// operation already succeeded and the types are an authoring-time contract only.
 async fn regenerate_domain_types(name: &str) {
     // #514 dry-out: an Urban-shaped app (`nano.app.json`) delegates artifact

@@ -2903,6 +2903,12 @@ async fn gen_with_urban(name: &str, urban: &Path) -> Result<(), String> {
     let output = Command::new(urban)
         .current_dir(&dir)
         .arg("gen")
+        // Mirror `run_data_op`'s subprocess hygiene: `NO_COLOR` keeps ANSI escapes
+        // out of captured stderr/stdout (so the error detail is clean), and
+        // `kill_on_drop` reaps the child if this task is cancelled (shutdown,
+        // timeout) rather than leaking an orphaned `urban` process.
+        .env("NO_COLOR", "1")
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|e| format!("spawn urban: {e}"))?;
