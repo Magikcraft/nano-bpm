@@ -119,14 +119,14 @@ The clustering and tuning variables are covered in
 
 Open `http://127.0.0.1:8080/console`. The console is a single-page app whose
 navigation depends on the build **profile**: the **Studio** (authoring) profile
-adds the **Projects** and **Extensions** tabs, while the **Observe** (operator)
+adds the **Studio** and **Extensions** tabs, while the **Observe** (operator)
 profile shows only the runtime tabs below. The root `/` is a small landing page,
 and `/swagger` is an **offline** Swagger UI for the REST API (nothing is fetched
 from the internet).
 
 | Tab | Profile | What it's for |
 |---|---|---|
-| **Projects** | Studio | The Rapid Application Development IDE. Open a project and author BPMN models, DMN decisions, forms, and pages; **deploy**, **start** instances, and **test** a model in your browser. See [Model and test a process](#model-and-test-a-process). |
+| **Studio** | Studio | **Nano Studio** — the Rapid Application Development IDE. Open a project and author BPMN models, DMN decisions, forms, and pages; **deploy**, **start** instances, and **test** a model in your browser. See [Model and test a process](#model-and-test-a-process). |
 | **Extensions** | Studio | Install extension packs — agentic SDLC, languages, app templates, example apps, triggers, and themes. |
 | **Topology** | both | Cluster, partition, and Raft overview with **live per-node health** — each node is probed every few seconds for reachability, version, and round-trip latency. |
 | **Metrics** | both | A live performance dashboard — process starts/s, jobs/s, active processes, connected clients, commit-pipeline depth, journal/fsync timings, memory — with sparklines, and a per-node breakdown in a cluster. |
@@ -139,9 +139,9 @@ the navigation rail.)
 
 ## Model and test a process
 
-Models are authored inside a **project** in the **Projects** tab. To get started:
+Models are authored inside a **project** in the **Studio** tab. To get started:
 
-1. Open the **Projects** tab and **create or open a project** (use **New project**
+1. Open the **Studio** tab and **create or open a project** (use **New project**
    to scaffold one from a template).
 2. In the project workspace, use **New file → Model** to create a `.bpmn` file (or
    open an existing one under `resources/processes/`). DMN decisions, forms, and
