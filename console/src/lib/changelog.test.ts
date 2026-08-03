@@ -42,8 +42,15 @@ test("displayVersion flags non-release builds", () => {
   // Clean prerelease tag keeps its suffix (not a dev build).
   assert.equal(displayVersion("0.0.11-rc.1"), "0.0.11-rc.1");
   assert.equal(displayVersion("v0.0.11-rc.1"), "0.0.11-rc.1");
+  // git describe measured from a prerelease tag keeps the -rc.1 context.
+  assert.equal(displayVersion("0.0.11-rc.1-3-g8b71af4"), "0.0.11-rc.1-dev");
+  assert.equal(
+    displayVersion("0.0.11-rc.1-3-g8b71af4-dirty"),
+    "0.0.11-rc.1-dirty",
+  );
   // Untagged fallbacks (git describe --always / literal) shown verbatim.
   assert.equal(displayVersion("8b71af4"), "8b71af4");
+  assert.equal(displayVersion("8b71af4-dirty"), "8b71af4-dirty");
   assert.equal(displayVersion("dev"), "dev");
   assert.equal(displayVersion(null), null);
 });

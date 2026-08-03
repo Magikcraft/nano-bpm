@@ -77,25 +77,42 @@ export function normalizeVersion(v: string | null | undefined): string | null {
 /**
  * A short, friendly label for the running gateway version, for the sidebar
  * chrome. The gateway is stamped with `git describe --tags --always --dirty`
- * (server/build.rs), so a value can carry build metadata past its released
- * `x.y.z` prefix. This collapses that to a legible tag while still flagging a
- * non-release build so a local dev binary is distinguishable at a glance:
- *   - `0.0.11`                      -> `0.0.11`        (clean tagged release)
- *   - `0.0.11-3-g8b71af4-dirty`     -> `0.0.11-dirty`  (uncommitted changes)
- *   - `0.0.11-3-g8b71af4`           -> `0.0.11-dev`    (commits past the tag)
- *   - `0.0.11-rc.1`                 -> `0.0.11-rc.1`   (clean prerelease tag)
- *   - `8b71af4` / `dev`             -> shown verbatim  (untagged fallback)
+ * (server/build.rs), so a value can carry build metadata past its tag. This
+ * strips only the git-describe suffix (the `-<n>-g<sha>` distance and a `-dirty`
+ * marker) — keeping the FULL tag, including any prerelease — and appends a
+ * build-state hint so a non-release binary is distinguishable at a glance:
+ *   - `0.0.11`                       -> `0.0.11`         (clean tagged release)
+ *   - `0.0.11-rc.1`                  -> `0.0.11-rc.1`    (clean prerelease tag)
+ *   - `0.0.11-3-g8b71af4`            -> `0.0.11-dev`     (commits past the tag)
+ *   - `0.0.11-3-g8b71af4-dirty`      -> `0.0.11-dirty`   (uncommitted changes)
+ *   - `0.0.11-rc.1-3-g8b71af4`       -> `0.0.11-rc.1-dev`
+ *   - `0.0.11-rc.1-3-g8b71af4-dirty` -> `0.0.11-rc.1-dirty`
+ *   - `8b71af4` / `dev`              -> shown verbatim   (untagged fallback)
  * The full, unabbreviated build id stays available on the Topology page and via
  * `c8 nano status`.
  */
 export function displayVersion(v: string | null | undefined): string | null {
   if (!v) return null;
-  const raw = v.trim();
-  const bare = normalizeVersion(raw);
-  if (!bare) return raw; // non-semver (bare sha / "dev") — show verbatim
-  if (/-dirty$/.test(raw)) return `${bare}-dirty`; // dirty working tree
-  if (/-\d+-g[0-9a-f]+/.test(raw)) return `${bare}-dev`; // ahead of the tag
-  return raw.replace(/^v/, ""); // clean release (keeps prerelease suffixes)
+  let tag = v.trim().replace(/^v/, "");
+  let dirty = false;
+  if (tag.endsWith("-dirty")) {
+    dirty = true;
+    tag = tag.slice(0, -"-dirty".length);
+  }
+  // Strip a trailing git-describe distance + abbreviated hash ("-<n>-g<sha>"),
+  // leaving the tag it was measured from (which may carry a prerelease suffix).
+  let ahead = false;
+  const m = tag.match(/^(.*)-\d+-g[0-9a-f]+$/);
+  if (m) {
+    ahead = true;
+    tag = m[1];
+  }
+  // Only treat a semver-shaped remainder as a version tag; a bare sha or literal
+  // fallback (git describe --always with no tags) is shown verbatim.
+  const isSemverTag = /^\d+\.\d+\.\d+(?:[-+].*)?$/.test(tag);
+  if (dirty) return `${tag}-dirty`;
+  if (ahead && isSemverTag) return `${tag}-dev`;
+  return tag;
 }
 
 /**
