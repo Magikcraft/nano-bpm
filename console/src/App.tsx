@@ -343,9 +343,9 @@ export default function App() {
   const closeChangelog = () => {
     setChangelogOpen(false);
     // Closing acknowledges the newest version, clearing the dot. Persist on
-    // close (not open) so opening before changelog.json has loaded still marks
-    // the release seen once it arrives, and update state so the dot clears
-    // without a reload.
+    // close (not open) so an open that happened before changelog.json finished
+    // loading still records the release once its data is present at close time,
+    // and update state so the dot clears without a reload.
     const newest = changelog?.versions[0]?.version;
     if (newest) {
       localStorage.setItem("nano.changelog.lastSeen", newest);
