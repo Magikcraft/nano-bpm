@@ -75,6 +75,51 @@ export function normalizeVersion(v: string | null | undefined): string | null {
 }
 
 /**
+ * A short, friendly label for the running gateway version, for the sidebar
+ * chrome. The gateway is stamped with `git describe --tags --always --dirty`
+ * (server/build.rs), so a value can carry build metadata past its tag. This
+ * strips only the git-describe suffix (the `-<n>-g<sha>` distance and a `-dirty`
+ * marker) off a semver-shaped tag — keeping the FULL tag, including any
+ * prerelease — and appends a build-state hint so a non-release binary is
+ * distinguishable at a glance:
+ *   - `0.0.11`                       -> `0.0.11`         (clean tagged release)
+ *   - `0.0.11-rc.1`                  -> `0.0.11-rc.1`    (clean prerelease tag)
+ *   - `0.0.11-3-g8b71af4`            -> `0.0.11-dev`     (commits past the tag)
+ *   - `0.0.11-3-g8b71af4-dirty`      -> `0.0.11-dirty`   (uncommitted changes)
+ *   - `0.0.11-rc.1-3-g8b71af4`       -> `0.0.11-rc.1-dev`
+ *   - `0.0.11-rc.1-3-g8b71af4-dirty` -> `0.0.11-rc.1-dirty`
+ *   - `8b71af4` / `dev` / `dev-3-g…` -> shown verbatim   (untagged fallback)
+ * A dirty marker on a non-semver base still appends `-dirty`. The full,
+ * unabbreviated build id stays available on the Topology page and via
+ * `c8 nano status`.
+ */
+export function displayVersion(v: string | null | undefined): string | null {
+  if (!v) return null;
+  let tag = v.trim().replace(/^v/, "");
+  let dirty = false;
+  if (tag.endsWith("-dirty")) {
+    dirty = true;
+    tag = tag.slice(0, -"-dirty".length);
+  }
+  // A semver tag optionally measured N commits ahead by git describe. The
+  // describe suffix is only stripped when the base is semver-shaped, so a
+  // non-semver tag (e.g. `dev-3-gabc123`) is left verbatim rather than mangled.
+  const ahead = tag.match(/^(\d+\.\d+\.\d+(?:[-+].*?)?)-\d+-g[0-9a-f]+$/);
+  if (ahead) return dirty ? `${ahead[1]}-dirty` : `${ahead[1]}-dev`;
+  return dirty ? `${tag}-dirty` : tag;
+}
+
+/**
+ * The sidebar's gateway label, prefixing `v` only for a semver-shaped version so
+ * an untagged fallback (a bare commit sha / literal) does not read as `v8b71af4`.
+ */
+export function gatewayLabel(v: string | null | undefined): string | null {
+  const d = displayVersion(v);
+  if (!d) return null;
+  return /^\d+\.\d+\.\d+/.test(d) ? `v${d}` : d;
+}
+
+/**
  * Is there a changelog entry newer than what the user last acknowledged?
  *
  * `lastSeen` is the bare version the user most recently opened the panel at

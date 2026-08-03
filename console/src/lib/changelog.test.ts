@@ -3,6 +3,8 @@ import assert from "node:assert/strict";
 import {
   compareVersions,
   normalizeVersion,
+  displayVersion,
+  gatewayLabel,
   hasUnseenSince,
   UNRELEASED,
   type ChangelogDoc,
@@ -27,6 +29,43 @@ test("normalizeVersion extracts the released prefix", () => {
   assert.equal(normalizeVersion("0.0.11-3-gabc123"), "0.0.11");
   assert.equal(normalizeVersion(null), null);
   assert.equal(normalizeVersion("dev"), null);
+});
+
+test("displayVersion flags non-release builds", () => {
+  // Clean tagged release: shown bare.
+  assert.equal(displayVersion("0.0.11"), "0.0.11");
+  assert.equal(displayVersion("v0.0.11"), "0.0.11");
+  // Dirty working tree wins even when also ahead of the tag.
+  assert.equal(displayVersion("0.0.11-3-g8b71af4-dirty"), "0.0.11-dirty");
+  assert.equal(displayVersion("0.0.11-dirty"), "0.0.11-dirty");
+  // Commits past the tag, clean tree.
+  assert.equal(displayVersion("0.0.11-3-g8b71af4"), "0.0.11-dev");
+  // Clean prerelease tag keeps its suffix (not a dev build).
+  assert.equal(displayVersion("0.0.11-rc.1"), "0.0.11-rc.1");
+  assert.equal(displayVersion("v0.0.11-rc.1"), "0.0.11-rc.1");
+  // git describe measured from a prerelease tag keeps the -rc.1 context.
+  assert.equal(displayVersion("0.0.11-rc.1-3-g8b71af4"), "0.0.11-rc.1-dev");
+  assert.equal(
+    displayVersion("0.0.11-rc.1-3-g8b71af4-dirty"),
+    "0.0.11-rc.1-dirty",
+  );
+  // Untagged fallbacks (git describe --always / literal) shown verbatim.
+  assert.equal(displayVersion("8b71af4"), "8b71af4");
+  assert.equal(displayVersion("8b71af4-dirty"), "8b71af4-dirty");
+  assert.equal(displayVersion("dev"), "dev");
+  // A non-semver base is NOT mangled by the describe-suffix strip.
+  assert.equal(displayVersion("dev-3-gabc123"), "dev-3-gabc123");
+  assert.equal(displayVersion(null), null);
+});
+
+test("gatewayLabel prefixes v only for semver versions", () => {
+  assert.equal(gatewayLabel("0.0.11"), "v0.0.11");
+  assert.equal(gatewayLabel("0.0.11-3-g8b71af4-dirty"), "v0.0.11-dirty");
+  assert.equal(gatewayLabel("0.0.11-rc.1-3-g8b71af4"), "v0.0.11-rc.1-dev");
+  // No stray `v` on a bare sha / literal identifier.
+  assert.equal(gatewayLabel("8b71af4"), "8b71af4");
+  assert.equal(gatewayLabel("dev"), "dev");
+  assert.equal(gatewayLabel(null), null);
 });
 
 const docWith = (versions: string[]): ChangelogDoc => ({
