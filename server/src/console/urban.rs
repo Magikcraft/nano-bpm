@@ -27,39 +27,65 @@
 //! elsewhere — extend this one.
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Name of the `urban` executable, platform-adjusted (npm installs a `.cmd`
 /// shim on Windows).
 const URBAN_EXE: &str = if cfg!(windows) { "urban.cmd" } else { "urban" };
 
+/// Install directory name of the first-party Urban marketplace App pack under
+/// [`super::extensions::extensions_root`]. The `urban` CLI is a dependency of
+/// this pack, so once it (and its `node_modules`) are installed the binary
+/// lives at `<pack>/node_modules/.bin/urban` — see [`pack_urban_bin`].
+const URBAN_PACK_DIR: &str = "nano-ide-app-urban";
+
+/// The pack-relative `urban` binary path: `<extensions>/nano-ide-app-urban/
+/// node_modules/.bin/urban`. This is the Studio-managed acquisition path — the
+/// pack is lazy-installed on first Urban use (#520) — and is preferred over an
+/// ambient `PATH` install so a Studio-pinned `urban` wins. Returns the
+/// candidate path unconditionally (existence is checked by [`resolve_urban`]).
+fn pack_urban_bin() -> PathBuf {
+    super::extensions::extensions_root()
+        .join(URBAN_PACK_DIR)
+        .join("node_modules")
+        .join(".bin")
+        .join(URBAN_EXE)
+}
+
 /// Locates the `urban` CLI binary, mirroring [`super::workers::find_deno`].
-/// Today the resolution order is `NANOBPMN_URBAN_BIN` (explicit override) →
-/// `PATH`; a reserved `#520` seam sits between them where the marketplace-pack
-/// bin lookup will slot in, making the eventual order `env → pack → PATH`.
+/// The resolution order is `NANOBPMN_URBAN_BIN` (explicit override) → the
+/// first-party marketplace pack ([`pack_urban_bin`]) → `PATH`.
 ///
 /// Returns `None` when no binary is found; callers then report
 /// `urbanAvailable: false` so the Studio can prompt the user to install the
 /// pack. The order is deliberate (agreed on #520/#522): an explicit override
-/// always wins, the first-party pack (once #520 lands) is preferred over an
-/// ambient `PATH` install, and there is no `npx` fallback — the pack is the
-/// real-machine acquisition path.
+/// always wins, the first-party pack is preferred over an ambient `PATH`
+/// install so a Studio-pinned `urban` wins, and there is no `npx` fallback —
+/// the pack is the real-machine acquisition path.
 ///
 /// The actual matching is delegated to the pure [`resolve_urban`] so it can be
 /// unit-tested without mutating the global process environment (which is UB
 /// under parallel `cargo test`).
 pub(crate) fn find_urban() -> Option<PathBuf> {
     let bin_override = std::env::var("NANOBPMN_URBAN_BIN").ok();
+    let pack = pack_urban_bin();
     let path = std::env::var_os("PATH");
-    resolve_urban(bin_override.as_deref(), path.as_deref())
+    resolve_urban(
+        bin_override.as_deref(),
+        Some(pack.as_path()),
+        path.as_deref(),
+    )
 }
 
-/// Pure core of [`find_urban`]: given the `NANOBPMN_URBAN_BIN` override and the
-/// `PATH` value, applies the current `env → PATH` resolution (the `#520` pack
-/// lookup slots in at the marked seam to make it `env → pack → PATH`). Kept
-/// free of any global-env reads so it is deterministic and testable in
-/// parallel.
-fn resolve_urban(bin_override: Option<&str>, path: Option<&OsStr>) -> Option<PathBuf> {
+/// Pure core of [`find_urban`]: given the `NANOBPMN_URBAN_BIN` override, the
+/// marketplace-pack bin candidate, and the `PATH` value, applies the
+/// `env → pack → PATH` resolution. Kept free of any global-env reads so it is
+/// deterministic and testable in parallel.
+fn resolve_urban(
+    bin_override: Option<&str>,
+    pack_bin: Option<&Path>,
+    path: Option<&OsStr>,
+) -> Option<PathBuf> {
     if let Some(p) = bin_override
         && !p.is_empty()
     {
@@ -68,8 +94,13 @@ fn resolve_urban(bin_override: Option<&str>, path: Option<&OsStr>) -> Option<Pat
             return Some(pb);
         }
     }
-    // #520 seam: resolve `<workspace>/extensions/<pkg>/node_modules/.bin/urban`
-    // here, before falling through to PATH. Owned by #520.
+    // #520 seam: the marketplace pack's `<pack>/node_modules/.bin/urban`, tried
+    // before `PATH` so a Studio-pinned pack install wins over an ambient one.
+    if let Some(pack) = pack_bin
+        && pack.is_file()
+    {
+        return Some(pack.to_path_buf());
+    }
     if let Some(path) = path {
         for dir in std::env::split_paths(path) {
             let cand = dir.join(URBAN_EXE);
@@ -102,21 +133,51 @@ mod tests {
         let fake = dir.join(URBAN_EXE);
         std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
 
-        // Override wins outright, without consulting PATH.
+        // Override wins outright, without consulting the pack or PATH.
         assert_eq!(
-            resolve_urban(Some(fake.to_str().unwrap()), None),
+            resolve_urban(Some(fake.to_str().unwrap()), None, None),
             Some(fake.clone())
         );
-        // A bogus override falls through (here: to an empty PATH → None), and
-        // never returns the bogus path itself.
+        // A bogus override falls through (here: to an empty pack/PATH → None),
+        // and never returns the bogus path itself.
         assert_eq!(
-            resolve_urban(Some("/nonexistent/definitely/not/urban"), None),
+            resolve_urban(Some("/nonexistent/definitely/not/urban"), None, None),
             None
         );
         // An empty override is treated as unset.
-        assert_eq!(resolve_urban(Some(""), None), None);
+        assert_eq!(resolve_urban(Some(""), None, None), None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resolve_urban_prefers_pack_over_path() {
+        // With no override, an installed pack bin is preferred over a PATH hit,
+        // and a non-existent pack candidate is skipped in favour of PATH.
+        let base = std::env::temp_dir().join(format!("nbpm-urban-pack-{}", std::process::id()));
+        let pack_dir = base.join("pack");
+        let path_dir = base.join("path");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let pack_bin = pack_dir.join(URBAN_EXE);
+        let path_bin = path_dir.join(URBAN_EXE);
+        std::fs::write(&pack_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&path_bin, b"#!/bin/sh\n").unwrap();
+        let path = std::env::join_paths([path_dir.as_os_str()]).unwrap();
+
+        // Pack present → pack wins over PATH.
+        assert_eq!(
+            resolve_urban(None, Some(pack_bin.as_path()), Some(path.as_os_str())),
+            Some(pack_bin.clone())
+        );
+        // Pack candidate does not exist → fall through to PATH.
+        let missing_pack = pack_dir.join("does-not-exist").join(URBAN_EXE);
+        assert_eq!(
+            resolve_urban(None, Some(missing_pack.as_path()), Some(path.as_os_str())),
+            Some(path_bin)
+        );
+
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -128,9 +189,9 @@ mod tests {
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
 
         let path = std::env::join_paths([dir.as_os_str()]).unwrap();
-        assert_eq!(resolve_urban(None, Some(path.as_os_str())), Some(bin));
-        // Nothing on PATH, no override → not available.
-        assert_eq!(resolve_urban(None, None), None);
+        assert_eq!(resolve_urban(None, None, Some(path.as_os_str())), Some(bin));
+        // Nothing on PATH, no override, no pack → not available.
+        assert_eq!(resolve_urban(None, None, None), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }
