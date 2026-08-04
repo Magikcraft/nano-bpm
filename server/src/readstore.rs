@@ -2407,7 +2407,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // `process_instance_result` when no definition is on record). With
             // every version retained, pick the latest deployed so far — during an
             // ordered replay only versions deployed before this create are on
-            // record, so MAX(version) is the version the instance was created on.
+            // record, so the highest version (ORDER BY version DESC LIMIT 1) is the version the
+            // instance was created on.
             let (def_key, version): (String, i32) = tx
                 .query_row(
                     "SELECT key, version FROM process_definitions WHERE process_id = ?1 \
