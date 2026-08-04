@@ -1455,6 +1455,65 @@ fn heal_package_json_npm_deps(dir: &Path) -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// Names declared under `dependencies` in the project's `package.json` that are
+/// not yet materialised in `node_modules`. These are the real npm packages the
+/// Node run path resolves as **bare** specifiers (e.g. `@nanobpm/urban`, an Urban
+/// app's toolkit); a host-scaffolded app's relative/`@lib` aliases live in the
+/// import map, not here, so they are correctly ignored.
+///
+/// Empty when there is no `package.json`, it declares no `dependencies`, or every
+/// declared dep is already present — so a healthy app, a Deno-fetched project, or
+/// a non-Node pack (Rust/Java: no `package.json` deps) is a no-op.
+fn missing_node_modules(dir: &Path) -> Vec<String> {
+    let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) else {
+        return Vec::new();
+    };
+    let Ok(serde_json::Value::Object(root)) = serde_json::from_str::<serde_json::Value>(&raw)
+    else {
+        return Vec::new();
+    };
+    let Some(deps) = root.get("dependencies").and_then(|v| v.as_object()) else {
+        return Vec::new();
+    };
+    let node_modules = dir.join("node_modules");
+    deps.keys()
+        // `join` treats a scoped name's `/` as a path separator, so
+        // `@nanobpm/urban` resolves to `node_modules/@nanobpm/urban`.
+        .filter(|name| !node_modules.join(name).is_dir())
+        .cloned()
+        .collect()
+}
+
+/// Best-effort guarded `npm install` to materialise a project's declared npm
+/// `dependencies` into `node_modules` before a Node-first run. Third-party
+/// package installation only: dev dependencies and lifecycle scripts are omitted,
+/// so a pack's runtime deps (e.g. `@nanobpm/urban`) resolve without paying a
+/// build-script surface. Requires `npm` on PATH; returns an error when npm is
+/// unavailable or the install fails.
+fn install_project_node_modules(dir: &Path) -> Result<(), String> {
+    let npm = super::extensions::find_program("npm").ok_or("npm not found on PATH")?;
+    let out = std::process::Command::new(&npm)
+        .arg("install")
+        .arg("--omit=dev")
+        .arg("--ignore-scripts")
+        .arg("--no-audit")
+        .arg("--no-fund")
+        .arg("--loglevel=error")
+        .current_dir(dir)
+        .env("NO_COLOR", "1")
+        .output()
+        .map_err(|e| format!("spawn npm: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(format!(
+            "npm install exited {}: {}",
+            out.status,
+            stderr.trim()
+        ));
+    }
+    Ok(())
+}
 /// and workers on disk, so dropping a file into the project is all it takes.
 const MAIN_TS: &str = r#"// Generated entrypoint for your Nano application. Edit freely. The deploy +
 // worker bootstrap helpers live in lib/nano.ts so this stays a clean entrypoint.
@@ -5379,6 +5438,46 @@ impl ProjectSupervisor {
         let base_url = Self::base_url(&cfg);
 
         Self::auto_deploy_resources(&cfg, &dir, &base_url, &inner).await;
+
+        // Node resolves the project's real npm `dependencies` (e.g. `@nanobpm/urban`,
+        // a published Urban app's toolkit) as bare specifiers from `node_modules`.
+        // Unlike Deno — which fetches `npm:` on demand — the host never populates
+        // it, so a project created from such an app fails with ERR_MODULE_NOT_FOUND.
+        // Lazily materialise any declared dep missing from `node_modules` with a
+        // guarded, best-effort `npm install` (no dev deps, no lifecycle scripts)
+        // before the Node spawn. A failure is logged, not fatal: the spawn then
+        // surfaces the underlying resolution error, so the run is never silently
+        // blocked on a flaky install.
+        if let RunRuntime::Node(_) = &runtime {
+            let missing = missing_node_modules(&dir);
+            if !missing.is_empty() {
+                inner
+                    .push_log(
+                        "info",
+                        format!(
+                            "installing {} missing npm dependenc{} ({})…",
+                            missing.len(),
+                            if missing.len() == 1 { "y" } else { "ies" },
+                            missing.join(", "),
+                        ),
+                    )
+                    .await;
+                let install_dir = dir.clone();
+                match tokio::task::spawn_blocking(move || {
+                    install_project_node_modules(&install_dir)
+                })
+                .await
+                {
+                    Ok(Ok(())) => inner.push_log("info", "npm install complete".into()).await,
+                    Ok(Err(e)) => inner.push_log("err", format!("npm install: {e}")).await,
+                    Err(e) => {
+                        inner
+                            .push_log("err", format!("npm install task: {e}"))
+                            .await
+                    }
+                }
+            }
+        }
 
         let runtime_label;
         let mut cmd;
@@ -9768,7 +9867,44 @@ mod tests {
         );
     }
 
-    /// Defect-class guard across the WHOLE built-in surface (drift-free — driven
+    /// `missing_node_modules` drives the lazy `npm install` on the Node run path:
+    /// it must list only declared `dependencies` absent from `node_modules`, and
+    /// no-op for a healthy app, a depless manifest, or a project with no
+    /// `package.json` (Rust/Java pack). Scoped names resolve under their scope dir.
+    #[test]
+    fn missing_node_modules_lists_only_absent_declared_deps() {
+        let dir = std::env::temp_dir().join(format!("nano-nm-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // No package.json → nothing to install.
+        assert!(missing_node_modules(&dir).is_empty());
+
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"@nanobpm/urban":"^0.17.1","left-pad":"^1"}}"#,
+        )
+        .unwrap();
+        // Both declared, none present → both reported.
+        let mut got = missing_node_modules(&dir);
+        got.sort();
+        assert_eq!(got, vec!["@nanobpm/urban".to_string(), "left-pad".into()]);
+
+        // Materialise one (scoped) → only the other remains.
+        std::fs::create_dir_all(dir.join("node_modules/@nanobpm/urban")).unwrap();
+        assert_eq!(missing_node_modules(&dir), vec!["left-pad".to_string()]);
+
+        // Materialise the rest → no-op.
+        std::fs::create_dir_all(dir.join("node_modules/left-pad")).unwrap();
+        assert!(missing_node_modules(&dir).is_empty());
+
+        // A manifest without `dependencies` is a no-op.
+        std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert!(missing_node_modules(&dir).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// off the `TEMPLATES` registry, so a new template is covered automatically).
     /// Guards *both* Node-fallback failure modes for every template:
     ///   (a) every `npm:` import in the project `deno.json` is declared in
