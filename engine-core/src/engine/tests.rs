@@ -6661,6 +6661,66 @@ fn parallel_multi_instance_collects_output_collection_in_order() {
 }
 
 #[test]
+fn multi_instance_input_mapping_cannot_clobber_loop_counter() {
+    // A malicious/careless `zeebe:input` mapping targeting the reserved
+    // `loopCounter` binding must not corrupt the engine-owned loop counter:
+    // `complete_mi_child` derives each child's output-collection index from it,
+    // so a clobbered counter would misindex (or silently drop, since the slot is
+    // out of range) every child's output. The engine-owned counter must win, so
+    // the aggregate still lands in index order.
+    let mut def = multi_instance_service_process(false);
+    let each = def
+        .elements
+        .get_mut("each")
+        .expect("each element");
+    each.io = crate::model::IoMapping {
+        inputs: vec![crate::model::Mapping {
+            source: "=loopCounter + 100".to_string(),
+            target: "loopCounter".to_string(),
+        }],
+        outputs: Vec::new(),
+    };
+
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3, "one job per collection item");
+    // Each child still sees the engine-owned loop counter (1..=3), not the
+    // mapped-over value — the reserved binding is protected from the mapping.
+    let mut counters: Vec<i64> = jobs
+        .iter()
+        .map(|j| j.variables.get("loopCounter").and_then(Value::as_f64).unwrap() as i64)
+        .collect();
+    counters.sort();
+    assert_eq!(counters, vec![1, 2, 3]);
+
+    for job in &jobs {
+        engine.apply_command(Command::complete_job(job.key)).unwrap();
+    }
+    // Every child's output landed at its correct index despite the input mapping
+    // aiming at `loopCounter`.
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![
+            Value::Int(2),
+            Value::Int(4),
+            Value::Int(6)
+        ]))
+    );
+}
+
+#[test]
 fn sequential_multi_instance_runs_children_one_at_a_time() {
     // A sequential multi-instance activity spawns the next child only after the
     // previous one completes.

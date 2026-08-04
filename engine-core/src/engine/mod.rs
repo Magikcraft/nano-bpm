@@ -3801,7 +3801,14 @@ impl Engine {
         // and, for a sub-process child, to its inner flow.
         let inputs = self.io_inputs(instance_key, &element_id);
         if !inputs.is_empty() {
-            let mapped = self.eval_io_mappings_in(&child_vars, &inputs);
+            let mut mapped = self.eval_io_mappings_in(&child_vars, &inputs);
+            // `loopCounter` is a reserved MI binding: `complete_mi_child` derives
+            // the child's index (and thus its output-collection slot / join
+            // bookkeeping) from it. A user `zeebe:input` mapping targeting
+            // `loopCounter` must not clobber that binding, or the child would
+            // write to the wrong (or an out-of-range, silently dropped) slot. Drop
+            // any such mapping so the engine-owned counter always wins.
+            mapped.remove("loopCounter");
             child_vars.extend(mapped.clone());
             locals.extend(mapped);
         }
