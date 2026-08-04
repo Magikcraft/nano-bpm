@@ -6669,10 +6669,7 @@ fn multi_instance_input_mapping_cannot_clobber_loop_counter() {
     // out of range) every child's output. The engine-owned counter must win, so
     // the aggregate still lands in index order.
     let mut def = multi_instance_service_process(false);
-    let each = def
-        .elements
-        .get_mut("each")
-        .expect("each element");
+    let each = def.elements.get_mut("each").expect("each element");
     each.io = crate::model::IoMapping {
         inputs: vec![crate::model::Mapping {
             source: "=loopCounter + 100".to_string(),
@@ -6700,13 +6697,20 @@ fn multi_instance_input_mapping_cannot_clobber_loop_counter() {
     // mapped-over value — the reserved binding is protected from the mapping.
     let mut counters: Vec<i64> = jobs
         .iter()
-        .map(|j| j.variables.get("loopCounter").and_then(Value::as_f64).unwrap() as i64)
+        .map(|j| {
+            j.variables
+                .get("loopCounter")
+                .and_then(Value::as_f64)
+                .unwrap() as i64
+        })
         .collect();
     counters.sort();
     assert_eq!(counters, vec![1, 2, 3]);
 
     for job in &jobs {
-        engine.apply_command(Command::complete_job(job.key)).unwrap();
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
     }
     // Every child's output landed at its correct index despite the input mapping
     // aiming at `loopCounter`.
@@ -6761,7 +6765,9 @@ fn multi_instance_child_index_survives_worker_clobbering_loop_counter() {
                 true,
             ))
             .unwrap();
-        engine.apply_command(Command::complete_job(job.key)).unwrap();
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
     }
 
     // Each child's output still landed at its true engine-owned index.
