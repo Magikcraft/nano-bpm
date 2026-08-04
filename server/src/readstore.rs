@@ -70,7 +70,10 @@ CREATE TABLE process_definitions (
     version    INTEGER NOT NULL,
     xml        TEXT NOT NULL DEFAULT ''
 );
-CREATE INDEX idx_process_definitions_id_version
+-- UNIQUE enforces one row per (process_id, version) so a redeploy of the same
+-- version can never create ambiguous \"latest version per id\" rows, and the
+-- index also backs the MAX(version)/ORDER BY lookups below.
+CREATE UNIQUE INDEX idx_process_definitions_id_version
     ON process_definitions(process_id, version);
 CREATE TABLE process_instances (
     key                    INTEGER PRIMARY KEY,
