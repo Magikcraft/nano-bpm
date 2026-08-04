@@ -65,11 +65,13 @@ fn fnv1a_64(bytes: &[u8]) -> i64 {
 
 const SCHEMA: &str = "
 CREATE TABLE process_definitions (
-    process_id TEXT PRIMARY KEY,
-    key        INTEGER NOT NULL,
+    key        INTEGER PRIMARY KEY,
+    process_id TEXT NOT NULL,
     version    INTEGER NOT NULL,
     xml        TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX idx_process_definitions_id_version
+    ON process_definitions(process_id, version);
 CREATE TABLE process_instances (
     key                    INTEGER PRIMARY KEY,
     process_id             TEXT NOT NULL,
@@ -1514,8 +1516,15 @@ impl ReadStore {
 
     pub fn process_definitions(&self) -> Vec<ProcessDefinitionRow> {
         let conn = self.conn.lock().expect("read store poisoned");
+        // Search surfaces only the latest version per process id (the endpoint's
+        // `isLatestVersion` filter and Zeebe-parity list semantics), even though
+        // every version's XML is retained for by-key diagram lookups.
         let mut stmt = conn
-            .prepare("SELECT key, process_id, version FROM process_definitions")
+            .prepare(
+                "SELECT key, process_id, version FROM process_definitions pd \
+                 WHERE version = (SELECT MAX(version) FROM process_definitions \
+                                  WHERE process_id = pd.process_id)",
+            )
             .expect("prepare process_definitions");
         let rows = stmt
             .query_map([], |r| {
@@ -2349,14 +2358,18 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             process,
             ..
         } => {
-            // Only the latest version of a process id is searchable, mirroring
-            // the engine's `state.processes` (keyed by id); a redeploy replaces.
-            // The verbatim BPMN XML rides on the deploy event (engine state) and
-            // is projected here so getProcessDefinitionXML / the console diagram
-            // can serve it by key without querying the engine actor.
+            // Retain EVERY deployed version, keyed by processDefinitionKey (one
+            // row per version), so getProcessDefinitionXML / the console diagram
+            // can serve any version's verbatim BPMN — including versions that a
+            // later redeploy has superseded but whose instances are still around
+            // (a redeploy no longer overwrites the prior version's XML, which
+            // previously blanked the Explorer diagram of every older-version
+            // instance). Search stays scoped to the latest version per id (see
+            // `process_definitions`). `ON CONFLICT(key)` refreshes idempotently on
+            // replay/re-delivery of the same ProcessDeployed event.
             tx.cexecute(
                 "INSERT INTO process_definitions (process_id, key, version, xml) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(process_id) DO UPDATE SET key = excluded.key, version = excluded.version, xml = excluded.xml",
+                 ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, xml = excluded.xml",
                 params![process.id, *process_definition_key as i64, version, process.xml],
             )?;
             // Element metadata (type + BPMN name) keyed by (definition, element
@@ -2388,10 +2401,14 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             business_id,
         } => {
             // Resolve the deployed identity now (defaults mirror
-            // `process_instance_result` when no definition is on record).
+            // `process_instance_result` when no definition is on record). With
+            // every version retained, pick the latest deployed so far — during an
+            // ordered replay only versions deployed before this create are on
+            // record, so MAX(version) is the version the instance was created on.
             let (def_key, version): (String, i32) = tx
                 .query_row(
-                    "SELECT key, version FROM process_definitions WHERE process_id = ?1",
+                    "SELECT key, version FROM process_definitions WHERE process_id = ?1 \
+                     ORDER BY version DESC LIMIT 1",
                     params![process_id],
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?)),
                 )
@@ -3384,7 +3401,11 @@ mod definition_xml_tests {
     use super::ReadStore;
 
     fn deployed_event(key: u64, xml: &str) -> Event {
-        let mut def: ProcessDefinition = ProcessBuilder::new("p")
+        deployed_event_versioned("p", key, 1, xml)
+    }
+
+    fn deployed_event_versioned(process_id: &str, key: u64, version: i32, xml: &str) -> Event {
+        let mut def: ProcessDefinition = ProcessBuilder::new(process_id)
             .start_event("s")
             .end_event("e")
             .connect("s", "e")
@@ -3394,7 +3415,7 @@ mod definition_xml_tests {
         Event::ProcessDeployed {
             deployment_key: 1,
             process_definition_key: key,
-            version: 1,
+            version,
             process: def,
         }
     }
@@ -3418,6 +3439,33 @@ mod definition_xml_tests {
         store.export(&[&event]).unwrap();
         // Present but empty — the handler maps this to a 204, not a 404.
         assert_eq!(store.process_definition_xml(7).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn redeploy_retains_every_version_xml_by_key() {
+        let store = ReadStore::open(None).unwrap();
+        // Deploy v1 (key 6) then a new version v2 (key 297) of the same process id.
+        let v1 = deployed_event_versioned("p", 6, 1, "<xml>v1</xml>");
+        let v2 = deployed_event_versioned("p", 297, 2, "<xml>v2</xml>");
+        store.export(&[&v1]).unwrap();
+        store.export(&[&v2]).unwrap();
+
+        // Both versions' XML remain serveable by key: an older-version instance's
+        // Explorer diagram survives a redeploy (the bug this fixes).
+        assert_eq!(
+            store.process_definition_xml(6).as_deref(),
+            Some("<xml>v1</xml>")
+        );
+        assert_eq!(
+            store.process_definition_xml(297).as_deref(),
+            Some("<xml>v2</xml>")
+        );
+
+        // Search remains scoped to the latest version per id.
+        let defs = store.process_definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].key, 297);
+        assert_eq!(defs[0].version, 2);
     }
 
     #[test]
