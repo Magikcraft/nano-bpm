@@ -437,6 +437,14 @@ pub struct MultiInstanceState {
     pub spawned: usize,
     /// Element instances of the children that are still active.
     pub active: std::collections::BTreeSet<Key>,
+    /// Authoritative 0-based loop index of each child element instance, recorded
+    /// at activation and read back on completion to position the child's output.
+    /// The index is engine-owned runtime state, NOT derived from the child's
+    /// mutable `loopCounter` variable — so no write path into the child scope
+    /// (`zeebe:input` mapping, a worker `SetVariables`, an inner output mapping)
+    /// can corrupt `outputCollection` indexing / join bookkeeping.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub child_indices: std::collections::BTreeMap<Key, usize>,
     /// Collected per-child output, positioned by the child's 0-based index.
     pub output_values: Vec<Option<Value>>,
 }
@@ -1992,6 +2000,7 @@ pub fn apply(state: &mut State, event: &Event) {
                         input_element: input_element.clone(),
                         spawned: 0,
                         active: std::collections::BTreeSet::new(),
+                        child_indices: std::collections::BTreeMap::new(),
                         output_values: vec![None; total],
                     },
                 );
@@ -2015,6 +2024,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     .insert(*child_key, local_variables.clone());
                 if let Some(mi) = instance.multi_instances.get_mut(body_key) {
                     mi.active.insert(*child_key);
+                    mi.child_indices.insert(*child_key, *index);
                     mi.spawned = mi.spawned.max(*index + 1);
                 }
             }
@@ -2033,6 +2043,7 @@ pub fn apply(state: &mut State, event: &Event) {
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 if let Some(mi) = instance.multi_instances.get_mut(body_key) {
                     mi.active.remove(child_key);
+                    mi.child_indices.remove(child_key);
                     if let Some(slot) = mi.output_values.get_mut(*index) {
                         *slot = output.clone();
                     }

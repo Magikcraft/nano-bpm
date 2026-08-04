@@ -2868,6 +2868,45 @@ impl Engine {
             // The sub-process completes in its own (parent) scope, captured before
             // its scope entry is cleared by `ElementCompleted`.
             let scope = self.scope_of(instance_key, eik);
+
+            // A drained sub-process whose enclosing scope is a multi-instance body
+            // (with a matching element id) is a MULTI-INSTANCE CHILD: its
+            // completion must feed the loop's output collection + join / next
+            // child rather than take the activity's outgoing flow. `complete`
+            // detects this and delegates to `complete_mi_child`, so route it
+            // there via `Step::Complete` (which emits its `ElementCompleted` and
+            // tears down the child scope). Cancel any boundary events armed on the
+            // child first — the MI completion path does not follow the normal
+            // boundary-cleanup branch below. Its `output_element` (the MI output),
+            // not the sub-process's `zeebe:ioMapping` outputs, is what aggregates.
+            let is_mi_child = self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.multi_instances.get(&scope))
+                .map(|mi| mi.element_id == element_id)
+                .unwrap_or(false);
+            if is_mi_child {
+                for event in self.cancel_boundary_timers_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_message_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_signal_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id,
+                });
+                continue;
+            }
+
             // Output mappings on a sub-process evaluate against the sub-process's
             // own scope view (its input-mapped locals + anything set inside it)
             // BEFORE its scope is torn down, then propagate the mapped result to
@@ -3750,6 +3789,31 @@ impl Engine {
         let mut child_vars = (*self.variables_for_element(instance_key, body_key)).clone();
         child_vars.extend(locals.clone());
 
+        // Apply the activity's own input mappings (`zeebe:input`) per-child,
+        // evaluated with `inputElement`/`loopCounter` already bound, writing the
+        // results LOCAL to this child's scope — matching Zeebe, which applies an
+        // MI inner activity's input mappings on each instance's activation into
+        // that instance's OWN scope (`getVariableScopeKey` returns the
+        // element-instance key while the loop counter is set). `activate_mi_child`
+        // hand-builds the child (bypassing `activate`), so unlike a
+        // normally-activated element these mappings must be applied here; they are
+        // then visible both to the child's job-type/retry FEEL resolution below
+        // and, for a sub-process child, to its inner flow.
+        let inputs = self.io_inputs(instance_key, &element_id);
+        if !inputs.is_empty() {
+            let mut mapped = self.eval_io_mappings_in(&child_vars, &inputs);
+            // `loopCounter` is a reserved MI binding. The child's output-collection
+            // index is now engine-owned runtime state (`MultiInstanceState::
+            // child_indices`, read back by `complete_mi_child`), so a clobbered
+            // counter can no longer misindex a child's output. We still drop any
+            // user `zeebe:input` mapping targeting `loopCounter` so the FEEL-visible
+            // reserved binding (job type, `outputElement`, etc.) keeps reporting the
+            // true engine-owned counter rather than a mapped-over value.
+            mapped.remove("loopCounter");
+            child_vars.extend(mapped.clone());
+            locals.extend(mapped);
+        }
+
         let mut events = vec![
             Event::ElementActivating {
                 instance_key,
@@ -3789,6 +3853,29 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                });
+            }
+            // A multi-instance child that is an embedded SUB-PROCESS opens its own
+            // token scope (this child element instance) and activates its inner
+            // start event inside it — exactly like a normally-activated
+            // sub-process (see `activate`). The child rests while its inner flow
+            // runs; once that scope drains, `complete_drained_subprocesses`
+            // recognises the drained instance as a multi-instance child and routes
+            // it back into the loop via `complete_mi_child` (output collection +
+            // join / next child) rather than following the activity's outgoing
+            // flow. This is what makes the nested "wave" pattern — a sequential MI
+            // over waves wrapping a parallel MI over a wave's tasks — executable.
+            Some(ElementKind::SubProcess { start_event }) => {
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    child_key,
+                    body_key,
+                    &element_id,
+                ));
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: start_event,
+                    scope: child_key,
                 });
             }
             _ => {
@@ -3857,16 +3944,45 @@ impl Engine {
             .state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.scope_variables.get(&child_eik))
-            .and_then(|l| l.get("loopCounter"))
-            .and_then(|v| v.as_f64())
-            .map(|c| (c as i64 - 1).max(0) as usize)
+            .and_then(|i| i.multi_instances.get(&body_key))
+            .and_then(|mi| mi.child_indices.get(&child_eik))
+            .copied()
+            // Fallback for instances rehydrated from a pre-`child_indices`
+            // snapshot: derive from the child's `loopCounter` binding. Newly
+            // activated children always hit the authoritative map above, so no
+            // write path into the child scope can corrupt the index.
+            .or_else(|| {
+                self.state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.scope_variables.get(&child_eik))
+                    .and_then(|l| l.get("loopCounter"))
+                    .and_then(|v| v.as_f64())
+                    .map(|c| (c as i64 - 1).max(0) as usize)
+            })
             .unwrap_or(0);
 
         // Collect this child's output (evaluated in its local scope) at its index.
+        // First apply the MI element's own output mappings (`zeebe:output`) to the
+        // child's local scope view, matching Zeebe: an MI inner activity's output
+        // mappings are applied on each instance's completion into the instance's
+        // OWN scope (`getVariableScopeKey` returns the element-instance key while
+        // the loop counter is set), so `outputElement` can read them. They are NOT
+        // propagated to the parent — only the aggregated `outputCollection` is. We
+        // therefore overlay the mapped values onto the eval context in memory
+        // rather than writing them into the (about-to-be-torn-down, non-propagated)
+        // child scope.
         let output = output_element.as_deref().and_then(|expr| {
-            let vars = self.variables_for_element(instance_key, child_eik);
-            crate::feel::eval(expr, &vars).ok()
+            let visible = self.variables_for_element(instance_key, child_eik);
+            let outputs = self.io_outputs(instance_key, &element_id);
+            if outputs.is_empty() {
+                crate::feel::eval(expr, &visible).ok()
+            } else {
+                let mapped = self.eval_io_mappings_in(&visible, &outputs);
+                let mut vars = (*visible).clone();
+                vars.extend(mapped);
+                crate::feel::eval(expr, &vars).ok()
+            }
         });
         events.push(Event::MultiInstanceChildCompleted {
             instance_key,
