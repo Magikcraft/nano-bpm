@@ -3453,7 +3453,7 @@ mod definition_xml_tests {
         store.export(&[&v1]).unwrap();
         store.export(&[&v2]).unwrap();
 
-        // Both versions' XML remain serveable by key: an older-version instance's
+        // Both versions' XML remain servable by key: an older-version instance's
         // Explorer diagram survives a redeploy (the bug this fixes).
         assert_eq!(
             store.process_definition_xml(6).as_deref(),
