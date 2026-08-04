@@ -3802,12 +3802,13 @@ impl Engine {
         let inputs = self.io_inputs(instance_key, &element_id);
         if !inputs.is_empty() {
             let mut mapped = self.eval_io_mappings_in(&child_vars, &inputs);
-            // `loopCounter` is a reserved MI binding: `complete_mi_child` derives
-            // the child's index (and thus its output-collection slot / join
-            // bookkeeping) from it. A user `zeebe:input` mapping targeting
-            // `loopCounter` must not clobber that binding, or the child would
-            // write to the wrong (or an out-of-range, silently dropped) slot. Drop
-            // any such mapping so the engine-owned counter always wins.
+            // `loopCounter` is a reserved MI binding. The child's output-collection
+            // index is now engine-owned runtime state (`MultiInstanceState::
+            // child_indices`, read back by `complete_mi_child`), so a clobbered
+            // counter can no longer misindex a child's output. We still drop any
+            // user `zeebe:input` mapping targeting `loopCounter` so the FEEL-visible
+            // reserved binding (job type, `outputElement`, etc.) keeps reporting the
+            // true engine-owned counter rather than a mapped-over value.
             mapped.remove("loopCounter");
             child_vars.extend(mapped.clone());
             locals.extend(mapped);
@@ -3943,10 +3944,22 @@ impl Engine {
             .state
             .instances
             .get(&instance_key)
-            .and_then(|i| i.scope_variables.get(&child_eik))
-            .and_then(|l| l.get("loopCounter"))
-            .and_then(|v| v.as_f64())
-            .map(|c| (c as i64 - 1).max(0) as usize)
+            .and_then(|i| i.multi_instances.get(&body_key))
+            .and_then(|mi| mi.child_indices.get(&child_eik))
+            .copied()
+            // Fallback for instances rehydrated from a pre-`child_indices`
+            // snapshot: derive from the child's `loopCounter` binding. Newly
+            // activated children always hit the authoritative map above, so no
+            // write path into the child scope can corrupt the index.
+            .or_else(|| {
+                self.state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.scope_variables.get(&child_eik))
+                    .and_then(|l| l.get("loopCounter"))
+                    .and_then(|v| v.as_f64())
+                    .map(|c| (c as i64 - 1).max(0) as usize)
+            })
             .unwrap_or(0);
 
         // Collect this child's output (evaluated in its local scope) at its index.

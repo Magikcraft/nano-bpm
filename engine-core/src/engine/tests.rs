@@ -6721,6 +6721,61 @@ fn multi_instance_input_mapping_cannot_clobber_loop_counter() {
 }
 
 #[test]
+fn multi_instance_child_index_survives_worker_clobbering_loop_counter() {
+    // The child's output-collection index is engine-owned runtime state, not
+    // derived from the mutable `loopCounter` variable. So even a write path the
+    // `zeebe:input` guard cannot see — a worker issuing
+    // `SetVariables { local: true }` against its child scope to overwrite
+    // `loopCounter` — must not corrupt `outputCollection` indexing: an
+    // out-of-range counter would otherwise silently drop the output, and a
+    // collided one would overwrite another child's slot. The aggregate must still
+    // land in index order.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi",
+            vars(&[(
+                "items",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3, "one job per collection item");
+
+    // Every worker slams the SAME out-of-range `loopCounter` into its own child
+    // scope before completing. If completion trusted this variable, all three
+    // outputs would target index 99 (out of range) and be dropped.
+    for job in &jobs {
+        engine
+            .apply_command(Command::set_variables_scoped(
+                job.element_instance_key,
+                vars(&[("loopCounter", Value::Int(99))]),
+                true,
+            ))
+            .unwrap();
+        engine.apply_command(Command::complete_job(job.key)).unwrap();
+    }
+
+    // Each child's output still landed at its true engine-owned index.
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("results"),
+        Some(&Value::List(vec![
+            Value::Int(2),
+            Value::Int(4),
+            Value::Int(6)
+        ]))
+    );
+}
+
+#[test]
 fn sequential_multi_instance_runs_children_one_at_a_time() {
     // A sequential multi-instance activity spawns the next child only after the
     // previous one completes.
