@@ -370,10 +370,20 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
         constructor(elementRegistry: ElementRegistry) {
           this.elementRegistry = elementRegistry;
         }
-        getVariablesForElement(bo: unknown): FeelVariable[] {
+        // `@bpmn-io/extract-process-variables` >=2 made zeebe variable
+        // extraction async, and bpmn-js-properties-panel awaits this method
+        // (`await variableResolver.getVariablesForElement(...)`), so we await the
+        // extraction rather than iterating its Promise (which threw "not
+        // iterable" and crashed the whole panel render on every selection).
+        // Both sources are coerced to arrays so a future signature change can
+        // never wedge the panel again.
+        async getVariablesForElement(bo: unknown): Promise<FeelVariable[]> {
           let base: FeelVariable[] = [];
           try {
-            base = (extractZeebeVariables(bo) as FeelVariable[]) ?? [];
+            const extracted = await extractZeebeVariables(bo);
+            base = Array.isArray(extracted)
+              ? (extracted as FeelVariable[])
+              : [];
           } catch {
             base = [];
           }
@@ -383,7 +393,8 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
           } catch {
             taskOutputs = [];
           }
-          const domain = getVariablesRef.current?.({ taskOutputs }) ?? [];
+          const resolved = getVariablesRef.current?.({ taskOutputs });
+          const domain = Array.isArray(resolved) ? resolved : [];
           // Dedupe by name; a typed domain variable supersedes its plain
           // extracted counterpart so nested-field completion wins.
           const byName = new Map<string, FeelVariable>();
