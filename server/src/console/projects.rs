@@ -1462,9 +1462,11 @@ fn heal_package_json_npm_deps(dir: &Path) -> std::io::Result<()> {
 /// app's toolkit); a host-scaffolded app's relative/`@lib` aliases live in the
 /// import map, not here, so they are correctly ignored.
 ///
-/// Empty when there is no `package.json`, it declares no `dependencies`, or every
-/// declared dep is already present — so a healthy app, a Deno-fetched project, or
-/// a non-Node pack (Rust/Java: no `package.json` deps) is a no-op.
+/// Empty when there is no `package.json`, it is unreadable or not valid JSON, it
+/// declares no `dependencies`, or every declared dep is already present — so a
+/// healthy app, a Deno-fetched project, or a non-Node pack (Rust/Java: no
+/// `package.json` deps) is a no-op. A malformed `package.json` therefore skips the
+/// install attempt rather than aborting the run.
 fn missing_node_modules(dir: &Path) -> Vec<String> {
     let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) else {
         return Vec::new();
@@ -1506,11 +1508,17 @@ fn install_project_node_modules(dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("spawn npm: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(format!(
-            "npm install exited {}: {}",
-            out.status,
-            stderr.trim()
-        ));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut detail = stderr.trim().to_string();
+        let stdout = stdout.trim();
+        if !stdout.is_empty() {
+            if detail.is_empty() {
+                detail = stdout.to_string();
+            } else {
+                detail = format!("{detail}\n{stdout}");
+            }
+        }
+        return Err(format!("npm install exited {}: {}", out.status, detail));
     }
     Ok(())
 }
