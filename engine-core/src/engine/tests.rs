@@ -2160,6 +2160,70 @@ fn should_merge_message_variables_on_correlation() {
 }
 
 #[test]
+fn catch_event_output_mapping_applies_on_correlation() {
+    // A message catch event carrying a `zeebe:ioMapping` output that increments a
+    // loop counter (`=round + 1 -> round`) — the shape the urban-pr-review
+    // convergence loop uses to advance its round on each `review-ready`. The
+    // mapping must apply when the event is triggered; before the parser attached
+    // catch-event ioMappings it was silently dropped and `round` stayed at 1.
+    let xml = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+          xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:intermediateCatchEvent id="await">
+            <bpmn:extensionElements>
+              <zeebe:ioMapping>
+                <zeebe:output source="=round + 1" target="round" />
+              </zeebe:ioMapping>
+            </bpmn:extensionElements>
+            <bpmn:messageEventDefinition messageRef="Message_1" />
+          </bpmn:intermediateCatchEvent>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="await" />
+          <bpmn:sequenceFlow id="f1" sourceRef="await" targetRef="e" />
+        </bpmn:process>
+        <bpmn:message id="Message_1" name="review-ready">
+          <bpmn:extensionElements>
+            <zeebe:subscription correlationKey="=prKey" />
+          </bpmn:extensionElements>
+        </bpmn:message>
+      </bpmn:definitions>"#;
+    let process = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process))
+        .unwrap();
+    let instance_key = engine
+        .apply_command(Command::create_instance_with(
+            "p",
+            vars(&[("prKey", Value::Str("A".into())), ("round", Value::Int(1))]),
+        ))
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap();
+
+    // Triggering the catch event runs its output mapping. The instance then
+    // completes and drops hot state (ADR 0012), so assert the incremented value
+    // on the durable `VariablesUpdated` event rather than hot state.
+    let fired = engine.correlate_message("review-ready", "A", HashMap::new(), 0);
+    let bumped = fired
+        .iter()
+        .find_map(|e| match e {
+            Event::VariablesUpdated {
+                instance_key: k,
+                variables,
+            } if *k == instance_key => variables.get("round").cloned(),
+            _ => None,
+        })
+        .expect("the catch event's output mapping emits a VariablesUpdated for round");
+    assert_eq!(bumped, Value::Int(2));
+    assert!(engine.is_completed(instance_key));
+}
+
+#[test]
 fn should_correlate_only_the_instance_with_the_matching_key() {
     let mut engine = Engine::new();
     engine
