@@ -8701,8 +8701,9 @@ impl ServerImpl {
                             .is_none_or(|r| *r == resource_name(id))
                         && f.version_tag.is_none()
                         && f.has_start_form.is_none_or(|want| !want)
-                        // Only latest versions are retained, so they are all
-                        // "latest"; an explicit `false` therefore matches none.
+                        // `process_definitions()` returns only the latest version
+                        // per id, so every result is "latest"; an explicit
+                        // `false` therefore matches none.
                         && f.is_latest_version.is_none_or(|want| want)
                 }
             })
