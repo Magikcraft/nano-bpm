@@ -3789,6 +3789,23 @@ impl Engine {
         let mut child_vars = (*self.variables_for_element(instance_key, body_key)).clone();
         child_vars.extend(locals.clone());
 
+        // Apply the activity's own input mappings (`zeebe:input`) per-child,
+        // evaluated with `inputElement`/`loopCounter` already bound, writing the
+        // results LOCAL to this child's scope — matching Zeebe, which applies an
+        // MI inner activity's input mappings on each instance's activation into
+        // that instance's OWN scope (`getVariableScopeKey` returns the
+        // element-instance key while the loop counter is set). `activate_mi_child`
+        // hand-builds the child (bypassing `activate`), so unlike a
+        // normally-activated element these mappings must be applied here; they are
+        // then visible both to the child's job-type/retry FEEL resolution below
+        // and, for a sub-process child, to its inner flow.
+        let inputs = self.io_inputs(instance_key, &element_id);
+        if !inputs.is_empty() {
+            let mapped = self.eval_io_mappings_in(&child_vars, &inputs);
+            child_vars.extend(mapped.clone());
+            locals.extend(mapped);
+        }
+
         let mut events = vec![
             Event::ElementActivating {
                 instance_key,
@@ -3926,9 +3943,26 @@ impl Engine {
             .unwrap_or(0);
 
         // Collect this child's output (evaluated in its local scope) at its index.
+        // First apply the MI element's own output mappings (`zeebe:output`) to the
+        // child's local scope view, matching Zeebe: an MI inner activity's output
+        // mappings are applied on each instance's completion into the instance's
+        // OWN scope (`getVariableScopeKey` returns the element-instance key while
+        // the loop counter is set), so `outputElement` can read them. They are NOT
+        // propagated to the parent — only the aggregated `outputCollection` is. We
+        // therefore overlay the mapped values onto the eval context in memory
+        // rather than writing them into the (about-to-be-torn-down, non-propagated)
+        // child scope.
         let output = output_element.as_deref().and_then(|expr| {
-            let vars = self.variables_for_element(instance_key, child_eik);
-            crate::feel::eval(expr, &vars).ok()
+            let visible = self.variables_for_element(instance_key, child_eik);
+            let outputs = self.io_outputs(instance_key, &element_id);
+            if outputs.is_empty() {
+                crate::feel::eval(expr, &visible).ok()
+            } else {
+                let mapped = self.eval_io_mappings_in(&visible, &outputs);
+                let mut vars = (*visible).clone();
+                vars.extend(mapped);
+                crate::feel::eval(expr, &vars).ok()
+            }
         });
         events.push(Event::MultiInstanceChildCompleted {
             instance_key,

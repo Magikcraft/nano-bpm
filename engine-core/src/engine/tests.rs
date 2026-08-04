@@ -7027,6 +7027,176 @@ fn sequential_multi_instance_on_a_subprocess_runs_one_scope_at_a_time() {
     );
 }
 
+/// Like `multi_instance_subprocess` but the `wave` sub-process carries its own
+/// `zeebe:output` mapping (`tag = n * 10`) and the loop's `outputElement` reads
+/// that mapped local (`=tag`). Proves an MI-child sub-process applies its own
+/// output mappings into its local scope before the `outputElement` is collected
+/// (Zeebe parity: `getVariableScopeKey` writes them to the instance's own scope,
+/// visible to `outputElement`, NOT propagated to the parent).
+fn multi_instance_subprocess_with_output_mapping() -> ProcessDefinition {
+    ProcessBuilder::new("mi-sub-out")
+        .start_event("start")
+        .sub_process("wave", "wave_start")
+        .with_multi_instance(
+            "wave",
+            crate::model::MultiInstance {
+                input_collection: "=nums".to_string(),
+                input_element: Some("n".to_string()),
+                output_collection: Some("tags".to_string()),
+                output_element: Some("=tag".to_string()),
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "wave",
+            crate::model::IoMapping {
+                inputs: vec![],
+                outputs: vec![crate::model::Mapping {
+                    source: "=n * 10".to_string(),
+                    target: "tag".to_string(),
+                }],
+            },
+        )
+        .start_event("wave_start")
+        .contained_in("wave_start", "wave")
+        .service_task("impl", "do-work")
+        .contained_in("impl", "wave")
+        .end_event("wave_end")
+        .contained_in("wave_end", "wave")
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "wave")
+        .connect("wave_start", "impl")
+        .connect("impl", "wave_end")
+        .connect("wave", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn multi_instance_subprocess_applies_its_own_output_mapping_before_collecting() {
+    // Zeebe parity: an MI-child sub-process evaluates its own `zeebe:output`
+    // mappings on each instance's completion, into that instance's OWN scope, so
+    // the loop's `outputElement` can read the mapped value. Here `outputElement`
+    // is `=tag`, and `tag` exists ONLY because the sub-process output mapping
+    // `tag = n * 10` ran — if it were skipped, `outputElement` would collect null.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            multi_instance_subprocess_with_output_mapping(),
+        ))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub-out",
+            vars(&[(
+                "nums",
+                Value::List(vec![Value::Int(1), Value::Int(2), Value::Int(3)]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let jobs = engine.activate_jobs("do-work", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3, "one sub-process child per item");
+    for job in &jobs {
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+
+    assert!(!engine.is_completed(key), "token parked at the sink");
+    // The aggregated collection reflects the sub-process output mapping (n*10),
+    // in index order.
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("tags"),
+        Some(&Value::List(vec![
+            Value::Int(10),
+            Value::Int(20),
+            Value::Int(30),
+        ])),
+        "outputElement read the sub-process-mapped local `tag`"
+    );
+    // The mapped local stays scoped to each child — it does NOT leak to the
+    // parent instance scope (only the outputCollection propagates).
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("tag"),
+        None,
+        "the MI-child output mapping must not propagate `tag` to the parent"
+    );
+}
+
+/// An MI service task `each` whose own `zeebe:input` mapping references the
+/// per-child `inputElement` (`item`) and `loopCounter` — so the mapping can only
+/// be evaluated correctly once those child bindings exist.
+fn multi_instance_service_with_input_mapping() -> ProcessDefinition {
+    ProcessBuilder::new("mi-in")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: None,
+                output_element: None,
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .with_io(
+            "each",
+            crate::model::IoMapping {
+                inputs: vec![crate::model::Mapping {
+                    source: "=item * 100 + loopCounter".to_string(),
+                    target: "handle_arg".to_string(),
+                }],
+                outputs: vec![],
+            },
+        )
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn multi_instance_task_evaluates_input_mappings_per_child_with_bindings() {
+    // Zeebe parity: an MI activity's `zeebe:input` mappings are evaluated on each
+    // child's activation, with `inputElement`/`loopCounter` already bound, into
+    // the child's own local scope. Here `handle_arg = item * 100 + loopCounter`,
+    // so each job carries a value that only exists because the mapping ran with
+    // that child's bindings.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            multi_instance_service_with_input_mapping(),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance_with(
+            "mi-in",
+            vars(&[("items", Value::List(vec![Value::Int(5), Value::Int(6)]))]),
+        ))
+        .unwrap();
+
+    let jobs = engine.activate_jobs("handle", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 2, "one job per item");
+    let mut args: Vec<i64> = jobs
+        .iter()
+        .map(|j| match j.variables.get("handle_arg") {
+            Some(Value::Int(n)) => *n,
+            other => panic!("expected a per-child input-mapped `handle_arg`, got {other:?}"),
+        })
+        .collect();
+    args.sort();
+    // item=5,loopCounter=1 -> 501 ; item=6,loopCounter=2 -> 602
+    assert_eq!(args, vec![501, 602]);
+}
+
 #[test]
 fn set_variables_local_on_a_multi_instance_child_stays_in_its_scope() {
     // A `local` SetVariables targeting a running MI child scope writes only that
