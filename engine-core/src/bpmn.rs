@@ -842,8 +842,15 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     }
                 }
                 "intermediateCatchEvent" => {
+                    // Only pop when we actually pushed. The push is conditional
+                    // on `add_node` returning `Some` (i.e. the event carries an
+                    // `id`); popping unconditionally would detach the parent
+                    // element from `io_stack` for an id-less catch event and
+                    // misattach subsequent `zeebe:ioMapping` entries.
+                    if cur_intermediate.is_some() {
+                        io_stack.pop();
+                    }
                     cur_intermediate = None;
-                    io_stack.pop();
                 }
                 "multiInstanceLoopCharacteristics" => cur_multi_instance = None,
                 "completionCondition" => {
@@ -2851,6 +2858,54 @@ mod tests {
         assert_eq!(io.outputs.len(), 1);
         assert_eq!(io.outputs[0].source, "=round + 1");
         assert_eq!(io.outputs[0].target, "round");
+    }
+
+    #[test]
+    fn should_not_misattribute_io_mapping_after_an_id_less_catch_event() {
+        // given — an intermediate catch event with no `id` (so it is never
+        // pushed onto the io_stack) followed by a service task carrying a
+        // `zeebe:ioMapping`. A previously unconditional pop on
+        // `</intermediateCatchEvent>` would underflow/detach the stack and
+        // cause the service task's mapping to attach to the wrong node.
+        let xml = r#"
+          <bpmn:definitions
+              xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+              xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:intermediateCatchEvent>
+                <bpmn:messageEventDefinition messageRef="Message_1" />
+              </bpmn:intermediateCatchEvent>
+              <bpmn:serviceTask id="charge">
+                <bpmn:extensionElements>
+                  <zeebe:ioMapping>
+                    <zeebe:input source="=amount" target="chargeAmount" />
+                    <zeebe:output source="=result" target="chargeResult" />
+                  </zeebe:ioMapping>
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="f1" sourceRef="charge" targetRef="e" />
+            </bpmn:process>
+            <bpmn:message id="Message_1" name="review-ready">
+              <bpmn:extensionElements>
+                <zeebe:subscription correlationKey="=prKey" />
+              </bpmn:extensionElements>
+            </bpmn:message>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then — the mapping attaches to the service task, not a stray node.
+        let io = &def.element("charge").unwrap().io;
+        assert_eq!(io.inputs.len(), 1);
+        assert_eq!(io.inputs[0].source, "=amount");
+        assert_eq!(io.inputs[0].target, "chargeAmount");
+        assert_eq!(io.outputs.len(), 1);
+        assert_eq!(io.outputs[0].source, "=result");
+        assert_eq!(io.outputs[0].target, "chargeResult");
     }
 
     #[test]
