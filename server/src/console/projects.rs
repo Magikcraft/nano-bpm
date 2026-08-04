@@ -1466,7 +1466,10 @@ fn heal_package_json_npm_deps(dir: &Path) -> std::io::Result<()> {
 /// declares no `dependencies`, or every declared dep is already present — so a
 /// healthy app, a Deno-fetched project, or a non-Node pack (Rust/Java: no
 /// `package.json` deps) is a no-op. A malformed `package.json` therefore skips the
-/// install attempt rather than aborting the run.
+/// install attempt rather than aborting the run. Dependency keys that are not
+/// syntactically valid npm names are ignored (see [`is_safe_dependency_name`]) so
+/// a malicious manifest cannot make the presence probe reach outside
+/// `node_modules`.
 fn missing_node_modules(dir: &Path) -> Vec<String> {
     let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) else {
         return Vec::new();
@@ -1480,11 +1483,51 @@ fn missing_node_modules(dir: &Path) -> Vec<String> {
     };
     let node_modules = dir.join("node_modules");
     deps.keys()
-        // `join` treats a scoped name's `/` as a path separator, so
+        // A dependency key is attacker-controlled: `join` would treat a leading
+        // `/`, a `..` segment, or an embedded separator as a real path, so an
+        // entry like `../../etc` would probe (and could report as "missing")
+        // paths outside `node_modules`. Only join names that are valid npm
+        // specifiers; anything else is dropped rather than install-attempted.
+        .filter(|name| is_safe_dependency_name(name))
+        // `join` treats a scoped name's single `/` as a path separator, so
         // `@nanobpm/urban` resolves to `node_modules/@nanobpm/urban`.
         .filter(|name| !node_modules.join(name).is_dir())
         .cloned()
         .collect()
+}
+
+/// Whether `name` is a syntactically valid npm dependency name that is safe to
+/// `join` onto `node_modules` without escaping it. A scoped name is exactly
+/// `@scope/pkg` (a single `/`); every other name has no separator at all. Each
+/// segment must be non-empty, must not be a `.`/`..` traversal or start with a
+/// dot, and may only contain `[A-Za-z0-9._-]` — so absolute paths, backslashes,
+/// and traversal sequences from a malformed/malicious manifest are rejected.
+fn is_safe_dependency_name(name: &str) -> bool {
+    // npm caps package names at 214 characters; anything longer is not a real dep.
+    if name.is_empty() || name.len() > 214 {
+        return false;
+    }
+    let segments: [&str; 2];
+    let segments: &[&str] = if let Some(rest) = name.strip_prefix('@') {
+        let mut parts = rest.splitn(2, '/');
+        match (parts.next(), parts.next()) {
+            (Some(scope), Some(pkg)) => {
+                segments = [scope, pkg];
+                &segments
+            }
+            _ => return false,
+        }
+    } else {
+        std::slice::from_ref(&name)
+    };
+    segments.iter().all(|seg| {
+        !seg.is_empty()
+            && !seg.starts_with('.')
+            && !seg.contains('/')
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    })
 }
 
 /// Best-effort guarded `npm install` to materialise a project's declared npm
@@ -9910,7 +9953,57 @@ mod tests {
         std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
         assert!(missing_node_modules(&dir).is_empty());
 
+        // Invalid JSON → non-fatal, empty (the malformed manifest skips install).
+        std::fs::write(dir.join("package.json"), "{ not valid json").unwrap();
+        assert!(missing_node_modules(&dir).is_empty());
+
+        // Unreadable `package.json` (a directory at that path) → non-fatal, empty.
+        std::fs::remove_file(dir.join("package.json")).unwrap();
+        std::fs::create_dir_all(dir.join("package.json")).unwrap();
+        assert!(missing_node_modules(&dir).is_empty());
+        std::fs::remove_dir(dir.join("package.json")).unwrap();
+
+        // Traversal / absolute / malformed dependency names are dropped: the
+        // presence probe must never `join` them onto `node_modules` and reach
+        // outside it, and a well-known outside path must never be reported.
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"../../etc":"^1","/tmp":"^1",".hidden":"^1","a/b/c":"^1"}}"#,
+        )
+        .unwrap();
+        assert!(missing_node_modules(&dir).is_empty());
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The dependency-name guard must accept real npm specifiers (plain + scoped)
+    /// and reject anything that could escape `node_modules` when joined.
+    #[test]
+    fn is_safe_dependency_name_rejects_traversal_and_absolute() {
+        for ok in [
+            "left-pad",
+            "@nanobpm/urban",
+            "lodash.merge",
+            "a_b",
+            "react-dom",
+        ] {
+            assert!(is_safe_dependency_name(ok), "{ok} should be accepted");
+        }
+        for bad in [
+            "",
+            "../../etc",
+            "..",
+            ".",
+            "/tmp",
+            ".hidden",
+            "a/b/c",
+            "@scope",
+            "@/pkg",
+            "@scope/",
+            "a\\b",
+        ] {
+            assert!(!is_safe_dependency_name(bad), "{bad:?} should be rejected");
+        }
     }
 
     /// off the `TEMPLATES` registry, so a new template is covered automatically).
