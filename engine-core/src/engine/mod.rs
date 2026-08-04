@@ -2868,6 +2868,45 @@ impl Engine {
             // The sub-process completes in its own (parent) scope, captured before
             // its scope entry is cleared by `ElementCompleted`.
             let scope = self.scope_of(instance_key, eik);
+
+            // A drained sub-process whose enclosing scope is a multi-instance body
+            // (with a matching element id) is a MULTI-INSTANCE CHILD: its
+            // completion must feed the loop's output collection + join / next
+            // child rather than take the activity's outgoing flow. `complete`
+            // detects this and delegates to `complete_mi_child`, so route it
+            // there via `Step::Complete` (which emits its `ElementCompleted` and
+            // tears down the child scope). Cancel any boundary events armed on the
+            // child first — the MI completion path does not follow the normal
+            // boundary-cleanup branch below. Its `output_element` (the MI output),
+            // not the sub-process's `zeebe:ioMapping` outputs, is what aggregates.
+            let is_mi_child = self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.multi_instances.get(&scope))
+                .map(|mi| mi.element_id == element_id)
+                .unwrap_or(false);
+            if is_mi_child {
+                for event in self.cancel_boundary_timers_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_message_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_signal_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                for event in self.cancel_boundary_conditional_subscriptions_on(eik) {
+                    self.emit(log, event);
+                }
+                followups.push(Step::Complete {
+                    instance_key,
+                    element_instance_key: eik,
+                    element_id,
+                });
+                continue;
+            }
+
             // Output mappings on a sub-process evaluate against the sub-process's
             // own scope view (its input-mapped locals + anything set inside it)
             // BEFORE its scope is torn down, then propagate the mapped result to
@@ -3789,6 +3828,29 @@ impl Engine {
                     created_at: self.now,
                     priority,
                     retries,
+                });
+            }
+            // A multi-instance child that is an embedded SUB-PROCESS opens its own
+            // token scope (this child element instance) and activates its inner
+            // start event inside it — exactly like a normally-activated
+            // sub-process (see `activate`). The child rests while its inner flow
+            // runs; once that scope drains, `complete_drained_subprocesses`
+            // recognises the drained instance as a multi-instance child and routes
+            // it back into the loop via `complete_mi_child` (output collection +
+            // join / next child) rather than following the activity's outgoing
+            // flow. This is what makes the nested "wave" pattern — a sequential MI
+            // over waves wrapping a parallel MI over a wave's tasks — executable.
+            Some(ElementKind::SubProcess { start_event }) => {
+                events.extend(self.arm_boundary_events(
+                    instance_key,
+                    child_key,
+                    body_key,
+                    &element_id,
+                ));
+                followups.push(Step::Activate {
+                    instance_key,
+                    element_id: start_event,
+                    scope: child_key,
                 });
             }
             _ => {

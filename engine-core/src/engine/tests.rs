@@ -6858,6 +6858,175 @@ fn multi_instance_children_hold_their_bindings_in_real_child_scopes() {
     }
 }
 
+/// A process whose embedded sub-process `wave` carries multi-instance
+/// characteristics driven by `=tasks`, binding each item to `task`. Unlike
+/// [`multi_instance_service_process`] the MI body is a whole SUB-PROCESS scope
+/// (start -> inner service task `impl` (job `do-work`) -> end), so this exercises
+/// MI fan-out over a multi-step body. `output_element` echoes the bound `task`
+/// into `done_tasks`. A trailing `sink` service task parks the token after the
+/// join so the aggregate stays observable in hot state. This is the primitive
+/// under the agent-fleet "sequential MI over waves wrapping parallel MI over a
+/// wave's tasks" pattern (Magikcraft/nano-bpm#547).
+fn multi_instance_subprocess(sequential: bool) -> ProcessDefinition {
+    ProcessBuilder::new("mi-sub")
+        .start_event("start")
+        .sub_process("wave", "wave_start")
+        .with_multi_instance(
+            "wave",
+            crate::model::MultiInstance {
+                input_collection: "=tasks".to_string(),
+                input_element: Some("task".to_string()),
+                output_collection: Some("done_tasks".to_string()),
+                output_element: Some("=task".to_string()),
+                completion_condition: None,
+                sequential,
+            },
+        )
+        .start_event("wave_start")
+        .contained_in("wave_start", "wave")
+        .service_task("impl", "do-work")
+        .contained_in("impl", "wave")
+        .end_event("wave_end")
+        .contained_in("wave_end", "wave")
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "wave")
+        .connect("wave_start", "impl")
+        .connect("impl", "wave_end")
+        .connect("wave", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap()
+}
+
+/// The bound `task` string of an activated `do-work` job (fails loudly if the
+/// MI-bound item never reached the inner sub-process scope).
+fn bound_task(job: &ActivatedJob) -> String {
+    match job.variables.get("task") {
+        Some(Value::Str(s)) => s.clone(),
+        other => panic!("expected a bound `task` string in the child scope, got {other:?}"),
+    }
+}
+
+#[test]
+fn parallel_multi_instance_on_a_subprocess_fans_out_one_scope_per_item() {
+    // Agent-fleet / #547 wave nesting: a multi-instance attached to an EMBEDDED
+    // SUB-PROCESS fans out one full sub-process scope per collection item, runs
+    // each inner task with its bound item, then joins. This is the primitive
+    // under "sequential MI over waves wrapping parallel MI over a wave's tasks".
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_subprocess(false)))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub",
+            vars(&[(
+                "tasks",
+                Value::List(vec![
+                    Value::Str("s549".into()),
+                    Value::Str("s550".into()),
+                    Value::Str("s551".into()),
+                ]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // One inner job per item, all active at once (parallel), each carrying its
+    // MI-bound `task` visible inside its own sub-process scope.
+    let jobs = engine.activate_jobs("do-work", "w", 10, 60_000, 0);
+    assert_eq!(jobs.len(), 3, "one sub-process child per task");
+    let mut seen: Vec<String> = jobs.iter().map(bound_task).collect();
+    seen.sort();
+    assert_eq!(seen, vec!["s549", "s550", "s551"]);
+
+    // The join waits for every child sub-process; the token has not left the MI
+    // body until the last one completes.
+    for job in &jobs {
+        assert!(!engine.is_completed(key));
+        assert!(
+            engine
+                .state()
+                .jobs
+                .values()
+                .all(|j| j.job_type != "sink-work"),
+            "sink not reached until the MI sub-process joins"
+        );
+        engine
+            .apply_command(Command::complete_job(job.key))
+            .unwrap();
+    }
+
+    // Joined -> token parked at the sink; aggregate collected in index order
+    // regardless of completion order.
+    assert!(!engine.is_completed(key));
+    assert!(
+        engine
+            .state()
+            .jobs
+            .values()
+            .any(|j| j.job_type == "sink-work" && matches!(j.state, state::JobState::Created)),
+        "token joined the MI sub-process and parked at the sink"
+    );
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("done_tasks"),
+        Some(&Value::List(vec![
+            Value::Str("s549".into()),
+            Value::Str("s550".into()),
+            Value::Str("s551".into()),
+        ]))
+    );
+}
+
+#[test]
+fn sequential_multi_instance_on_a_subprocess_runs_one_scope_at_a_time() {
+    // The sequential form (a "wave" that runs its sub-process bodies one after
+    // another) spawns the next child sub-process only after the previous one
+    // fully completes.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_subprocess(true)))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "mi-sub",
+            vars(&[(
+                "tasks",
+                Value::List(vec![Value::Str("a".into()), Value::Str("b".into())]),
+            )]),
+        ))
+        .unwrap();
+    let key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let first = engine.activate_jobs("do-work", "w", 10, 60_000, 0);
+    assert_eq!(first.len(), 1, "only the first wave sub-process is active");
+    assert_eq!(bound_task(&first[0]), "a");
+    engine
+        .apply_command(Command::complete_job(first[0].key))
+        .unwrap();
+
+    let second = engine.activate_jobs("do-work", "w", 10, 60_000, 0);
+    assert_eq!(
+        second.len(),
+        1,
+        "next sub-process spawned only after the first"
+    );
+    assert_eq!(bound_task(&second[0]), "b");
+    engine
+        .apply_command(Command::complete_job(second[0].key))
+        .unwrap();
+
+    assert!(!engine.is_completed(key));
+    assert_eq!(
+        engine.instance(key).unwrap().variables.get("done_tasks"),
+        Some(&Value::List(vec![
+            Value::Str("a".into()),
+            Value::Str("b".into())
+        ]))
+    );
+}
+
 #[test]
 fn set_variables_local_on_a_multi_instance_child_stays_in_its_scope() {
     // A `local` SetVariables targeting a running MI child scope writes only that
