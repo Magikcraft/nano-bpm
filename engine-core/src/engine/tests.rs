@@ -6942,8 +6942,12 @@ fn parallel_multi_instance_on_a_subprocess_fans_out_one_scope_per_item() {
     assert_eq!(seen, vec!["s549", "s550", "s551"]);
 
     // The join waits for every child sub-process; the token has not left the MI
-    // body until the last one completes.
-    for job in &jobs {
+    // body until the last one completes. Complete the children in a deliberately
+    // shuffled order (last item first, first item last) so that if aggregation
+    // accidentally depended on completion order the assert below would catch it.
+    let by_task: std::collections::HashMap<String, u64> =
+        jobs.iter().map(|j| (bound_task(j), j.key)).collect();
+    for task in ["s551", "s549", "s550"] {
         assert!(!engine.is_completed(key));
         assert!(
             engine
@@ -6954,7 +6958,7 @@ fn parallel_multi_instance_on_a_subprocess_fans_out_one_scope_per_item() {
             "sink not reached until the MI sub-process joins"
         );
         engine
-            .apply_command(Command::complete_job(job.key))
+            .apply_command(Command::complete_job(by_task[task]))
             .unwrap();
     }
 
