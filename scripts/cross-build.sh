@@ -10,9 +10,10 @@
 # distros.
 #
 # It does NOT regenerate the REST layer or the web console: the git-ignored
-# generated/, generated-console/, server/src/stub_impls.rs and console/dist must
-# already exist. The Makefile `cross-*` targets share `release`'s prerequisites,
-# so `make cross-linux-x64` builds those for you first — prefer the make targets.
+# generated/ + server/src/stub_impls.rs must already exist (plus generated-console/
+# and console/dist for the default console build; --no-console needs neither). The
+# Makefile `cross-*` targets share `release`'s prerequisites, so
+# `make cross-linux-x64` builds those for you first — prefer the make targets.
 #
 # Prerequisites (verified below, with install hints):
 #   * rustup + the target's std (auto-added via `rustup target add`)
@@ -46,6 +47,12 @@ die() { echo "cross-build: $*" >&2; exit 1; }
 # than a cryptic `set -u` "$2: unbound variable". Call as `need_val "$@"`.
 need_val() { [ $# -ge 2 ] || die "flag $1 needs a value (e.g. $1 <value>)"; }
 
+# Wrap the entire body in main() so bash parses the whole script before running
+# any of it. Bash reads a script by byte offset as it executes; without this,
+# editing the file on disk while a long `cargo` build is in flight would make
+# bash resume at a stale offset afterwards and fail with a spurious
+# "syntax error near unexpected token". A fully-parsed main() is edit-safe.
+main() {
 TARGET=""; GLIBC="2.31"; CONSOLE=1; OUT=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -120,3 +127,6 @@ cp "$built" "$OUT"
 echo "cross-build: staged $(command -v file >/dev/null 2>&1 && file -b "$OUT" || echo "$OUT")"
 echo "cross-build: -> $OUT"
 echo "BUILD_OK $TARGET $OUT (${secs}s)"
+}
+
+main "$@"
