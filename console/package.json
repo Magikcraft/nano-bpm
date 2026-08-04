@@ -18,6 +18,7 @@
     "test:e2e": "playwright test"
   },
   "dependencies": {
+    "@bpmn-io/extract-process-variables": "^2.2.1",
     "@bpmn-io/form-js": "^1.21.3",
     "@bpmn-io/properties-panel": "^3.44.1",
     "@camunda/zeebe-element-templates-json-schema": "0.44.0",

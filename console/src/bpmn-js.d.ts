@@ -98,6 +98,13 @@ declare module "camunda-bpmn-js-behaviors/lib/camunda-cloud" {
 }
 
 declare module "@bpmn-io/extract-process-variables/zeebe" {
-  /** Variables written into scope up to `element` (moddle business object). */
-  export function getVariablesForElement(element: unknown): { name: string }[];
+  /**
+   * Variables written into scope up to `element` (moddle business object).
+   * Async since v2 — resolves to the variable list. Consumers (including
+   * bpmn-js-properties-panel and our own resolver) must await it; treating it
+   * as synchronous throws "not iterable" and wedges the properties panel.
+   */
+  export function getVariablesForElement(
+    element: unknown,
+  ): Promise<{ name: string }[]>;
 }
