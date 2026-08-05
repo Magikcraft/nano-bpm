@@ -4353,9 +4353,10 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
     use std::collections::HashMap;
 
     // (a) Old log entries lack the new fields — they must still deserialize.
-    let throw: Command =
-        serde_json::from_str(r#"{"ThrowJobError":{"job_key":7,"error_code":"E","error_message":"m"}}"#)
-            .expect("legacy ThrowJobError without variables must deserialize");
+    let throw: Command = serde_json::from_str(
+        r#"{"ThrowJobError":{"job_key":7,"error_code":"E","error_message":"m"}}"#,
+    )
+    .expect("legacy ThrowJobError without variables must deserialize");
     assert!(matches!(
         throw,
         Command::ThrowJobError { ref variables, .. } if variables.is_empty()
@@ -4366,7 +4367,10 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
             .expect("legacy UpdateJobRetries without operation_reference must deserialize");
     assert!(matches!(
         retries,
-        Command::UpdateJobRetries { operation_reference: None, .. }
+        Command::UpdateJobRetries {
+            operation_reference: None,
+            ..
+        }
     ));
 
     let timeout: Command =
@@ -4374,7 +4378,10 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
             .expect("legacy UpdateJobTimeout without operation_reference must deserialize");
     assert!(matches!(
         timeout,
-        Command::UpdateJobTimeout { operation_reference: None, .. }
+        Command::UpdateJobTimeout {
+            operation_reference: None,
+            ..
+        }
     ));
 
     // (b) The empty/absent form must not appear on the wire (byte-unchanged).
@@ -4385,7 +4392,10 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
         variables: HashMap::new(),
     };
     let s = serde_json::to_string(&throw_empty).unwrap();
-    assert!(!s.contains("variables"), "empty variables must be skipped: {s}");
+    assert!(
+        !s.contains("variables"),
+        "empty variables must be skipped: {s}"
+    );
 
     let s = serde_json::to_string(&Command::update_job_retries(7, 3)).unwrap();
     assert!(
@@ -4405,7 +4415,10 @@ fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
     let back: Command = serde_json::from_str(&s).unwrap();
     assert!(matches!(
         back,
-        Command::UpdateJobRetries { operation_reference: Some(42), .. }
+        Command::UpdateJobRetries {
+            operation_reference: Some(42),
+            ..
+        }
     ));
 }
 

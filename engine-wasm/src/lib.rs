@@ -338,11 +338,11 @@ impl TestEngine {
     ) -> Result<String, JsValue> {
         let key = parse_key(job_key)?;
         self.ensure_activated(key)?;
-        self.apply(Command::ThrowJobError {
-            job_key: key,
-            error_code: error_code.to_string(),
-            error_message: error_message.to_string(),
-        })
+        self.apply(Command::throw_job_error(
+            key,
+            error_code.to_string(),
+            error_message.to_string(),
+        ))
         .map_err(|e| js_err(&format!("throw error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }
@@ -353,11 +353,8 @@ impl TestEngine {
     #[wasm_bindgen(js_name = updateRetries)]
     pub fn update_retries(&mut self, job_key: &str, retries: i32) -> Result<String, JsValue> {
         let key = parse_key(job_key)?;
-        self.apply(Command::UpdateJobRetries {
-            job_key: key,
-            retries,
-        })
-        .map_err(|e| js_err(&format!("update retries error: {e}")))?;
+        self.apply(Command::update_job_retries(key, retries))
+            .map_err(|e| js_err(&format!("update retries error: {e}")))?;
         to_json(&self.snapshot_value(None))
     }
 
