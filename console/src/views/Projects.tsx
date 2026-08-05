@@ -6,9 +6,11 @@ import {
   importProject,
   listProjects,
   renameProject,
+  updateProjectFromTemplate,
   type ProjectSummary,
   type ProjectTemplate,
   type TemplateOption,
+  type UpdatePlan,
 } from "../gen";
 import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
 import JourneyPicker from "../components/JourneyPicker";
@@ -70,6 +72,13 @@ export default function Projects() {
   const [browsing, setBrowsing] = useState(false);
   const canBrowse = useMemo(() => isLocalhost(), []);
   const [busy, setBusy] = useState(false);
+  // "Update from template" flow: the dry-run plan awaiting the user's review,
+  // and whether an apply is in flight.
+  const [updatePlan, setUpdatePlan] = useState<{
+    project: ProjectSummary;
+    plan: UpdatePlan;
+  } | null>(null);
+  const [updateBusy, setUpdateBusy] = useState(false);
   // "Point your agent here" affordance (ADR 0051): reveals the /agent brief URL
   // an external coding agent can be aimed at to author an app and link it in.
   const [agentHint, setAgentHint] = useState(false);
@@ -236,6 +245,47 @@ export default function Projects() {
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  /// Preview a template update (dry run): fetch the overlay plan and open the
+  /// review modal. Nothing is written until the user confirms.
+  const previewUpdate = async (project: ProjectSummary) => {
+    setUpdateBusy(true);
+    try {
+      const plan = (
+        await updateProjectFromTemplate({
+          path: { name: project.name },
+          body: { apply: false },
+          throwOnError: true,
+        })
+      ).data;
+      setUpdatePlan({ project, plan });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdateBusy(false);
+    }
+  };
+
+  /// Apply the reviewed plan: write the non-conflicting subset, then reload.
+  const applyUpdate = async () => {
+    if (!updatePlan) return;
+    setUpdateBusy(true);
+    try {
+      const plan = (
+        await updateProjectFromTemplate({
+          path: { name: updatePlan.project.name },
+          body: { apply: true },
+          throwOnError: true,
+        })
+      ).data;
+      setUpdatePlan({ project: updatePlan.project, plan });
+      await reload();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setUpdateBusy(false);
     }
   };
 
@@ -615,9 +665,23 @@ export default function Projects() {
               onOpen={() => navigate(`/projects/${encodeURIComponent(p.name)}`)}
               onDelete={() => void remove(p)}
               onRename={() => void rename(p)}
+              onUpdate={
+                p.updateAvailable && !updateBusy
+                  ? () => void previewUpdate(p)
+                  : undefined
+              }
             />
           ))}
         </div>
+      )}
+      {updatePlan && (
+        <UpdatePlanModal
+          project={updatePlan.project}
+          plan={updatePlan.plan}
+          busy={updateBusy}
+          onApply={() => void applyUpdate()}
+          onClose={() => setUpdatePlan(null)}
+        />
       )}
     </div>
   );
@@ -724,17 +788,30 @@ function ProjectTile({
   onOpen,
   onDelete,
   onRename,
+  onUpdate,
 }: {
   project: ProjectSummary;
   lang?: LangMeta;
   onOpen: () => void;
   onDelete: () => void;
   onRename: () => void;
+  onUpdate?: () => void;
 }) {
   const title = project.displayName ?? project.name;
   return (
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
       <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex">
+        {onUpdate && (
+          <button
+            type="button"
+            onClick={onUpdate}
+            title={`Update from template${project.latestVersion ? ` (v${project.latestVersion} available)` : ""}`}
+            aria-label={`Update ${title} from template`}
+            className="rounded px-1.5 py-0.5 text-xs text-accent hover:bg-accent/10"
+          >
+            ↑
+          </button>
+        )}
         <button
           type="button"
           onClick={onRename}
@@ -777,6 +854,14 @@ function ProjectTile({
               className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent"
             >
               ⧉ linked
+            </span>
+          )}
+          {project.updateAvailable && (
+            <span
+              title={`A newer template is available${project.latestVersion ? ` (v${project.latestVersion})` : ""} — hover and click ↑ to review the update`}
+              className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent"
+            >
+              ↑ update
             </span>
           )}
           {project.running && (
@@ -824,6 +909,145 @@ function TemplateProvenance({ project }: { project: ProjectSummary }) {
         <span className="text-fg-muted">{project.template}</span>
         <span className="text-fg-faint"> · {origin}</span>
       </span>
+    </div>
+  );
+}
+
+/// The review modal for "Update from template": shows the overlay plan grouped
+/// by outcome (new / updated / merged / conflicts / kept), and applies the safe
+/// subset on confirm. Conflicts are never written — they're surfaced so the
+/// user can resolve them by hand and re-run.
+function UpdatePlanModal({
+  project,
+  plan,
+  busy,
+  onApply,
+  onClose,
+}: {
+  project: ProjectSummary;
+  plan: UpdatePlan;
+  busy: boolean;
+  onApply: () => void;
+  onClose: () => void;
+}) {
+  const title = project.displayName ?? project.name;
+  const changes =
+    plan.create.length + plan.overwrite.length + plan.merged.length;
+  const nothingToDo = changes === 0 && plan.conflicts.length === 0;
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-edge bg-panel shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-edge px-4 py-2.5">
+          <h2 className="text-sm font-semibold text-fg">
+            Update “{title}” from template
+          </h2>
+          <button
+            onClick={onClose}
+            className="rounded p-1 text-fg-faint hover:bg-hover"
+            title="Close"
+          >
+            ✕
+          </button>
+        </div>
+        <div className="min-h-0 flex-1 space-y-3 overflow-auto p-4 text-sm">
+          <p className="text-fg-faint">
+            {plan.pack}
+            {plan.fromVersion ? ` v${plan.fromVersion}` : ""} →
+            {plan.toVersion ? ` v${plan.toVersion}` : " latest"}
+            {plan.applied && (
+              <span className="ml-2 font-semibold text-ok">
+                {plan.versionBumped ? "✓ applied" : "✓ applied (version kept)"}
+              </span>
+            )}
+          </p>
+          {plan.conflicts.length > 0 && (
+            <p className="rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+              {plan.conflicts.length} file
+              {plan.conflicts.length === 1 ? "" : "s"} changed both upstream and
+              locally — these are <strong>not</strong> written. Resolve them by
+              hand, then re-run the update.
+            </p>
+          )}
+          <PlanGroup label="New files" tone="ok" items={plan.create} />
+          <PlanGroup label="Updated" tone="accent" items={plan.overwrite} />
+          <PlanGroup
+            label="Merged (your edits kept)"
+            tone="accent"
+            items={plan.merged}
+          />
+          <PlanGroup
+            label="Conflicts (skipped)"
+            tone="danger"
+            items={plan.conflicts}
+          />
+          <PlanGroup label="Preserved" tone="muted" items={plan.preserved} />
+          <PlanGroup
+            label="Kept (local only)"
+            tone="muted"
+            items={plan.orphans}
+          />
+          {nothingToDo && (
+            <p className="text-fg-faint">
+              This project is already up to date with the template.
+            </p>
+          )}
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-edge px-4 py-2.5">
+          <Button variant="ghost" onClick={onClose} disabled={busy}>
+            {plan.applied ? "Close" : "Cancel"}
+          </Button>
+          {!plan.applied && (
+            <Button onClick={onApply} disabled={busy || changes === 0}>
+              {busy
+                ? "Applying…"
+                : plan.conflicts.length > 0
+                  ? `Apply ${changes} safe change${changes === 1 ? "" : "s"}`
+                  : "Apply update"}
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/// One labelled bucket of the update plan; renders nothing when empty.
+function PlanGroup({
+  label,
+  items,
+  tone,
+}: {
+  label: string;
+  items: string[];
+  tone: "ok" | "accent" | "danger" | "muted";
+}) {
+  if (items.length === 0) return null;
+  const toneClass = {
+    ok: "text-ok",
+    accent: "text-accent",
+    danger: "text-danger",
+    muted: "text-fg-muted",
+  }[tone];
+  return (
+    <div>
+      <div
+        className={`mb-1 text-xs font-semibold uppercase tracking-wider ${toneClass}`}
+      >
+        {label} ({items.length})
+      </div>
+      <ul className="space-y-0.5 font-mono text-xs text-fg-faint">
+        {items.map((f) => (
+          <li key={f} className="truncate" title={f}>
+            {f}
+          </li>
+        ))}
+      </ul>
     </div>
   );
 }

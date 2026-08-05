@@ -3797,6 +3797,34 @@ pub struct ProjectSummary {
     /// the built-in scaffold).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scaffolded_from: Option<ScaffoldedFrom>,
+    /// True when the project was scaffolded from a pack whose currently
+    /// installed version differs from the recorded `scaffolded_from.version`
+    /// — a newer template is available to overlay via `update_from_template`.
+    /// Offline signal (installed pack vs breadcrumb); false for built-ins.
+    pub update_available: bool,
+    /// The installed pack's version, when it differs from the recorded
+    /// scaffold version (the update target). Absent when up to date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+}
+
+/// Compare a project's recorded scaffold version against the currently
+/// installed pack version to decide whether a template update is available.
+/// Offline and best-effort: an unknown installed version (built-in pack, or
+/// `package.json` unreadable) yields no update. Returns `(update_available,
+/// latest_version)` where `latest_version` is `Some` only when it differs.
+fn compute_update_available(sf: Option<&ScaffoldedFrom>) -> (bool, Option<String>) {
+    let Some(sf) = sf else {
+        return (false, None);
+    };
+    let Some(installed) = super::extensions::pack_version(&sf.pack) else {
+        return (false, None);
+    };
+    if sf.version.as_deref() == Some(installed.as_str()) {
+        (false, None)
+    } else {
+        (true, Some(installed))
+    }
 }
 
 fn count_ext(dir: &Path, ext: &str) -> usize {
@@ -3833,6 +3861,8 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         }
         let cfg = read_config(name).unwrap_or_else(|| ProjectConfig::new(name, ""));
         let res = path.join("resources");
+        let (update_available, latest_version) =
+            compute_update_available(cfg.scaffolded_from.as_ref());
         out.push(ProjectSummary {
             name: name.to_string(),
             display_name: cfg.display_name,
@@ -3848,6 +3878,8 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
             lang: cfg.lang,
             template: cfg.template,
             scaffolded_from: cfg.scaffolded_from,
+            update_available,
+            latest_version,
         });
     }
     // Imported-by-reference projects (ADR 0041): `<name>.project-ref.json` files
@@ -3896,11 +3928,15 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
                 lang: "deno".to_string(),
                 template: None,
                 scaffolded_from: None,
+                update_available: false,
+                latest_version: None,
             });
             continue;
         }
         let cfg = read_config(name).unwrap_or_else(|| ProjectConfig::new(name, ""));
         let res = dir.join("resources");
+        let (update_available, latest_version) =
+            compute_update_available(cfg.scaffolded_from.as_ref());
         out.push(ProjectSummary {
             name: name.to_string(),
             // Prefer the spelling the operator typed at import time (kept on the
@@ -3922,6 +3958,8 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
             lang: cfg.lang,
             template: cfg.template,
             scaffolded_from: cfg.scaffolded_from,
+            update_available,
+            latest_version,
         });
     }
     out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then(a.name.cmp(&b.name)));
@@ -3929,8 +3967,391 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
 }
 
 // ---------------------------------------------------------------------------
-// File tree
+// Update from template (issue #573)
 // ---------------------------------------------------------------------------
+
+/// The overlay plan for updating a project from a newer version of its
+/// scaffolding pack. All buckets are project-relative POSIX-ish paths.
+#[derive(Serialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePlan {
+    /// The scaffolding pack id (`scaffolded_from.pack`).
+    pub pack: String,
+    /// The project's recorded scaffold version (the 3-way merge base).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
+    /// The version being overlaid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    /// False for a dry run; true when the plan was written.
+    pub applied: bool,
+    /// True when `scaffolded_from.version` was advanced (clean apply only).
+    pub version_bumped: bool,
+    /// New files the pack adds.
+    pub create: Vec<String>,
+    /// Files the pack changed that the user had not modified (safe overwrite).
+    pub overwrite: Vec<String>,
+    /// Files 3-way auto-merged (upstream + local edits, no overlap).
+    pub merged: Vec<String>,
+    /// Files/dirs kept as-is (datasource DB, nano-generated/, .git/, …).
+    pub preserved: Vec<String>,
+    /// Files where upstream and local both changed and could not be
+    /// auto-merged — NOT written; surfaced for manual resolution.
+    pub conflicts: Vec<String>,
+    /// Files present locally but absent from the new pack — kept, listed.
+    pub orphans: Vec<String>,
+}
+
+/// Directory names (any depth) whose entire subtree is preserved across an
+/// update: local VCS/deps and derived/generated state the pack must never
+/// clobber.
+const UPDATE_PRESERVE_DIRS: &[&str] = &[".git", "node_modules", "nano-generated", ".nano"];
+
+/// Whether a project-relative path lies inside a preserved subtree.
+fn is_preserved_path(rel: &Path) -> bool {
+    rel.components().any(|c| {
+        matches!(c, std::path::Component::Normal(os)
+            if UPDATE_PRESERVE_DIRS.iter().any(|d| os == *d))
+    })
+}
+
+/// The datasource sqlite file (+ WAL/SHM sidecars) to preserve, resolved from
+/// `NANO_APP_DB_URL` (default `file:./app.db`). Only in-tree, relative targets
+/// are honoured — an absolute or `..`-escaping URL is ignored (nothing to
+/// preserve in-tree).
+fn datasource_preserve_files() -> Vec<String> {
+    let url = std::env::var("NANO_APP_DB_URL").unwrap_or_else(|_| "file:./app.db".to_string());
+    let raw = url.strip_prefix("file:").unwrap_or(&url);
+    let raw = raw.strip_prefix("./").unwrap_or(raw);
+    let p = Path::new(raw);
+    if raw.is_empty()
+        || p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Vec::new();
+    }
+    vec![raw.to_string(), format!("{raw}-wal"), format!("{raw}-shm")]
+}
+
+/// Whether the byte content looks like text (no NUL in the first 8 KiB), so a
+/// 3-way `git merge-file` is meaningful. Binary files fall back to whole-file
+/// conflict handling.
+fn looks_textual(bytes: &[u8]) -> bool {
+    !bytes.iter().take(8192).any(|&b| b == 0)
+}
+
+/// Attempt a 3-way text merge of `current`+`new` over `base` using
+/// `git merge-file -p` (stdin-free, temp-file based). Returns `Some(merged)`
+/// on a clean auto-merge, `None` on conflict or when git/text preconditions
+/// aren't met. Never writes into the project.
+fn try_git_merge(base: &[u8], current: &[u8], new: &[u8]) -> Option<Vec<u8>> {
+    if !(looks_textual(base) && looks_textual(current) && looks_textual(new)) {
+        return None;
+    }
+    let git = super::extensions::find_program("git")?;
+    let tmp = std::env::temp_dir().join(format!(
+        "nano-merge-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&tmp).ok()?;
+    let cur_p = tmp.join("current");
+    let base_p = tmp.join("base");
+    let new_p = tmp.join("new");
+    let write_ok = std::fs::write(&cur_p, current).is_ok()
+        && std::fs::write(&base_p, base).is_ok()
+        && std::fs::write(&new_p, new).is_ok();
+    let result = if write_ok {
+        std::process::Command::new(&git)
+            .args(["merge-file", "-p", "--stdout"])
+            .arg(&cur_p)
+            .arg(&base_p)
+            .arg(&new_p)
+            .output()
+            .ok()
+            .and_then(|out| {
+                // git merge-file exits 0 on clean merge, >0 = conflict count.
+                out.status.success().then_some(out.stdout)
+            })
+    } else {
+        None
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Recursively collect every file under `root` as a project-relative path.
+fn collect_rel_files(root: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_rel_files(root, &p, out);
+        } else if let Ok(rel) = p.strip_prefix(root) {
+            out.push(rel.to_path_buf());
+        }
+    }
+}
+
+/// Overlay a newer version of a project's scaffolding pack onto it, using the
+/// recorded scaffold version as a 3-way merge base so a user's edits to
+/// upstream-unchanged files survive and only genuine conflicts surface. See the
+/// `updateProjectFromTemplate` OpenAPI op for the contract. `apply=false` is a
+/// dry run (no writes). Returns the plan.
+pub fn update_from_template(
+    name: &str,
+    apply: bool,
+    version: Option<&str>,
+) -> Result<UpdatePlan, String> {
+    let dir = project_dir(name).ok_or_else(|| "not found".to_string())?;
+    if !dir.is_dir() {
+        return Err("not found".to_string());
+    }
+    let mut cfg = read_config(name).ok_or_else(|| "not found".to_string())?;
+    let sf = cfg
+        .scaffolded_from
+        .clone()
+        .ok_or_else(|| "project was not scaffolded from a pack".to_string())?;
+    let template = cfg
+        .template
+        .clone()
+        .ok_or_else(|| "project has no recorded template".to_string())?;
+
+    // Resolve the "new" source tree + its version. Default: the currently
+    // installed pack on disk (the marketplace already updates the pack itself).
+    // An explicit, different `version` is fetched from npm into a temp dir.
+    let installed_version = super::extensions::pack_version(&sf.pack);
+    let want_version = version
+        .map(String::from)
+        .or_else(|| installed_version.clone());
+    let mut tmp_dirs: Vec<PathBuf> = Vec::new();
+    let new_src: PathBuf = match version {
+        Some(v) if Some(v.to_string()) != installed_version => {
+            let pkg = super::extensions::pack_npm_name(&sf.pack)
+                .ok_or_else(|| "pack has no npm name (built-in?)".to_string())?;
+            let root = super::extensions::pack_into_tmp(&format!("{pkg}@{v}"))?;
+            tmp_dirs.push(root.clone());
+            super::extensions::template_dir_in_root(&root, &template)
+                .ok_or_else(|| format!("template '{template}' not found in {pkg}@{v}"))?
+        }
+        _ => super::extensions::template_source(&template)
+            .map(|(_, d)| d)
+            .ok_or_else(|| format!("pack '{}' / template '{template}' not installed", sf.pack))?,
+    };
+
+    // Resolve the 3-way base: the recorded scaffold version fetched from npm.
+    // Best-effort — if unavailable, we degrade to a safe 2-way overlay.
+    let base_src: Option<PathBuf> = match (&sf.version, super::extensions::pack_npm_name(&sf.pack))
+    {
+        (Some(fromv), Some(pkg)) => {
+            match super::extensions::pack_into_tmp(&format!("{pkg}@{fromv}")) {
+                Ok(root) => {
+                    tmp_dirs.push(root.clone());
+                    super::extensions::template_dir_in_root(&root, &template)
+                }
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+
+    let cleanup = |dirs: &[PathBuf]| {
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    };
+
+    let plan = overlay_plan(
+        &dir,
+        &new_src,
+        base_src.as_deref(),
+        apply,
+        &sf.pack,
+        sf.version.clone(),
+        want_version.clone(),
+    );
+    let mut plan = match plan {
+        Ok(p) => p,
+        Err(e) => {
+            cleanup(&tmp_dirs);
+            return Err(e);
+        }
+    };
+
+    // Bump the recorded scaffold version only on a clean apply (no conflicts),
+    // preserving the old merge base for a later re-run when conflicts remain.
+    if apply
+        && plan.conflicts.is_empty()
+        && want_version.is_some()
+        && want_version != sf.version
+        && maybe_bump_scaffold_version(name, &mut cfg, want_version.clone())
+    {
+        plan.version_bumped = true;
+    }
+
+    cleanup(&tmp_dirs);
+    Ok(plan)
+}
+
+/// Write `to_version` into the project's `scaffolded_from.version` breadcrumb.
+/// Returns whether the config was updated (best-effort — a write failure leaves
+/// the old version so a later re-run still has the right merge base).
+fn maybe_bump_scaffold_version(
+    name: &str,
+    cfg: &mut ProjectConfig,
+    to_version: Option<String>,
+) -> bool {
+    if let Some(sfm) = cfg.scaffolded_from.as_mut() {
+        sfm.version = to_version;
+    } else {
+        return false;
+    }
+    write_config(name, cfg).is_ok()
+}
+
+/// The pure, directory-level overlay: classify every file in `new_src` against
+/// the project `dir` (and the optional 3-way `base_src`), writing the safe
+/// subset when `apply`. No npm/config side effects — the orchestrator
+/// [`update_from_template`] resolves the source dirs and handles the version
+/// bump. Factored out so the merge classification is unit-testable without a
+/// live registry.
+#[allow(clippy::too_many_arguments)]
+fn overlay_plan(
+    dir: &Path,
+    new_src: &Path,
+    base_src: Option<&Path>,
+    apply: bool,
+    pack: &str,
+    from_version: Option<String>,
+    to_version: Option<String>,
+) -> Result<UpdatePlan, String> {
+    let mut plan = UpdatePlan {
+        pack: pack.to_string(),
+        from_version,
+        to_version,
+        applied: apply,
+        ..Default::default()
+    };
+
+    // Track preserved subtree names we've already reported once (dir-level).
+    let mut preserved_seen: BTreeSet<String> = BTreeSet::new();
+    let ds_preserve: BTreeSet<String> = datasource_preserve_files().into_iter().collect();
+
+    // Walk the new source tree; classify each file.
+    let mut new_files: Vec<PathBuf> = Vec::new();
+    collect_rel_files(new_src, new_src, &mut new_files);
+    new_files.sort();
+    let new_set: BTreeSet<PathBuf> = new_files.iter().cloned().collect();
+
+    for rel in &new_files {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if is_preserved_path(rel) {
+            if let Some(top) = rel.components().find_map(|c| match c {
+                std::path::Component::Normal(os)
+                    if UPDATE_PRESERVE_DIRS.iter().any(|d| os == *d) =>
+                {
+                    Some(os.to_string_lossy().to_string())
+                }
+                _ => None,
+            }) && preserved_seen.insert(top.clone())
+            {
+                plan.preserved.push(top);
+            }
+            continue;
+        }
+        if ds_preserve.contains(&rel_str) {
+            if preserved_seen.insert(rel_str.clone()) {
+                plan.preserved.push(rel_str.clone());
+            }
+            continue;
+        }
+        let src_path = new_src.join(rel);
+        let dst_path = dir.join(rel);
+        let Ok(new_bytes) = std::fs::read(&src_path) else {
+            continue;
+        };
+        let Ok(cur_bytes) = std::fs::read(&dst_path) else {
+            // File doesn't exist locally → new file.
+            plan.create.push(rel_str.clone());
+            if apply {
+                if let Some(parent) = dst_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if std::fs::write(&dst_path, &new_bytes).is_err() {
+                    return Err(format!("write {rel_str}"));
+                }
+            }
+            continue;
+        };
+        if cur_bytes == new_bytes {
+            continue; // identical — nothing to do.
+        }
+        // 3-way classification when a base is available.
+        let base_bytes = base_src.and_then(|b| std::fs::read(b.join(rel)).ok());
+        match base_bytes {
+            Some(base) if cur_bytes == base => {
+                // User hadn't touched it → safe to take upstream's new version.
+                plan.overwrite.push(rel_str.clone());
+                if apply && std::fs::write(&dst_path, &new_bytes).is_err() {
+                    return Err(format!("write {rel_str}"));
+                }
+            }
+            Some(base) if new_bytes == base => {
+                // Upstream unchanged since scaffold; user edited → keep local.
+            }
+            Some(base) => {
+                // Both sides changed — try a 3-way auto-merge, else conflict.
+                if let Some(merged) = try_git_merge(&base, &cur_bytes, &new_bytes) {
+                    plan.merged.push(rel_str.clone());
+                    if apply && std::fs::write(&dst_path, &merged).is_err() {
+                        return Err(format!("write {rel_str}"));
+                    }
+                } else {
+                    plan.conflicts.push(rel_str.clone());
+                }
+            }
+            None => {
+                // No merge base (2-way): the file exists locally and differs —
+                // we can't prove the user didn't edit it, so never clobber.
+                plan.conflicts.push(rel_str.clone());
+            }
+        }
+    }
+
+    // Orphans: files present locally but absent from the new pack (kept).
+    let mut local_files: Vec<PathBuf> = Vec::new();
+    collect_rel_files(dir, dir, &mut local_files);
+    for rel in local_files {
+        if is_preserved_path(&rel) {
+            continue;
+        }
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if ds_preserve.contains(&rel_str) {
+            continue;
+        }
+        // The project config/breadcrumb file is project-owned, not an orphan.
+        if rel_str == CONFIG_FILE {
+            continue;
+        }
+        if !new_set.contains(&rel) {
+            plan.orphans.push(rel_str);
+        }
+    }
+
+    plan.create.sort();
+    plan.overwrite.sort();
+    plan.merged.sort();
+    plan.preserved.sort();
+    plan.conflicts.sort();
+    plan.orphans.sort();
+    Ok(plan)
+}
 
 /// A node in the project file tree.
 #[derive(Serialize)]
@@ -10202,6 +10623,227 @@ mod tests {
         assert!(
             required_npm_deps(&dir).is_empty(),
             "a valid import-less deno.json must not fall through to deno.jsonc"
+        );
+    }
+
+    // ── update-from-template overlay / 3-way merge (issue #573) ────────────
+
+    /// Build a throwaway directory tree from `(relpath, contents)` pairs and
+    /// return its root. Cleaned up by the OS temp reaper; each call is unique.
+    fn tree(files: &[(&str, &str)]) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nano-overlay-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, AOrd::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        root
+    }
+
+    fn read(dir: &Path, rel: &str) -> String {
+        std::fs::read_to_string(dir.join(rel)).unwrap()
+    }
+
+    #[test]
+    fn compute_update_available_compares_recorded_vs_installed() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = root.join("ext-store");
+        let pack = ext.join("nanobpm__app-x");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"appx","kind":"app","displayName":"X"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("package.json"),
+            r#"{"name":"@nanobpm/app-x","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+
+        // No scaffold breadcrumb → never an update.
+        assert_eq!(compute_update_available(None), (false, None));
+
+        // Recorded == installed → up to date.
+        let same = ScaffoldedFrom {
+            pack: "appx".into(),
+            version: Some("2.0.0".into()),
+        };
+        assert_eq!(compute_update_available(Some(&same)), (false, None));
+
+        // Recorded older → update available, surfacing the installed version.
+        let older = ScaffoldedFrom {
+            pack: "appx".into(),
+            version: Some("1.0.0".into()),
+        };
+        assert_eq!(
+            compute_update_available(Some(&older)),
+            (true, Some("2.0.0".into()))
+        );
+
+        // Unknown installed version (built-in / unreadable) → no update.
+        let missing = ScaffoldedFrom {
+            pack: "nope".into(),
+            version: Some("1.0.0".into()),
+        };
+        assert_eq!(compute_update_available(Some(&missing)), (false, None));
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    #[test]
+    fn overlay_plan_dry_run_classifies_without_writing() {
+        let _g = lock();
+        // Ensure a deterministic datasource-preserve target.
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        let proj = tree(&[
+            ("main.ts", "old\n"),        // upstream will change, user untouched
+            ("keep.ts", "user local\n"), // user-only file (orphan)
+            ("app.db", "SQLITEDATA"),    // datasource — preserved
+            (".git/config", "[core]\n"), // vcs — preserved subtree
+        ]);
+        let base = tree(&[("main.ts", "old\n")]);
+        let new = tree(&[
+            ("main.ts", "new upstream\n"),
+            ("added.ts", "brand new\n"),
+            ("app.db", "PACKDEFAULT"), // pack ships a stub DB — must be preserved
+            ("nano-generated/gen.ts", "x"), // generated subtree — preserved
+        ]);
+
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            false,
+            "appx",
+            Some("1.0.0".into()),
+            Some("2.0.0".into()),
+        )
+        .unwrap();
+
+        assert_eq!(plan.create, vec!["added.ts"]);
+        assert_eq!(plan.overwrite, vec!["main.ts"]);
+        assert!(plan.merged.is_empty());
+        assert!(plan.conflicts.is_empty());
+        assert!(plan.preserved.contains(&"nano-generated".to_string()));
+        assert!(plan.preserved.contains(&"app.db".to_string()));
+        assert_eq!(plan.orphans, vec!["keep.ts"]);
+        assert!(!plan.applied && !plan.version_bumped);
+
+        // Dry run must not touch the filesystem.
+        assert_eq!(read(&proj, "main.ts"), "old\n");
+        assert!(!proj.join("added.ts").exists());
+        assert_eq!(read(&proj, "app.db"), "SQLITEDATA");
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[test]
+    fn overlay_plan_three_way_keeps_user_edit_when_upstream_unchanged() {
+        let _g = lock();
+        let base = tree(&[("main.ts", "line1\nline2\n")]);
+        // User edited the file; upstream (new) is identical to base.
+        let proj = tree(&[("main.ts", "line1\nMINE\n")]);
+        let new = tree(&[("main.ts", "line1\nline2\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        assert!(plan.overwrite.is_empty() && plan.conflicts.is_empty() && plan.merged.is_empty());
+        // The user's edit survives verbatim.
+        assert_eq!(read(&proj, "main.ts"), "line1\nMINE\n");
+    }
+
+    #[test]
+    fn overlay_plan_three_way_auto_merges_disjoint_edits() {
+        let _g = lock();
+        let base = tree(&[("f.txt", "a\nb\nc\nd\ne\n")]);
+        // User changed the top; upstream changed the bottom → non-overlapping.
+        let proj = tree(&[("f.txt", "AAA\nb\nc\nd\ne\n")]);
+        let new = tree(&[("f.txt", "a\nb\nc\nd\nEEE\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        assert_eq!(plan.merged, vec!["f.txt"], "disjoint edits auto-merge");
+        assert!(plan.conflicts.is_empty());
+        let merged = read(&proj, "f.txt");
+        assert!(merged.contains("AAA") && merged.contains("EEE"));
+    }
+
+    #[test]
+    fn overlay_plan_three_way_surfaces_a_real_conflict_and_does_not_clobber() {
+        let _g = lock();
+        let base = tree(&[("f.txt", "shared\n")]);
+        // Both sides changed the same line → conflict.
+        let proj = tree(&[("f.txt", "user version\n")]);
+        let new = tree(&[("f.txt", "upstream version\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        assert_eq!(plan.conflicts, vec!["f.txt"]);
+        assert!(plan.overwrite.is_empty() && plan.merged.is_empty());
+        // The user's file is left untouched on a conflict.
+        assert_eq!(read(&proj, "f.txt"), "user version\n");
+    }
+
+    #[test]
+    fn overlay_plan_without_base_treats_any_local_change_as_conflict() {
+        let _g = lock();
+        // No merge base (couldn't fetch the scaffold version) → safe 2-way:
+        // an existing, differing file is a conflict, never a silent overwrite.
+        let proj = tree(&[("f.txt", "local\n"), ("same.txt", "x\n")]);
+        let new = tree(&[
+            ("f.txt", "upstream\n"),
+            ("same.txt", "x\n"),
+            ("n.txt", "new\n"),
+        ]);
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+        assert_eq!(plan.conflicts, vec!["f.txt"]);
+        assert_eq!(plan.create, vec!["n.txt"]);
+        assert_eq!(read(&proj, "f.txt"), "local\n");
+        assert_eq!(read(&proj, "n.txt"), "new\n");
+    }
+
+    #[test]
+    fn overlay_plan_apply_writes_create_and_overwrite() {
+        let _g = lock();
+        let base = tree(&[("a.txt", "1\n")]);
+        let proj = tree(&[("a.txt", "1\n")]);
+        let new = tree(&[("a.txt", "2\n"), ("sub/b.txt", "hi\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        assert_eq!(plan.overwrite, vec!["a.txt"]);
+        assert_eq!(plan.create, vec!["sub/b.txt"]);
+        assert_eq!(read(&proj, "a.txt"), "2\n");
+        assert_eq!(read(&proj, "sub/b.txt"), "hi\n");
+    }
+
+    #[test]
+    fn maybe_bump_scaffold_version_persists_only_with_a_breadcrumb() {
+        let _g = lock();
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("proj")).unwrap();
+        let mut cfg = ProjectConfig::new("proj", "");
+        // No scaffolded_from → nothing to bump.
+        assert!(!maybe_bump_scaffold_version(
+            "proj",
+            &mut cfg,
+            Some("2.0.0".into())
+        ));
+
+        cfg.scaffolded_from = Some(ScaffoldedFrom {
+            pack: "appx".into(),
+            version: Some("1.0.0".into()),
+        });
+        write_config("proj", &cfg).unwrap();
+        assert!(maybe_bump_scaffold_version(
+            "proj",
+            &mut cfg,
+            Some("2.0.0".into())
+        ));
+        let reread = read_config("proj").unwrap();
+        assert_eq!(
+            reread.scaffolded_from.and_then(|s| s.version),
+            Some("2.0.0".into())
         );
     }
 }

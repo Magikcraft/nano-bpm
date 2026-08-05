@@ -920,7 +920,78 @@ pub fn pack_version(ext_id: &str) -> Option<String> {
     None
 }
 
-/// Reads the element templates contributed by the installed pack `ext_id` (ADR
+/// The npm package **name** of the installed pack whose manifest id is `ext_id`,
+/// read from its bundled `package.json`. Mirror of [`pack_version`] (same scan,
+/// different field). Returns `None` for built-in packs (no tarball / no
+/// `package.json`) or when the pack dir isn't found. Used to resolve the npm
+/// spec (`<name>@<version>`) when fetching the 3-way merge base of a project
+/// update.
+pub fn pack_npm_name(ext_id: &str) -> Option<String> {
+    for base in pack_dirs() {
+        let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<ExtManifest>(&txt) else {
+            continue;
+        };
+        if m.id != ext_id {
+            continue;
+        }
+        let pkg = std::fs::read_to_string(base.join("package.json")).ok()?;
+        let v: serde_json::Value = serde_json::from_str(&pkg).ok()?;
+        return v
+            .get("name")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+    }
+    None
+}
+
+/// `npm pack <pkg_spec>` + extract into a fresh temp dir, returning the
+/// extracted package root. Unlike [`install_from_npm`], this NEVER touches the
+/// pack store (`safe_pkg_dir`) — it materialises a throwaway copy (e.g. an old
+/// pack version fetched as a 3-way merge base) that the caller cleans up. No
+/// dependency install is run (base/overlay comparison only needs the pack's own
+/// files). `pkg_spec` accepts `name`, `name@version`, or `@scope/name@version`.
+/// Best-effort: requires `npm` and `tar` on PATH.
+pub fn pack_into_tmp(pkg_spec: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "nano-pack-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    let npm = find_program("npm").ok_or("npm not found on PATH")?;
+    let out = std::process::Command::new(&npm)
+        .args(["pack", pkg_spec, "--silent"])
+        .current_dir(&dir)
+        .output()
+        .map_err(|e| format!("npm pack: {e}"))?;
+    if !out.status.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(format!(
+            "npm pack failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let tgz = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let tar = find_program("tar").ok_or("tar not found")?;
+    let st = std::process::Command::new(&tar)
+        .args(["xzf", &tgz, "--strip-components=1"])
+        .current_dir(&dir)
+        .status()
+        .map_err(|e| format!("tar: {e}"))?;
+    if !st.success() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err("tar extract failed".into());
+    }
+    let _ = std::fs::remove_file(dir.join(&tgz));
+    Ok(dir)
+}
 /// 0033 §4): resolves each of its manifest `components` paths against the pack
 /// dir, parses the JSON (a single template or an array), and returns every
 /// element-template-looking entry (a string `id` + a non-empty `appliesTo`).
@@ -1017,6 +1088,30 @@ pub fn template_source(template_id: &str) -> Option<(ExtManifest, PathBuf)> {
             if dir.is_dir() {
                 return Some((m, dir));
             }
+        }
+    }
+    None
+}
+
+/// Locate the scaffold template dir for `template_id` **within an arbitrary
+/// pack root** (e.g. a version fetched by [`pack_into_tmp`]), rather than
+/// scanning the installed pack store like [`template_source`]. Same resolution
+/// rule: an example pack's `appDir`, or `templates/<template_id>` for a
+/// lang/app pack. Returns `None` when the root has no readable manifest or the
+/// resolved dir is absent.
+pub fn template_dir_in_root(root: &Path, template_id: &str) -> Option<PathBuf> {
+    let txt = std::fs::read_to_string(root.join(manifest_name())).ok()?;
+    let m: ExtManifest = serde_json::from_str(&txt).ok()?;
+    if m.kind == ExtKind::Example && m.id == template_id {
+        let dir = root.join(m.app_dir.clone().unwrap_or_else(|| "app".into()));
+        if dir.is_dir() {
+            return Some(dir);
+        }
+    }
+    if m.templates.iter().any(|t| t.id == template_id) {
+        let dir = root.join("templates").join(template_id);
+        if dir.is_dir() {
+            return Some(dir);
         }
     }
     None

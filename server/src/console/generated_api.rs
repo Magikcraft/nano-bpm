@@ -1047,6 +1047,34 @@ impl apis::projects::Projects for ServerImpl {
         }
     }
 
+    async fn update_project_from_template(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::UpdateProjectFromTemplatePathParams,
+        body: &Option<models::UpdateFromTemplateRequest>,
+    ) -> Result<apis::projects::UpdateProjectFromTemplateResponse, ()> {
+        use apis::projects::UpdateProjectFromTemplateResponse as R;
+        let name = path_params.name.clone();
+        let apply = body.as_ref().and_then(|b| b.apply).unwrap_or(false);
+        let version = body.as_ref().and_then(|b| b.version.clone());
+        // npm pack + filesystem work — keep it off the async runtime.
+        let res = tokio::task::spawn_blocking(move || {
+            super::projects::update_from_template(&name, apply, version.as_deref())
+        })
+        .await;
+        match res {
+            Ok(Ok(plan)) => {
+                let v = serde_json::to_value(plan).expect("update plan serializes");
+                Ok(R::Status200_TheOverlayPlan(from_val(v)))
+            }
+            Ok(Err(msg)) if msg == "not found" => Ok(R::Status404_NotFound(msg)),
+            Ok(Err(msg)) => Ok(R::Status400_InvalidRequest(msg)),
+            Err(e) => Ok(R::Status400_InvalidRequest(format!("update failed: {e}"))),
+        }
+    }
+
     async fn run_project(
         &self,
         _method: &Method,
