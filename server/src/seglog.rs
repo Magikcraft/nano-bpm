@@ -1327,12 +1327,12 @@ pub fn catch_up_shard(shard: &crate::readstore::ReadStore, floor: u64, surviving
             }
         }
         CatchUpPlan::RebuildFromSurviving => {
-            shard.reset().expect("reset read store");
-            if !surviving.is_empty() {
-                shard
-                    .export(surviving)
-                    .expect("rebuild read model from surviving journal tail");
-            }
+            rebuild_from_surviving_tail(
+                shard,
+                floor,
+                surviving,
+                "rebuild read model from surviving journal tail",
+            );
         }
         CatchUpPlan::CompactedGap { missing } => {
             if read_model_lossy_rebuild_enabled() {
@@ -1346,12 +1346,12 @@ pub fn catch_up_shard(shard: &crate::readstore::ReadStore, floor: u64, surviving
                      rebuilding from the surviving journal tail and PERMANENTLY DROPPING the \
                      compacted history."
                 );
-                shard.reset().expect("reset read store");
-                if !surviving.is_empty() {
-                    shard
-                        .export(surviving)
-                        .expect("lossy rebuild read model from surviving journal tail");
-                }
+                rebuild_from_surviving_tail(
+                    shard,
+                    floor,
+                    surviving,
+                    "lossy rebuild read model from surviving journal tail",
+                );
             } else {
                 panic!(
                     "read model at exported_position={exported} is below the journal compaction \
@@ -1367,6 +1367,30 @@ pub fn catch_up_shard(shard: &crate::readstore::ReadStore, floor: u64, surviving
                 );
             }
         }
+    }
+}
+
+/// Resets a shard and rebuilds it from just the surviving tail. Because
+/// `exported_position` is an ABSOLUTE event index (compared against the
+/// compaction `floor` on every boot), the cursor is advanced to `floor` before
+/// the tail is projected — so it lands at `floor + surviving.len()`
+/// (== `total_events`), not a relative `surviving.len()`. Skipping this would
+/// leave the cursor below `floor` and re-trip [`CatchUpPlan::CompactedGap`] on
+/// the very next boot, so even the opt-in lossy rebuild would never stick.
+fn rebuild_from_surviving_tail(
+    shard: &crate::readstore::ReadStore,
+    floor: u64,
+    surviving: &[&Event],
+    export_ctx: &str,
+) {
+    shard.reset().expect("reset read store");
+    if floor > 0 {
+        shard
+            .advance_exported(floor as usize)
+            .expect("advance exported_position to the compaction floor");
+    }
+    if !surviving.is_empty() {
+        shard.export(surviving).expect(export_ctx);
     }
 }
 
@@ -2363,9 +2387,24 @@ mod tests {
         unsafe { std::env::remove_var("NANOBPMN_READ_MODEL_LOSSY_REBUILD") };
         assert!(rebuilt.is_ok(), "the escape hatch must rebuild, not abort");
         assert_eq!(
-            store.exported_position(),
-            surviving.len(),
-            "lossy rebuild resets then projects exactly the surviving tail"
+            store.exported_position() as u64,
+            recovery.total_events,
+            "lossy rebuild must leave the cursor at the ABSOLUTE tail end \
+             (floor + surviving.len() == total_events), not a relative surviving.len()"
+        );
+        // Regression guard for the re-abort loop: with the cursor now at the
+        // absolute tail, a subsequent boot resumes cleanly instead of re-tripping
+        // CompactedGap — even without the escape hatch set.
+        assert_eq!(
+            plan_catch_up(
+                store.exported_position() as u64,
+                recovery.first_index,
+                surviving.len() as u64,
+            ),
+            CatchUpPlan::Resume {
+                skip: surviving.len()
+            },
+            "the rebuilt cursor must resume, not re-abort, on the next boot"
         );
 
         let _ = fs::remove_dir_all(&dir);
