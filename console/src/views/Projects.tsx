@@ -666,7 +666,7 @@ export default function Projects() {
               onDelete={() => void remove(p)}
               onRename={() => void rename(p)}
               onUpdate={
-                p.updateAvailable && !updateBusy
+                p.updateAvailable && p.source !== "path" && !updateBusy
                   ? () => void previewUpdate(p)
                   : undefined
               }
@@ -680,7 +680,12 @@ export default function Projects() {
           plan={updatePlan.plan}
           busy={updateBusy}
           onApply={() => void applyUpdate()}
-          onClose={() => setUpdatePlan(null)}
+          onClose={() => {
+            // Ignore close (backdrop/✕) while an apply is in flight: the pending
+            // request resolves into setUpdatePlan(...) and would otherwise race
+            // the UI by reopening the modal after the user dismissed it.
+            if (!updateBusy) setUpdatePlan(null);
+          }}
         />
       )}
     </div>

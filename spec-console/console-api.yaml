@@ -781,7 +781,6 @@ paths:
               schema: { $ref: '#/components/schemas/UpdatePlan' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
-        '409': { $ref: '#/components/responses/Conflict' }
 
   /projects/{name}/run-configs:
     get:

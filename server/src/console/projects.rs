@@ -4082,7 +4082,7 @@ fn try_git_merge(base: &[u8], current: &[u8], new: &[u8]) -> Option<Vec<u8>> {
         && std::fs::write(&new_p, new).is_ok();
     let result = if write_ok {
         std::process::Command::new(&git)
-            .args(["merge-file", "-p", "--stdout"])
+            .args(["merge-file", "-p"])
             .arg(&cur_p)
             .arg(&base_p)
             .arg(&new_p)
@@ -4143,6 +4143,14 @@ pub fn update_from_template(
     let dir = project_dir(name).ok_or_else(|| "not found".to_string())?;
     if !dir.is_dir() {
         return Err("not found".to_string());
+    }
+    // Import-by-reference projects (ADR 0041) own only their pointer file; their
+    // tree lives in an external checkout the console must never mutate. A pure
+    // reference has no workspace directory but a `.project-ref.json`, so `dir`
+    // above resolves to the external path — refuse to overlay a template onto it
+    // (mirrors the delete/rename guards).
+    if !projects_root().join(name).is_dir() && read_project_ref(name).is_some() {
+        return Err("cannot update an imported-by-reference project from a template".to_string());
     }
     let mut cfg = read_config(name).ok_or_else(|| "not found".to_string())?;
     let sf = cfg
