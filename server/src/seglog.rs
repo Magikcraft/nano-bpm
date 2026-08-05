@@ -1297,7 +1297,7 @@ pub fn plan_catch_up(exported: u64, floor: u64, surviving: u64) -> CatchUpPlan {
         CatchUpPlan::CompactedGap {
             missing: floor - exported,
         }
-    } else if exported > floor + surviving {
+    } else if exported > floor.saturating_add(surviving) {
         CatchUpPlan::RebuildFromSurviving
     } else {
         CatchUpPlan::Resume {
@@ -1358,7 +1358,7 @@ pub fn catch_up_shard(shard: &crate::readstore::ReadStore, floor: u64, surviving
                      floor={floor}: {missing} events were compacted out of the journal (folded \
                      into the engine snapshot) and can no longer be replayed to rebuild the read \
                      model. This happens when the read model is wiped or reset — e.g. a \
-                     schema-version change across a binary upgrade, or an unreadable \
+                     schema-fingerprint change across a binary upgrade, or an unreadable \
                      read-model.sqlite — while the segmented journal has already been compacted. \
                      Proceeding would SILENTLY lose every pre-compaction process instance. \
                      Restore the read model (read-model.sqlite) from a backup, or set \
