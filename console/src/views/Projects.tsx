@@ -805,7 +805,7 @@ function ProjectTile({
   const title = project.displayName ?? project.name;
   return (
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
-      <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex">
+      <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex focus-within:flex">
         {onUpdate && (
           <button
             type="button"
@@ -939,6 +939,14 @@ function UpdatePlanModal({
   const changes =
     plan.create.length + plan.overwrite.length + plan.merged.length;
   const nothingToDo = changes === 0 && plan.conflicts.length === 0;
+  // Close on Escape for keyboard users, but not while an apply is in flight.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busy) onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, busy]);
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
