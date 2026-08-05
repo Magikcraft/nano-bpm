@@ -213,6 +213,7 @@ function VariableRow({
     setParseError(null);
   };
   const save = () => {
+    if (busy) return;
     let parsed: unknown;
     try {
       parsed = JSON.parse(draft);
