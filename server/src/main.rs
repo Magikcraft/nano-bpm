@@ -4580,31 +4580,28 @@ impl ServerImpl {
                 409,
                 detail,
             )),
-            _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Internal error",
-                500,
+            // Any other status (e.g. 502 when a peer is unreachable) has no
+            // dedicated response variant, so it maps onto the 500 transport
+            // variant — but we preserve the real upstream status in the
+            // ProblemDetail body for troubleshooting, mirroring the other
+            // forwarders in this file (see `forward_resolve_incident`).
+            other => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Upstream error",
+                other,
                 detail,
             )),
         };
 
         let node = self.route_by_leader(job_key);
 
-        if let Some(retries) = retries {
-            let res = match node {
-                Some(node) => {
-                    self.forward_update_job_retries(node, job_key, retries, operation_reference)
-                        .await
-                }
-                None => {
-                    self.update_job_retries_local(job_key, retries, operation_reference)
-                        .await
-                }
-            };
-            if let Err((status, detail)) = res {
-                return Ok(to_resp(status, detail));
-            }
-        }
-
+        // Apply `timeout` before `retries` to keep a combined update effectively
+        // atomic. `UpdateJobTimeout` only succeeds when the job is Activated
+        // (locked), whereas `UpdateJobRetries` only fails when the job is
+        // missing or terminal — so a successful timeout guarantees the job is
+        // in a state where the subsequent retries update also succeeds. Doing
+        // timeout first therefore avoids the partial-apply hazard where retries
+        // would be committed and then the request returns a failure because the
+        // timeout was rejected (e.g. an unlocked job yielding 409).
         if let Some(timeout) = timeout {
             let timeout = timeout as u64;
             let res = match node {
@@ -4614,6 +4611,22 @@ impl ServerImpl {
                 }
                 None => {
                     self.update_job_timeout_local(job_key, timeout, operation_reference)
+                        .await
+                }
+            };
+            if let Err((status, detail)) = res {
+                return Ok(to_resp(status, detail));
+            }
+        }
+
+        if let Some(retries) = retries {
+            let res = match node {
+                Some(node) => {
+                    self.forward_update_job_retries(node, job_key, retries, operation_reference)
+                        .await
+                }
+                None => {
+                    self.update_job_retries_local(job_key, retries, operation_reference)
                         .await
                 }
             };

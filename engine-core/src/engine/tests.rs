@@ -4310,6 +4310,36 @@ fn should_thread_operation_reference_onto_job_update_events() {
     )));
 }
 
+/// #592 follow-up: `updateJob` may carry BOTH `retries` and `timeout` in one
+/// changeset, applied by the server as two engine commands. The server applies
+/// `timeout` first so the combined update never partially applies then fails.
+/// That ordering is only sound because of an engine invariant: any job for which
+/// a lock extension (`UpdateJobTimeout`) succeeds is Activated, and an Activated
+/// job is never terminal, so `UpdateJobRetries` on it also succeeds. This test
+/// pins that invariant — if retries were ever tightened to reject Activated
+/// jobs, the partial-apply hazard would return and this guard would fail.
+#[test]
+fn activated_job_accepts_both_timeout_then_retries_updates() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+
+    // A lock extension succeeds only while Activated...
+    engine
+        .apply_command_at(Command::update_job_timeout(job_key, 5_000), 100)
+        .unwrap();
+    // ...and because the job is still Activated (not terminal), the retries
+    // update that the server applies next is guaranteed to succeed too.
+    engine
+        .apply_command(Command::update_job_retries(job_key, 3))
+        .unwrap();
+}
+
 /// start -> charge(payment) --normal--> done
 ///     charge --(error CARD_DECLINED boundary)--> recover(recovery) -> rec_done
 fn process_with_error_boundary_to_task() -> ProcessDefinition {
