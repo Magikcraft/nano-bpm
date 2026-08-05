@@ -60,7 +60,7 @@ use nanobpmn_engine_core::bpmn::parse_bpmn;
 use nanobpmn_engine_core::{
     ActivatedJob, AdHocActivateElement, AdHocJobResult, Command, EngineError, Event, IncidentKind,
     IncidentState, Key, MAX_PARTITION_ID, ProcessBuilder, ProcessDefinition, ProcessInstanceState,
-    Value, partition_of,
+    TaskListenerJobResult, UserTaskCorrections, Value, partition_of,
 };
 
 use crate::backpressure::{
@@ -4254,6 +4254,23 @@ impl ServerImpl {
         // `None` for ordinary completions, keeping that path byte-unchanged.
         let adhoc_result = adhoc_result_from_completion(body);
 
+        // Optional user-task-listener result (Camunda `JobResult` for user-task
+        // jobs): a denial and/or corrections. `None` for ordinary completions.
+        let task_result = task_result_from_completion(body);
+
+        // Engine parity (`EngineError::TaskListenerJobWithVariables`): a
+        // task-listener result cannot carry variables. Reject at the boundary
+        // rather than silently dropping them (the command constructor forces an
+        // empty map). Runs before routing so the forwarded/peer path is covered
+        // too.
+        if let Some((_, detail)) = reject_task_result_with_variables(&task_result, &variables) {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid data",
+                400,
+                detail,
+            )));
+        }
+
         // Cluster: if a peer owns the job's partition, forward over the command
         // stream and map its answer back (single-node always owns every key).
         if let Some(node) = self.route_by_leader(job_key) {
@@ -4265,13 +4282,19 @@ impl ServerImpl {
                     types::Nullable::Null => None,
                 });
             return Ok(self
-                .forward_complete_job(node, job_key, wire, adhoc_result)
+                .forward_complete_job(node, job_key, wire, adhoc_result, task_result)
                 .await);
         }
 
-        let command = match adhoc_result {
-            Some(result) => Command::complete_job_with_result(job_key, variables, result),
-            None => Command::complete_job_with(job_key, variables),
+        let command = match (task_result, adhoc_result) {
+            // A user-task-listener result and an ad-hoc result are mutually
+            // exclusive (a job is one kind or the other). Task-listener jobs
+            // reject variables engine-side, so none are threaded here.
+            (Some(task_listener_result), _) => {
+                Command::complete_job_with_task_result(job_key, task_listener_result)
+            }
+            (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
+            (None, None) => Command::complete_job_with(job_key, variables),
         };
         let result = self
             .engine
@@ -4435,9 +4458,21 @@ impl ServerImpl {
         };
         let body_error_code = body.error_code.clone();
 
+        // Variables instantiated at the local scope of the error catch event
+        // (Camunda `JobErrorRequest.variables`). Empty for the common bare
+        // error-throw, keeping that path unchanged.
+        let variables = match body.variables.as_ref() {
+            Some(types::Nullable::Present(map)) => from_object_map(map),
+            _ => std::collections::HashMap::new(),
+        };
+
         if let Some(node) = self.route_by_leader(job_key) {
+            let wire = match body.variables.as_ref() {
+                Some(types::Nullable::Present(map)) => wire_variables(Some(map)),
+                _ => None,
+            };
             return Ok(self
-                .forward_throw_error(node, job_key, body_error_code, error_message)
+                .forward_throw_error(node, job_key, body_error_code, error_message, wire)
                 .await);
         }
 
@@ -4446,7 +4481,12 @@ impl ServerImpl {
             .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(
-                    Command::throw_job_error(job_key, body_error_code, error_message),
+                    Command::throw_job_error_with(
+                        job_key,
+                        body_error_code,
+                        error_message,
+                        variables,
+                    ),
                     now_millis(),
                 )
             })
@@ -4508,53 +4548,107 @@ impl ServerImpl {
             }
         };
 
-        // The POC only acts on the retries part of the changeset (timeout
-        // updates are not modelled). A changeset without retries is a no-op.
+        // A changeset may carry `retries`, `timeout`, both, or neither. Each
+        // present field is applied to the job; an empty changeset is a no-op.
         let retries = match body.changeset.retries.as_ref() {
-            Some(types::Nullable::Present(r)) => *r,
-            _ => {
-                return Ok(Resp::Status204_TheJobWasUpdatedSuccessfully);
-            }
+            Some(types::Nullable::Present(r)) => Some(*r),
+            _ => None,
+        };
+        let timeout = match body.changeset.timeout.as_ref() {
+            Some(types::Nullable::Present(t)) => Some(*t),
+            _ => None,
         };
 
-        if let Some(node) = self.route_by_leader(job_key) {
-            return Ok(self.forward_update_job(node, job_key, retries).await);
+        // An optional client-supplied reference correlating this update with an
+        // external operation, threaded onto the emitted event for audit
+        // (Camunda `JobUpdateRequest.operationReference`).
+        let operation_reference = body.operation_reference;
+
+        if retries.is_none() && timeout.is_none() {
+            return Ok(Resp::Status204_TheJobWasUpdatedSuccessfully);
         }
 
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                engine.apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
-            })
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheJobWasUpdatedSuccessfully)
-            }
-            Err(EngineError::JobNotFound { job_key }) => {
-                Ok(Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
-                    "Job not found",
-                    404,
-                    format!("No job with key {job_key}."),
-                )))
-            }
-            Err(EngineError::JobNotActive { job_key }) => Ok(
-                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "Job in wrong state",
-                    409,
-                    format!("Job {job_key} is terminal and its retries cannot be updated."),
-                )),
-            ),
-            Err(e) => Ok(
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Internal error",
-                    500,
-                    e.to_string(),
-                )),
-            ),
+        // A lock extension needs a strictly-positive number of milliseconds; a
+        // zero/negative timeout would set the deadline at or before "now",
+        // expiring the lock rather than extending it.
+        if let Some(t) = timeout
+            && t <= 0
+        {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid data",
+                400,
+                format!("timeout must be a positive number of milliseconds, got {t}."),
+            )));
         }
+
+        // Map a by-key update failure (u16 status + detail) to the right
+        // response variant, shared by the local and forwarded paths.
+        let to_resp = |status: u16, detail: String| match status {
+            400 => Resp::Status400_TheProvidedDataIsNotValid(problem("Invalid data", 400, detail)),
+            404 => {
+                Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem("Job not found", 404, detail))
+            }
+            409 => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                "Job in wrong state",
+                409,
+                detail,
+            )),
+            // Any other status (e.g. 502 when a peer is unreachable) has no
+            // dedicated response variant, so it maps onto the 500 transport
+            // variant — but we preserve the real upstream status in the
+            // ProblemDetail body for troubleshooting, mirroring the other
+            // forwarders in this file (see `forward_resolve_incident`).
+            other => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Upstream error",
+                other,
+                detail,
+            )),
+        };
+
+        let node = self.route_by_leader(job_key);
+
+        // Apply `timeout` before `retries` to keep a combined update effectively
+        // atomic. `UpdateJobTimeout` only succeeds when the job is Activated
+        // (locked), whereas `UpdateJobRetries` only fails when the job is
+        // missing or terminal — so a successful timeout guarantees the job is
+        // in a state where the subsequent retries update also succeeds. Doing
+        // timeout first therefore avoids the partial-apply hazard where retries
+        // would be committed and then the request returns a failure because the
+        // timeout was rejected (e.g. an unlocked job yielding 409).
+        if let Some(timeout) = timeout {
+            let timeout = timeout as u64;
+            let res = match node {
+                Some(node) => {
+                    self.forward_update_job_timeout(node, job_key, timeout, operation_reference)
+                        .await
+                }
+                None => {
+                    self.update_job_timeout_local(job_key, timeout, operation_reference)
+                        .await
+                }
+            };
+            if let Err((status, detail)) = res {
+                return Ok(to_resp(status, detail));
+            }
+        }
+
+        if let Some(retries) = retries {
+            let res = match node {
+                Some(node) => {
+                    self.forward_update_job_retries(node, job_key, retries, operation_reference)
+                        .await
+                }
+                None => {
+                    self.update_job_retries_local(job_key, retries, operation_reference)
+                        .await
+                }
+            };
+            if let Err((status, detail)) = res {
+                return Ok(to_resp(status, detail));
+            }
+        }
+
+        Ok(Resp::Status204_TheJobWasUpdatedSuccessfully)
     }
 
     async fn resolve_incident_impl(
@@ -5346,12 +5440,16 @@ impl ServerImpl {
         &self,
         job_key: u64,
         retries: i32,
+        operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
         let result = self
             .engine
             .by_key(job_key)
             .with(move |engine| {
-                engine.apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
+                engine.apply_command_at(
+                    Command::update_job_retries_with_ref(job_key, retries, operation_reference),
+                    now_millis(),
+                )
             })
             .await;
         match result {
@@ -5365,6 +5463,53 @@ impl ServerImpl {
             Err(EngineError::JobNotActive { job_key }) => Err((
                 409,
                 format!("Job {job_key} is terminal and its retries cannot be updated."),
+            )),
+            Err(e) => Err((500, e.to_string())),
+        }
+    }
+
+    /// Extends a job's activation lock on this node's owning partition. The job
+    /// must currently be activated (locked); otherwise there is no lock to
+    /// extend and this yields a 409.
+    pub(crate) async fn update_job_timeout_local(
+        &self,
+        job_key: u64,
+        timeout: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<(), (u16, String)> {
+        // A lock extension needs a strictly-positive duration; a zero timeout
+        // would set the deadline to `now + 0 == now`, immediately expiring the
+        // lock rather than extending it. The REST handler already rejects
+        // non-positive timeouts, but guard at this partition-boundary helper too
+        // so every call site — peer-forwarded `UpdateJobTimeout` frames and any
+        // future caller — enforces the same contract and can't misuse it.
+        if timeout == 0 {
+            return Err((
+                400,
+                "timeout must be a positive number of milliseconds, got 0.".to_string(),
+            ));
+        }
+        let result = self
+            .engine
+            .by_key(job_key)
+            .with(move |engine| {
+                engine.apply_command_at(
+                    Command::update_job_timeout_with_ref(job_key, timeout, operation_reference),
+                    now_millis(),
+                )
+            })
+            .await;
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(())
+            }
+            Err(EngineError::JobNotFound { job_key }) => {
+                Err((404, format!("No job with key {job_key}.")))
+            }
+            Err(EngineError::JobNotActive { job_key }) => Err((
+                409,
+                format!("Job {job_key} is not activated; its lock timeout cannot be extended."),
             )),
             Err(e) => Err((500, e.to_string())),
         }
@@ -5714,12 +5859,13 @@ impl ServerImpl {
         job_key: u64,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         adhoc_result: Option<AdHocJobResult>,
+        task_result: Option<TaskListenerJobResult>,
     ) -> apis::job::CompleteJobResponse {
         use apis::job::CompleteJobResponse as Resp;
         let res =
             match self.peer_link(node).await {
                 Ok(link) => {
-                    link.complete_job(job_key.to_string(), variables, adhoc_result)
+                    link.complete_job(job_key.to_string(), variables, adhoc_result, task_result)
                         .await
                 }
                 Err((s, m)) => {
@@ -5804,12 +5950,13 @@ impl ServerImpl {
         job_key: u64,
         error_code: String,
         error_message: String,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> apis::job::ThrowJobErrorResponse {
         use apis::job::ThrowJobErrorResponse as Resp;
         let res =
             match self.peer_link(node).await {
                 Ok(link) => {
-                    link.throw_error(job_key.to_string(), error_code, error_message)
+                    link.throw_error(job_key.to_string(), error_code, error_message, variables)
                         .await
                 }
                 Err((s, m)) => {
@@ -5858,10 +6005,11 @@ impl ServerImpl {
         job_key: u64,
         variables: Option<serde_json::Map<String, serde_json::Value>>,
         adhoc_result: Option<AdHocJobResult>,
+        task_result: Option<TaskListenerJobResult>,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
             Ok(link) => match link
-                .complete_job(job_key.to_string(), variables, adhoc_result)
+                .complete_job(job_key.to_string(), variables, adhoc_result, task_result)
                 .await
             {
                 Ok(r) => (r.status, r.body),
@@ -5900,10 +6048,11 @@ impl ServerImpl {
         job_key: u64,
         error_code: String,
         error_message: String,
+        variables: Option<serde_json::Map<String, serde_json::Value>>,
     ) -> (u16, Option<serde_json::Value>) {
         match self.peer_link(node).await {
             Ok(link) => match link
-                .throw_error(job_key.to_string(), error_code, error_message)
+                .throw_error(job_key.to_string(), error_code, error_message, variables)
                 .await
             {
                 Ok(r) => (r.status, r.body),
@@ -5999,46 +6148,45 @@ impl ServerImpl {
     }
 
     /// Forwards a job-retries update to the peer owning the job.
-    async fn forward_update_job(
+    async fn forward_update_job_retries(
         &self,
         node: u32,
         job_key: u64,
         retries: i32,
-    ) -> apis::job::UpdateJobResponse {
-        use apis::job::UpdateJobResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => link.update_job_retries(job_key.to_string(), retries).await,
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
-        match res {
-            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobWasUpdatedSuccessfully,
-            Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
-                "Job not found",
-                404,
-                peer_detail(&r),
-            )),
-            Ok(r) if r.status == 409 => {
-                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "Job in wrong state",
-                    409,
-                    peer_detail(&r),
-                ))
-            }
-            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                500,
-                peer_detail(&r),
-            )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
+        operation_reference: Option<i64>,
+    ) -> Result<(), (u16, String)> {
+        let link = self.peer_link(node).await?;
+        match link
+            .update_job_retries(job_key.to_string(), retries, operation_reference)
+            .await
+        {
+            Ok(r) if is_ok_status(r.status) => Ok(()),
+            Ok(r) if r.status == 404 => Err((404, peer_detail(&r))),
+            Ok(r) if r.status == 409 => Err((409, peer_detail(&r))),
+            Ok(r) => Err((500, peer_detail(&r))),
+            Err(e) => Err((502, e.to_string())),
+        }
+    }
+
+    /// Forwards a job lock-extension (timeout) to the peer owning the job.
+    async fn forward_update_job_timeout(
+        &self,
+        node: u32,
+        job_key: u64,
+        timeout: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<(), (u16, String)> {
+        let link = self.peer_link(node).await?;
+        match link
+            .update_job_timeout(job_key.to_string(), timeout, operation_reference)
+            .await
+        {
+            Ok(r) if is_ok_status(r.status) => Ok(()),
+            Ok(r) if r.status == 404 => Err((404, peer_detail(&r))),
+            Ok(r) if r.status == 409 => Err((409, peer_detail(&r))),
+            Ok(r) if r.status == 400 => Err((400, peer_detail(&r))),
+            Ok(r) => Err((500, peer_detail(&r))),
+            Err(e) => Err((502, e.to_string())),
         }
     }
 
@@ -12998,10 +13146,20 @@ impl ServerImpl {
         job_key: u64,
         variables: std::collections::HashMap<String, Value>,
         adhoc_result: Option<AdHocJobResult>,
+        task_result: Option<TaskListenerJobResult>,
     ) -> Result<Commit, (u16, String)> {
-        let command = match adhoc_result {
-            Some(result) => Command::complete_job_with_result(job_key, variables, result),
-            None => Command::complete_job_with(job_key, variables),
+        // Engine parity (`EngineError::TaskListenerJobWithVariables`): a
+        // task-listener result cannot carry variables. Reject here rather than
+        // letting the command constructor silently drop them.
+        if let Some(err) = reject_task_result_with_variables(&task_result, &variables) {
+            return Err(err);
+        }
+        let command = match (task_result, adhoc_result) {
+            (Some(task_listener_result), _) => {
+                Command::complete_job_with_task_result(job_key, task_listener_result)
+            }
+            (None, Some(result)) => Command::complete_job_with_result(job_key, variables, result),
+            (None, None) => Command::complete_job_with(job_key, variables),
         };
         if !self.raft.is_empty() {
             return self.propose_job_for_stream(job_key, command).await;
@@ -13055,12 +13213,13 @@ impl ServerImpl {
         job_key: u64,
         error_code: String,
         error_message: String,
+        variables: std::collections::HashMap<String, Value>,
     ) -> Result<Commit, (u16, String)> {
         if !self.raft.is_empty() {
             return self
                 .propose_job_for_stream(
                     job_key,
-                    Command::throw_job_error(job_key, error_code, error_message),
+                    Command::throw_job_error_with(job_key, error_code, error_message, variables),
                 )
                 .await;
         }
@@ -13069,7 +13228,7 @@ impl ServerImpl {
             .by_key(job_key)
             .with(move |engine| {
                 engine.apply_command_at(
-                    Command::throw_job_error(job_key, error_code, error_message),
+                    Command::throw_job_error_with(job_key, error_code, error_message, variables),
                     now_millis(),
                 )
             })
@@ -14637,6 +14796,127 @@ fn adhoc_result_from_completion(
         completion_condition_fulfilled: adhoc.is_completion_condition_fulfilled.unwrap_or(false),
         cancel_remaining_instances: adhoc.is_cancel_remaining_instances.unwrap_or(false),
     })
+}
+
+/// A user-task-listener job result must not be completed with variables: the
+/// engine rejects it (`EngineError::TaskListenerJobWithVariables`) and the
+/// server-side `Command::complete_job_with_task_result` constructor hardcodes an
+/// empty variables map. Without a boundary guard the server would *silently
+/// discard* any variables a client sent alongside a task-listener result and
+/// still report success — the "success but intent discarded" defect class,
+/// diverging from the engine contract.
+///
+/// This is the single canonical guard shared by every completion entry point
+/// (REST `complete_job_impl` and stream `complete_job_for_stream`), run before
+/// the command is built or forwarded to a peer, so no call site can reintroduce
+/// the drop. Returns `Some((400, detail))` to reject, `None` to allow.
+fn reject_task_result_with_variables(
+    task_result: &Option<TaskListenerJobResult>,
+    variables: &std::collections::HashMap<String, Value>,
+) -> Option<(u16, String)> {
+    if task_result.is_some() && !variables.is_empty() {
+        Some((
+            400,
+            "a user-task-listener job result cannot be completed with variables".to_string(),
+        ))
+    } else {
+        None
+    }
+}
+
+/// Maps a REST `JobResultUserTask` (Camunda user-task listener result) onto the
+/// engine's [`TaskListenerJobResult`] (denial + corrections). Returns `None`
+/// for ordinary completions (no `result`, an ad-hoc result, or a user-task
+/// result that neither denies nor corrects), keeping that path byte-unchanged.
+///
+/// Nullable mapping follows the OpenAPI contract (`spec/jobs.yaml`
+/// `JobResultCorrections`): a JSON `null` (or omitted) assignee / date /
+/// candidate list *preserves* the persisted attribute (uncorrected), while an
+/// empty String (assignee, dates) or empty list (candidate collections) *clears*
+/// it. See [`user_task_corrections_from_model`] for the field-by-field mapping.
+fn task_result_from_completion(
+    body: &Option<models::JobCompletionRequest>,
+) -> Option<TaskListenerJobResult> {
+    let result = body.as_ref()?.result.as_ref()?;
+    let user = match result {
+        models::JobResult::JobResultUserTask(u) => u,
+        models::JobResult::JobResultAdHocSubProcess(_) => return None,
+    };
+
+    let denied = match &user.denied {
+        Some(types::Nullable::Present(b)) => *b,
+        _ => false,
+    };
+    // The reason is meaningful only alongside `denied = true` (the engine ignores
+    // it otherwise). Dropping a bare `deniedReason` keeps an otherwise-empty
+    // result on the fast completion path instead of forcing the task-listener
+    // command for a value the engine will never read.
+    let denied_reason = if denied {
+        match &user.denied_reason {
+            Some(types::Nullable::Present(s)) => Some(s.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    let corrections = match &user.corrections {
+        Some(types::Nullable::Present(c)) => user_task_corrections_from_model(c),
+        _ => UserTaskCorrections::default(),
+    };
+
+    let mapped = TaskListenerJobResult {
+        denied,
+        denied_reason,
+        corrections,
+    };
+    // An all-default result is an ordinary completion; keep it on the fast path.
+    if mapped.is_empty() {
+        None
+    } else {
+        Some(mapped)
+    }
+}
+
+/// Maps REST `JobResultCorrections` onto the engine's [`UserTaskCorrections`].
+/// Per the OpenAPI contract (`spec/jobs.yaml` `JobResultCorrections`), a `null`
+/// value *or* an omitted field preserves the persisted attribute (uncorrected,
+/// `None`); an attribute is *cleared* by providing an empty String (assignee,
+/// dates) or an empty list (candidate collections).
+fn user_task_corrections_from_model(c: &models::JobResultCorrections) -> UserTaskCorrections {
+    fn opt_string(field: &Option<types::Nullable<String>>) -> Option<String> {
+        match field {
+            Some(types::Nullable::Present(s)) => Some(s.clone()),
+            // `null` (and absent) preserve the value; clearing is an empty String.
+            Some(types::Nullable::Null) | None => None,
+        }
+    }
+    fn opt_list(field: &Option<types::Nullable<Vec<String>>>) -> Option<Vec<String>> {
+        match field {
+            Some(types::Nullable::Present(v)) => Some(v.clone()),
+            // `null` (and absent) preserve the value; clearing is an empty list.
+            Some(types::Nullable::Null) | None => None,
+        }
+    }
+    fn opt_date(field: &Option<types::Nullable<chrono::DateTime<chrono::Utc>>>) -> Option<String> {
+        match field {
+            Some(types::Nullable::Present(dt)) => Some(dt.to_rfc3339()),
+            // `null` (and absent) preserve the value; clearing is an empty String.
+            Some(types::Nullable::Null) | None => None,
+        }
+    }
+    let priority = match &c.priority {
+        Some(types::Nullable::Present(p)) => Some(i32::from(*p)),
+        _ => None,
+    };
+    UserTaskCorrections {
+        assignee: opt_string(&c.assignee),
+        candidate_groups: opt_list(&c.candidate_groups),
+        candidate_users: opt_list(&c.candidate_users),
+        due_date: opt_date(&c.due_date),
+        follow_up_date: opt_date(&c.follow_up_date),
+        priority,
+    }
 }
 
 fn from_object_map(
@@ -19894,7 +20174,9 @@ mod clustered_startup_tests {
 
         // Forward the completion to node 0 over the wire and map its answer back.
         use apis::job::CompleteJobResponse as R;
-        let resp = node1.forward_complete_job(owner, job_key, None, None).await;
+        let resp = node1
+            .forward_complete_job(owner, job_key, None, None, None)
+            .await;
         assert!(
             matches!(resp, R::Status204_TheJobWasCompletedSuccessfully),
             "the forwarded completion should succeed (204)"
@@ -19902,7 +20184,9 @@ mod clustered_startup_tests {
 
         // The completion really mutated node 0's state: completing the same job
         // again is rejected (it is no longer an activated job).
-        let again = node1.forward_complete_job(owner, job_key, None, None).await;
+        let again = node1
+            .forward_complete_job(owner, job_key, None, None, None)
+            .await;
         assert!(
             !matches!(again, R::Status204_TheJobWasCompletedSuccessfully),
             "re-completing an already-completed job must not return 204, got a success"
@@ -20449,7 +20733,7 @@ mod clustered_startup_tests {
             .expect("the job's partition is owned by node 0");
         assert_eq!(owner, 0);
         let (status, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None)
+            .forward_complete_job_stream(owner, job_key, None, None, None)
             .await;
         assert!(
             is_ok_status(status),
@@ -20458,7 +20742,7 @@ mod clustered_startup_tests {
 
         // Re-completing the same job is rejected — proof it mutated node 0's state.
         let (again, _) = node1
-            .forward_complete_job_stream(owner, job_key, None, None)
+            .forward_complete_job_stream(owner, job_key, None, None, None)
             .await;
         assert!(
             !is_ok_status(again),
@@ -20940,7 +21224,7 @@ mod clustered_startup_tests {
         let job_key = job_key.expect("the parked job activates on the leader");
 
         let commit = node0
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("raft-routed complete commits via quorum");
         commit.wait().await;
@@ -20948,7 +21232,7 @@ mod clustered_startup_tests {
         // Re-completing the same job is rejected THROUGH the Raft log, proving the
         // first completion mutated the leader's durable state via propose().
         let err = match node0
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
         {
             Ok(_) => panic!("re-complete of a completed job must be rejected"),
@@ -21104,7 +21388,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the parked job activates on the leader");
         node0
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("raft-routed complete commits via quorum")
             .wait()
@@ -21328,7 +21612,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the parked job activates on the new leader after failover");
         new_leader
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("complete commits via the new quorum")
             .wait()
@@ -21656,7 +21940,7 @@ mod clustered_startup_tests {
             for j in jobs {
                 let job_key = j.job_key.0.parse::<u64>().expect("numeric job key");
                 new_leader
-                    .complete_job_for_stream(job_key, Default::default(), None)
+                    .complete_job_for_stream(job_key, Default::default(), None, None)
                     .await
                     .expect("complete commits via the new quorum")
                     .wait()
@@ -22260,7 +22544,7 @@ mod clustered_startup_tests {
         }
         let job_key = job_key.expect("the leased-but-uncompleted job re-activates after failover");
         new_leader
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("complete commits via the new quorum")
             .wait()
@@ -22914,7 +23198,7 @@ mod clustered_startup_tests {
         let job_key =
             job_key.expect("the auto-promoted leader serves activateJobs for partition 0");
         node1
-            .complete_job_for_stream(job_key, Default::default(), None)
+            .complete_job_for_stream(job_key, Default::default(), None, None)
             .await
             .expect("the auto-promoted leader commits the completion")
             .wait()
@@ -24252,6 +24536,27 @@ mod subscription_placement_tests {
         </bpmn:message>
       </bpmn:definitions>"#;
 
+    /// A zero `timeout` at the partition-boundary helper must be rejected with a
+    /// 400 *before* the engine is touched — a lock "extension" of 0ms would set
+    /// the deadline to `now`, instantly expiring the lock. This guards the
+    /// peer-forwarded `UpdateJobTimeout` path (and any future caller), which does
+    /// not re-run the REST validation. The guard short-circuits ahead of the job
+    /// lookup, so it holds even for an unknown key (400, not 404).
+    #[tokio::test]
+    async fn update_job_timeout_local_rejects_zero_timeout_before_lookup() {
+        let server = single_node_multi_partition();
+        let err = server
+            .update_job_timeout_local(0xdead_beef, 0, None)
+            .await
+            .expect_err("a zero timeout must be rejected");
+        assert_eq!(err.0, 400, "zero timeout is a client (validation) error");
+        assert!(
+            err.1.contains("positive"),
+            "detail explains the positive-duration contract, got {:?}",
+            err.1
+        );
+    }
+
     #[tokio::test]
     async fn cross_partition_message_catch_completes_via_the_pump() {
         let server = single_node_multi_partition();
@@ -24592,7 +24897,7 @@ mod subscription_placement_tests {
             .find(|k| nanobpmn_engine_core::partition_of(*k) == p_inst)
             .expect("our instance's job is activatable");
         server
-            .complete_job_for_stream(job_key, std::collections::HashMap::new(), None)
+            .complete_job_for_stream(job_key, std::collections::HashMap::new(), None, None)
             .await
             .expect("complete succeeds")
             .wait()
@@ -24888,5 +25193,211 @@ mod adhoc_result_mapping_tests {
         assert!(mapped.completion_condition_fulfilled);
         assert!(!mapped.cancel_remaining_instances);
         assert!(!mapped.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod task_result_mapping_tests {
+    use super::*;
+
+    /// An ordinary completion (no `result`, or an ad-hoc result) maps to `None`,
+    /// so the fast path builds a plain `complete_job_with` command.
+    #[test]
+    fn plain_and_adhoc_completions_have_no_task_result() {
+        assert!(task_result_from_completion(&None).is_none());
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: None,
+        };
+        assert!(task_result_from_completion(&Some(body)).is_none());
+
+        let adhoc = models::JobResultAdHocSubProcess {
+            activate_elements: None,
+            is_completion_condition_fulfilled: Some(true),
+            is_cancel_remaining_instances: None,
+            r_type: Some("adHocSubProcess".to_string()),
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultAdHocSubProcess(adhoc)),
+        };
+        assert!(task_result_from_completion(&Some(body)).is_none());
+    }
+
+    /// A user-task result that neither denies nor corrects is an ordinary
+    /// completion: it stays on the fast path (`None`), byte-unchanged.
+    #[test]
+    fn empty_user_task_result_stays_on_the_fast_path() {
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(
+                models::JobResultUserTask::new(),
+            )),
+        };
+        assert!(task_result_from_completion(&Some(body)).is_none());
+    }
+
+    /// #592 follow-up #3: a user-task-listener denial must be carried to the
+    /// engine (denied + reason), not silently dropped into a plain completion.
+    #[test]
+    fn user_task_denial_maps_to_engine_denial() {
+        let user = models::JobResultUserTask {
+            denied: Some(types::Nullable::Present(true)),
+            denied_reason: Some(types::Nullable::Present("needs manager".to_string())),
+            corrections: None,
+            r_type: None,
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(user)),
+        };
+        let mapped = task_result_from_completion(&Some(body)).expect("task result");
+        assert!(mapped.denied);
+        assert_eq!(mapped.denied_reason.as_deref(), Some("needs manager"));
+        assert!(mapped.corrections.is_empty());
+    }
+
+    /// A bare `deniedReason` without `denied = true` carries no meaning to the
+    /// engine (which only reads the reason when denied), so it must not by itself
+    /// force the slow task-listener path: an otherwise-empty result stays on the
+    /// fast completion path (`None`).
+    #[test]
+    fn bare_denied_reason_without_denial_stays_on_the_fast_path() {
+        let user = models::JobResultUserTask {
+            denied: None,
+            denied_reason: Some(types::Nullable::Present("stray reason".to_string())),
+            corrections: None,
+            r_type: None,
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(user)),
+        };
+        assert!(task_result_from_completion(&Some(body)).is_none());
+
+        // Explicit denied = false with a reason behaves the same way.
+        let user = models::JobResultUserTask {
+            denied: Some(types::Nullable::Present(false)),
+            denied_reason: Some(types::Nullable::Present("stray reason".to_string())),
+            corrections: None,
+            r_type: None,
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(user)),
+        };
+        assert!(task_result_from_completion(&Some(body)).is_none());
+    }
+
+    /// User-task corrections map field-for-field onto the engine's
+    /// `UserTaskCorrections`, honouring the OpenAPI contract
+    /// (`spec/jobs.yaml` `JobResultCorrections`): a JSON `null` (or omitted)
+    /// field *preserves* the persisted value (`None`, uncorrected), while an
+    /// attribute is *cleared* by an empty String (assignee/date) or empty list
+    /// (candidate collection).
+    #[test]
+    fn user_task_corrections_map_including_clear_semantics() {
+        use chrono::TimeZone;
+        let corrections = models::JobResultCorrections {
+            assignee: Some(types::Nullable::Present("alice".to_string())),
+            // null preserves (stays None); empty string below clears.
+            due_date: Some(types::Nullable::Null),
+            // present (epoch) date -> corrected to that value.
+            follow_up_date: Some(types::Nullable::Present(
+                chrono::Utc.timestamp_opt(0, 0).unwrap(),
+            )),
+            candidate_users: Some(types::Nullable::Present(vec!["u1".to_string()])),
+            // empty list clears the candidate groups.
+            candidate_groups: Some(types::Nullable::Present(Vec::new())),
+            priority: Some(types::Nullable::Present(80)),
+        };
+        let user = models::JobResultUserTask {
+            denied: None,
+            denied_reason: None,
+            corrections: Some(types::Nullable::Present(corrections)),
+            r_type: None,
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(user)),
+        };
+        let mapped = task_result_from_completion(&Some(body)).expect("task result");
+        assert!(!mapped.denied);
+        let c = &mapped.corrections;
+        assert_eq!(c.assignee.as_deref(), Some("alice"));
+        // null due date preserves -> None (NOT cleared).
+        assert_eq!(c.due_date, None);
+        // a present (epoch) follow-up date is corrected.
+        assert!(c.follow_up_date.is_some());
+        assert_eq!(c.candidate_users, Some(vec!["u1".to_string()]));
+        // empty candidate-group list clears -> Some(empty).
+        assert_eq!(c.candidate_groups, Some(Vec::new()));
+        assert_eq!(c.priority, Some(80));
+        assert!(!mapped.is_empty());
+    }
+
+    /// A corrections object whose fields are all JSON `null` (or omitted)
+    /// preserves every attribute — nothing is corrected — so the result carries
+    /// no corrections and stays on the fast completion path.
+    #[test]
+    fn user_task_corrections_all_null_preserve_and_correct_nothing() {
+        let corrections = models::JobResultCorrections {
+            assignee: Some(types::Nullable::Null),
+            due_date: Some(types::Nullable::Null),
+            follow_up_date: Some(types::Nullable::Null),
+            candidate_users: Some(types::Nullable::Null),
+            candidate_groups: Some(types::Nullable::Null),
+            priority: Some(types::Nullable::Null),
+        };
+        let user = models::JobResultUserTask {
+            denied: None,
+            denied_reason: None,
+            corrections: Some(types::Nullable::Present(corrections)),
+            r_type: None,
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(user)),
+        };
+        // All-null corrections correct nothing -> ordinary completion (fast path).
+        assert!(task_result_from_completion(&Some(body)).is_none());
+    }
+
+    /// #592 follow-up: a user-task-listener result completed *with* variables is
+    /// rejected at the boundary with 400 instead of silently discarding them
+    /// (the "success but intent discarded" defect class). This guards every
+    /// completion entry point (REST + stream) via the shared helper.
+    #[test]
+    fn task_result_with_variables_is_rejected() {
+        let task_result = Some(TaskListenerJobResult {
+            denied: true,
+            denied_reason: Some("needs manager".to_string()),
+            corrections: UserTaskCorrections::default(),
+        });
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("amount".to_string(), Value::Int(42));
+
+        let rejection = reject_task_result_with_variables(&task_result, &variables)
+            .expect("task-listener result with variables must be rejected");
+        assert_eq!(rejection.0, 400);
+        assert!(rejection.1.contains("cannot be completed with variables"));
+    }
+
+    /// A task-listener result with *no* variables is allowed (the ordinary
+    /// task-listener completion path), and a plain completion with variables is
+    /// allowed (no task result) — the guard fires only on the invalid pairing.
+    #[test]
+    fn task_result_without_variables_and_plain_with_variables_are_allowed() {
+        let task_result = Some(TaskListenerJobResult {
+            denied: true,
+            denied_reason: Some("needs manager".to_string()),
+            corrections: UserTaskCorrections::default(),
+        });
+        let empty = std::collections::HashMap::new();
+        assert!(reject_task_result_with_variables(&task_result, &empty).is_none());
+
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("amount".to_string(), Value::Int(42));
+        assert!(reject_task_result_with_variables(&None, &variables).is_none());
     }
 }
