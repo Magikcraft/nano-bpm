@@ -235,6 +235,12 @@ const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
 const LOG_RING_CAP: usize = 1000;
 
+/// Upper bound on how long [`ProjectSupervisor::stop_all`] waits for every
+/// supervised child process group to be reaped on shutdown. Kept comfortably
+/// under c8ctl's 8s SIGTERM→SIGKILL grace window so the reap (plus the HTTP
+/// graceful shutdown) completes before c8ctl escalates to SIGKILL.
+const STOP_ALL_TIMEOUT_MS: u64 = 5_000;
+
 /// The config file name at the root of every project.
 pub const CONFIG_FILE: &str = "nanobpm.project.json";
 
@@ -6477,6 +6483,54 @@ impl ProjectSupervisor {
         Ok(())
     }
 
+    /// Stops **every** supervised project and waits, bounded, for each child
+    /// process group to be reaped. Called on server shutdown so studio-started
+    /// apps (and their whole process subtrees, e.g. `uv run` → python) don't
+    /// orphan to init when the server exits.
+    ///
+    /// Each run task parks on `inner.stop.notified()` and, when woken,
+    /// `kill_process_group`s the child's group (SIGKILL is uncatchable) before
+    /// driving the phase to a terminal state. We notify them all, then poll for
+    /// those terminal phases up to [`STOP_ALL_TIMEOUT_MS`] so the whole teardown
+    /// fits inside c8ctl's SIGTERM→SIGKILL grace window — we do **not** rely on
+    /// `kill_on_drop`, which never fires on an abrupt (non-graceful) exit.
+    pub async fn stop_all(&self) {
+        // Snapshot the entries so we never hold the map lock while awaiting
+        // child exits (a stuck reap would otherwise deadlock every accessor).
+        let entries: Vec<(String, Arc<ProjectInner>)> = {
+            let map = self.projects.lock().await;
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        if entries.is_empty() {
+            return;
+        }
+        // Signal every still-live project to stop (idempotent) and tear down its
+        // trigger dispatcher, mirroring `stop(name)`.
+        for (name, inner) in &entries {
+            triggers::dispatcher().stop(name).await;
+            if !matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
+                inner.desired_running.store(false, Ordering::Relaxed);
+                inner.stop.notify_waiters();
+            }
+        }
+        // Wait, bounded, for the reap tasks to land each project in a terminal
+        // phase. Poll rather than join because the run task owns the `Child`.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(STOP_ALL_TIMEOUT_MS);
+        for (name, inner) in &entries {
+            loop {
+                if matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    tracing::warn!(project = %name, "stop_all: reap timed out before terminal phase");
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+
     /// Compiles the project into `dist/` — once for the host, or once per
     /// requested target triple for cross-compilation. Streams progress to the
     /// project log channel and resolves when all builds finish.
@@ -11245,5 +11299,70 @@ mod tests {
             reread.scaffolded_from.and_then(|s| s.version),
             Some("2.0.0".into())
         );
+    }
+
+    /// `stop_all` must reap a running supervised child (and its process group)
+    /// and drive its phase to `Stopped`, so studio runs don't orphan on server
+    /// shutdown. We reproduce a live run: spawn a `sleep` as its own
+    /// process-group leader (as the real run paths do) and wire the same
+    /// stop-notified reap task, then assert `stop_all` kills it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_all_reaps_running_child_process_group() {
+        use std::process::Stdio;
+
+        let sup = ProjectSupervisor {
+            projects: tokio::sync::Mutex::new(HashMap::new()),
+        };
+        let inner = ProjectInner::new();
+        *inner.phase.lock().await = Phase::Running;
+        inner.desired_running.store(true, Ordering::Relaxed);
+
+        // Spawn a long-lived child as its own process-group leader, mirroring
+        // the `process_group(0)` + `kill_on_drop` spawn in `run`/`run_toolchain`.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("child pid") as i32;
+        inner.pid.store(pid as u32, Ordering::Relaxed);
+
+        // The production reap task: SIGKILL the group on stop, then settle phase.
+        let reap_inner = inner.clone();
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                _ = reap_inner.stop.notified() => {
+                    kill_process_group(&mut child);
+                    child.wait().await.ok()
+                }
+                st = child.wait() => st.ok(),
+            };
+            reap_inner.pid.store(0, Ordering::Relaxed);
+            let _ = status;
+            *reap_inner.phase.lock().await = Phase::Stopped;
+        });
+
+        sup.projects
+            .lock()
+            .await
+            .insert("proj".to_string(), inner.clone());
+
+        // Let the reap task park on `stop.notified()` before we signal.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        sup.stop_all().await;
+
+        assert!(
+            matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed),
+            "project should be in a terminal phase after stop_all"
+        );
+        // SIGKILL is uncatchable; the process (and its group) must be gone.
+        // `kill(pid, 0)` returns ESRCH once it's reaped.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "child process {pid} should have been reaped");
     }
 }

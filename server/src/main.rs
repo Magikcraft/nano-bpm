@@ -17791,8 +17791,45 @@ fn install_panic_hook() {
 }
 
 async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-    tracing::info!("shutdown signal received");
+    // Resolve on SIGINT (ctrl-c) **or** SIGTERM. c8ctl `nano stop`/`restart`
+    // terminates the server with SIGTERM (escalating to SIGKILL after a grace
+    // window); without a SIGTERM handler the process would die abruptly, so the
+    // axum graceful-shutdown future below would never fire and supervised apps
+    // would never be reaped.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler; SIGINT only");
+                let _ = tokio::signal::ctrl_c().await;
+                reap_supervised_projects().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("shutdown signal received (SIGINT)"),
+            _ = term.recv() => tracing::info!("shutdown signal received (SIGTERM)"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutdown signal received");
+    }
+    reap_supervised_projects().await;
+}
+
+/// Reaps every studio-supervised project (and its process group) before the
+/// server exits, so runs started from the console don't orphan to init on
+/// `c8 nano stop`/`restart`. No-op without the `console` feature.
+async fn reap_supervised_projects() {
+    #[cfg(feature = "console")]
+    {
+        tracing::info!("stopping supervised project runs");
+        crate::console::projects::supervisor().stop_all().await;
+    }
 }
 
 /// Resolves the journal and read-model database paths from the environment.
