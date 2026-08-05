@@ -425,6 +425,14 @@ export type ProjectSummary = {
      */
     template?: string;
     scaffoldedFrom?: ProjectScaffoldedFrom;
+    /**
+     * True when the project was scaffolded from a pack whose currently installed version differs from the project's recorded `scaffoldedFrom.version` — i.e. a newer template is available to overlay via `updateProjectFromTemplate`. Offline signal (installed pack vs scaffold breadcrumb); always present as a boolean and `false` for built-in templates and projects not scaffolded from a pack.
+     */
+    updateAvailable: boolean;
+    /**
+     * The installed scaffolding pack's current version, when it differs from `scaffoldedFrom.version` (the target of an update). Absent when up to date or not scaffolded from a pack.
+     */
+    latestVersion?: string;
 };
 
 export type ProjectRunConfig = {
@@ -656,6 +664,64 @@ export type CompileRequest = {
 
 export type CompileStarted = {
     started: boolean;
+};
+
+export type UpdateFromTemplateRequest = {
+    /**
+     * When false (default) compute and return the plan without writing (dry run). When true, write the non-conflicting subset (create + safe overwrite + auto-merged) and bump `scaffoldedFrom.version` on a clean update; conflicted files are left untouched.
+     */
+    apply?: boolean;
+    /**
+     * Optional npm version/dist-tag of the pack to overlay. Defaults to the currently installed pack version (the offline `updateAvailable` target).
+     */
+    version?: string;
+};
+
+export type UpdatePlan = {
+    /**
+     * The scaffolding pack id (`scaffoldedFrom.pack`).
+     */
+    pack: string;
+    /**
+     * The project's recorded scaffold version (the 3-way merge base).
+     */
+    fromVersion?: string;
+    /**
+     * The version being overlaid.
+     */
+    toVersion?: string;
+    /**
+     * False for a dry run; true when the plan was written.
+     */
+    applied: boolean;
+    /**
+     * True when `scaffoldedFrom.version` was advanced to `toVersion` — only on a clean apply with no remaining conflicts.
+     */
+    versionBumped: boolean;
+    /**
+     * New files the pack adds (written on apply).
+     */
+    create: Array<string>;
+    /**
+     * Files the pack changed that the user had not modified — safe to overwrite (written on apply).
+     */
+    overwrite: Array<string>;
+    /**
+     * Files 3-way auto-merged (upstream + local edits combined without overlap; written on apply).
+     */
+    merged: Array<string>;
+    /**
+     * Files/dirs kept as-is (datasource DB + sidecars, nano-generated/, .git/, node_modules/).
+     */
+    preserved: Array<string>;
+    /**
+     * Files where upstream and local both changed and could not be auto-merged — NOT written; surfaced for manual resolution.
+     */
+    conflicts: Array<string>;
+    /**
+     * Files present locally but absent from the new pack — kept (never deleted), listed for review.
+     */
+    orphans: Array<string>;
 };
 
 export type ActiveRunConfigRequest = {
@@ -2580,6 +2646,37 @@ export type CompileProjectResponses = {
 };
 
 export type CompileProjectResponse = CompileProjectResponses[keyof CompileProjectResponses];
+
+export type UpdateProjectFromTemplateData = {
+    body?: UpdateFromTemplateRequest;
+    path: {
+        name: string;
+    };
+    query?: never;
+    url: '/projects/{name}/update-from-template';
+};
+
+export type UpdateProjectFromTemplateErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type UpdateProjectFromTemplateError = UpdateProjectFromTemplateErrors[keyof UpdateProjectFromTemplateErrors];
+
+export type UpdateProjectFromTemplateResponses = {
+    /**
+     * The overlay plan (and, when applied, what was written)
+     */
+    200: UpdatePlan;
+};
+
+export type UpdateProjectFromTemplateResponse = UpdateProjectFromTemplateResponses[keyof UpdateProjectFromTemplateResponses];
 
 export type GetRunConfigsData = {
     body?: never;

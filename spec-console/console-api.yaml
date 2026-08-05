@@ -753,6 +753,35 @@ paths:
               schema: { $ref: '#/components/schemas/CompileStarted' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /projects/{name}/update-from-template:
+    post:
+      operationId: updateProjectFromTemplate
+      tags: [projects]
+      summary: Update a project from a newer version of its scaffolding pack
+      description: >-
+        Overlays a newer version of the project's `scaffoldedFrom` pack onto the
+        project, preserving the sqlite datasource (app.db + WAL/SHM), generated
+        SDK (`nano-generated/`) and local VCS/deps (`.git/`, `node_modules/`).
+        Uses the recorded `scaffoldedFrom.version` as a 3-way merge base so a
+        user's edits to upstream-unchanged files survive and only genuine
+        conflicts are surfaced. Dry-run by default (`apply: false`) — returns the
+        plan without writing. With `apply: true` it writes the non-conflicting
+        subset and bumps `scaffoldedFrom.version` on a clean update.
+      parameters: [ { $ref: '#/components/parameters/NamePath' } ]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateFromTemplateRequest' }
+      responses:
+        '200':
+          description: The overlay plan (and, when applied, what was written)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UpdatePlan' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
   /projects/{name}/run-configs:
     get:
       operationId: getRunConfigs
@@ -1857,7 +1886,7 @@ components:
     # ---- Projects (camelCase wire fields) --------------------------------
     ProjectSummary:
       type: object
-      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running, source, lang]
+      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running, source, lang, updateAvailable]
       properties:
         name: { type: string }
         displayName:
@@ -1896,6 +1925,22 @@ components:
             card so a bug can be traced back to the built-in template or pack.
         scaffoldedFrom:
           $ref: '#/components/schemas/ProjectScaffoldedFrom'
+        updateAvailable:
+          type: boolean
+          description: >-
+            True when the project was scaffolded from a pack whose currently
+            installed version differs from the project's recorded
+            `scaffoldedFrom.version` — i.e. a newer template is available to
+            overlay via `updateProjectFromTemplate`. Offline signal (installed
+            pack vs scaffold breadcrumb); always present as a boolean and
+            `false` for built-in templates and projects not scaffolded from a
+            pack.
+        latestVersion:
+          type: string
+          description: >-
+            The installed scaffolding pack's current version, when it differs
+            from `scaffoldedFrom.version` (the target of an update). Absent when
+            up to date or not scaffolded from a pack.
     ProjectRunConfig:
       type: object
       required: [id, label, run, compile]
@@ -2226,6 +2271,78 @@ components:
       required: [started]
       properties:
         started: { type: boolean }
+    UpdateFromTemplateRequest:
+      type: object
+      properties:
+        apply:
+          type: boolean
+          default: false
+          description: >-
+            When false (default) compute and return the plan without writing
+            (dry run). When true, write the non-conflicting subset (create +
+            safe overwrite + auto-merged) and bump `scaffoldedFrom.version` on a
+            clean update; conflicted files are left untouched.
+        version:
+          type: string
+          description: >-
+            Optional npm version/dist-tag of the pack to overlay. Defaults to the
+            currently installed pack version (the offline `updateAvailable`
+            target).
+    UpdatePlan:
+      type: object
+      required: [pack, applied, versionBumped, create, overwrite, merged, preserved, conflicts, orphans]
+      properties:
+        pack:
+          type: string
+          description: The scaffolding pack id (`scaffoldedFrom.pack`).
+        fromVersion:
+          type: string
+          description: The project's recorded scaffold version (the 3-way merge base).
+        toVersion:
+          type: string
+          description: The version being overlaid.
+        applied:
+          type: boolean
+          description: False for a dry run; true when the plan was written.
+        versionBumped:
+          type: boolean
+          description: >-
+            True when `scaffoldedFrom.version` was advanced to `toVersion` — only
+            on a clean apply with no remaining conflicts.
+        create:
+          type: array
+          items: { type: string }
+          description: New files the pack adds (written on apply).
+        overwrite:
+          type: array
+          items: { type: string }
+          description: >-
+            Files the pack changed that the user had not modified — safe to
+            overwrite (written on apply).
+        merged:
+          type: array
+          items: { type: string }
+          description: >-
+            Files 3-way auto-merged (upstream + local edits combined without
+            overlap; written on apply).
+        preserved:
+          type: array
+          items: { type: string }
+          description: >-
+            Files/dirs kept as-is (datasource DB + sidecars, nano-generated/,
+            .git/, node_modules/).
+        conflicts:
+          type: array
+          items: { type: string }
+          description: >-
+            Files where upstream and local both changed and could not be
+            auto-merged — NOT written; surfaced for manual resolution.
+        orphans:
+          type: array
+          items: { type: string }
+          description: >-
+            Files present locally but absent from the new pack — kept (never
+            deleted), listed for review.
     ActiveRunConfigRequest:
       type: object
       properties:
