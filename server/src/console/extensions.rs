@@ -982,6 +982,41 @@ pub fn installed_pack_versions() -> std::collections::HashMap<String, String> {
     map
 }
 
+/// Shared `npm pack <pkg_spec>` + `tar xzf --strip-components=1` core used by
+/// both [`install_from_npm`] and [`pack_into_tmp`]. Runs `npm pack` inside
+/// `dir` (fetching the tarball there), extracts it in place, and removes the
+/// tarball, leaving only the package's own files. Keeping this one place means
+/// the security-sensitive extraction flags (`--strip-components=1`) and cleanup
+/// can't drift between the two callers. Does NOT create or clean up `dir` on
+/// error — the caller owns `dir`'s lifecycle. Best-effort: requires `npm` and
+/// `tar` on PATH.
+fn npm_pack_extract(dir: &Path, pkg_spec: &str) -> Result<(), String> {
+    let npm = find_program("npm").ok_or("npm not found on PATH")?;
+    let out = std::process::Command::new(&npm)
+        .args(["pack", pkg_spec, "--silent"])
+        .current_dir(dir)
+        .output()
+        .map_err(|e| format!("npm pack: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "npm pack failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    let tgz = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let tar = find_program("tar").ok_or("tar not found")?;
+    let st = std::process::Command::new(&tar)
+        .args(["xzf", &tgz, "--strip-components=1"])
+        .current_dir(dir)
+        .status()
+        .map_err(|e| format!("tar: {e}"))?;
+    if !st.success() {
+        return Err("tar extract failed".into());
+    }
+    let _ = std::fs::remove_file(dir.join(&tgz));
+    Ok(())
+}
+
 /// `npm pack <pkg_spec>` + extract into a fresh temp dir, returning the
 /// extracted package root. Unlike [`install_from_npm`], this NEVER touches the
 /// pack store (`safe_pkg_dir`) — it materialises a throwaway copy (e.g. an old
@@ -999,52 +1034,12 @@ pub fn pack_into_tmp(pkg_spec: &str) -> Result<PathBuf, String> {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    let cleanup = |dir: &Path| {
-        let _ = std::fs::remove_dir_all(dir);
-    };
-    let Some(npm) = find_program("npm") else {
-        cleanup(&dir);
-        return Err("npm not found on PATH".into());
-    };
-    let out = match std::process::Command::new(&npm)
-        .args(["pack", pkg_spec, "--silent"])
-        .current_dir(&dir)
-        .output()
-    {
-        Ok(out) => out,
-        Err(e) => {
-            cleanup(&dir);
-            return Err(format!("npm pack: {e}"));
-        }
-    };
-    if !out.status.success() {
-        cleanup(&dir);
-        return Err(format!(
-            "npm pack failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+    // Throwaway dir: tear it down on any failure so a partial extract never
+    // leaks into the temp root.
+    if let Err(e) = npm_pack_extract(&dir, pkg_spec) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
     }
-    let tgz = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let Some(tar) = find_program("tar") else {
-        cleanup(&dir);
-        return Err("tar not found".into());
-    };
-    let st = match std::process::Command::new(&tar)
-        .args(["xzf", &tgz, "--strip-components=1"])
-        .current_dir(&dir)
-        .status()
-    {
-        Ok(st) => st,
-        Err(e) => {
-            cleanup(&dir);
-            return Err(format!("tar: {e}"));
-        }
-    };
-    if !st.success() {
-        cleanup(&dir);
-        return Err("tar extract failed".into());
-    }
-    let _ = std::fs::remove_file(dir.join(&tgz));
     Ok(dir)
 }
 /// 0033 §4): resolves each of its manifest `components` paths against the pack
@@ -1274,29 +1269,7 @@ pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
         let _ = std::fs::remove_dir_all(&dir);
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    let npm = find_program("npm").ok_or("npm not found on PATH")?;
-    let out = std::process::Command::new(&npm)
-        .args(["pack", pkg, "--silent"])
-        .current_dir(&dir)
-        .output()
-        .map_err(|e| format!("npm pack: {e}"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "npm pack failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let tgz = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let tar = find_program("tar").ok_or("tar not found")?;
-    let st = std::process::Command::new(&tar)
-        .args(["xzf", &tgz, "--strip-components=1"])
-        .current_dir(&dir)
-        .status()
-        .map_err(|e| format!("tar: {e}"))?;
-    if !st.success() {
-        return Err("tar extract failed".into());
-    }
-    let _ = std::fs::remove_file(dir.join(&tgz));
+    npm_pack_extract(&dir, pkg)?;
     let mf = dir.join(manifest_name());
     let txt =
         std::fs::read_to_string(&mf).map_err(|_| "package has no nano-ide.ext.json".to_string())?;

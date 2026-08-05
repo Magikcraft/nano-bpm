@@ -1886,7 +1886,7 @@ components:
     # ---- Projects (camelCase wire fields) --------------------------------
     ProjectSummary:
       type: object
-      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running, source, lang]
+      required: [name, description, deployTarget, updatedMs, processes, decisions, forms, workers, running, source, lang, updateAvailable]
       properties:
         name: { type: string }
         displayName:
@@ -2290,7 +2290,7 @@ components:
             target).
     UpdatePlan:
       type: object
-      required: [pack, applied, create, overwrite, merged, preserved, conflicts, orphans]
+      required: [pack, applied, versionBumped, create, overwrite, merged, preserved, conflicts, orphans]
       properties:
         pack:
           type: string

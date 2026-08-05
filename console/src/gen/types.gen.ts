@@ -428,7 +428,7 @@ export type ProjectSummary = {
     /**
      * True when the project was scaffolded from a pack whose currently installed version differs from the project's recorded `scaffoldedFrom.version` — i.e. a newer template is available to overlay via `updateProjectFromTemplate`. Offline signal (installed pack vs scaffold breadcrumb); always present as a boolean and `false` for built-in templates and projects not scaffolded from a pack.
      */
-    updateAvailable?: boolean;
+    updateAvailable: boolean;
     /**
      * The installed scaffolding pack's current version, when it differs from `scaffoldedFrom.version` (the target of an update). Absent when up to date or not scaffolded from a pack.
      */
@@ -697,7 +697,7 @@ export type UpdatePlan = {
     /**
      * True when `scaffoldedFrom.version` was advanced to `toVersion` — only on a clean apply with no remaining conflicts.
      */
-    versionBumped?: boolean;
+    versionBumped: boolean;
     /**
      * New files the pack adds (written on apply).
      */
