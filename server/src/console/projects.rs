@@ -3813,17 +3813,23 @@ pub struct ProjectSummary {
 /// Offline and best-effort: an unknown installed version (built-in pack, or
 /// `package.json` unreadable) yields no update. Returns `(update_available,
 /// latest_version)` where `latest_version` is `Some` only when it differs.
-fn compute_update_available(sf: Option<&ScaffoldedFrom>) -> (bool, Option<String>) {
+/// `installed_versions` is the `pack_id → version` map computed once per
+/// [`list_projects`] pass (see [`extensions::installed_pack_versions`]) so a
+/// listing doesn't rescan the pack store once per project.
+fn compute_update_available(
+    sf: Option<&ScaffoldedFrom>,
+    installed_versions: &std::collections::HashMap<String, String>,
+) -> (bool, Option<String>) {
     let Some(sf) = sf else {
         return (false, None);
     };
-    let Some(installed) = super::extensions::pack_version(&sf.pack) else {
+    let Some(installed) = installed_versions.get(&sf.pack) else {
         return (false, None);
     };
     if sf.version.as_deref() == Some(installed.as_str()) {
         (false, None)
     } else {
-        (true, Some(installed))
+        (true, Some(installed.clone()))
     }
 }
 
@@ -3847,6 +3853,11 @@ fn count_dirs(dir: &Path) -> usize {
 /// left `false` here; the handler fills it from the supervisor.
 pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
     let root = ensure_projects_root()?;
+    // One scan of the pack store for the whole listing: `compute_update_available`
+    // is called once per project (workspace + reference), so resolving each
+    // pack's installed version from this shared map keeps the refresh
+    // O(projects + packs) instead of re-scanning the store per project.
+    let installed_versions = super::extensions::installed_pack_versions();
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&root)?.flatten() {
         let path = entry.path();
@@ -3862,7 +3873,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         let cfg = read_config(name).unwrap_or_else(|| ProjectConfig::new(name, ""));
         let res = path.join("resources");
         let (update_available, latest_version) =
-            compute_update_available(cfg.scaffolded_from.as_ref());
+            compute_update_available(cfg.scaffolded_from.as_ref(), &installed_versions);
         out.push(ProjectSummary {
             name: name.to_string(),
             display_name: cfg.display_name,
@@ -3936,7 +3947,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         let cfg = read_config(name).unwrap_or_else(|| ProjectConfig::new(name, ""));
         let res = dir.join("resources");
         let (update_available, latest_version) =
-            compute_update_available(cfg.scaffolded_from.as_ref());
+            compute_update_available(cfg.scaffolded_from.as_ref(), &installed_versions);
         out.push(ProjectSummary {
             name: name.to_string(),
             // Prefer the spelling the operator typed at import time (kept on the
@@ -4179,9 +4190,25 @@ pub fn update_from_template(
             super::extensions::template_dir_in_root(&root, &template)
                 .ok_or_else(|| format!("template '{template}' not found in {pkg}@{v}"))?
         }
-        _ => super::extensions::template_source(&template)
-            .map(|(_, d)| d)
-            .ok_or_else(|| format!("pack '{}' / template '{template}' not installed", sf.pack))?,
+        _ => {
+            // No explicit version: overlay the currently installed pack. But
+            // `template_source` resolves a *template id* against the FIRST
+            // installed pack that carries it — if two packs contribute the same
+            // template id it can land on a different upstream than the one this
+            // project was scaffolded from (`sf.pack`). Validate the resolved
+            // manifest id and fail closed rather than silently overlay the wrong
+            // pack.
+            let (m, d) = super::extensions::template_source(&template).ok_or_else(|| {
+                format!("pack '{}' / template '{template}' not installed", sf.pack)
+            })?;
+            if m.id != sf.pack {
+                return Err(format!(
+                    "template '{template}' resolves to pack '{}', but this project was scaffolded from '{}' — refusing to overlay a different upstream",
+                    m.id, sf.pack
+                ));
+            }
+            d
+        }
     };
 
     // Resolve the 3-way base: the recorded scaffold version fetched from npm.
@@ -10719,16 +10746,20 @@ mod tests {
         )
         .unwrap();
         unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let versions = crate::console::extensions::installed_pack_versions();
 
         // No scaffold breadcrumb → never an update.
-        assert_eq!(compute_update_available(None), (false, None));
+        assert_eq!(compute_update_available(None, &versions), (false, None));
 
         // Recorded == installed → up to date.
         let same = ScaffoldedFrom {
             pack: "appx".into(),
             version: Some("2.0.0".into()),
         };
-        assert_eq!(compute_update_available(Some(&same)), (false, None));
+        assert_eq!(
+            compute_update_available(Some(&same), &versions),
+            (false, None)
+        );
 
         // Recorded older → update available, surfacing the installed version.
         let older = ScaffoldedFrom {
@@ -10736,7 +10767,7 @@ mod tests {
             version: Some("1.0.0".into()),
         };
         assert_eq!(
-            compute_update_available(Some(&older)),
+            compute_update_available(Some(&older), &versions),
             (true, Some("2.0.0".into()))
         );
 
@@ -10745,7 +10776,10 @@ mod tests {
             pack: "nope".into(),
             version: Some("1.0.0".into()),
         };
-        assert_eq!(compute_update_available(Some(&missing)), (false, None));
+        assert_eq!(
+            compute_update_available(Some(&missing), &versions),
+            (false, None)
+        );
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
     }
 

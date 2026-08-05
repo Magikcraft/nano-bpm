@@ -948,6 +948,40 @@ pub fn pack_npm_name(ext_id: &str) -> Option<String> {
     None
 }
 
+/// Map every installed pack's manifest id to its `package.json` version in a
+/// single scan of the extensions store — the batch form of [`pack_version`].
+/// Callers that need the installed version for *many* packs (e.g.
+/// [`list_projects`](super::projects::list_projects) deciding `update_available`
+/// per project) build this once instead of re-scanning the whole store per
+/// lookup, turning an O(projects × packs) refresh into O(projects + packs).
+/// First-writer-wins on an id collision, matching `pack_version`'s first-match
+/// resolution over the sorted `pack_dirs()`.
+pub fn installed_pack_versions() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for base in pack_dirs() {
+        let Ok(txt) = std::fs::read_to_string(base.join(manifest_name())) else {
+            continue;
+        };
+        let Ok(m) = serde_json::from_str::<ExtManifest>(&txt) else {
+            continue;
+        };
+        let Ok(pkg) = std::fs::read_to_string(base.join("package.json")) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&pkg) else {
+            continue;
+        };
+        if let Some(ver) = v
+            .get("version")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            map.entry(m.id).or_insert_with(|| ver.to_string());
+        }
+    }
+    map
+}
+
 /// `npm pack <pkg_spec>` + extract into a fresh temp dir, returning the
 /// extracted package root. Unlike [`install_from_npm`], this NEVER touches the
 /// pack store (`safe_pkg_dir`) — it materialises a throwaway copy (e.g. an old

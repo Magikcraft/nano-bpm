@@ -1071,7 +1071,14 @@ impl apis::projects::Projects for ServerImpl {
             }
             Ok(Err(msg)) if msg == "not found" => Ok(R::Status404_NotFound(msg)),
             Ok(Err(msg)) => Ok(R::Status400_InvalidRequest(msg)),
-            Err(e) => Ok(R::Status400_InvalidRequest(format!("update failed: {e}"))),
+            // A JoinError means the blocking update task itself panicked/was
+            // cancelled — not a client error. Keep the 400 (no 5xx variant on
+            // this op) but make the message name the failure mode explicitly so
+            // operators can triage it, mirroring the `import task panicked`
+            // convention on the import handler above.
+            Err(e) => Ok(R::Status400_InvalidRequest(format!(
+                "update task panicked: {e}"
+            ))),
         }
     }
 
