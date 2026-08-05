@@ -1017,6 +1017,48 @@ fn npm_pack_extract(dir: &Path, pkg_spec: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Create a fresh, uniquely-named temp directory under the system temp root
+/// using *exclusive* creation (`create_dir`, not `create_dir_all`): a
+/// pre-existing entry at the target — including an attacker-planted symlink or
+/// directory on a shared multi-user host — makes creation fail rather than
+/// letting us write through it, which defuses the classic predictable-temp-dir
+/// TOCTOU/symlink race. The name mixes the pid, a high-resolution timestamp and
+/// OS-seeded randomness (`RandomState` is seeded from the platform CSPRNG on
+/// construction), and we retry on the rare `AlreadyExists` collision. Callers
+/// are responsible for removing the returned directory.
+pub fn secure_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    use std::hash::{BuildHasher, Hasher};
+    let base = std::env::temp_dir();
+    let mut last_err: Option<std::io::Error> = None;
+    for _ in 0..64 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // A fresh `RandomState` each iteration is seeded from the OS CSPRNG, so
+        // its hasher yields an unpredictable 64-bit value with no input.
+        let rand = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        let candidate =
+            base.join(format!("{prefix}-{}-{nanos}-{rand:016x}", std::process::id()));
+        match std::fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not create a unique temp dir",
+        )
+    }))
+}
+
 /// `npm pack <pkg_spec>` + extract into a fresh temp dir, returning the
 /// extracted package root. Unlike [`install_from_npm`], this NEVER touches the
 /// pack store (`safe_pkg_dir`) — it materialises a throwaway copy (e.g. an old
@@ -1025,15 +1067,7 @@ fn npm_pack_extract(dir: &Path, pkg_spec: &str) -> Result<(), String> {
 /// files). `pkg_spec` accepts `name`, `name@version`, or `@scope/name@version`.
 /// Best-effort: requires `npm` and `tar` on PATH.
 pub fn pack_into_tmp(pkg_spec: &str) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!(
-        "nano-pack-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+    let dir = secure_temp_dir("nano-pack").map_err(|e| format!("mkdir: {e}"))?;
     // Throwaway dir: tear it down on any failure so a partial extract never
     // leaks into the temp root.
     if let Err(e) = npm_pack_extract(&dir, pkg_spec) {

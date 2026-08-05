@@ -4158,15 +4158,11 @@ fn try_git_merge(base: &[u8], current: &[u8], new: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let git = super::extensions::find_program("git")?;
-    let tmp = std::env::temp_dir().join(format!(
-        "nano-merge-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&tmp).ok()?;
+    // Securely create a unique temp dir (exclusive `create_dir` + OS-seeded
+    // random name) instead of a predictable `temp_dir().join(pid-nanos)`, which
+    // was vulnerable to pre-creation/symlink tricks and same-nanosecond
+    // collisions on shared hosts.
+    let tmp = super::extensions::secure_temp_dir("nano-merge").ok()?;
     let cur_p = tmp.join("current");
     let base_p = tmp.join("base");
     let new_p = tmp.join("new");
@@ -4515,11 +4511,11 @@ fn overlay_plan(
                 plan.create.push(rel_str.clone());
                 if apply {
                     if let Some(parent) = dst_path.parent() {
-                        let _ = std::fs::create_dir_all(parent);
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("mkdir {rel_str}: {e}"))?;
                     }
-                    if std::fs::write(&dst_path, &new_bytes).is_err() {
-                        return Err(format!("write {rel_str}"));
-                    }
+                    std::fs::write(&dst_path, &new_bytes)
+                        .map_err(|e| format!("write {rel_str}: {e}"))?;
                 }
                 continue;
             }
@@ -4550,8 +4546,9 @@ fn overlay_plan(
             Some(base) if cur_bytes == base => {
                 // User hadn't touched it → safe to take upstream's new version.
                 plan.overwrite.push(rel_str.clone());
-                if apply && std::fs::write(&dst_path, &new_bytes).is_err() {
-                    return Err(format!("write {rel_str}"));
+                if apply {
+                    std::fs::write(&dst_path, &new_bytes)
+                        .map_err(|e| format!("write {rel_str}: {e}"))?;
                 }
             }
             Some(base) if new_bytes == base => {
@@ -4561,8 +4558,9 @@ fn overlay_plan(
                 // Both sides changed — try a 3-way auto-merge, else conflict.
                 if let Some(merged) = try_git_merge(&base, &cur_bytes, &new_bytes) {
                     plan.merged.push(rel_str.clone());
-                    if apply && std::fs::write(&dst_path, &merged).is_err() {
-                        return Err(format!("write {rel_str}"));
+                    if apply {
+                        std::fs::write(&dst_path, &merged)
+                            .map_err(|e| format!("write {rel_str}: {e}"))?;
                     }
                 } else {
                     plan.conflicts.push(rel_str.clone());
