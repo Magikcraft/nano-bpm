@@ -223,6 +223,19 @@ pub fn segmented_enabled() -> bool {
     }
 }
 
+/// Opt-in escape hatch for the unrecoverable read-model compaction gap (see
+/// [`CatchUpPlan::CompactedGap`] and [`catch_up_shard`]). When set truthy via
+/// `NANOBPMN_READ_MODEL_LOSSY_REBUILD`, a boot that finds the read model below
+/// the journal's compaction floor rebuilds it from the surviving journal tail —
+/// **permanently dropping** the compacted-away history — instead of aborting.
+/// Default (`false`) fails fast so the data loss is never silent.
+pub fn read_model_lossy_rebuild_enabled() -> bool {
+    match std::env::var("NANOBPMN_READ_MODEL_LOSSY_REBUILD") {
+        Ok(v) => matches!(v.trim(), "1" | "true" | "on" | "yes"),
+        Err(_) => false,
+    }
+}
+
 /// Snapshot + compaction cadence from `NANOBPMN_SNAPSHOT_INTERVAL_MS` (default
 /// 60 s, floored at 1 s). `0` disables periodic snapshots/compaction entirely
 /// (the journal then grows unbounded, as in the legacy path). Returns `None`
@@ -1248,6 +1261,115 @@ pub fn compact_multi(shared: &SegShared, covered: &[u64], exported: &[u64]) -> u
     removed
 }
 
+/// How a boot read-model catch-up must treat one shard, given its persisted
+/// `exported_position` relative to the surviving journal window
+/// `[floor, floor + surviving)`. `floor` is the shard's compaction boundary:
+/// `SegRecovery::first_index` for the single-partition path, `pp_base[p]` for a
+/// per-partition shard. Everything below `floor` has been compacted out of the
+/// journal (folded into the engine snapshot) and no longer exists to replay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchUpPlan {
+    /// The store sits inside the surviving window: resume projection by skipping
+    /// the `skip` surviving events it has already projected, then project the rest.
+    Resume { skip: usize },
+    /// The store is *ahead* of the surviving log (a truncated/corrupt journal):
+    /// reset it and rebuild from whatever survives.
+    RebuildFromSurviving,
+    /// The store sits *below* the compaction floor: the `missing` events in
+    /// `[exported, floor)` it still needs were compacted out of the journal and
+    /// cannot be replayed. Resuming would silently drop them — this is the
+    /// data-loss failure mode of issue #600 and must never be handled silently.
+    CompactedGap { missing: u64 },
+}
+
+/// Classifies a read-model shard's catch-up situation. Pure and total so the
+/// three boot catch-up sites share one canonical decision (no drift), and the
+/// compaction-gap detection is unit-testable in isolation.
+///
+/// In normal operation `exported >= floor` always holds — compaction is gated on
+/// the exporter watermark, so the journal never discards events the read model
+/// has not projected. `exported < floor` therefore only arises when the read
+/// model was independently wiped or reset (a schema-fingerprint change across a
+/// binary upgrade, an unreadable `read-model.sqlite`, or [`ReadStore::reset`])
+/// while the journal had already been compacted.
+pub fn plan_catch_up(exported: u64, floor: u64, surviving: u64) -> CatchUpPlan {
+    if exported < floor {
+        CatchUpPlan::CompactedGap {
+            missing: floor - exported,
+        }
+    } else if exported > floor + surviving {
+        CatchUpPlan::RebuildFromSurviving
+    } else {
+        CatchUpPlan::Resume {
+            skip: (exported - floor) as usize,
+        }
+    }
+}
+
+/// Catches one read-model shard up from a segmented recovery, using the single
+/// canonical [`plan_catch_up`] decision. `surviving` are this shard's surviving
+/// events (log-ordered, spanning `[floor, floor + surviving.len())`).
+///
+/// Unlike the previous inline logic at each boot site, a [`CatchUpPlan::CompactedGap`]
+/// is **never** silently resumed: by default it aborts (the pre-compaction
+/// process instances are unrecoverable by replay, so coming up with a partial or
+/// empty read model would silently lose them — issue #600). Set
+/// `NANOBPMN_READ_MODEL_LOSSY_REBUILD=1` to instead rebuild from the surviving
+/// tail and accept the loss, logged loudly.
+pub fn catch_up_shard(shard: &crate::readstore::ReadStore, floor: u64, surviving: &[&Event]) {
+    let exported = shard.exported_position() as u64;
+    match plan_catch_up(exported, floor, surviving.len() as u64) {
+        CatchUpPlan::Resume { skip } => {
+            if skip < surviving.len() {
+                shard
+                    .export(&surviving[skip..])
+                    .expect("catch up read model from segmented journal");
+            }
+        }
+        CatchUpPlan::RebuildFromSurviving => {
+            shard.reset().expect("reset read store");
+            if !surviving.is_empty() {
+                shard
+                    .export(surviving)
+                    .expect("rebuild read model from surviving journal tail");
+            }
+        }
+        CatchUpPlan::CompactedGap { missing } => {
+            if read_model_lossy_rebuild_enabled() {
+                tracing::error!(
+                    exported,
+                    floor,
+                    missing,
+                    "read model sits below the journal compaction floor (wiped or reset while \
+                     the journal was compacted): {missing} events were compacted out of the \
+                     journal and cannot be replayed. NANOBPMN_READ_MODEL_LOSSY_REBUILD is set — \
+                     rebuilding from the surviving journal tail and PERMANENTLY DROPPING the \
+                     compacted history."
+                );
+                shard.reset().expect("reset read store");
+                if !surviving.is_empty() {
+                    shard
+                        .export(surviving)
+                        .expect("lossy rebuild read model from surviving journal tail");
+                }
+            } else {
+                panic!(
+                    "read model at exported_position={exported} is below the journal compaction \
+                     floor={floor}: {missing} events were compacted out of the journal (folded \
+                     into the engine snapshot) and can no longer be replayed to rebuild the read \
+                     model. This happens when the read model is wiped or reset — e.g. a \
+                     schema-version change across a binary upgrade, or an unreadable \
+                     read-model.sqlite — while the segmented journal has already been compacted. \
+                     Proceeding would SILENTLY lose every pre-compaction process instance. \
+                     Restore the read model (read-model.sqlite) from a backup, or set \
+                     NANOBPMN_READ_MODEL_LOSSY_REBUILD=1 to rebuild from the surviving journal \
+                     tail and accept the loss. See issue #600."
+                );
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nanobpmn_engine_core::{Command, ProcessBuilder};
@@ -2117,6 +2239,133 @@ mod tests {
         assert!(
             read_segment_events(&p3).is_err(),
             "mid-file corruption is not silently dropped"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The catch-up classifier is the single source of truth for the three boot
+    /// sites. In the normal window it resumes; above the tail it rebuilds; and —
+    /// the issue #600 guard — a store *below* the compaction floor is a
+    /// `CompactedGap`, never a silent `Resume`.
+    #[test]
+    fn plan_catch_up_classifies_every_position() {
+        // Fresh dir (no compaction): floor 0, resume from the start.
+        assert_eq!(plan_catch_up(0, 0, 5), CatchUpPlan::Resume { skip: 0 });
+        // Warm resume inside the surviving window.
+        assert_eq!(
+            plan_catch_up(4850, 4848, 10),
+            CatchUpPlan::Resume { skip: 2 }
+        );
+        // Exactly at the floor: resume, replaying the whole surviving tail.
+        assert_eq!(
+            plan_catch_up(4848, 4848, 10),
+            CatchUpPlan::Resume { skip: 0 }
+        );
+        // Exactly at the tail end: resume with nothing left to project.
+        assert_eq!(
+            plan_catch_up(4858, 4848, 10),
+            CatchUpPlan::Resume { skip: 10 }
+        );
+        // Past the tail (truncated/corrupt log): rebuild from what survives.
+        assert_eq!(
+            plan_catch_up(4859, 4848, 10),
+            CatchUpPlan::RebuildFromSurviving
+        );
+        // Below the floor (wiped/reset read model over a compacted journal): the
+        // defect. Must be a gap, NOT `Resume { skip: 0 }` (which silently drops
+        // the compacted-away history — issue #600).
+        assert_eq!(
+            plan_catch_up(0, 4848, 10),
+            CatchUpPlan::CompactedGap { missing: 4848 }
+        );
+        assert_eq!(
+            plan_catch_up(4000, 4848, 10),
+            CatchUpPlan::CompactedGap { missing: 848 }
+        );
+    }
+
+    /// End-to-end reproduction of issue #600: a read model wiped below the
+    /// journal's compaction floor is **refused** (default) rather than silently
+    /// resumed into a partial/empty projection; with the opt-in escape hatch it
+    /// rebuilds loudly from the surviving tail.
+    #[test]
+    fn wiped_read_model_over_compacted_journal_is_refused() {
+        use nanobpmn_engine_core::Command;
+
+        use crate::readstore::ReadStore;
+
+        let dir = temp_dir("readmodel-gap-600");
+
+        // Build a segmented journal, snapshot+rotate+compact so history moves
+        // into the snapshot and `first_index > 0`, then add a self-consistent
+        // post-compaction tail (re-deploy + instance) that projects cleanly.
+        {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1, "sealed prefix compacted away");
+            // Post-compaction, self-consistent tail.
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+        }
+
+        // Reopen: the surviving tail sits above a non-zero compaction floor.
+        let (_engine, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        assert!(
+            recovery.first_index > 0,
+            "compaction must leave a non-zero floor to reproduce the gap"
+        );
+        let surviving: Vec<&Event> = recovery.events.iter().collect();
+
+        // A freshly wiped read model reports `exported_position == 0`, i.e. below
+        // the compaction floor — the exact state after a schema-fingerprint wipe.
+        let store = ReadStore::open(None).expect("fresh in-memory read store");
+        assert_eq!(store.exported_position(), 0);
+
+        // Default: refuse. Suppress the panic hook so the expected abort doesn't
+        // spam the test log.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            catch_up_shard(&store, recovery.first_index, &surviving);
+        }));
+        std::panic::set_hook(prev);
+        assert!(
+            refused.is_err(),
+            "a read model below the compaction floor must abort, not silently resume"
+        );
+        assert_eq!(
+            store.exported_position(),
+            0,
+            "the refused catch-up must not have advanced the read model"
+        );
+
+        // Opt-in escape hatch: rebuild from the surviving tail (lossy, but loud).
+        // Safe from cross-test env races: this is the only test touching this var.
+        unsafe { std::env::set_var("NANOBPMN_READ_MODEL_LOSSY_REBUILD", "1") };
+        let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            catch_up_shard(&store, recovery.first_index, &surviving);
+        }));
+        unsafe { std::env::remove_var("NANOBPMN_READ_MODEL_LOSSY_REBUILD") };
+        assert!(rebuilt.is_ok(), "the escape hatch must rebuild, not abort");
+        assert_eq!(
+            store.exported_position(),
+            surviving.len(),
+            "lossy rebuild resets then projects exactly the surviving tail"
         );
 
         let _ = fs::remove_dir_all(&dir);
