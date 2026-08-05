@@ -4187,6 +4187,340 @@ fn should_lock_an_activated_job_until_its_deadline() {
 }
 
 #[test]
+fn should_extend_a_job_lock_past_its_original_deadline() {
+    // given worker A activated the job at t=0 for 1000ms (deadline=1000)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+    assert_eq!(engine.job(job_key).unwrap().deadline, Some(1_000));
+
+    // when A extends the lock by 5000ms at t=800 (before the original deadline)
+    engine
+        .apply_command_at(Command::update_job_timeout(job_key, 5_000), 800)
+        .unwrap();
+
+    // then the deadline moved out to now + timeout = 5800
+    assert_eq!(engine.job(job_key).unwrap().deadline, Some(5_800));
+
+    // and the periodic expiry tick fired at the ORIGINAL deadline no longer
+    // reclaims the job, so another worker still cannot activate it
+    engine.expire_jobs(1_500);
+    assert!(engine
+        .activate_jobs("payment", "B", 10, 1_000, 1_500)
+        .is_empty());
+
+    // only once the EXTENDED deadline passes is the lock released and the job
+    // redelivered
+    engine.expire_jobs(5_900);
+    let reactivated = engine.activate_jobs("payment", "B", 10, 1_000, 5_900);
+    assert_eq!(reactivated.len(), 1);
+    assert_eq!(reactivated[0].key, job_key);
+}
+
+#[test]
+fn should_reject_a_lock_extension_once_the_lock_has_expired() {
+    // given a job whose activation lock has expired (back in the pool, Created)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+    engine.expire_jobs(1_500);
+
+    // when its (now non-existent) lock is extended
+    let err = engine
+        .apply_command_at(Command::update_job_timeout(job_key, 5_000), 1_600)
+        .unwrap_err();
+
+    // then it is a wrong-state error, not a silent success — a job must be
+    // activated to have a lock to extend
+    assert_eq!(err, EngineError::JobNotActive { job_key });
+}
+
+#[test]
+fn should_reject_a_lock_extension_for_an_unknown_job() {
+    let mut engine = Engine::new();
+    let err = engine
+        .apply_command(Command::update_job_timeout(999, 5_000))
+        .unwrap_err();
+    assert_eq!(err, EngineError::JobNotFound { job_key: 999 });
+}
+
+/// #592 follow-up #4: `JobUpdateRequest.operationReference` must be threaded
+/// onto the emitted update events (audit correlation), for BOTH the retries and
+/// the timeout changeset fields — not silently dropped.
+#[test]
+fn should_thread_operation_reference_onto_job_update_events() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "A", 10, 60_000, 0)[0].key;
+
+    // when a retries update carries an operation reference
+    let events = engine
+        .apply_command(Command::update_job_retries_with_ref(job_key, 5, Some(4242)))
+        .unwrap();
+    // then the reference lands on the JobRetriesUpdated event
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::JobRetriesUpdated {
+            operation_reference: Some(4242),
+            ..
+        }
+    )));
+
+    // and likewise for a timeout (lock-extension) update
+    let events = engine
+        .apply_command_at(
+            Command::update_job_timeout_with_ref(job_key, 5_000, Some(9001)),
+            100,
+        )
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::JobTimeoutUpdated {
+            operation_reference: Some(9001),
+            ..
+        }
+    )));
+
+    // class-scoped: an update WITHOUT a reference leaves the field None (not a
+    // defaulted zero), so the audit trail distinguishes "no ref" from "ref 0".
+    let events = engine
+        .apply_command(Command::update_job_retries(job_key, 7))
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::JobRetriesUpdated {
+            operation_reference: None,
+            ..
+        }
+    )));
+}
+
+/// #592 follow-up: `updateJob` may carry BOTH `retries` and `timeout` in one
+/// changeset, applied by the server as two engine commands. The server applies
+/// `timeout` first so the combined update never partially applies then fails.
+/// That ordering is only sound because of an engine invariant: any job for which
+/// a lock extension (`UpdateJobTimeout`) succeeds is Activated, and an Activated
+/// job is never terminal, so `UpdateJobRetries` on it also succeeds. This test
+/// pins that invariant — if retries were ever tightened to reject Activated
+/// jobs, the partial-apply hazard would return and this guard would fail.
+#[test]
+fn activated_job_accepts_both_timeout_then_retries_updates() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+
+    // A lock extension succeeds only while Activated...
+    engine
+        .apply_command_at(Command::update_job_timeout(job_key, 5_000), 100)
+        .unwrap();
+    // ...and because the job is still Activated (not terminal), the retries
+    // update that the server applies next is guaranteed to succeed too.
+    engine
+        .apply_command(Command::update_job_retries(job_key, 3))
+        .unwrap();
+}
+
+/// `Command` is persisted through the Raft log (`ReplicatedCommand` serializes
+/// `Command`). New fields on persisted variants must (a) deserialize from logs
+/// written before the field existed (`serde(default)`) and (b) stay off the wire
+/// in their empty/absent form (`skip_serializing_if`) so the documented
+/// "byte-unchanged" claim holds. This guards the whole defect class for the
+/// three fields added in #592: `ThrowJobError.variables`,
+/// `UpdateJobRetries.operation_reference`, `UpdateJobTimeout.operation_reference`.
+#[cfg(feature = "serde")]
+#[test]
+fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
+    use std::collections::HashMap;
+
+    // (a) Old log entries lack the new fields — they must still deserialize.
+    let throw: Command = serde_json::from_str(
+        r#"{"ThrowJobError":{"job_key":7,"error_code":"E","error_message":"m"}}"#,
+    )
+    .expect("legacy ThrowJobError without variables must deserialize");
+    assert!(matches!(
+        throw,
+        Command::ThrowJobError { ref variables, .. } if variables.is_empty()
+    ));
+
+    let retries: Command =
+        serde_json::from_str(r#"{"UpdateJobRetries":{"job_key":7,"retries":3}}"#)
+            .expect("legacy UpdateJobRetries without operation_reference must deserialize");
+    assert!(matches!(
+        retries,
+        Command::UpdateJobRetries {
+            operation_reference: None,
+            ..
+        }
+    ));
+
+    let timeout: Command =
+        serde_json::from_str(r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5000}}"#)
+            .expect("legacy UpdateJobTimeout without operation_reference must deserialize");
+    assert!(matches!(
+        timeout,
+        Command::UpdateJobTimeout {
+            operation_reference: None,
+            ..
+        }
+    ));
+
+    // (b) The empty/absent form must not appear on the wire (byte-unchanged).
+    let throw_empty = Command::ThrowJobError {
+        job_key: 7,
+        error_code: "E".into(),
+        error_message: "m".into(),
+        variables: HashMap::new(),
+    };
+    let s = serde_json::to_string(&throw_empty).unwrap();
+    assert!(
+        !s.contains("variables"),
+        "empty variables must be skipped: {s}"
+    );
+
+    let s = serde_json::to_string(&Command::update_job_retries(7, 3)).unwrap();
+    assert!(
+        !s.contains("operation_reference"),
+        "absent operation_reference must be skipped: {s}"
+    );
+
+    let s = serde_json::to_string(&Command::update_job_timeout(7, 5000)).unwrap();
+    assert!(
+        !s.contains("operation_reference"),
+        "absent operation_reference must be skipped: {s}"
+    );
+
+    // Present values still round-trip.
+    let s = serde_json::to_string(&Command::update_job_retries_with_ref(7, 3, Some(42))).unwrap();
+    assert!(s.contains("operation_reference"));
+    let back: Command = serde_json::from_str(&s).unwrap();
+    assert!(matches!(
+        back,
+        Command::UpdateJobRetries {
+            operation_reference: Some(42),
+            ..
+        }
+    ));
+}
+
+/// start -> charge(payment) --normal--> done
+///     charge --(error CARD_DECLINED boundary)--> recover(recovery) -> rec_done
+fn process_with_error_boundary_to_task() -> ProcessDefinition {
+    ProcessBuilder::new("payment-recover")
+        .start_event("s")
+        .service_task("charge", "payment")
+        .error_boundary_event("boundary", "charge", "CARD_DECLINED")
+        .service_task("recover", "recovery")
+        .end_event("done")
+        .end_event("rec_done")
+        .connect("s", "charge")
+        .connect("charge", "done")
+        .connect("boundary", "recover")
+        .connect("recover", "rec_done")
+        .build()
+        .unwrap()
+}
+
+/// #592 follow-up #2: `JobErrorRequest.variables` must be instantiated at the
+/// local scope of the error catch event, so the error-handling path downstream
+/// can read them — not silently dropped.
+#[test]
+fn should_seed_thrown_error_variables_at_the_catch_scope() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_error_boundary_to_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("payment-recover"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
+
+    // when the worker throws the caught error WITH variables
+    let vars = HashMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
+    engine
+        .apply_command(Command::throw_job_error_with(
+            job_key,
+            "CARD_DECLINED",
+            "card was declined",
+            vars,
+        ))
+        .unwrap();
+
+    // then the downstream recovery job (on the error-handling path) sees them
+    let recover = engine.activate_jobs("recovery", "w", 1, 60_000, 0);
+    assert_eq!(recover.len(), 1);
+    assert_eq!(
+        recover[0].variables.get("reason"),
+        Some(&Value::Str("declined".to_string()))
+    );
+}
+
+/// Class-scoped companion to the above: variables on an UNHANDLED thrown error
+/// (one that raises an incident rather than being caught) must NOT be seeded —
+/// there is no catch scope to instantiate them at.
+#[test]
+fn should_not_seed_variables_when_a_thrown_error_is_unhandled() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_error_boundary_to_task()))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("payment-recover"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
+
+    // when an error no boundary catches is thrown with variables
+    let vars = HashMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
+    let events = engine
+        .apply_command(Command::throw_job_error_with(
+            job_key, "UNKNOWN", "boom", vars,
+        ))
+        .unwrap();
+
+    // then an incident is raised and no seed variable write was emitted
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::IncidentRaised { .. })));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::VariablesUpdated { variables, .. } if variables.contains_key("reason")
+    )));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::ScopedVariablesUpdated { variables, .. } if variables.contains_key("reason")
+    )));
+    // the instance did not acquire the dropped variable either
+    assert_eq!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .variables
+            .get("reason"),
+        None
+    );
+}
+
+#[test]
 fn should_let_a_previous_worker_complete_after_re_activation() {
     // given worker A activated the job, then its lock expired and worker B
     // re-activated it (e.g. A's work outran the activation window)

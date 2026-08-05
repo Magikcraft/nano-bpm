@@ -2769,6 +2769,15 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
+        Event::JobTimeoutUpdated {
+            job_key, deadline, ..
+        } => {
+            tx.cexecute(
+                "UPDATE jobs SET deadline_ms = ?2 WHERE key = ?1",
+                params![*job_key as i64, *deadline as i64],
+            )?;
+        }
+
         Event::UserTaskCreated {
             user_task_key,
             instance_key,

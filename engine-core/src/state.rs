@@ -1650,6 +1650,16 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
+        Event::JobTimeoutUpdated {
+            job_key, deadline, ..
+        } => {
+            // The job stays Activated (still locked by the same worker); only its
+            // lock deadline moves out. Index membership is unchanged.
+            if let Some(job) = state.jobs.get_mut(job_key) {
+                job.deadline = Some(*deadline);
+            }
+        }
+
         Event::IncidentResolved {
             incident_key,
             instance_key,
