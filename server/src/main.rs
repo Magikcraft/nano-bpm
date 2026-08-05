@@ -4651,6 +4651,114 @@ impl ServerImpl {
         Ok(Resp::Status204_TheJobWasUpdatedSuccessfully)
     }
 
+    /// Surface-independent core of "resolve an incident": leader-forward when
+    /// this node is not the leader, else apply [`Command::ResolveIncident`] and
+    /// wait for commit. Returns a neutral outcome so every API surface (the v2
+    /// REST handler and the console Process-Explorer handler) maps a single
+    /// source of truth for the engine-command + clustering semantics to its own
+    /// response type — no drift between surfaces.
+    pub(crate) async fn resolve_incident_core(
+        &self,
+        incident_key: u64,
+        operation_reference: Option<i64>,
+    ) -> ResolveIncidentOutcome {
+        use ResolveIncidentOutcome as Out;
+
+        if let Some(node) = self.route_by_leader(incident_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link
+                    .resolve_incident(incident_key.to_string(), operation_reference)
+                    .await
+                {
+                    Ok(r) if is_ok_status(r.status) => Out::Resolved,
+                    Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 409 => Out::NotResolvable(peer_detail(&r)),
+                    Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+
+        let command = Command::ResolveIncident {
+            incident_key,
+            operation_reference,
+        };
+        match self
+            .engine
+            .by_key(incident_key)
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await
+        {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                // Resolving a job-incident returns the job to the activatable
+                // pool, so wake any long-pollers.
+                self.signal_jobs_available();
+                Out::Resolved
+            }
+            Err(EngineError::IncidentNotFound { incident_key }) => {
+                Out::NotFound(format!("No incident with key {incident_key}."))
+            }
+            Err(EngineError::IncidentNotResolvable { reason, .. }) => Out::NotResolvable(reason),
+            Err(e) => Out::Internal(e.to_string()),
+        }
+    }
+
+    /// Surface-independent core of "merge variables into a scope". Mirrors
+    /// [`Self::resolve_incident_core`]: leader-forward or apply
+    /// [`Command::set_variables_scoped`]. `variables` is the raw JSON object as
+    /// received on the wire (engine values are derived per entry, and the same
+    /// map is forwarded verbatim so a peer re-derives identical values).
+    pub(crate) async fn set_variables_core(
+        &self,
+        scope_key: u64,
+        variables: serde_json::Map<String, serde_json::Value>,
+        local: bool,
+    ) -> SetVariablesOutcome {
+        use SetVariablesOutcome as Out;
+
+        if let Some(node) = self.route_by_leader(scope_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link
+                    .set_variables(scope_key.to_string(), Some(variables), local)
+                    .await
+                {
+                    Ok(r) if is_ok_status(r.status) => Out::Updated,
+                    Ok(r) if r.status == 400 => Out::ScopeNotFound(peer_detail(&r)),
+                    Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+
+        let engine_vars: std::collections::HashMap<String, Value> = variables
+            .iter()
+            .map(|(name, v)| (name.clone(), json_to_value(v)))
+            .collect();
+        match self
+            .engine
+            .by_key(scope_key)
+            .with(move |engine| {
+                engine.apply_command_at(
+                    Command::set_variables_scoped(scope_key, engine_vars, local),
+                    now_millis(),
+                )
+            })
+            .await
+        {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Out::Updated
+            }
+            Err(EngineError::ScopeNotFound { scope_key }) => Out::ScopeNotFound(format!(
+                "No process or element instance with key {scope_key}."
+            )),
+            Err(e) => Out::Internal(e.to_string()),
+        }
+    }
+
     async fn resolve_incident_impl(
         &self,
         path_params: &models::ResolveIncidentPathParams,
@@ -4676,59 +4784,44 @@ impl ServerImpl {
 
         let operation_reference = body.as_ref().and_then(|b| b.operation_reference);
 
-        if let Some(node) = self.route_by_leader(incident_key) {
-            return Ok(self
-                .forward_resolve_incident(node, incident_key, operation_reference)
-                .await);
-        }
-
-        let command = Command::ResolveIncident {
-            incident_key,
-            operation_reference,
-        };
-
-        let result = self
-            .engine
-            .by_key(incident_key)
-            .with(move |engine| engine.apply_command_at(command, now_millis()))
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                // Resolving a job-incident returns the job to the activatable
-                // pool, so wake any long-pollers.
-                self.signal_jobs_available();
-                Ok(Resp::Status204_TheIncidentIsMarkedAsResolved)
-            }
-            Err(EngineError::IncidentNotFound { incident_key }) => Ok(
-                Resp::Status404_TheIncidentWithTheIncidentKeyIsNotFound(problem(
-                    "Incident not found",
-                    404,
-                    format!("No incident with key {incident_key}."),
-                )),
-            ),
-            Err(EngineError::IncidentNotResolvable { reason, .. }) => Ok(
-                Resp::Status409_TheIncidentCannotBeResolvedDueToAnInvalidState(problem(
-                    "Incident not resolvable",
-                    409,
-                    reason,
-                )),
-            ),
-            Err(e) => Ok(
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Internal error",
-                    500,
-                    e.to_string(),
-                )),
-            ),
-        }
+        Ok(
+            match self
+                .resolve_incident_core(incident_key, operation_reference)
+                .await
+            {
+                ResolveIncidentOutcome::Resolved => Resp::Status204_TheIncidentIsMarkedAsResolved,
+                ResolveIncidentOutcome::NotFound(detail) => {
+                    Resp::Status404_TheIncidentWithTheIncidentKeyIsNotFound(problem(
+                        "Incident not found",
+                        404,
+                        detail,
+                    ))
+                }
+                ResolveIncidentOutcome::NotResolvable(detail) => {
+                    Resp::Status409_TheIncidentCannotBeResolvedDueToAnInvalidState(problem(
+                        "Incident not resolvable",
+                        409,
+                        detail,
+                    ))
+                }
+                ResolveIncidentOutcome::Internal(detail) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        detail,
+                    ))
+                }
+            },
+        )
     }
 
     /// `PUT /v2/element-instances/{elementInstanceKey}/variables` — merge
     /// variables into a scope so an operator can correct the data behind an
-    /// incident before resolving it. The path key may be the process instance
-    /// key or an element instance key; both resolve to nano's single
-    /// instance-level scope (so `local` is accepted but has no effect).
+    /// incident before resolving it. The path key addresses the target scope:
+    /// pass the process-instance key for instance-level variables, or an
+    /// element-instance key to target a nested (element) scope. `local`
+    /// follows Zeebe semantics — `local=true` writes strictly into the
+    /// addressed scope, `local=false` propagates upward to the process instance.
     async fn create_element_instance_variables_impl(
         &self,
         path_params: &models::CreateElementInstanceVariablesPathParams,
@@ -4750,50 +4843,28 @@ impl ServerImpl {
             }
         };
 
-        let variables = from_object_map(&body.variables);
+        let variables = wire_variables(Some(&body.variables)).unwrap_or_default();
         let local = body.local.unwrap_or(false);
 
-        if let Some(node) = self.route_by_leader(scope_key) {
-            return Ok(self
-                .forward_set_variables(
-                    node,
-                    scope_key,
-                    wire_variables(Some(&body.variables)),
-                    local,
-                )
-                .await);
-        }
-
-        let result = self
-            .engine
-            .by_key(scope_key)
-            .with(move |engine| {
-                engine.apply_command_at(
-                    Command::set_variables_scoped(scope_key, variables, local),
-                    now_millis(),
-                )
-            })
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheVariablesWereUpdated)
-            }
-            Err(EngineError::ScopeNotFound { scope_key }) => {
-                Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Scope not found",
-                    400,
-                    format!("No process or element instance with key {scope_key}."),
-                )))
-            }
-            Err(e) => Ok(
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Internal error",
-                    500,
-                    e.to_string(),
-                )),
-            ),
-        }
+        Ok(
+            match self.set_variables_core(scope_key, variables, local).await {
+                SetVariablesOutcome::Updated => Resp::Status204_TheVariablesWereUpdated,
+                SetVariablesOutcome::ScopeNotFound(detail) => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Scope not found",
+                        400,
+                        detail,
+                    ))
+                }
+                SetVariablesOutcome::Internal(detail) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        detail,
+                    ))
+                }
+            },
+        )
     }
 
     async fn get_process_instance_impl(
@@ -6187,92 +6258,6 @@ impl ServerImpl {
             Ok(r) if r.status == 400 => Err((400, peer_detail(&r))),
             Ok(r) => Err((500, peer_detail(&r))),
             Err(e) => Err((502, e.to_string())),
-        }
-    }
-
-    /// Forwards an incident resolution to the peer owning the incident.
-    async fn forward_resolve_incident(
-        &self,
-        node: u32,
-        incident_key: u64,
-        operation_reference: Option<i64>,
-    ) -> apis::incident::ResolveIncidentResponse {
-        use apis::incident::ResolveIncidentResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => {
-                    link.resolve_incident(incident_key.to_string(), operation_reference)
-                        .await
-                }
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
-        match res {
-            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheIncidentIsMarkedAsResolved,
-            Ok(r) if r.status == 404 => Resp::Status404_TheIncidentWithTheIncidentKeyIsNotFound(
-                problem("Incident not found", 404, peer_detail(&r)),
-            ),
-            Ok(r) if r.status == 409 => {
-                Resp::Status409_TheIncidentCannotBeResolvedDueToAnInvalidState(problem(
-                    "Incident not resolvable",
-                    409,
-                    peer_detail(&r),
-                ))
-            }
-            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                500,
-                peer_detail(&r),
-            )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
-        }
-    }
-
-    /// Forwards a by-key variable merge to the peer owning the scope.
-    async fn forward_set_variables(
-        &self,
-        node: u32,
-        scope_key: u64,
-        variables: Option<serde_json::Map<String, serde_json::Value>>,
-        local: bool,
-    ) -> apis::element_instance::CreateElementInstanceVariablesResponse {
-        use apis::element_instance::CreateElementInstanceVariablesResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => {
-                    link.set_variables(scope_key.to_string(), variables, local)
-                        .await
-                }
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
-        match res {
-            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheVariablesWereUpdated,
-            Ok(r) if r.status == 400 => Resp::Status400_TheProvidedDataIsNotValid(problem(
-                "Scope not found",
-                400,
-                peer_detail(&r),
-            )),
-            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                500,
-                peer_detail(&r),
-            )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
         }
     }
 
@@ -14985,6 +14970,31 @@ fn engine_vars_bytes(vars: &std::collections::HashMap<String, Value>) -> u64 {
         .sum()
 }
 
+/// Surface-independent outcome of [`ServerImpl::resolve_incident_core`], mapped
+/// to each API's own response type (v2 REST and console) so the engine-command
+/// and clustering semantics have a single source of truth.
+pub(crate) enum ResolveIncidentOutcome {
+    /// The incident was resolved (the failed element will be retried).
+    Resolved,
+    /// No incident with the given key exists (404).
+    NotFound(String),
+    /// The incident exists but is not in a resolvable state (409).
+    NotResolvable(String),
+    /// An unexpected engine/peer error occurred (500).
+    Internal(String),
+}
+
+/// Surface-independent outcome of [`ServerImpl::set_variables_core`].
+pub(crate) enum SetVariablesOutcome {
+    /// The variables were merged into the scope.
+    Updated,
+    /// No process/element instance with the given scope key exists (v2 maps
+    /// this to 400 for Camunda parity; the console maps it to 404).
+    ScopeNotFound(String),
+    /// An unexpected engine/peer error occurred (500).
+    Internal(String),
+}
+
 /// Converts a JSON value into the engine [`Value`] tree, preserving numbers
 /// (integral vs. decimal), lists and objects so FEEL can operate on them.
 pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
@@ -19873,6 +19883,125 @@ mod clustered_startup_tests {
         assert!(matches!(
             resp,
             Resp::Status404_TheElementInstanceWithTheGivenKeyWasNotFound(_)
+        ));
+    }
+
+    /// The operator "fix-and-retry" loop that the console Process Explorer drives
+    /// (issue #594): a script's FEEL expression fails on bad data → incident; an
+    /// operator corrects the variable and resolves the incident; the script
+    /// re-evaluates and the token advances. Exercises the surface-independent
+    /// [`ServerImpl::set_variables_core`] / [`ServerImpl::resolve_incident_core`]
+    /// that both the v2 REST API and the console handlers share, plus their
+    /// not-found outcomes.
+    #[tokio::test]
+    async fn operator_fix_and_retry_loop_via_shared_core() {
+        let server = ServerImpl::default();
+
+        // A script `=n + 1` raises an ExpressionEvaluation incident when `n` is a
+        // string; fixing `n` and resolving re-evaluates it (no job retries needed,
+        // unlike a job-exhaustion incident) — the exact data-fix loop the console
+        // targets.
+        let proc = ProcessBuilder::new("scripted-fail")
+            .start_event("s")
+            .script_task("calc", "=n + 1", "next")
+            .end_event("e")
+            .connect("s", "calc")
+            .connect("calc", "e")
+            .build()
+            .expect("valid definition");
+        let mut names = std::collections::HashMap::new();
+        names.insert(
+            "scripted-fail".to_string(),
+            "scripted-fail.bpmn".to_string(),
+        );
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("scripted-fail".into()),
+                None,
+                std::collections::HashMap::from([("n".to_string(), Value::Str("oops".into()))]),
+            )
+            .await
+            .expect("create the instance");
+
+        // The expression incident projects into the read model.
+        let mut incident_key = None;
+        for _ in 0..200 {
+            if let Some(i) = server
+                .store
+                .incidents()
+                .into_iter()
+                .find(|i| i.instance_key == instance_key && i.state == IncidentState::Active)
+            {
+                incident_key = Some(i.key);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let incident_key = incident_key.expect("incident projects");
+
+        // Not-found outcomes: a bogus incident key / scope key are reported, not
+        // silently swallowed.
+        assert!(matches!(
+            server.resolve_incident_core(999_999_999, None).await,
+            ResolveIncidentOutcome::NotFound(_)
+        ));
+        assert!(matches!(
+            server
+                .set_variables_core(888_888_888, serde_json::Map::new(), false)
+                .await,
+            SetVariablesOutcome::ScopeNotFound(_)
+        ));
+
+        // Operator corrects `n` to a number, then resolves the incident.
+        let mut fix = serde_json::Map::new();
+        fix.insert("n".to_string(), serde_json::Value::Number(41.into()));
+        assert!(matches!(
+            server.set_variables_core(instance_key, fix, false).await,
+            SetVariablesOutcome::Updated
+        ));
+        assert!(matches!(
+            server.resolve_incident_core(incident_key, None).await,
+            ResolveIncidentOutcome::Resolved
+        ));
+
+        // The incident clears and the script re-evaluated (`next` == 42).
+        let mut recovered = false;
+        for _ in 0..200 {
+            let still_open = server
+                .store
+                .incidents()
+                .into_iter()
+                .any(|i| i.instance_key == instance_key && i.state == IncidentState::Active);
+            let next_written = server
+                .store
+                .instance_variables(instance_key)
+                .iter()
+                .any(|v| v.name == "next" && v.value == "42");
+            if !still_open && next_written {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            recovered,
+            "resolving the incident clears it and re-evaluates the script"
+        );
+
+        // Resolving an already-cleared incident is now a not-found.
+        assert!(matches!(
+            server.resolve_incident_core(incident_key, None).await,
+            ResolveIncidentOutcome::NotFound(_)
         ));
     }
 

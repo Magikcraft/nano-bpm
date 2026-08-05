@@ -119,6 +119,47 @@ paths:
               schema: { $ref: '#/components/schemas/InstanceDetail' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /instances/{key}/incidents/{incidentKey}/resolution:
+    post:
+      operationId: resolveIncident
+      tags: [instances]
+      summary: Resolve an incident so the engine retries the failed element
+      description: >
+        Operator action from the Process Explorer. Clears the incident; for a
+        job-incident the job returns to the activatable pool and is retried.
+        Fix the offending data first (see setInstanceVariables) when the
+        incident was caused by bad variables.
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+        - { name: incidentKey, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: The incident was resolved }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
+  /instances/{key}/variables:
+    put:
+      operationId: setInstanceVariables
+      tags: [instances]
+      summary: Merge variables into an instance scope
+      description: >
+        Operator action from the Process Explorer. Merges the given variables
+        into the target scope (typically to correct the data behind an incident
+        before resolving it).
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SetInstanceVariablesRequest' }
+      responses:
+        '204': { description: The variables were merged }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /traces:
     get:
       operationId: listTraces
@@ -1328,6 +1369,11 @@ components:
       content:
         text/plain:
           schema: { type: string }
+    InternalError:
+      description: Internal error
+      content:
+        text/plain:
+          schema: { type: string }
 
   schemas:
     # ---- Cluster / topology (snake_case wire fields) ----------------------
@@ -1411,6 +1457,30 @@ components:
         name: { type: string }
         value: { type: string }
         scope_key: { type: string }
+    SetInstanceVariablesRequest:
+      type: object
+      required: [scopeKey, variables]
+      properties:
+        scopeKey:
+          type: string
+          description: >
+            Target variable scope key (e.g. a Variable's scope_key). The engine
+            addresses both process-instance and element-instance scopes: pass the
+            process-instance key to update instance-level variables, or an
+            element-instance scope key to target a nested (activity/subprocess) scope.
+        variables:
+          type: object
+          additionalProperties: true
+          description: JSON object of variable name → value to merge into the scope.
+        local:
+          type: boolean
+          default: false
+          description: >
+            Zeebe local semantics. When true, variables are written strictly into
+            the addressed scopeKey. When false (the default), each variable is
+            merged into the scope where it is already defined, propagating upward
+            from the addressed scope (and created on the addressed scope if it is
+            not found on any ancestor).
     Job:
       type: object
       required: [key, element_id, job_type, state, retries, worker, deadline_ms]

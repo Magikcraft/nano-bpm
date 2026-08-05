@@ -1,10 +1,10 @@
-import type { ReactNode } from "react";
-import { useQuery } from "@tanstack/react-query";
-import { getInstance } from "../gen";
+import { useState, type ReactNode } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { getInstance, resolveIncident, setInstanceVariables } from "../gen";
 import { fetchProcessXml } from "../lib/api";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import BpmnViewer from "../components/BpmnViewer";
-import { Badge, SectionLabel } from "../components/ui";
+import { Badge, Button, Input, SectionLabel } from "../components/ui";
 
 export default function InstanceDetail({
   instanceKey,
@@ -13,6 +13,10 @@ export default function InstanceDetail({
 }) {
   // Detail refetches on the same live signal as the list.
   useLiveInvalidation(["instance"]);
+  const qc = useQueryClient();
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+
   const { data, isLoading, error } = useQuery({
     queryKey: ["instance", instanceKey],
     queryFn: async () =>
@@ -28,18 +32,53 @@ export default function InstanceDetail({
     staleTime: Infinity,
   });
 
+  // Both operator actions refresh the same detail query so the diagram overlay,
+  // the incident list and the variables all reflect the new engine state.
+  const refresh = () =>
+    qc.invalidateQueries({ queryKey: ["instance", instanceKey] });
+
+  const onResolve = (incidentKey: string) => {
+    setBusy(true);
+    setActionError(null);
+    resolveIncident({
+      path: { key: instanceKey, incidentKey },
+      throwOnError: true,
+    })
+      .then(refresh)
+      .catch((e) => setActionError(String(e)))
+      .finally(() => setBusy(false));
+  };
+
+  const onSetVariable = (scopeKey: string, name: string, value: unknown) => {
+    setBusy(true);
+    setActionError(null);
+    return setInstanceVariables({
+      path: { key: instanceKey },
+      body: { scopeKey, variables: { [name]: value } },
+      throwOnError: true,
+    })
+      .then(refresh)
+      .catch((e) => {
+        setActionError(String(e));
+        throw e;
+      })
+      .finally(() => setBusy(false));
+  };
+
   if (isLoading) return <p className="p-8 text-fg-muted">Loading…</p>;
   if (error)
     return <p className="p-8 text-danger">Failed to load: {String(error)}</p>;
   if (!data) return null;
 
   const { instance, variables, jobs, incidents } = data;
-  // Active service tasks (pending jobs) and incident elements drive the overlay.
+  // Active service tasks (pending jobs) and open-incident elements drive the
+  // overlay. Incidents project with state "Active" once raised (they become
+  // "Resolved" — kept for history — after an operator clears them).
   const activeEls = jobs
     .filter((j) => j.state === "Created" || j.state === "Activated")
     .map((j) => j.element_id);
   const incidentEls = incidents
-    .filter((i) => i.state === "Created")
+    .filter((i) => i.state === "Active")
     .map((i) => i.element_id);
 
   return (
@@ -69,15 +108,32 @@ export default function InstanceDetail({
       </div>
 
       <div className="min-h-0 flex-1 overflow-auto p-8">
+        {actionError && (
+          <p className="mb-4 rounded-md border border-danger/30 bg-danger/10 px-3 py-2 text-sm text-danger">
+            {actionError}
+          </p>
+        )}
+
         {incidents.length > 0 && (
           <Section title="Incidents">
-            <Table head={["Element", "Kind", "State", "Reason"]}>
+            <Table head={["Element", "Kind", "State", "Reason", ""]}>
               {incidents.map((i) => (
                 <tr key={i.key} className="border-b border-edge">
                   <Td>{i.element_id}</Td>
                   <Td>{i.kind}</Td>
                   <Td>{i.state}</Td>
                   <Td className="text-danger">{i.reason}</Td>
+                  <Td className="text-right">
+                    {i.state === "Active" && (
+                      <Button
+                        size="sm"
+                        disabled={busy}
+                        onClick={() => onResolve(i.key)}
+                      >
+                        Resolve
+                      </Button>
+                    )}
+                  </Td>
                 </tr>
               ))}
             </Table>
@@ -88,16 +144,18 @@ export default function InstanceDetail({
           {variables.length === 0 ? (
             <Empty>No variables.</Empty>
           ) : (
-            <Table head={["Name", "Value", "Scope"]}>
+            <Table head={["Name", "Value", "Scope", ""]}>
               {variables.map((v) => (
-                <tr
+                <VariableRow
                   key={`${v.scope_key}:${v.name}`}
-                  className="border-b border-edge"
-                >
-                  <Td className="font-medium">{v.name}</Td>
-                  <Td className="font-mono text-fg-muted">{v.value}</Td>
-                  <Td className="font-mono text-fg-faint">{v.scope_key}</Td>
-                </tr>
+                  name={v.name}
+                  value={v.value}
+                  scopeKey={v.scope_key}
+                  busy={busy}
+                  onSave={(parsed) =>
+                    onSetVariable(v.scope_key, v.name, parsed)
+                  }
+                />
               ))}
             </Table>
           )}
@@ -125,6 +183,96 @@ export default function InstanceDetail({
   );
 }
 
+/** One variable row with inline edit. The stored `value` is a serialized-JSON
+ * string (e.g. `"text"`, `42`, `true`); the editor is seeded with it and the
+ * input is parsed as JSON on save so the engine receives a typed value. */
+function VariableRow({
+  name,
+  value,
+  scopeKey,
+  busy,
+  onSave,
+}: {
+  name: string;
+  value: string;
+  scopeKey: string;
+  busy: boolean;
+  onSave: (parsed: unknown) => Promise<unknown>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(value);
+  const [parseError, setParseError] = useState<string | null>(null);
+
+  const start = () => {
+    setDraft(value);
+    setParseError(null);
+    setEditing(true);
+  };
+  const cancel = () => {
+    setEditing(false);
+    setParseError(null);
+  };
+  const save = () => {
+    if (busy) return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(draft);
+    } catch {
+      setParseError('Value must be valid JSON (e.g. 42, true, "text").');
+      return;
+    }
+    onSave(parsed)
+      .then(() => setEditing(false))
+      .catch(() => {
+        /* surfaced by the parent's action error banner */
+      });
+  };
+
+  if (!editing) {
+    return (
+      <tr className="border-b border-edge">
+        <Td className="font-medium">{name}</Td>
+        <Td className="font-mono text-fg-muted">{value}</Td>
+        <Td className="font-mono text-fg-faint">{scopeKey}</Td>
+        <Td className="text-right">
+          <Button size="sm" variant="ghost" disabled={busy} onClick={start}>
+            Edit
+          </Button>
+        </Td>
+      </tr>
+    );
+  }
+
+  return (
+    <tr className="border-b border-edge">
+      <Td className="font-medium">{name}</Td>
+      <Td colSpan={2}>
+        <Input
+          className="w-full font-mono text-xs"
+          value={draft}
+          autoFocus
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") save();
+            if (e.key === "Escape") cancel();
+          }}
+        />
+        {parseError && (
+          <span className="mt-1 block text-xs text-danger">{parseError}</span>
+        )}
+      </Td>
+      <Td className="text-right whitespace-nowrap">
+        <Button size="sm" disabled={busy} onClick={save}>
+          Save
+        </Button>{" "}
+        <Button size="sm" variant="ghost" disabled={busy} onClick={cancel}>
+          Cancel
+        </Button>
+      </Td>
+    </tr>
+  );
+}
+
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="mb-8">
@@ -139,8 +287,8 @@ function Table({ head, children }: { head: string[]; children: ReactNode }) {
     <table className="w-full border-collapse text-sm">
       <thead>
         <tr className="border-b border-edge text-left text-fg-faint">
-          {head.map((h) => (
-            <th key={h} className="py-2 pr-4 font-medium">
+          {head.map((h, idx) => (
+            <th key={h || `col-${idx}`} className="py-2 pr-4 font-medium">
               {h}
             </th>
           ))}
@@ -154,11 +302,17 @@ function Table({ head, children }: { head: string[]; children: ReactNode }) {
 function Td({
   children,
   className = "",
+  colSpan,
 }: {
   children: ReactNode;
   className?: string;
+  colSpan?: number;
 }) {
-  return <td className={`py-2 pr-4 ${className}`}>{children}</td>;
+  return (
+    <td className={`py-2 pr-4 ${className}`} colSpan={colSpan}>
+      {children}
+    </td>
+  );
 }
 
 function Empty({ children }: { children: ReactNode }) {

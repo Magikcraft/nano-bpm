@@ -63,6 +63,25 @@ export type Variable = {
     scope_key: string;
 };
 
+export type SetInstanceVariablesRequest = {
+    /**
+     * Target variable scope key (e.g. a Variable's scope_key). The engine addresses both process-instance and element-instance scopes: pass the process-instance key to update instance-level variables, or an element-instance scope key to target a nested (activity/subprocess) scope.
+     *
+     */
+    scopeKey: string;
+    /**
+     * JSON object of variable name → value to merge into the scope.
+     */
+    variables: {
+        [key: string]: unknown;
+    };
+    /**
+     * Zeebe local semantics. When true, variables are written strictly into the addressed scopeKey. When false (the default), each variable is merged into the scope where it is already defined, propagating upward from the addressed scope (and created on the addressed scope if it is not found on any ancestor).
+     *
+     */
+    local?: boolean;
+};
+
 export type Job = {
     key: string;
     element_id: string;
@@ -1488,6 +1507,77 @@ export type GetInstanceResponses = {
 };
 
 export type GetInstanceResponse = GetInstanceResponses[keyof GetInstanceResponses];
+
+export type ResolveIncidentData = {
+    body?: never;
+    path: {
+        key: string;
+        incidentKey: string;
+    };
+    query?: never;
+    url: '/instances/{key}/incidents/{incidentKey}/resolution';
+};
+
+export type ResolveIncidentErrors = {
+    /**
+     * Not found
+     */
+    404: string;
+    /**
+     * Already exists
+     */
+    409: string;
+    /**
+     * Internal error
+     */
+    500: string;
+};
+
+export type ResolveIncidentError = ResolveIncidentErrors[keyof ResolveIncidentErrors];
+
+export type ResolveIncidentResponses = {
+    /**
+     * The incident was resolved
+     */
+    204: void;
+};
+
+export type ResolveIncidentResponse = ResolveIncidentResponses[keyof ResolveIncidentResponses];
+
+export type SetInstanceVariablesData = {
+    body: SetInstanceVariablesRequest;
+    path: {
+        key: string;
+    };
+    query?: never;
+    url: '/instances/{key}/variables';
+};
+
+export type SetInstanceVariablesErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+    /**
+     * Internal error
+     */
+    500: string;
+};
+
+export type SetInstanceVariablesError = SetInstanceVariablesErrors[keyof SetInstanceVariablesErrors];
+
+export type SetInstanceVariablesResponses = {
+    /**
+     * The variables were merged
+     */
+    204: void;
+};
+
+export type SetInstanceVariablesResponse = SetInstanceVariablesResponses[keyof SetInstanceVariablesResponses];
 
 export type ListTracesData = {
     body?: never;
