@@ -15,8 +15,22 @@ cd "$repo_root"
 # if it does not (e.g. a fresh clone before the first build) drop a throwaway
 # one-line stub for the parse-only check and remove it afterwards, exactly as
 # the CI fmt job does — never clobbering a real generated file.
+#
+# The cleanup runs from a `trap` so an interrupt (Ctrl-C during fmt-check) or any
+# early exit still removes a stub we created. Without it, a leaked placeholder is
+# left behind with a fresh mtime, which defeats the Makefile's timestamp-based
+# regeneration of stub_impls.rs and makes the next build compile the placeholder
+# (the FORCE-stub-check guard on the $(STUB_IMPLS) rule is the Makefile-side
+# backstop that re-checks the content and regenerates regardless of mtime).
 stub="server/src/stub_impls.rs"
 created_stub=0
+cleanup() {
+	if [ "$created_stub" -eq 1 ]; then
+		rm -f "$stub"
+	fi
+	return 0
+}
+trap cleanup EXIT INT TERM
 if [ ! -f "$stub" ]; then
 	printf '// fmt stub\n' > "$stub"
 	created_stub=1
@@ -24,10 +38,6 @@ fi
 
 status=0
 make fmt-check || status=$?
-
-if [ "$created_stub" -eq 1 ]; then
-	rm -f "$stub"
-fi
 
 if [ "$status" -ne 0 ]; then
 	echo "" >&2

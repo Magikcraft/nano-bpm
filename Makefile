@@ -123,14 +123,47 @@ $(CONSOLE_GENERATED_DIR)/Cargo.toml: $(CONSOLE_SPEC_SRCS)
 # failure CI never sees because it regenerates the stub and compiles tests.
 # When the generated apis already exist this is a fast, Java-free re-run of just
 # the Python stub step; otherwise fall back to a full `make generate`.
-$(STUB_IMPLS): scripts/gen-stub-server.py $(GENERATED_DIR)/Cargo.toml
-	@if [ -d "$(GENERATED_DIR)/src/apis" ]; then \
-		echo "Regenerating $(STUB_IMPLS) from $(GENERATED_DIR)/src/apis"; \
-		python3 scripts/gen-stub-server.py "$(GENERATED_DIR)/src/apis" "$(STUB_IMPLS)"; \
-		command -v rustfmt >/dev/null 2>&1 && rustfmt --edition 2024 "$(STUB_IMPLS)" || true; \
-	else \
-		$(MAKE) generate; \
+#
+# Placeholder guard (FORCE idiom). A leaked `// fmt stub` one-liner placeholder
+# defeats a plain mtime rule: that placeholder is written deliberately by the CI
+# fmt job and the pre-push hook so rustfmt can resolve the `mod stub_impls` tree
+# without full codegen, and if it is left behind (e.g. a push interrupted
+# mid-hook) it carries a FRESH mtime — newer than both prerequisites. Make would
+# then treat stub_impls.rs as up to date and skip regeneration, so the build
+# compiles the placeholder and fails with "the trait `apis::*` is not implemented
+# for `ServerImpl`" for every REST tag (a failure CI never sees: its build jobs
+# regenerate from a clean checkout).
+#
+# An order-only prune (`| prune`) does NOT fix this: Make decides the target is up
+# to date from the placeholder's fresh mtime and never runs the recipe, so a prune
+# that deletes the file mid-pass just leaves it missing and unregenerated. Instead
+# the recipe ALWAYS runs (via the phony FORCE-stub-check prerequisite) and decides
+# for itself whether to regenerate — on a missing target, a placeholder (no
+# `for ServerImpl` impl), or a genuinely newer prerequisite (a changed delegation
+# map / spec must still take effect). A real, current stub is left untouched, so
+# its mtime is preserved and dependent server objects are not needlessly recompiled.
+$(STUB_IMPLS): scripts/gen-stub-server.py $(GENERATED_DIR)/Cargo.toml FORCE-stub-check
+	@need=0; \
+	if [ ! -f "$(STUB_IMPLS)" ]; then need=1; \
+	elif ! grep -q "for ServerImpl" "$(STUB_IMPLS)" 2>/dev/null; then need=1; \
+	elif [ scripts/gen-stub-server.py -nt "$(STUB_IMPLS)" ]; then need=1; \
+	elif [ "$(GENERATED_DIR)/Cargo.toml" -nt "$(STUB_IMPLS)" ]; then need=1; \
+	fi; \
+	if [ $$need -eq 1 ]; then \
+		if [ -d "$(GENERATED_DIR)/src/apis" ]; then \
+			echo "Regenerating $(STUB_IMPLS) from $(GENERATED_DIR)/src/apis"; \
+			python3 scripts/gen-stub-server.py "$(GENERATED_DIR)/src/apis" "$(STUB_IMPLS)"; \
+			command -v rustfmt >/dev/null 2>&1 && rustfmt --edition 2024 "$(STUB_IMPLS)" || true; \
+		else \
+			$(MAKE) generate; \
+		fi; \
 	fi
+
+# Empty phony that forces the $(STUB_IMPLS) recipe to run every build so it can
+# content-check the target (see the FORCE idiom explanation on the rule above).
+# It updates no file, so it does not by itself trigger any downstream rebuild.
+.PHONY: FORCE-stub-check
+FORCE-stub-check:
 
 .PHONY: build
 build: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Compile the generated crate and the stub server
