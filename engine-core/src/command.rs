@@ -127,18 +127,36 @@ pub enum Command {
         job_key: Key,
         error_code: String,
         error_message: String,
+        /// Variables to instantiate at the local scope of the error catch event
+        /// that catches the thrown error (Camunda `JobErrorRequest.variables`).
+        /// Empty for an error thrown without variables, keeping that path
+        /// byte-unchanged. Applied only when a matching boundary catches the
+        /// error; ignored when the error is unhandled (parks on an incident).
+        variables: HashMap<String, Value>,
     },
     /// Update a job's remaining retries. Used to recover a job parked on a
     /// no-retries incident before resolving that incident. Does not by itself
-    /// unblock the job — the incident must still be resolved.
-    UpdateJobRetries { job_key: Key, retries: i32 },
+    /// unblock the job — the incident must still be resolved. `operation_reference`
+    /// is an optional caller-supplied audit correlation id, journaled on the
+    /// resulting event.
+    UpdateJobRetries {
+        job_key: Key,
+        retries: i32,
+        operation_reference: Option<i64>,
+    },
     /// Extend the activation lock of a currently-activated job, resetting its
     /// `deadline` to `now + timeout`. This is the worker-side mechanism for
     /// legitimately holding a long-running job open past its original lock:
     /// without it the lock simply expires (`JobLockExpired`) and the job is
     /// re-activated elsewhere. Only meaningful for an `Activated` job — a job
-    /// that is not currently locked returns `JobNotActive`.
-    UpdateJobTimeout { job_key: Key, timeout: u64 },
+    /// that is not currently locked returns `JobNotActive`. `operation_reference`
+    /// is an optional caller-supplied audit correlation id, journaled on the
+    /// resulting event.
+    UpdateJobTimeout {
+        job_key: Key,
+        timeout: u64,
+        operation_reference: Option<i64>,
+    },
     /// Resolve an open incident by retrying the work that failed. A job-incident
     /// returns the parked job (which must have retries left) to the activatable
     /// pool; an exclusive-gateway incident re-evaluates the gateway against the
@@ -537,17 +555,68 @@ impl Command {
             job_key,
             error_code: error_code.into(),
             error_message: error_message.into(),
+            variables: HashMap::new(),
+        }
+    }
+
+    /// Convenience constructor for a `ThrowJobError` that seeds `variables` at
+    /// the local scope of the catching error boundary event.
+    pub fn throw_job_error_with(
+        job_key: Key,
+        error_code: impl Into<String>,
+        error_message: impl Into<String>,
+        variables: HashMap<String, Value>,
+    ) -> Self {
+        Command::ThrowJobError {
+            job_key,
+            error_code: error_code.into(),
+            error_message: error_message.into(),
+            variables,
         }
     }
 
     /// Convenience constructor for an `UpdateJobRetries`.
     pub fn update_job_retries(job_key: Key, retries: i32) -> Self {
-        Command::UpdateJobRetries { job_key, retries }
+        Command::UpdateJobRetries {
+            job_key,
+            retries,
+            operation_reference: None,
+        }
+    }
+
+    /// `UpdateJobRetries` tagged with a caller audit `operation_reference`.
+    pub fn update_job_retries_with_ref(
+        job_key: Key,
+        retries: i32,
+        operation_reference: Option<i64>,
+    ) -> Self {
+        Command::UpdateJobRetries {
+            job_key,
+            retries,
+            operation_reference,
+        }
     }
 
     /// Convenience constructor for an `UpdateJobTimeout`.
     pub fn update_job_timeout(job_key: Key, timeout: u64) -> Self {
-        Command::UpdateJobTimeout { job_key, timeout }
+        Command::UpdateJobTimeout {
+            job_key,
+            timeout,
+            operation_reference: None,
+        }
+    }
+
+    /// `UpdateJobTimeout` tagged with a caller audit `operation_reference`.
+    pub fn update_job_timeout_with_ref(
+        job_key: Key,
+        timeout: u64,
+        operation_reference: Option<i64>,
+    ) -> Self {
+        Command::UpdateJobTimeout {
+            job_key,
+            timeout,
+            operation_reference,
+        }
     }
 
     /// Convenience constructor for a `ResolveIncident` with no operation

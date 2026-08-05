@@ -302,6 +302,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         retries: i32,
+        /// Optional caller audit correlation id (Camunda `operationReference`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        operation_reference: Option<i64>,
     },
 
     /// A job's activation lock was extended: its `deadline` was reset to a later
@@ -312,6 +315,9 @@ pub enum Event {
         job_key: Key,
         instance_key: Key,
         deadline: u64,
+        /// Optional caller audit correlation id (Camunda `operationReference`).
+        #[cfg_attr(feature = "serde", serde(default))]
+        operation_reference: Option<i64>,
     },
 
     /// A user task was created for a `userTask` element; the token now rests

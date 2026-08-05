@@ -4254,6 +4254,160 @@ fn should_reject_a_lock_extension_for_an_unknown_job() {
     assert_eq!(err, EngineError::JobNotFound { job_key: 999 });
 }
 
+/// #592 follow-up #4: `JobUpdateRequest.operationReference` must be threaded
+/// onto the emitted update events (audit correlation), for BOTH the retries and
+/// the timeout changeset fields — not silently dropped.
+#[test]
+fn should_thread_operation_reference_onto_job_update_events() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "A", 10, 60_000, 0)[0].key;
+
+    // when a retries update carries an operation reference
+    let events = engine
+        .apply_command(Command::update_job_retries_with_ref(job_key, 5, Some(4242)))
+        .unwrap();
+    // then the reference lands on the JobRetriesUpdated event
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::JobRetriesUpdated {
+            operation_reference: Some(4242),
+            ..
+        }
+    )));
+
+    // and likewise for a timeout (lock-extension) update
+    let events = engine
+        .apply_command_at(
+            Command::update_job_timeout_with_ref(job_key, 5_000, Some(9001)),
+            100,
+        )
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::JobTimeoutUpdated {
+            operation_reference: Some(9001),
+            ..
+        }
+    )));
+
+    // class-scoped: an update WITHOUT a reference leaves the field None (not a
+    // defaulted zero), so the audit trail distinguishes "no ref" from "ref 0".
+    let events = engine
+        .apply_command(Command::update_job_retries(job_key, 7))
+        .unwrap();
+    assert!(events.iter().any(|e| matches!(
+        e,
+        Event::JobRetriesUpdated {
+            operation_reference: None,
+            ..
+        }
+    )));
+}
+
+/// start -> charge(payment) --normal--> done
+///     charge --(error CARD_DECLINED boundary)--> recover(recovery) -> rec_done
+fn process_with_error_boundary_to_task() -> ProcessDefinition {
+    ProcessBuilder::new("payment-recover")
+        .start_event("s")
+        .service_task("charge", "payment")
+        .error_boundary_event("boundary", "charge", "CARD_DECLINED")
+        .service_task("recover", "recovery")
+        .end_event("done")
+        .end_event("rec_done")
+        .connect("s", "charge")
+        .connect("charge", "done")
+        .connect("boundary", "recover")
+        .connect("recover", "rec_done")
+        .build()
+        .unwrap()
+}
+
+/// #592 follow-up #2: `JobErrorRequest.variables` must be instantiated at the
+/// local scope of the error catch event, so the error-handling path downstream
+/// can read them — not silently dropped.
+#[test]
+fn should_seed_thrown_error_variables_at_the_catch_scope() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_error_boundary_to_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("payment-recover"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
+
+    // when the worker throws the caught error WITH variables
+    let vars = HashMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
+    engine
+        .apply_command(Command::throw_job_error_with(
+            job_key,
+            "CARD_DECLINED",
+            "card was declined",
+            vars,
+        ))
+        .unwrap();
+
+    // then the downstream recovery job (on the error-handling path) sees them
+    let recover = engine.activate_jobs("recovery", "w", 1, 60_000, 0);
+    assert_eq!(recover.len(), 1);
+    assert_eq!(
+        recover[0].variables.get("reason"),
+        Some(&Value::Str("declined".to_string()))
+    );
+}
+
+/// Class-scoped companion to the above: variables on an UNHANDLED thrown error
+/// (one that raises an incident rather than being caught) must NOT be seeded —
+/// there is no catch scope to instantiate them at.
+#[test]
+fn should_not_seed_variables_when_a_thrown_error_is_unhandled() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_error_boundary_to_task()))
+        .unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("payment-recover"))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+    let job_key = engine.activate_jobs("payment", "w", 1, 60_000, 0)[0].key;
+
+    // when an error no boundary catches is thrown with variables
+    let vars = HashMap::from([("reason".to_string(), Value::Str("declined".to_string()))]);
+    let events = engine
+        .apply_command(Command::throw_job_error_with(
+            job_key, "UNKNOWN", "boom", vars,
+        ))
+        .unwrap();
+
+    // then an incident is raised and no seed variable write was emitted
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, Event::IncidentRaised { .. })));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::VariablesUpdated { variables, .. } if variables.contains_key("reason")
+    )));
+    assert!(!events.iter().any(|e| matches!(
+        e,
+        Event::ScopedVariablesUpdated { variables, .. } if variables.contains_key("reason")
+    )));
+    // the instance did not acquire the dropped variable either
+    assert_eq!(
+        engine
+            .instance(instance_key)
+            .unwrap()
+            .variables
+            .get("reason"),
+        None
+    );
+}
+
 #[test]
 fn should_let_a_previous_worker_complete_after_re_activation() {
     // given worker A activated the job, then its lock expired and worker B
