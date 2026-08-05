@@ -999,28 +999,49 @@ pub fn pack_into_tmp(pkg_spec: &str) -> Result<PathBuf, String> {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
-    let npm = find_program("npm").ok_or("npm not found on PATH")?;
-    let out = std::process::Command::new(&npm)
+    let cleanup = |dir: &Path| {
+        let _ = std::fs::remove_dir_all(dir);
+    };
+    let Some(npm) = find_program("npm") else {
+        cleanup(&dir);
+        return Err("npm not found on PATH".into());
+    };
+    let out = match std::process::Command::new(&npm)
         .args(["pack", pkg_spec, "--silent"])
         .current_dir(&dir)
         .output()
-        .map_err(|e| format!("npm pack: {e}"))?;
+    {
+        Ok(out) => out,
+        Err(e) => {
+            cleanup(&dir);
+            return Err(format!("npm pack: {e}"));
+        }
+    };
     if !out.status.success() {
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&dir);
         return Err(format!(
             "npm pack failed: {}",
             String::from_utf8_lossy(&out.stderr)
         ));
     }
     let tgz = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let tar = find_program("tar").ok_or("tar not found")?;
-    let st = std::process::Command::new(&tar)
+    let Some(tar) = find_program("tar") else {
+        cleanup(&dir);
+        return Err("tar not found".into());
+    };
+    let st = match std::process::Command::new(&tar)
         .args(["xzf", &tgz, "--strip-components=1"])
         .current_dir(&dir)
         .status()
-        .map_err(|e| format!("tar: {e}"))?;
+    {
+        Ok(st) => st,
+        Err(e) => {
+            cleanup(&dir);
+            return Err(format!("tar: {e}"));
+        }
+    };
     if !st.success() {
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&dir);
         return Err("tar extract failed".into());
     }
     let _ = std::fs::remove_file(dir.join(&tgz));

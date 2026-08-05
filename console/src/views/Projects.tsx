@@ -945,11 +945,14 @@ function UpdatePlanModal({
       onClick={onClose}
     >
       <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="update-plan-title"
         className="flex max-h-[85vh] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-edge bg-panel shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-edge px-4 py-2.5">
-          <h2 className="text-sm font-semibold text-fg">
+          <h2 id="update-plan-title" className="text-sm font-semibold text-fg">
             Update “{title}” from template
           </h2>
           <button

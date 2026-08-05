@@ -4026,36 +4026,118 @@ fn is_preserved_path(rel: &Path) -> bool {
     })
 }
 
+/// Resolve `${VAR}` / `${VAR:-default}` env templates against the process
+/// environment, mirroring `data-sdk.ts` `resolveEnvTemplate` so a manifest URL
+/// like `${NANO_APP_DB_URL:-file:./app.db}` resolves the same way the runtime
+/// resolves it. Unknown or empty vars fall back to the `:-default` (or "").
+fn resolve_env_template(tpl: &str) -> String {
+    let mut out = String::new();
+    let mut rest = tpl;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let inner = &after[..end];
+            let (name, dflt) = match inner.split_once(":-") {
+                Some((n, d)) => (n, Some(d)),
+                None => (inner, None),
+            };
+            let val = std::env::var(name).ok().filter(|s| !s.is_empty());
+            out.push_str(&val.unwrap_or_else(|| dflt.unwrap_or("").to_string()));
+            rest = &after[end + 1..];
+        } else {
+            out.push_str("${");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract the in-tree, project-relative sqlite filename from a datasource `url`
+/// (mirrors `data-sdk.ts` `sqlitePath`). Returns `None` for `:memory:`, an
+/// absolute path, or a `..`-escaping path — none of which name a file inside the
+/// project tree that the overlay could clobber.
+fn in_tree_sqlite_rel(url: &str) -> Option<String> {
+    let mut raw = url.strip_prefix("file:").unwrap_or(url);
+    while let Some(r) = raw.strip_prefix("./") {
+        raw = r;
+    }
+    if raw.is_empty() || raw == ":memory:" {
+        return None;
+    }
+    let p = Path::new(raw);
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// In-tree relative sqlite files declared by the project's `nano.app.json`
+/// datasources (ADR 0027). Each source's (env-templated) `url` is resolved the
+/// same way the runtime does before deciding whether it names an in-tree file.
+fn manifest_sqlite_rels(dir: &Path) -> Vec<String> {
+    let Ok(txt) = std::fs::read_to_string(dir.join("nano.app.json")) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(sources) = v
+        .get("data")
+        .and_then(|d| d.get("sources"))
+        .and_then(|s| s.as_object())
+    {
+        for src in sources.values() {
+            let Some(url) = src.get("url").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            if let Some(rel) = in_tree_sqlite_rel(&resolve_env_template(url)) {
+                out.push(rel);
+            }
+        }
+    }
+    out
+}
+
 /// The datasource sqlite file(s) (+ WAL/SHM sidecars) to preserve across an
 /// update. The default in-tree `app.db` is *always* preserved as a baseline so
 /// the update never clobbers the project's sqlite DB — even when
 /// `NANO_APP_DB_URL` is unset or points somewhere non-relative. In addition, a
 /// validated in-tree relative target from `NANO_APP_DB_URL` is preserved when
-/// present; an absolute or `..`-escaping URL is ignored (nothing extra to
-/// preserve in-tree).
-fn datasource_preserve_files() -> Vec<String> {
-    fn triplet(base: &str) -> [String; 3] {
-        [base.to_string(), format!("{base}-wal"), format!("{base}-shm")]
-    }
-
-    // Baseline: always protect the conventional in-tree sqlite DB.
-    let mut out: Vec<String> = triplet("app.db").to_vec();
-
-    // Additionally protect a validated, in-tree relative `NANO_APP_DB_URL`.
-    let url = std::env::var("NANO_APP_DB_URL").unwrap_or_else(|_| "file:./app.db".to_string());
-    let raw = url.strip_prefix("file:").unwrap_or(&url);
-    let raw = raw.strip_prefix("./").unwrap_or(raw);
-    let p = Path::new(raw);
-    if !(raw.is_empty()
-        || p.is_absolute()
-        || p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir)))
-    {
-        for f in triplet(raw) {
+/// present, as is any in-tree sqlite datasource declared in the project's
+/// `nano.app.json` manifest (ADR 0027). Absolute or `..`-escaping targets are
+/// ignored (nothing extra to preserve in-tree).
+fn datasource_preserve_files(dir: &Path) -> Vec<String> {
+    fn push_triplet(out: &mut Vec<String>, base: &str) {
+        for f in [
+            base.to_string(),
+            format!("{base}-wal"),
+            format!("{base}-shm"),
+        ] {
             if !out.contains(&f) {
                 out.push(f);
             }
         }
+    }
+
+    // Baseline: always protect the conventional in-tree sqlite DB.
+    let mut out: Vec<String> = Vec::new();
+    push_triplet(&mut out, "app.db");
+
+    // Additionally protect a validated, in-tree relative `NANO_APP_DB_URL`.
+    let url = std::env::var("NANO_APP_DB_URL").unwrap_or_else(|_| "file:./app.db".to_string());
+    if let Some(rel) = in_tree_sqlite_rel(&url) {
+        push_triplet(&mut out, &rel);
+    }
+
+    // …and any in-tree sqlite datasource the manifest declares.
+    for rel in manifest_sqlite_rels(dir) {
+        push_triplet(&mut out, &rel);
     }
     out
 }
@@ -4139,6 +4221,31 @@ fn collect_rel_files(
             out.push(rel.to_path_buf());
         }
     }
+}
+
+/// Whether writing `dir/rel` stays inside `dir` without traversing any symlink.
+/// Rejects a destination whose path components (or the target file itself) are
+/// symlinks, so a malicious/accidental symlink in the project tree (e.g.
+/// `resources -> /etc`) can't make the overlay write outside the project root.
+/// Non-existent components are fine (they'll be created as real dirs/files).
+fn is_symlink_safe_dst(dir: &Path, rel: &Path) -> bool {
+    let mut cur = dir.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(seg) => {
+                cur.push(seg);
+                if let Ok(md) = std::fs::symlink_metadata(&cur)
+                    && md.file_type().is_symlink()
+                {
+                    return false;
+                }
+            }
+            // `..`, `.`, root, or a prefix have no business in a pack-relative
+            // path — refuse rather than risk escaping the project root.
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Overlay a newer version of a project's scaffolding pack onto it, using the
@@ -4307,7 +4414,7 @@ fn overlay_plan(
 
     // Track preserved subtree names we've already reported once (dir-level).
     let mut preserved_seen: BTreeSet<String> = BTreeSet::new();
-    let ds_preserve: BTreeSet<String> = datasource_preserve_files().into_iter().collect();
+    let ds_preserve: BTreeSet<String> = datasource_preserve_files(dir).into_iter().collect();
 
     // Walk the new source tree; classify each file. Preserved subtrees are
     // pruned during traversal; report any the pack ships so the plan reflects
@@ -4350,18 +4457,35 @@ fn overlay_plan(
         let Ok(new_bytes) = std::fs::read(&src_path) else {
             continue;
         };
-        let Ok(cur_bytes) = std::fs::read(&dst_path) else {
-            // File doesn't exist locally → new file.
-            plan.create.push(rel_str.clone());
-            if apply {
-                if let Some(parent) = dst_path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                if std::fs::write(&dst_path, &new_bytes).is_err() {
-                    return Err(format!("write {rel_str}"));
-                }
-            }
+        // Never write through a symlinked path component — it could escape the
+        // project root. Surface as a conflict for the user to resolve by hand
+        // (applies to dry-run classification too, so the plan matches apply).
+        if !is_symlink_safe_dst(dir, rel) {
+            plan.conflicts.push(rel_str.clone());
             continue;
+        }
+        let cur_bytes = match std::fs::read(&dst_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist locally → new file.
+                plan.create.push(rel_str.clone());
+                if apply {
+                    if let Some(parent) = dst_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::write(&dst_path, &new_bytes).is_err() {
+                        return Err(format!("write {rel_str}"));
+                    }
+                }
+                continue;
+            }
+            Err(_) => {
+                // Unreadable for another reason (a directory in the way, a
+                // permission error, …) — don't guess it's new; treat as a
+                // conflict so apply never clobbers an unexpected local entry.
+                plan.conflicts.push(rel_str.clone());
+                continue;
+            }
         };
         if cur_bytes == new_bytes {
             continue; // identical — nothing to do.
@@ -4399,11 +4523,17 @@ fn overlay_plan(
     }
 
     // Orphans: files present locally but absent from the new pack (kept).
-    // Preserved subtrees are pruned during traversal (and not reported here —
-    // they are the project's own state, not pack-shipped skips).
+    // Preserved subtrees are pruned during traversal; report any that exist
+    // locally (e.g. `.git/`, `node_modules/`) so the plan's "Preserved" list
+    // reflects what the overlay intentionally left untouched.
     let mut local_files: Vec<PathBuf> = Vec::new();
     let mut local_pruned: BTreeSet<String> = BTreeSet::new();
     collect_rel_files(dir, dir, &mut local_files, &mut local_pruned);
+    for name in local_pruned {
+        if preserved_seen.insert(name.clone()) {
+            plan.preserved.push(name);
+        }
+    }
     for rel in local_files {
         if is_preserved_path(&rel) {
             continue;
@@ -10826,6 +10956,53 @@ mod tests {
         assert_eq!(read(&proj, "main.ts"), "old\n");
         assert!(!proj.join("added.ts").exists());
         assert_eq!(read(&proj, "app.db"), "SQLITEDATA");
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_plan_refuses_write_through_symlinked_component() {
+        let _g = lock();
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        // A malicious/accidental symlink inside the project points outside it.
+        let outside = tree(&[("secret.txt", "DO NOT TOUCH\n")]);
+        let proj = tree(&[("keep.ts", "x\n")]);
+        std::os::unix::fs::symlink(&outside, proj.join("resources")).unwrap();
+        // The pack tries to write through the symlinked `resources/` dir.
+        let new = tree(&[("resources/secret.txt", "clobbered\n")]);
+
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+
+        // Fail closed: surfaced as a conflict, and the outside file is intact.
+        assert_eq!(plan.conflicts, vec!["resources/secret.txt"]);
+        assert!(plan.create.is_empty() && plan.overwrite.is_empty());
+        assert_eq!(read(&outside, "secret.txt"), "DO NOT TOUCH\n");
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[test]
+    fn overlay_plan_preserves_manifest_declared_datasource() {
+        let _g = lock();
+        // Env points at the default; the manifest declares a *different*,
+        // non-default in-tree sqlite file that must also be preserved.
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        let manifest = r#"{"data":{"default":"app","sources":{"app":{"driver":"sqlite","url":"file:./db/data.sqlite"}}}}"#;
+        let proj = tree(&[("nano.app.json", manifest), ("db/data.sqlite", "LOCALDB")]);
+        let new = tree(&[
+            ("nano.app.json", manifest),
+            ("db/data.sqlite", "PACKDB"), // pack ships a stub — must be skipped
+        ]);
+
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+
+        assert!(
+            plan.preserved.contains(&"db/data.sqlite".to_string()),
+            "manifest-declared datasource is preserved: {:?}",
+            plan.preserved
+        );
+        assert!(plan.overwrite.is_empty() && plan.conflicts.is_empty());
+        // The user's DB content survives untouched.
+        assert_eq!(read(&proj, "db/data.sqlite"), "LOCALDB");
         unsafe { std::env::remove_var("NANO_APP_DB_URL") };
     }
 
