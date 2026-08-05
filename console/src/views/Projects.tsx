@@ -958,7 +958,8 @@ function UpdatePlanModal({
           <button
             type="button"
             onClick={onClose}
-            className="rounded p-1 text-fg-faint hover:bg-hover"
+            disabled={busy}
+            className="rounded p-1 text-fg-faint hover:bg-hover disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent"
             title="Close"
             aria-label="Close"
           >
