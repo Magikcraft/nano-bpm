@@ -426,7 +426,7 @@ export type ProjectSummary = {
     template?: string;
     scaffoldedFrom?: ProjectScaffoldedFrom;
     /**
-     * True when the project was scaffolded from a pack whose currently installed version differs from the project's recorded `scaffoldedFrom.version` — i.e. a newer template is available to overlay via `updateProjectFromTemplate`. Offline signal (installed pack vs scaffold breadcrumb); never set for built-in templates.
+     * True when the project was scaffolded from a pack whose currently installed version differs from the project's recorded `scaffoldedFrom.version` — i.e. a newer template is available to overlay via `updateProjectFromTemplate`. Offline signal (installed pack vs scaffold breadcrumb); always present as a boolean and `false` for built-in templates and projects not scaffolded from a pack.
      */
     updateAvailable?: boolean;
     /**

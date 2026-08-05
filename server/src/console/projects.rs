@@ -4524,7 +4524,17 @@ fn overlay_plan(
             continue; // identical — nothing to do.
         }
         // 3-way classification when a base is available.
-        let base_bytes = base_src.and_then(|b| std::fs::read(b.join(rel)).ok());
+        // Guard the base read the same way as the source/destination: a
+        // symlinked base entry (the base is an extracted npm tarball too) must
+        // never let the server read host files. An unsafe base path is treated
+        // as "no base available", falling back to conservative 2-way behavior.
+        let base_bytes = base_src.and_then(|b| {
+            if is_symlink_safe(b, rel) {
+                std::fs::read(b.join(rel)).ok()
+            } else {
+                None
+            }
+        });
         match base_bytes {
             Some(base) if cur_bytes == base => {
                 // User hadn't touched it → safe to take upstream's new version.
@@ -11039,6 +11049,9 @@ mod tests {
         assert!(!proj.join("leak").exists());
         unsafe { std::env::remove_var("NANO_APP_DB_URL") };
     }
+
+    #[test]
+    fn overlay_plan_preserves_manifest_declared_datasource() {
         let _g = lock();
         // Env points at the default; the manifest declares a *different*,
         // non-default in-tree sqlite file that must also be preserved.
@@ -11101,6 +11114,27 @@ mod tests {
         assert_eq!(plan.conflicts, vec!["f.txt"]);
         assert!(plan.overwrite.is_empty() && plan.merged.is_empty());
         // The user's file is left untouched on a conflict.
+        assert_eq!(read(&proj, "f.txt"), "user version\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_plan_ignores_symlinked_base_entry() {
+        let _g = lock();
+        // A host file the extracted *base* pack must never be able to read.
+        let outside = tree(&[("secret", "upstream version\n")]);
+        // The base ships `f.txt` as a symlink to the host file. If the server
+        // followed it, `base_bytes` would equal `new` and the 3-way logic would
+        // silently keep the local edit (no conflict) — masking a host-file read.
+        let base = tree(&[("keep", "x\n")]);
+        std::os::unix::fs::symlink(outside.join("secret"), base.join("f.txt")).unwrap();
+        let proj = tree(&[("f.txt", "user version\n")]);
+        let new = tree(&[("f.txt", "upstream version\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        // With the base treated as unavailable, we fall back to conservative
+        // 2-way: an existing, differing file is a conflict, never touched.
+        assert_eq!(plan.conflicts, vec!["f.txt"]);
+        assert!(plan.overwrite.is_empty() && plan.merged.is_empty());
         assert_eq!(read(&proj, "f.txt"), "user version\n");
     }
 
