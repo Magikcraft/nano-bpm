@@ -2665,10 +2665,6 @@ export type UpdateProjectFromTemplateErrors = {
      * Not found
      */
     404: string;
-    /**
-     * Already exists
-     */
-    409: string;
 };
 
 export type UpdateProjectFromTemplateError = UpdateProjectFromTemplateErrors[keyof UpdateProjectFromTemplateErrors];

@@ -4208,8 +4208,23 @@ fn collect_rel_files(
         return;
     };
     for e in rd.flatten() {
+        // Use the `DirEntry`'s own file type (a plain `lstat`) rather than
+        // `Path::is_dir()`, which follows symlinks: a symlinked directory in
+        // the tree could otherwise let traversal escape `root` or spin on a
+        // cycle. Never recurse through a symlink. We still record a symlinked
+        // *entry* itself (relative) so `overlay_plan` surfaces it as a conflict
+        // instead of silently reading through it.
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
         let p = e.path();
-        if p.is_dir() {
+        if ft.is_symlink() {
+            if let Ok(rel) = p.strip_prefix(root) {
+                out.push(rel.to_path_buf());
+            }
+            continue;
+        }
+        if ft.is_dir() {
             if let Some(name) = p.file_name().and_then(|n| n.to_str())
                 && UPDATE_PRESERVE_DIRS.contains(&name)
             {
@@ -4223,13 +4238,15 @@ fn collect_rel_files(
     }
 }
 
-/// Whether writing `dir/rel` stays inside `dir` without traversing any symlink.
-/// Rejects a destination whose path components (or the target file itself) are
-/// symlinks, so a malicious/accidental symlink in the project tree (e.g.
-/// `resources -> /etc`) can't make the overlay write outside the project root.
-/// Non-existent components are fine (they'll be created as real dirs/files).
-fn is_symlink_safe_dst(dir: &Path, rel: &Path) -> bool {
-    let mut cur = dir.to_path_buf();
+/// Whether reading/writing `root/rel` stays inside `root` without traversing any
+/// symlink. Rejects a path whose components (or the target file itself) are
+/// symlinks, so a malicious/accidental symlink in the project tree or an
+/// extracted pack (e.g. `resources -> /etc`) can't make the overlay read or
+/// write outside `root`. Non-existent components are fine (they'll be created as
+/// real dirs/files on the destination side; on the source side a missing file is
+/// caught separately by the read).
+fn is_symlink_safe(root: &Path, rel: &Path) -> bool {
+    let mut cur = root.to_path_buf();
     for comp in rel.components() {
         match comp {
             std::path::Component::Normal(seg) => {
@@ -4454,13 +4471,29 @@ fn overlay_plan(
         }
         let src_path = new_src.join(rel);
         let dst_path = dir.join(rel);
-        let Ok(new_bytes) = std::fs::read(&src_path) else {
+        // Never read the source through a symlinked path component: an
+        // extracted pack could contain `x -> /etc/passwd` and we'd copy the
+        // host file's bytes into the project. Surface such an entry as a
+        // conflict (never read/write it automatically) — symmetric with the
+        // destination guard below.
+        if !is_symlink_safe(new_src, rel) {
+            plan.conflicts.push(rel_str.clone());
             continue;
+        }
+        let new_bytes = match std::fs::read(&src_path) {
+            Ok(b) => b,
+            // An unreadable source file was silently dropped from the plan (and
+            // from apply) before — surface it as a conflict so it's visible and
+            // never written blind.
+            Err(_) => {
+                plan.conflicts.push(rel_str.clone());
+                continue;
+            }
         };
         // Never write through a symlinked path component — it could escape the
         // project root. Surface as a conflict for the user to resolve by hand
         // (applies to dry-run classification too, so the plan matches apply).
-        if !is_symlink_safe_dst(dir, rel) {
+        if !is_symlink_safe(dir, rel) {
             plan.conflicts.push(rel_str.clone());
             continue;
         }
@@ -10980,8 +11013,32 @@ mod tests {
         unsafe { std::env::remove_var("NANO_APP_DB_URL") };
     }
 
+    #[cfg(unix)]
     #[test]
-    fn overlay_plan_preserves_manifest_declared_datasource() {
+    fn overlay_plan_refuses_to_read_through_symlinked_source() {
+        let _g = lock();
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        // A host file the extracted pack must never be able to exfiltrate.
+        let outside = tree(&[("passwd", "HOSTSECRET\n")]);
+        let proj = tree(&[("keep.ts", "x\n")]);
+        // The pack ships a symlink `leak -> <outside>/passwd`. Traversal must
+        // not follow it, and overlay must surface it as a conflict rather than
+        // copying the host file's bytes into the project.
+        let new = tree(&[("real.ts", "hi\n")]);
+        std::os::unix::fs::symlink(outside.join("passwd"), new.join("leak")).unwrap();
+
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+
+        assert!(
+            plan.conflicts.contains(&"leak".to_string()),
+            "symlinked source entry surfaced as conflict: {:?}",
+            plan.conflicts
+        );
+        assert_eq!(plan.create, vec!["real.ts"]);
+        // Never wrote the symlink target's bytes into the project.
+        assert!(!proj.join("leak").exists());
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
         let _g = lock();
         // Env points at the default; the manifest declares a *different*,
         // non-default in-tree sqlite file that must also be preserved.

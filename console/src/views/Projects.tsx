@@ -956,9 +956,11 @@ function UpdatePlanModal({
             Update “{title}” from template
           </h2>
           <button
+            type="button"
             onClick={onClose}
             className="rounded p-1 text-fg-faint hover:bg-hover"
             title="Close"
+            aria-label="Close"
           >
             ✕
           </button>
