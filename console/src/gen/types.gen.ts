@@ -65,7 +65,7 @@ export type Variable = {
 
 export type SetInstanceVariablesRequest = {
     /**
-     * Target scope key (e.g. a Variable's scope_key). Nano exposes a single instance-level scope, so this is normally the process instance key.
+     * Target variable scope key (e.g. a Variable's scope_key). The engine addresses both process-instance and element-instance scopes: pass the process-instance key to update instance-level variables, or an element-instance scope key to target a nested (activity/subprocess) scope.
      *
      */
     scopeKey: string;
@@ -76,7 +76,7 @@ export type SetInstanceVariablesRequest = {
         [key: string]: unknown;
     };
     /**
-     * Accepted for Camunda parity; nano has one scope so it has no effect.
+     * Zeebe local semantics. When true, variables are written strictly into the addressed scopeKey. When false (the default), each variable is merged into the scope where it is already defined, propagating upward from the addressed scope (and created on the addressed scope if it is not found on any ancestor).
      */
     local?: boolean;
 };
