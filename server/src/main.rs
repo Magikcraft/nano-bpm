@@ -14828,10 +14828,11 @@ fn reject_task_result_with_variables(
 /// for ordinary completions (no `result`, an ad-hoc result, or a user-task
 /// result that neither denies nor corrects), keeping that path byte-unchanged.
 ///
-/// Nullable mapping follows the engine's "clear" convention: a JSON `null`
-/// assignee / date clears the attribute (empty string), a `null` candidate list
-/// clears it (empty list). A `null` priority carries no clear sentinel, so it is
-/// treated as "uncorrected".
+/// Nullable mapping follows the OpenAPI contract (`spec/jobs.yaml`
+/// `JobResultCorrections`): a JSON `null` (or omitted) assignee / date /
+/// candidate list *preserves* the persisted attribute (uncorrected), while an
+/// empty String (assignee, dates) or empty list (candidate collections) *clears*
+/// it. See [`user_task_corrections_from_model`] for the field-by-field mapping.
 fn task_result_from_completion(
     body: &Option<models::JobCompletionRequest>,
 ) -> Option<TaskListenerJobResult> {
