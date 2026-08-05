@@ -5464,6 +5464,18 @@ impl ServerImpl {
         timeout: u64,
         operation_reference: Option<i64>,
     ) -> Result<(), (u16, String)> {
+        // A lock extension needs a strictly-positive duration; a zero timeout
+        // would set the deadline to `now + 0 == now`, immediately expiring the
+        // lock rather than extending it. The REST handler already rejects
+        // non-positive timeouts, but guard at this partition-boundary helper too
+        // so every call site — peer-forwarded `UpdateJobTimeout` frames and any
+        // future caller — enforces the same contract and can't misuse it.
+        if timeout == 0 {
+            return Err((
+                400,
+                "timeout must be a positive number of milliseconds, got 0.".to_string(),
+            ));
+        }
         let result = self
             .engine
             .by_key(job_key)
@@ -24474,6 +24486,27 @@ mod subscription_placement_tests {
           </bpmn:extensionElements>
         </bpmn:message>
       </bpmn:definitions>"#;
+
+    /// A zero `timeout` at the partition-boundary helper must be rejected with a
+    /// 400 *before* the engine is touched — a lock "extension" of 0ms would set
+    /// the deadline to `now`, instantly expiring the lock. This guards the
+    /// peer-forwarded `UpdateJobTimeout` path (and any future caller), which does
+    /// not re-run the REST validation. The guard short-circuits ahead of the job
+    /// lookup, so it holds even for an unknown key (400, not 404).
+    #[tokio::test]
+    async fn update_job_timeout_local_rejects_zero_timeout_before_lookup() {
+        let server = single_node_multi_partition();
+        let err = server
+            .update_job_timeout_local(0xdead_beef, 0, None)
+            .await
+            .expect_err("a zero timeout must be rejected");
+        assert_eq!(err.0, 400, "zero timeout is a client (validation) error");
+        assert!(
+            err.1.contains("positive"),
+            "detail explains the positive-duration contract, got {:?}",
+            err.1
+        );
+    }
 
     #[tokio::test]
     async fn cross_partition_message_catch_completes_via_the_pump() {
