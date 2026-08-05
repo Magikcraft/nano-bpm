@@ -4305,6 +4305,14 @@ pub fn update_from_template(
         .map(String::from)
         .or_else(|| installed_version.clone());
     let mut tmp_dirs: Vec<PathBuf> = Vec::new();
+    // Defined here (before the resolution match) so every error path that has
+    // already pushed an extracted temp dir into `tmp_dirs` can clean it up
+    // before bailing, rather than leaking it on disk.
+    let cleanup = |dirs: &[PathBuf]| {
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    };
     let new_src: PathBuf = match version {
         Some(v) if Some(v.to_string()) != installed_version => {
             let pkg = super::extensions::pack_npm_name(&sf.pack).ok_or_else(|| {
@@ -4315,8 +4323,13 @@ pub fn update_from_template(
             })?;
             let root = super::extensions::pack_into_tmp(&format!("{pkg}@{v}"))?;
             tmp_dirs.push(root.clone());
-            super::extensions::template_dir_in_root(&root, &template)
-                .ok_or_else(|| format!("template '{template}' not found in {pkg}@{v}"))?
+            match super::extensions::template_dir_in_root(&root, &template) {
+                Some(d) => d,
+                None => {
+                    cleanup(&tmp_dirs);
+                    return Err(format!("template '{template}' not found in {pkg}@{v}"));
+                }
+            }
         }
         _ => {
             // No explicit version: overlay the currently installed pack. But
@@ -4353,12 +4366,6 @@ pub fn update_from_template(
             }
         }
         _ => None,
-    };
-
-    let cleanup = |dirs: &[PathBuf]| {
-        for d in dirs {
-            let _ = std::fs::remove_dir_all(d);
-        }
     };
 
     let plan = overlay_plan(
