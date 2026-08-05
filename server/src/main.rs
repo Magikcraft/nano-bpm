@@ -4723,9 +4723,11 @@ impl ServerImpl {
 
     /// `PUT /v2/element-instances/{elementInstanceKey}/variables` — merge
     /// variables into a scope so an operator can correct the data behind an
-    /// incident before resolving it. The path key may be the process instance
-    /// key or an element instance key; both resolve to nano's single
-    /// instance-level scope (so `local` is accepted but has no effect).
+    /// incident before resolving it. The path key addresses the target scope:
+    /// pass the process-instance key for instance-level variables, or an
+    /// element-instance key to target a nested (element) scope. `local`
+    /// follows Zeebe semantics — `local=true` writes strictly into the
+    /// addressed scope, `local=false` propagates upward to the process instance.
     async fn create_element_instance_variables_impl(
         &self,
         path_params: &models::CreateElementInstanceVariablesPathParams,
