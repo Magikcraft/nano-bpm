@@ -63,6 +63,24 @@ export type Variable = {
     scope_key: string;
 };
 
+export type SetInstanceVariablesRequest = {
+    /**
+     * Target scope key (e.g. a Variable's scope_key). Nano exposes a single instance-level scope, so this is normally the process instance key.
+     *
+     */
+    scopeKey: string;
+    /**
+     * JSON object of variable name → value to merge into the scope.
+     */
+    variables: {
+        [key: string]: unknown;
+    };
+    /**
+     * Accepted for Camunda parity; nano has one scope so it has no effect.
+     */
+    local?: boolean;
+};
+
 export type Job = {
     key: string;
     element_id: string;
@@ -1422,6 +1440,77 @@ export type GetInstanceResponses = {
 };
 
 export type GetInstanceResponse = GetInstanceResponses[keyof GetInstanceResponses];
+
+export type ResolveIncidentData = {
+    body?: never;
+    path: {
+        key: string;
+        incidentKey: string;
+    };
+    query?: never;
+    url: '/instances/{key}/incidents/{incidentKey}/resolution';
+};
+
+export type ResolveIncidentErrors = {
+    /**
+     * Not found
+     */
+    404: string;
+    /**
+     * Already exists
+     */
+    409: string;
+    /**
+     * Internal error
+     */
+    500: string;
+};
+
+export type ResolveIncidentError = ResolveIncidentErrors[keyof ResolveIncidentErrors];
+
+export type ResolveIncidentResponses = {
+    /**
+     * The incident was resolved
+     */
+    204: void;
+};
+
+export type ResolveIncidentResponse = ResolveIncidentResponses[keyof ResolveIncidentResponses];
+
+export type SetInstanceVariablesData = {
+    body: SetInstanceVariablesRequest;
+    path: {
+        key: string;
+    };
+    query?: never;
+    url: '/instances/{key}/variables';
+};
+
+export type SetInstanceVariablesErrors = {
+    /**
+     * Invalid request
+     */
+    400: string;
+    /**
+     * Not found
+     */
+    404: string;
+    /**
+     * Internal error
+     */
+    500: string;
+};
+
+export type SetInstanceVariablesError = SetInstanceVariablesErrors[keyof SetInstanceVariablesErrors];
+
+export type SetInstanceVariablesResponses = {
+    /**
+     * The variables were merged
+     */
+    204: void;
+};
+
+export type SetInstanceVariablesResponse = SetInstanceVariablesResponses[keyof SetInstanceVariablesResponses];
 
 export type ListTracesData = {
     body?: never;

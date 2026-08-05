@@ -349,6 +349,78 @@ impl apis::instances::Instances for ServerImpl {
             )),
         )
     }
+
+    async fn resolve_incident(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::ResolveIncidentPathParams,
+    ) -> Result<apis::instances::ResolveIncidentResponse, ()> {
+        use apis::instances::ResolveIncidentResponse as Resp;
+
+        use crate::ResolveIncidentOutcome as Out;
+
+        let incident_key: u64 = match path_params.incident_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_NotFound(format!(
+                    "Incident key '{}' is not a valid key.",
+                    path_params.incident_key
+                )));
+            }
+        };
+
+        // Console operator action: no operationReference (that is a client
+        // idempotency token on the public v2 API). Reuses the same engine-command
+        // + leader-forward core as `POST /v2/incidents/{key}/resolution`.
+        Ok(match self.resolve_incident_core(incident_key, None).await {
+            Out::Resolved => Resp::Status204_TheIncidentWasResolved,
+            Out::NotFound(d) => Resp::Status404_NotFound(d),
+            Out::NotResolvable(d) => Resp::Status409_AlreadyExists(d),
+            Out::Internal(d) => Resp::Status500_InternalError(d),
+        })
+    }
+
+    async fn set_instance_variables(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _path_params: &models::SetInstanceVariablesPathParams,
+        body: &models::SetInstanceVariablesRequest,
+    ) -> Result<apis::instances::SetInstanceVariablesResponse, ()> {
+        use apis::instances::SetInstanceVariablesResponse as Resp;
+
+        use crate::SetVariablesOutcome as Out;
+
+        let scope_key: u64 = match body.scope_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status400_InvalidRequest(format!(
+                    "Scope key '{}' is not a valid key.",
+                    body.scope_key
+                )));
+            }
+        };
+
+        // The generated `types::Object` wraps the raw JSON value in `.0`; forward
+        // it verbatim so the engine (or a peer) re-derives identical values.
+        let variables: serde_json::Map<String, serde_json::Value> = body
+            .variables
+            .iter()
+            .map(|(name, obj)| (name.clone(), obj.0.clone()))
+            .collect();
+        let local = body.local.unwrap_or(false);
+
+        Ok(
+            match self.set_variables_core(scope_key, variables, local).await {
+                Out::Updated => Resp::Status204_TheVariablesWereMerged,
+                Out::ScopeNotFound(d) => Resp::Status404_NotFound(d),
+                Out::Internal(d) => Resp::Status500_InternalError(d),
+            },
+        )
+    }
 }
 
 // --- traces ---------------------------------------------------------------
