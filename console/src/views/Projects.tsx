@@ -861,7 +861,7 @@ function ProjectTile({
               ⧉ linked
             </span>
           )}
-          {project.updateAvailable && (
+          {project.updateAvailable && project.source !== "path" && (
             <span
               title={`A newer template is available${project.latestVersion ? ` (v${project.latestVersion})` : ""} — hover and click ↑ to review the update`}
               className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent"

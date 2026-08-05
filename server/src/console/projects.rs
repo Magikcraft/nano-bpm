@@ -4307,8 +4307,12 @@ pub fn update_from_template(
     let mut tmp_dirs: Vec<PathBuf> = Vec::new();
     let new_src: PathBuf = match version {
         Some(v) if Some(v.to_string()) != installed_version => {
-            let pkg = super::extensions::pack_npm_name(&sf.pack)
-                .ok_or_else(|| "pack has no npm name (built-in?)".to_string())?;
+            let pkg = super::extensions::pack_npm_name(&sf.pack).ok_or_else(|| {
+                format!(
+                    "could not resolve an npm package name for pack '{}' (pack not installed, its package.json is missing/unreadable or has no name, or it is a built-in pack)",
+                    sf.pack
+                )
+            })?;
             let root = super::extensions::pack_into_tmp(&format!("{pkg}@{v}"))?;
             tmp_dirs.push(root.clone());
             super::extensions::template_dir_in_root(&root, &template)
