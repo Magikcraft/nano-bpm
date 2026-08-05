@@ -4258,6 +4258,19 @@ impl ServerImpl {
         // jobs): a denial and/or corrections. `None` for ordinary completions.
         let task_result = task_result_from_completion(body);
 
+        // Engine parity (`EngineError::TaskListenerJobWithVariables`): a
+        // task-listener result cannot carry variables. Reject at the boundary
+        // rather than silently dropping them (the command constructor forces an
+        // empty map). Runs before routing so the forwarded/peer path is covered
+        // too.
+        if let Some((_, detail)) = reject_task_result_with_variables(&task_result, &variables) {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid data",
+                400,
+                detail,
+            )));
+        }
+
         // Cluster: if a peer owns the job's partition, forward over the command
         // stream and map its answer back (single-node always owns every key).
         if let Some(node) = self.route_by_leader(job_key) {
@@ -13134,6 +13147,12 @@ impl ServerImpl {
         adhoc_result: Option<AdHocJobResult>,
         task_result: Option<TaskListenerJobResult>,
     ) -> Result<Commit, (u16, String)> {
+        // Engine parity (`EngineError::TaskListenerJobWithVariables`): a
+        // task-listener result cannot carry variables. Reject here rather than
+        // letting the command constructor silently drop them.
+        if let Some(err) = reject_task_result_with_variables(&task_result, &variables) {
+            return Err(err);
+        }
         let command = match (task_result, adhoc_result) {
             (Some(task_listener_result), _) => {
                 Command::complete_job_with_task_result(job_key, task_listener_result)
@@ -14776,6 +14795,32 @@ fn adhoc_result_from_completion(
         completion_condition_fulfilled: adhoc.is_completion_condition_fulfilled.unwrap_or(false),
         cancel_remaining_instances: adhoc.is_cancel_remaining_instances.unwrap_or(false),
     })
+}
+
+/// A user-task-listener job result must not be completed with variables: the
+/// engine rejects it (`EngineError::TaskListenerJobWithVariables`) and the
+/// server-side `Command::complete_job_with_task_result` constructor hardcodes an
+/// empty variables map. Without a boundary guard the server would *silently
+/// discard* any variables a client sent alongside a task-listener result and
+/// still report success — the "success but intent discarded" defect class,
+/// diverging from the engine contract.
+///
+/// This is the single canonical guard shared by every completion entry point
+/// (REST `complete_job_impl` and stream `complete_job_for_stream`), run before
+/// the command is built or forwarded to a peer, so no call site can reintroduce
+/// the drop. Returns `Some((400, detail))` to reject, `None` to allow.
+fn reject_task_result_with_variables(
+    task_result: &Option<TaskListenerJobResult>,
+    variables: &std::collections::HashMap<String, Value>,
+) -> Option<(u16, String)> {
+    if task_result.is_some() && !variables.is_empty() {
+        Some((
+            400,
+            "a user-task-listener job result cannot be completed with variables".to_string(),
+        ))
+    } else {
+        None
+    }
 }
 
 /// Maps a REST `JobResultUserTask` (Camunda user-task listener result) onto the
@@ -25276,5 +25321,43 @@ mod task_result_mapping_tests {
         assert_eq!(c.candidate_groups, Some(Vec::new()));
         assert_eq!(c.priority, Some(80));
         assert!(!mapped.is_empty());
+    }
+
+    /// #592 follow-up: a user-task-listener result completed *with* variables is
+    /// rejected at the boundary with 400 instead of silently discarding them
+    /// (the "success but intent discarded" defect class). This guards every
+    /// completion entry point (REST + stream) via the shared helper.
+    #[test]
+    fn task_result_with_variables_is_rejected() {
+        let task_result = Some(TaskListenerJobResult {
+            denied: true,
+            denied_reason: Some("needs manager".to_string()),
+            corrections: UserTaskCorrections::default(),
+        });
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("amount".to_string(), Value::Int(42));
+
+        let rejection = reject_task_result_with_variables(&task_result, &variables)
+            .expect("task-listener result with variables must be rejected");
+        assert_eq!(rejection.0, 400);
+        assert!(rejection.1.contains("cannot be completed with variables"));
+    }
+
+    /// A task-listener result with *no* variables is allowed (the ordinary
+    /// task-listener completion path), and a plain completion with variables is
+    /// allowed (no task result) — the guard fires only on the invalid pairing.
+    #[test]
+    fn task_result_without_variables_and_plain_with_variables_are_allowed() {
+        let task_result = Some(TaskListenerJobResult {
+            denied: true,
+            denied_reason: Some("needs manager".to_string()),
+            corrections: UserTaskCorrections::default(),
+        });
+        let empty = std::collections::HashMap::new();
+        assert!(reject_task_result_with_variables(&task_result, &empty).is_none());
+
+        let mut variables = std::collections::HashMap::new();
+        variables.insert("amount".to_string(), Value::Int(42));
+        assert!(reject_task_result_with_variables(&None, &variables).is_none());
     }
 }
