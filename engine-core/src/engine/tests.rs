@@ -4340,6 +4340,75 @@ fn activated_job_accepts_both_timeout_then_retries_updates() {
         .unwrap();
 }
 
+/// `Command` is persisted through the Raft log (`ReplicatedCommand` serializes
+/// `Command`). New fields on persisted variants must (a) deserialize from logs
+/// written before the field existed (`serde(default)`) and (b) stay off the wire
+/// in their empty/absent form (`skip_serializing_if`) so the documented
+/// "byte-unchanged" claim holds. This guards the whole defect class for the
+/// three fields added in #592: `ThrowJobError.variables`,
+/// `UpdateJobRetries.operation_reference`, `UpdateJobTimeout.operation_reference`.
+#[cfg(feature = "serde")]
+#[test]
+fn new_persisted_command_fields_are_backward_compatible_and_omit_when_empty() {
+    use std::collections::HashMap;
+
+    // (a) Old log entries lack the new fields — they must still deserialize.
+    let throw: Command =
+        serde_json::from_str(r#"{"ThrowJobError":{"job_key":7,"error_code":"E","error_message":"m"}}"#)
+            .expect("legacy ThrowJobError without variables must deserialize");
+    assert!(matches!(
+        throw,
+        Command::ThrowJobError { ref variables, .. } if variables.is_empty()
+    ));
+
+    let retries: Command =
+        serde_json::from_str(r#"{"UpdateJobRetries":{"job_key":7,"retries":3}}"#)
+            .expect("legacy UpdateJobRetries without operation_reference must deserialize");
+    assert!(matches!(
+        retries,
+        Command::UpdateJobRetries { operation_reference: None, .. }
+    ));
+
+    let timeout: Command =
+        serde_json::from_str(r#"{"UpdateJobTimeout":{"job_key":7,"timeout":5000}}"#)
+            .expect("legacy UpdateJobTimeout without operation_reference must deserialize");
+    assert!(matches!(
+        timeout,
+        Command::UpdateJobTimeout { operation_reference: None, .. }
+    ));
+
+    // (b) The empty/absent form must not appear on the wire (byte-unchanged).
+    let throw_empty = Command::ThrowJobError {
+        job_key: 7,
+        error_code: "E".into(),
+        error_message: "m".into(),
+        variables: HashMap::new(),
+    };
+    let s = serde_json::to_string(&throw_empty).unwrap();
+    assert!(!s.contains("variables"), "empty variables must be skipped: {s}");
+
+    let s = serde_json::to_string(&Command::update_job_retries(7, 3)).unwrap();
+    assert!(
+        !s.contains("operation_reference"),
+        "absent operation_reference must be skipped: {s}"
+    );
+
+    let s = serde_json::to_string(&Command::update_job_timeout(7, 5000)).unwrap();
+    assert!(
+        !s.contains("operation_reference"),
+        "absent operation_reference must be skipped: {s}"
+    );
+
+    // Present values still round-trip.
+    let s = serde_json::to_string(&Command::update_job_retries_with_ref(7, 3, Some(42))).unwrap();
+    assert!(s.contains("operation_reference"));
+    let back: Command = serde_json::from_str(&s).unwrap();
+    assert!(matches!(
+        back,
+        Command::UpdateJobRetries { operation_reference: Some(42), .. }
+    ));
+}
+
 /// start -> charge(payment) --normal--> done
 ///     charge --(error CARD_DECLINED boundary)--> recover(recovery) -> rec_done
 fn process_with_error_boundary_to_task() -> ProcessDefinition {

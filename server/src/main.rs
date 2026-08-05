@@ -14788,9 +14788,17 @@ fn task_result_from_completion(
         Some(types::Nullable::Present(b)) => *b,
         _ => false,
     };
-    let denied_reason = match &user.denied_reason {
-        Some(types::Nullable::Present(s)) => Some(s.clone()),
-        _ => None,
+    // The reason is meaningful only alongside `denied = true` (the engine ignores
+    // it otherwise). Dropping a bare `deniedReason` keeps an otherwise-empty
+    // result on the fast completion path instead of forcing the task-listener
+    // command for a value the engine will never read.
+    let denied_reason = if denied {
+        match &user.denied_reason {
+            Some(types::Nullable::Present(s)) => Some(s.clone()),
+            _ => None,
+        }
+    } else {
+        None
     };
 
     let corrections = match &user.corrections {
@@ -25165,6 +25173,38 @@ mod task_result_mapping_tests {
         assert!(mapped.denied);
         assert_eq!(mapped.denied_reason.as_deref(), Some("needs manager"));
         assert!(mapped.corrections.is_empty());
+    }
+
+    /// A bare `deniedReason` without `denied = true` carries no meaning to the
+    /// engine (which only reads the reason when denied), so it must not by itself
+    /// force the slow task-listener path: an otherwise-empty result stays on the
+    /// fast completion path (`None`).
+    #[test]
+    fn bare_denied_reason_without_denial_stays_on_the_fast_path() {
+        let user = models::JobResultUserTask {
+            denied: None,
+            denied_reason: Some(types::Nullable::Present("stray reason".to_string())),
+            corrections: None,
+            r_type: None,
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(user)),
+        };
+        assert!(task_result_from_completion(&Some(body)).is_none());
+
+        // Explicit denied = false with a reason behaves the same way.
+        let user = models::JobResultUserTask {
+            denied: Some(types::Nullable::Present(false)),
+            denied_reason: Some(types::Nullable::Present("stray reason".to_string())),
+            corrections: None,
+            r_type: None,
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(user)),
+        };
+        assert!(task_result_from_completion(&Some(body)).is_none());
     }
 
     /// User-task corrections map field-for-field onto the engine's

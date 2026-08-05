@@ -132,6 +132,10 @@ pub enum Command {
         /// Empty for an error thrown without variables, keeping that path
         /// byte-unchanged. Applied only when a matching boundary catches the
         /// error; ignored when the error is unhandled (parks on an incident).
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "HashMap::is_empty")
+        )]
         variables: HashMap<String, Value>,
     },
     /// Update a job's remaining retries. Used to recover a job parked on a
@@ -142,6 +146,10 @@ pub enum Command {
     UpdateJobRetries {
         job_key: Key,
         retries: i32,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
         operation_reference: Option<i64>,
     },
     /// Extend the activation lock of a currently-activated job, resetting its
@@ -155,6 +163,10 @@ pub enum Command {
     UpdateJobTimeout {
         job_key: Key,
         timeout: u64,
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
         operation_reference: Option<i64>,
     },
     /// Resolve an open incident by retrying the work that failed. A job-incident
