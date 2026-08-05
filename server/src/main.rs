@@ -14877,28 +14877,30 @@ fn task_result_from_completion(
 }
 
 /// Maps REST `JobResultCorrections` onto the engine's [`UserTaskCorrections`].
-/// A `null` field clears the attribute (empty string for dates/assignee, empty
-/// list for candidate collections); an absent field leaves it uncorrected.
+/// Per the OpenAPI contract (`spec/jobs.yaml` `JobResultCorrections`), a `null`
+/// value *or* an omitted field preserves the persisted attribute (uncorrected,
+/// `None`); an attribute is *cleared* by providing an empty String (assignee,
+/// dates) or an empty list (candidate collections).
 fn user_task_corrections_from_model(c: &models::JobResultCorrections) -> UserTaskCorrections {
     fn opt_string(field: &Option<types::Nullable<String>>) -> Option<String> {
         match field {
             Some(types::Nullable::Present(s)) => Some(s.clone()),
-            Some(types::Nullable::Null) => Some(String::new()),
-            None => None,
+            // `null` (and absent) preserve the value; clearing is an empty String.
+            Some(types::Nullable::Null) | None => None,
         }
     }
     fn opt_list(field: &Option<types::Nullable<Vec<String>>>) -> Option<Vec<String>> {
         match field {
             Some(types::Nullable::Present(v)) => Some(v.clone()),
-            Some(types::Nullable::Null) => Some(Vec::new()),
-            None => None,
+            // `null` (and absent) preserve the value; clearing is an empty list.
+            Some(types::Nullable::Null) | None => None,
         }
     }
     fn opt_date(field: &Option<types::Nullable<chrono::DateTime<chrono::Utc>>>) -> Option<String> {
         match field {
             Some(types::Nullable::Present(dt)) => Some(dt.to_rfc3339()),
-            Some(types::Nullable::Null) => Some(String::new()),
-            None => None,
+            // `null` (and absent) preserve the value; clearing is an empty String.
+            Some(types::Nullable::Null) | None => None,
         }
     }
     let priority = match &c.priority {
@@ -25286,17 +25288,25 @@ mod task_result_mapping_tests {
     }
 
     /// User-task corrections map field-for-field onto the engine's
-    /// `UserTaskCorrections`, including the "clear" convention: a JSON `null`
-    /// assignee/date clears it (empty string) and a `null` candidate list clears
-    /// it (empty list). An absent field stays uncorrected (`None`).
+    /// `UserTaskCorrections`, honouring the OpenAPI contract
+    /// (`spec/jobs.yaml` `JobResultCorrections`): a JSON `null` (or omitted)
+    /// field *preserves* the persisted value (`None`, uncorrected), while an
+    /// attribute is *cleared* by an empty String (assignee/date) or empty list
+    /// (candidate collection).
     #[test]
     fn user_task_corrections_map_including_clear_semantics() {
+        use chrono::TimeZone;
         let corrections = models::JobResultCorrections {
             assignee: Some(types::Nullable::Present("alice".to_string())),
+            // null preserves (stays None); empty string below clears.
             due_date: Some(types::Nullable::Null),
-            follow_up_date: None,
+            // present (epoch) date -> corrected to that value.
+            follow_up_date: Some(types::Nullable::Present(
+                chrono::Utc.timestamp_opt(0, 0).unwrap(),
+            )),
             candidate_users: Some(types::Nullable::Present(vec!["u1".to_string()])),
-            candidate_groups: Some(types::Nullable::Null),
+            // empty list clears the candidate groups.
+            candidate_groups: Some(types::Nullable::Present(Vec::new())),
             priority: Some(types::Nullable::Present(80)),
         };
         let user = models::JobResultUserTask {
@@ -25313,14 +25323,42 @@ mod task_result_mapping_tests {
         assert!(!mapped.denied);
         let c = &mapped.corrections;
         assert_eq!(c.assignee.as_deref(), Some("alice"));
-        // null due date clears -> empty string; absent follow-up stays None
-        assert_eq!(c.due_date.as_deref(), Some(""));
-        assert_eq!(c.follow_up_date, None);
+        // null due date preserves -> None (NOT cleared).
+        assert_eq!(c.due_date, None);
+        // a present (epoch) follow-up date is corrected.
+        assert!(c.follow_up_date.is_some());
         assert_eq!(c.candidate_users, Some(vec!["u1".to_string()]));
-        // null candidate groups clears -> empty list
+        // empty candidate-group list clears -> Some(empty).
         assert_eq!(c.candidate_groups, Some(Vec::new()));
         assert_eq!(c.priority, Some(80));
         assert!(!mapped.is_empty());
+    }
+
+    /// A corrections object whose fields are all JSON `null` (or omitted)
+    /// preserves every attribute — nothing is corrected — so the result carries
+    /// no corrections and stays on the fast completion path.
+    #[test]
+    fn user_task_corrections_all_null_preserve_and_correct_nothing() {
+        let corrections = models::JobResultCorrections {
+            assignee: Some(types::Nullable::Null),
+            due_date: Some(types::Nullable::Null),
+            follow_up_date: Some(types::Nullable::Null),
+            candidate_users: Some(types::Nullable::Null),
+            candidate_groups: Some(types::Nullable::Null),
+            priority: Some(types::Nullable::Null),
+        };
+        let user = models::JobResultUserTask {
+            denied: None,
+            denied_reason: None,
+            corrections: Some(types::Nullable::Present(corrections)),
+            r_type: None,
+        };
+        let body = models::JobCompletionRequest {
+            variables: None,
+            result: Some(models::JobResult::JobResultUserTask(user)),
+        };
+        // All-null corrections correct nothing -> ordinary completion (fast path).
+        assert!(task_result_from_completion(&Some(body)).is_none());
     }
 
     /// #592 follow-up: a user-task-listener result completed *with* variables is
