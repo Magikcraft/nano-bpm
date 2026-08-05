@@ -264,6 +264,15 @@ pub enum ClientFrame {
         job_key: String,
         retries: i32,
     },
+    /// **Intra-cluster only.** A gateway forwards a by-key job lock-extension
+    /// (timeout) to the peer that owns the job's partition. Answered by a
+    /// `CommandResult`.
+    #[serde(rename_all = "camelCase")]
+    UpdateJobTimeout {
+        corr: u64,
+        job_key: String,
+        timeout: u64,
+    },
     /// **Intra-cluster only.** A gateway forwards a by-key incident resolution to
     /// the peer that owns the incident's partition. Answered by a `CommandResult`.
     #[serde(rename_all = "camelCase")]
@@ -1357,6 +1366,7 @@ async fn handle_client_frame(
         ClientFrame::CancelInstance { .. } => "cancel_instance",
         ClientFrame::RouteSubscription { .. } => "route_subscription",
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
+        ClientFrame::UpdateJobTimeout { .. } => "update_job_timeout",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
         ClientFrame::SetVariables { .. } => "set_variables",
         ClientFrame::ActivateJobs { .. } => "activate_jobs",
@@ -1899,6 +1909,16 @@ async fn handle_client_frame(
         } => {
             forward_by_key_reply(conn, corr, &job_key, |key| async move {
                 server.update_job_retries_local(key, retries).await
+            })
+            .await;
+        }
+        ClientFrame::UpdateJobTimeout {
+            corr,
+            job_key,
+            timeout,
+        } => {
+            forward_by_key_reply(conn, corr, &job_key, |key| async move {
+                server.update_job_timeout_local(key, timeout).await
             })
             .await;
         }

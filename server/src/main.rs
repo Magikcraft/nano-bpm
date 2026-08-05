@@ -4508,53 +4508,83 @@ impl ServerImpl {
             }
         };
 
-        // The POC only acts on the retries part of the changeset (timeout
-        // updates are not modelled). A changeset without retries is a no-op.
+        // A changeset may carry `retries`, `timeout`, both, or neither. Each
+        // present field is applied to the job; an empty changeset is a no-op.
         let retries = match body.changeset.retries.as_ref() {
-            Some(types::Nullable::Present(r)) => *r,
-            _ => {
-                return Ok(Resp::Status204_TheJobWasUpdatedSuccessfully);
-            }
+            Some(types::Nullable::Present(r)) => Some(*r),
+            _ => None,
+        };
+        let timeout = match body.changeset.timeout.as_ref() {
+            Some(types::Nullable::Present(t)) => Some(*t),
+            _ => None,
         };
 
-        if let Some(node) = self.route_by_leader(job_key) {
-            return Ok(self.forward_update_job(node, job_key, retries).await);
+        if retries.is_none() && timeout.is_none() {
+            return Ok(Resp::Status204_TheJobWasUpdatedSuccessfully);
         }
 
-        let result = self
-            .engine
-            .by_key(job_key)
-            .with(move |engine| {
-                engine.apply_command_at(Command::update_job_retries(job_key, retries), now_millis())
-            })
-            .await;
-        match result {
-            Ok((_, commit)) => {
-                commit.wait().await;
-                Ok(Resp::Status204_TheJobWasUpdatedSuccessfully)
-            }
-            Err(EngineError::JobNotFound { job_key }) => {
-                Ok(Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
-                    "Job not found",
-                    404,
-                    format!("No job with key {job_key}."),
-                )))
-            }
-            Err(EngineError::JobNotActive { job_key }) => Ok(
-                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "Job in wrong state",
-                    409,
-                    format!("Job {job_key} is terminal and its retries cannot be updated."),
-                )),
-            ),
-            Err(e) => Ok(
-                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                    "Internal error",
-                    500,
-                    e.to_string(),
-                )),
-            ),
+        // A lock extension needs a strictly-positive number of milliseconds; a
+        // zero/negative timeout would set the deadline at or before "now",
+        // expiring the lock rather than extending it.
+        if let Some(t) = timeout
+            && t <= 0
+        {
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid data",
+                400,
+                format!("timeout must be a positive number of milliseconds, got {t}."),
+            )));
         }
+
+        // Map a by-key update failure (u16 status + detail) to the right
+        // response variant, shared by the local and forwarded paths.
+        let to_resp = |status: u16, detail: String| match status {
+            400 => Resp::Status400_TheProvidedDataIsNotValid(problem("Invalid data", 400, detail)),
+            404 => {
+                Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem("Job not found", 404, detail))
+            }
+            409 => Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
+                "Job in wrong state",
+                409,
+                detail,
+            )),
+            _ => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                "Internal error",
+                500,
+                detail,
+            )),
+        };
+
+        let node = self.route_by_leader(job_key);
+
+        if let Some(retries) = retries {
+            let res = match node {
+                Some(node) => {
+                    self.forward_update_job_retries(node, job_key, retries)
+                        .await
+                }
+                None => self.update_job_retries_local(job_key, retries).await,
+            };
+            if let Err((status, detail)) = res {
+                return Ok(to_resp(status, detail));
+            }
+        }
+
+        if let Some(timeout) = timeout {
+            let timeout = timeout as u64;
+            let res = match node {
+                Some(node) => {
+                    self.forward_update_job_timeout(node, job_key, timeout)
+                        .await
+                }
+                None => self.update_job_timeout_local(job_key, timeout).await,
+            };
+            if let Err((status, detail)) = res {
+                return Ok(to_resp(status, detail));
+            }
+        }
+
+        Ok(Resp::Status204_TheJobWasUpdatedSuccessfully)
     }
 
     async fn resolve_incident_impl(
@@ -5370,6 +5400,37 @@ impl ServerImpl {
         }
     }
 
+    /// Extends a job's activation lock on this node's owning partition. The job
+    /// must currently be activated (locked); otherwise there is no lock to
+    /// extend and this yields a 409.
+    pub(crate) async fn update_job_timeout_local(
+        &self,
+        job_key: u64,
+        timeout: u64,
+    ) -> Result<(), (u16, String)> {
+        let result = self
+            .engine
+            .by_key(job_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::update_job_timeout(job_key, timeout), now_millis())
+            })
+            .await;
+        match result {
+            Ok((_, commit)) => {
+                commit.wait().await;
+                Ok(())
+            }
+            Err(EngineError::JobNotFound { job_key }) => {
+                Err((404, format!("No job with key {job_key}.")))
+            }
+            Err(EngineError::JobNotActive { job_key }) => Err((
+                409,
+                format!("Job {job_key} is not activated; its lock timeout cannot be extended."),
+            )),
+            Err(e) => Err((500, e.to_string())),
+        }
+    }
+
     /// Resolves an incident on this node's owning partition.
     pub(crate) async fn resolve_incident_local(
         &self,
@@ -5999,46 +6060,37 @@ impl ServerImpl {
     }
 
     /// Forwards a job-retries update to the peer owning the job.
-    async fn forward_update_job(
+    async fn forward_update_job_retries(
         &self,
         node: u32,
         job_key: u64,
         retries: i32,
-    ) -> apis::job::UpdateJobResponse {
-        use apis::job::UpdateJobResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => link.update_job_retries(job_key.to_string(), retries).await,
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
-        match res {
-            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheJobWasUpdatedSuccessfully,
-            Ok(r) if r.status == 404 => Resp::Status404_TheJobWithTheJobKeyIsNotFound(problem(
-                "Job not found",
-                404,
-                peer_detail(&r),
-            )),
-            Ok(r) if r.status == 409 => {
-                Resp::Status409_TheJobWithTheGivenKeyIsInTheWrongStateCurrently(problem(
-                    "Job in wrong state",
-                    409,
-                    peer_detail(&r),
-                ))
-            }
-            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                500,
-                peer_detail(&r),
-            )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
+    ) -> Result<(), (u16, String)> {
+        let link = self.peer_link(node).await?;
+        match link.update_job_retries(job_key.to_string(), retries).await {
+            Ok(r) if is_ok_status(r.status) => Ok(()),
+            Ok(r) if r.status == 404 => Err((404, peer_detail(&r))),
+            Ok(r) if r.status == 409 => Err((409, peer_detail(&r))),
+            Ok(r) => Err((500, peer_detail(&r))),
+            Err(e) => Err((502, e.to_string())),
+        }
+    }
+
+    /// Forwards a job lock-extension (timeout) to the peer owning the job.
+    async fn forward_update_job_timeout(
+        &self,
+        node: u32,
+        job_key: u64,
+        timeout: u64,
+    ) -> Result<(), (u16, String)> {
+        let link = self.peer_link(node).await?;
+        match link.update_job_timeout(job_key.to_string(), timeout).await {
+            Ok(r) if is_ok_status(r.status) => Ok(()),
+            Ok(r) if r.status == 404 => Err((404, peer_detail(&r))),
+            Ok(r) if r.status == 409 => Err((409, peer_detail(&r))),
+            Ok(r) if r.status == 400 => Err((400, peer_detail(&r))),
+            Ok(r) => Err((500, peer_detail(&r))),
+            Err(e) => Err((502, e.to_string())),
         }
     }
 

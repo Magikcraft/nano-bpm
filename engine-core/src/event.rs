@@ -304,6 +304,16 @@ pub enum Event {
         retries: i32,
     },
 
+    /// A job's activation lock was extended: its `deadline` was reset to a later
+    /// logical instant while it stayed `Activated` (e.g. a worker holding a
+    /// long-running job open). Does not change job state; the holder keeps the
+    /// lock until this new `deadline` passes.
+    JobTimeoutUpdated {
+        job_key: Key,
+        instance_key: Key,
+        deadline: u64,
+    },
+
     /// A user task was created for a `userTask` element; the token now rests
     /// until the task is completed. `created_at` is the logical instant it was
     /// created, carried on the event so replay reconstructs the same timestamp.
@@ -854,6 +864,7 @@ impl Event {
             | Event::JobErrorThrown { instance_key, .. }
             | Event::JobCompleted { instance_key, .. }
             | Event::JobRetriesUpdated { instance_key, .. }
+            | Event::JobTimeoutUpdated { instance_key, .. }
             | Event::UserTaskCreated { instance_key, .. }
             | Event::UserTaskAssigned { instance_key, .. }
             | Event::UserTaskUpdated { instance_key, .. }
@@ -998,7 +1009,8 @@ impl Event {
             | Event::JobErrorThrown { job_key, .. }
             | Event::JobCompleted { job_key, .. }
             | Event::JobCanceled { job_key, .. }
-            | Event::JobRetriesUpdated { job_key, .. } => m = m.max(*job_key),
+            | Event::JobRetriesUpdated { job_key, .. }
+            | Event::JobTimeoutUpdated { job_key, .. } => m = m.max(*job_key),
             Event::IncidentRaised {
                 incident_key,
                 element_instance_key,

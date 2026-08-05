@@ -1767,6 +1767,29 @@ impl Engine {
                 );
             }
 
+            Command::UpdateJobTimeout { job_key, timeout } => {
+                let job = self
+                    .state
+                    .jobs
+                    .get(&job_key)
+                    .ok_or(EngineError::JobNotFound { job_key })?;
+                // Only a currently-locked (Activated) job has a lock to extend.
+                // A Created/terminal job has no active deadline to reset.
+                if job.state != state::JobState::Activated {
+                    return Err(EngineError::JobNotActive { job_key });
+                }
+                let instance_key = job.instance_key;
+                let deadline = now.saturating_add(timeout);
+                self.emit(
+                    &mut log,
+                    Event::JobTimeoutUpdated {
+                        job_key,
+                        instance_key,
+                        deadline,
+                    },
+                );
+            }
+
             Command::ResolveIncident {
                 incident_key,
                 operation_reference,

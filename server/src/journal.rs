@@ -1372,7 +1372,8 @@ impl Journal {
             Command::CompleteJob { job_key, .. }
             | Command::FailJob { job_key, .. }
             | Command::ThrowJobError { job_key, .. }
-            | Command::UpdateJobRetries { job_key, .. } => {
+            | Command::UpdateJobRetries { job_key, .. }
+            | Command::UpdateJobTimeout { job_key, .. } => {
                 targets.extend(cold.index.instance_for_job(*job_key));
             }
             Command::AssignUserTask { user_task_key, .. }

@@ -736,6 +736,23 @@ impl PeerLink {
         .await
     }
 
+    /// Forwards a job lock-extension (timeout) to the peer that owns the job's
+    /// partition.
+    pub async fn update_job_timeout(
+        &self,
+        job_key: String,
+        timeout: u64,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::UpdateJobTimeout {
+                corr,
+                job_key,
+                timeout,
+            }
+        })
+        .await
+    }
+
     /// Forwards an incident resolution to the peer that owns the incident.
     pub async fn resolve_incident(
         &self,

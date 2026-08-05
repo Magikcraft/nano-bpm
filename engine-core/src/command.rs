@@ -132,6 +132,13 @@ pub enum Command {
     /// no-retries incident before resolving that incident. Does not by itself
     /// unblock the job — the incident must still be resolved.
     UpdateJobRetries { job_key: Key, retries: i32 },
+    /// Extend the activation lock of a currently-activated job, resetting its
+    /// `deadline` to `now + timeout`. This is the worker-side mechanism for
+    /// legitimately holding a long-running job open past its original lock:
+    /// without it the lock simply expires (`JobLockExpired`) and the job is
+    /// re-activated elsewhere. Only meaningful for an `Activated` job — a job
+    /// that is not currently locked returns `JobNotActive`.
+    UpdateJobTimeout { job_key: Key, timeout: u64 },
     /// Resolve an open incident by retrying the work that failed. A job-incident
     /// returns the parked job (which must have retries left) to the activatable
     /// pool; an exclusive-gateway incident re-evaluates the gateway against the
@@ -327,6 +334,7 @@ impl Command {
             Command::FailJob { .. } => "fail_job",
             Command::ThrowJobError { .. } => "throw_job_error",
             Command::UpdateJobRetries { .. } => "update_job_retries",
+            Command::UpdateJobTimeout { .. } => "update_job_timeout",
             Command::ResolveIncident { .. } => "resolve_incident",
             Command::SetVariables { .. } => "set_variables",
             Command::CorrelateMessage { .. } => "correlate_message",
@@ -535,6 +543,11 @@ impl Command {
     /// Convenience constructor for an `UpdateJobRetries`.
     pub fn update_job_retries(job_key: Key, retries: i32) -> Self {
         Command::UpdateJobRetries { job_key, retries }
+    }
+
+    /// Convenience constructor for an `UpdateJobTimeout`.
+    pub fn update_job_timeout(job_key: Key, timeout: u64) -> Self {
+        Command::UpdateJobTimeout { job_key, timeout }
     }
 
     /// Convenience constructor for a `ResolveIncident` with no operation

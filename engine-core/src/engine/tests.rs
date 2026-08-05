@@ -4187,6 +4187,74 @@ fn should_lock_an_activated_job_until_its_deadline() {
 }
 
 #[test]
+fn should_extend_a_job_lock_past_its_original_deadline() {
+    // given worker A activated the job at t=0 for 1000ms (deadline=1000)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+    assert_eq!(engine.job(job_key).unwrap().deadline, Some(1_000));
+
+    // when A extends the lock by 5000ms at t=800 (before the original deadline)
+    engine
+        .apply_command_at(Command::update_job_timeout(job_key, 5_000), 800)
+        .unwrap();
+
+    // then the deadline moved out to now + timeout = 5800
+    assert_eq!(engine.job(job_key).unwrap().deadline, Some(5_800));
+
+    // and the periodic expiry tick fired at the ORIGINAL deadline no longer
+    // reclaims the job, so another worker still cannot activate it
+    engine.expire_jobs(1_500);
+    assert!(engine
+        .activate_jobs("payment", "B", 10, 1_000, 1_500)
+        .is_empty());
+
+    // only once the EXTENDED deadline passes is the lock released and the job
+    // redelivered
+    engine.expire_jobs(5_900);
+    let reactivated = engine.activate_jobs("payment", "B", 10, 1_000, 5_900);
+    assert_eq!(reactivated.len(), 1);
+    assert_eq!(reactivated[0].key, job_key);
+}
+
+#[test]
+fn should_reject_a_lock_extension_once_the_lock_has_expired() {
+    // given a job whose activation lock has expired (back in the pool, Created)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(linear_with_task()))
+        .unwrap();
+    engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let job_key = engine.activate_jobs("payment", "A", 10, 1_000, 0)[0].key;
+    engine.expire_jobs(1_500);
+
+    // when its (now non-existent) lock is extended
+    let err = engine
+        .apply_command_at(Command::update_job_timeout(job_key, 5_000), 1_600)
+        .unwrap_err();
+
+    // then it is a wrong-state error, not a silent success — a job must be
+    // activated to have a lock to extend
+    assert_eq!(err, EngineError::JobNotActive { job_key });
+}
+
+#[test]
+fn should_reject_a_lock_extension_for_an_unknown_job() {
+    let mut engine = Engine::new();
+    let err = engine
+        .apply_command(Command::update_job_timeout(999, 5_000))
+        .unwrap_err();
+    assert_eq!(err, EngineError::JobNotFound { job_key: 999 });
+}
+
+#[test]
 fn should_let_a_previous_worker_complete_after_re_activation() {
     // given worker A activated the job, then its lock expired and worker B
     // re-activated it (e.g. A's work outran the activation window)
