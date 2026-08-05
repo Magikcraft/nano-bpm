@@ -3797,6 +3797,40 @@ pub struct ProjectSummary {
     /// the built-in scaffold).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scaffolded_from: Option<ScaffoldedFrom>,
+    /// True when the project was scaffolded from a pack whose currently
+    /// installed version differs from the recorded `scaffolded_from.version`
+    /// — a newer template is available to overlay via `update_from_template`.
+    /// Offline signal (installed pack vs breadcrumb); false for built-ins.
+    pub update_available: bool,
+    /// The installed pack's version, when it differs from the recorded
+    /// scaffold version (the update target). Absent when up to date.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+}
+
+/// Compare a project's recorded scaffold version against the currently
+/// installed pack version to decide whether a template update is available.
+/// Offline and best-effort: an unknown installed version (built-in pack, or
+/// `package.json` unreadable) yields no update. Returns `(update_available,
+/// latest_version)` where `latest_version` is `Some` only when it differs.
+/// `installed_versions` is the `pack_id → version` map computed once per
+/// [`list_projects`] pass (see [`extensions::installed_pack_versions`]) so a
+/// listing doesn't rescan the pack store once per project.
+fn compute_update_available(
+    sf: Option<&ScaffoldedFrom>,
+    installed_versions: &std::collections::HashMap<String, String>,
+) -> (bool, Option<String>) {
+    let Some(sf) = sf else {
+        return (false, None);
+    };
+    let Some(installed) = installed_versions.get(&sf.pack) else {
+        return (false, None);
+    };
+    if sf.version.as_deref() == Some(installed.as_str()) {
+        (false, None)
+    } else {
+        (true, Some(installed.clone()))
+    }
 }
 
 fn count_ext(dir: &Path, ext: &str) -> usize {
@@ -3819,6 +3853,11 @@ fn count_dirs(dir: &Path) -> usize {
 /// left `false` here; the handler fills it from the supervisor.
 pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
     let root = ensure_projects_root()?;
+    // One scan of the pack store for the whole listing: `compute_update_available`
+    // is called once per project (workspace + reference), so resolving each
+    // pack's installed version from this shared map keeps the refresh
+    // O(projects + packs) instead of re-scanning the store per project.
+    let installed_versions = super::extensions::installed_pack_versions();
     let mut out = Vec::new();
     for entry in std::fs::read_dir(&root)?.flatten() {
         let path = entry.path();
@@ -3833,6 +3872,8 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
         }
         let cfg = read_config(name).unwrap_or_else(|| ProjectConfig::new(name, ""));
         let res = path.join("resources");
+        let (update_available, latest_version) =
+            compute_update_available(cfg.scaffolded_from.as_ref(), &installed_versions);
         out.push(ProjectSummary {
             name: name.to_string(),
             display_name: cfg.display_name,
@@ -3848,6 +3889,8 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
             lang: cfg.lang,
             template: cfg.template,
             scaffolded_from: cfg.scaffolded_from,
+            update_available,
+            latest_version,
         });
     }
     // Imported-by-reference projects (ADR 0041): `<name>.project-ref.json` files
@@ -3896,11 +3939,15 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
                 lang: "deno".to_string(),
                 template: None,
                 scaffolded_from: None,
+                update_available: false,
+                latest_version: None,
             });
             continue;
         }
         let cfg = read_config(name).unwrap_or_else(|| ProjectConfig::new(name, ""));
         let res = dir.join("resources");
+        let (update_available, latest_version) =
+            compute_update_available(cfg.scaffolded_from.as_ref(), &installed_versions);
         out.push(ProjectSummary {
             name: name.to_string(),
             // Prefer the spelling the operator typed at import time (kept on the
@@ -3922,6 +3969,8 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
             lang: cfg.lang,
             template: cfg.template,
             scaffolded_from: cfg.scaffolded_from,
+            update_available,
+            latest_version,
         });
     }
     out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then(a.name.cmp(&b.name)));
@@ -3929,8 +3978,653 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
 }
 
 // ---------------------------------------------------------------------------
-// File tree
+// Update from template (issue #573)
 // ---------------------------------------------------------------------------
+
+/// The overlay plan for updating a project from a newer version of its
+/// scaffolding pack. All buckets are project-relative POSIX-ish paths.
+#[derive(Serialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePlan {
+    /// The scaffolding pack id (`scaffolded_from.pack`).
+    pub pack: String,
+    /// The project's recorded scaffold version (the 3-way merge base).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
+    /// The version being overlaid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    /// False for a dry run; true when the plan was written.
+    pub applied: bool,
+    /// True when `scaffolded_from.version` was advanced (clean apply only).
+    pub version_bumped: bool,
+    /// New files the pack adds.
+    pub create: Vec<String>,
+    /// Files the pack changed that the user had not modified (safe overwrite).
+    pub overwrite: Vec<String>,
+    /// Files 3-way auto-merged (upstream + local edits, no overlap).
+    pub merged: Vec<String>,
+    /// Files/dirs kept as-is (datasource DB, nano-generated/, .git/, …).
+    pub preserved: Vec<String>,
+    /// Files where upstream and local both changed and could not be
+    /// auto-merged — NOT written; surfaced for manual resolution.
+    pub conflicts: Vec<String>,
+    /// Files present locally but absent from the new pack — kept, listed.
+    pub orphans: Vec<String>,
+}
+
+/// Directory names (any depth) whose entire subtree is preserved across an
+/// update: local VCS/deps and derived/generated state the pack must never
+/// clobber.
+const UPDATE_PRESERVE_DIRS: &[&str] = &[".git", "node_modules", "nano-generated", ".nano"];
+
+/// Whether a project-relative path lies inside a preserved subtree.
+fn is_preserved_path(rel: &Path) -> bool {
+    rel.components().any(|c| {
+        matches!(c, std::path::Component::Normal(os)
+            if UPDATE_PRESERVE_DIRS.iter().any(|d| os == *d))
+    })
+}
+
+/// Resolve `${VAR}` / `${VAR:-default}` env templates against the process
+/// environment, mirroring `data-sdk.ts` `resolveEnvTemplate` so a manifest URL
+/// like `${NANO_APP_DB_URL:-file:./app.db}` resolves the same way the runtime
+/// resolves it. Unknown or empty vars fall back to the `:-default` (or "").
+fn resolve_env_template(tpl: &str) -> String {
+    let mut out = String::new();
+    let mut rest = tpl;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        if let Some(end) = after.find('}') {
+            let inner = &after[..end];
+            let (name, dflt) = match inner.split_once(":-") {
+                Some((n, d)) => (n, Some(d)),
+                None => (inner, None),
+            };
+            let val = std::env::var(name).ok().filter(|s| !s.is_empty());
+            out.push_str(&val.unwrap_or_else(|| dflt.unwrap_or("").to_string()));
+            rest = &after[end + 1..];
+        } else {
+            out.push_str("${");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Extract the in-tree, project-relative sqlite filename from a datasource `url`
+/// (mirrors `data-sdk.ts` `sqlitePath`). Returns `None` for `:memory:`, an
+/// absolute path, or a `..`-escaping path — none of which name a file inside the
+/// project tree that the overlay could clobber.
+fn in_tree_sqlite_rel(url: &str) -> Option<String> {
+    let mut raw = url.strip_prefix("file:").unwrap_or(url);
+    while let Some(r) = raw.strip_prefix("./") {
+        raw = r;
+    }
+    if raw.is_empty() || raw == ":memory:" {
+        return None;
+    }
+    let p = Path::new(raw);
+    if p.is_absolute()
+        || p.components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    Some(raw.to_string())
+}
+
+/// In-tree relative sqlite files declared by the project's `nano.app.json`
+/// datasources (ADR 0027). Each source's (env-templated) `url` is resolved the
+/// same way the runtime does before deciding whether it names an in-tree file.
+fn manifest_sqlite_rels(dir: &Path) -> Vec<String> {
+    let Ok(txt) = std::fs::read_to_string(dir.join("nano.app.json")) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    if let Some(sources) = v
+        .get("data")
+        .and_then(|d| d.get("sources"))
+        .and_then(|s| s.as_object())
+    {
+        for src in sources.values() {
+            let Some(url) = src.get("url").and_then(|u| u.as_str()) else {
+                continue;
+            };
+            if let Some(rel) = in_tree_sqlite_rel(&resolve_env_template(url)) {
+                out.push(rel);
+            }
+        }
+    }
+    out
+}
+
+/// The datasource sqlite file(s) (+ WAL/SHM sidecars) to preserve across an
+/// update. The default in-tree `app.db` is *always* preserved as a baseline so
+/// the update never clobbers the project's sqlite DB — even when
+/// `NANO_APP_DB_URL` is unset or points somewhere non-relative. In addition, a
+/// validated in-tree relative target from `NANO_APP_DB_URL` is preserved when
+/// present, as is any in-tree sqlite datasource declared in the project's
+/// `nano.app.json` manifest (ADR 0027). Absolute or `..`-escaping targets are
+/// ignored (nothing extra to preserve in-tree).
+fn datasource_preserve_files(dir: &Path) -> Vec<String> {
+    fn push_triplet(out: &mut Vec<String>, base: &str) {
+        for f in [
+            base.to_string(),
+            format!("{base}-wal"),
+            format!("{base}-shm"),
+        ] {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
+    }
+
+    // Baseline: always protect the conventional in-tree sqlite DB.
+    let mut out: Vec<String> = Vec::new();
+    push_triplet(&mut out, "app.db");
+
+    // Additionally protect a validated, in-tree relative `NANO_APP_DB_URL`.
+    let url = std::env::var("NANO_APP_DB_URL").unwrap_or_else(|_| "file:./app.db".to_string());
+    if let Some(rel) = in_tree_sqlite_rel(&url) {
+        push_triplet(&mut out, &rel);
+    }
+
+    // …and any in-tree sqlite datasource the manifest declares.
+    for rel in manifest_sqlite_rels(dir) {
+        push_triplet(&mut out, &rel);
+    }
+    out
+}
+
+/// Whether the byte content looks like text (no NUL in the first 8 KiB), so a
+/// 3-way `git merge-file` is meaningful. Binary files fall back to whole-file
+/// conflict handling.
+fn looks_textual(bytes: &[u8]) -> bool {
+    !bytes.iter().take(8192).any(|&b| b == 0)
+}
+
+/// Attempt a 3-way text merge of `current`+`new` over `base` using
+/// `git merge-file -p` (stdin-free, temp-file based). Returns `Some(merged)`
+/// on a clean auto-merge, `None` on conflict or when git/text preconditions
+/// aren't met. Never writes into the project.
+fn try_git_merge(base: &[u8], current: &[u8], new: &[u8]) -> Option<Vec<u8>> {
+    if !(looks_textual(base) && looks_textual(current) && looks_textual(new)) {
+        return None;
+    }
+    let git = super::extensions::find_program("git")?;
+    // Securely create a unique temp dir (exclusive `create_dir` + OS-seeded
+    // random name) instead of a predictable `temp_dir().join(pid-nanos)`, which
+    // was vulnerable to pre-creation/symlink tricks and same-nanosecond
+    // collisions on shared hosts.
+    let tmp = super::extensions::secure_temp_dir("nano-merge").ok()?;
+    let cur_p = tmp.join("current");
+    let base_p = tmp.join("base");
+    let new_p = tmp.join("new");
+    let write_ok = std::fs::write(&cur_p, current).is_ok()
+        && std::fs::write(&base_p, base).is_ok()
+        && std::fs::write(&new_p, new).is_ok();
+    let result = if write_ok {
+        std::process::Command::new(&git)
+            .args(["merge-file", "-p"])
+            .arg(&cur_p)
+            .arg(&base_p)
+            .arg(&new_p)
+            .output()
+            .ok()
+            .and_then(|out| {
+                // git merge-file exits 0 on clean merge, >0 = conflict count.
+                out.status.success().then_some(out.stdout)
+            })
+    } else {
+        None
+    };
+    let _ = std::fs::remove_dir_all(&tmp);
+    result
+}
+
+/// Recursively collect every file under `root` as a project-relative path.
+/// Preserved subtrees (`UPDATE_PRESERVE_DIRS`: `.git`, `node_modules`,
+/// `nano-generated`, `.nano`) are pruned during traversal — we never descend
+/// into them, since they are skipped by the overlay anyway and can be huge on
+/// real projects. The name of each pruned preserved directory is recorded in
+/// `pruned` (deduplicated) so callers can still report what was preserved.
+fn collect_rel_files(
+    root: &Path,
+    base: &Path,
+    out: &mut Vec<PathBuf>,
+    pruned: &mut BTreeSet<String>,
+) {
+    let Ok(rd) = std::fs::read_dir(base) else {
+        return;
+    };
+    for e in rd.flatten() {
+        // Use the `DirEntry`'s own file type (a plain `lstat`) rather than
+        // `Path::is_dir()`, which follows symlinks: a symlinked directory in
+        // the tree could otherwise let traversal escape `root` or spin on a
+        // cycle. Never recurse through a symlink. We still record a symlinked
+        // *entry* itself (relative) so `overlay_plan` surfaces it as a conflict
+        // instead of silently reading through it.
+        let Ok(ft) = e.file_type() else {
+            continue;
+        };
+        let p = e.path();
+        if ft.is_symlink() {
+            if let Ok(rel) = p.strip_prefix(root) {
+                out.push(rel.to_path_buf());
+            }
+            continue;
+        }
+        if ft.is_dir() {
+            if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && UPDATE_PRESERVE_DIRS.contains(&name)
+            {
+                pruned.insert(name.to_string());
+                continue;
+            }
+            collect_rel_files(root, &p, out, pruned);
+        } else if let Ok(rel) = p.strip_prefix(root) {
+            out.push(rel.to_path_buf());
+        }
+    }
+}
+
+/// Whether reading/writing `root/rel` stays inside `root` without traversing any
+/// symlink. Rejects a path whose components (or the target file itself) are
+/// symlinks, so a malicious/accidental symlink in the project tree or an
+/// extracted pack (e.g. `resources -> /etc`) can't make the overlay read or
+/// write outside `root`. Non-existent components are fine (they'll be created as
+/// real dirs/files on the destination side; on the source side a missing file is
+/// caught separately by the read).
+fn is_symlink_safe(root: &Path, rel: &Path) -> bool {
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(seg) => {
+                cur.push(seg);
+                if let Ok(md) = std::fs::symlink_metadata(&cur)
+                    && md.file_type().is_symlink()
+                {
+                    return false;
+                }
+            }
+            // `..`, `.`, root, or a prefix have no business in a pack-relative
+            // path — refuse rather than risk escaping the project root.
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Overlay a newer version of a project's scaffolding pack onto it, using the
+/// recorded scaffold version as a 3-way merge base so a user's edits to
+/// upstream-unchanged files survive and only genuine conflicts surface. See the
+/// `updateProjectFromTemplate` OpenAPI op for the contract. `apply=false` is a
+/// dry run (no writes). Returns the plan.
+pub fn update_from_template(
+    name: &str,
+    apply: bool,
+    version: Option<&str>,
+) -> Result<UpdatePlan, String> {
+    let dir = project_dir(name).ok_or_else(|| "not found".to_string())?;
+    if !dir.is_dir() {
+        return Err("not found".to_string());
+    }
+    // Import-by-reference projects (ADR 0041) own only their pointer file; their
+    // tree lives in an external checkout the console must never mutate. A pure
+    // reference has no workspace directory but a `.project-ref.json`, so `dir`
+    // above resolves to the external path — refuse to overlay a template onto it
+    // (mirrors the delete/rename guards).
+    if !projects_root().join(name).is_dir() && read_project_ref(name).is_some() {
+        return Err("cannot update an imported-by-reference project from a template".to_string());
+    }
+    let mut cfg = read_config(name).ok_or_else(|| "not found".to_string())?;
+    let sf = cfg
+        .scaffolded_from
+        .clone()
+        .ok_or_else(|| "project was not scaffolded from a pack".to_string())?;
+    let template = cfg
+        .template
+        .clone()
+        .ok_or_else(|| "project has no recorded template".to_string())?;
+
+    // Resolve the "new" source tree + its version. Default: the currently
+    // installed pack on disk (the marketplace already updates the pack itself).
+    // An explicit, different `version` is fetched from npm into a temp dir.
+    let installed_version = super::extensions::pack_version(&sf.pack);
+    let want_version = version
+        .map(String::from)
+        .or_else(|| installed_version.clone());
+    let mut tmp_dirs: Vec<PathBuf> = Vec::new();
+    // Defined here (before the resolution match) so every error path that has
+    // already pushed an extracted temp dir into `tmp_dirs` can clean it up
+    // before bailing, rather than leaking it on disk.
+    let cleanup = |dirs: &[PathBuf]| {
+        for d in dirs {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    };
+    let new_src: PathBuf = match version {
+        Some(v) if Some(v.to_string()) != installed_version => {
+            let pkg = super::extensions::pack_npm_name(&sf.pack).ok_or_else(|| {
+                format!(
+                    "could not resolve an npm package name for pack '{}' (pack not installed, its package.json is missing/unreadable or has no name, or it is a built-in pack)",
+                    sf.pack
+                )
+            })?;
+            let root = super::extensions::pack_into_tmp(&format!("{pkg}@{v}"))?;
+            tmp_dirs.push(root.clone());
+            match super::extensions::template_dir_in_root(&root, &template) {
+                Some(d) => d,
+                None => {
+                    cleanup(&tmp_dirs);
+                    return Err(format!("template '{template}' not found in {pkg}@{v}"));
+                }
+            }
+        }
+        _ => {
+            // No explicit version: overlay the currently installed pack. But
+            // `template_source` resolves a *template id* against the FIRST
+            // installed pack that carries it — if two packs contribute the same
+            // template id it can land on a different upstream than the one this
+            // project was scaffolded from (`sf.pack`). Validate the resolved
+            // manifest id and fail closed rather than silently overlay the wrong
+            // pack.
+            let (m, d) = super::extensions::template_source(&template).ok_or_else(|| {
+                format!("pack '{}' / template '{template}' not installed", sf.pack)
+            })?;
+            if m.id != sf.pack {
+                return Err(format!(
+                    "template '{template}' resolves to pack '{}', but this project was scaffolded from '{}' — refusing to overlay a different upstream",
+                    m.id, sf.pack
+                ));
+            }
+            d
+        }
+    };
+
+    // Resolve the 3-way base: the recorded scaffold version fetched from npm.
+    // Best-effort — if unavailable, we degrade to a safe 2-way overlay.
+    let base_src: Option<PathBuf> = match (&sf.version, super::extensions::pack_npm_name(&sf.pack))
+    {
+        (Some(fromv), Some(pkg)) => {
+            match super::extensions::pack_into_tmp(&format!("{pkg}@{fromv}")) {
+                Ok(root) => {
+                    tmp_dirs.push(root.clone());
+                    super::extensions::template_dir_in_root(&root, &template)
+                }
+                Err(_) => None,
+            }
+        }
+        _ => None,
+    };
+
+    let plan = overlay_plan(
+        &dir,
+        &new_src,
+        base_src.as_deref(),
+        apply,
+        &sf.pack,
+        sf.version.clone(),
+        want_version.clone(),
+    );
+    let mut plan = match plan {
+        Ok(p) => p,
+        Err(e) => {
+            cleanup(&tmp_dirs);
+            return Err(e);
+        }
+    };
+
+    // Bump the recorded scaffold version only on a clean apply (no conflicts),
+    // preserving the old merge base for a later re-run when conflicts remain.
+    if apply
+        && plan.conflicts.is_empty()
+        && want_version.is_some()
+        && want_version != sf.version
+        && maybe_bump_scaffold_version(name, &mut cfg, want_version.clone())
+    {
+        plan.version_bumped = true;
+    }
+
+    cleanup(&tmp_dirs);
+    Ok(plan)
+}
+
+/// Write `to_version` into the project's `scaffolded_from.version` breadcrumb.
+/// Returns whether the config was updated (best-effort — a write failure leaves
+/// the old version so a later re-run still has the right merge base).
+fn maybe_bump_scaffold_version(
+    name: &str,
+    cfg: &mut ProjectConfig,
+    to_version: Option<String>,
+) -> bool {
+    if let Some(sfm) = cfg.scaffolded_from.as_mut() {
+        sfm.version = to_version;
+    } else {
+        return false;
+    }
+    write_config(name, cfg).is_ok()
+}
+
+/// The pure, directory-level overlay: classify every file in `new_src` against
+/// the project `dir` (and the optional 3-way `base_src`), writing the safe
+/// subset when `apply`. No npm/config side effects — the orchestrator
+/// [`update_from_template`] resolves the source dirs and handles the version
+/// bump. Factored out so the merge classification is unit-testable without a
+/// live registry.
+#[allow(clippy::too_many_arguments)]
+fn overlay_plan(
+    dir: &Path,
+    new_src: &Path,
+    base_src: Option<&Path>,
+    apply: bool,
+    pack: &str,
+    from_version: Option<String>,
+    to_version: Option<String>,
+) -> Result<UpdatePlan, String> {
+    let mut plan = UpdatePlan {
+        pack: pack.to_string(),
+        from_version,
+        to_version,
+        applied: apply,
+        ..Default::default()
+    };
+
+    // Track preserved subtree names we've already reported once (dir-level).
+    let mut preserved_seen: BTreeSet<String> = BTreeSet::new();
+    let ds_preserve: BTreeSet<String> = datasource_preserve_files(dir).into_iter().collect();
+
+    // Eagerly report any datasource-preserve file that already exists in the
+    // project, independent of whether the new pack ships one at that path. The
+    // per-file preserve checks below only push to `plan.preserved` while
+    // iterating the *new* pack's files, so a local `app.db` the pack doesn't
+    // ship (the common case) would be protected but silently omitted from the
+    // plan's "Preserved" bucket — contradicting the OpenAPI/`UpdatePlan`
+    // docstring. Guard by existence so we never claim to preserve a file that
+    // isn't actually there.
+    for rel_str in &ds_preserve {
+        if dir.join(rel_str).exists() && preserved_seen.insert(rel_str.clone()) {
+            plan.preserved.push(rel_str.clone());
+        }
+    }
+
+    // Walk the new source tree; classify each file. Preserved subtrees are
+    // pruned during traversal; report any the pack ships so the plan reflects
+    // that they were intentionally skipped.
+    let mut new_files: Vec<PathBuf> = Vec::new();
+    let mut new_pruned: BTreeSet<String> = BTreeSet::new();
+    collect_rel_files(new_src, new_src, &mut new_files, &mut new_pruned);
+    for name in new_pruned {
+        if preserved_seen.insert(name.clone()) {
+            plan.preserved.push(name);
+        }
+    }
+    new_files.sort();
+    let new_set: BTreeSet<PathBuf> = new_files.iter().cloned().collect();
+
+    for rel in &new_files {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if is_preserved_path(rel) {
+            if let Some(top) = rel.components().find_map(|c| match c {
+                std::path::Component::Normal(os)
+                    if UPDATE_PRESERVE_DIRS.iter().any(|d| os == *d) =>
+                {
+                    Some(os.to_string_lossy().to_string())
+                }
+                _ => None,
+            }) && preserved_seen.insert(top.clone())
+            {
+                plan.preserved.push(top);
+            }
+            continue;
+        }
+        if ds_preserve.contains(&rel_str) {
+            if preserved_seen.insert(rel_str.clone()) {
+                plan.preserved.push(rel_str.clone());
+            }
+            continue;
+        }
+        let src_path = new_src.join(rel);
+        let dst_path = dir.join(rel);
+        // Never read the source through a symlinked path component: an
+        // extracted pack could contain `x -> /etc/passwd` and we'd copy the
+        // host file's bytes into the project. Surface such an entry as a
+        // conflict (never read/write it automatically) — symmetric with the
+        // destination guard below.
+        if !is_symlink_safe(new_src, rel) {
+            plan.conflicts.push(rel_str.clone());
+            continue;
+        }
+        let new_bytes = match std::fs::read(&src_path) {
+            Ok(b) => b,
+            // An unreadable source file was silently dropped from the plan (and
+            // from apply) before — surface it as a conflict so it's visible and
+            // never written blind.
+            Err(_) => {
+                plan.conflicts.push(rel_str.clone());
+                continue;
+            }
+        };
+        // Never write through a symlinked path component — it could escape the
+        // project root. Surface as a conflict for the user to resolve by hand
+        // (applies to dry-run classification too, so the plan matches apply).
+        if !is_symlink_safe(dir, rel) {
+            plan.conflicts.push(rel_str.clone());
+            continue;
+        }
+        let cur_bytes = match std::fs::read(&dst_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist locally → new file.
+                plan.create.push(rel_str.clone());
+                if apply {
+                    if let Some(parent) = dst_path.parent() {
+                        std::fs::create_dir_all(parent)
+                            .map_err(|e| format!("mkdir {rel_str}: {e}"))?;
+                    }
+                    std::fs::write(&dst_path, &new_bytes)
+                        .map_err(|e| format!("write {rel_str}: {e}"))?;
+                }
+                continue;
+            }
+            Err(_) => {
+                // Unreadable for another reason (a directory in the way, a
+                // permission error, …) — don't guess it's new; treat as a
+                // conflict so apply never clobbers an unexpected local entry.
+                plan.conflicts.push(rel_str.clone());
+                continue;
+            }
+        };
+        if cur_bytes == new_bytes {
+            continue; // identical — nothing to do.
+        }
+        // 3-way classification when a base is available.
+        // Guard the base read the same way as the source/destination: a
+        // symlinked base entry (the base is an extracted npm tarball too) must
+        // never let the server read host files. An unsafe base path is treated
+        // as "no base available", falling back to conservative 2-way behavior.
+        let base_bytes = base_src.and_then(|b| {
+            if is_symlink_safe(b, rel) {
+                std::fs::read(b.join(rel)).ok()
+            } else {
+                None
+            }
+        });
+        match base_bytes {
+            Some(base) if cur_bytes == base => {
+                // User hadn't touched it → safe to take upstream's new version.
+                plan.overwrite.push(rel_str.clone());
+                if apply {
+                    std::fs::write(&dst_path, &new_bytes)
+                        .map_err(|e| format!("write {rel_str}: {e}"))?;
+                }
+            }
+            Some(base) if new_bytes == base => {
+                // Upstream unchanged since scaffold; user edited → keep local.
+            }
+            Some(base) => {
+                // Both sides changed — try a 3-way auto-merge, else conflict.
+                if let Some(merged) = try_git_merge(&base, &cur_bytes, &new_bytes) {
+                    plan.merged.push(rel_str.clone());
+                    if apply {
+                        std::fs::write(&dst_path, &merged)
+                            .map_err(|e| format!("write {rel_str}: {e}"))?;
+                    }
+                } else {
+                    plan.conflicts.push(rel_str.clone());
+                }
+            }
+            None => {
+                // No merge base (2-way): the file exists locally and differs —
+                // we can't prove the user didn't edit it, so never clobber.
+                plan.conflicts.push(rel_str.clone());
+            }
+        }
+    }
+
+    // Orphans: files present locally but absent from the new pack (kept).
+    // Preserved subtrees are pruned during traversal; report any that exist
+    // locally (e.g. `.git/`, `node_modules/`) so the plan's "Preserved" list
+    // reflects what the overlay intentionally left untouched.
+    let mut local_files: Vec<PathBuf> = Vec::new();
+    let mut local_pruned: BTreeSet<String> = BTreeSet::new();
+    collect_rel_files(dir, dir, &mut local_files, &mut local_pruned);
+    for name in local_pruned {
+        if preserved_seen.insert(name.clone()) {
+            plan.preserved.push(name);
+        }
+    }
+    for rel in local_files {
+        if is_preserved_path(&rel) {
+            continue;
+        }
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if ds_preserve.contains(&rel_str) {
+            continue;
+        }
+        // The project config/breadcrumb file is project-owned, not an orphan.
+        if rel_str == CONFIG_FILE {
+            continue;
+        }
+        if !new_set.contains(&rel) {
+            plan.orphans.push(rel_str);
+        }
+    }
+
+    plan.create.sort();
+    plan.overwrite.sort();
+    plan.merged.sort();
+    plan.preserved.sort();
+    plan.conflicts.sort();
+    plan.orphans.sort();
+    Ok(plan)
+}
 
 /// A node in the project file tree.
 #[derive(Serialize)]
@@ -10202,6 +10896,354 @@ mod tests {
         assert!(
             required_npm_deps(&dir).is_empty(),
             "a valid import-less deno.json must not fall through to deno.jsonc"
+        );
+    }
+
+    // ── update-from-template overlay / 3-way merge (issue #573) ────────────
+
+    /// Build a throwaway directory tree from `(relpath, contents)` pairs and
+    /// return its root. Cleaned up by the OS temp reaper; each call is unique.
+    fn tree(files: &[(&str, &str)]) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "nano-overlay-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, AOrd::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        for (rel, body) in files {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, body).unwrap();
+        }
+        root
+    }
+
+    fn read(dir: &Path, rel: &str) -> String {
+        std::fs::read_to_string(dir.join(rel)).unwrap()
+    }
+
+    #[test]
+    fn compute_update_available_compares_recorded_vs_installed() {
+        let _g = lock();
+        let root = temp_root();
+        let ext = root.join("ext-store");
+        let pack = ext.join("nanobpm__app-x");
+        std::fs::create_dir_all(&pack).unwrap();
+        std::fs::write(
+            pack.join("nano-ide.ext.json"),
+            r#"{"id":"appx","kind":"app","displayName":"X"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pack.join("package.json"),
+            r#"{"name":"@nanobpm/app-x","version":"2.0.0"}"#,
+        )
+        .unwrap();
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &ext) };
+        let versions = crate::console::extensions::installed_pack_versions();
+
+        // No scaffold breadcrumb → never an update.
+        assert_eq!(compute_update_available(None, &versions), (false, None));
+
+        // Recorded == installed → up to date.
+        let same = ScaffoldedFrom {
+            pack: "appx".into(),
+            version: Some("2.0.0".into()),
+        };
+        assert_eq!(
+            compute_update_available(Some(&same), &versions),
+            (false, None)
+        );
+
+        // Recorded older → update available, surfacing the installed version.
+        let older = ScaffoldedFrom {
+            pack: "appx".into(),
+            version: Some("1.0.0".into()),
+        };
+        assert_eq!(
+            compute_update_available(Some(&older), &versions),
+            (true, Some("2.0.0".into()))
+        );
+
+        // Unknown installed version (built-in / unreadable) → no update.
+        let missing = ScaffoldedFrom {
+            pack: "nope".into(),
+            version: Some("1.0.0".into()),
+        };
+        assert_eq!(
+            compute_update_available(Some(&missing), &versions),
+            (false, None)
+        );
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    #[test]
+    fn overlay_plan_dry_run_classifies_without_writing() {
+        let _g = lock();
+        // Ensure a deterministic datasource-preserve target.
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        let proj = tree(&[
+            ("main.ts", "old\n"),        // upstream will change, user untouched
+            ("keep.ts", "user local\n"), // user-only file (orphan)
+            ("app.db", "SQLITEDATA"),    // datasource — preserved
+            (".git/config", "[core]\n"), // vcs — preserved subtree
+        ]);
+        let base = tree(&[("main.ts", "old\n")]);
+        let new = tree(&[
+            ("main.ts", "new upstream\n"),
+            ("added.ts", "brand new\n"),
+            ("app.db", "PACKDEFAULT"), // pack ships a stub DB — must be preserved
+            ("nano-generated/gen.ts", "x"), // generated subtree — preserved
+        ]);
+
+        let plan = overlay_plan(
+            &proj,
+            &new,
+            Some(base.as_path()),
+            false,
+            "appx",
+            Some("1.0.0".into()),
+            Some("2.0.0".into()),
+        )
+        .unwrap();
+
+        assert_eq!(plan.create, vec!["added.ts"]);
+        assert_eq!(plan.overwrite, vec!["main.ts"]);
+        assert!(plan.merged.is_empty());
+        assert!(plan.conflicts.is_empty());
+        assert!(plan.preserved.contains(&"nano-generated".to_string()));
+        assert!(plan.preserved.contains(&"app.db".to_string()));
+        assert_eq!(plan.orphans, vec!["keep.ts"]);
+        assert!(!plan.applied && !plan.version_bumped);
+
+        // Dry run must not touch the filesystem.
+        assert_eq!(read(&proj, "main.ts"), "old\n");
+        assert!(!proj.join("added.ts").exists());
+        assert_eq!(read(&proj, "app.db"), "SQLITEDATA");
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_plan_refuses_write_through_symlinked_component() {
+        let _g = lock();
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        // A malicious/accidental symlink inside the project points outside it.
+        let outside = tree(&[("secret.txt", "DO NOT TOUCH\n")]);
+        let proj = tree(&[("keep.ts", "x\n")]);
+        std::os::unix::fs::symlink(&outside, proj.join("resources")).unwrap();
+        // The pack tries to write through the symlinked `resources/` dir.
+        let new = tree(&[("resources/secret.txt", "clobbered\n")]);
+
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+
+        // Fail closed: surfaced as a conflict, and the outside file is intact.
+        assert_eq!(plan.conflicts, vec!["resources/secret.txt"]);
+        assert!(plan.create.is_empty() && plan.overwrite.is_empty());
+        assert_eq!(read(&outside, "secret.txt"), "DO NOT TOUCH\n");
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_plan_refuses_to_read_through_symlinked_source() {
+        let _g = lock();
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        // A host file the extracted pack must never be able to exfiltrate.
+        let outside = tree(&[("passwd", "HOSTSECRET\n")]);
+        let proj = tree(&[("keep.ts", "x\n")]);
+        // The pack ships a symlink `leak -> <outside>/passwd`. Traversal must
+        // not follow it, and overlay must surface it as a conflict rather than
+        // copying the host file's bytes into the project.
+        let new = tree(&[("real.ts", "hi\n")]);
+        std::os::unix::fs::symlink(outside.join("passwd"), new.join("leak")).unwrap();
+
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+
+        assert!(
+            plan.conflicts.contains(&"leak".to_string()),
+            "symlinked source entry surfaced as conflict: {:?}",
+            plan.conflicts
+        );
+        assert_eq!(plan.create, vec!["real.ts"]);
+        // Never wrote the symlink target's bytes into the project.
+        assert!(!proj.join("leak").exists());
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[test]
+    fn overlay_plan_preserves_manifest_declared_datasource() {
+        let _g = lock();
+        // Env points at the default; the manifest declares a *different*,
+        // non-default in-tree sqlite file that must also be preserved.
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        let manifest = r#"{"data":{"default":"app","sources":{"app":{"driver":"sqlite","url":"file:./db/data.sqlite"}}}}"#;
+        let proj = tree(&[("nano.app.json", manifest), ("db/data.sqlite", "LOCALDB")]);
+        let new = tree(&[
+            ("nano.app.json", manifest),
+            ("db/data.sqlite", "PACKDB"), // pack ships a stub — must be skipped
+        ]);
+
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+
+        assert!(
+            plan.preserved.contains(&"db/data.sqlite".to_string()),
+            "manifest-declared datasource is preserved: {:?}",
+            plan.preserved
+        );
+        assert!(plan.overwrite.is_empty() && plan.conflicts.is_empty());
+        // The user's DB content survives untouched.
+        assert_eq!(read(&proj, "db/data.sqlite"), "LOCALDB");
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[test]
+    fn overlay_plan_preserves_local_datasource_when_pack_omits_it() {
+        let _g = lock();
+        // The common case: the project has a live sqlite DB but the new pack
+        // does NOT ship a stub at that path. The DB is still protected (never
+        // an orphan, never overwritten) and the plan must report it as
+        // preserved so the "Preserved" bucket matches reality.
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        let proj = tree(&[("main.ts", "old\n"), ("app.db", "LIVEDATA")]);
+        let new = tree(&[("main.ts", "old\n")]); // no app.db shipped
+
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+
+        assert!(
+            plan.preserved.contains(&"app.db".to_string()),
+            "local datasource preserved even when the pack omits it: {:?}",
+            plan.preserved
+        );
+        // It must not be treated as an orphan or clobbered.
+        assert!(!plan.orphans.contains(&"app.db".to_string()));
+        assert!(plan.overwrite.is_empty() && plan.conflicts.is_empty());
+        assert_eq!(read(&proj, "app.db"), "LIVEDATA");
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[test]
+    fn overlay_plan_three_way_keeps_user_edit_when_upstream_unchanged() {
+        let _g = lock();
+        let base = tree(&[("main.ts", "line1\nline2\n")]);
+        // User edited the file; upstream (new) is identical to base.
+        let proj = tree(&[("main.ts", "line1\nMINE\n")]);
+        let new = tree(&[("main.ts", "line1\nline2\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        assert!(plan.overwrite.is_empty() && plan.conflicts.is_empty() && plan.merged.is_empty());
+        // The user's edit survives verbatim.
+        assert_eq!(read(&proj, "main.ts"), "line1\nMINE\n");
+    }
+
+    #[test]
+    fn overlay_plan_three_way_auto_merges_disjoint_edits() {
+        let _g = lock();
+        let base = tree(&[("f.txt", "a\nb\nc\nd\ne\n")]);
+        // User changed the top; upstream changed the bottom → non-overlapping.
+        let proj = tree(&[("f.txt", "AAA\nb\nc\nd\ne\n")]);
+        let new = tree(&[("f.txt", "a\nb\nc\nd\nEEE\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        assert_eq!(plan.merged, vec!["f.txt"], "disjoint edits auto-merge");
+        assert!(plan.conflicts.is_empty());
+        let merged = read(&proj, "f.txt");
+        assert!(merged.contains("AAA") && merged.contains("EEE"));
+    }
+
+    #[test]
+    fn overlay_plan_three_way_surfaces_a_real_conflict_and_does_not_clobber() {
+        let _g = lock();
+        let base = tree(&[("f.txt", "shared\n")]);
+        // Both sides changed the same line → conflict.
+        let proj = tree(&[("f.txt", "user version\n")]);
+        let new = tree(&[("f.txt", "upstream version\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        assert_eq!(plan.conflicts, vec!["f.txt"]);
+        assert!(plan.overwrite.is_empty() && plan.merged.is_empty());
+        // The user's file is left untouched on a conflict.
+        assert_eq!(read(&proj, "f.txt"), "user version\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn overlay_plan_ignores_symlinked_base_entry() {
+        let _g = lock();
+        // A host file the extracted *base* pack must never be able to read.
+        let outside = tree(&[("secret", "upstream version\n")]);
+        // The base ships `f.txt` as a symlink to the host file. If the server
+        // followed it, `base_bytes` would equal `new` and the 3-way logic would
+        // silently keep the local edit (no conflict) — masking a host-file read.
+        let base = tree(&[("keep", "x\n")]);
+        std::os::unix::fs::symlink(outside.join("secret"), base.join("f.txt")).unwrap();
+        let proj = tree(&[("f.txt", "user version\n")]);
+        let new = tree(&[("f.txt", "upstream version\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        // With the base treated as unavailable, we fall back to conservative
+        // 2-way: an existing, differing file is a conflict, never touched.
+        assert_eq!(plan.conflicts, vec!["f.txt"]);
+        assert!(plan.overwrite.is_empty() && plan.merged.is_empty());
+        assert_eq!(read(&proj, "f.txt"), "user version\n");
+    }
+
+    #[test]
+    fn overlay_plan_without_base_treats_any_local_change_as_conflict() {
+        let _g = lock();
+        // No merge base (couldn't fetch the scaffold version) → safe 2-way:
+        // an existing, differing file is a conflict, never a silent overwrite.
+        let proj = tree(&[("f.txt", "local\n"), ("same.txt", "x\n")]);
+        let new = tree(&[
+            ("f.txt", "upstream\n"),
+            ("same.txt", "x\n"),
+            ("n.txt", "new\n"),
+        ]);
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+        assert_eq!(plan.conflicts, vec!["f.txt"]);
+        assert_eq!(plan.create, vec!["n.txt"]);
+        assert_eq!(read(&proj, "f.txt"), "local\n");
+        assert_eq!(read(&proj, "n.txt"), "new\n");
+    }
+
+    #[test]
+    fn overlay_plan_apply_writes_create_and_overwrite() {
+        let _g = lock();
+        let base = tree(&[("a.txt", "1\n")]);
+        let proj = tree(&[("a.txt", "1\n")]);
+        let new = tree(&[("a.txt", "2\n"), ("sub/b.txt", "hi\n")]);
+        let plan = overlay_plan(&proj, &new, Some(base.as_path()), true, "p", None, None).unwrap();
+        assert_eq!(plan.overwrite, vec!["a.txt"]);
+        assert_eq!(plan.create, vec!["sub/b.txt"]);
+        assert_eq!(read(&proj, "a.txt"), "2\n");
+        assert_eq!(read(&proj, "sub/b.txt"), "hi\n");
+    }
+
+    #[test]
+    fn maybe_bump_scaffold_version_persists_only_with_a_breadcrumb() {
+        let _g = lock();
+        let root = temp_root();
+        std::fs::create_dir_all(root.join("proj")).unwrap();
+        let mut cfg = ProjectConfig::new("proj", "");
+        // No scaffolded_from → nothing to bump.
+        assert!(!maybe_bump_scaffold_version(
+            "proj",
+            &mut cfg,
+            Some("2.0.0".into())
+        ));
+
+        cfg.scaffolded_from = Some(ScaffoldedFrom {
+            pack: "appx".into(),
+            version: Some("1.0.0".into()),
+        });
+        write_config("proj", &cfg).unwrap();
+        assert!(maybe_bump_scaffold_version(
+            "proj",
+            &mut cfg,
+            Some("2.0.0".into())
+        ));
+        let reread = read_config("proj").unwrap();
+        assert_eq!(
+            reread.scaffolded_from.and_then(|s| s.version),
+            Some("2.0.0".into())
         );
     }
 }

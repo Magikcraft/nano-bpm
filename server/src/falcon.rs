@@ -159,6 +159,11 @@ pub enum ClientFrame {
         /// completions so the frame is byte-unchanged on the hot path.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adhoc_result: Option<nanobpmn_engine_core::AdHocJobResult>,
+        /// Optional user-task-listener result (Camunda `JobResult` for user-task
+        /// jobs): a denial and/or corrections, forwarded to the owning peer.
+        /// `None`/skipped for ordinary completions (byte-unchanged hot path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        task_result: Option<nanobpmn_engine_core::TaskListenerJobResult>,
     },
     /// Fail an activated job (unmetered drain).
     #[serde(rename_all = "camelCase")]
@@ -178,6 +183,11 @@ pub enum ClientFrame {
         error_code: String,
         #[serde(default)]
         error_message: Option<String>,
+        /// Variables instantiated at the local scope of the error catch event
+        /// (Camunda `JobErrorRequest.variables`), forwarded to the owning peer.
+        /// `None`/skipped for a bare error-throw (byte-unchanged hot path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        variables: Option<Map<String, Value>>,
     },
     /// Re-subscribe to completion of an already-created instance. Used for
     /// recovery: a client that persisted the `processInstanceKey` from an earlier
@@ -263,6 +273,19 @@ pub enum ClientFrame {
         corr: u64,
         job_key: String,
         retries: i32,
+        #[serde(default)]
+        operation_reference: Option<i64>,
+    },
+    /// **Intra-cluster only.** A gateway forwards a by-key job lock-extension
+    /// (timeout) to the peer that owns the job's partition. Answered by a
+    /// `CommandResult`.
+    #[serde(rename_all = "camelCase")]
+    UpdateJobTimeout {
+        corr: u64,
+        job_key: String,
+        timeout: u64,
+        #[serde(default)]
+        operation_reference: Option<i64>,
     },
     /// **Intra-cluster only.** A gateway forwards a by-key incident resolution to
     /// the peer that owns the incident's partition. Answered by a `CommandResult`.
@@ -1357,6 +1380,7 @@ async fn handle_client_frame(
         ClientFrame::CancelInstance { .. } => "cancel_instance",
         ClientFrame::RouteSubscription { .. } => "route_subscription",
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
+        ClientFrame::UpdateJobTimeout { .. } => "update_job_timeout",
         ClientFrame::ResolveIncident { .. } => "resolve_incident",
         ClientFrame::SetVariables { .. } => "set_variables",
         ClientFrame::ActivateJobs { .. } => "activate_jobs",
@@ -1666,6 +1690,7 @@ async fn handle_client_frame(
             job_key,
             variables,
             adhoc_result,
+            task_result,
         } => {
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
@@ -1678,7 +1703,13 @@ async fn handle_client_frame(
                 let server = server.clone();
                 spawn_forward_stream_reply(conn, corr, async move {
                     let outcome = server
-                        .forward_complete_job_stream(node, key, variables, adhoc_result)
+                        .forward_complete_job_stream(
+                            node,
+                            key,
+                            variables,
+                            adhoc_result,
+                            task_result,
+                        )
                         .await;
                     crate::metrics::record_complete_outcome(if outcome.0 < 300 {
                         "forward_ok"
@@ -1696,7 +1727,7 @@ async fn handle_client_frame(
                         conn,
                         corr,
                         server
-                            .complete_job_for_stream(key, vars, adhoc_result)
+                            .complete_job_for_stream(key, vars, adhoc_result, task_result)
                             .await,
                     );
                 } else {
@@ -1707,7 +1738,7 @@ async fn handle_client_frame(
                     let conn = conn.clone();
                     tokio::spawn(async move {
                         let outcome = server
-                            .complete_job_for_stream(key, vars, adhoc_result)
+                            .complete_job_for_stream(key, vars, adhoc_result, task_result)
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });
@@ -1757,6 +1788,7 @@ async fn handle_client_frame(
             job_key,
             error_code,
             error_message,
+            variables,
         } => {
             let Some(key) = parse_job_key(conn, corr, &job_key) else {
                 return;
@@ -1767,14 +1799,15 @@ async fn handle_client_frame(
                 let error_message = error_message.clone().unwrap_or_default();
                 spawn_forward_stream_reply(conn, corr, async move {
                     server
-                        .forward_throw_error_stream(node, key, error_code, error_message)
+                        .forward_throw_error_stream(node, key, error_code, error_message, variables)
                         .await
                 });
             } else {
                 let error_message = error_message.unwrap_or_default();
+                let vars = to_engine_vars(variables);
                 if server.raft_registry().is_empty() {
                     let outcome = server
-                        .throw_error_for_stream(key, error_code, error_message)
+                        .throw_error_for_stream(key, error_code, error_message, vars)
                         .await;
                     pipeline_job_command(server, conn, corr, outcome);
                 } else {
@@ -1782,7 +1815,7 @@ async fn handle_client_frame(
                     let conn = conn.clone();
                     tokio::spawn(async move {
                         let outcome = server
-                            .throw_error_for_stream(key, error_code, error_message)
+                            .throw_error_for_stream(key, error_code, error_message, vars)
                             .await;
                         pipeline_job_command(&server, &conn, corr, outcome);
                     });
@@ -1896,9 +1929,25 @@ async fn handle_client_frame(
             corr,
             job_key,
             retries,
+            operation_reference,
         } => {
             forward_by_key_reply(conn, corr, &job_key, |key| async move {
-                server.update_job_retries_local(key, retries).await
+                server
+                    .update_job_retries_local(key, retries, operation_reference)
+                    .await
+            })
+            .await;
+        }
+        ClientFrame::UpdateJobTimeout {
+            corr,
+            job_key,
+            timeout,
+            operation_reference,
+        } => {
+            forward_by_key_reply(conn, corr, &job_key, |key| async move {
+                server
+                    .update_job_timeout_local(key, timeout, operation_reference)
+                    .await
             })
             .await;
         }

@@ -776,14 +776,11 @@ pub fn replay_instance_with_mocks(
                                 apply_and_fold(
                                     &mut engine,
                                     &mut produced,
-                                    Command::ThrowJobError {
+                                    Command::throw_job_error(
                                         job_key,
-                                        error_code: code.clone(),
-                                        error_message: mock_out
-                                            .error_message
-                                            .clone()
-                                            .unwrap_or_default(),
-                                    },
+                                        code.clone(),
+                                        mock_out.error_message.clone().unwrap_or_default(),
+                                    ),
                                     clock,
                                 );
                             } else {

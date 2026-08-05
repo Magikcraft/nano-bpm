@@ -1627,6 +1627,7 @@ impl Engine {
                 job_key,
                 error_code,
                 error_message,
+                variables,
             } => {
                 let job = self
                     .state
@@ -1708,6 +1709,20 @@ impl Engine {
                         for event in self.cancel_boundary_conditional_subscriptions_on(caught_eik) {
                             self.emit(&mut log, event);
                         }
+                        // Seed the thrown error's variables at the local scope of
+                        // the catch (the boundary event's scope), so the
+                        // error-handling path downstream can read them (Camunda
+                        // `JobErrorRequest.variables`).
+                        if !variables.is_empty() {
+                            for event in self.propagated_updates(
+                                instance_key,
+                                boundary_scope,
+                                variables,
+                                true,
+                            ) {
+                                self.emit(&mut log, event);
+                            }
+                        }
                         queue.push_back(Step::Activate {
                             instance_key,
                             element_id: boundary_id,
@@ -1739,7 +1754,11 @@ impl Engine {
                 }
             }
 
-            Command::UpdateJobRetries { job_key, retries } => {
+            Command::UpdateJobRetries {
+                job_key,
+                retries,
+                operation_reference,
+            } => {
                 let job = self
                     .state
                     .jobs
@@ -1763,6 +1782,35 @@ impl Engine {
                         job_key,
                         instance_key,
                         retries,
+                        operation_reference,
+                    },
+                );
+            }
+
+            Command::UpdateJobTimeout {
+                job_key,
+                timeout,
+                operation_reference,
+            } => {
+                let job = self
+                    .state
+                    .jobs
+                    .get(&job_key)
+                    .ok_or(EngineError::JobNotFound { job_key })?;
+                // Only a currently-locked (Activated) job has a lock to extend.
+                // A Created/terminal job has no active deadline to reset.
+                if job.state != state::JobState::Activated {
+                    return Err(EngineError::JobNotActive { job_key });
+                }
+                let instance_key = job.instance_key;
+                let deadline = now.saturating_add(timeout);
+                self.emit(
+                    &mut log,
+                    Event::JobTimeoutUpdated {
+                        job_key,
+                        instance_key,
+                        deadline,
+                        operation_reference,
                     },
                 );
             }

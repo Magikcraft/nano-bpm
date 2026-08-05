@@ -535,12 +535,14 @@ impl PeerLink {
         job_key: String,
         variables: Option<serde_json::Map<String, Value>>,
         adhoc_result: Option<nanobpmn_engine_core::AdHocJobResult>,
+        task_result: Option<nanobpmn_engine_core::TaskListenerJobResult>,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::CompleteJob {
             corr,
             job_key,
             variables,
             adhoc_result,
+            task_result,
         })
         .await
     }
@@ -689,12 +691,14 @@ impl PeerLink {
         job_key: String,
         error_code: String,
         error_message: String,
+        variables: Option<serde_json::Map<String, Value>>,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| ClientFrame::ThrowError {
             corr,
             job_key,
             error_code,
             error_message: Some(error_message),
+            variables,
         })
         .await
     }
@@ -725,12 +729,33 @@ impl PeerLink {
         &self,
         job_key: String,
         retries: i32,
+        operation_reference: Option<i64>,
     ) -> Result<PeerResult, PeerError> {
         self.request_within(fast_forward_timeout(), |corr| {
             ClientFrame::UpdateJobRetries {
                 corr,
                 job_key,
                 retries,
+                operation_reference,
+            }
+        })
+        .await
+    }
+
+    /// Forwards a job lock-extension (timeout) to the peer that owns the job's
+    /// partition.
+    pub async fn update_job_timeout(
+        &self,
+        job_key: String,
+        timeout: u64,
+        operation_reference: Option<i64>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::UpdateJobTimeout {
+                corr,
+                job_key,
+                timeout,
+                operation_reference,
             }
         })
         .await
