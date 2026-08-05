@@ -4440,6 +4440,20 @@ fn overlay_plan(
     let mut preserved_seen: BTreeSet<String> = BTreeSet::new();
     let ds_preserve: BTreeSet<String> = datasource_preserve_files(dir).into_iter().collect();
 
+    // Eagerly report any datasource-preserve file that already exists in the
+    // project, independent of whether the new pack ships one at that path. The
+    // per-file preserve checks below only push to `plan.preserved` while
+    // iterating the *new* pack's files, so a local `app.db` the pack doesn't
+    // ship (the common case) would be protected but silently omitted from the
+    // plan's "Preserved" bucket — contradicting the OpenAPI/`UpdatePlan`
+    // docstring. Guard by existence so we never claim to preserve a file that
+    // isn't actually there.
+    for rel_str in &ds_preserve {
+        if dir.join(rel_str).exists() && preserved_seen.insert(rel_str.clone()) {
+            plan.preserved.push(rel_str.clone());
+        }
+    }
+
     // Walk the new source tree; classify each file. Preserved subtrees are
     // pruned during traversal; report any the pack ships so the plan reflects
     // that they were intentionally skipped.
@@ -11082,6 +11096,31 @@ mod tests {
         assert!(plan.overwrite.is_empty() && plan.conflicts.is_empty());
         // The user's DB content survives untouched.
         assert_eq!(read(&proj, "db/data.sqlite"), "LOCALDB");
+        unsafe { std::env::remove_var("NANO_APP_DB_URL") };
+    }
+
+    #[test]
+    fn overlay_plan_preserves_local_datasource_when_pack_omits_it() {
+        let _g = lock();
+        // The common case: the project has a live sqlite DB but the new pack
+        // does NOT ship a stub at that path. The DB is still protected (never
+        // an orphan, never overwritten) and the plan must report it as
+        // preserved so the "Preserved" bucket matches reality.
+        unsafe { std::env::set_var("NANO_APP_DB_URL", "file:./app.db") };
+        let proj = tree(&[("main.ts", "old\n"), ("app.db", "LIVEDATA")]);
+        let new = tree(&[("main.ts", "old\n")]); // no app.db shipped
+
+        let plan = overlay_plan(&proj, &new, None, true, "p", None, None).unwrap();
+
+        assert!(
+            plan.preserved.contains(&"app.db".to_string()),
+            "local datasource preserved even when the pack omits it: {:?}",
+            plan.preserved
+        );
+        // It must not be treated as an orphan or clobbered.
+        assert!(!plan.orphans.contains(&"app.db".to_string()));
+        assert!(plan.overwrite.is_empty() && plan.conflicts.is_empty());
+        assert_eq!(read(&proj, "app.db"), "LIVEDATA");
         unsafe { std::env::remove_var("NANO_APP_DB_URL") };
     }
 
