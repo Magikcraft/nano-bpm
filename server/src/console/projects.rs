@@ -4015,23 +4015,38 @@ fn is_preserved_path(rel: &Path) -> bool {
     })
 }
 
-/// The datasource sqlite file (+ WAL/SHM sidecars) to preserve, resolved from
-/// `NANO_APP_DB_URL` (default `file:./app.db`). Only in-tree, relative targets
-/// are honoured — an absolute or `..`-escaping URL is ignored (nothing to
+/// The datasource sqlite file(s) (+ WAL/SHM sidecars) to preserve across an
+/// update. The default in-tree `app.db` is *always* preserved as a baseline so
+/// the update never clobbers the project's sqlite DB — even when
+/// `NANO_APP_DB_URL` is unset or points somewhere non-relative. In addition, a
+/// validated in-tree relative target from `NANO_APP_DB_URL` is preserved when
+/// present; an absolute or `..`-escaping URL is ignored (nothing extra to
 /// preserve in-tree).
 fn datasource_preserve_files() -> Vec<String> {
+    fn triplet(base: &str) -> [String; 3] {
+        [base.to_string(), format!("{base}-wal"), format!("{base}-shm")]
+    }
+
+    // Baseline: always protect the conventional in-tree sqlite DB.
+    let mut out: Vec<String> = triplet("app.db").to_vec();
+
+    // Additionally protect a validated, in-tree relative `NANO_APP_DB_URL`.
     let url = std::env::var("NANO_APP_DB_URL").unwrap_or_else(|_| "file:./app.db".to_string());
     let raw = url.strip_prefix("file:").unwrap_or(&url);
     let raw = raw.strip_prefix("./").unwrap_or(raw);
     let p = Path::new(raw);
-    if raw.is_empty()
+    if !(raw.is_empty()
         || p.is_absolute()
         || p.components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
+            .any(|c| matches!(c, std::path::Component::ParentDir)))
     {
-        return Vec::new();
+        for f in triplet(raw) {
+            if !out.contains(&f) {
+                out.push(f);
+            }
+        }
     }
-    vec![raw.to_string(), format!("{raw}-wal"), format!("{raw}-shm")]
+    out
 }
 
 /// Whether the byte content looks like text (no NUL in the first 8 KiB), so a
@@ -4085,14 +4100,30 @@ fn try_git_merge(base: &[u8], current: &[u8], new: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// Recursively collect every file under `root` as a project-relative path.
-fn collect_rel_files(root: &Path, base: &Path, out: &mut Vec<PathBuf>) {
+/// Preserved subtrees (`UPDATE_PRESERVE_DIRS`: `.git`, `node_modules`,
+/// `nano-generated`, `.nano`) are pruned during traversal — we never descend
+/// into them, since they are skipped by the overlay anyway and can be huge on
+/// real projects. The name of each pruned preserved directory is recorded in
+/// `pruned` (deduplicated) so callers can still report what was preserved.
+fn collect_rel_files(
+    root: &Path,
+    base: &Path,
+    out: &mut Vec<PathBuf>,
+    pruned: &mut BTreeSet<String>,
+) {
     let Ok(rd) = std::fs::read_dir(base) else {
         return;
     };
     for e in rd.flatten() {
         let p = e.path();
         if p.is_dir() {
-            collect_rel_files(root, &p, out);
+            if let Some(name) = p.file_name().and_then(|n| n.to_str())
+                && UPDATE_PRESERVE_DIRS.contains(&name)
+            {
+                pruned.insert(name.to_string());
+                continue;
+            }
+            collect_rel_files(root, &p, out, pruned);
         } else if let Ok(rel) = p.strip_prefix(root) {
             out.push(rel.to_path_buf());
         }
@@ -4243,9 +4274,17 @@ fn overlay_plan(
     let mut preserved_seen: BTreeSet<String> = BTreeSet::new();
     let ds_preserve: BTreeSet<String> = datasource_preserve_files().into_iter().collect();
 
-    // Walk the new source tree; classify each file.
+    // Walk the new source tree; classify each file. Preserved subtrees are
+    // pruned during traversal; report any the pack ships so the plan reflects
+    // that they were intentionally skipped.
     let mut new_files: Vec<PathBuf> = Vec::new();
-    collect_rel_files(new_src, new_src, &mut new_files);
+    let mut new_pruned: BTreeSet<String> = BTreeSet::new();
+    collect_rel_files(new_src, new_src, &mut new_files, &mut new_pruned);
+    for name in new_pruned {
+        if preserved_seen.insert(name.clone()) {
+            plan.preserved.push(name);
+        }
+    }
     new_files.sort();
     let new_set: BTreeSet<PathBuf> = new_files.iter().cloned().collect();
 
@@ -4325,8 +4364,11 @@ fn overlay_plan(
     }
 
     // Orphans: files present locally but absent from the new pack (kept).
+    // Preserved subtrees are pruned during traversal (and not reported here —
+    // they are the project's own state, not pack-shipped skips).
     let mut local_files: Vec<PathBuf> = Vec::new();
-    collect_rel_files(dir, dir, &mut local_files);
+    let mut local_pruned: BTreeSet<String> = BTreeSet::new();
+    collect_rel_files(dir, dir, &mut local_files, &mut local_pruned);
     for rel in local_files {
         if is_preserved_path(&rel) {
             continue;
