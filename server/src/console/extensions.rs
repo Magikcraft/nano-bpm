@@ -1040,8 +1040,10 @@ pub fn secure_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
         let rand = std::collections::hash_map::RandomState::new()
             .build_hasher()
             .finish();
-        let candidate =
-            base.join(format!("{prefix}-{}-{nanos}-{rand:016x}", std::process::id()));
+        let candidate = base.join(format!(
+            "{prefix}-{}-{nanos}-{rand:016x}",
+            std::process::id()
+        ));
         match std::fs::create_dir(&candidate) {
             Ok(()) => return Ok(candidate),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
