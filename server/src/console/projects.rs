@@ -1585,13 +1585,17 @@ fn range_satisfies(range: &str, installed: (u64, u64, u64)) -> Option<bool> {
         return Some(installed == lower);
     }
     let (m, n, p) = lower;
+    // Compute the exclusive upper bound with checked arithmetic: a version
+    // component at `u64::MAX` would wrap on `+ 1` and turn this conservative
+    // check into a false positive (forcing needless reinstalls), so treat any
+    // overflow as undecidable and bail out with `None`.
     let upper = match op {
-        '~' => (m, n + 1, 0),
+        '~' => (m, n.checked_add(1)?, 0),
         // Caret: allow changes that do not modify the left-most non-zero
         // component. For 0.x that pins the minor (0.0.x pins the patch).
-        '^' if m > 0 => (m + 1, 0, 0),
-        '^' if n > 0 => (m, n + 1, 0),
-        '^' => (m, n, p + 1),
+        '^' if m > 0 => (m.checked_add(1)?, 0, 0),
+        '^' if n > 0 => (m, n.checked_add(1)?, 0),
+        '^' => (m, n, p.checked_add(1)?),
         _ => return None,
     };
     Some(installed >= lower && installed < upper)
@@ -10878,6 +10882,15 @@ mod tests {
                 "range {r:?} must be undecidable"
             );
         }
+
+        // A version component at u64::MAX would overflow the exclusive upper
+        // bound; treat it as undecidable rather than wrapping into a false
+        // positive that forces needless reinstalls.
+        let max = u64::MAX;
+        assert_eq!(range_satisfies(&format!("^{max}.0.0"), (max, 0, 0)), None);
+        assert_eq!(range_satisfies(&format!("^0.{max}.0"), (0, max, 0)), None);
+        assert_eq!(range_satisfies(&format!("^0.0.{max}"), (0, 0, max)), None);
+        assert_eq!(range_satisfies(&format!("~1.{max}.0"), (1, max, 0)), None);
     }
 
     /// `parse_semver_triple` normalises a concrete installed version and rejects
