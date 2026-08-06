@@ -1193,8 +1193,10 @@ impl ServerImpl {
 /// shard owns ONE partition and tracks that partition's projected event count, so
 /// catch-up demuxes the surviving events by their write tag and resumes each shard
 /// from its own persisted `exported_position` (accounting for the compacted prefix
-/// via `recovery.pp_base`). A shard behind the compacted prefix or ahead of the
-/// surviving tail (truncated/corrupt) is reset and rebuilt from what survives.
+/// via `recovery.pp_base`) through the canonical [`seglog::catch_up_shard`]. A
+/// shard ahead of the surviving tail (truncated/corrupt) is rebuilt from what
+/// survives; a shard *below* the compacted prefix is refused, not silently
+/// resumed (issue #600).
 fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::MultiSegRecovery) {
     for (pid, shard) in shards {
         let base_p = recovery.pp_base.get(*pid as usize).copied().unwrap_or(0);
@@ -1204,17 +1206,7 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
             .filter(|(tag, _)| tag == pid)
             .map(|(_, e)| e)
             .collect();
-        let mut projected = shard.exported_position() as u64;
-        if projected < base_p || projected > base_p + p_events.len() as u64 {
-            shard.reset().expect("reset read store shard");
-            projected = base_p;
-        }
-        let skip = (projected - base_p) as usize;
-        if skip < p_events.len() {
-            shard
-                .export(&p_events[skip..])
-                .expect("catch up read model shard from segmented multi-partition journal");
-        }
+        seglog::catch_up_shard(shard, base_p, &p_events);
     }
 }
 
@@ -16095,25 +16087,14 @@ async fn main() {
                         panic!("failed to open segmented journal at {}: {e}", dir.display())
                     });
                     seg_shared = Some(Arc::clone(&recovery.shared));
-                    // Read-store catch-up over absolute event positions. The
-                    // surviving events span `[first_index, total_events)`; events
-                    // compacted before `first_index` were already projected (the
-                    // exporter watermark gates compaction), so the store is never
-                    // behind the compacted prefix.
-                    let mut pos = shard.exported_position() as u64;
-                    if pos > recovery.total_events {
-                        // Store ahead of the log (truncated/corrupt): rebuild from
-                        // whatever survives.
-                        shard.reset().expect("reset read store");
-                        pos = recovery.first_index;
-                    }
-                    let skip = pos.saturating_sub(recovery.first_index) as usize;
-                    if skip < recovery.events.len() {
-                        let refs: Vec<&Event> = recovery.events[skip..].iter().collect();
-                        shard
-                            .export(&refs)
-                            .expect("catch up read model from segmented journal");
-                    }
+                    // Read-store catch-up over absolute event positions, via the
+                    // canonical `catch_up_shard` decision. The surviving events
+                    // span `[first_index, total_events)`; a store below
+                    // `first_index` (a wiped/reset read model over a compacted
+                    // journal) is refused rather than silently resumed — see
+                    // issue #600.
+                    let surviving: Vec<&Event> = recovery.events.iter().collect();
+                    seglog::catch_up_shard(&shard, recovery.first_index, &surviving);
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 } else {
