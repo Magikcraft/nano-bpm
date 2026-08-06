@@ -1456,21 +1456,34 @@ fn heal_package_json_npm_deps(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Names declared under `dependencies` in the project's `package.json` that are
-/// not yet materialised in `node_modules`. These are the real npm packages the
-/// Node run path resolves as **bare** specifiers (e.g. `@nanobpm/urban`, an Urban
-/// app's toolkit); a host-scaffolded app's relative/`@lib` aliases live in the
-/// import map, not here, so they are correctly ignored.
+/// Names declared under `dependencies` in the project's `package.json` that
+/// need a (re)install before a Node-first run — either **absent** from
+/// `node_modules`, or **present but out of the declared version range** (e.g. an
+/// extension update bumped the range but the update flow preserves
+/// `node_modules`, so the old version is still on disk). These are the real npm
+/// packages the Node run path resolves as **bare** specifiers (e.g.
+/// `@nanobpm/urban`, an Urban app's toolkit); a host-scaffolded app's
+/// relative/`@lib` aliases live in the import map, not here, so they are
+/// correctly ignored.
+///
+/// The out-of-range check is deliberately conservative: a present dependency is
+/// reported only when the installed version can be read AND the declared range
+/// is one [`range_satisfies`] can decide AND the version provably violates it.
+/// An unreadable installed version or an undecidable range (a partial range like
+/// `^1`, a `*`/`x` range, a union, a dist-tag, or a git/file/workspace specifier)
+/// is treated as satisfied, so a healthy tree is never needlessly reinstalled —
+/// the check only ever adds installs the old presence-only probe would miss,
+/// never false positives on the common ranges.
 ///
 /// Empty when there is no `package.json`, it is unreadable or not valid JSON, it
-/// declares no `dependencies`, or every declared dep is already present — so a
-/// healthy app, a Deno-fetched project, or a non-Node pack (Rust/Java: no
-/// `package.json` deps) is a no-op. A malformed `package.json` therefore skips the
-/// install attempt rather than aborting the run. Dependency keys that are not
-/// syntactically valid npm names are ignored (see [`is_safe_dependency_name`]) so
-/// a malicious manifest cannot make the presence probe reach outside
-/// `node_modules`.
-fn missing_node_modules(dir: &Path) -> Vec<String> {
+/// declares no `dependencies`, or every declared dep is already present and in
+/// range — so a healthy app, a Deno-fetched project, or a non-Node pack
+/// (Rust/Java: no `package.json` deps) is a no-op. A malformed `package.json`
+/// therefore skips the install attempt rather than aborting the run. Dependency
+/// keys that are not syntactically valid npm names are ignored (see
+/// [`is_safe_dependency_name`]) so a malicious manifest cannot make the probe
+/// reach outside `node_modules`.
+fn node_modules_needing_install(dir: &Path) -> Vec<String> {
     let Ok(raw) = std::fs::read_to_string(dir.join("package.json")) else {
         return Vec::new();
     };
@@ -1482,18 +1495,110 @@ fn missing_node_modules(dir: &Path) -> Vec<String> {
         return Vec::new();
     };
     let node_modules = dir.join("node_modules");
-    deps.keys()
+    deps.iter()
         // A dependency key is attacker-controlled: `join` would treat a leading
         // `/`, a `..` segment, or an embedded separator as a real path, so an
-        // entry like `../../etc` would probe (and could report as "missing")
-        // paths outside `node_modules`. Only join names that are valid npm
-        // specifiers; anything else is dropped rather than install-attempted.
-        .filter(|name| is_safe_dependency_name(name))
-        // `join` treats a scoped name's single `/` as a path separator, so
-        // `@nanobpm/urban` resolves to `node_modules/@nanobpm/urban`.
-        .filter(|name| !node_modules.join(name).is_dir())
-        .cloned()
+        // entry like `../../etc` would probe paths outside `node_modules`. Only
+        // join names that are valid npm specifiers; anything else is dropped
+        // rather than install-attempted.
+        .filter(|(name, _)| is_safe_dependency_name(name))
+        .filter_map(|(name, range)| {
+            // `join` treats a scoped name's single `/` as a path separator, so
+            // `@nanobpm/urban` resolves to `node_modules/@nanobpm/urban`.
+            let pkg_dir = node_modules.join(name);
+            let needs = if !pkg_dir.is_dir() {
+                true
+            } else {
+                // Present: reinstall only when we can prove the installed
+                // version is out of the declared range (a bump the update flow
+                // left stale). Undecidable → treated as satisfied.
+                range
+                    .as_str()
+                    .is_some_and(|r| installed_is_out_of_range(&pkg_dir, r))
+            };
+            needs.then(|| name.clone())
+        })
         .collect()
+}
+
+/// Whether the package installed at `pkg_dir` provably violates the declared
+/// npm `range`. Returns `false` (satisfied — do not reinstall) whenever the
+/// installed `version` cannot be read or the range is one [`range_satisfies`]
+/// cannot decide, so this never forces a needless reinstall.
+fn installed_is_out_of_range(pkg_dir: &Path, range: &str) -> bool {
+    let Some(installed) = installed_dep_version(pkg_dir) else {
+        return false;
+    };
+    match range_satisfies(range, installed) {
+        Some(satisfied) => !satisfied,
+        None => false,
+    }
+}
+
+/// Read the `version` field from an installed dependency's
+/// `node_modules/<name>/package.json` and parse it into a comparable triple.
+/// `None` when the file is missing/unreadable, is not valid JSON, has no string
+/// `version`, or the version is not a clean numeric triple.
+fn installed_dep_version(pkg_dir: &Path) -> Option<(u64, u64, u64)> {
+    let raw = std::fs::read_to_string(pkg_dir.join("package.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    parse_semver_triple(v.get("version")?.as_str()?)
+}
+
+/// Parse a concrete semver version into a comparable `(major, minor, patch)`
+/// triple, ignoring any `-prerelease` / `+build` metadata and an optional `v`
+/// prefix. Requires all three numeric components; returns `None` otherwise (an
+/// installed package always records a full `x.y.z`).
+fn parse_semver_triple(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.trim().trim_start_matches('v');
+    let core = core.split(['-', '+']).next().unwrap_or(core);
+    let mut it = core.split('.');
+    let maj = it.next()?.trim().parse().ok()?;
+    let min = it.next()?.trim().parse().ok()?;
+    let pat = it.next()?.trim().parse().ok()?;
+    if it.next().is_some() {
+        return None;
+    }
+    Some((maj, min, pat))
+}
+
+/// Whether `installed` satisfies the npm `range`, or `None` when the range is
+/// not one this conservative checker decides. It handles exactly the ranges
+/// packs actually pin with — an exact `M.m.p`, a caret `^M.m.p`, or a tilde
+/// `~M.m.p` (each with an optional `v`/`=` prefix) — and returns `None` for
+/// anything else (a partial range like `^1` or `^0.21`, a `*`/`x`/`>=` range, a
+/// `||` union, a dist-tag, or a git/file/workspace specifier), so callers fall
+/// back to presence-only. Follows npm caret semantics, where for a `0.x` version
+/// the left-most non-zero component is the breaking one — the exact rule that
+/// makes `^0.20.0` exclude `0.21.0` (`^0.20.0` == `>=0.20.0 <0.21.0`).
+fn range_satisfies(range: &str, installed: (u64, u64, u64)) -> Option<bool> {
+    let range = range.trim();
+    let (op, rest) = if let Some(r) = range.strip_prefix('^') {
+        ('^', r)
+    } else if let Some(r) = range.strip_prefix('~') {
+        ('~', r)
+    } else {
+        ('=', range.strip_prefix('=').unwrap_or(range))
+    };
+    let lower = parse_semver_triple(rest)?;
+    if op == '=' {
+        return Some(installed == lower);
+    }
+    let (m, n, p) = lower;
+    // Compute the exclusive upper bound with checked arithmetic: a version
+    // component at `u64::MAX` would wrap on `+ 1` and turn this conservative
+    // check into a false positive (forcing needless reinstalls), so treat any
+    // overflow as undecidable and bail out with `None`.
+    let upper = match op {
+        '~' => (m, n.checked_add(1)?, 0),
+        // Caret: allow changes that do not modify the left-most non-zero
+        // component. For 0.x that pins the minor (0.0.x pins the patch).
+        '^' if m > 0 => (m.checked_add(1)?, 0, 0),
+        '^' if n > 0 => (m, n.checked_add(1)?, 0),
+        '^' => (m, n, p.checked_add(1)?),
+        _ => return None,
+    };
+    Some(installed >= lower && installed < upper)
 }
 
 /// Whether `name` is a syntactically valid npm dependency name that is safe to
@@ -6188,22 +6293,24 @@ impl ProjectSupervisor {
         // a published Urban app's toolkit) as bare specifiers from `node_modules`.
         // Unlike Deno — which fetches `npm:` on demand — the host never populates
         // it, so a project created from such an app fails with ERR_MODULE_NOT_FOUND.
-        // Lazily materialise any declared dep missing from `node_modules` with a
-        // guarded, best-effort `npm install` (no dev deps, no lifecycle scripts)
-        // before the Node spawn. A failure is logged, not fatal: the spawn then
+        // Lazily materialise any declared dep that is missing from `node_modules`
+        // OR present but out of its declared version range (e.g. an extension
+        // update bumped the range while preserving node_modules) with a guarded,
+        // best-effort `npm install` (no dev deps, no lifecycle scripts) before
+        // the Node spawn. A failure is logged, not fatal: the spawn then
         // surfaces the underlying resolution error, so the run is never silently
         // blocked on a flaky install.
         if let RunRuntime::Node(_) = &runtime {
-            let missing = missing_node_modules(&dir);
-            if !missing.is_empty() {
+            let needing = node_modules_needing_install(&dir);
+            if !needing.is_empty() {
                 inner
                     .push_log(
                         "info",
                         format!(
-                            "installing {} missing npm dependenc{} ({})…",
-                            missing.len(),
-                            if missing.len() == 1 { "y" } else { "ies" },
-                            missing.join(", "),
+                            "installing {} npm dependenc{} ({})…",
+                            needing.len(),
+                            if needing.len() == 1 { "y" } else { "ies" },
+                            needing.join(", "),
                         ),
                     )
                     .await;
@@ -10612,18 +10719,20 @@ mod tests {
         );
     }
 
-    /// `missing_node_modules` drives the lazy `npm install` on the Node run path:
-    /// it must list only declared `dependencies` absent from `node_modules`, and
-    /// no-op for a healthy app, a depless manifest, or a project with no
-    /// `package.json` (Rust/Java pack). Scoped names resolve under their scope dir.
+    /// `node_modules_needing_install` drives the lazy `npm install` on the Node
+    /// run path: it must list declared `dependencies` absent from `node_modules`,
+    /// and no-op for a healthy app, a depless manifest, or a project with no
+    /// `package.json` (Rust/Java pack). Scoped names resolve under their scope
+    /// dir. A present dep with no readable installed version is treated as
+    /// satisfied (presence-only fallback).
     #[test]
-    fn missing_node_modules_lists_only_absent_declared_deps() {
+    fn node_modules_needing_install_lists_only_absent_declared_deps() {
         let dir = std::env::temp_dir().join(format!("nano-nm-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
 
         // No package.json → nothing to install.
-        assert!(missing_node_modules(&dir).is_empty());
+        assert!(node_modules_needing_install(&dir).is_empty());
 
         std::fs::write(
             dir.join("package.json"),
@@ -10631,43 +10740,171 @@ mod tests {
         )
         .unwrap();
         // Both declared, none present → both reported.
-        let mut got = missing_node_modules(&dir);
+        let mut got = node_modules_needing_install(&dir);
         got.sort();
         assert_eq!(got, vec!["@nanobpm/urban".to_string(), "left-pad".into()]);
 
-        // Materialise one (scoped) → only the other remains.
+        // Materialise one (scoped) → only the other remains. No inner
+        // package.json version, so it is treated as satisfied, not stale.
         std::fs::create_dir_all(dir.join("node_modules/@nanobpm/urban")).unwrap();
-        assert_eq!(missing_node_modules(&dir), vec!["left-pad".to_string()]);
+        assert_eq!(
+            node_modules_needing_install(&dir),
+            vec!["left-pad".to_string()]
+        );
 
         // Materialise the rest → no-op.
         std::fs::create_dir_all(dir.join("node_modules/left-pad")).unwrap();
-        assert!(missing_node_modules(&dir).is_empty());
+        assert!(node_modules_needing_install(&dir).is_empty());
 
         // A manifest without `dependencies` is a no-op.
         std::fs::write(dir.join("package.json"), r#"{"name":"x"}"#).unwrap();
-        assert!(missing_node_modules(&dir).is_empty());
+        assert!(node_modules_needing_install(&dir).is_empty());
 
         // Invalid JSON → non-fatal, empty (the malformed manifest skips install).
         std::fs::write(dir.join("package.json"), "{ not valid json").unwrap();
-        assert!(missing_node_modules(&dir).is_empty());
+        assert!(node_modules_needing_install(&dir).is_empty());
 
         // Unreadable `package.json` (a directory at that path) → non-fatal, empty.
         std::fs::remove_file(dir.join("package.json")).unwrap();
         std::fs::create_dir_all(dir.join("package.json")).unwrap();
-        assert!(missing_node_modules(&dir).is_empty());
+        assert!(node_modules_needing_install(&dir).is_empty());
         std::fs::remove_dir(dir.join("package.json")).unwrap();
 
         // Traversal / absolute / malformed dependency names are dropped: the
-        // presence probe must never `join` them onto `node_modules` and reach
-        // outside it, and a well-known outside path must never be reported.
+        // probe must never `join` them onto `node_modules` and reach outside it,
+        // and a well-known outside path must never be reported.
         std::fs::write(
             dir.join("package.json"),
             r#"{"dependencies":{"../../etc":"^1","/tmp":"^1",".hidden":"^1","a/b/c":"^1"}}"#,
         )
         .unwrap();
-        assert!(missing_node_modules(&dir).is_empty());
+        assert!(node_modules_needing_install(&dir).is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for the console update gap (issue #602): the project-update
+    /// three-way merge preserves `node_modules` while merging a bumped
+    /// dependency into `package.json`, so a dep can be **present but stale**. The
+    /// run-path probe must flag a present dep whose installed version is out of
+    /// the declared range, so the lazy install heals it — while leaving an
+    /// in-range install and an undecidable range untouched (no needless
+    /// reinstall). This is the whole defect class, not one instance: it asserts
+    /// staleness is detected regardless of which dep, via the installed
+    /// `node_modules/<name>/package.json` `version`.
+    #[test]
+    fn node_modules_needing_install_flags_out_of_range_present_deps() {
+        let dir = std::env::temp_dir().join(format!("nano-stale-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Helper: write an installed dep at node_modules/<name> with a version.
+        let install = |name: &str, version: &str| {
+            let p = dir.join("node_modules").join(name);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(
+                p.join("package.json"),
+                format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+            )
+            .unwrap();
+        };
+
+        // `stale` is pinned ^0.21.0 but 0.20.0 is installed (the exact 0.x-caret
+        // case from the row-collapse bump); `fresh` is in range; `loose` uses a
+        // partial range this checker can't decide (must be left alone).
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"dependencies":{"stale":"^0.21.0","fresh":"^1.2.0","loose":"^1"}}"#,
+        )
+        .unwrap();
+        install("stale", "0.20.0");
+        install("fresh", "1.5.3");
+        install("loose", "1.0.0");
+
+        let got = node_modules_needing_install(&dir);
+        assert!(
+            got.contains(&"stale".to_string()),
+            "a present dep whose installed version is out of range must be reinstalled; got {got:?}"
+        );
+        assert!(
+            !got.contains(&"fresh".to_string()),
+            "an in-range dep must not be reinstalled; got {got:?}"
+        );
+        assert!(
+            !got.contains(&"loose".to_string()),
+            "an undecidable range must fall back to presence-only; got {got:?}"
+        );
+
+        // Bumping the installed version into range clears the staleness.
+        install("stale", "0.21.4");
+        assert!(
+            !node_modules_needing_install(&dir).contains(&"stale".to_string()),
+            "once the installed version satisfies the range it is no longer stale"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Unit-level coverage of the npm-range satisfier that powers the staleness
+    /// check, including the 0.x caret semantics whose absence caused the
+    /// original miss (`^0.20.0` must exclude `0.21.0`).
+    #[test]
+    fn range_satisfies_follows_npm_caret_tilde_and_exact() {
+        // Caret on a normal major: locks the major.
+        assert_eq!(range_satisfies("^1.2.0", (1, 5, 3)), Some(true));
+        assert_eq!(range_satisfies("^1.2.0", (2, 0, 0)), Some(false));
+        assert_eq!(range_satisfies("^1.2.0", (1, 1, 0)), Some(false));
+
+        // Caret on 0.x: locks the MINOR (the bug that started this).
+        assert_eq!(range_satisfies("^0.20.0", (0, 20, 9)), Some(true));
+        assert_eq!(range_satisfies("^0.20.0", (0, 21, 0)), Some(false));
+        assert_eq!(range_satisfies("^0.21.0", (0, 20, 0)), Some(false));
+
+        // Caret on 0.0.x: locks the PATCH.
+        assert_eq!(range_satisfies("^0.0.3", (0, 0, 3)), Some(true));
+        assert_eq!(range_satisfies("^0.0.3", (0, 0, 4)), Some(false));
+
+        // Tilde: locks the minor.
+        assert_eq!(range_satisfies("~1.2.3", (1, 2, 9)), Some(true));
+        assert_eq!(range_satisfies("~1.2.3", (1, 3, 0)), Some(false));
+
+        // Exact (optionally `=`/`v` prefixed): only that version.
+        assert_eq!(range_satisfies("1.2.3", (1, 2, 3)), Some(true));
+        assert_eq!(range_satisfies("=1.2.3", (1, 2, 4)), Some(false));
+        assert_eq!(range_satisfies("v1.2.3", (1, 2, 3)), Some(true));
+
+        // Undecidable ranges → None (presence-only fallback), never a false
+        // positive that would force a reinstall.
+        for r in ["^1", "^0.21", "*", "1.x", ">=1.2.0", "1 || 2", "latest", ""] {
+            assert_eq!(
+                range_satisfies(r, (1, 2, 3)),
+                None,
+                "range {r:?} must be undecidable"
+            );
+        }
+
+        // A version component at u64::MAX would overflow the exclusive upper
+        // bound; treat it as undecidable rather than wrapping into a false
+        // positive that forces needless reinstalls.
+        let max = u64::MAX;
+        assert_eq!(range_satisfies(&format!("^{max}.0.0"), (max, 0, 0)), None);
+        assert_eq!(range_satisfies(&format!("^0.{max}.0"), (0, max, 0)), None);
+        assert_eq!(range_satisfies(&format!("^0.0.{max}"), (0, 0, max)), None);
+        assert_eq!(range_satisfies(&format!("~1.{max}.0"), (1, max, 0)), None);
+    }
+
+    /// `parse_semver_triple` normalises a concrete installed version and rejects
+    /// non-triples so the range check never compares garbage.
+    #[test]
+    fn parse_semver_triple_normalises_and_rejects() {
+        assert_eq!(parse_semver_triple("0.21.0"), Some((0, 21, 0)));
+        assert_eq!(parse_semver_triple("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_semver_triple("1.2.3-rc.1"), Some((1, 2, 3)));
+        assert_eq!(parse_semver_triple("1.2.3+build.5"), Some((1, 2, 3)));
+        assert_eq!(parse_semver_triple("1.2"), None);
+        assert_eq!(parse_semver_triple("1.2.3.4"), None);
+        assert_eq!(parse_semver_triple("latest"), None);
+        assert_eq!(parse_semver_triple(""), None);
     }
 
     /// The dependency-name guard must accept real npm specifiers (plain + scoped)
