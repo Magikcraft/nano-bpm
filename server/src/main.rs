@@ -14703,12 +14703,26 @@ fn activated_job_result(
 
     let (job_kind_enum, job_listener_event_type_enum) = job_kind_enums(&job.kind);
 
+    // Zeebe `customHeaders`: the task's static `zeebe:taskHeaders`, surfaced as
+    // an object map (each value a JSON string) so the REST contract matches.
+    let custom_headers: std::collections::HashMap<String, types::Object> = job
+        .custom_headers
+        .iter()
+        .map(|(k, v)| {
+            (
+                k.clone(),
+                types::Object(serde_json::Value::String(v.clone())),
+            )
+        })
+        .collect();
+    let tags: Vec<models::Tag> = job.tags.iter().cloned().map(models::Tag).collect();
+
     models::ActivatedJobResult::new(
         job.job_type,
         process_id,
         version,
         job.element_id,
-        std::collections::HashMap::new(),
+        custom_headers,
         job.worker,
         job.retries,
         job.deadline as i64,
@@ -14721,9 +14735,9 @@ fn activated_job_result(
         job_kind_enum,
         job_listener_event_type_enum,
         nanobpm_gateway_rest::types::Nullable::Null,
-        Vec::new(),
+        tags,
         nanobpm_gateway_rest::types::Nullable::Null,
-        0,
+        job.priority,
     )
 }
 

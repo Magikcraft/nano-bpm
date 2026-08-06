@@ -177,10 +177,17 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         | ElementKind::ParallelGateway
         | ElementKind::EventBasedGateway
         | ElementKind::IntermediateThrowEvent => {}
-        ElementKind::ServiceTask { job_type, priority } => {
+        ElementKind::ServiceTask {
+            job_type,
+            priority,
+            custom_headers,
+        } => {
             attrs.push(format!("jobType {}", quote(job_type)));
             if let Some(p) = priority {
                 attrs.push(format!("priority {}", quote(p)));
+            }
+            for (k, v) in custom_headers {
+                attrs.push(format!("header {} <- {}", quote(k), quote(v)));
             }
         }
         ElementKind::BusinessRuleTask {
@@ -678,6 +685,8 @@ struct NodeAttrs {
     scalars: HashMap<String, String>,
     inputs: Vec<Mapping>,
     outputs: Vec<Mapping>,
+    /// `zeebe:taskHeaders` entries (serviceTask only), keyed by header name.
+    headers: BTreeMap<String, String>,
     timer: Option<TimerDef>,
     multi_instance: Option<MultiInstance>,
 }
@@ -904,6 +913,15 @@ impl<'a> Parser<'a> {
                 "element '{id}' has an unknown attribute '{leftover}'"
             ));
         }
+        // `header` statements only feed `attrs.headers`, which is consumed by the
+        // `serviceTask` arm. For any other kind the headers are left behind here;
+        // surface that as an error instead of silently dropping them (mirrors the
+        // unknown-scalar-attribute check above).
+        if let Some((leftover, _)) = attrs.headers.iter().next() {
+            return Err(format!(
+                "element '{id}' declares task header '{leftover}' but only a serviceTask may have headers"
+            ));
+        }
         Ok((id, name, element))
     }
 
@@ -936,6 +954,12 @@ impl<'a> Parser<'a> {
                 } else {
                     attrs.outputs.push(mapping);
                 }
+            }
+            "header" => {
+                let key = self.expect_str("for a task header key")?;
+                self.expect_tok(&Tok::LArrow, "in a task header")?;
+                let value = self.expect_str("for a task header value")?;
+                attrs.headers.insert(key, value);
             }
             "timer" => {
                 let kind_word = self.expect_word("for a timer kind")?;
@@ -1063,6 +1087,7 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         "serviceTask" => ElementKind::ServiceTask {
             job_type: attrs.require("jobType", id)?,
             priority: attrs.take("priority"),
+            custom_headers: std::mem::take(&mut attrs.headers),
         },
         "businessRuleTask" => ElementKind::BusinessRuleTask {
             decision_id: attrs.require("decisionId", id)?,
@@ -1515,6 +1540,12 @@ mod tests {
         // Unterminated string.
         let e = ir_to_definition("process \"p").unwrap_err();
         assert!(e.contains("unterminated string"), "{e}");
+        // Task headers on a non-serviceTask kind are rejected, not silently dropped.
+        let e = ir_to_definition(
+            "process \"p\" {\n start S\n startEvent S { header \"k\" <- \"v\" }\n}",
+        )
+        .unwrap_err();
+        assert!(e.contains("only a serviceTask may have headers"), "{e}");
     }
 
     #[test]

@@ -287,40 +287,53 @@ impl TestEngine {
         } else {
             30_000
         };
-        self.apply(Command::ActivateJobs {
-            job_type: job_type.to_string(),
-            worker: worker.to_string(),
-            max_jobs: (max_jobs.max(1)) as usize,
-            timeout,
-            now,
-        })
-        .map_err(|e| js_err(&format!("activate error: {e}")))?;
-        let state = self.engine.state();
-        let mut out: Vec<serde_json::Value> = state
-            .jobs
-            .values()
-            .filter(|j| {
-                j.job_type == job_type
-                    && j.state == JobState::Activated
-                    && j.worker.as_deref() == Some(worker)
+        let events = self
+            .apply(Command::ActivateJobs {
+                job_type: job_type.to_string(),
+                worker: worker.to_string(),
+                max_jobs: (max_jobs.max(1)) as usize,
+                timeout,
+                now,
             })
+            .map_err(|e| js_err(&format!("activate error: {e}")))?;
+        // Derive the returned job keys from the `JobActivated` events *this*
+        // call emitted — not by scanning all `Activated` jobs, which would also
+        // surface jobs locked by earlier `activateJobs` calls and could exceed
+        // `max_jobs`. Each is then projected through the engine's canonical
+        // `ActivatedJob` snapshot so the console TestEngine surfaces the same
+        // Zeebe field set as the server/FFI paths (custom headers,
+        // process-definition identity, tags, priority).
+        let keys: Vec<_> = events
+            .iter()
+            .filter_map(|ev| match ev {
+                Event::JobActivated { job_key, .. } => Some(*job_key),
+                _ => None,
+            })
+            .collect();
+        let out: Vec<serde_json::Value> = keys
+            .iter()
+            .filter_map(|k| self.engine.activated_job(*k))
             .map(|j| {
-                let vars = state
-                    .instances
-                    .get(&j.instance_key)
-                    .map(|i| vars_to_json(&i.variables))
-                    .unwrap_or_default();
                 serde_json::json!({
                     "key": j.key.to_string(),
                     "type": j.job_type,
                     "instanceKey": j.instance_key.to_string(),
+                    "elementInstanceKey": j.element_instance_key.to_string(),
                     "elementId": j.element_id,
+                    "bpmnProcessId": j.bpmn_process_id,
+                    "processDefinitionKey": j.process_definition_key.to_string(),
+                    "processDefinitionVersion": j.process_definition_version,
+                    "worker": j.worker,
                     "retries": j.retries,
-                    "variables": vars,
+                    "deadline": j.deadline,
+                    "priority": j.priority,
+                    "customHeaders": j.custom_headers,
+                    "tags": j.tags,
+                    "businessId": j.business_id,
+                    "variables": vars_to_json(&j.variables),
                 })
             })
             .collect();
-        out.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
         to_json(&serde_json::Value::Array(out))
     }
 
@@ -1533,6 +1546,44 @@ mod tests {
         assert!(
             !snap["jobs"].as_array().unwrap().is_empty(),
             "job should be activatable again: {snap}"
+        );
+    }
+
+    #[test]
+    fn activate_jobs_returns_only_this_calls_jobs_bounded_by_max() {
+        let mut eng = TestEngine::new();
+        eng.deploy(SERVICE_TASK_XML).unwrap();
+        // Two instances → two `do-work` jobs waiting to be activated.
+        eng.create_instance("p", "{}").unwrap();
+        eng.create_instance("p", "{}").unwrap();
+
+        // First activation with the same worker locks exactly one job.
+        let first: Vec<J> =
+            serde_json::from_str(&eng.activate_jobs("do-work", 1, 30_000.0, "w1").unwrap())
+                .unwrap();
+        assert_eq!(
+            first.len(),
+            1,
+            "first call must respect max_jobs=1: {first:?}"
+        );
+        let first_key = first[0]["key"].as_str().unwrap().to_string();
+
+        // Second activation with the *same* worker must return only the job it
+        // newly locks — not the one already locked by the first call. Scanning
+        // all `Activated` jobs for the worker would leak `first_key` back and
+        // exceed `max_jobs`.
+        let second: Vec<J> =
+            serde_json::from_str(&eng.activate_jobs("do-work", 1, 30_000.0, "w1").unwrap())
+                .unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "second call must respect max_jobs=1 and not re-return earlier jobs: {second:?}"
+        );
+        let second_key = second[0]["key"].as_str().unwrap().to_string();
+        assert_ne!(
+            first_key, second_key,
+            "each activation call must return distinct, freshly-locked jobs"
         );
     }
 
