@@ -913,6 +913,15 @@ impl<'a> Parser<'a> {
                 "element '{id}' has an unknown attribute '{leftover}'"
             ));
         }
+        // `header` statements only feed `attrs.headers`, which is consumed by the
+        // `serviceTask` arm. For any other kind the headers are left behind here;
+        // surface that as an error instead of silently dropping them (mirrors the
+        // unknown-scalar-attribute check above).
+        if let Some((leftover, _)) = attrs.headers.iter().next() {
+            return Err(format!(
+                "element '{id}' declares task header '{leftover}' but only a serviceTask may have headers"
+            ));
+        }
         Ok((id, name, element))
     }
 
@@ -1531,6 +1540,12 @@ mod tests {
         // Unterminated string.
         let e = ir_to_definition("process \"p").unwrap_err();
         assert!(e.contains("unterminated string"), "{e}");
+        // Task headers on a non-serviceTask kind are rejected, not silently dropped.
+        let e = ir_to_definition(
+            "process \"p\" {\n start S\n startEvent S { header \"k\" <- \"v\" }\n}",
+        )
+        .unwrap_err();
+        assert!(e.contains("only a serviceTask may have headers"), "{e}");
     }
 
     #[test]

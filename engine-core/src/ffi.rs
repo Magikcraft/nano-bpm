@@ -452,9 +452,13 @@ pub unsafe extern "C" fn nbpmn_activate_jobs(
             write_json_string(&mut json, tag);
         }
         json.push(']');
-        if let Some(business_id) = &job.business_id {
-            json.push_str(",\"businessId\":");
-            write_json_string(&mut json, business_id);
+        // Always emit `businessId` (using `null` when absent) so the C-ABI
+        // activation surface matches the wasm `TestEngine` shape, which
+        // serializes `Option<String>` as `null` rather than dropping the key.
+        json.push_str(",\"businessId\":");
+        match &job.business_id {
+            Some(business_id) => write_json_string(&mut json, business_id),
+            None => json.push_str("null"),
         }
         json.push_str(",\"variables\":{");
         for (j, (k, v)) in job.variables.iter().enumerate() {
@@ -729,6 +733,12 @@ mod tests {
             );
             assert!(json.contains("\"priority\":50"), "no priority: {json}");
             assert!(json.contains("\"tags\":["), "no tags: {json}");
+            // `businessId` is always emitted (null when absent) so this surface
+            // matches the wasm `TestEngine` job shape.
+            assert!(
+                json.contains("\"businessId\":null"),
+                "businessId should be present as null: {json}"
+            );
             // extract the job key: `"key":"<digits>"`
             let k_start = json.find("\"key\":\"").unwrap() + 7;
             let k_end = k_start + json[k_start..].find('"').unwrap();
