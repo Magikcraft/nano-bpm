@@ -1558,21 +1558,23 @@ mod tests {
         eng.create_instance("p", "{}").unwrap();
 
         // First activation with the same worker locks exactly one job.
-        let first: Vec<J> = serde_json::from_str(
-            &eng.activate_jobs("do-work", 1, 30_000.0, "w1").unwrap(),
-        )
-        .unwrap();
-        assert_eq!(first.len(), 1, "first call must respect max_jobs=1: {first:?}");
+        let first: Vec<J> =
+            serde_json::from_str(&eng.activate_jobs("do-work", 1, 30_000.0, "w1").unwrap())
+                .unwrap();
+        assert_eq!(
+            first.len(),
+            1,
+            "first call must respect max_jobs=1: {first:?}"
+        );
         let first_key = first[0]["key"].as_str().unwrap().to_string();
 
         // Second activation with the *same* worker must return only the job it
         // newly locks — not the one already locked by the first call. Scanning
         // all `Activated` jobs for the worker would leak `first_key` back and
         // exceed `max_jobs`.
-        let second: Vec<J> = serde_json::from_str(
-            &eng.activate_jobs("do-work", 1, 30_000.0, "w1").unwrap(),
-        )
-        .unwrap();
+        let second: Vec<J> =
+            serde_json::from_str(&eng.activate_jobs("do-work", 1, 30_000.0, "w1").unwrap())
+                .unwrap();
         assert_eq!(
             second.len(),
             1,
