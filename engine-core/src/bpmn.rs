@@ -635,7 +635,14 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 in_io_mapping = true;
                             }
                             "taskHeaders" => {
-                                in_task_headers = true;
+                                // A self-closing `<zeebe:taskHeaders />` has no
+                                // nested headers and emits no matching end tag, so
+                                // only enter the container state for a real open
+                                // element — otherwise the flag would stay stuck
+                                // `true` and wrongly capture later `zeebe:header`s.
+                                if !self_closing {
+                                    in_task_headers = true;
+                                }
                             }
                             // zeebe:header key="…" value="…" inside a
                             // zeebe:taskHeaders container: a static custom header
@@ -2378,6 +2385,55 @@ mod tests {
                 custom_headers: expected,
             }
         );
+    }
+
+    #[test]
+    fn self_closing_task_headers_do_not_leak_into_later_headers() {
+        // given: a first service task with a self-closing (empty)
+        // `<zeebe:taskHeaders />`, then a second service task whose own
+        // `zeebe:header` sits *outside* any taskHeaders container. A
+        // self-closing start tag emits no matching end tag, so the
+        // `in_task_headers` gate must not stay stuck open across elements.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="first">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="a" />
+                  <zeebe:taskHeaders />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:serviceTask id="second">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="b" />
+                  <zeebe:header key="stray" value="nope" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="first" />
+              <bpmn:sequenceFlow id="f2" sourceRef="first" targetRef="second" />
+              <bpmn:sequenceFlow id="f3" sourceRef="second" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the empty container yields no headers, and the stray header
+        // that follows is *not* captured onto the second task.
+        for id in ["first", "second"] {
+            match &def.element(id).unwrap().kind {
+                ElementKind::ServiceTask { custom_headers, .. } => {
+                    assert!(
+                        custom_headers.is_empty(),
+                        "{id} unexpectedly captured headers: {custom_headers:?}"
+                    );
+                }
+                other => panic!("{id} should be a service task, got {other:?}"),
+            }
+        }
     }
 
     #[test]
