@@ -235,6 +235,21 @@ const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
 const LOG_RING_CAP: usize = 1000;
 
+/// Upper bound on how long [`ProjectSupervisor::stop_all`] waits for every
+/// supervised child process group to be reaped on shutdown. Kept comfortably
+/// under c8ctl's 8s SIGTERM→SIGKILL grace window so the reap (plus the HTTP
+/// graceful shutdown) completes before c8ctl escalates to SIGKILL.
+#[cfg(not(test))]
+const STOP_ALL_TIMEOUT_MS: u64 = 5_000;
+
+/// Under test we deliberately exercise the timeout backstop
+/// (`stop_all_backstop_hard_kills_and_marks_terminal`), so use a much shorter
+/// bound to keep the suite fast while still preserving the production 5s bound
+/// above. 250ms is comfortably longer than the 20ms poll interval, so the
+/// backstop still fires only after a genuine timeout.
+#[cfg(test)]
+const STOP_ALL_TIMEOUT_MS: u64 = 250;
+
 /// The config file name at the root of every project.
 pub const CONFIG_FILE: &str = "nanobpm.project.json";
 
@@ -548,6 +563,89 @@ fn kill_process_group(child: &mut tokio::process::Child) {
         }
     }
     let _ = child.start_kill();
+}
+
+/// Hard-kills the process group led by `pid` (uncatchable SIGKILL on Unix,
+/// `taskkill /T` tree-kill on Windows). Used only as a shutdown backstop by
+/// [`ProjectSupervisor::stop_all`] when a stuck or dropped run task never reaps
+/// its own `Child` — the run task owns the `Child`, so we can't call
+/// [`kill_process_group`] and must fall back to the stored leader `pid` (spawned
+/// with `process_group(0)`, so `-pid` targets the whole group).
+///
+/// On Windows this blocks waiting for `taskkill` to exit so its status is
+/// observed, so callers in async contexts must run it on a blocking thread
+/// (e.g. [`tokio::task::spawn_blocking`]).
+fn kill_group_by_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: a negative pid signals the process group led by `pid`.
+        let group_rc = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if group_rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::ESRCH) {
+                // The group is already gone (the common, benign race: the run
+                // task reaped it a beat before this backstop fired). Nothing
+                // left to orphan.
+                return;
+            }
+            // The group signal failed for a real reason (e.g. EPERM). Log it and
+            // fall back to SIGKILLing the leader pid directly so a signalling
+            // failure can't silently orphan the known process.
+            tracing::warn!(
+                pid,
+                error = %err,
+                "kill_group_by_pid: group SIGKILL failed; trying direct-pid fallback"
+            );
+            // SAFETY: a positive pid signals just that process.
+            let direct_rc = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            if direct_rc != 0 {
+                let derr = std::io::Error::last_os_error();
+                if derr.raw_os_error() != Some(libc::ESRCH) {
+                    tracing::error!(
+                        pid,
+                        error = %derr,
+                        "kill_group_by_pid: direct-pid SIGKILL fallback also failed; process may be orphaned"
+                    );
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        // Mirror the Unix path: wait for `taskkill` to finish and surface any
+        // failure, because both a spawn failure (couldn't even launch) and a
+        // non-success exit (e.g. access denied, tree partly gone) can silently
+        // leave the process subtree running even though `stop_all` will mark
+        // the project `Stopped`. We block on `.status()` rather than fire-and-
+        // forget `.spawn()` so the exit code is actually observed; the caller
+        // runs us on a blocking thread (`spawn_blocking`), so this wait does
+        // not stall the async runtime.
+        match std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                tracing::warn!(
+                    pid,
+                    code = ?status.code(),
+                    "kill_group_by_pid: taskkill exited non-success; process tree may be orphaned"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    pid,
+                    error = %err,
+                    "kill_group_by_pid: failed to spawn taskkill; process tree may be orphaned"
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6584,6 +6682,91 @@ impl ProjectSupervisor {
         Ok(())
     }
 
+    /// Stops **every** supervised project and waits, bounded, for each child
+    /// process group to be reaped. Called on server shutdown so studio-started
+    /// apps (and their whole process subtrees, e.g. `uv run` → python) don't
+    /// orphan to init when the server exits.
+    ///
+    /// Each run task parks on `inner.stop.notified()` and, when woken,
+    /// `kill_process_group`s the child's group (SIGKILL is uncatchable) before
+    /// driving the phase to a terminal state. We notify them all, then poll for
+    /// those terminal phases up to [`STOP_ALL_TIMEOUT_MS`] so the whole teardown
+    /// fits inside c8ctl's SIGTERM→SIGKILL grace window — we do **not** rely on
+    /// `kill_on_drop`, which never fires on an abrupt (non-graceful) exit. If a
+    /// run task is stuck or dropped and the deadline is hit, we hard-kill its
+    /// process group directly via the stored leader pid as a backstop so a
+    /// missed reap still can't orphan the subtree.
+    pub async fn stop_all(&self) {
+        // Snapshot the entries so we never hold the map lock while awaiting
+        // child exits (a stuck reap would otherwise deadlock every accessor).
+        let entries: Vec<(String, Arc<ProjectInner>)> = {
+            let map = self.projects.lock().await;
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+        if entries.is_empty() {
+            return;
+        }
+        // Signal every still-live project to stop (idempotent) and tear down its
+        // trigger dispatcher, mirroring `stop(name)`.
+        for (name, inner) in &entries {
+            triggers::dispatcher().stop(name).await;
+            if !matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
+                inner.desired_running.store(false, Ordering::Relaxed);
+                // `notify_one` (not `notify_waiters`): it stores a permit when
+                // the reap task hasn't parked on `stop.notified()` yet, so the
+                // stop can't be dropped in the spawn→await race. There is exactly
+                // one reap task per project, and on shutdown a leftover permit is
+                // harmless (the process is exiting; there is no next run to
+                // mis-trigger).
+                inner.stop.notify_one();
+            }
+        }
+        // Wait, bounded, for the reap tasks to land each project in a terminal
+        // phase. Poll rather than join because the run task owns the `Child`.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(STOP_ALL_TIMEOUT_MS);
+        for (name, inner) in &entries {
+            loop {
+                if matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    // Backstop: the run task is stuck or was dropped without
+                    // reaping, so the notify never drove it to a terminal phase.
+                    // Hard-kill the child's process group directly via the stored
+                    // leader pid so we don't orphan the subtree — the exact
+                    // failure this shutdown reap exists to prevent.
+                    let pid = inner.pid.load(Ordering::Relaxed);
+                    tracing::warn!(
+                        project = %name,
+                        pid,
+                        "stop_all: reap timed out before terminal phase; hard-killing process group"
+                    );
+                    // On Windows `kill_group_by_pid` blocks waiting for
+                    // `taskkill` to exit, so run it on a blocking thread to
+                    // avoid stalling the async runtime (a no-op cost on Unix,
+                    // where it is just a `libc::kill` syscall).
+                    tokio::task::spawn_blocking(move || kill_group_by_pid(pid))
+                        .await
+                        .ok();
+                    // Uphold `stop_all`'s "drive every project to a terminal
+                    // phase" contract even on this hard-kill path: the reap task
+                    // never ran, so nothing else will clear the pid or advance
+                    // the phase. Do it here, otherwise `stop_all()` can return
+                    // with the project still marked `Running`, making any
+                    // post-shutdown introspection/logging lie about a process we
+                    // just killed.
+                    inner.pid.store(0, Ordering::Relaxed);
+                    *inner.last_error.lock().await =
+                        Some("stop_all: reap timed out; process group hard-killed".to_string());
+                    *inner.phase.lock().await = Phase::Stopped;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    }
+
     /// Compiles the project into `dist/` — once for the host, or once per
     /// requested target triple for cross-compilation. Streams progress to the
     /// project log channel and resolves when all builds finish.
@@ -11481,6 +11664,138 @@ mod tests {
         assert_eq!(
             reread.scaffolded_from.and_then(|s| s.version),
             Some("2.0.0".into())
+        );
+    }
+
+    /// `stop_all` must reap a running supervised child (and its process group)
+    /// and drive its phase to `Stopped`, so studio runs don't orphan on server
+    /// shutdown. We reproduce a live run: spawn a `sleep` as its own
+    /// process-group leader (as the real run paths do) and wire the same
+    /// stop-notified reap task, then assert `stop_all` kills it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_all_reaps_running_child_process_group() {
+        use std::process::Stdio;
+
+        let sup = ProjectSupervisor {
+            projects: tokio::sync::Mutex::new(HashMap::new()),
+        };
+        let inner = ProjectInner::new();
+        *inner.phase.lock().await = Phase::Running;
+        inner.desired_running.store(true, Ordering::Relaxed);
+
+        // Spawn a long-lived child as its own process-group leader, mirroring
+        // the `process_group(0)` + `kill_on_drop` spawn in `run`/`run_toolchain`.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("child pid") as i32;
+        inner.pid.store(pid as u32, Ordering::Relaxed);
+
+        // The production reap task: SIGKILL the group on stop, then settle phase.
+        let reap_inner = inner.clone();
+        tokio::spawn(async move {
+            let status = tokio::select! {
+                _ = reap_inner.stop.notified() => {
+                    kill_process_group(&mut child);
+                    child.wait().await.ok()
+                }
+                st = child.wait() => st.ok(),
+            };
+            reap_inner.pid.store(0, Ordering::Relaxed);
+            let _ = status;
+            *reap_inner.phase.lock().await = Phase::Stopped;
+        });
+
+        sup.projects
+            .lock()
+            .await
+            .insert("proj".to_string(), inner.clone());
+
+        // Let the reap task park on `stop.notified()` before we signal.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        sup.stop_all().await;
+
+        assert!(
+            matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed),
+            "project should be in a terminal phase after stop_all"
+        );
+        // SIGKILL is uncatchable; the process (and its group) must be gone.
+        // `kill(pid, 0)` returns ESRCH once it's reaped.
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "child process {pid} should have been reaped");
+    }
+
+    /// When the run task is stuck or was dropped without reaping (so the stop
+    /// notify never drives the project to a terminal phase), `stop_all` must
+    /// fall back to hard-killing the stored process group *and* uphold its
+    /// contract: on return the project is in a terminal phase with a cleared
+    /// pid, so post-shutdown introspection can't lie about a process we killed.
+    /// This guards the backstop path (no reap task wired at all).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_all_backstop_hard_kills_and_marks_terminal() {
+        use std::process::Stdio;
+
+        let sup = ProjectSupervisor {
+            projects: tokio::sync::Mutex::new(HashMap::new()),
+        };
+        let inner = ProjectInner::new();
+        *inner.phase.lock().await = Phase::Running;
+        inner.desired_running.store(true, Ordering::Relaxed);
+
+        // Spawn a long-lived group leader, but deliberately wire NO reap task —
+        // simulating a run task that is stuck or was dropped without reaping.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        cmd.process_group(0);
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id().expect("child pid") as i32;
+        inner.pid.store(pid as u32, Ordering::Relaxed);
+        // Keep the handle in scope (do NOT drop or `wait` it) so `kill_on_drop`
+        // can't reap the child before the backstop runs — the backstop must be
+        // what kills the process group.
+
+        sup.projects
+            .lock()
+            .await
+            .insert("proj".to_string(), inner.clone());
+
+        // No reap task will ever land a terminal phase, so `stop_all` must take
+        // the timeout backstop (bounded by STOP_ALL_TIMEOUT_MS).
+        sup.stop_all().await;
+
+        assert!(
+            matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed),
+            "backstop must leave the project in a terminal phase, not Running"
+        );
+        assert_eq!(
+            inner.pid.load(Ordering::Relaxed),
+            0,
+            "backstop must clear the stored pid"
+        );
+        // Verify the backstop actually SIGKILLed the group: reap the child (we
+        // are its parent, so until we `wait` it lingers as a zombie that
+        // `kill(pid, 0)` still reports as live). It must have exited via SIGKILL.
+        use std::os::unix::process::ExitStatusExt;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
+            .await
+            .expect("child should have exited after backstop SIGKILL")
+            .expect("wait child");
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "child {pid} should have been killed by SIGKILL from the backstop"
         );
     }
 }
