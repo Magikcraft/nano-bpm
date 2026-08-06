@@ -556,6 +556,33 @@ fn kill_process_group(child: &mut tokio::process::Child) {
     let _ = child.start_kill();
 }
 
+/// Hard-kills the process group led by `pid` (uncatchable SIGKILL on Unix,
+/// `taskkill /T` tree-kill on Windows). Used only as a shutdown backstop by
+/// [`ProjectSupervisor::stop_all`] when a stuck or dropped run task never reaps
+/// its own `Child` — the run task owns the `Child`, so we can't call
+/// [`kill_process_group`] and must fall back to the stored leader `pid` (spawned
+/// with `process_group(0)`, so `-pid` targets the whole group).
+fn kill_group_by_pid(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: a negative pid signals the process group led by `pid`.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem model
 // ---------------------------------------------------------------------------
@@ -6493,7 +6520,10 @@ impl ProjectSupervisor {
     /// driving the phase to a terminal state. We notify them all, then poll for
     /// those terminal phases up to [`STOP_ALL_TIMEOUT_MS`] so the whole teardown
     /// fits inside c8ctl's SIGTERM→SIGKILL grace window — we do **not** rely on
-    /// `kill_on_drop`, which never fires on an abrupt (non-graceful) exit.
+    /// `kill_on_drop`, which never fires on an abrupt (non-graceful) exit. If a
+    /// run task is stuck or dropped and the deadline is hit, we hard-kill its
+    /// process group directly via the stored leader pid as a backstop so a
+    /// missed reap still can't orphan the subtree.
     pub async fn stop_all(&self) {
         // Snapshot the entries so we never hold the map lock while awaiting
         // child exits (a stuck reap would otherwise deadlock every accessor).
@@ -6510,7 +6540,13 @@ impl ProjectSupervisor {
             triggers::dispatcher().stop(name).await;
             if !matches!(*inner.phase.lock().await, Phase::Stopped | Phase::Crashed) {
                 inner.desired_running.store(false, Ordering::Relaxed);
-                inner.stop.notify_waiters();
+                // `notify_one` (not `notify_waiters`): it stores a permit when
+                // the reap task hasn't parked on `stop.notified()` yet, so the
+                // stop can't be dropped in the spawn→await race. There is exactly
+                // one reap task per project, and on shutdown a leftover permit is
+                // harmless (the process is exiting; there is no next run to
+                // mis-trigger).
+                inner.stop.notify_one();
             }
         }
         // Wait, bounded, for the reap tasks to land each project in a terminal
@@ -6523,7 +6559,18 @@ impl ProjectSupervisor {
                     break;
                 }
                 if std::time::Instant::now() >= deadline {
-                    tracing::warn!(project = %name, "stop_all: reap timed out before terminal phase");
+                    // Backstop: the run task is stuck or was dropped without
+                    // reaping, so the notify never drove it to a terminal phase.
+                    // Hard-kill the child's process group directly via the stored
+                    // leader pid so we don't orphan the subtree — the exact
+                    // failure this shutdown reap exists to prevent.
+                    let pid = inner.pid.load(Ordering::Relaxed);
+                    tracing::warn!(
+                        project = %name,
+                        pid,
+                        "stop_all: reap timed out before terminal phase; hard-killing process group"
+                    );
+                    kill_group_by_pid(pid);
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
