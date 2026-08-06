@@ -323,7 +323,7 @@ impl apis::instances::Instances for ServerImpl {
         _cookies: &CookieJar,
         path_params: &models::GetInstancePathParams,
     ) -> Result<apis::instances::GetInstanceResponse, ()> {
-        match super::instance_detail(self, &path_params.key) {
+        match super::instance_detail(self, &path_params.key).await {
             Some(dto) => {
                 Ok(apis::instances::GetInstanceResponse::Status200_InstanceDetail(from_dto(dto)))
             }

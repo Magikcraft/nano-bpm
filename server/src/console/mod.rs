@@ -1633,9 +1633,52 @@ pub(super) fn instances(server: &ServerImpl, page: i64, page_size: i64) -> Insta
     }
 }
 
+/// The live activation view of a single job, read from the authoritative engine
+/// state (not the read model). Used to overlay the studio-only `Activated`
+/// status — see [`apply_job_activation_overlay`] and [`instance_detail`].
+#[derive(Clone, Debug)]
+struct LiveJob {
+    state: String,
+    worker: Option<String>,
+    deadline_ms: Option<u64>,
+}
+
+/// Overlays live engine job state onto read-model job DTOs (studio-only, nano
+/// enhancement — issue #608).
+///
+/// Job activation is a *volatile* lease that nano deliberately does not journal
+/// or export (see `console::trace`), so the read model shows a leased job as
+/// `Created` until it completes. The engine, however, holds the authoritative
+/// live state. This upgrades a read-model job still shown as `Created` to the
+/// engine's live `Activated` view (state + worker + deadline) when the engine
+/// reports it activated. Every other case is left exactly as the read model has
+/// it: a terminal/failed row is never regressed, and a job the engine no longer
+/// holds (evicted on completion) keeps its read-model state. Pure, so the merge
+/// is unit-testable without an engine.
+fn apply_job_activation_overlay(
+    jobs: &mut [JobDto],
+    live: &std::collections::HashMap<u64, LiveJob>,
+) {
+    for dto in jobs.iter_mut() {
+        if dto.state != "Created" {
+            continue;
+        }
+        let Ok(key) = dto.key.parse::<u64>() else {
+            continue;
+        };
+        if let Some(l) = live.get(&key)
+            && l.state == "Activated"
+        {
+            dto.state = l.state.clone();
+            dto.worker = l.worker.clone();
+            dto.deadline_ms = l.deadline_ms;
+        }
+    }
+}
+
 /// `GET /console/api/instances/{key}` — one instance with its variables, jobs,
 /// and incidents. Returns `None` when the key is malformed or unknown (404).
-pub(super) fn instance_detail(server: &ServerImpl, key: &str) -> Option<InstanceDetailDto> {
+pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<InstanceDetailDto> {
     let key = key.parse::<u64>().ok()?;
     let row = server.store.process_instance(key)?;
 
@@ -1650,7 +1693,7 @@ pub(super) fn instance_detail(server: &ServerImpl, key: &str) -> Option<Instance
         })
         .collect();
 
-    let jobs: Vec<JobDto> = server
+    let mut jobs: Vec<JobDto> = server
         .store
         .jobs()
         .iter()
@@ -1665,6 +1708,43 @@ pub(super) fn instance_detail(server: &ServerImpl, key: &str) -> Option<Instance
             deadline_ms: j.deadline_ms,
         })
         .collect();
+
+    // Studio-only enhancement (#608): surface the live `Activated` lease that the
+    // read model can't see. For jobs still shown as `Created`, ask the owning
+    // partition's engine — the authoritative holder of the volatile activation
+    // lease — for their true state and overlay `Activated` + worker + deadline.
+    // On a non-leader node no handle is found (or the job isn't resident) and the
+    // row stays `Created` (still correct). `POST /jobs/search` is intentionally
+    // NOT overlaid, keeping it at Zeebe parity (Zeebe has no queryable Activated
+    // job state either). A few point lookups, off the hot path.
+    let created_keys: Vec<u64> = jobs
+        .iter()
+        .filter(|d| d.state == "Created")
+        .filter_map(|d| d.key.parse::<u64>().ok())
+        .collect();
+    if !created_keys.is_empty()
+        && let Some(handle) = server.engine_handle_for(nanobpmn_engine_core::partition_of(key))
+    {
+        let live = handle
+            .with(move |journal| {
+                let mut m = std::collections::HashMap::new();
+                for k in created_keys {
+                    if let Some(job) = journal.engine().job(k) {
+                        m.insert(
+                            k,
+                            LiveJob {
+                                state: format!("{:?}", job.state),
+                                worker: job.worker.clone(),
+                                deadline_ms: job.deadline,
+                            },
+                        );
+                    }
+                }
+                m
+            })
+            .await;
+        apply_job_activation_overlay(&mut jobs, &live);
+    }
 
     let incidents: Vec<IncidentDto> = server
         .store
@@ -1689,7 +1769,94 @@ pub(super) fn instance_detail(server: &ServerImpl, key: &str) -> Option<Instance
     })
 }
 
-/// `GET /console/api/traces?limit=N` — recent execution-trace summaries
+#[cfg(test)]
+mod job_activation_overlay_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn job(key: &str, state: &str) -> JobDto {
+        JobDto {
+            key: key.to_string(),
+            element_id: "task".to_string(),
+            job_type: "work".to_string(),
+            state: state.to_string(),
+            retries: 3,
+            worker: None,
+            deadline_ms: None,
+        }
+    }
+
+    fn activated(worker: &str, deadline_ms: u64) -> LiveJob {
+        LiveJob {
+            state: "Activated".to_string(),
+            worker: Some(worker.to_string()),
+            deadline_ms: Some(deadline_ms),
+        }
+    }
+
+    #[test]
+    fn upgrades_created_to_activated_with_worker_and_deadline() {
+        let mut jobs = vec![job("10", "Created")];
+        let mut live = HashMap::new();
+        live.insert(10u64, activated("w1", 5_000));
+        apply_job_activation_overlay(&mut jobs, &live);
+        assert_eq!(jobs[0].state, "Activated");
+        assert_eq!(jobs[0].worker.as_deref(), Some("w1"));
+        assert_eq!(jobs[0].deadline_ms, Some(5_000));
+    }
+
+    #[test]
+    fn leaves_created_untouched_when_engine_has_no_live_entry() {
+        // Engine no longer holds the job (e.g. evicted) — keep the read-model row.
+        let mut jobs = vec![job("10", "Created")];
+        let live: HashMap<u64, LiveJob> = HashMap::new();
+        apply_job_activation_overlay(&mut jobs, &live);
+        assert_eq!(jobs[0].state, "Created");
+        assert!(jobs[0].worker.is_none());
+        assert!(jobs[0].deadline_ms.is_none());
+    }
+
+    #[test]
+    fn leaves_created_when_engine_still_reports_created() {
+        let mut jobs = vec![job("10", "Created")];
+        let mut live = HashMap::new();
+        live.insert(
+            10u64,
+            LiveJob {
+                state: "Created".to_string(),
+                worker: None,
+                deadline_ms: None,
+            },
+        );
+        apply_job_activation_overlay(&mut jobs, &live);
+        assert_eq!(jobs[0].state, "Created");
+    }
+
+    #[test]
+    fn never_regresses_a_terminal_row() {
+        // A completed read-model job must not be overwritten even if a stale live
+        // entry says Activated (guards against any race with eviction ordering).
+        let mut jobs = vec![job("10", "Completed")];
+        let mut live = HashMap::new();
+        live.insert(10u64, activated("w1", 5_000));
+        apply_job_activation_overlay(&mut jobs, &live);
+        assert_eq!(jobs[0].state, "Completed");
+        assert!(jobs[0].worker.is_none());
+    }
+
+    #[test]
+    fn overlays_only_the_matching_keys() {
+        let mut jobs = vec![job("10", "Created"), job("11", "Created")];
+        let mut live = HashMap::new();
+        live.insert(11u64, activated("w2", 9_000));
+        apply_job_activation_overlay(&mut jobs, &live);
+        assert_eq!(jobs[0].state, "Created"); // key 10: no live entry
+        assert_eq!(jobs[1].state, "Activated"); // key 11: upgraded
+        assert_eq!(jobs[1].worker.as_deref(), Some("w2"));
+    }
+}
+
 /// (most-recent first). Backed by the in-memory [`trace::TraceStore`] folded
 /// off the engine event stream (process-optimization design doc §3, Tier A).
 pub(super) fn traces(server: &ServerImpl, limit: usize) -> Vec<trace::TraceSummaryDto> {
