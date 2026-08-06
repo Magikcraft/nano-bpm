@@ -8673,6 +8673,83 @@ fn activate_element(id: &str) -> crate::model::AdHocActivateElement {
     }
 }
 
+fn activate_element_with(
+    id: &str,
+    variables: &[(&str, Value)],
+) -> crate::model::AdHocActivateElement {
+    crate::model::AdHocActivateElement {
+        element_id: id.to_string(),
+        variables: variables
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+    }
+}
+
+/// Regression for Magikcraft/nano-bpm#605: an agent's
+/// `activateElements[{ elementId, variables }]` must scope those `variables`
+/// into the activated tool's OWN job — including tools that declare no
+/// `ioMapping` (the `toolA`/`toolB` fixture tools have none). The reported bug
+/// dropped the seed variables entirely, so a no-mapping tool saw only the
+/// instance-root scope. This asserts the whole defect class: a plain tool AND a
+/// second tool activated in the same turn each receive only their own seed
+/// variables, with no cross-contamination.
+#[test]
+fn adhoc_activation_variables_reach_a_tool_job_without_iomapping() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    // Turn 1: activate both no-ioMapping tools, each with a distinct seed var.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![
+                    activate_element_with("toolA", &[("fromActivation", Value::Str("A".into()))]),
+                    activate_element_with("toolB", &[("fromActivation", Value::Str("B".into()))]),
+                ],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    let tool_a = tool_jobs
+        .iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job emitted");
+    let tool_b = tool_jobs
+        .iter()
+        .find(|j| j.element_id == "toolB")
+        .expect("toolB job emitted");
+
+    assert_eq!(
+        tool_a.variables.get("fromActivation"),
+        Some(&Value::Str("A".into())),
+        "toolA's activation variable must reach its job even with no ioMapping (#605)"
+    );
+    assert_eq!(
+        tool_b.variables.get("fromActivation"),
+        Some(&Value::Str("B".into())),
+        "toolB's activation variable must reach its own job scope (#605)"
+    );
+
+    assert!(
+        !engine.is_completed(inst),
+        "container still parked while the seeded tools run"
+    );
+}
+
 #[test]
 fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
     let mut engine = Engine::new();
