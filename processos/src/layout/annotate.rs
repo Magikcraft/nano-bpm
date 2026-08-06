@@ -549,6 +549,7 @@ mod tests {
             &ElementKind::ServiceTask {
                 job_type: "notify".into(),
                 priority: None,
+                custom_headers: std::collections::BTreeMap::new(),
             },
         );
         assert_eq!(role, Some(Role::Notification));
