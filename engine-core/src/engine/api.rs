@@ -169,8 +169,12 @@ impl Engine {
         let process_definition_key = deployed.map(|d| d.key).unwrap_or(0);
         let process_definition_version = deployed.map(|d| d.version).unwrap_or(0);
         let custom_headers = if matches!(job.kind, state::JobKind::BpmnElement) {
-            match self.element_kind(job.instance_key, &job.element_id) {
-                Some(ElementKind::ServiceTask { custom_headers, .. }) => custom_headers,
+            match self
+                .process_of_instance(job.instance_key)
+                .and_then(|p| p.element(&job.element_id))
+                .map(|e| &e.kind)
+            {
+                Some(ElementKind::ServiceTask { custom_headers, .. }) => custom_headers.clone(),
                 _ => std::collections::BTreeMap::new(),
             }
         } else {
