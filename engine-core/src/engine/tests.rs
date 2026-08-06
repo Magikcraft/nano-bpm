@@ -1637,6 +1637,82 @@ fn missing_retries_declaration_defaults_to_three() {
 }
 
 #[test]
+fn activated_job_carries_custom_headers_and_process_identity() {
+    // A service task's static zeebe:taskHeaders, the owning instance's tags and
+    // business id, and the process-definition identity (bpmnProcessId, key,
+    // version) must all ride on the ActivatedJob worker snapshot — the full
+    // Zeebe ActivatedJob contract, not just key/type/variables.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="charge">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="payment" />
+              <zeebe:taskHeaders>
+                <zeebe:header key="channel" value="card" />
+              </zeebe:taskHeaders>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="charge" />
+          <bpmn:sequenceFlow id="b" sourceRef="charge" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance_full(
+            "p",
+            HashMap::new(),
+            vec!["vip".to_string(), "eu".to_string()],
+            Some("order-42".to_string()),
+        ))
+        .unwrap();
+
+    let deployed = engine.state().processes.get("p").unwrap();
+    let expected_key = deployed.key;
+    let expected_version = deployed.version;
+
+    let activated = engine.activate_jobs("payment", "w1", 10, 60_000, 0);
+    assert_eq!(activated.len(), 1);
+    let job = &activated[0];
+
+    // Custom headers surfaced verbatim.
+    assert_eq!(job.custom_headers.get("channel"), Some(&"card".to_string()));
+    assert_eq!(job.custom_headers.len(), 1);
+    // Process-definition identity.
+    assert_eq!(job.bpmn_process_id, "p");
+    assert_eq!(job.process_definition_key, expected_key);
+    assert_eq!(job.process_definition_version, expected_version);
+    // Instance metadata.
+    assert_eq!(job.tags, vec!["vip".to_string(), "eu".to_string()]);
+    assert_eq!(job.business_id, Some("order-42".to_string()));
+    // Priority defaults to the standard 50 when undeclared.
+    assert_eq!(job.priority, state::DEFAULT_JOB_PRIORITY);
+
+    // The read-back projection (activated_job) must agree with activate_jobs.
+    let projected = engine.activated_job(job.key).unwrap();
+    assert_eq!(projected.custom_headers, job.custom_headers);
+    assert_eq!(projected.bpmn_process_id, "p");
+    assert_eq!(projected.tags, job.tags);
+    assert_eq!(projected.business_id, job.business_id);
+}
+
+#[test]
+fn activated_job_has_empty_custom_headers_when_task_declares_none() {
+    // A service task without zeebe:taskHeaders yields an empty header map — the
+    // conservative default, never a borrowed or synthesised set.
+    let engine = deploy_and_create_retryable(None, HashMap::new());
+    let mut engine = engine;
+    let activated = engine.activate_jobs("do-work", "w1", 10, 60_000, 0);
+    assert_eq!(activated.len(), 1);
+    assert!(activated[0].custom_headers.is_empty());
+}
+
+#[test]
 fn inline_script_task_evaluates_feel_and_writes_result_variable() {
     // A zeebe:script script task evaluates its FEEL expression on activation,
     // stores the result under resultVariable, and passes straight through with

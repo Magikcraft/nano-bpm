@@ -181,6 +181,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // Gates `zeebe:taskListener` reads to a real `zeebe:taskListeners` container
     // (ADR 0037 §6). Task listeners attach to the innermost open user task.
     let mut in_task_listeners = false;
+    // Gates `zeebe:header` reads to a real `zeebe:taskHeaders` container; each
+    // header attaches to the innermost open activity on the io_stack.
+    let mut in_task_headers = false;
 
     for token in &tokens {
         match token {
@@ -631,6 +634,28 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             "ioMapping" => {
                                 in_io_mapping = true;
                             }
+                            "taskHeaders" => {
+                                // A self-closing `<zeebe:taskHeaders />` has no
+                                // nested headers and emits no matching end tag, so
+                                // only enter the container state for a real open
+                                // element — otherwise the flag would stay stuck
+                                // `true` and wrongly capture later `zeebe:header`s.
+                                if !self_closing {
+                                    in_task_headers = true;
+                                }
+                            }
+                            // zeebe:header key="…" value="…" inside a
+                            // zeebe:taskHeaders container: a static custom header
+                            // attached to the innermost open activity. Surfaced
+                            // verbatim on the activated job (Zeebe customHeaders).
+                            "header" if in_task_headers => {
+                                if let (Some(&idx), Some(key)) =
+                                    (io_stack.last(), attr(attrs, "key"))
+                                {
+                                    let value = attr(attrs, "value").unwrap_or("").to_string();
+                                    acc.nodes[idx].task_headers.insert(key.to_string(), value);
+                                }
+                            }
                             "input" | "output" if in_io_mapping => {
                                 if let (Some(&idx), Some(source), Some(target)) = (
                                     io_stack.last(),
@@ -797,6 +822,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     io_stack.pop();
                 }
                 "ioMapping" => in_io_mapping = false,
+                "taskHeaders" => in_task_headers = false,
                 "executionListeners" => in_execution_listeners = false,
                 "taskListeners" => in_task_listeners = false,
                 "startEvent" => cur_start = None,
@@ -1074,6 +1100,10 @@ struct NodeAcc {
     /// Task listeners (`zeebe:taskListener`) declared on this user task, all
     /// event types in one list in declaration order (ADR 0037 §6).
     task_listeners: Vec<crate::model::TaskListener>,
+    /// Static `zeebe:taskHeaders` (`<zeebe:header key value/>`) declared on a
+    /// job-based task, in a deterministic map. Surfaced verbatim on the
+    /// activated job (Zeebe `ActivatedJob.customHeaders`). Empty when none.
+    task_headers: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1187,6 +1217,7 @@ impl ProcessAcc {
             start_listeners: Vec::new(),
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
+            task_headers: std::collections::BTreeMap::new(),
         });
         Some(self.nodes.len() - 1)
     }
@@ -1468,7 +1499,12 @@ impl ProcessAcc {
                         )
                     } else {
                         let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
-                        builder.service_task_with_priority(node.id, job_type, node.job_priority)
+                        builder.service_task_with(
+                            node.id,
+                            job_type,
+                            node.job_priority,
+                            node.task_headers,
+                        )
                     }
                 }
                 NodeKind::User => builder.user_task_with(node.id, node.user_task),
@@ -1878,6 +1914,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "payment".to_string(),
                 priority: None,
+                custom_headers: std::collections::BTreeMap::new(),
             }
         );
         assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
@@ -1944,6 +1981,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "do-work".to_string(),
                 priority: None,
+                custom_headers: std::collections::BTreeMap::new(),
             }
         );
     }
@@ -2003,6 +2041,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "ruler".to_string(),
                 priority: None,
+                custom_headers: std::collections::BTreeMap::new(),
             }
         );
     }
@@ -2063,6 +2102,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "run-script".to_string(),
                 priority: None,
+                custom_headers: std::collections::BTreeMap::new(),
             }
         );
     }
@@ -2108,6 +2148,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "io.camunda.agenticai:aiagent-job-worker:1".to_string(),
                 priority: None,
+                custom_headers: std::collections::BTreeMap::new(),
             }
         );
         assert_eq!(def.element("s").unwrap().outgoing[0].to, "agent");
@@ -2304,6 +2345,98 @@ mod tests {
     }
 
     #[test]
+    fn should_parse_service_task_task_headers_into_custom_headers() {
+        // given: a service task carrying static zeebe:taskHeaders alongside its
+        // taskDefinition, as Camunda 8 emits custom headers. Two headers, given
+        // out of key order, to prove the parser captures every entry (order is
+        // normalised by the BTreeMap).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="charge">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="payment" />
+                  <zeebe:taskHeaders>
+                    <zeebe:header key="retryBackoff" value="PT5S" />
+                    <zeebe:header key="channel" value="card" />
+                  </zeebe:taskHeaders>
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="charge" />
+              <bpmn:sequenceFlow id="b" sourceRef="charge" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: both headers ride on the service task element verbatim.
+        let mut expected = std::collections::BTreeMap::new();
+        expected.insert("channel".to_string(), "card".to_string());
+        expected.insert("retryBackoff".to_string(), "PT5S".to_string());
+        assert_eq!(
+            def.element("charge").unwrap().kind,
+            ElementKind::ServiceTask {
+                job_type: "payment".to_string(),
+                priority: None,
+                custom_headers: expected,
+            }
+        );
+    }
+
+    #[test]
+    fn self_closing_task_headers_do_not_leak_into_later_headers() {
+        // given: a first service task with a self-closing (empty)
+        // `<zeebe:taskHeaders />`, then a second service task whose own
+        // `zeebe:header` sits *outside* any taskHeaders container. A
+        // self-closing start tag emits no matching end tag, so the
+        // `in_task_headers` gate must not stay stuck open across elements.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="first">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="a" />
+                  <zeebe:taskHeaders />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:serviceTask id="second">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="b" />
+                  <zeebe:header key="stray" value="nope" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="first" />
+              <bpmn:sequenceFlow id="f2" sourceRef="first" targetRef="second" />
+              <bpmn:sequenceFlow id="f3" sourceRef="second" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the empty container yields no headers, and the stray header
+        // that follows is *not* captured onto the second task.
+        for id in ["first", "second"] {
+            match &def.element(id).unwrap().kind {
+                ElementKind::ServiceTask { custom_headers, .. } => {
+                    assert!(
+                        custom_headers.is_empty(),
+                        "{id} unexpectedly captured headers: {custom_headers:?}"
+                    );
+                }
+                other => panic!("{id} should be a service task, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn should_parse_service_task_job_priority() {
         // given: a service task carrying a zeebe:priorityDefinition (job priority),
         // alongside its taskDefinition, as Camunda 8.10 emits it.
@@ -2333,6 +2466,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "payment".to_string(),
                 priority: Some("=urgency".to_string()),
+                custom_headers: std::collections::BTreeMap::new(),
             }
         );
     }
@@ -2360,6 +2494,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "payment".to_string(),
                 priority: None,
+                custom_headers: std::collections::BTreeMap::new(),
             }
         );
     }
@@ -2387,6 +2522,7 @@ mod tests {
             ElementKind::ServiceTask {
                 job_type: "work".to_string(),
                 priority: None,
+                custom_headers: std::collections::BTreeMap::new(),
             }
         );
     }

@@ -395,6 +395,14 @@ pub enum ElementKind {
     ServiceTask {
         job_type: String,
         priority: Option<String>,
+        /// Static custom headers declared on the task via `zeebe:taskHeaders`
+        /// (`<zeebe:header key="…" value="…"/>`). Immutable model metadata
+        /// surfaced verbatim on the activated job (Zeebe `ActivatedJob.customHeaders`).
+        /// A `BTreeMap` so the serialized order is deterministic. Empty when the
+        /// task declares no headers and when deserializing definitions written
+        /// before headers were parsed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        custom_headers: BTreeMap<String, String>,
     },
     /// A business rule task bound to a DMN decision via `zeebe:calledDecision`.
     /// On activation the engine evaluates the referenced decision natively
@@ -1385,6 +1393,7 @@ impl ProcessBuilder {
             ElementKind::ServiceTask {
                 job_type: job_type.into(),
                 priority: None,
+                custom_headers: BTreeMap::new(),
             },
         )
     }
@@ -1398,11 +1407,26 @@ impl ProcessBuilder {
         job_type: impl Into<String>,
         priority: Option<String>,
     ) -> Self {
+        self.service_task_with(id, job_type, priority, BTreeMap::new())
+    }
+
+    /// Adds a service task with an optional (raw) `zeebe:priorityDefinition`
+    /// expression and static `zeebe:taskHeaders` — the full job-based service
+    /// task the BPMN parser materialises. The headers ride onto the activated
+    /// job verbatim (Zeebe `ActivatedJob.customHeaders`).
+    pub fn service_task_with(
+        self,
+        id: impl Into<String>,
+        job_type: impl Into<String>,
+        priority: Option<String>,
+        custom_headers: BTreeMap<String, String>,
+    ) -> Self {
         self.add(
             id,
             ElementKind::ServiceTask {
                 job_type: job_type.into(),
                 priority,
+                custom_headers,
             },
         )
     }

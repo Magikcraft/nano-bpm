@@ -421,6 +421,45 @@ pub unsafe extern "C" fn nbpmn_activate_jobs(
             use core::fmt::Write as _;
             let _ = write!(json, "{}", job.retries);
         }
+        json.push_str(",\"bpmnProcessId\":");
+        write_json_string(&mut json, &job.bpmn_process_id);
+        json.push_str(",\"processDefinitionKey\":\"");
+        push_u64(&mut json, job.process_definition_key);
+        json.push_str("\",\"processDefinitionVersion\":");
+        {
+            use core::fmt::Write as _;
+            let _ = write!(json, "{}", job.process_definition_version);
+        }
+        json.push_str(",\"priority\":");
+        {
+            use core::fmt::Write as _;
+            let _ = write!(json, "{}", job.priority);
+        }
+        json.push_str(",\"customHeaders\":{");
+        for (j, (k, v)) in job.custom_headers.iter().enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            write_json_string(&mut json, k);
+            json.push(':');
+            write_json_string(&mut json, v);
+        }
+        json.push_str("},\"tags\":[");
+        for (j, tag) in job.tags.iter().enumerate() {
+            if j > 0 {
+                json.push(',');
+            }
+            write_json_string(&mut json, tag);
+        }
+        json.push(']');
+        // Always emit `businessId` (using `null` when absent) so the C-ABI
+        // activation surface matches the wasm `TestEngine` shape, which
+        // serializes `Option<String>` as `null` rather than dropping the key.
+        json.push_str(",\"businessId\":");
+        match &job.business_id {
+            Some(business_id) => write_json_string(&mut json, business_id),
+            None => json.push_str("null"),
+        }
         json.push_str(",\"variables\":{");
         for (j, (k, v)) in job.variables.iter().enumerate() {
             if j > 0 {
@@ -638,6 +677,9 @@ mod tests {
               <bpmn:serviceTask id="t">
                 <bpmn:extensionElements>
                   <zeebe:taskDefinition type="work" />
+                  <zeebe:taskHeaders>
+                    <zeebe:header key="channel" value="card" />
+                  </zeebe:taskHeaders>
                 </bpmn:extensionElements>
               </bpmn:serviceTask>
               <bpmn:endEvent id="e" />
@@ -677,6 +719,26 @@ mod tests {
             assert!(json.contains("\"worker\":\"w1\""), "no worker: {json}");
             assert!(json.contains("\"retries\":"), "no retries: {json}");
             assert!(json.contains("\"variables\":"), "no variables: {json}");
+            assert!(
+                json.contains("\"customHeaders\":{\"channel\":\"card\"}"),
+                "no custom headers: {json}"
+            );
+            assert!(
+                json.contains("\"bpmnProcessId\":\"p\""),
+                "no bpmnProcessId: {json}"
+            );
+            assert!(
+                json.contains("\"processDefinitionVersion\":1"),
+                "no processDefinitionVersion: {json}"
+            );
+            assert!(json.contains("\"priority\":50"), "no priority: {json}");
+            assert!(json.contains("\"tags\":["), "no tags: {json}");
+            // `businessId` is always emitted (null when absent) so this surface
+            // matches the wasm `TestEngine` job shape.
+            assert!(
+                json.contains("\"businessId\":null"),
+                "businessId should be present as null: {json}"
+            );
             // extract the job key: `"key":"<digits>"`
             let k_start = json.find("\"key\":\"").unwrap() + 7;
             let k_end = k_start + json[k_start..].find('"').unwrap();

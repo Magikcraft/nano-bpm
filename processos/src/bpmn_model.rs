@@ -103,7 +103,9 @@ fn is_task(kind: &ElementKind) -> bool {
 fn kind_extras(kind: &ElementKind) -> serde_json::Map<String, Value> {
     let mut m = serde_json::Map::new();
     match kind {
-        ElementKind::ServiceTask { job_type, priority } => {
+        ElementKind::ServiceTask {
+            job_type, priority, ..
+        } => {
             m.insert("jobType".into(), json!(job_type));
             if let Some(p) = priority {
                 m.insert("priority".into(), json!(p));
@@ -2025,7 +2027,11 @@ fn emit_element(
         ElementKind::EventBasedGateway => {
             out.push_str(&format!("    <bpmn:eventBasedGateway id=\"{eid}\"{na}/>\n"));
         }
-        ElementKind::ServiceTask { job_type, priority } => {
+        ElementKind::ServiceTask {
+            job_type,
+            priority,
+            custom_headers,
+        } => {
             out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:extensionElements>\n");
             let retries_attr = el
@@ -2042,6 +2048,17 @@ fn emit_element(
                     "        <zeebe:priorityDefinition priority=\"{}\"/>\n",
                     xml_escape(p)
                 ));
+            }
+            if !custom_headers.is_empty() {
+                out.push_str("        <zeebe:taskHeaders>\n");
+                for (k, v) in custom_headers {
+                    out.push_str(&format!(
+                        "          <zeebe:header key=\"{}\" value=\"{}\"/>\n",
+                        xml_escape(k),
+                        xml_escape(v)
+                    ));
+                }
+                out.push_str("        </zeebe:taskHeaders>\n");
             }
             emit_io_mapping(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
@@ -3240,6 +3257,7 @@ fn apply_edit_op(
                     kind: ElementKind::ServiceTask {
                         job_type: job_type.to_string(),
                         priority: None,
+                        custom_headers: std::collections::BTreeMap::new(),
                     },
                     name: None,
                     outgoing: moved,
