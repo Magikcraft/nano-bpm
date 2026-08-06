@@ -8667,10 +8667,7 @@ fn adhoc_agent_process() -> ProcessDefinition {
 }
 
 fn activate_element(id: &str) -> crate::model::AdHocActivateElement {
-    crate::model::AdHocActivateElement {
-        element_id: id.to_string(),
-        variables: HashMap::new(),
-    }
+    activate_element_with(id, &[])
 }
 
 fn activate_element_with(
