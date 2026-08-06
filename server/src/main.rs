@@ -4332,6 +4332,25 @@ impl ServerImpl {
                     format!("Job {job_key} has not been activated and cannot be completed."),
                 )),
             ),
+            Err(EngineError::AdHocUnknownElement {
+                instance_key,
+                element_id,
+            }) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Unknown ad-hoc element",
+                400,
+                format!(
+                    "Ad-hoc sub-process in instance {instance_key} has no activatable element with id '{element_id}'."
+                ),
+            ))),
+            Err(EngineError::AdHocActivateWithCompletion { job_key }) => {
+                Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Contradictory ad-hoc completion",
+                    400,
+                    format!(
+                        "Ad-hoc agent job {job_key} cannot both assert the completion condition is fulfilled and activate elements."
+                    ),
+                )))
+            }
             Err(e) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",

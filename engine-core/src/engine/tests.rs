@@ -8800,6 +8800,87 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
     );
 }
 
+/// Regression for Magikcraft/nano-bpm#614 gap 4 (Zeebe parity): an agent's
+/// `activateElements[]` instruction referencing an id that is not one of the
+/// container's tools must be REJECTED (Zeebe returns NOT_FOUND from
+/// `AdHocSubProcessInstructionActivateProcessor`), not silently turned into a
+/// phantom child. The rejection is atomic — a valid tool named in the same
+/// batch is not activated either. This asserts the whole defect class: both a
+/// lone unknown id and an unknown id mixed with a valid one are rejected, and
+/// nothing is left half-applied.
+#[test]
+fn adhoc_rejects_activation_of_unknown_element() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    // A batch mixing a real tool (`toolA`) with an unknown id (`ghost`) is
+    // rejected wholesale — the command fails and no state changes.
+    let err = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA"), activate_element("ghost")],
+                ..Default::default()
+            },
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::AdHocUnknownElement { element_id, .. } if element_id == "ghost"),
+        "unknown activate-element id must be rejected (NOT_FOUND parity), got {err:?}"
+    );
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        0,
+        "atomic rejection: the valid `toolA` in the same batch is not activated"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the agent job was not consumed; the container is still parked"
+    );
+
+    // The agent job is still activatable/completable: a corrected instruction
+    // (only real tools) now succeeds.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .expect("a corrected instruction naming only real tools succeeds");
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the corrected instruction activated `toolA`"
+    );
+}
+
 #[test]
 fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
     let mut engine = Engine::new();
@@ -9373,10 +9454,57 @@ fn adhoc_tool_io_mapping_applies_inputs_on_activation_and_outputs_on_completion(
 }
 
 #[test]
-fn adhoc_agent_completion_flag_completes_without_activating_and_cancels() {
-    // The agent's `isCompletionConditionFulfilled` flag ends the loop even when it
-    // also returns activate-element instructions: the container completes at once
-    // and no tool is activated.
+fn adhoc_agent_completion_flag_with_activations_is_rejected() {
+    // Zeebe parity (#614 gap 4): asserting `isCompletionConditionFulfilled`
+    // while ALSO returning activate-element instructions is contradictory. The
+    // JOB_WORKER completion path rejects it with INVALID_ARGUMENT
+    // (JobCompleteProcessor.checkAdHocSubProcessCompletionConditionNotFulfilled
+    // ForElementActivation). nano previously silently superseded the
+    // activations and completed the container; it now rejects the command so
+    // the agent must resubmit a coherent turn.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+    let err = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&err, EngineError::AdHocActivateWithCompletion { .. }),
+        "completion flag + activations is rejected (INVALID_ARGUMENT parity), got {err:?}"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the rejected command leaves the container running"
+    );
+    assert!(
+        engine.activate_jobs("tool", "W", 10, 1_000, 0).is_empty(),
+        "no tool was activated by the rejected turn"
+    );
+    let _ = container;
+}
+
+#[test]
+fn adhoc_agent_completion_flag_alone_completes_and_cancels() {
+    // The `isCompletionConditionFulfilled` flag on its own (no activations) ends
+    // the loop: the container completes at once and any in-flight tool is
+    // cancelled. This is the non-contradictory sibling of the rejection test
+    // above.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(adhoc_agent_process()))
@@ -9393,7 +9521,6 @@ fn adhoc_agent_completion_flag_completes_without_activating_and_cancels() {
             agent.key,
             HashMap::new(),
             crate::model::AdHocJobResult {
-                activate_elements: vec![activate_element("toolA")],
                 completion_condition_fulfilled: true,
                 ..Default::default()
             },
@@ -9410,10 +9537,9 @@ fn adhoc_agent_completion_flag_completes_without_activating_and_cancels() {
             .unwrap_or(true),
         "runtime state torn down; no tool left active"
     );
-    // No `tool` job was ever created — the activate instruction was superseded.
     assert!(
         engine.activate_jobs("tool", "W", 10, 1_000, 0).is_empty(),
-        "the completion flag supersedes the activate-element instruction"
+        "no tool job was created"
     );
     let _ = container;
 }

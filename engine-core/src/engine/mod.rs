@@ -939,6 +939,40 @@ impl Engine {
                     }
                 }
 
+                // Ad-hoc agent job completion (ADR 0023 seam 2 / #614 gap 4):
+                // validate the activate-element instructions up-front so a bad
+                // turn is rejected wholesale (Zeebe parity) before any
+                // `JobCompleted` or activation side effect applies. The check
+                // only fires for a container's agent job (its element id is in
+                // the ad-hoc catalog); the tools' own jobs are not, so they fall
+                // through unchanged.
+                if let Some(result) = adhoc_result.as_ref() {
+                    if let Some(def) = self.adhoc_def_of(instance_key, &element_id) {
+                        // Every activated id must name one of the container's
+                        // tools (Zeebe NOT_FOUND, checked first — see
+                        // JobCompleteProcessor.checkAdHocSubprocessActivationTargetsAreValid);
+                        // otherwise the loop would mint a phantom child that
+                        // immediately completes.
+                        for instr in &result.activate_elements {
+                            if !def.tools.iter().any(|t| t.element_id == instr.element_id) {
+                                return Err(EngineError::AdHocUnknownElement {
+                                    instance_key,
+                                    element_id: instr.element_id.clone(),
+                                });
+                            }
+                        }
+                        // Asserting the completion condition is fulfilled while
+                        // also requesting activations is contradictory (Zeebe
+                        // INVALID_ARGUMENT — checkAdHocSubProcessCompletionCondition
+                        // NotFulfilledForElementActivation).
+                        if result.completion_condition_fulfilled
+                            && !result.activate_elements.is_empty()
+                        {
+                            return Err(EngineError::AdHocActivateWithCompletion { job_key });
+                        }
+                    }
+                }
+
                 self.emit(
                     &mut log,
                     Event::JobCompleted {
@@ -6407,6 +6441,18 @@ pub enum EngineError {
     /// A `creating` task listener tried to correct the assignee of a user task
     /// that already declares an initial assignee (ADR 0037 §6, Zeebe parity).
     TaskListenerAssigneeCorrectionOnCreating { user_task_key: Key },
+    /// An ad-hoc sub-process agent's `activateElements[]` instruction referenced
+    /// an element id that is not one of the container's tools. Zeebe rejects the
+    /// activation with NOT_FOUND (`AdHocSubProcessInstructionActivateProcessor`).
+    AdHocUnknownElement {
+        instance_key: Key,
+        element_id: String,
+    },
+    /// An ad-hoc sub-process agent asserted `completionConditionFulfilled` while
+    /// also requesting new element activations in the same turn. The two are
+    /// contradictory; Zeebe rejects with INVALID_ARGUMENT
+    /// (`AdHocSubProcessUtils.verifyCompletionConditionFulfilled`).
+    AdHocActivateWithCompletion { job_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -6501,6 +6547,21 @@ impl std::fmt::Display for EngineError {
                 write!(
                     f,
                     "a creating task listener cannot correct the assignee of user task {user_task_key}: it already has an initial assignee"
+                )
+            }
+            EngineError::AdHocUnknownElement {
+                instance_key,
+                element_id,
+            } => {
+                write!(
+                    f,
+                    "ad-hoc sub-process in instance {instance_key} has no activatable element with id {element_id}"
+                )
+            }
+            EngineError::AdHocActivateWithCompletion { job_key } => {
+                write!(
+                    f,
+                    "ad-hoc agent job {job_key} cannot both assert the completion condition is fulfilled and activate elements"
                 )
             }
         }
