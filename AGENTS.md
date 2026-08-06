@@ -164,8 +164,9 @@ same as committing to `main` — a PR sits open until a human or agent deliberat
 merges it:
 
 <!-- Machine-readable merge protocol (consumed by Merlin / any merge-driving agent —
-     jwulf/urban-pr-review#43). Keep this block in sync with the prose below: it is the
-     single source of truth automation reads to land a PR here. -->
+     jwulf/urban-pr-review#43). This block is the single, AUTHORITATIVE source of truth
+     automation reads to land a PR here; the prose below is a human-readable gloss that
+     may lag and never overrides this block. Update this block first, then the prose. -->
 ```merge-protocol
 {
   "autoMerge": false,
@@ -173,17 +174,15 @@ merges it:
   "waitForChecks": true,
   "land": { "method": "mergify-queue", "comment": "@mergifyio queue" },
   "requiredChecks": [
-    "rustfmt (pinned nightly)",
-    "engine-core (clippy + test)",
-    "engine-wasm-ffi (dist + verify)",
-    "server (clippy + test)",
-    "@nanobpm/nano-bernd (build + test)",
-    "io.github.jwulf:nano-bernd (JVM, Chicory)",
-    "processos (clippy + test)"
+    { "name": "rustfmt (pinned nightly)", "acceptedConclusions": ["success"] },
+    { "name": "engine-core (clippy + test)", "acceptedConclusions": ["success"] },
+    { "name": "engine-wasm-ffi (dist + verify)", "acceptedConclusions": ["success"] },
+    { "name": "server (clippy + test)", "acceptedConclusions": ["success"] },
+    { "name": "@nanobpm/nano-bernd (build + test)", "acceptedConclusions": ["success"] },
+    { "name": "io.github.jwulf:nano-bernd (JVM, Chicory)", "acceptedConclusions": ["success"] },
+    { "name": "processos (clippy + test)", "acceptedConclusions": ["success", "skipped"] }
   ],
-  "skippedOkChecks": [
-    "processos (clippy + test)"
-  ],
+  "checksSemantics": "Every entry in requiredChecks gates the merge and must reach one of its acceptedConclusions. 'processos (clippy + test)' is change-gated in ci.yml and skipped for PRs that don't touch its inputs; a skipped check never reports success, so it accepts 'skipped' too (required-when-run, skip-tolerant). This mirrors .mergify.yml success_conditions (check-success OR check-skipped for processos).",
   "doc": "AGENTS.md#merging-prs"
 }
 ```
