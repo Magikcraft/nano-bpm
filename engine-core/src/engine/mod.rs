@@ -3314,7 +3314,9 @@ impl Engine {
 
         match kind {
             // A service task creates a job and parks the token.
-            Some(ElementKind::ServiceTask { job_type, priority }) => {
+            Some(ElementKind::ServiceTask {
+                job_type, priority, ..
+            }) => {
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(&element_vars, &job_type);
                 let priority = self.resolve_priority(&element_vars, priority.as_deref());
@@ -3884,7 +3886,9 @@ impl Engine {
         ];
         let mut followups = Vec::new();
         match self.element_kind(instance_key, &element_id) {
-            Some(ElementKind::ServiceTask { job_type, priority }) => {
+            Some(ElementKind::ServiceTask {
+                job_type, priority, ..
+            }) => {
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(&child_vars, &job_type);
                 let priority = self.resolve_priority(&child_vars, priority.as_deref());
@@ -5855,7 +5859,9 @@ impl Engine {
         element_id: String,
     ) -> (Vec<Event>, Vec<Step>) {
         match self.element_kind(instance_key, &element_id) {
-            Some(ElementKind::ServiceTask { job_type, priority }) => {
+            Some(ElementKind::ServiceTask {
+                job_type, priority, ..
+            }) => {
                 let job_key = self.mint_key();
                 // The element instance is already active (this is an incident
                 // retry), so resolve its FEEL attributes against its own applied
@@ -6472,12 +6478,35 @@ pub struct ActivatedJob {
     pub instance_key: Key,
     pub element_instance_key: Key,
     pub element_id: String,
+    /// The BPMN process id of the job's process definition (Zeebe
+    /// `ActivatedJob.bpmnProcessId`).
+    pub bpmn_process_id: String,
+    /// The key of the job's process definition (Zeebe
+    /// `ActivatedJob.processDefinitionKey`).
+    pub process_definition_key: Key,
+    /// The version of the job's process definition (Zeebe
+    /// `ActivatedJob.processDefinitionVersion`).
+    pub process_definition_version: i32,
     /// The worker the job was locked to.
     pub worker: String,
     /// Logical instant at which the activation lock expires.
     pub deadline: u64,
     /// Remaining retries for this job.
     pub retries: i32,
+    /// Activation priority (higher is activated first; Zeebe
+    /// `ActivatedJob.priority`).
+    pub priority: i32,
+    /// Static custom headers declared on the task via `zeebe:taskHeaders`,
+    /// surfaced verbatim (Zeebe `ActivatedJob.customHeaders`). Empty for jobs
+    /// that are not ordinary BPMN-element jobs or whose task declares none. A
+    /// `BTreeMap` for deterministic serialization order.
+    pub custom_headers: std::collections::BTreeMap<String, String>,
+    /// User-defined tags on the owning process instance (Zeebe
+    /// `ActivatedJob.tags`).
+    pub tags: Vec<String>,
+    /// The owning process instance's business id, if any (Zeebe
+    /// `ActivatedJob.businessId`).
+    pub business_id: Option<String>,
     /// A snapshot of the instance's variables at activation time. Shared via
     /// `Arc` with the engine's instance state, so activation does not deep-clone
     /// the (up to 50 KB) value tree on the single command thread; the response

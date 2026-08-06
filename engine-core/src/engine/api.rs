@@ -121,19 +121,9 @@ impl Engine {
                     worker,
                     deadline,
                     ..
-                } => self.job(*job_key).map(|job| ActivatedJob {
-                    key: job.key,
-                    job_type: job.job_type.clone(),
-                    instance_key: job.instance_key,
-                    element_instance_key: job.element_instance_key,
-                    element_id: job.element_id.clone(),
-                    worker: worker.clone(),
-                    deadline: *deadline,
-                    retries: job.retries,
-                    variables: self
-                        .variables_for_element(job.instance_key, job.element_instance_key),
-                    kind: job.kind,
-                }),
+                } => self
+                    .job(*job_key)
+                    .map(|job| self.project_activated_job(job, worker.clone(), *deadline)),
                 _ => None,
             })
             .collect()
@@ -146,18 +136,65 @@ impl Engine {
     /// to followers) and the projection for the worker happens in a separate read
     /// on the leader. Mirrors the projection inside [`Engine::activate_jobs`].
     pub fn activated_job(&self, job_key: Key) -> Option<ActivatedJob> {
-        self.job(job_key).map(|job| ActivatedJob {
+        self.job(job_key).map(|job| {
+            self.project_activated_job(
+                job,
+                job.worker.clone().unwrap_or_default(),
+                job.deadline.unwrap_or(0),
+            )
+        })
+    }
+
+    /// Builds the [`ActivatedJob`] worker snapshot for `job`, joining the
+    /// immutable process-definition identity (`bpmnProcessId`,
+    /// `processDefinitionKey`/`version`) and the owning instance's `tags` /
+    /// `businessId`, plus the task's static `zeebe:taskHeaders` — the full Zeebe
+    /// `ActivatedJob` contract. All of it is derived from state at projection
+    /// time (no journaled fields), so the log stays byte-identical. Custom
+    /// headers are surfaced only for ordinary BPMN-element jobs (execution- and
+    /// task-listener jobs carry their own, unparsed headers in Zeebe, so nano
+    /// leaves them empty rather than borrow the underlying element's).
+    fn project_activated_job(
+        &self,
+        job: &state::Job,
+        worker: String,
+        deadline: u64,
+    ) -> ActivatedJob {
+        let instance = self.instance(job.instance_key);
+        let bpmn_process_id = instance.map(|i| i.process_id.clone()).unwrap_or_default();
+        let (tags, business_id) = instance
+            .map(|i| (i.tags.clone(), i.business_id.clone()))
+            .unwrap_or_default();
+        let deployed = instance.and_then(|i| self.state.processes.get(&i.process_id));
+        let process_definition_key = deployed.map(|d| d.key).unwrap_or(0);
+        let process_definition_version = deployed.map(|d| d.version).unwrap_or(0);
+        let custom_headers = if matches!(job.kind, state::JobKind::BpmnElement) {
+            match self.element_kind(job.instance_key, &job.element_id) {
+                Some(ElementKind::ServiceTask { custom_headers, .. }) => custom_headers,
+                _ => std::collections::BTreeMap::new(),
+            }
+        } else {
+            std::collections::BTreeMap::new()
+        };
+        ActivatedJob {
             key: job.key,
             job_type: job.job_type.clone(),
             instance_key: job.instance_key,
             element_instance_key: job.element_instance_key,
             element_id: job.element_id.clone(),
-            worker: job.worker.clone().unwrap_or_default(),
-            deadline: job.deadline.unwrap_or(0),
+            bpmn_process_id,
+            process_definition_key,
+            process_definition_version,
+            worker,
+            deadline,
             retries: job.retries,
+            priority: job.priority,
+            custom_headers,
+            tags,
+            business_id,
             variables: self.variables_for_element(job.instance_key, job.element_instance_key),
             kind: job.kind,
-        })
+        }
     }
     /// making it activatable again. Like [`Engine::trigger_timers`], the host
     /// drives this periodically; the engine never reads a clock. Returns the

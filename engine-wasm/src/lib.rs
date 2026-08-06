@@ -295,32 +295,49 @@ impl TestEngine {
             now,
         })
         .map_err(|e| js_err(&format!("activate error: {e}")))?;
-        let state = self.engine.state();
-        let mut out: Vec<serde_json::Value> = state
-            .jobs
-            .values()
-            .filter(|j| {
-                j.job_type == job_type
-                    && j.state == JobState::Activated
-                    && j.worker.as_deref() == Some(worker)
-            })
+        // Collect the just-activated job keys, then project each through the
+        // engine's canonical `ActivatedJob` snapshot so the console TestEngine
+        // surfaces the same Zeebe field set as the server/FFI paths (custom
+        // headers, process-definition identity, tags, priority).
+        let keys: Vec<_> = {
+            let state = self.engine.state();
+            let mut keys: Vec<_> = state
+                .jobs
+                .values()
+                .filter(|j| {
+                    j.job_type == job_type
+                        && j.state == JobState::Activated
+                        && j.worker.as_deref() == Some(worker)
+                })
+                .map(|j| j.key)
+                .collect();
+            keys.sort_unstable();
+            keys
+        };
+        let out: Vec<serde_json::Value> = keys
+            .iter()
+            .filter_map(|k| self.engine.activated_job(*k))
             .map(|j| {
-                let vars = state
-                    .instances
-                    .get(&j.instance_key)
-                    .map(|i| vars_to_json(&i.variables))
-                    .unwrap_or_default();
                 serde_json::json!({
                     "key": j.key.to_string(),
                     "type": j.job_type,
                     "instanceKey": j.instance_key.to_string(),
+                    "elementInstanceKey": j.element_instance_key.to_string(),
                     "elementId": j.element_id,
+                    "bpmnProcessId": j.bpmn_process_id,
+                    "processDefinitionKey": j.process_definition_key.to_string(),
+                    "processDefinitionVersion": j.process_definition_version,
+                    "worker": j.worker,
                     "retries": j.retries,
-                    "variables": vars,
+                    "deadline": j.deadline,
+                    "priority": j.priority,
+                    "customHeaders": j.custom_headers,
+                    "tags": j.tags,
+                    "businessId": j.business_id,
+                    "variables": vars_to_json(&j.variables),
                 })
             })
             .collect();
-        out.sort_by(|a, b| a["key"].as_str().cmp(&b["key"].as_str()));
         to_json(&serde_json::Value::Array(out))
     }
 
