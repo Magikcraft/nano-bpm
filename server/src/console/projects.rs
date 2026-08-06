@@ -571,6 +571,10 @@ fn kill_process_group(child: &mut tokio::process::Child) {
 /// its own `Child` — the run task owns the `Child`, so we can't call
 /// [`kill_process_group`] and must fall back to the stored leader `pid` (spawned
 /// with `process_group(0)`, so `-pid` targets the whole group).
+///
+/// On Windows this blocks waiting for `taskkill` to exit so its status is
+/// observed, so callers in async contexts must run it on a blocking thread
+/// (e.g. [`tokio::task::spawn_blocking`]).
 fn kill_group_by_pid(pid: u32) {
     if pid == 0 {
         return;
@@ -611,21 +615,35 @@ fn kill_group_by_pid(pid: u32) {
     }
     #[cfg(windows)]
     {
-        // Mirror the Unix path: a spawn failure here means we couldn't even
-        // attempt to reap the tree, which can silently leave the process
-        // subtree running even though `stop_all` will mark the project
-        // `Stopped`. Surface it so shutdown reaping failures are visible.
-        if let Err(err) = std::process::Command::new("taskkill")
+        // Mirror the Unix path: wait for `taskkill` to finish and surface any
+        // failure, because both a spawn failure (couldn't even launch) and a
+        // non-success exit (e.g. access denied, tree partly gone) can silently
+        // leave the process subtree running even though `stop_all` will mark
+        // the project `Stopped`. We block on `.status()` rather than fire-and-
+        // forget `.spawn()` so the exit code is actually observed; the caller
+        // runs us on a blocking thread (`spawn_blocking`), so this wait does
+        // not stall the async runtime.
+        match std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn()
+            .status()
         {
-            tracing::warn!(
-                pid,
-                error = %err,
-                "kill_group_by_pid: failed to spawn taskkill; process tree may be orphaned"
-            );
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                tracing::warn!(
+                    pid,
+                    code = ?status.code(),
+                    "kill_group_by_pid: taskkill exited non-success; process tree may be orphaned"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    pid,
+                    error = %err,
+                    "kill_group_by_pid: failed to spawn taskkill; process tree may be orphaned"
+                );
+            }
         }
     }
 }
@@ -6617,7 +6635,13 @@ impl ProjectSupervisor {
                         pid,
                         "stop_all: reap timed out before terminal phase; hard-killing process group"
                     );
-                    kill_group_by_pid(pid);
+                    // On Windows `kill_group_by_pid` blocks waiting for
+                    // `taskkill` to exit, so run it on a blocking thread to
+                    // avoid stalling the async runtime (a no-op cost on Unix,
+                    // where it is just a `libc::kill` syscall).
+                    tokio::task::spawn_blocking(move || kill_group_by_pid(pid))
+                        .await
+                        .ok();
                     // Uphold `stop_all`'s "drive every project to a terminal
                     // phase" contract even on this hard-kill path: the reap task
                     // never ran, so nothing else will clear the pid or advance
