@@ -289,9 +289,10 @@ function homeHtml() {
 <section class="hero">
   <p class="eyebrow"><span class="arp">Advanced Research Prototype</span></p>
   <h1>Agentic Orchestration<br>for the <span class="grad">Developer Workstation.</span></h1>
+  <p class="subhead">Graphs that run the loops.</p>
   <p class="lede">A RAAD — Rapid Agentic Application Development — environment that runs on
   your machine. Compose coding agents, tools, and human approvals into durable workflows.
-  Code-first or Model-first, provider-agnostic, and small enough to start on a Raspberry Pi.</p>
+  Code-first or Model-first Graphs, provider-agnostic, and small enough to start on a Raspberry Pi.</p>
   <div class="cta">
     <a class="btn primary" href="#try">See it live ↓</a>
     <a class="btn ghost" href="/demo/">Open the browser demo →</a>
@@ -304,7 +305,7 @@ function homeHtml() {
 </section>
 
 <section id="try" class="demo-tabs wrap">
-  <h2 class="tabs-title">Code-first <span class="grad">or</span> Model-first.</h2>
+  <h2 class="tabs-title">Code-first <span class="grad">or</span> Model-first Graphs.</h2>
   <p class="tabs-sub">One app — two authoring surfaces, the same engine.</p>
   <div class="tablist" role="tablist" aria-label="Authoring surface">
     <button class="tab" role="tab" id="tab-code" aria-controls="panel-code" aria-selected="true" tabindex="0">Code-first</button>
@@ -347,7 +348,7 @@ function homeHtml() {
     <p class="proof">Author once. Nano derives the rest.</p>
   </article>
   <article>
-    <h3>Code-first or Model-first</h3>
+    <h3>Code-first or Model-first Graphs</h3>
     <p>Write the workflow as code, or draw it as BPMN — the same durable engine runs both. Switch
     surfaces without re-platforming; the model and the code are two views of one runtime.</p>
     <p class="proof">Same engine. Same app. Your choice of surface.</p>
@@ -547,7 +548,8 @@ function homePage(title, body) {
     text-transform: uppercase; letter-spacing: 0.18em; font-size: .78rem; font-weight: 700;
     color: var(--sky); margin: 0 0 1rem;
   }
-  .hero h1 { font-size: clamp(2.2rem, 5.6vw, 3.7rem); margin: 0 0 1.2rem; font-weight: 700; }
+  .hero h1 { font-size: clamp(2.2rem, 5.6vw, 3.7rem); margin: 0 0 .6rem; font-weight: 700; }
+  .subhead { font-size: clamp(1.2rem, 2.8vw, 1.55rem); color: var(--ink); font-weight: 600; max-width: 40rem; margin: 0 auto 1.6rem; letter-spacing: -0.01em; }
   .grad {
     background: linear-gradient(90deg, var(--emerald), var(--sky));
     -webkit-background-clip: text; background-clip: text; color: transparent;
