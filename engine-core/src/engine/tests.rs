@@ -8695,7 +8695,7 @@ fn activate_element_with(
 /// second tool activated in the same turn each receive only their own seed
 /// variables, with no cross-contamination.
 #[test]
-fn adhoc_activation_variables_reach_a_tool_job_without_iomapping() {
+fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(adhoc_agent_process()))
@@ -8724,6 +8724,11 @@ fn adhoc_activation_variables_reach_a_tool_job_without_iomapping() {
         .unwrap();
 
     let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(
+        tool_jobs.len(),
+        2,
+        "exactly the two activated tools emit jobs — no duplicates or extras (#605)"
+    );
     let tool_a = tool_jobs
         .iter()
         .find(|j| j.element_id == "toolA")
