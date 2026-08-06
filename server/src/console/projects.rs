@@ -239,7 +239,16 @@ const LOG_RING_CAP: usize = 1000;
 /// supervised child process group to be reaped on shutdown. Kept comfortably
 /// under c8ctl's 8s SIGTERM→SIGKILL grace window so the reap (plus the HTTP
 /// graceful shutdown) completes before c8ctl escalates to SIGKILL.
+#[cfg(not(test))]
 const STOP_ALL_TIMEOUT_MS: u64 = 5_000;
+
+/// Under test we deliberately exercise the timeout backstop
+/// (`stop_all_backstop_hard_kills_and_marks_terminal`), so use a much shorter
+/// bound to keep the suite fast while still preserving the production 5s bound
+/// above. 250ms is comfortably longer than the 20ms poll interval, so the
+/// backstop still fires only after a genuine timeout.
+#[cfg(test)]
+const STOP_ALL_TIMEOUT_MS: u64 = 250;
 
 /// The config file name at the root of every project.
 pub const CONFIG_FILE: &str = "nanobpm.project.json";
@@ -602,11 +611,22 @@ fn kill_group_by_pid(pid: u32) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        // Mirror the Unix path: a spawn failure here means we couldn't even
+        // attempt to reap the tree, which can silently leave the process
+        // subtree running even though `stop_all` will mark the project
+        // `Stopped`. Surface it so shutdown reaping failures are visible.
+        if let Err(err) = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
-            .spawn();
+            .spawn()
+        {
+            tracing::warn!(
+                pid,
+                error = %err,
+                "kill_group_by_pid: failed to spawn taskkill; process tree may be orphaned"
+            );
+        }
     }
 }
 
