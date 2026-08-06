@@ -163,6 +163,28 @@ This repository does **not** auto-merge pull requests. Opening a PR is *not* the
 same as committing to `main` — a PR sits open until a human or agent deliberately
 merges it:
 
+<!-- Machine-readable merge protocol (consumed by Merlin / any merge-driving agent —
+     jwulf/urban-pr-review#43). Keep this block in sync with the prose below: it is the
+     single source of truth automation reads to land a PR here. -->
+```merge-protocol
+{
+  "autoMerge": false,
+  "freshHeadRun": "ready-or-reopen",
+  "waitForChecks": true,
+  "land": { "method": "mergify-queue", "comment": "@mergifyio queue" },
+  "requiredChecks": [
+    "rustfmt (pinned nightly)",
+    "engine-core (clippy + test)",
+    "engine-wasm-ffi (dist + verify)",
+    "server (clippy + test)",
+    "@nanobpm/nano-bernd (build + test)",
+    "io.github.jwulf:nano-bernd (JVM, Chicory)",
+    "processos (clippy + test)"
+  ],
+  "doc": "AGENTS.md#merging-prs"
+}
+```
+
 - Merge is a manual act. CI runs **once when the PR is opened**; follow-up pushes
   (review-fix commits) deliberately do **not** re-run CI, to keep review cycles
   cheap. So the recommended flow is: **open the PR as a draft** (`gh pr create
