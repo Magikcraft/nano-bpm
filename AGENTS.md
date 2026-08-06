@@ -181,6 +181,9 @@ merges it:
     "io.github.jwulf:nano-bernd (JVM, Chicory)",
     "processos (clippy + test)"
   ],
+  "skippedOkChecks": [
+    "processos (clippy + test)"
+  ],
   "doc": "AGENTS.md#merging-prs"
 }
 ```
