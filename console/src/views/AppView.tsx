@@ -73,6 +73,11 @@ export default function AppView() {
       setError(
         typeof err === "string" ? err : "Failed to load the app's status.",
       );
+      // A non-404 failure (offline/500) tells us nothing about whether the app
+      // still exists, so clear any stale not-found state from a prior 404 —
+      // otherwise a transient error after a real 404 would keep rendering the
+      // "no longer exists" screen indefinitely.
+      setNotFound(false);
       return;
     }
     setRunState(data.runState);
