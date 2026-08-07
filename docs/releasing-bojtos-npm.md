@@ -71,9 +71,12 @@ so neither can slip through unnoticed:
   `engine-core/**`, `engine-wasm/src/**` or `engine-wasm/pkg.package.json` has
   changed since the last `bojtos-npm-v*` tag but the version hasn't been bumped
   past it. In other words: once the engine moves, an *unreleased* version bump
-  must always be pending. The **first** engine change after a release bumps
-  `0.x.0 → 0.(x+1).0`; later changes pass until that version is actually tagged
-  and released, after which they must bump again. Cut the pending release with
+  must always be pending — the pending `pkg.package.json` version must be
+  **strictly greater** than the last published `bojtos-npm-v*` tag (a patch bump
+  like `0.3.0 → 0.3.1` is enough; the guard compares with `sort -V`, so any
+  higher version passes). The **first** engine change after a release must cross
+  that threshold; later changes pass until that version is actually tagged and
+  released, after which they must bump again. Cut the pending release with
   `make release-engine-wasm`.
 
 - **Surface gap (engine gained a capability the wrapper doesn't expose).** A
