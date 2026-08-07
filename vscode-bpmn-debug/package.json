@@ -11,7 +11,7 @@
   "type": "commonjs",
   "main": "./dist/extension.js",
   "categories": ["Debuggers"],
-  "activationEvents": ["onDebugResolve:nanobpmn"],
+  "activationEvents": ["onDebugResolve:nanobpmn", "onCommand:nanobpmn.showDiagram"],
   "contributes": {
     "commands": [
       {
@@ -72,7 +72,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.20.1",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "~1.85.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.5.0",
     "vitest": "^2.1.0"
