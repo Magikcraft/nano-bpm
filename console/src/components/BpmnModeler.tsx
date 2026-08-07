@@ -1,4 +1,11 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useRef,
+  useState,
+} from "react";
 import Modeler from "bpmn-js/lib/Modeler";
 import {
   BpmnPropertiesPanelModule,
@@ -292,6 +299,20 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
     const containerRef = useRef<HTMLDivElement>(null);
     const panelRef = useRef<HTMLDivElement>(null);
     const modelerRef = useRef<Modeler | null>(null);
+    // Collapsible properties panel. Persist the collapsed/expanded choice in
+    // localStorage — same convention as `nano.railCollapsed` in App.tsx — so it
+    // survives reloads. The panel div stays mounted while collapsed (bpmn-js
+    // keeps its `propertiesPanel.parent`); only its width is clipped to 0.
+    const [panelCollapsed, setPanelCollapsed] = useState<boolean>(
+      () => localStorage.getItem("nano.bpmnPropertiesCollapsed") === "1",
+    );
+    const togglePanel = useCallback(() => {
+      setPanelCollapsed((prev) => {
+        const next = !prev;
+        localStorage.setItem("nano.bpmnPropertiesCollapsed", next ? "1" : "0");
+        return next;
+      });
+    }, []);
     // Set once the modeler has been destroyed, so async work that was already
     // in flight (an import, the initial createDiagram) doesn't touch a dead
     // instance — diagram-js throws "reading 'root-0'" when operated on after
@@ -804,10 +825,41 @@ const BpmnModeler = forwardRef<BpmnModelerHandle, BpmnModelerProps>(
       // divider) regardless of the console theme to keep diagrams legible.
       <div className="flex h-full w-full">
         <div ref={containerRef} className="h-full min-w-0 flex-1 bg-white" />
-        <div
-          ref={panelRef}
-          className="bpmn-properties h-full w-80 shrink-0 overflow-auto border-l border-[#d4d4d8] bg-white"
-        />
+        <div className="relative flex h-full shrink-0">
+          <button
+            type="button"
+            onClick={togglePanel}
+            title={
+              panelCollapsed ? "Show properties panel" : "Hide properties panel"
+            }
+            aria-label={
+              panelCollapsed ? "Show properties panel" : "Hide properties panel"
+            }
+            aria-expanded={!panelCollapsed}
+            className="absolute left-0 top-2 z-10 -translate-x-full rounded-l border border-r-0 border-[#d4d4d8] bg-white p-1 text-[#52525b] shadow-sm hover:bg-[#f4f4f5]"
+          >
+            <svg
+              className={`h-4 w-4 ${panelCollapsed ? "rotate-180" : ""}`}
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <path d="M9 6l6 6-6 6" />
+            </svg>
+          </button>
+          <div
+            ref={panelRef}
+            className={`bpmn-properties h-full overflow-auto bg-white ${
+              panelCollapsed
+                ? "w-0 overflow-hidden border-l-0"
+                : "w-80 border-l border-[#d4d4d8]"
+            }`}
+          />
+        </div>
       </div>
     );
   },
