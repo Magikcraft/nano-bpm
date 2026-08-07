@@ -124,9 +124,11 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },
         Command::UpdateJobTimeout { .. } => Surface::NotSurfaced {
-            reason: "job-activation lock extension; the virtual clock never expires an \
-                     activation mid-test, so there is nothing to extend. Surface if the \
-                     modeler grows long-poll semantics.",
+            reason: "extends a job-activation lock deadline; the modeler test engine exposes \
+                     no long-poll job-lease API to extend (jobs are activated and completed \
+                     synchronously), so there is no held lock to prolong even though the \
+                     virtual clock's ExpireJobs can retire deadlines. Surface if the modeler \
+                     grows long-poll activation semantics.",
         },
         Command::OpenMessageSubscription { .. } => Surface::NotSurfaced {
             reason: "internal subscription lifecycle the engine drives itself; not a user op",

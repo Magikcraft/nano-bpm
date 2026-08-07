@@ -306,10 +306,21 @@ engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guar
 
 .PHONY: release-engine-wasm
 release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-v<pkg version> on the current commit and push it (CI OIDC-publishes). Run on `main` after the version bump + `make console-wasm` have merged.
-	@tmpl=$$(node -p "require('$(PROJECT_ROOT)/engine-wasm/pkg.package.json').version"); \
+	@set -eu; \
+	tmpl=$$(node -p "require('$(PROJECT_ROOT)/engine-wasm/pkg.package.json').version"); \
 	built=$$(node -p "require('$(PROJECT_ROOT)/engine-wasm/pkg/package.json').version"); \
+	if [ -z "$$tmpl" ] || [ -z "$$built" ]; then \
+	  echo "could not read engine-wasm package version(s) — aborting"; exit 1; \
+	fi; \
 	if [ "$$tmpl" != "$$built" ]; then \
 	  echo "version mismatch: pkg.package.json=$$tmpl but pkg/package.json=$$built — run 'make console-wasm' first"; exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+	  echo "working tree is dirty — commit or stash before releasing (release must tag a clean tree)"; exit 1; \
+	fi; \
+	git fetch -q origin main; \
+	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/main)" ]; then \
+	  echo "HEAD is not origin/main — cut the release from the merged main commit"; exit 1; \
 	fi; \
 	tag="bojtos-npm-v$$tmpl"; \
 	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
