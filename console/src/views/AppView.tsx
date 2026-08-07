@@ -40,6 +40,10 @@ function streamTone(stream: ProjectLogLine["stream"]): string {
   return "text-fg";
 }
 
+// A log line tagged with a stable, monotonically-assigned React key so the
+// capped buffer can trim its front without reshuffling existing rows' keys.
+type KeyedLogLine = ProjectLogLine & { _key: number };
+
 export default function AppView() {
   const { name = "" } = useParams<{ name: string }>();
   const [runState, setRunState] = useState<RunState | null>(null);
@@ -48,8 +52,13 @@ export default function AppView() {
   const [error, setError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [logs, setLogs] = useState<ProjectLogLine[]>([]);
+  const [logs, setLogs] = useState<KeyedLogLine[]>([]);
   const logRef = useRef<HTMLDivElement | null>(null);
+  // Monotonic id source for stable React keys: assigning a per-line id on
+  // ingest means trimming the front of the capped buffer never shifts an
+  // existing line's key, so React re-renders only the changed rows instead of
+  // re-mounting the whole list.
+  const logKeyRef = useRef(0);
 
   const refresh = useCallback(async () => {
     // Use the non-throwing client so we can inspect the HTTP status: the
@@ -89,7 +98,7 @@ export default function AppView() {
         // before the push so the array settles at exactly 2000, not 2001.
         const next =
           prev.length >= 2000 ? prev.slice(prev.length - 1999) : prev.slice();
-        next.push(line);
+        next.push({ ...line, _key: logKeyRef.current++ });
         return next;
       });
     });
@@ -356,8 +365,8 @@ export default function AppView() {
               No output yet. Start the app to see logs.
             </p>
           ) : (
-            logs.map((l, i) => (
-              <div key={i} className={streamTone(l.stream)}>
+            logs.map((l) => (
+              <div key={l._key} className={streamTone(l.stream)}>
                 {l.text}
               </div>
             ))
