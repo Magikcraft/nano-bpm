@@ -9297,6 +9297,113 @@ fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
     );
 }
 
+/// Gap #9 (issue #614): each activated ad-hoc tool must run beneath a dedicated
+/// `AD_HOC_SUB_PROCESS_INNER_INSTANCE` element (id `<container>#innerInstance`),
+/// exactly as Zeebe's `BpmnAdHocSubProcessBehavior.createInnerInstance` nests
+/// `container → innerInstance → tool`. On `main` nano activates the tool child
+/// directly under the container (`scopes[child] == container`), so the
+/// read-model element-instance tree is one level too shallow and cannot be
+/// migrated/queried like a Zeebe process. This asserts the whole defect class:
+/// (a) two tools activated in one turn each get their OWN inner instance whose
+/// scope is the container and whose element id is the inner-instance id;
+/// (b) the tool child's scope is its inner instance (not the container); and
+/// (c) completing a tool tears its inner instance down too, leaving no dangling
+/// element instance in the read model.
+#[test]
+fn adhoc_tools_run_under_a_dedicated_inner_instance_element() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    // Turn 1: activate both tools.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool_jobs.len(), 2, "both tools produced jobs");
+
+    for job in &tool_jobs {
+        let child = job.element_instance_key;
+        // (b) the tool child hangs off an inner instance, NOT the container.
+        let inner = engine.instance(inst).unwrap().scopes.get(&child).copied();
+        let inner = inner.expect("tool child has a read-model scope");
+        assert_ne!(
+            inner, container,
+            "tool child's scope is a dedicated inner instance, not the container"
+        );
+        // (a) the inner instance is scoped to the container and carries the
+        // `<container>#innerInstance` element id.
+        assert_eq!(
+            engine.instance(inst).unwrap().scopes.get(&inner).copied(),
+            Some(container),
+            "inner instance is scoped to the container"
+        );
+        assert_eq!(
+            engine.instance(inst).unwrap().active.get(&inner).cloned(),
+            Some("agent#innerInstance".to_string()),
+            "inner instance carries the ad-hoc inner-instance element id"
+        );
+    }
+
+    // Each tool got its OWN inner instance (no sharing).
+    let inners: Vec<Key> = tool_jobs
+        .iter()
+        .map(|j| {
+            engine
+                .instance(inst)
+                .unwrap()
+                .scopes
+                .get(&j.element_instance_key)
+                .copied()
+                .unwrap()
+        })
+        .collect();
+    assert_ne!(
+        inners[0], inners[1],
+        "each tool gets its own inner instance"
+    );
+
+    // (c) completing a tool tears its inner instance down — no dangling
+    // element instance survives in the read model.
+    let first = tool_jobs[0].element_instance_key;
+    let first_inner = inners[0];
+    let mut vars = HashMap::new();
+    vars.insert("result".to_string(), Value::Str("A".to_string()));
+    engine
+        .apply_command(Command::complete_job_with(tool_jobs[0].key, vars))
+        .unwrap();
+    let live = engine.instance(inst).unwrap();
+    assert!(
+        !live.active.contains_key(&first_inner),
+        "the completed tool's inner instance is torn down"
+    );
+    assert!(
+        !live.active.contains_key(&first),
+        "the completed tool child is torn down"
+    );
+    assert!(
+        !live.scopes.contains_key(&first_inner),
+        "the inner instance leaves no read-model scope entry behind"
+    );
+}
+
 /// Gap #1 (issue #614): a native **user-task** tool must execute, not silently
 /// pass through. Activating one has to create a real user task and PARK the
 /// child inside the container scope until it is completed via `CompleteUserTask`

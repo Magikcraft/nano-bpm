@@ -4662,7 +4662,32 @@ impl Engine {
             }
         }
 
+        // Each tool runs beneath a dedicated `AD_HOC_SUB_PROCESS_INNER_INSTANCE`
+        // element (Zeebe `BpmnAdHocSubProcessBehavior.createInnerInstance`): the
+        // container's direct child in the element-instance tree is this inner
+        // instance, and the tool child hangs off it. This is a read-model
+        // (element-instance tree) nesting only — the inner instance opens no
+        // variable scope, so the child's variable scope stays parented straight to
+        // the container (`AdHocToolActivated` below), keeping variable resolution
+        // and the activate-element loop byte-identical. The inner instance's id is
+        // the container id with the `#innerInstance` postfix Zeebe uses.
+        let inner_key = self.mint_key();
+        let inner_element_id = container_element_id
+            .as_deref()
+            .map(adhoc_inner_instance_id)
+            .unwrap_or_else(|| adhoc_inner_instance_id(&element_id));
         let mut events = vec![
+            Event::ElementActivating {
+                instance_key,
+                element_instance_key: inner_key,
+                element_id: inner_element_id.clone(),
+            },
+            Event::ElementActivated {
+                instance_key,
+                element_instance_key: inner_key,
+                element_id: inner_element_id,
+                scope: container_key,
+            },
             Event::ElementActivating {
                 instance_key,
                 element_instance_key: child_key,
@@ -4672,7 +4697,7 @@ impl Engine {
                 instance_key,
                 element_instance_key: child_key,
                 element_id: element_id.clone(),
-                scope: container_key,
+                scope: inner_key,
             },
             Event::AdHocToolActivated {
                 instance_key,
@@ -4783,6 +4808,7 @@ impl Engine {
         child_eik: Key,
         element_id: String,
         container_key: Key,
+        inner_key: Key,
     ) -> (Vec<Event>, Vec<Step>) {
         let tool_element_id = element_id;
         let (output_element, output_collection, active_now, container_element_id) = match self
@@ -4856,6 +4882,16 @@ impl Engine {
         // its scope down when the caller applies these events, so any read of the
         // child scope (output mappings / completion condition below) must precede
         // that application (it does — events are batched, state is read live).
+        //
+        // The tool's dedicated inner instance (gap #9) completes WITH the child
+        // (Zeebe `AdHocSubProcessInnerInstanceProcessor.afterExecutionPath
+        // Completed`) so the read-model element-instance tree leaves nothing
+        // dangling once the tool drains. This teardown is emitted here — after the
+        // type guard — not at the top, so a deferred (incident-parked) tool keeps
+        // its inner wrapper alive for the retry-on-resolve re-drive.
+        let inner_element_id = self
+            .element_id_of_instance(instance_key, inner_key)
+            .unwrap_or_default();
         let mut events = vec![
             Event::ElementCompleting {
                 instance_key,
@@ -4866,6 +4902,16 @@ impl Engine {
                 instance_key,
                 element_instance_key: child_eik,
                 element_id: tool_element_id.clone(),
+            },
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key: inner_key,
+                element_id: inner_element_id.clone(),
+            },
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key: inner_key,
+                element_id: inner_element_id,
             },
             Event::AdHocToolCompleted {
                 instance_key,
@@ -5061,9 +5107,28 @@ impl Engine {
 
         let mut events = Vec::new();
         // Cancel any tools still running (a cancel-remaining-instances request).
+        // Each active tool child hangs off a dedicated inner instance, so tearing
+        // the child down also tears down its inner instance — otherwise the
+        // read-model element-instance tree would leak an orphaned inner instance.
         if cancel {
             for child in &active {
+                let inner = self.scope_of(instance_key, *child);
                 events.extend(self.cancel_mi_child_events(instance_key, *child));
+                if inner != 0 && inner != container_key {
+                    let inner_element_id = self
+                        .element_id_of_instance(instance_key, inner)
+                        .unwrap_or_default();
+                    events.push(Event::ElementCompleting {
+                        instance_key,
+                        element_instance_key: inner,
+                        element_id: inner_element_id.clone(),
+                    });
+                    events.push(Event::ElementCompleted {
+                        instance_key,
+                        element_instance_key: inner,
+                        element_id: inner_element_id,
+                    });
+                }
             }
         }
         // The output collection propagates OUT of the container to its enclosing
@@ -5232,22 +5297,32 @@ impl Engine {
             return self.complete_mi_child(instance_key, element_instance_key, element_id, scope);
         }
 
-        // A completing element instance that is a directly-activated ad-hoc tool
-        // (its scope is an ad-hoc container and it is in that container's active
-        // set): its completion feeds the container's output collection and the
-        // activate-element loop rather than taking an outgoing flow. (v1 supports
-        // single-activity tools; a tool that is a multi-element sub-graph is a
-        // deferred refinement — see ADR 0023 §Subset.)
-        if scope != 0
-            && self
-                .state
-                .instances
-                .get(&instance_key)
-                .and_then(|i| i.adhoc_instances.get(&scope))
-                .map(|a| a.active.contains(&element_instance_key))
-                .unwrap_or(false)
-        {
-            return self.complete_adhoc_tool(instance_key, element_instance_key, element_id, scope);
+        // A completing element instance that is an ad-hoc tool: it hangs off an
+        // `AD_HOC_SUB_PROCESS_INNER_INSTANCE` whose own scope is the ad-hoc
+        // container that still lists the tool child active. Its completion feeds
+        // the container's output collection and the activate-element loop rather
+        // than taking an outgoing flow, and tears the inner instance down with it.
+        // (v1 supports single-activity tools; a tool that is a multi-element
+        // sub-graph is a deferred refinement — see ADR 0023 §Subset.)
+        if scope != 0 {
+            let container = self.scope_of(instance_key, scope);
+            if container != 0
+                && self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.adhoc_instances.get(&container))
+                    .map(|a| a.active.contains(&element_instance_key))
+                    .unwrap_or(false)
+            {
+                return self.complete_adhoc_tool(
+                    instance_key,
+                    element_instance_key,
+                    element_id,
+                    container,
+                    scope,
+                );
+            }
         }
 
         if matches!(
@@ -6735,6 +6810,19 @@ fn sorted_referenced_vars(condition: &str) -> Vec<String> {
         .collect();
     vars.sort();
     vars
+}
+
+/// The postfix Zeebe appends to an ad-hoc sub-process id to form its
+/// `AD_HOC_SUB_PROCESS_INNER_INSTANCE` element id
+/// (`ZeebeConstants.AD_HOC_SUB_PROCESS_INNER_INSTANCE_ID_POSTFIX`). Kept as the
+/// single source of truth so the engine (which mints inner instances) and the
+/// read model (which stamps their element type) agree.
+pub const ADHOC_INNER_INSTANCE_ID_POSTFIX: &str = "#innerInstance";
+
+/// The element id of the `AD_HOC_SUB_PROCESS_INNER_INSTANCE` that nests the tools
+/// of the ad-hoc container `container_element_id`.
+pub fn adhoc_inner_instance_id(container_element_id: &str) -> String {
+    format!("{container_element_id}{ADHOC_INNER_INSTANCE_ID_POSTFIX}")
 }
 
 /// Removes from `map` every entity owned by `instance_key`, returning them. Used
