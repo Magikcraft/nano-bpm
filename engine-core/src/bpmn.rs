@@ -1437,6 +1437,7 @@ impl ProcessAcc {
                 if let Some(pos) = nearest_adhoc(&n.id).and_then(|c| index.get(&c).copied()) {
                     adhoc_catalog[pos].tools.push(crate::model::AdHocTool {
                         element_id: n.id.clone(),
+                        name: n.name.clone().unwrap_or_default(),
                         kind,
                         io: n.io.clone(),
                     });

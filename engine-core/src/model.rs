@@ -799,6 +799,12 @@ pub enum AdHocToolKind {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AdHocTool {
     pub element_id: ElementId,
+    /// The tool's BPMN `name` attribute (empty if none). Retained on the catalog
+    /// (like `io`) because the tool element is pruned from the executable graph;
+    /// surfaced to the agent in the advertised `adHocSubProcessElements` catalog
+    /// as `elementName` so the agent can present a human-readable tool list.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub name: String,
     pub kind: AdHocToolKind,
     /// The tool's own `zeebe:ioMapping` (empty if none). Retained on the catalog
     /// because the tool element is pruned from the executable graph, so the

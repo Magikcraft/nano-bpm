@@ -146,6 +146,11 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             reason:
                 "engine-internal message/timer start dispatch; instances start via createInstance",
         },
+        Command::ActivateAdHocActivities { .. } => Surface::NotSurfaced {
+            reason:
+                "external ad-hoc activity activation is a server/REST seam; the studio wasm engine \
+                 drives ad-hoc tools through the agent-job path, not this direct command",
+        },
     }
 }
 

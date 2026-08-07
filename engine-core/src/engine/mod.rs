@@ -3461,6 +3461,45 @@ impl Engine {
                         output_collection: def.output_collection.clone(),
                         output_element: def.output_element.clone(),
                     });
+                    // Advertise the tool catalog to the agent (Camunda
+                    // `AdHocSubProcessProcessor.onActivate` writes the local var
+                    // `adHocSubProcessElements`): a list of `{ elementId,
+                    // elementName }`, one per activatable tool in document order,
+                    // so the agent can discover which tools it may activate. It is
+                    // written LOCAL to the container scope (registered in
+                    // `activate`), so it rides the agent job's variable snapshot
+                    // without leaking to the parent instance. Per-tool
+                    // documentation / `zeebe:properties` / `fromAi` parameter
+                    // schema are not parsed by nano yet (deferred; see #614).
+                    let entries: Vec<Value> = def
+                        .tools
+                        .iter()
+                        .filter(|t| {
+                            // Only advertise activatable ad-hoc tools. The parser
+                            // captures known non-activatable inner nodes (e.g.
+                            // gateways) as `AdHocToolKind::Other`; excluding them
+                            // keeps the advertised catalog at Zeebe parity so the
+                            // agent never sees entries it cannot activate.
+                            !matches!(t.kind, crate::model::AdHocToolKind::Other)
+                        })
+                        .map(|t| {
+                            Value::Map(
+                                [
+                                    ("elementId".to_string(), Value::Str(t.element_id.clone())),
+                                    ("elementName".to_string(), Value::Str(t.name.clone())),
+                                ]
+                                .into_iter()
+                                .collect(),
+                            )
+                        })
+                        .collect();
+                    let mut catalog_var = HashMap::new();
+                    catalog_var.insert("adHocSubProcessElements".to_string(), Value::List(entries));
+                    events.push(Event::ScopedVariablesUpdated {
+                        instance_key,
+                        scope_key: element_instance_key,
+                        variables: catalog_var,
+                    });
                 }
                 // Arm timers/subscriptions for every attached boundary event.
                 events.extend(self.arm_boundary_events(
