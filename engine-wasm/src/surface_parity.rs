@@ -38,7 +38,10 @@ use nanobpmn_engine_core::Command;
 
 /// How a given [`Command`] variant relates to the `TestEngine` wasm surface.
 pub(crate) enum Surface {
-    /// Exposed to the modeler via the named `TestEngine` method (the JS name).
+    /// Exposed to the modeler via the named `TestEngine` method(s) — the JS
+    /// name(s). Usually a single method; when one command is surfaced through
+    /// more than one JS entry point this is their names joined with `/`
+    /// (e.g. `advanceTime/tickNow`, which both fan out to the same command).
     Surfaced { js_method: &'static str },
     /// Deliberately not exposed, with the rationale. Revisit if the modeler ever
     /// needs it — this is a "not yet / not here", never a hard "never".

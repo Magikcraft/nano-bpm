@@ -555,8 +555,10 @@ jobs:
             exit 1
           fi
 
-          # Has the wasm-relevant source moved since the last release?
-          if git diff --quiet "$last_tag" -- engine-core engine-wasm/src engine-wasm/pkg.package.json; then
+          # Has the wasm-relevant source moved since the last release? Cargo.toml
+          # / Cargo.lock are inputs too: a dependency or feature change alters the
+          # produced wasm without touching engine-core or engine-wasm/src.
+          if git diff --quiet "$last_tag" -- engine-core engine-wasm/src engine-wasm/Cargo.toml engine-wasm/Cargo.lock engine-wasm/pkg.package.json; then
             echo "engine-wasm inputs unchanged since $last_tag (v$last_ver) — ok"
             exit 0
           fi
