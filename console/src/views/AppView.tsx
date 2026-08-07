@@ -281,10 +281,30 @@ export default function AppView() {
   const canEmbed = !headless && status === "running";
   // Headless apps have no App tab; coerce the active tab to logs for them.
   const activeTab: "app" | "logs" = headless ? "logs" : tab;
-  // Path the app declares for its landing view; drop the leading slash so it
-  // maps onto the reverse-proxy wildcard `/console/app-view/<name>/<rest>`.
-  const appPath = (appUi?.path ?? "/").replace(/^\/+/, "");
-  const appSrc = `/console/app-view/${encodeURIComponent(name)}/${appPath}`;
+  // The app's declared landing path is resolved *within* its own app-view
+  // namespace, and may not escape it. A manifest `path` like `../../console/api`
+  // would otherwise resolve (in the browser) to an arbitrary same-origin console
+  // route and point the iframe there, so we resolve the path against the
+  // app-view base and keep it only when the result still lives under that base.
+  const appViewBase = `/console/app-view/${encodeURIComponent(name)}/`;
+  const appSrc = (() => {
+    const rawPath = (appUi?.path ?? "/").replace(/^\/+/, "");
+    try {
+      const resolved = new URL(
+        rawPath,
+        `${window.location.origin}${appViewBase}`,
+      );
+      if (
+        resolved.origin === window.location.origin &&
+        resolved.pathname.startsWith(appViewBase)
+      ) {
+        return resolved.pathname + resolved.search + resolved.hash;
+      }
+    } catch {
+      // Malformed path ⇒ fall back to the app-view root below.
+    }
+    return appViewBase;
+  })();
   const btn =
     "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50";
 
