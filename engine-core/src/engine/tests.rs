@@ -9156,6 +9156,236 @@ fn adhoc_agent_completion_flag_completes_without_activating_and_cancels() {
     let _ = container;
 }
 
+// --- ADR 0023 v1.1: declarative (BPMN_TASK) ad-hoc sub-process --------------
+
+fn adhoc_declarative_process() -> ProcessDefinition {
+    // A declarative ad-hoc container: no `zeebe:taskDefinition` (so it is NOT a
+    // job worker), only a `zeebe:adHoc activeElementsCollection` FEEL expression
+    // naming the inner elements to activate. Each tool captures its `result` into
+    // the container's `outputCollection` ("results").
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="sub">
+            <bpmn:extensionElements>
+              <zeebe:adHoc activeElementsCollection="=tools" outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="sub" />
+          <bpmn:sequenceFlow id="f2" sourceRef="sub" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+fn create_instance_with_vars(
+    engine: &mut Engine,
+    process_id: &str,
+    variables: HashMap<String, Value>,
+) -> Key {
+    engine
+        .apply_command(Command::CreateInstance {
+            process_id: process_id.to_string(),
+            variables,
+            tags: Vec::new(),
+            business_id: None,
+        })
+        .unwrap()
+        .iter()
+        .find_map(|e| e.instance_key())
+        .unwrap()
+}
+
+#[test]
+fn adhoc_declarative_activates_collection_elements_without_a_job() {
+    // The defect class: a declarative (BPMN_TASK) ad-hoc container is parsed but
+    // never executed — on `main` it is minted as a plain job (job type = its id)
+    // and its `activeElementsCollection` is ignored, so no inner element runs.
+    // On the branch it evaluates the collection and activates those elements
+    // directly, minting no container job.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_declarative_process()))
+        .unwrap();
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "p",
+        HashMap::from([(
+            "tools".to_string(),
+            Value::List(vec![
+                Value::Str("toolA".to_string()),
+                Value::Str("toolB".to_string()),
+            ]),
+        )]),
+    );
+
+    // No job is minted for the container itself (it is declarative, not a job
+    // worker). On `main` a "sub" job would exist here.
+    assert!(
+        engine.activate_jobs("sub", "W", 10, 1_000, 0).is_empty(),
+        "a declarative ad-hoc container mints no job"
+    );
+
+    // Both collection elements activated immediately as real element instances
+    // inside the container scope, each parked on its own `tool` job.
+    let container = *engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .keys()
+        .next()
+        .expect("container runtime state registered");
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        2,
+        "both named elements active with no agent turn"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "container parks while tools run"
+    );
+
+    // Drain the two tool jobs, each producing a `result`. When the last drains,
+    // the declarative container completes (no agent job re-emitted), writes its
+    // `outputCollection`, and takes its outgoing flow to the end event.
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool_jobs.len(), 2, "both named tools produced jobs");
+    let mut final_events = Vec::new();
+    for (job, val) in tool_jobs.iter().zip(["A", "B"]) {
+        let mut vars = HashMap::new();
+        vars.insert("result".to_string(), Value::Str(val.to_string()));
+        final_events = engine
+            .apply_command(Command::complete_job_with(job.key, vars))
+            .unwrap();
+    }
+    assert!(
+        engine.is_completed(inst),
+        "container completes once its collection drains → instance done"
+    );
+    // No agent job is ever re-emitted for a declarative container.
+    assert!(
+        engine.activate_jobs("sub", "W", 10, 1_000, 0).is_empty(),
+        "declarative container never re-emits a container job"
+    );
+    let results = final_events.iter().find_map(|e| match e {
+        Event::VariablesUpdated { variables, .. } => variables.get("results").cloned(),
+        _ => None,
+    });
+    let mut got = match results {
+        Some(Value::List(v)) => v,
+        other => panic!("expected outputCollection list, got {other:?}"),
+    };
+    got.sort_by_key(|v| match v {
+        Value::Str(s) => s.clone(),
+        _ => String::new(),
+    });
+    assert_eq!(
+        got,
+        vec![Value::Str("A".to_string()), Value::Str("B".to_string())],
+        "outputCollection holds both tool results"
+    );
+}
+
+#[test]
+fn adhoc_declarative_empty_collection_completes_immediately() {
+    // A declarative container whose collection evaluates to an empty list has
+    // nothing to run and completes at once, flowing on to the end event — it must
+    // not park forever waiting on a non-existent job.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_declarative_process()))
+        .unwrap();
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "p",
+        HashMap::from([("tools".to_string(), Value::List(vec![]))]),
+    );
+    assert!(
+        engine.is_completed(inst),
+        "an empty active-elements collection completes the container immediately"
+    );
+    assert!(
+        engine.activate_jobs("tool", "W", 10, 1_000, 0).is_empty(),
+        "no tool was activated"
+    );
+    assert!(
+        engine.activate_jobs("sub", "W", 10, 1_000, 0).is_empty(),
+        "no container job was minted"
+    );
+}
+
+#[test]
+fn adhoc_declarative_ignores_unknown_collection_ids() {
+    // An id in the collection that is not one of the container's inner elements
+    // is not activatable (nano prunes inner tools from the executable graph), so
+    // it is dropped rather than minting a phantom child. Only the real element
+    // runs. (Raising the Camunda NOT_FOUND incident is a separate validation
+    // gap.)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_declarative_process()))
+        .unwrap();
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "p",
+        HashMap::from([(
+            "tools".to_string(),
+            Value::List(vec![
+                Value::Str("toolA".to_string()),
+                Value::Str("ghost".to_string()),
+            ]),
+        )]),
+    );
+    let container = *engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .keys()
+        .next()
+        .expect("container runtime state registered");
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "only the real element activated; the unknown id was dropped"
+    );
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(tool_jobs.len(), 1, "exactly one tool ran");
+    engine
+        .apply_command(Command::complete_job(tool_jobs[0].key))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "container completes after its one tool"
+    );
+}
+
 // --- Execution listeners (ADR 0037) -----------------------------------------
 
 use crate::model::{ExecutionListener, ListenerEventType};

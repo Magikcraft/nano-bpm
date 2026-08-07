@@ -3317,6 +3317,59 @@ impl Engine {
             Some(ElementKind::ServiceTask {
                 job_type, priority, ..
             }) => {
+                // A declarative ad-hoc container (Camunda BPMN_TASK /
+                // `activeElementsCollection`) is NOT a job worker: on activation
+                // it evaluates the FEEL collection to the inner element ids and
+                // activates them directly — no job is minted, and the container
+                // completes once those elements drain (ADR 0023 v1.1;
+                // `AdHocSubProcessProcessor.readActivateElementsCollection`). The
+                // agentic JOB_WORKER variant keeps the job-worker path below.
+                let declarative_adhoc = adhoc_def
+                    .as_ref()
+                    .map(|d| d.impl_type == crate::model::AdHocImplementationType::BpmnTask)
+                    .unwrap_or(false);
+                if declarative_adhoc {
+                    let def = adhoc_def
+                        .as_ref()
+                        .expect("declarative_adhoc implies adhoc_def is Some");
+                    events.push(Event::AdHocActivated {
+                        instance_key,
+                        container_key: element_instance_key,
+                        element_id: element_id.clone(),
+                        output_collection: def.output_collection.clone(),
+                        output_element: def.output_element.clone(),
+                    });
+                    let ids = def
+                        .active_elements_collection
+                        .as_deref()
+                        .map(|expr| self.eval_adhoc_active_elements(expr, &element_vars, def))
+                        .unwrap_or_default();
+                    for id in &ids {
+                        followups.push(Step::ActivateAdHocTool {
+                            instance_key,
+                            container_key: element_instance_key,
+                            element_id: id.clone(),
+                            variables: HashMap::new(),
+                        });
+                    }
+                    // An empty collection has nothing to run: the container
+                    // completes at once, exactly as Camunda completes an ad-hoc
+                    // sub-process whose active-elements collection is empty.
+                    if ids.is_empty() {
+                        followups.push(Step::CompleteAdHoc {
+                            instance_key,
+                            container_key: element_instance_key,
+                            cancel: false,
+                        });
+                    }
+                    events.extend(self.arm_boundary_events(
+                        instance_key,
+                        element_instance_key,
+                        scope,
+                        &element_id,
+                    ));
+                    return (events, followups);
+                }
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(&element_vars, &job_type);
                 let priority = self.resolve_priority(&element_vars, priority.as_deref());
@@ -4346,6 +4399,36 @@ impl Engine {
     /// passes straight through to completion (which feeds the loop). v1 targets
     /// single-activity tools (service/connector tasks); richer tool sub-graphs
     /// are a deferred refinement.
+    /// Evaluates a declarative ad-hoc container's `activeElementsCollection` FEEL
+    /// expression to the ordered inner element ids to activate (Camunda BPMN_TASK
+    /// variant; `AdHocSubProcessProcessor.readActivateElementsCollection`
+    /// evaluates it as an array of strings). Only ids that exist in the
+    /// container's tool catalog are kept: nano prunes inner tools from the
+    /// executable graph, so an id absent from the catalog is not an activatable
+    /// element — activating it would mint a phantom child. A non-list result, a
+    /// non-string entry, or an unknown id is dropped here (v1.1 does not yet raise
+    /// the Camunda `EXTRACT_VALUE_ERROR`/`NOT_FOUND` incident — tracked as the
+    /// validation/rejection gaps).
+    fn eval_adhoc_active_elements(
+        &self,
+        expr: &str,
+        vars: &HashMap<String, Value>,
+        def: &crate::model::AdHocSubProcessDef,
+    ) -> Vec<String> {
+        let names: std::collections::HashSet<&str> =
+            def.tools.iter().map(|t| t.element_id.as_str()).collect();
+        match crate::feel::eval(expr, vars) {
+            Ok(Value::List(items)) => items
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::Str(s) if names.contains(s.as_str()) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
     fn activate_adhoc_tool(
         &mut self,
         instance_key: Key,
@@ -4556,6 +4639,24 @@ impl Engine {
         // applied), so the last tool of the turn is the one leaving one active.
         let others = active_now.saturating_sub(1);
         if others == 0 {
+            // The declarative (BPMN_TASK) variant activates its collection once
+            // and completes when those elements drain — there is no agent to
+            // re-emit a job for (ADR 0023 v1.1). The agentic (JOB_WORKER) variant
+            // re-emits its job so the agent decides the next turn.
+            let declarative = self
+                .adhoc_def_of(instance_key, &container_element_id)
+                .map(|d| d.impl_type == crate::model::AdHocImplementationType::BpmnTask)
+                .unwrap_or(false);
+            if declarative {
+                return (
+                    events,
+                    vec![Step::CompleteAdHoc {
+                        instance_key,
+                        container_key,
+                        cancel: false,
+                    }],
+                );
+            }
             // Every tool this turn has drained: re-emit the agent job so the agent
             // inspects the accumulated results and decides the next turn (activate
             // more tools, or signal completion).
