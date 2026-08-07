@@ -304,6 +304,20 @@ engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest in
 engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)
 	cd $(WASM_DIR) && cargo check --target wasm32-unknown-unknown
 
+.PHONY: release-engine-wasm
+release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-v<pkg version> on the current commit and push it (CI OIDC-publishes). Run on `main` after the version bump + `make console-wasm` have merged.
+	@tmpl=$$(node -p "require('$(PROJECT_ROOT)/engine-wasm/pkg.package.json').version"); \
+	built=$$(node -p "require('$(PROJECT_ROOT)/engine-wasm/pkg/package.json').version"); \
+	if [ "$$tmpl" != "$$built" ]; then \
+	  echo "version mismatch: pkg.package.json=$$tmpl but pkg/package.json=$$built — run 'make console-wasm' first"; exit 1; \
+	fi; \
+	tag="bojtos-npm-v$$tmpl"; \
+	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
+	  echo "tag $$tag already exists — bump engine-wasm/pkg.package.json (+ 'make console-wasm') before releasing"; exit 1; \
+	fi; \
+	echo "Tagging $$tag on $$(git rev-parse --short HEAD) and pushing (fires release-bojtos-npm → OIDC publish)"; \
+	git tag "$$tag" && git push origin "$$tag"
+
 .PHONY: processos-build
 processos-build: ## Build ProcessOS, the separate optimization-plane server (Stage T1: Insights)
 	cd processos && cargo build
