@@ -837,6 +837,13 @@ pub struct AdHocSubProcessDef {
     /// into the output collection, if declared.
     #[cfg_attr(feature = "serde", serde(default))]
     pub output_element: Option<String>,
+    /// The BPMN `cancelRemainingInstances` attribute (default `true`). When the
+    /// declared `<completionCondition>` is fulfilled: `true` cancels any tools
+    /// still running and completes the container immediately; `false` defers
+    /// completion until no active children/flows remain (Zeebe
+    /// `BpmnAdHocSubProcessBehavior#completionConditionFulfilled`).
+    #[cfg_attr(feature = "serde", serde(default = "default_true"))]
+    pub cancel_remaining_instances: bool,
     /// The inner activatable elements, in document order.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tools: Vec<AdHocTool>,

@@ -4653,9 +4653,7 @@ impl Engine {
         }
         // Completion condition (ADR 0023 seam 4): a declared `<completionCondition>`
         // is evaluated after each tool completes, against the container scope
-        // overlaid with the output mappings just projected into it. When true, the
-        // container completes now, cancelling any tools still running this turn —
-        // exactly like a multi-instance body's early completion.
+        // overlaid with the output mappings just projected into it.
         let completion_now = self
             .adhoc_def_of(instance_key, &container_element_id)
             .and_then(|def| def.completion_condition)
@@ -4665,19 +4663,61 @@ impl Engine {
                 matches!(crate::feel::eval_bool(&cond, &ctx), Ok(true))
             })
             .unwrap_or(false);
-        if completion_now {
-            return (
-                events,
-                vec![Step::CompleteAdHoc {
-                    instance_key,
-                    container_key,
-                    cancel: true,
-                }],
-            );
-        }
         // `active_now` still counts this child (its removal above is not yet
         // applied), so the last tool of the turn is the one leaving one active.
         let others = active_now.saturating_sub(1);
+        // Zeebe latches a satisfied condition (`ElementInstance
+        // #isCompletionConditionFulfilled`), so a container that already deferred
+        // keeps completing on drain even if a later tool no longer satisfies it.
+        let already_fulfilled = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+            .map(|a| a.completion_condition_fulfilled)
+            .unwrap_or(false);
+        if completion_now || already_fulfilled {
+            let cancel_remaining = self
+                .adhoc_def_of(instance_key, &container_element_id)
+                .map(|d| d.cancel_remaining_instances)
+                .unwrap_or(true);
+            if cancel_remaining {
+                // `cancelRemainingInstances=true` (the BPMN default): complete now,
+                // cancelling any tools still running this turn — exactly like a
+                // multi-instance body's early completion.
+                return (
+                    events,
+                    vec![Step::CompleteAdHoc {
+                        instance_key,
+                        container_key,
+                        cancel: true,
+                    }],
+                );
+            }
+            // `cancelRemainingInstances=false`: defer container completion until no
+            // active children/flows remain (Zeebe
+            // `BpmnAdHocSubProcessBehavior#completionConditionFulfilled`). When the
+            // last outstanding tool drains, complete without cancelling; otherwise
+            // latch the fulfilment and park — no new agent turn, no further
+            // activation — so the container completes as its children drain.
+            if others == 0 {
+                return (
+                    events,
+                    vec![Step::CompleteAdHoc {
+                        instance_key,
+                        container_key,
+                        cancel: false,
+                    }],
+                );
+            }
+            if !already_fulfilled {
+                events.push(Event::AdHocCompletionConditionFulfilled {
+                    instance_key,
+                    container_key,
+                });
+            }
+            return (events, Vec::new());
+        }
         if others == 0 {
             // The declarative (BPMN_TASK) variant activates its collection once
             // and completes when those elements drain — there is no agent to
