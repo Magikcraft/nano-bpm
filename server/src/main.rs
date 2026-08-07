@@ -6015,6 +6015,15 @@ impl ServerImpl {
                 404,
                 format!("Ad-hoc sub-process has no activatable element with id '{element_id}'."),
             ))),
+            Err(EngineError::AdHocNoActivationTargets {
+                ad_hoc_instance_key,
+            }) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                "Invalid data",
+                400,
+                format!(
+                    "Ad-hoc sub-process activation for instance key {ad_hoc_instance_key} named no elements and did not set cancelRemainingInstances."
+                ),
+            ))),
             Err(e) => Ok(
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
@@ -25048,6 +25057,76 @@ mod subscription_placement_tests {
                 "unknown container key {bad:?} maps to 404, got {resp:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rest_activate_ad_hoc_activities_maps_empty_activation_to_400() {
+        // gap #3 (Magikcraft/nano-bpm#614): the REST schema permits an empty
+        // `elements` array, but an empty activation with no `cancelRemaining`
+        // must NOT implicitly complete the parked container — it is rejected as
+        // INVALID_ARGUMENT (HTTP 400), and the agent job stays parked.
+        use apis::ad_hoc_sub_process::ActivateAdHocSubProcessActivitiesResponse as Resp;
+        use apis::job::ActivateJobsResponse as JobResp;
+
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("agent.bpmn".into(), ADHOC_AGENT_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the ad-hoc agent process deploys onto every partition");
+
+        server
+            .create_for_stream(Some("agent-proc".into()), None, Default::default())
+            .await
+            .expect("the instance is created and parks on the agent container");
+
+        let mut agent_req = models::JobActivationRequest::new("agent-worker".into(), 60_000, 10);
+        agent_req.request_timeout = Some(-1);
+        let container_key = match server
+            .activate_jobs_impl(&agent_req)
+            .await
+            .expect("activate the agent job")
+        {
+            JobResp::Status200_TheListOfActivatedJobs(r) => {
+                r.jobs
+                    .into_iter()
+                    .next()
+                    .expect("an agent job is emitted for the ad-hoc container")
+                    .element_instance_key
+                    .0
+            }
+            other => panic!("expected the agent job list, got {other:?}"),
+        };
+
+        // Empty elements + no cancel: rejected 400, not silently 204-completed.
+        let path = models::ActivateAdHocSubProcessActivitiesPathParams {
+            ad_hoc_sub_process_instance_key: container_key,
+        };
+        let body = models::AdHocSubProcessActivateActivitiesInstruction::new(Vec::new());
+        let resp = server
+            .activate_ad_hoc_sub_process_activities_impl(&path, &body)
+            .await
+            .expect("the endpoint returns a response");
+        assert!(
+            matches!(resp, Resp::Status400_TheProvidedDataIsNotValid(_)),
+            "an empty activation with no cancel maps to 400, got {resp:?}"
+        );
+
+        // The container is still alive — a subsequent real activation succeeds,
+        // proving the rejected empty request did not complete it.
+        let real = models::AdHocSubProcessActivateActivitiesInstruction::new(vec![
+            models::AdHocSubProcessActivateActivityReference::new("toolA".into()),
+        ]);
+        let resp2 = server
+            .activate_ad_hoc_sub_process_activities_impl(&path, &real)
+            .await
+            .expect("the endpoint returns a response");
+        assert!(
+            matches!(resp2, Resp::Status204_TheAd),
+            "activating a real tool after the rejected empty request is 204, got {resp2:?}"
+        );
     }
 
     #[tokio::test]

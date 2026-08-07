@@ -8915,6 +8915,60 @@ fn adhoc_external_command_activates_tools_without_the_agent_job() {
     );
 }
 
+/// Regression for Magikcraft/nano-bpm#614 gap 3: the external "activate ad-hoc
+/// activities" command must NOT let an empty request (`elements: []` with
+/// `cancelRemainingInstances = false`) implicitly complete a parked container.
+/// The REST schema permits an empty `elements` array, so without this guard a
+/// client could accidentally finish a running instance by POSTing `{}`. The
+/// command rejects it as INVALID_ARGUMENT (mapped to HTTP 400) and leaves the
+/// container running; completion is only expressible via
+/// `cancelRemainingInstances`. (The agent-job completion seam — gap 4 — is
+/// unaffected: activating nothing there still ends the turn.)
+#[test]
+fn adhoc_external_command_rejects_empty_activation() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    // Empty elements with no cancel is rejected as INVALID_ARGUMENT — it must
+    // not complete the parked container.
+    let empty = engine
+        .apply_command(Command::ActivateAdHocActivities {
+            ad_hoc_instance_key: container,
+            activate_elements: Vec::new(),
+            cancel_remaining: false,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&empty, EngineError::AdHocNoActivationTargets { ad_hoc_instance_key } if *ad_hoc_instance_key == container),
+        "an empty activation with no cancel must be rejected (INVALID_ARGUMENT), got {empty:?}"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "a rejected empty activation must leave the container running, not complete it"
+    );
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        0,
+        "a rejected empty activation activates nothing"
+    );
+}
+
 /// Regression for Magikcraft/nano-bpm#614 gap 4 (Zeebe parity): an agent's
 /// `activateElements[]` instruction referencing an id that is not one of the
 /// container's tools must be REJECTED (Zeebe returns NOT_FOUND from

@@ -2521,6 +2521,21 @@ impl Engine {
                 // element-instance key the caller supplied
                 // (`adHocSubProcessInstanceKey`); an unknown/inactive key is
                 // rejected NOT_FOUND.
+                //
+                // An empty activation with no cancel is a no-op the caller never
+                // means: it would let `enqueue_adhoc_turn` implicitly complete a
+                // parked container (it completes when `already_active + requested
+                // == 0`), so an external client could accidentally finish an
+                // instance by POSTing `{ "elements": [] }`. Only the agent-job
+                // completion seam (#614 gap 4) may end a turn by activating
+                // nothing; the external command rejects it as INVALID_ARGUMENT
+                // (Zeebe parity). Completion via this command is only expressible
+                // through `cancelRemainingInstances`.
+                if activate_elements.is_empty() && !cancel_remaining {
+                    return Err(EngineError::AdHocNoActivationTargets {
+                        ad_hoc_instance_key,
+                    });
+                }
                 let container_key = ad_hoc_instance_key;
                 let (instance_key, element_id) = self
                     .state
@@ -6550,6 +6565,14 @@ pub enum EngineError {
     /// sub-process container. Zeebe rejects with NOT_FOUND
     /// (`AdHocSubProcessInstructionActivateProcessor`).
     AdHocSubProcessNotFound { ad_hoc_instance_key: Key },
+    /// The external "activate ad-hoc activities" command (#614 gap 3) was sent
+    /// with no `elements` to activate and `cancelRemainingInstances = false`.
+    /// That request is a no-op the caller cannot have intended — completing the
+    /// container is only expressible via `cancelRemainingInstances` — so it is
+    /// rejected as INVALID_ARGUMENT rather than silently finishing a parked
+    /// container. (The agent-job completion seam, #614 gap 4, still ends a turn
+    /// by activating nothing; only this external command forbids it.)
+    AdHocNoActivationTargets { ad_hoc_instance_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -6667,6 +6690,14 @@ impl std::fmt::Display for EngineError {
                 write!(
                     f,
                     "no active ad-hoc sub-process container with instance key {ad_hoc_instance_key}"
+                )
+            }
+            EngineError::AdHocNoActivationTargets {
+                ad_hoc_instance_key,
+            } => {
+                write!(
+                    f,
+                    "ad-hoc sub-process activation for container {ad_hoc_instance_key} named no elements and did not cancel remaining instances"
                 )
             }
         }
