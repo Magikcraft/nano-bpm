@@ -9,11 +9,13 @@
 //! `terminated` when the run drains.
 
 import { readFileSync } from 'node:fs';
+import { basename } from 'node:path';
 
 import {
   Event,
   InitializedEvent,
   LoggingDebugSession,
+  OutputEvent,
   Scope,
   Source,
   StackFrame,
@@ -91,6 +93,22 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
     args: DebugProtocol.SetBreakpointsArguments,
   ): void {
     const requested = args.breakpoints ?? [];
+    // This is a single-source adapter: breakpoints only resolve against the BPMN
+    // file passed to `launch`. If the client sends breakpoints for a different
+    // (or missing) source, resolving them against the loaded BPMN would falsely
+    // verify them, so treat every breakpoint in a mismatched source as unverified.
+    if (!this.isLaunchedSource(args.source)) {
+      this.breakElementIds = [];
+      response.body = {
+        breakpoints: requested.map((bp) => ({
+          verified: false,
+          line: bp.line,
+          message: 'breakpoints are only supported in the launched BPMN source',
+        })),
+      };
+      this.sendResponse(response);
+      return;
+    }
     const verified: DebugProtocol.Breakpoint[] = [];
     const ids: string[] = [];
     for (const bp of requested) {
@@ -108,6 +126,19 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
     this.sendResponse(response);
   }
 
+  /**
+   * Whether `source` refers to the BPMN file this session was launched with.
+   * A source with no `path` (some clients omit it) is accepted as the launched
+   * source; a `path` that resolves to a different file is rejected.
+   */
+  private isLaunchedSource(source: DebugProtocol.Source | undefined): boolean {
+    const path = source?.path;
+    if (path === undefined || path === '') {
+      return true;
+    }
+    return samePath(path, this.bpmnPath);
+  }
+
   protected override configurationDoneRequest(
     response: DebugProtocol.ConfigurationDoneResponse,
     args: DebugProtocol.ConfigurationDoneArguments,
@@ -122,7 +153,15 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
       kind: 'elementActivated',
       id,
     }));
-    const state = this.engine.start(launch.processId, launch.variables ?? {}, conditions);
+    let state: DebugState;
+    try {
+      state = this.engine.start(launch.processId, launch.variables ?? {}, conditions);
+    } catch (err) {
+      // A wasm failure (e.g. unknown processId) must terminate the session
+      // cleanly rather than crash the adapter process.
+      this.terminateWithError(err);
+      return;
+    }
     this.reportStopOrTerminate(state, 'breakpoint');
   }
 
@@ -135,7 +174,7 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
     response: DebugProtocol.StackTraceResponse,
     _args: DebugProtocol.StackTraceArguments,
   ): void {
-    const source = new Source(this.bpmnPath.split('/').pop() ?? 'process.bpmn', this.bpmnPath);
+    const source = new Source(basenameOf(this.bpmnPath), this.bpmnPath);
     const frames: StackFrame[] =
       this.activeElements.length > 0
         ? this.activeElements.map((id, i) => {
@@ -174,7 +213,7 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
     _args: DebugProtocol.ContinueArguments,
   ): void {
     this.sendResponse(response);
-    this.reportStopOrTerminate(this.engine.resume(), 'breakpoint');
+    this.stepOrResume(() => this.engine.resume(), 'breakpoint');
   }
 
   protected override nextRequest(
@@ -182,7 +221,7 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
     _args: DebugProtocol.NextArguments,
   ): void {
     this.sendResponse(response);
-    this.reportStopOrTerminate(this.engine.step(), 'step');
+    this.stepOrResume(() => this.engine.step(), 'step');
   }
 
   protected override stepInRequest(
@@ -190,7 +229,23 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
     _args: DebugProtocol.StepInArguments,
   ): void {
     this.sendResponse(response);
-    this.reportStopOrTerminate(this.engine.step(), 'step');
+    this.stepOrResume(() => this.engine.step(), 'step');
+  }
+
+  /**
+   * Drive one resume/step into the wasm engine, guarding against a throw: if the
+   * wasm surface fails mid-session, terminate the debug session cleanly instead
+   * of crashing the adapter process.
+   */
+  private stepOrResume(advance: () => DebugState, reason: 'breakpoint' | 'step'): void {
+    let state: DebugState;
+    try {
+      state = advance();
+    } catch (err) {
+      this.terminateWithError(err);
+      return;
+    }
+    this.reportStopOrTerminate(state, reason);
   }
 
   protected override disconnectRequest(
@@ -213,4 +268,22 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
       this.sendEvent(new TerminatedEvent());
     }
   }
+
+  /** Log a wasm-surface failure and end the debug session without crashing. */
+  private terminateWithError(err: unknown): void {
+    this.activeElements = [];
+    this.sendEvent(new OutputEvent(`debug engine error: ${String(err)}\n`, 'stderr'));
+    this.sendEvent(new TerminatedEvent());
+  }
+}
+
+/** The file name of a path, splitting on both POSIX and Windows separators. */
+function basenameOf(p: string): string {
+  const name = basename(p.replace(/\\/g, '/'));
+  return name === '' ? 'process.bpmn' : name;
+}
+
+/** Whether two filesystem paths refer to the same file (separator-insensitive). */
+function samePath(a: string, b: string): boolean {
+  return a.replace(/\\/g, '/') === b.replace(/\\/g, '/');
 }

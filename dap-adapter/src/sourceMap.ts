@@ -1,7 +1,10 @@
 //! A minimal BPMN source map: resolve a `.bpmn` XML file's line numbers to the
 //! flow-node element id declared on that line, and back. DAP anchors breakpoints
 //! to `{source, line}`; BPMN is XML, so we map a clicked line to the element whose
-//! opening tag carries the `id="…"` on (or nearest above) that line.
+//! opening tag carries the `id="…"` on that exact line. A line whose opening tag
+//! does not carry an `id="…"` resolves to no element (the client greys the
+//! breakpoint) — we deliberately do not scan upward, so a click on a sequence
+//! flow or a non-node line never anchors to a neighbouring node.
 //!
 //! This is deliberately regex-based rather than a full XML parse: it needs no
 //! dependency, and a flow node's opening tag + `id` are on one line in every
