@@ -3474,6 +3474,14 @@ impl Engine {
                     let entries: Vec<Value> = def
                         .tools
                         .iter()
+                        .filter(|t| {
+                            // Only advertise activatable ad-hoc tools. The parser
+                            // captures known non-activatable inner nodes (e.g.
+                            // gateways) as `AdHocToolKind::Other`; excluding them
+                            // keeps the advertised catalog at Zeebe parity so the
+                            // agent never sees entries it cannot activate.
+                            !matches!(t.kind, crate::model::AdHocToolKind::Other)
+                        })
                         .map(|t| {
                             Value::Map(
                                 [

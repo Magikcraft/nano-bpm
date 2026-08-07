@@ -9084,6 +9084,75 @@ fn adhoc_container_advertises_its_tool_catalog_on_the_agent_job() {
     );
 }
 
+/// Regression for the tool-catalog filter: the parser captures known
+/// non-activatable inner nodes (e.g. gateways) in `def.tools` as
+/// `AdHocToolKind::Other`, but the advertised `adHocSubProcessElements` catalog
+/// must only surface activatable tools (Zeebe parity). The inner exclusive
+/// gateway below must NOT appear in the advertised list.
+#[test]
+fn adhoc_container_advertised_catalog_excludes_non_activatable_nodes() {
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA" name="Search the web">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:exclusiveGateway id="gw" name="Not a tool" />
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let process = crate::bpmn::parse_bpmn(xml).unwrap().remove(0);
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process))
+        .unwrap();
+    let _inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    let catalog = agent
+        .variables
+        .get("adHocSubProcessElements")
+        .expect("the agent job advertises its tool catalog (#614 gap 2)");
+    let entries = match catalog {
+        Value::List(items) => items,
+        other => panic!("expected a list of tool metadata, got {other:?}"),
+    };
+
+    let entry = |elem_id: &str, name: &str| {
+        Value::Map(
+            [
+                ("elementId".to_string(), Value::Str(elem_id.to_string())),
+                ("elementName".to_string(), Value::Str(name.to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+    assert_eq!(
+        entries,
+        &vec![entry("toolA", "Search the web")],
+        "only the activatable service task is advertised; the gateway (Other) is excluded"
+    );
+}
+
 #[test]
 fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
     let mut engine = Engine::new();
