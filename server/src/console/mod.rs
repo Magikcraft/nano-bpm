@@ -2839,6 +2839,7 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
         "config": cfg,
         "files": tree,
         "runState": sup.run_state(name).await,
+        "appUi": sup.app_ui(name),
         "denoAvailable": sup.deno_available(),
         "nodeAvailable": sup.node_available(),
         // Presence of the `@nanobpm/urban` CLI (epic #514 host dry-out). The

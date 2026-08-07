@@ -6066,6 +6066,100 @@ fn resolve_run_env(cfg: &ProjectConfig) -> std::collections::BTreeMap<String, St
     out
 }
 
+/// The console-integrated app-view descriptor (issue #638, ADR 0057).
+///
+/// Derived from the optional `ui` object in `nano.app.json`, resolved against
+/// the project's run env so the studio knows how to surface a running app in
+/// the left rail and — for a UI app — where its embedded webview lives.
+///
+/// Every supervised app has one of these (the rail doubles as the "running
+/// apps" surface): an app with no reachable UI port is **headless** and gets a
+/// control-only pane (status + logs + Stop/Restart) rather than an iframe.
+///
+/// Identity/label/icon are deliberately *not* keyed on the manifest — apps
+/// scaffolded from the same template share an identical manifest — so the
+/// caller keys the nav entry on the project name and uses `label`/`icon` only
+/// as display hints (with a project-name fallback + default glyph).
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AppUi {
+    /// Whether the app opts in to an embedded UI. `false` (or no resolvable
+    /// port) ⇒ headless: still listed, but control-only.
+    pub enabled: bool,
+    /// The resolved integrated-UI port, when known. `None` ⇒ headless.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Path the webview should open (default `/`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Bundled icon name (or, later, a project asset path). Display hint only;
+    /// the console falls back to a default glyph when absent/invalid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    /// Nav label hint. Display only; the console disambiguates on project name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Resolve the console-integrated [`AppUi`] descriptor from a parsed
+/// `nano.app.json` manifest and the project's resolved run env.
+///
+/// Port precedence (issue #638): `ui.port` (fixed) → the port named by
+/// `ui.portEnv` looked up in `run_env` → `None` (headless). `ui.enabled:
+/// false` forces headless regardless of any declared port. A manifest with no
+/// `ui` object at all is treated as an opted-in app with no reachable port,
+/// i.e. it is still listed but headless until it declares a port.
+///
+/// Pure: no fs, no process — takes the manifest + env so it is unit-testable.
+pub fn resolve_app_ui(
+    manifest: &serde_json::Value,
+    run_env: &std::collections::BTreeMap<String, String>,
+) -> AppUi {
+    let ui = manifest.get("ui").and_then(|v| v.as_object());
+
+    // `enabled` defaults to true (absence of `ui` still lists the app).
+    let enabled = ui
+        .and_then(|u| u.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let str_field = |key: &str| -> Option<String> {
+        ui.and_then(|u| u.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    };
+
+    // Resolve the port only when the app is enabled. Fixed `port` has strict
+    // precedence: if the `port` key is *present* it decides the outcome (a valid
+    // 1..=65535 integer ⇒ that port; anything else — 0, out-of-range, negative,
+    // fractional, wrong type ⇒ headless), and we never fall through to
+    // `portEnv`. `portEnv` is consulted only when no `port` key is declared.
+    let port = if !enabled {
+        None
+    } else if let Some(port_val) = ui.and_then(|u| u.get("port")) {
+        // `as_u64` yields None for floats, strings, and negatives; `try_from`
+        // rejects anything above u16::MAX (no silent truncation).
+        port_val
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|&p| p != 0)
+    } else {
+        str_field("portEnv")
+            .and_then(|name| run_env.get(&name).cloned())
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .filter(|&p| p != 0)
+    };
+
+    AppUi {
+        enabled,
+        port,
+        path: str_field("path"),
+        icon: str_field("icon"),
+        label: str_field("label"),
+    }
+}
+
 pub fn supervisor() -> &'static ProjectSupervisor {
     SUPERVISOR.get_or_init(|| ProjectSupervisor {
         projects: Mutex::new(HashMap::new()),
@@ -6094,6 +6188,37 @@ impl ProjectSupervisor {
     /// Run state for one project (defaults to stopped if unknown).
     pub async fn run_state(&self, name: &str) -> RunStateDto {
         self.entry(name).await.dto().await
+    }
+
+    /// The console-integrated app-view descriptor for one project (issue #638,
+    /// ADR 0057): resolves the optional `ui` block in `nano.app.json` against
+    /// the project's run env so the studio can place the app in the left rail
+    /// and, for a UI app, locate its embedded webview.
+    ///
+    /// Static (manifest + config), independent of whether the app is running,
+    /// so the rail can render both the icon and the running/stopped state. A
+    /// missing/invalid manifest yields the default (`enabled`, headless).
+    ///
+    /// Port discovery deliberately resolves `ui.portEnv` against the
+    /// *app-declared* env only ([`resolve_run_env`]: project env overlaid with
+    /// the active run config), not the supervisor's inherited process env. The
+    /// spawned child does inherit the host env, but attributing a host-level
+    /// `PORT` (e.g. the studio's own) to every app is a misattribution hazard,
+    /// so discovery stays deterministic and per-app. Authors that want an
+    /// embedded webview declare `ui.port` or set the port in the project / run
+    /// config env. (A future slice can have the app self-report its bound URL at
+    /// boot for exact parity — the ADR 0057 handshake.)
+    pub fn app_ui(&self, name: &str) -> AppUi {
+        let run_env = read_config(name)
+            .map(|cfg| resolve_run_env(&cfg))
+            .unwrap_or_default();
+        match super::triggers::read_manifest(name) {
+            Ok(manifest) => resolve_app_ui(&manifest, &run_env),
+            Err(_) => AppUi {
+                enabled: true,
+                ..AppUi::default()
+            },
+        }
     }
 
     pub async fn is_running(&self, name: &str) -> bool {
@@ -8858,6 +8983,136 @@ mod tests {
             active_run_config: None,
         });
         assert!(resolve_run_env(&cfg).is_empty());
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn app_ui_no_ui_object_is_listed_but_headless() {
+        // A plain app (no `ui` block) still opts in — the rail doubles as the
+        // running-apps surface — but has no reachable port, so it is headless.
+        let ui = resolve_app_ui(&serde_json::json!({ "name": "x" }), &env(&[]));
+        assert_eq!(
+            ui,
+            AppUi {
+                enabled: true,
+                port: None,
+                path: None,
+                icon: None,
+                label: None
+            }
+        );
+    }
+
+    #[test]
+    fn app_ui_fixed_port_wins() {
+        let ui = resolve_app_ui(
+            &serde_json::json!({ "ui": { "port": 3000, "path": "/dash", "icon": "bot", "label": "PR Bot" } }),
+            &env(&[("PORT", "8090")]),
+        );
+        assert_eq!(ui.port, Some(3000));
+        assert_eq!(ui.path.as_deref(), Some("/dash"));
+        assert_eq!(ui.icon.as_deref(), Some("bot"));
+        assert_eq!(ui.label.as_deref(), Some("PR Bot"));
+        assert!(ui.enabled);
+    }
+
+    #[test]
+    fn app_ui_port_env_resolved_from_run_env() {
+        // urban-pr-review runs supervised on :3000 by reading PORT from its run
+        // config env; portEnv lets the studio discover that without allocating.
+        let ui = resolve_app_ui(
+            &serde_json::json!({ "ui": { "portEnv": "PORT" } }),
+            &env(&[("PORT", "3000")]),
+        );
+        assert_eq!(ui.port, Some(3000));
+        assert!(ui.enabled);
+    }
+
+    #[test]
+    fn app_ui_port_beats_port_env() {
+        let ui = resolve_app_ui(
+            &serde_json::json!({ "ui": { "port": 4000, "portEnv": "PORT" } }),
+            &env(&[("PORT", "3000")]),
+        );
+        assert_eq!(ui.port, Some(4000));
+    }
+
+    #[test]
+    fn app_ui_invalid_fixed_port_does_not_fall_through_to_port_env() {
+        // A present-but-invalid `port` must decide the outcome (headless), never
+        // silently fall back to `portEnv` — otherwise fixed-port precedence and
+        // "invalid port ⇒ headless" are both violated. `read_manifest` does no
+        // schema validation, so an out-of-range port can reach the resolver.
+        for bad in [
+            serde_json::json!({ "ui": { "port": 70000, "portEnv": "PORT" } }), // > u16::MAX
+            serde_json::json!({ "ui": { "port": 0, "portEnv": "PORT" } }),     // reserved 0
+            serde_json::json!({ "ui": { "port": -1, "portEnv": "PORT" } }),    // negative
+            serde_json::json!({ "ui": { "port": 8080.5, "portEnv": "PORT" } }), // fractional
+            serde_json::json!({ "ui": { "port": "3000", "portEnv": "PORT" } }), // wrong type
+        ] {
+            let ui = resolve_app_ui(&bad, &env(&[("PORT", "3000")]));
+            assert_eq!(ui.port, None, "invalid fixed port must be headless: {bad}");
+        }
+    }
+
+    #[test]
+    fn app_ui_out_of_range_port_env_is_headless() {
+        // Env-sourced ports are parsed as u16, so anything out of range rejects.
+        let ui = resolve_app_ui(
+            &serde_json::json!({ "ui": { "portEnv": "PORT" } }),
+            &env(&[("PORT", "70000")]),
+        );
+        assert_eq!(ui.port, None);
+    }
+
+    #[test]
+    fn app_ui_port_env_missing_from_env_is_headless() {
+        let ui = resolve_app_ui(
+            &serde_json::json!({ "ui": { "portEnv": "UI_PORT" } }),
+            &env(&[("PORT", "3000")]),
+        );
+        assert_eq!(ui.port, None);
+        assert!(ui.enabled);
+    }
+
+    #[test]
+    fn app_ui_disabled_forces_headless_even_with_port() {
+        let ui = resolve_app_ui(
+            &serde_json::json!({ "ui": { "enabled": false, "port": 3000, "label": "Batch" } }),
+            &env(&[]),
+        );
+        assert!(!ui.enabled);
+        assert_eq!(ui.port, None);
+        // Display hints are still carried so the rail can label the headless app.
+        assert_eq!(ui.label.as_deref(), Some("Batch"));
+    }
+
+    #[test]
+    fn app_ui_zero_and_unparseable_ports_are_ignored() {
+        let zero = resolve_app_ui(&serde_json::json!({ "ui": { "port": 0 } }), &env(&[]));
+        assert_eq!(zero.port, None);
+        let bad = resolve_app_ui(
+            &serde_json::json!({ "ui": { "portEnv": "P" } }),
+            &env(&[("P", "notaport")]),
+        );
+        assert_eq!(bad.port, None);
+    }
+
+    #[test]
+    fn app_ui_empty_string_hints_are_dropped() {
+        let ui = resolve_app_ui(
+            &serde_json::json!({ "ui": { "icon": "", "label": "", "path": "" } }),
+            &env(&[]),
+        );
+        assert_eq!(ui.icon, None);
+        assert_eq!(ui.label, None);
+        assert_eq!(ui.path, None);
     }
 
     #[test]

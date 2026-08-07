@@ -67,9 +67,44 @@
       "description": "Named LLM bindings usable as workers or as a chat surface agent (ADR 0022 §E).",
       "additionalProperties": { "$ref": "#/$defs/llmBinding" }
     },
-    "security": { "$ref": "#/$defs/security" }
+    "security": { "$ref": "#/$defs/security" },
+    "ui": { "$ref": "#/$defs/appUi" }
   },
   "$defs": {
+    "appUi": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Console-integrated app view (ADR 0057, issue #638). When the app runs under the studio supervisor it appears in the left rail as a running app; a UI app embeds its own webview in the right pane, a headless app shows a control (status/logs/stop) pane. Omitting this block still lists the app (headless).",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Opt in to an embedded UI. false ⇒ headless (control-only), but the app is still listed in the running-apps rail."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "description": "The integrated-UI port. Takes precedence over portEnv. Apps that expose multiple ports use this to name which one is the UI."
+        },
+        "portEnv": {
+          "type": "string",
+          "description": "Name of the env var the app reads its UI port from (e.g. \"PORT\"). The studio resolves it from the project run config so it can discover the port without allocating one."
+        },
+        "path": {
+          "type": "string",
+          "description": "Path the embedded webview opens (default \"/\")."
+        },
+        "icon": {
+          "type": "string",
+          "description": "Left-rail icon: a bundled icon name (project asset support may come later). Display hint only; the console falls back to a default glyph when absent/invalid."
+        },
+        "label": {
+          "type": "string",
+          "description": "Left-rail label hint. Display only; the console disambiguates on the project name, since same-template apps share a manifest."
+        }
+      }
+    },
     "slug": {
       "type": "string",
       "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",

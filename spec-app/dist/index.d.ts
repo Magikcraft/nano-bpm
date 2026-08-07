@@ -615,6 +615,7 @@ export interface AppManifest {
 		[k: string]: LlmBinding;
 	};
 	security?: Security;
+	ui?: AppUi;
 }
 /**
  * The shipping topology of the compiled App (ADR 0005). Distinct from the IDE dev-loop deployTarget, which lives in nanobpm.project.json (ADR 0027 §1).
@@ -887,6 +888,35 @@ export interface SecurityProvider {
  */
 export interface RoleMap {
 	[k: string]: string[];
+}
+/**
+ * Console-integrated app view (ADR 0057, issue #638). When the app runs under the studio supervisor it appears in the left rail as a running app; a UI app embeds its own webview in the right pane, a headless app shows a control (status/logs/stop) pane. Omitting this block still lists the app (headless).
+ */
+export interface AppUi {
+	/**
+	 * Opt in to an embedded UI. false ⇒ headless (control-only), but the app is still listed in the running-apps rail.
+	 */
+	enabled?: boolean;
+	/**
+	 * The integrated-UI port. Takes precedence over portEnv. Apps that expose multiple ports use this to name which one is the UI.
+	 */
+	port?: number;
+	/**
+	 * Name of the env var the app reads its UI port from (e.g. "PORT"). The studio resolves it from the project run config so it can discover the port without allocating one.
+	 */
+	portEnv?: string;
+	/**
+	 * Path the embedded webview opens (default "/").
+	 */
+	path?: string;
+	/**
+	 * Left-rail icon: a bundled icon name (project asset support may come later). Display hint only; the console falls back to a default glyph when absent/invalid.
+	 */
+	icon?: string;
+	/**
+	 * Left-rail label hint. Display only; the console disambiguates on the project name, since same-template apps share a manifest.
+	 */
+	label?: string;
 }
 
 export {};
