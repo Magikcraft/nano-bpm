@@ -296,3 +296,93 @@ glue, and the engine-backed handlers live in `server/src/main.rs` (committed).
 The per-tag trait impls are generated into `server/src/stub_impls.rs` by
 `gen-stub-server.py`, which routes the wired operations to the handlers via its
 `OVERRIDES` table and stubs everything else.
+
+## Releasing (local build + workflow distribution)
+
+Releases are cut **locally** and distributed by a small workflow. The heavy part
+— cross-compiling the gateway and ProcessOS for every OS/arch — runs on a
+developer machine that already has the toolchain, instead of a tag-triggered CI
+matrix that spun up macOS (10× minute cost) and Windows (2×) runners on every
+release. Only the steps that genuinely need repository secrets (pushing to the
+public plugin repo, mirroring to S3) run in CI.
+
+### The flow
+
+```
+make release-local                      # cross-compile ALL targets locally,
+                                        # attach them to a DRAFT GitHub Release
+<Publish the release on GitHub>         # the deliberate, irreversible gesture
+   └─ fires .github/workflows/distribute-binaries.yml (ubuntu-only, no compile):
+        • gateway   → plugin repo `binaries` release + marker bump (npm release)
+        • ProcessOS → S3 mirror (+ version.json)
+```
+
+1. **Bump + tag.** Bump `server/Cargo.toml` (+ `Cargo.lock`) so it matches the
+   release version, commit, then create and push the tag: `git tag v0.0.13 &&
+   git push origin v0.0.13`. The tag is the source of truth for the stamped
+   binary version (`NANOBPM_VERSION` / `PROCESSOS_VERSION`).
+2. **Build + stage the release locally:**
+   ```bash
+   make release-local                       # version taken from the v* tag on HEAD
+   # or explicitly / with flags:
+   make release-local RELEASE_ARGS='--version v0.0.13'
+   ```
+   This cross-compiles all seven gateway and four of the five ProcessOS binaries
+   into `dist/` (CI-identical asset names, same `cargo-zigbuild` glibc floor),
+   then creates a **draft** GitHub Release for the tag on this repo with every
+   binary attached. Pass `RELEASE_ARGS='--build-only'` to just fill `dist/`
+   without touching Releases, or `RELEASE_ARGS='--publish'` to publish
+   immediately (no human gate).
+
+   > **ProcessOS-Windows is the one target not built locally.** DuckDB's bundled
+   > amalgamation decorates deleted functions with `__declspec(dllexport)`, which
+   > native MSVC `cl.exe` accepts but `clang-cl` (what `cargo-xwin` drives)
+   > rejects. `release-local.sh` skips it and prints how to produce it from the
+   > CI fallback (`gh workflow run publish-processos-binaries.yml --ref <tag>`),
+   > which attaches the win32 asset to the same release. The gateway carries no
+   > DuckDB, so **gateway-win32 does build locally** via `cargo-xwin`.
+3. **Publish the release** (GitHub UI → *Publish release*, or `gh release edit
+   v0.0.13 --draft=false`). Publishing fires `distribute-binaries.yml`, which
+   downloads the assets and runs the secret-bearing distribution — no compile.
+
+### Prerequisites
+
+The gateway codegen/console prerequisites (`make release-local` builds them for
+you) need **Java (JDK), uv, Node, wasm-pack**. The cross-compilers:
+
+| Targets | Tool | Install |
+|---|---|---|
+| Linux x64/arm64/armv7/armv6 | `zig` + `cargo-zigbuild` | `brew install zig` · `cargo install cargo-zigbuild` |
+| macOS arm64/x64 | Apple Command Line Tools / Xcode SDK | `xcode-select --install` |
+| Windows x64 (MSVC) | `cargo-xwin` + LLVM/LLD | `cargo install cargo-xwin`; `brew install llvm lld` (provide `clang-cl`/`llvm-lib` and `lld-link`; the first build auto-downloads the MSVC CRT). `release-local.sh` adds Homebrew's keg-only LLVM+LLD to PATH for the Windows legs automatically. |
+
+Publishing the local draft release needs `gh` authenticated with
+`contents:write` on this repo — no other secret is held locally. The
+plugin-repo PAT (`C8CTL_PLUGIN_REPO_TOKEN`) and AWS keys live only in the
+repository's Actions secrets, used by `distribute-binaries.yml`.
+
+### The distribution recipe is single-sourced
+
+`distribute-binaries.yml` and the two clean-room fallback workflows all call the
+same shared scripts, so the upload / marker-bump / S3 recipe never drifts:
+
+- `scripts/publish-c8ctl-assets.sh <dist>` — upload the gateway binaries to the
+  plugin repo's rolling `binaries` release and bump `nanobpmn-binary.json` (which
+  triggers the plugin's semantic-release; the commit type is derived from the
+  server SemVer delta).
+- `scripts/publish-processos-assets.sh <dist>` — attach ProcessOS to this repo's
+  release and mirror to S3 (+ `version.json`).
+
+### CI fallback (clean-room build)
+
+If the local host is unavailable, dispatch the original matrix workflows manually
+— they build the binaries clean-room in CI and then call the same shared publish
+scripts:
+
+```bash
+gh workflow run publish-c8ctl-binaries.yml     --ref v0.0.13
+gh workflow run publish-processos-binaries.yml --ref v0.0.13
+```
+
+These are `workflow_dispatch`-only now (they no longer run on tag push), so a
+normal tagged release does **not** trigger the expensive matrix.

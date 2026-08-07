@@ -245,6 +245,10 @@ cross-linux-armv6: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embed
 .PHONY: cross-linux
 cross-linux: cross-linux-x64 cross-linux-armv7 ## Cross-compile the gateway for both Linux x86-64 and Raspberry Pi ARMv7 -> dist/
 
+.PHONY: release-local
+release-local: $(CROSS_PREREQS) ## Cut a release by cross-compiling ALL gateway + ProcessOS binaries locally and handing them to distribute-binaries.yml via a GitHub Release. Extra flags via RELEASE_ARGS (e.g. RELEASE_ARGS='--version v0.0.13 --publish'; '--build-only' just fills dist/). Needs cargo-xwin for the Windows leg.
+	$(PROJECT_ROOT)/scripts/release-local.sh $(RELEASE_ARGS)
+
 .PHONY: console-frontend
 console-frontend: console-wasm ## Build the web console SPA (console/ -> console/dist)
 	cd $(CONSOLE_DIR) && npm install && npm run build

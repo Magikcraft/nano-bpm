@@ -1,0 +1,112 @@
+# Distribute pre-built nanobpmn binaries — the cheap, secret-bearing half of the
+# release. The heavy cross-compile happens LOCALLY (`make release-local` /
+# scripts/release-local.sh), which builds every gateway + ProcessOS target on a
+# developer machine and attaches them to the GitHub Release for the tag. This
+# workflow then does only the parts that genuinely need repository secrets:
+#
+#   * gateway   -> upload to the PUBLIC plugin repo's rolling `binaries` release
+#                  and bump its bundled-binary marker (triggers the plugin's
+#                  semantic-release). Needs C8CTL_PLUGIN_REPO_TOKEN.
+#   * ProcessOS -> mirror to the public S3 bucket (+ version.json). Needs AWS_*.
+#
+# It downloads the already-built assets from the release and calls the SAME shared
+# scripts the clean-room fallback workflows use (scripts/publish-*-assets.sh), so
+# the distribution recipe has a single source of truth. No macOS/Windows runners,
+# no Rust compile — just one ubuntu job per artifact doing download-and-push.
+#
+# Fallback: if the local host is unavailable, dispatch publish-c8ctl-binaries.yml
+# / publish-processos-binaries.yml to build the binaries clean-room in CI (those
+# call the same shared scripts to distribute).
+
+name: Distribute binaries
+
+on:
+  # Fired when the local build's GitHub Release is published (the deliberate
+  # human "Publish release" gesture).
+  release:
+    types: [published]
+  # Manual re-run for a given tag (e.g. to re-mirror after a transient failure).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to distribute (e.g. v0.0.12)'
+        required: true
+
+concurrency:
+  group: distribute-binaries-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read          # download assets from this repo's release
+
+jobs:
+  distribute-gateway:
+    name: Distribute gateway to plugin repo
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      PLUGIN_TOKEN: ${{ secrets.C8CTL_PLUGIN_REPO_TOKEN }}
+    steps:
+      - name: Guard - plugin token present
+        if: env.PLUGIN_TOKEN == ''
+        run: |
+          echo "::error::C8CTL_PLUGIN_REPO_TOKEN is not configured — cannot distribute the gateway to the plugin repo." >&2
+          exit 1
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Download gateway binaries from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'nanobpm-gateway-rest-server-*' --dir dist
+          ls -l dist
+
+      - name: Upload to plugin repo + bump marker
+        env:
+          GH_TOKEN: ${{ secrets.C8CTL_PLUGIN_REPO_TOKEN }}
+          PLUGIN_REPO: jwulf/c8ctl-plugin-nano
+          VERSION: ${{ github.event.release.tag_name || inputs.tag }}
+          COMMIT: ${{ github.sha }}
+        run: scripts/publish-c8ctl-assets.sh dist
+
+  distribute-processos:
+    name: Mirror ProcessOS to S3
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      # Job-level so the skip-guard step's `if:` can see whether the credential
+      # is configured (step-level env is NOT in scope for that step's own `if:`).
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-east-1
+      S3_BUCKET: sitapati-storage
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+
+      - name: Download ProcessOS binaries from the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'processos-*' --dir dist
+          ls -l dist
+
+      # Re-attaches the assets to this repo's release (idempotent --clobber; the
+      # local build already did this) and mirrors to S3 (+ version.json). The S3
+      # step is skipped inside the script when AWS creds are absent.
+      - name: Mirror to S3 (+ version.json)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: scripts/publish-processos-assets.sh dist
