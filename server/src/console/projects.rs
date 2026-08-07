@@ -4009,6 +4009,12 @@ pub struct ProjectSummary {
     /// scaffold version (the update target). Absent when up to date.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latest_version: Option<String>,
+    /// Console-integrated app-view descriptor (ADR 0057, issue #638), populated
+    /// only for a *running* app so the left rail can render it as a running-app
+    /// entry without an extra per-project detail fetch. Absent for stopped
+    /// projects (the rail lists running apps only). See [`AppUi`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_ui: Option<AppUi>,
 }
 
 /// Compare a project's recorded scaffold version against the currently
@@ -4094,6 +4100,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
             scaffolded_from: cfg.scaffolded_from,
             update_available,
             latest_version,
+            app_ui: None,
         });
     }
     // Imported-by-reference projects (ADR 0041): `<name>.project-ref.json` files
@@ -4144,6 +4151,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
                 scaffolded_from: None,
                 update_available: false,
                 latest_version: None,
+                app_ui: None,
             });
             continue;
         }
@@ -4174,6 +4182,7 @@ pub fn list_projects() -> std::io::Result<Vec<ProjectSummary>> {
             scaffolded_from: cfg.scaffolded_from,
             update_available,
             latest_version,
+            app_ui: None,
         });
     }
     out.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms).then(a.name.cmp(&b.name)));
@@ -9069,6 +9078,66 @@ mod tests {
             &env(&[("PORT", "70000")]),
         );
         assert_eq!(ui.port, None);
+    }
+
+    #[test]
+    fn project_summary_serializes_app_ui_as_camel_case() {
+        // The list endpoint coerces its JSON into the typed generated
+        // `ProjectSummary` (which drops unknown fields), so the rail only sees
+        // `appUi` if the field name matches the spec exactly. Lock the contract.
+        let summary = ProjectSummary {
+            name: "acme".into(),
+            display_name: None,
+            description: String::new(),
+            deploy_target: default_deploy_target(),
+            updated_ms: 0,
+            processes: 0,
+            decisions: 0,
+            forms: 0,
+            workers: 0,
+            running: true,
+            source: "workspace".into(),
+            lang: "deno".into(),
+            template: None,
+            scaffolded_from: None,
+            update_available: false,
+            latest_version: None,
+            app_ui: Some(AppUi {
+                enabled: true,
+                port: Some(3000),
+                ..AppUi::default()
+            }),
+        };
+        let v = serde_json::to_value(&summary).unwrap();
+        assert_eq!(v["appUi"]["enabled"], serde_json::json!(true));
+        assert_eq!(v["appUi"]["port"], serde_json::json!(3000));
+    }
+
+    #[test]
+    fn project_summary_omits_app_ui_when_absent() {
+        // A stopped project carries no `app_ui`; it must be omitted, not null,
+        // so clients can treat presence as "running app with a descriptor".
+        let summary = ProjectSummary {
+            name: "acme".into(),
+            display_name: None,
+            description: String::new(),
+            deploy_target: default_deploy_target(),
+            updated_ms: 0,
+            processes: 0,
+            decisions: 0,
+            forms: 0,
+            workers: 0,
+            running: false,
+            source: "workspace".into(),
+            lang: "deno".into(),
+            template: None,
+            scaffolded_from: None,
+            update_available: false,
+            latest_version: None,
+            app_ui: None,
+        };
+        let v = serde_json::to_value(&summary).unwrap();
+        assert!(v.get("appUi").is_none(), "appUi must be omitted when None");
     }
 
     #[test]

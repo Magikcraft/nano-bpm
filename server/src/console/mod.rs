@@ -2604,6 +2604,12 @@ pub(super) async fn projects_list() -> ApiResult {
     let mut out = Vec::with_capacity(list.len());
     for mut p in list.drain(..) {
         p.running = sup.is_running(&p.name).await;
+        // Only running apps appear in the left-rail running-apps surface, so
+        // resolve the app-view descriptor lazily for those (avoids a manifest +
+        // config read per stopped project on every listing).
+        if p.running {
+            p.app_ui = Some(sup.app_ui(&p.name));
+        }
         out.push(p);
     }
     Ok(serde_json::json!({
