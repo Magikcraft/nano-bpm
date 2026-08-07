@@ -10,6 +10,25 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./sourceMap": {
+      "types": "./dist/sourceMap.d.ts",
+      "default": "./dist/sourceMap.js"
+    },
+    "./events": {
+      "types": "./dist/events.d.ts",
+      "default": "./dist/events.js"
+    },
+    "./session": {
+      "types": "./dist/session.d.ts",
+      "default": "./dist/session.js"
+    },
+    "./engine": {
+      "types": "./dist/engine.d.ts",
+      "default": "./dist/engine.js"
+    }
+  },
   "files": [
     "dist",
     "examples"

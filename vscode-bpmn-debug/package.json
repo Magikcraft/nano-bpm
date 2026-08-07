@@ -1,0 +1,80 @@
+{
+  "name": "@nanobpm/vscode-bpmn-debug",
+  "version": "0.1.0",
+  "private": true,
+  "description": "VS Code BPMN debug view: renders the process diagram and highlights the element the nanobpmn debugger is paused on (issue #652).",
+  "license": "Apache-2.0",
+  "publisher": "nanobpm",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "type": "commonjs",
+  "main": "./dist/extension.js",
+  "categories": ["Debuggers"],
+  "activationEvents": ["onDebug"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "nanobpmn.showDiagram",
+        "title": "nanobpmn: Show BPMN debug diagram"
+      }
+    ],
+    "breakpoints": [{ "language": "xml" }],
+    "debuggers": [
+      {
+        "type": "nanobpmn",
+        "label": "nanobpmn BPMN",
+        "program": "../dap-adapter/dist/index.js",
+        "runtime": "node",
+        "languages": ["xml"],
+        "configurationAttributes": {
+          "launch": {
+            "required": ["bpmn", "processId"],
+            "properties": {
+              "bpmn": {
+                "type": "string",
+                "description": "Absolute path to the .bpmn file to debug."
+              },
+              "processId": {
+                "type": "string",
+                "description": "The BPMN process id to start an instance of."
+              },
+              "variables": {
+                "type": "object",
+                "description": "Initial process variables.",
+                "default": {}
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "nanobpmn",
+            "request": "launch",
+            "name": "Debug BPMN process",
+            "bpmn": "${workspaceFolder}/process.bpmn",
+            "processId": "my-process",
+            "variables": {}
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
+    "pretest": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@nanobpm/dap-adapter": "file:../dap-adapter",
+    "bpmn-js": "^17.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "@types/vscode": "^1.85.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.1.0"
+  }
+}
