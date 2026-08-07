@@ -87,6 +87,7 @@ pub mod ffi;
 pub use command::{ActivateElementInstruction, Command, UserTaskChangeset};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
+pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};
 pub use engine::{ActivatedJob, DecisionEvaluation, Engine, EngineError};
 pub use event::Event;
 pub use feel::FeelError;

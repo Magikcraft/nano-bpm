@@ -2293,17 +2293,27 @@ fn upsert_element_instance(
 ) -> rusqlite::Result<()> {
     let (def_id, def_key) = instance_def(tx, instance_key);
     let def_key_int: i64 = def_key.parse().unwrap_or(-1);
-    let (element_type, element_name): (String, Option<String>) = tx
-        .cquery_row(
-            "SELECT element_type, element_name FROM definition_elements \
-             WHERE process_definition_key = ?1 AND element_id = ?2",
-            params![def_key_int, element_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| ("UNKNOWN".to_string(), None));
+    // An ad-hoc sub-process's synthetic inner instance (`<container>#innerInstance`)
+    // has no entry in the deployed model, so it is resolved by its id postfix
+    // rather than a `definition_elements` lookup — matching Zeebe's
+    // `AD_HOC_SUB_PROCESS_INNER_INSTANCE` element type. The postfix is owned by
+    // engine-core (the single source of truth shared with the engine that mints
+    // these instances).
+    let (element_type, element_name): (String, Option<String>) =
+        if element_id.ends_with(nanobpmn_engine_core::ADHOC_INNER_INSTANCE_ID_POSTFIX) {
+            ("AD_HOC_SUB_PROCESS_INNER_INSTANCE".to_string(), None)
+        } else {
+            tx.cquery_row(
+                "SELECT element_type, element_name FROM definition_elements \
+                 WHERE process_definition_key = ?1 AND element_id = ?2",
+                params![def_key_int, element_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| ("UNKNOWN".to_string(), None))
+        };
     tx.cexecute(
         "INSERT INTO element_instances (element_instance_key, instance_key, process_definition_id, \
          process_definition_key, element_id, element_name, element_type, state, start_date_ms, \
@@ -4136,6 +4146,28 @@ mod element_instance_tests {
             .unwrap();
         let row = store.element_instance(2002).unwrap();
         assert_eq!(row.element_type, "UNKNOWN");
+        assert_eq!(row.element_name, None);
+    }
+
+    /// Gap #9 (issue #614): the synthetic ad-hoc inner instance
+    /// (`<container>#innerInstance`) is not in the deployed model, so it must be
+    /// resolved to the `AD_HOC_SUB_PROCESS_INNER_INSTANCE` element type by its id
+    /// postfix rather than falling back to UNKNOWN — matching Zeebe's read model.
+    #[test]
+    fn adhoc_inner_instance_resolves_to_its_element_type() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        let inner_id = nanobpmn_engine_core::adhoc_inner_instance_id("agent");
+        store
+            .export(&[&Event::ElementActivated {
+                instance_key: INST,
+                element_instance_key: 2003,
+                element_id: inner_id,
+                scope: 0,
+            }])
+            .unwrap();
+        let row = store.element_instance(2003).unwrap();
+        assert_eq!(row.element_type, "AD_HOC_SUB_PROCESS_INNER_INSTANCE");
         assert_eq!(row.element_name, None);
     }
 
