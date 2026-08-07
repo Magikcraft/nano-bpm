@@ -3,6 +3,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -16,7 +17,13 @@ import {
 } from "react-router-dom";
 import Topology from "./views/Topology";
 import { useTheme } from "./theme/ThemeProvider";
-import { getExtensions, getMarketplace, getTopology } from "./gen";
+import {
+  getExtensions,
+  getMarketplace,
+  getTopology,
+  listProjects,
+  type ProjectSummary,
+} from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 import { IS_STUDIO, CONSOLE_PROFILE } from "./lib/profile";
@@ -46,6 +53,7 @@ const ProjectWorkspace = __STUDIO__
   ? lazy(() => import("./views/ProjectWorkspace"))
   : null;
 const Extensions = __STUDIO__ ? lazy(() => import("./views/Extensions")) : null;
+const AppView = __STUDIO__ ? lazy(() => import("./views/AppView")) : null;
 // Operator surface — always present in both profiles.
 const Workers = lazy(() => import("./views/Workers"));
 const Metrics = lazy(() => import("./views/Metrics"));
@@ -148,7 +156,27 @@ const icons = {
   // Chevrons-left: points left to "collapse"; rotated 180° to point right for
   // "expand" when the rail is already collapsed.
   collapse: <Icon d="M11 17l-5-5 5-5M18 17l-5-5 5-5" />,
+  // Default glyph for a supervised running app that declares no icon (issue
+  // #638): an app window. The rail keys identity on the project name, so this
+  // fallback is shared by every un-iconed app.
+  appDefault: (
+    <Icon>
+      <rect x="3" y="4" width="18" height="16" rx="2" />
+      <path d="M3 9h18M7 6.5h.01M10 6.5h.01" />
+    </Icon>
+  ),
 } as const;
+
+// Resolve a running app's left-rail glyph from its manifest `icon` hint (a
+// bundled icon name), falling back to the default app glyph when the hint is
+// absent or names an icon the console doesn't bundle (per the AppUi.icon
+// contract). Keys like theme/nav glyphs are all fair game as bundled names.
+function appRailIcon(icon: string | null | undefined): ReactNode {
+  if (icon && Object.prototype.hasOwnProperty.call(icons, icon)) {
+    return icons[icon as keyof typeof icons];
+  }
+  return icons.appDefault;
+}
 
 const navItems: {
   to: string;
@@ -173,6 +201,23 @@ const navItems: {
 // Where "home" lands: the maker starts in Studio; the operator ("observe"
 // build, no Studio route) starts on Topology.
 const HOME_ROUTE = IS_STUDIO ? "/projects" : "/topology";
+
+// Cheap structural equality on the running-apps set so the 5s poll only
+// re-renders the rail when the set actually changes (name + display fields).
+function sameApps(a: ProjectSummary[], b: ProjectSummary[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((p, i) => {
+    const q = b[i];
+    return (
+      p.name === q.name &&
+      p.displayName === q.displayName &&
+      p.appUi?.label === q.appUi?.label &&
+      p.appUi?.icon === q.appUi?.icon &&
+      p.appUi?.enabled === q.appUi?.enabled &&
+      p.appUi?.port === q.appUi?.port
+    );
+  });
+}
 
 function railItemClass(active: boolean, collapsed = false): string {
   return `relative flex items-center ${
@@ -413,7 +458,56 @@ export default function App() {
     };
   }, []);
 
-  // Register every installed lang pack's `fileTypes[]` with the Monaco
+  // Running supervised apps contributed to the left rail (issue #638). The rail
+  // doubles as the running-apps control surface: every app the supervisor is
+  // running gets an entry (UI or headless), keyed on the project name — manifest
+  // icon/label are display hints only, since same-template apps share a manifest.
+  const [runningApps, setRunningApps] = useState<ProjectSummary[]>([]);
+  useEffect(() => {
+    if (!IS_STUDIO) return;
+    let cancelled = false;
+    const poll = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      listProjects({ throwOnError: true })
+        .then(({ data }) => {
+          if (cancelled) return;
+          // Sort by the stable `name` key so a reshuffle of the server's
+          // `updatedMs`-then-name ordering doesn't churn the rail when the
+          // running-app set and its display fields are unchanged. Storing the
+          // sorted list also keeps the rendered rail order stable.
+          const running = data.projects
+            .filter((p) => p.running)
+            .sort((a, b) => a.name.localeCompare(b.name));
+          setRunningApps((prev) => (sameApps(prev, running) ? prev : running));
+        })
+        .catch(() => {
+          /* offline or supervisor unavailable — keep the last known set */
+        });
+    };
+    poll();
+    const id = window.setInterval(poll, 5_000);
+    const onVis = () => {
+      if (!document.hidden) poll();
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, []);
+
+  // How many running apps resolve to each base label. Same-template apps share a
+  // manifest (identical `appUi.label`), so a collision means the label alone is
+  // ambiguous and the rail must fall back to the unique project name.
+  const runningAppLabelCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of runningApps) {
+      const base = a.appUi?.label || a.displayName || a.name;
+      m.set(base, (m.get(base) ?? 0) + 1);
+    }
+    return m;
+  }, [runningApps]);
   // ext→language map at boot, and again whenever the user navigates — so a
   // pack installed via the Extensions view during this session takes effect
   // as soon as they open a project, without a hard reload. Extensions.tsx
@@ -544,6 +638,53 @@ export default function App() {
             })}
           </nav>
 
+          {IS_STUDIO && runningApps.length > 0 && (
+            <nav className="mt-2 flex flex-col gap-1 border-t border-edge px-3 pt-2">
+              {!railCollapsed && (
+                <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wide text-fg-muted">
+                  Running apps
+                </div>
+              )}
+              {runningApps.map((app) => {
+                const to = `/apps/${encodeURIComponent(app.name)}`;
+                const active = location.pathname === to;
+                // Label is a display hint; the manifest is not unique, so the
+                // project name is the stable identity. When two running apps
+                // resolve to the same label, disambiguate the visible text with
+                // the unique project name; always expose the name via title/aria.
+                const base = app.appUi?.label || app.displayName || app.name;
+                const collides = (runningAppLabelCounts.get(base) ?? 0) > 1;
+                const label = collides ? `${base} · ${app.name}` : base;
+                const hover =
+                  base === app.name ? app.name : `${base} (${app.name})`;
+                return (
+                  <NavLink
+                    key={app.name}
+                    to={to}
+                    className={railItemClass(active, railCollapsed)}
+                    title={hover}
+                    aria-label={railCollapsed ? hover : undefined}
+                  >
+                    <ActiveBar show={active} />
+                    {appRailIcon(app.appUi?.icon)}
+                    {!railCollapsed && (
+                      <span className="truncate">{label}</span>
+                    )}
+                    <span
+                      className={`inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-success ${
+                        railCollapsed
+                          ? "absolute -right-0.5 -top-0.5"
+                          : "ml-auto"
+                      }`}
+                      title="Running"
+                      aria-hidden="true"
+                    />
+                  </NavLink>
+                );
+              })}
+            </nav>
+          )}
+
           <button
             type="button"
             onClick={canResume ? resumeJourney : startTour}
@@ -669,6 +810,7 @@ export default function App() {
                 {Extensions && (
                   <Route path="/extensions" element={<Extensions />} />
                 )}
+                {AppView && <Route path="/apps/:name" element={<AppView />} />}
                 <Route path="/config" element={<Config />} />
                 <Route path="/credits" element={<Credits />} />
                 <Route path="/topology" element={<Topology />} />
