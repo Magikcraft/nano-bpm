@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 
-use crate::model::{AdHocJobResult, ProcessDefinition, TaskListenerJobResult, Value};
+use crate::model::{
+    AdHocActivateElement, AdHocJobResult, ProcessDefinition, TaskListenerJobResult, Value,
+};
 use crate::state::{Key, MessageSubscriptionKind};
 
 /// An instruction submitted to [`crate::Engine::apply_command`].
@@ -294,6 +296,25 @@ pub enum Command {
         tags: Vec<String>,
         business_id: Option<String>,
     },
+    /// External "activate ad-hoc activities" command (#614 gap 3, Zeebe
+    /// `AdHocSubProcessInstructionActivateProcessor` — REST
+    /// `POST /element-instances/ad-hoc-activities/{key}/activation`): activate
+    /// named tools on an already-running ad-hoc sub-process container WITHOUT
+    /// completing its agent job. This is the non-agentic activation seam — it
+    /// drives the same tool-activation machinery an agent job's
+    /// `activateElements[]` does, and shares the same target validation (an
+    /// unknown element id is rejected NOT_FOUND, Zeebe parity).
+    ActivateAdHocActivities {
+        /// Element-instance key of the ad-hoc sub-process container (the REST
+        /// `adHocSubProcessInstanceKey` path parameter).
+        ad_hoc_instance_key: Key,
+        /// The inner elements (tools) to activate, each with optional seed
+        /// variables.
+        activate_elements: Vec<AdHocActivateElement>,
+        /// Cancel any tools still running and complete the container after this
+        /// turn (`cancelRemainingInstances`).
+        cancel_remaining: bool,
+    },
 }
 
 /// One activation instruction of a [`Command::ModifyInstance`]: place a new
@@ -375,6 +396,7 @@ impl Command {
             Command::CancelInstance { .. } => "cancel_instance",
             Command::ModifyInstance { .. } => "modify_instance",
             Command::DispatchStartInstance { .. } => "dispatch_start_instance",
+            Command::ActivateAdHocActivities { .. } => "activate_ad_hoc_sub_process_activities",
         }
     }
 
@@ -416,6 +438,12 @@ impl Command {
                 // Each terminate instruction is an 8-byte element-instance key.
                 activate + (terminate_instructions.len() as u64 * 8)
             }
+            Command::ActivateAdHocActivities {
+                activate_elements, ..
+            } => activate_elements
+                .iter()
+                .map(|a| a.element_id.len() as u64 + vars(&a.variables))
+                .sum(),
             _ => 0,
         };
         BASE + payload

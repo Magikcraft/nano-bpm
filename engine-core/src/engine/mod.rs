@@ -939,6 +939,37 @@ impl Engine {
                     }
                 }
 
+                // Ad-hoc agent job completion (ADR 0023 seam 2 / #614 gap 4):
+                // validate the activate-element instructions up-front so a bad
+                // turn is rejected wholesale (Zeebe parity) before any
+                // `JobCompleted` or activation side effect applies. The check
+                // only fires for a container's agent job (its element id is in
+                // the ad-hoc catalog); the tools' own jobs are not, so they fall
+                // through unchanged.
+                if let Some(result) = adhoc_result.as_ref() {
+                    if let Some(def) = self.adhoc_def_of(instance_key, &element_id) {
+                        // Every activated id must name one of the container's
+                        // tools (Zeebe NOT_FOUND, checked first — see
+                        // JobCompleteProcessor.checkAdHocSubprocessActivationTargetsAreValid);
+                        // otherwise the loop would mint a phantom child that
+                        // immediately completes.
+                        Self::validate_adhoc_activation_targets(
+                            &def,
+                            instance_key,
+                            &result.activate_elements,
+                        )?;
+                        // Asserting the completion condition is fulfilled while
+                        // also requesting activations is contradictory (Zeebe
+                        // INVALID_ARGUMENT — checkAdHocSubProcessCompletionCondition
+                        // NotFulfilledForElementActivation).
+                        if result.completion_condition_fulfilled
+                            && !result.activate_elements.is_empty()
+                        {
+                            return Err(EngineError::AdHocActivateWithCompletion { job_key });
+                        }
+                    }
+                }
+
                 self.emit(
                     &mut log,
                     Event::JobCompleted {
@@ -1025,14 +1056,7 @@ impl Engine {
                     // are not, so they fall through to the normal token resume.
                     let container_key = element_instance_key;
                     let result = adhoc_result.unwrap_or_default();
-                    if result.cancel_remaining_instances {
-                        // Cancel any in-flight tools, then complete the container.
-                        queue.push_back(Step::CompleteAdHoc {
-                            instance_key,
-                            container_key,
-                            cancel: true,
-                        });
-                    } else if result.completion_condition_fulfilled {
+                    if result.completion_condition_fulfilled {
                         // The agent asserts the container's completion condition is
                         // met (Camunda `isCompletionConditionFulfilled`): complete
                         // now, cancelling any tools still running so none is orphaned
@@ -1046,34 +1070,16 @@ impl Engine {
                             cancel: true,
                         });
                     } else {
-                        let already_active = self
-                            .state
-                            .instances
-                            .get(&instance_key)
-                            .and_then(|i| i.adhoc_instances.get(&container_key))
-                            .map(|a| a.active.len())
-                            .unwrap_or(0);
-                        let requested = result.activate_elements.len();
-                        for instr in result.activate_elements {
-                            queue.push_back(Step::ActivateAdHocTool {
-                                instance_key,
-                                container_key,
-                                element_id: instr.element_id,
-                                variables: instr.variables,
-                            });
-                        }
-                        // With no tool active and none requested, the agent has
-                        // nothing more to run this turn (it signals completion, or
-                        // simply returns no activations) — complete the container.
-                        // Otherwise the container parks until its tools drain, then
-                        // its agent job is re-emitted for the next turn.
-                        if already_active + requested == 0 {
-                            queue.push_back(Step::CompleteAdHoc {
-                                instance_key,
-                                container_key,
-                                cancel: false,
-                            });
-                        }
+                        // Ordinary turn (possibly `cancelRemainingInstances`):
+                        // shared with the external activate-activities command
+                        // (#614 gap 3) so both seams activate identically.
+                        self.enqueue_adhoc_turn(
+                            &mut queue,
+                            instance_key,
+                            container_key,
+                            result.activate_elements,
+                            result.cancel_remaining_instances,
+                        );
                     }
                 } else {
                     // The parked service-task token resumes from ACTIVATED.
@@ -2501,6 +2507,62 @@ impl Engine {
                     variables,
                     tags,
                     business_id,
+                );
+            }
+
+            Command::ActivateAdHocActivities {
+                ad_hoc_instance_key,
+                activate_elements,
+                cancel_remaining,
+            } => {
+                // External (non-agent-job) ad-hoc activation (#614 gap 3, Zeebe
+                // `AdHocSubProcessInstructionActivateProcessor`). Resolve the
+                // owning process instance + the container's element id from the
+                // element-instance key the caller supplied
+                // (`adHocSubProcessInstanceKey`); an unknown/inactive key is
+                // rejected NOT_FOUND.
+                //
+                // An empty activation with no cancel is a no-op the caller never
+                // means: it would let `enqueue_adhoc_turn` implicitly complete a
+                // parked container (it completes when `already_active + requested
+                // == 0`), so an external client could accidentally finish an
+                // instance by POSTing `{ "elements": [] }`. Only the agent-job
+                // completion seam (#614 gap 4) may end a turn by activating
+                // nothing; the external command rejects it as INVALID_ARGUMENT
+                // (Zeebe parity). Completion via this command is only expressible
+                // through `cancelRemainingInstances`.
+                if activate_elements.is_empty() && !cancel_remaining {
+                    return Err(EngineError::AdHocNoActivationTargets {
+                        ad_hoc_instance_key,
+                    });
+                }
+                let container_key = ad_hoc_instance_key;
+                let (instance_key, element_id) = self
+                    .state
+                    .instances
+                    .iter()
+                    .find_map(|(ik, inst)| {
+                        inst.adhoc_instances
+                            .get(&container_key)
+                            .map(|a| (*ik, a.element_id.clone()))
+                    })
+                    .ok_or(EngineError::AdHocSubProcessNotFound {
+                        ad_hoc_instance_key,
+                    })?;
+                let def = self.adhoc_def_of(instance_key, &element_id).ok_or(
+                    EngineError::AdHocSubProcessNotFound {
+                        ad_hoc_instance_key,
+                    },
+                )?;
+                // Same target validation as the agent-job path (unknown id →
+                // NOT_FOUND, atomic), then drive the same activation turn.
+                Self::validate_adhoc_activation_targets(&def, instance_key, &activate_elements)?;
+                self.enqueue_adhoc_turn(
+                    &mut queue,
+                    instance_key,
+                    container_key,
+                    activate_elements,
+                    cancel_remaining,
                 );
             }
         }
@@ -4370,6 +4432,85 @@ impl Engine {
             .iter()
             .find(|d| d.container_id == element_id)
             .cloned()
+    }
+
+    /// Validate that every activate-element instruction names one of the
+    /// container's tools (Zeebe NOT_FOUND parity — see
+    /// `AdHocSubProcessInstructionActivateProcessor` /
+    /// `JobCompleteProcessor.checkAdHocSubprocessActivationTargetsAreValid`).
+    /// Shared by the agent-job completion path (#614 gap 4) and the external
+    /// activate-activities command (#614 gap 3) so an unknown id is rejected
+    /// identically on both seams — otherwise the loop would mint a phantom child
+    /// that immediately completes. Atomic: the first unknown id fails the whole
+    /// batch, before any activation applies.
+    fn validate_adhoc_activation_targets(
+        def: &crate::model::AdHocSubProcessDef,
+        instance_key: Key,
+        activate_elements: &[crate::model::AdHocActivateElement],
+    ) -> Result<(), EngineError> {
+        for instr in activate_elements {
+            if !def.tools.iter().any(|t| t.element_id == instr.element_id) {
+                return Err(EngineError::AdHocUnknownElement {
+                    instance_key,
+                    element_id: instr.element_id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Enqueue the steps for one ad-hoc activation "turn" — shared by the
+    /// agent-job completion path (#614 gap 4) and the external
+    /// activate-activities command (#614 gap 3). Targets must already be
+    /// validated (see [`Self::validate_adhoc_activation_targets`]). With
+    /// `cancel_remaining`, cancels any in-flight tools and completes the
+    /// container; otherwise activates each requested tool, and — when neither a
+    /// tool is already active nor one is requested this turn — completes the
+    /// container (nothing more to run).
+    fn enqueue_adhoc_turn(
+        &self,
+        queue: &mut VecDeque<Step>,
+        instance_key: Key,
+        container_key: Key,
+        activate_elements: Vec<crate::model::AdHocActivateElement>,
+        cancel_remaining: bool,
+    ) {
+        if cancel_remaining {
+            queue.push_back(Step::CompleteAdHoc {
+                instance_key,
+                container_key,
+                cancel: true,
+            });
+            return;
+        }
+        let already_active = self
+            .state
+            .instances
+            .get(&instance_key)
+            .and_then(|i| i.adhoc_instances.get(&container_key))
+            .map(|a| a.active.len())
+            .unwrap_or(0);
+        let requested = activate_elements.len();
+        for instr in activate_elements {
+            queue.push_back(Step::ActivateAdHocTool {
+                instance_key,
+                container_key,
+                element_id: instr.element_id,
+                variables: instr.variables,
+            });
+        }
+        // With no tool active and none requested, the agent has nothing more to
+        // run this turn (it signals completion, or simply returns no
+        // activations) — complete the container. Otherwise the container parks
+        // until its tools drain, then its agent job is re-emitted for the next
+        // turn.
+        if already_active + requested == 0 {
+            queue.push_back(Step::CompleteAdHoc {
+                instance_key,
+                container_key,
+                cancel: false,
+            });
+        }
     }
 
     /// The `zeebe:ioMapping` of one tool inside an ad-hoc container, read from the
@@ -6548,6 +6689,31 @@ pub enum EngineError {
     /// A `creating` task listener tried to correct the assignee of a user task
     /// that already declares an initial assignee (ADR 0037 §6, Zeebe parity).
     TaskListenerAssigneeCorrectionOnCreating { user_task_key: Key },
+    /// An ad-hoc sub-process agent's `activateElements[]` instruction referenced
+    /// an element id that is not one of the container's tools. Zeebe rejects the
+    /// activation with NOT_FOUND (`AdHocSubProcessInstructionActivateProcessor`).
+    AdHocUnknownElement {
+        instance_key: Key,
+        element_id: String,
+    },
+    /// An ad-hoc sub-process agent asserted `completionConditionFulfilled` while
+    /// also requesting new element activations in the same turn. The two are
+    /// contradictory; Zeebe rejects with INVALID_ARGUMENT
+    /// (`AdHocSubProcessUtils.verifyCompletionConditionFulfilled`).
+    AdHocActivateWithCompletion { job_key: Key },
+    /// The external "activate ad-hoc activities" command (#614 gap 3) named an
+    /// `adHocSubProcessInstanceKey` that does not identify an active ad-hoc
+    /// sub-process container. Zeebe rejects with NOT_FOUND
+    /// (`AdHocSubProcessInstructionActivateProcessor`).
+    AdHocSubProcessNotFound { ad_hoc_instance_key: Key },
+    /// The external "activate ad-hoc activities" command (#614 gap 3) was sent
+    /// with no `elements` to activate and `cancelRemainingInstances = false`.
+    /// That request is a no-op the caller cannot have intended — completing the
+    /// container is only expressible via `cancelRemainingInstances` — so it is
+    /// rejected as INVALID_ARGUMENT rather than silently finishing a parked
+    /// container. (The agent-job completion seam, #614 gap 4, still ends a turn
+    /// by activating nothing; only this external command forbids it.)
+    AdHocNoActivationTargets { ad_hoc_instance_key: Key },
 }
 
 impl std::fmt::Display for EngineError {
@@ -6642,6 +6808,37 @@ impl std::fmt::Display for EngineError {
                 write!(
                     f,
                     "a creating task listener cannot correct the assignee of user task {user_task_key}: it already has an initial assignee"
+                )
+            }
+            EngineError::AdHocUnknownElement {
+                instance_key,
+                element_id,
+            } => {
+                write!(
+                    f,
+                    "ad-hoc sub-process in instance {instance_key} has no activatable element with id {element_id}"
+                )
+            }
+            EngineError::AdHocActivateWithCompletion { job_key } => {
+                write!(
+                    f,
+                    "ad-hoc agent job {job_key} cannot both assert the completion condition is fulfilled and activate elements"
+                )
+            }
+            EngineError::AdHocSubProcessNotFound {
+                ad_hoc_instance_key,
+            } => {
+                write!(
+                    f,
+                    "no active ad-hoc sub-process container with instance key {ad_hoc_instance_key}"
+                )
+            }
+            EngineError::AdHocNoActivationTargets {
+                ad_hoc_instance_key,
+            } => {
+                write!(
+                    f,
+                    "ad-hoc sub-process activation for container {ad_hoc_instance_key} named no elements and did not cancel remaining instances"
                 )
             }
         }
