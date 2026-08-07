@@ -9,8 +9,9 @@ implemented for v1: the engine evaluates a declared `<completionCondition>` afte
 each tool completes (and honors the agent's `isCompletionConditionFulfilled`
 flag), and applies each activated tool's `zeebe:ioMapping` (inputs on activation,
 outputs projected into the container scope) — the pruned tool's mappings are
-carried on the container catalog. Deferred to v1.1: the declarative `BPMN_TASK`
-`activeElementsCollection` variant (small — see §Subset). Remaining: the seam 6
+carried on the container catalog. Implemented for v1.1: the declarative `BPMN_TASK`
+`activeElementsCollection` variant (an agent-less execution mode — see §Subset).
+Remaining: the seam 6
 E2E parity test.
 Date: 2026-07-21.
 Relates to: ADR 0022 (`0022-nano-rad-application.md` §E.1 — the parity strategy this ADR makes
@@ -116,8 +117,12 @@ shape byte-for-byte so the existing connector is unmodified. Scope is bounded an
   (the tool element is pruned from the executable graph, so it can't be read back by element id);
   inputs are evaluated on activation into the tool's local scope, outputs are projected into the
   container scope on completion.
-- **Deferred to v1.1:** `activeElementsCollection` (declarative `BPMN_TASK` variant) as a FEEL list
-  evaluated at container activation — small, but a distinct (agent-less) execution mode.
+- **Done (v1.1):** `activeElementsCollection` (declarative `BPMN_TASK` variant) as a FEEL list
+  evaluated at container activation — a distinct (agent-less) execution mode. On activation the
+  container evaluates the collection to the element ids to activate, seeds those tools directly
+  (no container job is minted), and completes once they drain; ids absent from the container's
+  tool catalog are dropped (raising the Camunda `NOT_FOUND`/`EXTRACT_VALUE_ERROR` incident is a
+  separate validation gap).
 
 ### 5. Read model + metrics
 
@@ -132,8 +137,9 @@ Ship in this order; state each boundary in `PERFORMANCE.md`/feature matrix:
 - **v1**: single-level ad-hoc, `JOB_WORKER` impl, tools = service/connector/user tasks and simple
   inner sub-graphs; `activateElements` + `completionCondition` + `cancelRemainingInstances` +
   `outputCollection/outputElement`.
-- **Deferred**: nested ad-hoc (agent-of-agents), boundary events on tools, `BPMN_TASK`
-  `activeElementsCollection` (add in v1.1, it's small), compensation inside ad-hoc.
+- **v1.1**: the declarative `BPMN_TASK` `activeElementsCollection` execution mode.
+- **Deferred**: nested ad-hoc (agent-of-agents), boundary events on tools, compensation inside
+  ad-hoc.
 
 ## Phased plan
 
@@ -142,8 +148,8 @@ Ship in this order; state each boundary in `PERFORMANCE.md`/feature matrix:
 2. **Model** (seam 1): parse + retain-as-catalog; unit tests over the fixtures.
 3. **Result plumbing** (seam 3): fields on REST + Falcon complete-job (no behavior yet).
 4. **Runtime** (seam 2): activate-element command, scope, loop, completion/cancel; engine tests.
-5. **FEEL/IO** (seam 4) ✅ (v1): completion condition + tool ioMapping; `BPMN_TASK` declarative
-   variant deferred to v1.1.
+5. **FEEL/IO** (seam 4) ✅ (v1): completion condition + tool ioMapping. ✅ (v1.1): the `BPMN_TASK`
+   declarative `activeElementsCollection` variant.
 6. **E2E parity test**: run a golden agentic BPMN on embedded Bernd driven by the **unmodified**
    Camunda AI Agent connector; assert per-tool instances appear in the read model and the run
    matches Camunda's outcome.
