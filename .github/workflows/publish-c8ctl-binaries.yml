@@ -149,6 +149,9 @@ jobs:
     name: Build ${{ matrix.asset }}
     needs: prepare
     runs-on: ${{ matrix.os }}
+    # Defensive cap so a future build wedge (see issue #634) fails fast instead of
+    # burning up to GitHub's 6h default and silently blocking the publish job.
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -172,20 +175,34 @@ jobs:
             zig: true
             glibc: '2.31'
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04
+            # Native arm64 runner: builds on aarch64 hardware instead of
+            # cross-compiling from x64, removing the cross codegen penalty. zig is
+            # kept because the runner's native glibc (2.39) would otherwise bake in
+            # GLIBC_2.39 symbol refs — zigbuild still pins the 2.31 floor.
+            os: ubuntu-24.04-arm
             asset: nanobpm-gateway-rest-server-linux-arm64
             zig: true
             glibc: '2.31'
+          # 32-bit ARM legs relax the release profile's fat LTO (see `lto_fast`
+          # handling in the build steps). `[profile.release]` uses `lto = true` +
+          # `codegen-units = 1`, which collapses every crate into one LLVM module
+          # optimized single-threaded — tolerable on 64-bit but pathological when
+          # cross-compiling to 32-bit ARM (armv7 wedged for 60+ min in run
+          # 31142202870, blocking the whole `publish` job). These are the least
+          # performance-critical binaries, so thin LTO + 16 codegen-units is an
+          # acceptable trade for builds that finish in minutes. See issue #634.
           - target: armv7-unknown-linux-gnueabihf
             os: ubuntu-24.04
             asset: nanobpm-gateway-rest-server-linux-armv7
             zig: true
             glibc: '2.31'
+            lto_fast: true
           - target: arm-unknown-linux-gnueabihf
             os: ubuntu-24.04
             asset: nanobpm-gateway-rest-server-linux-armv6
             zig: true
             glibc: '2.31'
+            lto_fast: true
           - target: x86_64-pc-windows-msvc
             os: windows-2022
             asset: nanobpm-gateway-rest-server-win32-x64.exe
@@ -233,6 +250,13 @@ jobs:
           NANOBPM_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
           set -euo pipefail
+          # 32-bit ARM legs relax fat LTO (see the matrix `lto_fast` comment) via
+          # cargo's profile env vars: thin LTO + 16 codegen-units keeps the final
+          # stage parallel so the build finishes in minutes instead of wedging.
+          if [ "${{ matrix.lto_fast }}" = "true" ]; then
+            export CARGO_PROFILE_RELEASE_LTO=thin
+            export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+          fi
           # The `.<glibc>` suffix pins the minimum glibc; zigbuild writes to the
           # unsuffixed target dir (server/target/<triple>/release/).
           cargo zigbuild --release --target "${{ matrix.target }}.${{ matrix.glibc }}" \
@@ -248,6 +272,10 @@ jobs:
           NANOBPM_VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
         run: |
           set -euo pipefail
+          if [ "${{ matrix.lto_fast }}" = "true" ]; then
+            export CARGO_PROFILE_RELEASE_LTO=thin
+            export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
+          fi
           cargo build --release --target "${{ matrix.target }}" \
             --features console --bin "$BIN_NAME"
 
