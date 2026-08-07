@@ -466,7 +466,7 @@ export interface AppUi {
    */
   path?: string;
   /**
-   * Left-rail icon: a bundled icon name (project asset support may come later). Display hint only; the console falls back to a default glyph when absent/invalid.
+   * Left-rail icon: either a bundled glyph name (e.g. "workers") resolved by the console, or a project-relative asset path the app ships itself (e.g. "assets/icon.svg"), served path-guarded and image-only from /console/app-view-icon/<project>. Display hint only; the console falls back to a default glyph when absent/invalid/unresolvable.
    */
   icon?: string;
   /**

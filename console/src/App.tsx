@@ -167,15 +167,58 @@ const icons = {
   ),
 } as const;
 
-// Resolve a running app's left-rail glyph from its manifest `icon` hint (a
-// bundled icon name), falling back to the default app glyph when the hint is
-// absent or names an icon the console doesn't bundle (per the AppUi.icon
-// contract). Keys like theme/nav glyphs are all fair game as bundled names.
+// A running app's left-rail `icon` hint is either a *bundled glyph name*
+// (resolved against the console's icon set) or a *project asset path* the app
+// ships itself (e.g. `assets/icon.svg`), served path-guarded from
+// `/console/app-view-icon/<name>`. Heuristic mirrored server-side
+// (`app_view_icon_is_asset`): a separator, or a real extension (a dot with a
+// non-separator char before it, so a dotfile like `.svg` is NOT an extension —
+// matching Rust's `Path::extension`), ⇒ asset path.
+function isAssetIcon(icon: string | null | undefined): boolean {
+  return !!icon && (icon.includes("/") || /[^/]\.[a-z0-9]+$/i.test(icon));
+}
+
+// Resolve a running app's left-rail glyph from its manifest `icon` hint,
+// falling back to the default app glyph when the hint is absent or names an
+// icon the console doesn't bundle (per the AppUi.icon contract). Keys like
+// theme/nav glyphs are all fair game as bundled names.
 function appRailIcon(icon: string | null | undefined): ReactNode {
   if (icon && Object.prototype.hasOwnProperty.call(icons, icon)) {
     return icons[icon as keyof typeof icons];
   }
   return icons.appDefault;
+}
+
+// The rail glyph for one running app: an app-shipped image icon (rendered via
+// <img>, which never executes a scripted SVG) when `icon` is an asset path,
+// else the resolved bundled glyph. A failed image load (missing/oversized/
+// wrong type ⇒ the server 404s) falls back to the default glyph.
+function AppRailGlyph({
+  name,
+  icon,
+}: {
+  name: string;
+  icon: string | null | undefined;
+}) {
+  const [failed, setFailed] = useState(false);
+  // Reset the fallback when the icon hint changes, so fixing a broken/renamed
+  // icon recovers without a full remount.
+  useEffect(() => setFailed(false), [icon]);
+  if (isAssetIcon(icon) && !failed) {
+    return (
+      <img
+        // The path is manifest-fixed; `v` cache-busts a changed icon hint.
+        src={`/console/app-view-icon/${encodeURIComponent(name)}?v=${encodeURIComponent(
+          icon ?? "",
+        )}`}
+        alt=""
+        aria-hidden="true"
+        className="h-4 w-4 shrink-0 rounded-sm object-contain"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+  return appRailIcon(icon);
 }
 
 const navItems: {
@@ -666,7 +709,7 @@ export default function App() {
                     aria-label={railCollapsed ? hover : undefined}
                   >
                     <ActiveBar show={active} />
-                    {appRailIcon(app.appUi?.icon)}
+                    <AppRailGlyph name={app.name} icon={app.appUi?.icon} />
                     {!railCollapsed && (
                       <span className="truncate">{label}</span>
                     )}
