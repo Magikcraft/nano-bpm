@@ -2406,6 +2406,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_job_worker_adhoc_with_cancel_remaining_instances_false() {
+        // Deliberate divergence from Zeebe (issue #614 gap 6): Zeebe's
+        // `AdHocSubProcessValidator` forbids `cancelRemainingInstances="false"`
+        // alongside a `zeebe:taskDefinition` (its JOB_WORKER path carries cancel
+        // purely on the job result), but nano defers `cancelRemainingInstances`
+        // separately (gap 7) and so must NOT reject a JOB_WORKER container that
+        // carries it. This is the positive twin of
+        // `accepts_job_worker_adhoc_with_completion_condition`, guarding against a
+        // future refactor accidentally reintroducing Zeebe's stricter rule.
+        let ext = r#"<zeebe:taskDefinition type="agent" /><zeebe:adHoc outputCollection="results" outputElement="=result" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool"><bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements></bpmn:serviceTask>"#;
+        let xml = adhoc_model(r#" cancelRemainingInstances="false""#, ext, inner);
+        let def = &parse_bpmn(&xml).unwrap()[0];
+        assert_eq!(def.adhoc.len(), 1);
+        assert_eq!(def.adhoc[0].container_id, "agent");
+    }
+
+    #[test]
     fn accepts_declarative_active_elements_collection_without_taskdefinition() {
         // The declarative BPMN_TASK variant legitimately declares
         // activeElementsCollection WITHOUT a taskDefinition — it must NOT be
