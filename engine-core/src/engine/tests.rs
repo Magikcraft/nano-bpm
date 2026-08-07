@@ -8702,10 +8702,102 @@ fn adhoc_agent_with_user_task_tool() -> ProcessDefinition {
 }
 
 fn activate_element(id: &str) -> crate::model::AdHocActivateElement {
+    activate_element_with(id, &[])
+}
+
+fn activate_element_with(
+    id: &str,
+    variables: &[(&str, Value)],
+) -> crate::model::AdHocActivateElement {
     crate::model::AdHocActivateElement {
         element_id: id.to_string(),
-        variables: HashMap::new(),
+        variables: variables
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
     }
+}
+
+/// Regression for Magikcraft/nano-bpm#605: an agent's
+/// `activateElements[{ elementId, variables }]` must scope those `variables`
+/// into the activated tool's OWN job — including tools that declare no
+/// `ioMapping` (the `toolA`/`toolB` fixture tools have none). The reported bug
+/// dropped the seed variables entirely, so a no-mapping tool saw only the
+/// instance-root scope. This asserts the whole defect class: a plain tool AND a
+/// second tool activated in the same turn each receive only their own seed
+/// variables, with no cross-contamination.
+#[test]
+fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+
+    // Turn 1: activate both no-ioMapping tools, each with a distinct seed var.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![
+                    activate_element_with("toolA", &[("fromActivation", Value::Str("A".into()))]),
+                    activate_element_with("toolB", &[("fromActivation", Value::Str("B".into()))]),
+                ],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    assert_eq!(
+        tool_jobs.len(),
+        2,
+        "exactly the two activated tools emit jobs — no duplicates or extras (#605)"
+    );
+    let tool_a = tool_jobs
+        .iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job emitted");
+    let tool_b = tool_jobs
+        .iter()
+        .find(|j| j.element_id == "toolB")
+        .expect("toolB job emitted");
+
+    assert_eq!(
+        *tool_a.variables,
+        HashMap::from([("fromActivation".to_string(), Value::Str("A".into()))]),
+        "toolA's job scope is EXACTLY its own activation seed — reaches the job \
+         with no ioMapping, and carries no root bleed-through or toolB var (#605)"
+    );
+    assert_eq!(
+        *tool_b.variables,
+        HashMap::from([("fromActivation".to_string(), Value::Str("B".into()))]),
+        "toolB's job scope is EXACTLY its own activation seed — no \
+         cross-contamination from toolA's concurrently-activated seed (#605)"
+    );
+
+    // The exact failure mode #605 describes: a seed merged into the shared
+    // instance-root scope would still satisfy the per-job assertions above while
+    // reintroducing the global-namespace leak. Guard it directly — the seeds
+    // must stay scoped to their tool jobs and never surface at the root.
+    assert_eq!(
+        io_var(&engine, inst, "fromActivation"),
+        None,
+        "activation seeds must stay scoped to their tool jobs, never merged \
+         into the instance-root scope (#605)"
+    );
+
+    assert!(
+        !engine.is_completed(inst),
+        "container still parked while the seeded tools run"
+    );
 }
 
 #[test]
