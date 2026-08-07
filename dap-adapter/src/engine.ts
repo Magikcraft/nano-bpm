@@ -25,6 +25,20 @@ export interface DebugState {
 let wasmReady = false;
 
 /**
+ * `JSON.parse` that never throws: the wasm surface returns a JSON string on
+ * success but may hand back an invalid-JSON error string (or malformed payload)
+ * on failure. A raw `JSON.parse` there would crash the adapter process, so parse
+ * defensively and let callers treat an unparseable result as "no data".
+ */
+function safeJsonParse(json: string): unknown {
+  try {
+    return JSON.parse(json) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Initialise the wasm module once, synchronously, from the on-disk `.wasm` bytes.
  * The pkg is built `--target web` (its default init fetches a URL), which does not
  * work under Node's `fetch` for `file://`; `initSync` with the raw bytes does.
@@ -50,7 +64,7 @@ export class DebugEngine {
 
   /** Parse + deploy a BPMN resource, returning the deployed process ids. */
   deploy(xml: string): string[] {
-    const res: unknown = JSON.parse(this.engine.deploy(xml));
+    const res = safeJsonParse(this.engine.deploy(xml));
     if (
       typeof res === 'object' &&
       res !== null &&
@@ -94,7 +108,7 @@ export class DebugEngine {
 
   /** The variables of the (single) instance, from the current snapshot. */
   variables(): Record<string, unknown> {
-    const snap: unknown = JSON.parse(this.engine.snapshot());
+    const snap = safeJsonParse(this.engine.snapshot());
     if (
       typeof snap === 'object' &&
       snap !== null &&
@@ -116,7 +130,7 @@ export class DebugEngine {
   }
 
   private parseState(json: string): DebugState {
-    const v: unknown = JSON.parse(json);
+    const v = safeJsonParse(json);
     if (typeof v !== 'object' || v === null) {
       return { paused: false, seq: 0, activeElements: [] };
     }
