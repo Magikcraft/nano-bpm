@@ -8736,14 +8736,27 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
         .expect("toolB job emitted");
 
     assert_eq!(
-        tool_a.variables.get("fromActivation"),
-        Some(&Value::Str("A".into())),
-        "toolA's activation variable must reach its job even with no ioMapping (#605)"
+        *tool_a.variables,
+        HashMap::from([("fromActivation".to_string(), Value::Str("A".into()))]),
+        "toolA's job scope is EXACTLY its own activation seed — reaches the job \
+         with no ioMapping, and carries no root bleed-through or toolB var (#605)"
     );
     assert_eq!(
-        tool_b.variables.get("fromActivation"),
-        Some(&Value::Str("B".into())),
-        "toolB's activation variable must reach its own job scope (#605)"
+        *tool_b.variables,
+        HashMap::from([("fromActivation".to_string(), Value::Str("B".into()))]),
+        "toolB's job scope is EXACTLY its own activation seed — no \
+         cross-contamination from toolA's concurrently-activated seed (#605)"
+    );
+
+    // The exact failure mode #605 describes: a seed merged into the shared
+    // instance-root scope would still satisfy the per-job assertions above while
+    // reintroducing the global-namespace leak. Guard it directly — the seeds
+    // must stay scoped to their tool jobs and never surface at the root.
+    assert_eq!(
+        io_var(&engine, inst, "fromActivation"),
+        None,
+        "activation seeds must stay scoped to their tool jobs, never merged \
+         into the instance-root scope (#605)"
     );
 
     assert!(
