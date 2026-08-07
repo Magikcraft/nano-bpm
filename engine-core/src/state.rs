@@ -473,6 +473,13 @@ pub struct AdHocState {
     pub output_values: Vec<Value>,
     /// How many agent-job turns have run (drives the metrics + runaway guard).
     pub iterations: u32,
+    /// Latched once the declared `<completionCondition>` has been satisfied with
+    /// `cancelRemainingInstances=false`: the loop stops activating new tools and
+    /// the container completes once its outstanding children drain, even if a
+    /// later tool's output would no longer satisfy the condition (Zeebe
+    /// `ElementInstance#isCompletionConditionFulfilled`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub completion_condition_fulfilled: bool,
 }
 
 /// Why an incident was raised. Maps to a recovery story and to the REST
@@ -2092,6 +2099,7 @@ pub fn apply(state: &mut State, event: &Event) {
                         active: std::collections::BTreeSet::new(),
                         output_values: Vec::new(),
                         iterations: 0,
+                        completion_condition_fulfilled: false,
                     },
                 );
             }
@@ -2132,6 +2140,20 @@ pub fn apply(state: &mut State, event: &Event) {
                     if let Some(value) = output {
                         adhoc.output_values.push(value.clone());
                     }
+                }
+            }
+        }
+
+        // The declared completion condition was satisfied with
+        // `cancelRemainingInstances=false`: latch it so the container stops
+        // activating new tools and completes once its children drain.
+        Event::AdHocCompletionConditionFulfilled {
+            instance_key,
+            container_key,
+        } => {
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                if let Some(adhoc) = instance.adhoc_instances.get_mut(container_key) {
+                    adhoc.completion_condition_fulfilled = true;
                 }
             }
         }

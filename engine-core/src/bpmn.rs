@@ -377,6 +377,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 let idx = acc.add_node(attrs, NodeKind::Service);
                                 if let Some(i) = idx {
                                     acc.nodes[i].is_adhoc = true;
+                                    // BPMN `cancelRemainingInstances` defaults to
+                                    // `true`; only an explicit "false" defers.
+                                    acc.nodes[i].adhoc_cancel_remaining_instances =
+                                        attr(attrs, "cancelRemainingInstances") != Some("false");
                                 }
                                 if !self_closing {
                                     cur_service_task = idx;
@@ -1051,6 +1055,10 @@ struct NodeAcc {
     adhoc_active_elements: Option<String>,
     /// An ad-hoc container's `<completionCondition>` FEEL text, if declared.
     adhoc_completion_condition: Option<String>,
+    /// An ad-hoc container's `cancelRemainingInstances` attribute (BPMN default
+    /// `true`): whether a fulfilled completion condition cancels still-running
+    /// tools or defers until they drain.
+    adhoc_cancel_remaining_instances: bool,
     /// For an exclusive gateway: the id of its `default="..."` sequence flow, if
     /// declared. That flow becomes the gateway's fallback (taken only when no
     /// other outgoing condition matches), regardless of document order.
@@ -1204,6 +1212,7 @@ impl ProcessAcc {
             adhoc_output_element: None,
             adhoc_active_elements: None,
             adhoc_completion_condition: None,
+            adhoc_cancel_remaining_instances: true,
             default_flow: None,
             io: crate::model::IoMapping::default(),
             timer_expr: None,
@@ -1314,6 +1323,7 @@ impl ProcessAcc {
                     active_elements_collection: n.adhoc_active_elements.clone(),
                     output_collection: n.adhoc_output_collection.clone(),
                     output_element: n.adhoc_output_element.clone(),
+                    cancel_remaining_instances: n.adhoc_cancel_remaining_instances,
                     tools: Vec::new(),
                 });
             }

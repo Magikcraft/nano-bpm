@@ -9154,6 +9154,163 @@ fn adhoc_completion_condition_ends_the_loop_and_cancels_remaining_tools() {
     );
 }
 
+fn adhoc_completion_condition_defer_process() -> ProcessDefinition {
+    // Identical to `adhoc_completion_condition_process`, but the container carries
+    // `cancelRemainingInstances="false"`: a fulfilled `<completionCondition>` must
+    // NOT cancel the still-running tool — the container defers its completion until
+    // that tool drains, collecting its output too.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent" cancelRemainingInstances="false">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:completionCondition>=done = true</bpmn:completionCondition>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn adhoc_completion_condition_cancel_remaining_defaults_true() {
+    // The BPMN `cancelRemainingInstances` attribute defaults to `true`, so a
+    // container that omits it cancels remaining tools on a fulfilled condition.
+    assert!(
+        adhoc_completion_condition_process().adhoc[0].cancel_remaining_instances,
+        "cancelRemainingInstances defaults to true when the attribute is absent"
+    );
+    // And an explicit `false` is parsed onto the catalog.
+    assert!(
+        !adhoc_completion_condition_defer_process().adhoc[0].cancel_remaining_instances,
+        "cancelRemainingInstances=\"false\" is parsed onto the catalog"
+    );
+}
+
+#[test]
+fn adhoc_completion_condition_defers_when_cancel_remaining_is_false() {
+    // The declared `<completionCondition>` fires after toolA sets `done = true`,
+    // but `cancelRemainingInstances="false"` defers container completion: toolB
+    // keeps running, and the container completes only once toolB drains — with
+    // BOTH tools' outputs collected (nothing cancelled).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_completion_condition_defer_process(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+
+    // Turn 1: activate both tools.
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    // Complete toolA with `done = true`: the completion condition fires, but with
+    // cancelRemainingInstances=false the container defers — it stays active with
+    // toolB still running and the fulfilment latched.
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 60_000, 0);
+    let job_a = tool_jobs
+        .iter()
+        .find(|j| j.element_id == "toolA")
+        .expect("toolA job")
+        .clone();
+    let job_b = tool_jobs
+        .iter()
+        .find(|j| j.element_id == "toolB")
+        .expect("toolB job")
+        .clone();
+    let mut vars_a = HashMap::new();
+    vars_a.insert("done".to_string(), Value::Bool(true));
+    vars_a.insert("result".to_string(), Value::Str("A".to_string()));
+    engine
+        .apply_command(Command::complete_job_with(job_a.key, vars_a))
+        .unwrap();
+
+    assert!(
+        !engine.is_completed(inst),
+        "the container defers completion while toolB is still running"
+    );
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .expect("ad-hoc container still active (deferred)")
+        .clone();
+    assert_eq!(
+        adhoc.active.len(),
+        1,
+        "toolB is still active (not cancelled)"
+    );
+    assert!(
+        adhoc.completion_condition_fulfilled,
+        "the fulfilled completion condition is latched while deferring"
+    );
+
+    // Complete toolB: no active children remain, so the deferred container now
+    // completes — collecting toolB's output as well.
+    let mut vars_b = HashMap::new();
+    vars_b.insert("result".to_string(), Value::Str("B".to_string()));
+    let final_events = engine
+        .apply_command(Command::complete_job_with(job_b.key, vars_b))
+        .unwrap();
+
+    assert!(
+        engine.is_completed(inst),
+        "the container completes once its last outstanding tool drains"
+    );
+    assert!(
+        engine
+            .instance(inst)
+            .map(|i| i.adhoc_instances.is_empty())
+            .unwrap_or(true),
+        "ad-hoc runtime state torn down after deferred completion"
+    );
+    let results = final_events.iter().find_map(|e| match e {
+        Event::VariablesUpdated { variables, .. } => variables.get("results").cloned(),
+        _ => None,
+    });
+    assert_eq!(
+        results,
+        Some(Value::List(vec![
+            Value::Str("A".to_string()),
+            Value::Str("B".to_string()),
+        ])),
+        "both tools' outputs are collected; the deferred toolB was not cancelled"
+    );
+}
+
 fn adhoc_tool_io_process() -> ProcessDefinition {
     // A container whose tool declares a `zeebe:ioMapping`: an input mapping
     // (`=base + 1` → `n`, local to the tool) and an output mapping
