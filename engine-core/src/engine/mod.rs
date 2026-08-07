@@ -4830,6 +4830,20 @@ impl Engine {
                     .get(name)
                     .cloned();
                 if matches!(current, Some(v) if !matches!(v, Value::List(_))) {
+                    // Drain the tool from the container's `active` set before
+                    // halting on the incident. `ElementCompleted` was already
+                    // emitted for the child above, so without this the child
+                    // would linger in `active` (removed only by the
+                    // `AdHocToolCompleted` applier) and leave the container
+                    // treating a completed tool as still running. `output: None`
+                    // ensures nothing is appended to the (wrongly-typed)
+                    // collection.
+                    events.push(Event::AdHocToolCompleted {
+                        instance_key,
+                        container_key,
+                        child_key: child_eik,
+                        output: None,
+                    });
                     let incident_key = self.mint_key();
                     let reason = format!(
                         "the output collection '{name}' of ad-hoc sub-process \

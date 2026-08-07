@@ -9637,6 +9637,21 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
         !engine.is_completed(inst),
         "container parks on the incident"
     );
+    // The tripped type guard must still drain the completed tool from the
+    // container's `active` set (via an `AdHocToolCompleted { output: None }`):
+    // `ElementCompleted` was already emitted for the child, so a lingering
+    // `active` entry would leave the container treating a completed tool as
+    // still running (double-cancel/complete on later paths).
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert!(
+        adhoc.active.is_empty(),
+        "the completed tool drains from the active set even when the type guard trips",
+    );
 }
 
 #[test]
