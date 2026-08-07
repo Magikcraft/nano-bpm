@@ -526,6 +526,11 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+      # Pin Node so the `node -p` version reads below don't depend on whatever the
+      # runner happens to preinstall — matches the rest of this workflow.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
       - name: Require a pending engine-wasm bump when the engine has changed
         # Mode-1 (staleness) guard. @nanobpm/engine-wasm is a wasm build of
         # engine-core, published only on a hand-pushed `bojtos-npm-v*` tag — so an
