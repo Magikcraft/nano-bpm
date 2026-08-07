@@ -782,8 +782,12 @@ pub enum AdHocImplementationType {
 pub enum AdHocToolKind {
     /// A job-based task; `job_type` is its resolved `zeebe:taskDefinition` type.
     ServiceTask { job_type: String },
-    /// A native user task (human-in-the-loop tool).
-    UserTask,
+    /// A native user task (human-in-the-loop tool). Carries the tool's
+    /// `zeebe:assignmentDefinition`/`taskSchedule`/`priorityDefinition`
+    /// expressions so activating it can create a real user task even though the
+    /// tool element is pruned from the executable graph (ADR 0023 seam 4, mirror
+    /// of the retained `io` mapping).
+    UserTask(UserTaskProps),
     /// A call activity; `process_id` is the invoked process id, if declared.
     CallActivity { process_id: Option<String> },
     /// Any other element kind usable as a tool.

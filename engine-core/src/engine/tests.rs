@@ -8666,6 +8666,41 @@ fn adhoc_agent_process() -> ProcessDefinition {
     crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
 }
 
+fn adhoc_agent_with_user_task_tool() -> ProcessDefinition {
+    // A JOB_WORKER ad-hoc container whose tool catalog mixes a service-task tool
+    // (`toolA`, a `tool` job) and a native user-task tool (`ask`, a
+    // human-in-the-loop tool with a static assignee). ADR 0023 lists user tasks
+    // as an in-scope v1 tool kind: activating one must create a real user task
+    // and park the child until it is completed — not silently pass through.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:userTask id="ask">
+              <bpmn:extensionElements>
+                <zeebe:assignmentDefinition assignee="alice" />
+              </bpmn:extensionElements>
+            </bpmn:userTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
 fn activate_element(id: &str) -> crate::model::AdHocActivateElement {
     crate::model::AdHocActivateElement {
         element_id: id.to_string(),
@@ -8801,6 +8836,141 @@ fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
         got,
         vec![Value::Str("A".to_string()), Value::Str("B".to_string())],
         "outputCollection holds both tool results"
+    );
+}
+
+/// Gap #1 (issue #614): a native **user-task** tool must execute, not silently
+/// pass through. Activating one has to create a real user task and PARK the
+/// child inside the container scope until it is completed via `CompleteUserTask`
+/// — mirroring an ordinary user-task activation. On `main` the non-service-task
+/// kinds fall into `activate_adhoc_tool`'s `None` arm and are short-circuited to
+/// immediate completion, so no user task is ever created and the child never
+/// parks. This asserts the whole defect class: the tool child stays active with
+/// a real user task, the container keeps looping, and the human's completion
+/// output flows through the container's `outputElement` exactly like a
+/// service-task tool's job output.
+#[test]
+fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_with_user_task_tool()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted for the ad-hoc container");
+    let container = agent.element_instance_key;
+
+    // Turn 1: the agent activates the user-task tool. It must create a user task
+    // and keep the child ACTIVE — not auto-complete it.
+    let activated = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("ask")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+
+    let user_task_key = activated
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                element_id,
+                assignee,
+                ..
+            } if element_id == "ask" => {
+                assert_eq!(
+                    assignee.as_deref(),
+                    Some("alice"),
+                    "the tool's static assignee is resolved on activation"
+                );
+                Some(*user_task_key)
+            }
+            _ => None,
+        })
+        .expect("activating a user-task tool creates a real user task (#614 gap 1)");
+
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        1,
+        "the user-task tool child stays active — it must not auto-complete"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "container parks while the human task is open"
+    );
+
+    // Complete the human task with an output; it flows through the container's
+    // `outputElement` and, as the last active tool, re-emits the agent job.
+    let mut vars = HashMap::new();
+    vars.insert("result".to_string(), Value::Str("approved".to_string()));
+    engine
+        .apply_command(Command::complete_user_task_with(user_task_key, vars))
+        .unwrap();
+
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert_eq!(
+        adhoc.active.len(),
+        0,
+        "the user-task tool drained on completion"
+    );
+    assert_eq!(
+        adhoc.iterations, 1,
+        "agent job re-emitted for the next turn after the human finished"
+    );
+    assert_eq!(
+        adhoc.output_values.len(),
+        1,
+        "the human's `result` was captured into the output collection"
+    );
+
+    // Turn 2: agent is done → container completes and writes its collection.
+    let agent2 = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job re-emitted");
+    let final_events = engine
+        .apply_command(Command::complete_job_with_result(
+            agent2.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                completion_condition_fulfilled: true,
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    assert!(
+        engine.is_completed(inst),
+        "container completed → instance done"
+    );
+    let results = final_events.iter().find_map(|e| match e {
+        Event::VariablesUpdated { variables, .. } => variables.get("results").cloned(),
+        _ => None,
+    });
+    assert_eq!(
+        results,
+        Some(Value::List(vec![Value::Str("approved".to_string())])),
+        "the user-task tool's output reached the container's outputCollection"
     );
 }
 

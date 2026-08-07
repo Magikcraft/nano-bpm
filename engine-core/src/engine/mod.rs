@@ -4404,30 +4404,29 @@ impl Engine {
             },
         ];
         let mut followups = Vec::new();
-        // The tool's kind (and job type) comes from the container's ad-hoc
-        // catalog, not the flat element graph: the parser flattens an ad-hoc
-        // container to a single job activity and prunes its inner tools, keeping
-        // each tool's id + kind in `ProcessDefinition.adhoc` (so the executable
-        // element map — and the processos model round-trip — stays identical to a
-        // plain container). A JOB_WORKER-style service-task tool emits a job; any
-        // other kind passes straight through to completion (feeding the loop).
-        // v1 targets single-activity tools; the catalog does not carry per-tool
-        // retries/priority, so those default (a later refinement).
-        let tool_job_type = container_element_id
+        // The tool's kind (and its job type / user-task props) comes from the
+        // container's ad-hoc catalog, not the flat element graph: the parser
+        // flattens an ad-hoc container to a single job activity and prunes its
+        // inner tools, keeping each tool's id + kind in `ProcessDefinition.adhoc`
+        // (so the executable element map — and the processos model round-trip —
+        // stays identical to a plain container). A JOB_WORKER-style service-task
+        // tool emits a job; a user-task tool creates a real user task and parks
+        // the child until it is completed (ADR 0023 v1 scopes tools =
+        // service/user tasks). Any other kind passes straight through to
+        // completion (feeding the loop). v1 targets single-activity tools; the
+        // catalog does not carry per-tool retries/priority for service tasks, so
+        // those default (a later refinement).
+        let tool_kind = container_element_id
             .as_deref()
             .and_then(|cid| self.adhoc_def_of(instance_key, cid))
             .and_then(|def| {
-                def.tools.iter().find_map(|t| match &t.kind {
-                    crate::model::AdHocToolKind::ServiceTask { job_type }
-                        if t.element_id == element_id =>
-                    {
-                        Some(job_type.clone())
-                    }
-                    _ => None,
-                })
+                def.tools
+                    .iter()
+                    .find(|t| t.element_id == element_id)
+                    .map(|t| t.kind.clone())
             });
-        match tool_job_type {
-            Some(job_type) => {
+        match tool_kind {
+            Some(crate::model::AdHocToolKind::ServiceTask { job_type }) => {
                 let job_key = self.mint_key();
                 let job_type = self.resolve_job_type(&child_vars, &job_type);
                 let priority = self.resolve_priority(&child_vars, None);
@@ -4443,7 +4442,48 @@ impl Engine {
                     retries,
                 });
             }
-            None => {
+            // A user-task tool parks the child on a real user task, resolving its
+            // assignment/scheduling/priority expressions against the activating
+            // view (container scope + seed vars + ioMapping inputs) exactly like
+            // an ordinary user-task activation. It stays active until
+            // `CompleteUserTask`, whose completion then routes through
+            // `complete_adhoc_tool` (the child is in the container's active set),
+            // feeding the container's `outputElement`/loop like any other tool.
+            // Task listeners declared on the tool are pruned with it, so v1 emits
+            // the plain CREATED record without a listener chain.
+            Some(crate::model::AdHocToolKind::UserTask(props)) => {
+                let user_task_key = self.mint_key();
+                let assignee = self
+                    .resolve_user_task_string(&child_vars, props.assignee.as_deref())
+                    .filter(|s| !s.is_empty());
+                let candidate_groups =
+                    self.resolve_user_task_list(&child_vars, props.candidate_groups.as_deref());
+                let candidate_users =
+                    self.resolve_user_task_list(&child_vars, props.candidate_users.as_deref());
+                let due_date = self
+                    .resolve_user_task_string(&child_vars, props.due_date.as_deref())
+                    .filter(|s| !s.is_empty());
+                let follow_up_date = self
+                    .resolve_user_task_string(&child_vars, props.follow_up_date.as_deref())
+                    .filter(|s| !s.is_empty());
+                let priority = self.resolve_priority(&child_vars, props.priority.as_deref());
+                events.push(Event::UserTaskCreated {
+                    user_task_key,
+                    instance_key,
+                    element_instance_key: child_key,
+                    element_id,
+                    created_at: self.now,
+                    assignee,
+                    candidate_groups,
+                    candidate_users,
+                    due_date,
+                    follow_up_date,
+                    priority,
+                });
+            }
+            // CallActivity / Other / an unlisted id: no job or task to run, so the
+            // child passes straight through to completion, feeding the loop.
+            _ => {
                 followups.push(Step::Complete {
                     instance_key,
                     element_instance_key: child_key,
