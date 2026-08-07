@@ -85,8 +85,10 @@ export default function AppView() {
     if (!name || notFound) return;
     const src = projectLogs(name, (line) => {
       setLogs((prev) => {
+        // Cap the buffer at 2000 lines *after* appending: keep the last 1999
+        // before the push so the array settles at exactly 2000, not 2001.
         const next =
-          prev.length > 2000 ? prev.slice(prev.length - 2000) : prev.slice();
+          prev.length >= 2000 ? prev.slice(prev.length - 1999) : prev.slice();
         next.push(line);
         return next;
       });
@@ -195,7 +197,11 @@ export default function AppView() {
           return;
         }
         const s = data?.runState.status;
-        if (!s || s === "stopped" || s === "error") break;
+        // Only a genuine terminal phase ends the poll. A transient failure
+        // (network error or missing `data`) leaves `s` undefined — sleep and
+        // keep polling within the bounded window rather than treating it as
+        // terminal, which would reintroduce the stop→run race.
+        if (s === "stopped" || s === "error") break;
         await new Promise((r) => setTimeout(r, 250));
       }
       setLogs([]);

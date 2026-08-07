@@ -471,7 +471,13 @@ export default function App() {
       listProjects({ throwOnError: true })
         .then(({ data }) => {
           if (cancelled) return;
-          const running = data.projects.filter((p) => p.running);
+          // Sort by the stable `name` key so a reshuffle of the server's
+          // `updatedMs`-then-name ordering doesn't churn the rail when the
+          // running-app set and its display fields are unchanged. Storing the
+          // sorted list also keeps the rendered rail order stable.
+          const running = data.projects
+            .filter((p) => p.running)
+            .sort((a, b) => a.name.localeCompare(b.name));
           setRunningApps((prev) => (sameApps(prev, running) ? prev : running));
         })
         .catch(() => {
