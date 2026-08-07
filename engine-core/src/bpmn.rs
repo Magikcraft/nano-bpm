@@ -1295,6 +1295,89 @@ impl ProcessAcc {
                 .map(|n| n.id.clone())
                 .collect();
 
+            // Deploy-time ad-hoc validation (Zeebe `AdHocSubProcessValidator`):
+            // reject structurally invalid containers before they can run, so a bad
+            // model fails at parse/deploy rather than misbehaving at runtime. The
+            // inner elements are pruned just below, so this must inspect
+            // `self.nodes` (pre-pruning). Rules mirror the oracle where nano shares
+            // its semantics:
+            //   * at least one inner activity;
+            //   * no start/end events inside the container;
+            //   * a `zeebe:taskDefinition` (job-worker variant) forbids
+            //     `activeElementsCollection` (the declarative BPMN_TASK selector,
+            //     which nano treats as mutually exclusive with a job — see the
+            //     `impl_type` split below);
+            //   * `outputElement` and `outputCollection` are both-or-neither.
+            //
+            // Deliberate divergence from Zeebe: nano does NOT forbid a
+            // `<completionCondition>` or `cancelRemainingInstances=false` alongside
+            // a `taskDefinition`. Zeebe rejects those because its JOB_WORKER path
+            // carries completion/cancel purely on the job result. nano instead
+            // supports an engine-side `<completionCondition>` on the JOB_WORKER
+            // container (an intentional parity extension exercised by the engine
+            // tests), and `cancelRemainingInstances` deferral is tracked separately
+            // (issue #614 gap 7), so enforcing those two Zeebe rules here would
+            // reject valid nano models. See issue #614 gap 6.
+            for n in self.nodes.iter().filter(|n| n.is_adhoc) {
+                let invalid = |reason: String| ParseError::InvalidProcess {
+                    process_id: self.id.clone(),
+                    reason,
+                };
+                // Zeebe validates the container's DIRECT flow elements
+                // (`getFlowElements()`), not elements nested inside an inner
+                // sub-process, so match on the immediate parent only.
+                let inner: Vec<&NodeAcc> = self
+                    .nodes
+                    .iter()
+                    .filter(|c| c.parent.as_deref() == Some(n.id.as_str()))
+                    .collect();
+                if inner.is_empty() {
+                    return Err(invalid(format!(
+                        "ad-hoc sub-process {} must have at least one activity",
+                        n.id
+                    )));
+                }
+                if inner.iter().any(|c| matches!(c.kind, NodeKind::Start)) {
+                    return Err(invalid(format!(
+                        "ad-hoc sub-process {} must not contain a start event",
+                        n.id
+                    )));
+                }
+                if inner.iter().any(|c| matches!(c.kind, NodeKind::End)) {
+                    return Err(invalid(format!(
+                        "ad-hoc sub-process {} must not contain an end event",
+                        n.id
+                    )));
+                }
+                // `taskDefinition` presence is authoritative here as `job_type`
+                // (set only by `zeebe:taskDefinition`; not yet defaulted to the id).
+                // A job-backed container ignores `activeElementsCollection` (the
+                // declarative selector), so declaring both is a contradictory model.
+                if n.job_type.is_some()
+                    && n.adhoc_active_elements
+                        .as_deref()
+                        .is_some_and(|s| !s.is_empty())
+                {
+                    return Err(invalid(format!(
+                        "ad-hoc sub-process {} must not define activeElementsCollection in combination with zeebe:taskDefinition",
+                        n.id
+                    )));
+                }
+                let output_element_empty =
+                    n.adhoc_output_element.as_deref().unwrap_or("").is_empty();
+                let output_collection_empty = n
+                    .adhoc_output_collection
+                    .as_deref()
+                    .unwrap_or("")
+                    .is_empty();
+                if output_element_empty != output_collection_empty {
+                    return Err(invalid(format!(
+                        "ad-hoc sub-process {} must set outputElement and outputCollection both or neither",
+                        n.id
+                    )));
+                }
+            }
+
             // One catalog entry per ad-hoc container, in document order.
             let mut index: HashMap<String, usize> = HashMap::new();
             for n in self.nodes.iter().filter(|n| n.is_adhoc) {
@@ -2188,6 +2271,130 @@ mod tests {
             crate::model::AdHocToolKind::UserTask(crate::model::UserTaskProps::default())
         );
         assert_eq!(cat.tools[2].kind, crate::model::AdHocToolKind::Other);
+    }
+
+    // ---- Deploy-time ad-hoc validation (gap #6, Zeebe AdHocSubProcessValidator) ----
+    // Each case is a full model that is REJECTED at parse/deploy on the branch and
+    // (was) silently accepted on `main`. Together they assert the whole defect class.
+
+    /// A minimal ad-hoc container XML with the given inner body / attributes /
+    /// extension wiring, wired s -> agent -> e. Callers vary one facet to isolate
+    /// a single validation rule.
+    fn adhoc_model(container_attrs: &str, ext: &str, inner: &str) -> String {
+        format!(
+            r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:adHocSubProcess id="agent"{container_attrs}>
+                <bpmn:extensionElements>{ext}</bpmn:extensionElements>
+                {inner}
+              </bpmn:adHocSubProcess>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+              <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#
+        )
+    }
+
+    fn assert_rejected(xml: &str, needle: &str) {
+        match parse_bpmn(xml) {
+            Err(ParseError::InvalidProcess { reason, .. }) => assert!(
+                reason.contains(needle),
+                "expected rejection mentioning {needle:?}, got: {reason}"
+            ),
+            other => panic!("expected InvalidProcess mentioning {needle:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_adhoc_subprocess_with_no_activity() {
+        let td = r#"<zeebe:taskDefinition type="agent" />"#;
+        let xml = adhoc_model("", td, "");
+        assert_rejected(&xml, "at least one activity");
+    }
+
+    #[test]
+    fn rejects_adhoc_subprocess_containing_a_start_event() {
+        let td = r#"<zeebe:taskDefinition type="agent" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool" /><bpmn:startEvent id="inner_start" />"#;
+        let xml = adhoc_model("", td, inner);
+        assert_rejected(&xml, "must not contain a start event");
+    }
+
+    #[test]
+    fn rejects_adhoc_subprocess_containing_an_end_event() {
+        let td = r#"<zeebe:taskDefinition type="agent" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool" /><bpmn:endEvent id="inner_end" />"#;
+        let xml = adhoc_model("", td, inner);
+        assert_rejected(&xml, "must not contain an end event");
+    }
+
+    #[test]
+    fn rejects_taskdefinition_with_active_elements_collection() {
+        let ext = r#"<zeebe:taskDefinition type="agent" /><zeebe:adHoc activeElementsCollection="=elems" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool" />"#;
+        let xml = adhoc_model("", ext, inner);
+        assert_rejected(&xml, "activeElementsCollection");
+    }
+
+    #[test]
+    fn rejects_output_element_without_output_collection() {
+        let ext =
+            r#"<zeebe:taskDefinition type="agent" /><zeebe:adHoc outputElement="={ id: 1 }" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool" />"#;
+        let xml = adhoc_model("", ext, inner);
+        assert_rejected(&xml, "outputElement and outputCollection");
+    }
+
+    #[test]
+    fn rejects_output_collection_without_output_element() {
+        let ext =
+            r#"<zeebe:taskDefinition type="agent" /><zeebe:adHoc outputCollection="results" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool" />"#;
+        let xml = adhoc_model("", ext, inner);
+        assert_rejected(&xml, "outputElement and outputCollection");
+    }
+
+    #[test]
+    fn accepts_a_valid_job_worker_adhoc_subprocess() {
+        // A well-formed JOB_WORKER container: one activity, both output fields set,
+        // cancelRemainingInstances left at its default — must parse cleanly.
+        let ext = r#"<zeebe:taskDefinition type="agent" /><zeebe:adHoc outputCollection="results" outputElement="={ id: 1 }" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool"><bpmn:extensionElements><zeebe:taskDefinition type="http" /></bpmn:extensionElements></bpmn:serviceTask>"#;
+        let xml = adhoc_model("", ext, inner);
+        let def = &parse_bpmn(&xml).unwrap()[0];
+        assert_eq!(def.adhoc.len(), 1);
+        assert_eq!(def.adhoc[0].container_id, "agent");
+    }
+
+    #[test]
+    fn accepts_job_worker_adhoc_with_completion_condition() {
+        // Deliberate divergence from Zeebe (issue #614 gap 6): nano supports an
+        // engine-side `<completionCondition>` on a JOB_WORKER (taskDefinition)
+        // ad-hoc container, so the deploy validator must NOT reject it.
+        let ext = r#"<zeebe:taskDefinition type="agent" /><zeebe:adHoc outputCollection="results" outputElement="=result" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool"><bpmn:extensionElements><zeebe:taskDefinition type="tool" /></bpmn:extensionElements></bpmn:serviceTask><bpmn:completionCondition>=done = true</bpmn:completionCondition>"#;
+        let xml = adhoc_model("", ext, inner);
+        let def = &parse_bpmn(&xml).unwrap()[0];
+        assert_eq!(def.adhoc.len(), 1);
+    }
+
+    #[test]
+    fn accepts_declarative_active_elements_collection_without_taskdefinition() {
+        // The declarative BPMN_TASK variant legitimately declares
+        // activeElementsCollection WITHOUT a taskDefinition — it must NOT be
+        // rejected by the taskDefinition-combination rule.
+        let ext = r#"<zeebe:adHoc activeElementsCollection="=elems" />"#;
+        let inner = r#"<bpmn:serviceTask id="tool" />"#;
+        let xml = adhoc_model("", ext, inner);
+        let def = &parse_bpmn(&xml).unwrap()[0];
+        assert_eq!(
+            def.adhoc[0].impl_type,
+            crate::model::AdHocImplementationType::BpmnTask
+        );
     }
 
     #[test]
