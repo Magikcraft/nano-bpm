@@ -4784,19 +4784,7 @@ impl Engine {
         element_id: String,
         container_key: Key,
     ) -> (Vec<Event>, Vec<Step>) {
-        let tool_element_id = element_id.clone();
-        let mut events = vec![
-            Event::ElementCompleting {
-                instance_key,
-                element_instance_key: child_eik,
-                element_id: element_id.clone(),
-            },
-            Event::ElementCompleted {
-                instance_key,
-                element_instance_key: child_eik,
-                element_id,
-            },
-        ];
+        let tool_element_id = element_id;
         let (output_element, output_collection, active_now, container_element_id) = match self
             .state
             .instances
@@ -4809,10 +4797,12 @@ impl Engine {
                 a.active.len(),
                 a.element_id.clone(),
             ),
-            None => return (events, Vec::new()),
+            None => return (Vec::new(), Vec::new()),
         };
-        // Collect this tool's output (evaluated in its local scope) — an entry in
-        // the agent's accumulated `outputCollection` memory.
+        // Collect this tool's output (evaluated in its local scope, which is still
+        // resident — its `ElementCompleted` is deferred until the append is known
+        // to be safe below) — an entry in the agent's accumulated
+        // `outputCollection` memory.
         let output = output_element.as_deref().and_then(|expr| {
             let vars = self.variables_for_element(instance_key, child_eik);
             crate::feel::eval(expr, &vars).ok()
@@ -4820,55 +4810,70 @@ impl Engine {
         // Type guard (Zeebe `AdHocSubProcessOutputCollectionBehavior`): the
         // `outputCollection` target must be an array to append to. It is seeded to
         // `[]` on activation, so a non-array here means an input mapping (or the
-        // agent) overwrote it with the wrong type. Raise an EXTRACT_VALUE_ERROR
-        // incident on the container instead of silently corrupting it, and leave
-        // the collection untouched (the append below is skipped).
+        // agent) overwrote it with the wrong type. Read the container's *local*
+        // binding directly (it is seeded/appended local to the container scope) —
+        // no need to merge the whole visible variable chain.
+        //
+        // On a type mismatch, DEFER the tool's completion for full Zeebe parity
+        // (retry-on-resolve): park an EXTRACT_VALUE_ERROR incident on the TOOL
+        // child and return WITHOUT emitting any completion event. The child stays
+        // in the container's `active` set with its local scope intact, so
+        // resolving the incident re-drives `Step::Complete` for this child (see
+        // `ResolveIncident` → `ExpressionEvaluation`) and re-attempts the append
+        // once the target has been corrected — nothing is discarded.
         if output.is_some() {
             if let Some(name) = &output_collection {
                 let current = self
-                    .variables_for_element(instance_key, container_key)
-                    .get(name)
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| i.scope_variables.get(&container_key))
+                    .and_then(|m| m.get(name))
                     .cloned();
                 if matches!(current, Some(v) if !matches!(v, Value::List(_))) {
-                    // Drain the tool from the container's `active` set before
-                    // halting on the incident. `ElementCompleted` was already
-                    // emitted for the child above, so without this the child
-                    // would linger in `active` (removed only by the
-                    // `AdHocToolCompleted` applier) and leave the container
-                    // treating a completed tool as still running. `output: None`
-                    // ensures nothing is appended to the (wrongly-typed)
-                    // collection.
-                    events.push(Event::AdHocToolCompleted {
-                        instance_key,
-                        container_key,
-                        child_key: child_eik,
-                        output: None,
-                    });
                     let incident_key = self.mint_key();
                     let reason = format!(
                         "the output collection '{name}' of ad-hoc sub-process \
                          '{container_element_id}' has the wrong type: expected an array"
                     );
-                    events.push(Event::IncidentRaised {
-                        incident_key,
-                        instance_key,
-                        element_instance_key: container_key,
-                        element_id: container_element_id.clone(),
-                        kind: state::IncidentKind::ExpressionEvaluation,
-                        reason,
-                        job_key: None,
-                        created_at: self.now,
-                    });
-                    return (events, Vec::new());
+                    return (
+                        vec![Event::IncidentRaised {
+                            incident_key,
+                            instance_key,
+                            element_instance_key: child_eik,
+                            element_id: tool_element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        }],
+                        Vec::new(),
+                    );
                 }
             }
         }
-        events.push(Event::AdHocToolCompleted {
-            instance_key,
-            container_key,
-            child_key: child_eik,
-            output,
-        });
+        // The append is safe — complete the child now. `ElementCompleted` tears
+        // its scope down when the caller applies these events, so any read of the
+        // child scope (output mappings / completion condition below) must precede
+        // that application (it does — events are batched, state is read live).
+        let mut events = vec![
+            Event::ElementCompleting {
+                instance_key,
+                element_instance_key: child_eik,
+                element_id: tool_element_id.clone(),
+            },
+            Event::ElementCompleted {
+                instance_key,
+                element_instance_key: child_eik,
+                element_id: tool_element_id.clone(),
+            },
+            Event::AdHocToolCompleted {
+                instance_key,
+                container_key,
+                child_key: child_eik,
+                output,
+            },
+        ];
         // Tool output mappings (ADR 0023 seam 4): project the tool's result into
         // the container scope, sourced from the container catalog (the pruned tool
         // has no element entry, so `io_outputs` cannot see it). Evaluated in the
@@ -5064,17 +5069,22 @@ impl Engine {
         // The output collection propagates OUT of the container to its enclosing
         // (flow) scope — for a top-level container that is the root, collapsing to
         // the flat `VariablesUpdated`. Its value is read from the container-scope
-        // variable (the single source of truth, seeded on activation and appended
-        // to as each tool completed), not re-assembled here.
+        // variable directly (the single source of truth, seeded on activation and
+        // appended to as each tool completed), and propagated AS-IS: with the
+        // retry-on-resolve type guard in `complete_adhoc_tool`, a non-array here
+        // can only be a value the guard deliberately preserved, so coercing it to
+        // `[]` would silently corrupt it. A never-seeded collection defaults to an
+        // empty array.
         let collection_map = output_collection.map(|name| {
-            let list = match self
-                .variables_for_element(instance_key, container_key)
-                .get(&name)
-            {
-                Some(Value::List(v)) => v.clone(),
-                _ => Vec::new(),
-            };
-            HashMap::from([(name, Value::List(list))])
+            let value = self
+                .state
+                .instances
+                .get(&instance_key)
+                .and_then(|i| i.scope_variables.get(&container_key))
+                .and_then(|m| m.get(&name))
+                .cloned()
+                .unwrap_or_else(|| Value::List(Vec::new()));
+            HashMap::from([(name, value)])
         });
         if let Some(map) = &collection_map {
             events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));

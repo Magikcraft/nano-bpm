@@ -9573,8 +9573,10 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
     // Zeebe (AdHocSubProcessOutputCollectionBehavior.appendToOutputCollection)
     // raises EXTRACT_VALUE_ERROR when the target is not an array. nano used to
     // silently accumulate into its hidden Vec and overwrite the scalar at
-    // completion. The type guard must reject it instead, parking an incident and
-    // leaving the collection uncorrupted.
+    // completion. The type guard must reject it instead — and for full parity it
+    // DEFERS the tool's completion: the incident sits on the TOOL child (so
+    // resolving it retries the append), the tool stays active with its scope
+    // intact, and the scalar target is left uncorrupted.
     let mut engine = Engine::new();
     engine
         .apply_command(Command::DeployProcess(
@@ -9624,8 +9626,12 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
         "non-array outputCollection maps to the EXTRACT_VALUE_ERROR taxonomy",
     );
     assert_eq!(
-        active[0].element_id, "agent",
-        "incident sits on the container"
+        active[0].element_id, "toolA",
+        "incident sits on the tool child, so resolving it re-drives the append",
+    );
+    assert_eq!(
+        active[0].element_instance_key, tool.element_instance_key,
+        "incident is parked on the tool's element instance, not the container",
     );
     // The scalar is left untouched — no silent corruption into a list.
     assert_eq!(
@@ -9637,11 +9643,10 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
         !engine.is_completed(inst),
         "container parks on the incident"
     );
-    // The tripped type guard must still drain the completed tool from the
-    // container's `active` set (via an `AdHocToolCompleted { output: None }`):
-    // `ElementCompleted` was already emitted for the child, so a lingering
-    // `active` entry would leave the container treating a completed tool as
-    // still running (double-cancel/complete on later paths).
+    // The tool's completion is DEFERRED (no `AdHocToolCompleted` emitted): it
+    // stays in the container's `active` set with its local scope intact so that
+    // resolving the incident retries the append against the corrected target —
+    // nothing is discarded.
     let adhoc = engine
         .instance(inst)
         .unwrap()
@@ -9649,8 +9654,88 @@ fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
         .get(&container)
         .unwrap();
     assert!(
-        adhoc.active.is_empty(),
-        "the completed tool drains from the active set even when the type guard trips",
+        adhoc.active.contains(&tool.element_instance_key),
+        "the tool stays active while parked on the incident",
+    );
+}
+
+#[test]
+fn adhoc_output_collection_incident_resolution_retries_the_append() {
+    // Full Zeebe parity for the EXTRACT_VALUE_ERROR incident: it is recoverable.
+    // After correcting the `outputCollection` target to an array and resolving
+    // the incident, the deferred tool completion is re-driven — its output is
+    // appended and the tool drains — exactly like Zeebe's retry-on-resolve.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_non_array_output_collection_process(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let tool = engine
+        .activate_jobs("tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("tool job");
+    let mut vars = HashMap::new();
+    vars.insert("result".to_string(), Value::Str("x".to_string()));
+    engine
+        .apply_command(Command::complete_job_with(tool.key, vars))
+        .unwrap();
+
+    let incident = engine.active_incidents()[0].clone();
+    assert_eq!(incident.element_id, "toolA", "parked on the tool child");
+
+    // Correct the target: overwrite the scalar with an empty array in the
+    // container's local scope (as an operator would via SetVariables).
+    engine
+        .apply_command(Command::set_variables_scoped(
+            container,
+            HashMap::from([("results".to_string(), Value::List(Vec::new()))]),
+            true,
+        ))
+        .unwrap();
+    // Resolve the incident → the deferred tool completion is re-driven.
+    engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the incident is cleared once the append succeeds",
+    );
+    // The tool's output is now appended to the corrected array.
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results"),
+        Some(Value::List(vec![Value::Str("x".to_string())])),
+        "resolving the incident retries the append against the fixed target",
+    );
+    // The tool has drained from the active set (it completed on retry).
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert!(
+        !adhoc.active.contains(&tool.element_instance_key),
+        "the tool drains once its deferred completion is re-driven",
     );
 }
 

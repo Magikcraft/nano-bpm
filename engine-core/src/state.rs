@@ -2125,10 +2125,14 @@ pub fn apply(state: &mut State, event: &Event) {
         // `outputCollection` variable (the single source of truth, seeded to an
         // empty array on activation and visible in the container scope mid-run)
         // and drop it from the active set. Its local scope is torn down by the
-        // child's `ElementCompleted` event. The append-time type guard in
-        // `complete_adhoc_tool` has already ensured the target is an array, so a
-        // non-list here can only mean no collection is declared — in which case
-        // the output is simply discarded (matching the pre-collection behaviour).
+        // child's `ElementCompleted` event. This applier only ever runs once the
+        // append is known to be safe: `complete_adhoc_tool` DEFERS emitting
+        // `AdHocToolCompleted` until its type guard confirms the target is an
+        // array (parking a retry-on-resolve incident on the tool otherwise), so
+        // the `Value::List` match below always holds for a declared collection.
+        // A non-list is therefore only reachable when no collection is declared or
+        // `output` is `None`, in which case nothing is appended (the output is
+        // discarded, matching the pre-collection behaviour).
         Event::AdHocToolCompleted {
             instance_key,
             container_key,
