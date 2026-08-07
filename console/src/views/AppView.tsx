@@ -116,9 +116,23 @@ export default function AppView() {
     setError(null);
     setLogs([]);
     try {
-      setRunState(
-        (await runProject({ path: { name }, throwOnError: true })).data,
-      );
+      // Use the non-throwing client so a 404 (project deleted mid-session)
+      // flips the view into `notFound` instead of surfacing as an opaque
+      // error while polling/streaming keep running against a gone project.
+      const {
+        data,
+        error: err,
+        response,
+      } = await runProject({ path: { name } });
+      if (response?.status === 404) {
+        setNotFound(true);
+        return;
+      }
+      if (err || !data) {
+        setError(typeof err === "string" ? err : "Failed to start the app.");
+        return;
+      }
+      setRunState(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -130,9 +144,22 @@ export default function AppView() {
     setBusy(true);
     setError(null);
     try {
-      setRunState(
-        (await stopProject({ path: { name }, throwOnError: true })).data,
-      );
+      const {
+        data,
+        error: err,
+        response,
+      } = await stopProject({
+        path: { name },
+      });
+      if (response?.status === 404) {
+        setNotFound(true);
+        return;
+      }
+      if (err || !data) {
+        setError(typeof err === "string" ? err : "Failed to stop the app.");
+        return;
+      }
+      setRunState(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -144,21 +171,48 @@ export default function AppView() {
     setBusy(true);
     setError(null);
     try {
-      await stopProject({ path: { name }, throwOnError: true });
+      const stopRes = await stopProject({ path: { name } });
+      if (stopRes.response?.status === 404) {
+        setNotFound(true);
+        return;
+      }
+      if (stopRes.error) {
+        setError(
+          typeof stopRes.error === "string"
+            ? stopRes.error
+            : "Failed to stop the app.",
+        );
+        return;
+      }
       // `stop` only *signals* termination; `run` no-ops while the phase is still
       // Starting/Running. Without waiting for the child to actually exit, the
       // run is dropped and the app is left stopped. Poll (bounded ~10s) until the
       // supervisor reports a terminal phase, then start.
       for (let i = 0; i < 40; i++) {
-        const { data } = await getProject({ path: { name } });
+        const { data, response } = await getProject({ path: { name } });
+        if (response?.status === 404) {
+          setNotFound(true);
+          return;
+        }
         const s = data?.runState.status;
         if (!s || s === "stopped" || s === "error") break;
         await new Promise((r) => setTimeout(r, 250));
       }
       setLogs([]);
-      setRunState(
-        (await runProject({ path: { name }, throwOnError: true })).data,
-      );
+      const runRes = await runProject({ path: { name } });
+      if (runRes.response?.status === 404) {
+        setNotFound(true);
+        return;
+      }
+      if (runRes.error || !runRes.data) {
+        setError(
+          typeof runRes.error === "string"
+            ? runRes.error
+            : "Failed to start the app.",
+        );
+        return;
+      }
+      setRunState(runRes.data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -182,7 +236,11 @@ export default function AppView() {
 
   const status = runState?.status ?? "stopped";
   const tone = statusTone(status);
-  const running = status === "running" || status === "starting";
+  // Treat every non-terminal phase as "in flight" so the Stop/Restart controls
+  // (not Start) show while the app is starting or stopping. Showing Start during
+  // a `stopping` transition invites an invalid action that races the shutdown.
+  const running =
+    status === "running" || status === "starting" || status === "stopping";
   const headless = !appUi?.enabled || appUi?.port == null;
   const btn =
     "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50";

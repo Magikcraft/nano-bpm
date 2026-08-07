@@ -167,6 +167,17 @@ const icons = {
   ),
 } as const;
 
+// Resolve a running app's left-rail glyph from its manifest `icon` hint (a
+// bundled icon name), falling back to the default app glyph when the hint is
+// absent or names an icon the console doesn't bundle (per the AppUi.icon
+// contract). Keys like theme/nav glyphs are all fair game as bundled names.
+function appRailIcon(icon: string | null | undefined): ReactNode {
+  if (icon && Object.prototype.hasOwnProperty.call(icons, icon)) {
+    return icons[icon as keyof typeof icons];
+  }
+  return icons.appDefault;
+}
+
 const navItems: {
   to: string;
   label: string;
@@ -649,7 +660,7 @@ export default function App() {
                     aria-label={railCollapsed ? hover : undefined}
                   >
                     <ActiveBar show={active} />
-                    {icons.appDefault}
+                    {appRailIcon(app.appUi?.icon)}
                     {!railCollapsed && (
                       <span className="truncate">{label}</span>
                     )}
