@@ -3292,6 +3292,21 @@ impl Engine {
             });
             scope_registered = true;
         }
+        // Seed the ad-hoc container's `outputCollection` to an empty array as a
+        // local variable the moment it activates (Zeebe
+        // `AdHocSubProcessProcessor.onActivate`), BEFORE the container's own input
+        // mappings run — so the agent can read the growing collection mid-run, and
+        // a mis-mapped non-array target is observable to the append-time type
+        // guard. This variable is the single source of truth for the accumulated
+        // tool outputs; `complete_adhoc_tool` appends to it and
+        // `complete_adhoc_container` propagates it outward.
+        if let Some(name) = adhoc_def.as_ref().and_then(|d| d.output_collection.clone()) {
+            events.push(Event::ScopedVariablesUpdated {
+                instance_key,
+                scope_key: element_instance_key,
+                variables: HashMap::from([(name, Value::List(Vec::new()))]),
+            });
+        }
         if !inputs.is_empty() {
             let updates = self.eval_io_mappings_in(&element_vars, &inputs);
             if !updates.is_empty() {
@@ -4782,7 +4797,7 @@ impl Engine {
                 element_id,
             },
         ];
-        let (output_element, active_now, container_element_id) = match self
+        let (output_element, output_collection, active_now, container_element_id) = match self
             .state
             .instances
             .get(&instance_key)
@@ -4790,6 +4805,7 @@ impl Engine {
         {
             Some(a) => (
                 a.output_element.clone(),
+                a.output_collection.clone(),
                 a.active.len(),
                 a.element_id.clone(),
             ),
@@ -4801,6 +4817,38 @@ impl Engine {
             let vars = self.variables_for_element(instance_key, child_eik);
             crate::feel::eval(expr, &vars).ok()
         });
+        // Type guard (Zeebe `AdHocSubProcessOutputCollectionBehavior`): the
+        // `outputCollection` target must be an array to append to. It is seeded to
+        // `[]` on activation, so a non-array here means an input mapping (or the
+        // agent) overwrote it with the wrong type. Raise an EXTRACT_VALUE_ERROR
+        // incident on the container instead of silently corrupting it, and leave
+        // the collection untouched (the append below is skipped).
+        if output.is_some() {
+            if let Some(name) = &output_collection {
+                let current = self
+                    .variables_for_element(instance_key, container_key)
+                    .get(name)
+                    .cloned();
+                if matches!(current, Some(v) if !matches!(v, Value::List(_))) {
+                    let incident_key = self.mint_key();
+                    let reason = format!(
+                        "the output collection '{name}' of ad-hoc sub-process \
+                         '{container_element_id}' has the wrong type: expected an array"
+                    );
+                    events.push(Event::IncidentRaised {
+                        incident_key,
+                        instance_key,
+                        element_instance_key: container_key,
+                        element_id: container_element_id.clone(),
+                        kind: state::IncidentKind::ExpressionEvaluation,
+                        reason,
+                        job_key: None,
+                        created_at: self.now,
+                    });
+                    return (events, Vec::new());
+                }
+            }
+        }
         events.push(Event::AdHocToolCompleted {
             instance_key,
             container_key,
@@ -4977,7 +5025,7 @@ impl Engine {
         container_key: Key,
         cancel: bool,
     ) -> (Vec<Event>, Vec<Step>) {
-        let (element_id, output_collection, output_values, active) = match self
+        let (element_id, output_collection, active) = match self
             .state
             .instances
             .get(&instance_key)
@@ -4986,7 +5034,6 @@ impl Engine {
             Some(a) => (
                 a.element_id.clone(),
                 a.output_collection.clone(),
-                a.output_values.clone(),
                 a.active.iter().copied().collect::<Vec<Key>>(),
             ),
             None => return (Vec::new(), Vec::new()),
@@ -5002,9 +5049,19 @@ impl Engine {
         }
         // The output collection propagates OUT of the container to its enclosing
         // (flow) scope — for a top-level container that is the root, collapsing to
-        // the flat `VariablesUpdated`.
-        let collection_map =
-            output_collection.map(|name| HashMap::from([(name, Value::List(output_values))]));
+        // the flat `VariablesUpdated`. Its value is read from the container-scope
+        // variable (the single source of truth, seeded on activation and appended
+        // to as each tool completed), not re-assembled here.
+        let collection_map = output_collection.map(|name| {
+            let list = match self
+                .variables_for_element(instance_key, container_key)
+                .get(&name)
+            {
+                Some(Value::List(v)) => v.clone(),
+                _ => Vec::new(),
+            };
+            HashMap::from([(name, Value::List(list))])
+        });
         if let Some(map) = &collection_map {
             events.extend(self.propagated_updates(instance_key, scope, map.clone(), false));
         }
