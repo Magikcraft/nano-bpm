@@ -10,10 +10,12 @@ import {
 import { projectLogs, type ProjectLogLine } from "../lib/api";
 
 // The console-integrated control surface for a supervised app (ADR 0057, issue
-// #638 — Slice 3/4). Reached from the left-rail running-apps entry. This is the
-// *headless* body: status + ports + Start/Stop/Restart + live logs. The
-// embedded webview for UI apps (a sandboxed iframe over a reverse proxy) is a
-// later slice; until then every app — UI or headless — is controlled here.
+// #638 — Slice 5). Reached from the left-rail running-apps entry. Headless apps
+// get a control-only body (status + ports + Start/Stop/Restart + live logs). A
+// *UI* app additionally gets an [App] tab: its own web UI embedded in a
+// sandboxed iframe over the same-origin reverse proxy at
+// `/console/app-view/<name>/…` (posture A — the app self-authenticates; the
+// console injects no credentials and never proxies its WebSocket stream).
 
 function statusTone(status: RunState["status"]): {
   label: string;
@@ -53,6 +55,7 @@ export default function AppView() {
   const [notFound, setNotFound] = useState(false);
   const [busy, setBusy] = useState(false);
   const [logs, setLogs] = useState<KeyedLogLine[]>([]);
+  const [tab, setTab] = useState<"app" | "logs">("app");
   const logRef = useRef<HTMLDivElement | null>(null);
   // Monotonic id source for stable React keys: assigning a per-line id on
   // ingest means trimming the front of the capped buffer never shifts an
@@ -274,6 +277,34 @@ export default function AppView() {
   const running =
     status === "running" || status === "starting" || status === "stopping";
   const headless = !appUi?.enabled || appUi?.port == null;
+  // The embedded UI can only be served while the app's own server is up.
+  const canEmbed = !headless && status === "running";
+  // Headless apps have no App tab; coerce the active tab to logs for them.
+  const activeTab: "app" | "logs" = headless ? "logs" : tab;
+  // The app's declared landing path is resolved *within* its own app-view
+  // namespace, and may not escape it. A manifest `path` like `../../console/api`
+  // would otherwise resolve (in the browser) to an arbitrary same-origin console
+  // route and point the iframe there, so we resolve the path against the
+  // app-view base and keep it only when the result still lives under that base.
+  const appViewBase = `/console/app-view/${encodeURIComponent(name)}/`;
+  const appSrc = (() => {
+    const rawPath = (appUi?.path ?? "/").replace(/^\/+/, "");
+    try {
+      const resolved = new URL(
+        rawPath,
+        `${window.location.origin}${appViewBase}`,
+      );
+      if (
+        resolved.origin === window.location.origin &&
+        resolved.pathname.startsWith(appViewBase)
+      ) {
+        return resolved.pathname + resolved.search + resolved.hash;
+      }
+    } catch {
+      // Malformed path ⇒ fall back to the app-view root below.
+    }
+    return appViewBase;
+  })();
   const btn =
     "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50";
 
@@ -343,12 +374,10 @@ export default function AppView() {
             </div>
           )}
         </dl>
-        {!headless && (
+        {!headless && appUi?.port != null && (
           <p className="mt-2 text-xs text-fg-muted">
-            This app declares an embedded UI on port{" "}
-            <span className="font-mono">{appUi?.port}</span>. The in-console
-            webview ships in a later slice; use the controls above to manage it
-            for now.
+            Embedded UI proxied from port{" "}
+            <span className="font-mono">{appUi.port}</span> on this host.
           </p>
         )}
         {runState?.lastError && (
@@ -358,25 +387,75 @@ export default function AppView() {
       </header>
 
       <section className="flex min-h-0 flex-1 flex-col">
-        <div className="border-b border-edge px-6 py-2 text-xs font-medium uppercase tracking-wide text-fg-muted">
-          Logs
-        </div>
-        <div
-          ref={logRef}
-          className="min-h-0 flex-1 overflow-auto bg-inset px-6 py-3 font-mono text-xs leading-relaxed"
-        >
-          {logs.length === 0 ? (
-            <p className="text-fg-muted">
-              No output yet. Start the app to see logs.
-            </p>
-          ) : (
-            logs.map((l) => (
-              <div key={l._key} className={streamTone(l.stream)}>
-                {l.text}
-              </div>
-            ))
+        <div className="flex border-b border-edge px-6 text-xs font-medium uppercase tracking-wide">
+          {!headless && (
+            <button
+              type="button"
+              onClick={() => setTab("app")}
+              className={`-mb-px border-b-2 px-2 py-2 ${
+                activeTab === "app"
+                  ? "border-accent text-fg"
+                  : "border-transparent text-fg-muted hover:text-fg"
+              }`}
+            >
+              App
+            </button>
           )}
+          <button
+            type="button"
+            onClick={() => setTab("logs")}
+            className={`-mb-px border-b-2 px-2 py-2 ${
+              activeTab === "logs"
+                ? "border-accent text-fg"
+                : "border-transparent text-fg-muted hover:text-fg"
+            }`}
+          >
+            Logs
+          </button>
         </div>
+
+        {activeTab === "app" && !headless ? (
+          canEmbed ? (
+            <iframe
+              // Sandboxed embed of the app's own UI. `allow-same-origin` is
+              // required because the app is proxied same-origin (posture A) so
+              // its fetches/cookies work; `referrerpolicy=no-referrer` avoids
+              // leaking console URLs. No `allow-top-navigation` — a framed app
+              // can't navigate the studio away.
+              key={appSrc}
+              title={`${appUi?.label || displayName} UI`}
+              src={appSrc}
+              className="min-h-0 flex-1 border-0 bg-white"
+              sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-downloads"
+              referrerPolicy="no-referrer"
+            />
+          ) : (
+            <div className="flex min-h-0 flex-1 items-center justify-center bg-inset px-6 text-center text-sm text-fg-muted">
+              <p>
+                Start the app to view its UI.
+                <br />
+                The embedded view loads once the app is running.
+              </p>
+            </div>
+          )
+        ) : (
+          <div
+            ref={logRef}
+            className="min-h-0 flex-1 overflow-auto bg-inset px-6 py-3 font-mono text-xs leading-relaxed"
+          >
+            {logs.length === 0 ? (
+              <p className="text-fg-muted">
+                No output yet. Start the app to see logs.
+              </p>
+            ) : (
+              logs.map((l) => (
+                <div key={l._key} className={streamTone(l.stream)}>
+                  {l.text}
+                </div>
+              ))
+            )}
+          </div>
+        )}
       </section>
     </div>
   );
