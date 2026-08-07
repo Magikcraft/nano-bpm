@@ -625,6 +625,24 @@ impl PeerLink {
         .await
     }
 
+    /// Forwards the external "activate ad-hoc activities" mutation (#614 gap 3)
+    /// to the peer that owns the ad-hoc container's partition. `payload` is the
+    /// original REST request body.
+    pub async fn forward_ad_hoc_activation(
+        &self,
+        ad_hoc_instance_key: String,
+        payload: Option<Value>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::ForwardAdHocActivation {
+                corr,
+                ad_hoc_instance_key,
+                payload,
+            }
+        })
+        .await
+    }
+
     /// Forwards a client deploy to this peer (the deployment-partition owner),
     /// which processes it centrally and broadcasts it. Used when a gateway that
     /// does not own partition 0 receives a deploy.
