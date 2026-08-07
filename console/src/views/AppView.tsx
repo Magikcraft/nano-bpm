@@ -190,6 +190,7 @@ export default function AppView() {
       // Starting/Running. Without waiting for the child to actually exit, the
       // run is dropped and the app is left stopped. Poll (bounded ~10s) until the
       // supervisor reports a terminal phase, then start.
+      let reachedTerminal = false;
       for (let i = 0; i < 40; i++) {
         const { data, response } = await getProject({ path: { name } });
         if (response?.status === 404) {
@@ -201,8 +202,19 @@ export default function AppView() {
         // (network error or missing `data`) leaves `s` undefined — sleep and
         // keep polling within the bounded window rather than treating it as
         // terminal, which would reintroduce the stop→run race.
-        if (s === "stopped" || s === "error") break;
+        if (s === "stopped" || s === "error") {
+          reachedTerminal = true;
+          break;
+        }
         await new Promise((r) => setTimeout(r, 250));
+      }
+      // If the bound elapsed without ever observing a terminal phase, the child
+      // is still shutting down. Starting now would let `run` no-op against the
+      // live process and reintroduce the stop→run race, leaving the app stopped.
+      // Surface an error and bail rather than issue a run that may be dropped.
+      if (!reachedTerminal) {
+        setError("The app did not stop in time to restart. Please try again.");
+        return;
       }
       setLogs([]);
       const runRes = await runProject({ path: { name } });
