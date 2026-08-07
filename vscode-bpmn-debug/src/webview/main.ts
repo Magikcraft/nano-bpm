@@ -62,17 +62,23 @@ async function load(xml: string): Promise<void> {
   await viewer.importXML(xml);
   const canvas = viewer.get<Canvas>('canvas');
   canvas.zoom('fit-viewport');
-  // Re-apply any highlights we already knew about.
+  // Reset the highlight state for the freshly loaded diagram.
   activeHighlight = [];
   breakpointHighlight = [];
-  const bus = viewer.get<EventBus>('eventBus');
-  bus.on('element.click', (e) => {
-    // Ignore the diagram root / connections; break on flow nodes only.
-    if (e.element.id && e.element.type !== 'bpmn:Process' && !e.element.type.includes('SequenceFlow')) {
-      vscodeApi.postMessage({ type: 'toggleBreakpoint', element: e.element.id });
-    }
-  });
+  activeRef.ids = activeHighlight;
+  bpRef.ids = breakpointHighlight;
 }
+
+// Register the click handler once: the viewer (and its eventBus) persists across
+// diagram loads, so registering inside load() would accumulate handlers and fire
+// the toggle multiple times per click.
+const bus = viewer.get<EventBus>('eventBus');
+bus.on('element.click', (e) => {
+  // Ignore the diagram root / connections; break on flow nodes only.
+  if (e.element.id && e.element.type !== 'bpmn:Process' && !e.element.type.includes('SequenceFlow')) {
+    vscodeApi.postMessage({ type: 'toggleBreakpoint', element: e.element.id });
+  }
+});
 
 const activeRef = { ids: activeHighlight };
 const bpRef = { ids: breakpointHighlight };
@@ -93,4 +99,3 @@ window.addEventListener('message', (event: MessageEvent<HostToWebview>) => {
 });
 
 injectCss();
-vscodeApi.postMessage({ type: 'ready' });

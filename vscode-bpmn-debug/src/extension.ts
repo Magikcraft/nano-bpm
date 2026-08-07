@@ -115,8 +115,10 @@ function openDiagram(context: vscode.ExtensionContext, session: vscode.DebugSess
 
   current.bpmnPath = bpmnPath;
   current.sourceMap = new BpmnSourceMap(xml);
+  // Load the diagram; the webview requests breakpoints via its `ready` handshake
+  // once the XML is imported, so we don't push them here against a canvas that
+  // isn't initialized yet.
   post({ type: 'load', xml });
-  pushBreakpoints();
 }
 
 function handleWebviewMessage(msg: WebviewToHost): void {
