@@ -3,6 +3,7 @@ import {
   Suspense,
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type ReactNode,
@@ -479,7 +480,17 @@ export default function App() {
     };
   }, []);
 
-  // Register every installed lang pack's `fileTypes[]` with the Monaco
+  // How many running apps resolve to each base label. Same-template apps share a
+  // manifest (identical `appUi.label`), so a collision means the label alone is
+  // ambiguous and the rail must fall back to the unique project name.
+  const runningAppLabelCounts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const a of runningApps) {
+      const base = a.appUi?.label || a.displayName || a.name;
+      m.set(base, (m.get(base) ?? 0) + 1);
+    }
+    return m;
+  }, [runningApps]);
   // ext→language map at boot, and again whenever the user navigates — so a
   // pack installed via the Extensions view during this session takes effect
   // as soon as they open a project, without a hard reload. Extensions.tsx
@@ -621,15 +632,21 @@ export default function App() {
                 const to = `/apps/${encodeURIComponent(app.name)}`;
                 const active = location.pathname === to;
                 // Label is a display hint; the manifest is not unique, so the
-                // project name is the stable identity and the disambiguator.
-                const label = app.appUi?.label || app.displayName || app.name;
+                // project name is the stable identity. When two running apps
+                // resolve to the same label, disambiguate the visible text with
+                // the unique project name; always expose the name via title/aria.
+                const base = app.appUi?.label || app.displayName || app.name;
+                const collides = (runningAppLabelCounts.get(base) ?? 0) > 1;
+                const label = collides ? `${base} · ${app.name}` : base;
+                const hover =
+                  base === app.name ? app.name : `${base} (${app.name})`;
                 return (
                   <NavLink
                     key={app.name}
                     to={to}
                     className={railItemClass(active, railCollapsed)}
-                    title={railCollapsed ? label : app.name}
-                    aria-label={railCollapsed ? label : undefined}
+                    title={hover}
+                    aria-label={railCollapsed ? hover : undefined}
                   >
                     <ActiveBar show={active} />
                     {icons.appDefault}

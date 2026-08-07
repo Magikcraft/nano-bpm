@@ -52,20 +52,25 @@ export default function AppView() {
   const logRef = useRef<HTMLDivElement | null>(null);
 
   const refresh = useCallback(async () => {
-    try {
-      const d = (await getProject({ path: { name }, throwOnError: true })).data;
-      setRunState(d.runState);
-      setAppUi(d.appUi ?? null);
-      setDisplayName(d.config.displayName || d.config.name || name);
-      setNotFound(false);
-    } catch (e) {
-      // A 404 means the project was deleted while the rail still linked it.
-      if (e instanceof Error && /not found|404/i.test(e.message)) {
-        setNotFound(true);
-      } else {
-        setError(e instanceof Error ? e.message : String(e));
-      }
+    // Use the non-throwing client so we can inspect the HTTP status: the
+    // generated client throws the raw response body (a string) on error, which
+    // makes 404 (deleted project) indistinguishable from a transport failure.
+    const { data, error: err, response } = await getProject({ path: { name } });
+    if (response?.status === 404) {
+      setNotFound(true);
+      return;
     }
+    if (err || !data) {
+      setError(
+        typeof err === "string" ? err : "Failed to load the app's status.",
+      );
+      return;
+    }
+    setRunState(data.runState);
+    setAppUi(data.appUi ?? null);
+    setDisplayName(data.config.displayName || data.config.name || name);
+    setNotFound(false);
+    setError(null);
   }, [name]);
 
   // Initial load whenever the routed app changes.
@@ -77,7 +82,7 @@ export default function AppView() {
 
   // Live logs for the life of this view (history replays first, then tail).
   useEffect(() => {
-    if (!name) return;
+    if (!name || notFound) return;
     const src = projectLogs(name, (line) => {
       setLogs((prev) => {
         const next =
@@ -87,19 +92,20 @@ export default function AppView() {
       });
     });
     return () => src.close();
-  }, [name]);
+  }, [name, notFound]);
 
   // Poll run state while the app is in a transient/active phase, so the badge
   // and buttons settle after an async start/stop without a manual reload.
   useEffect(() => {
     const active =
+      !notFound &&
       runState &&
       (runState.status !== "stopped" || runState.compiling) &&
       runState.status !== "error";
     if (!active) return;
     const t = window.setInterval(() => void refresh(), 1500);
     return () => window.clearInterval(t);
-  }, [runState, refresh]);
+  }, [runState, refresh, notFound]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -139,6 +145,16 @@ export default function AppView() {
     setError(null);
     try {
       await stopProject({ path: { name }, throwOnError: true });
+      // `stop` only *signals* termination; `run` no-ops while the phase is still
+      // Starting/Running. Without waiting for the child to actually exit, the
+      // run is dropped and the app is left stopped. Poll (bounded ~10s) until the
+      // supervisor reports a terminal phase, then start.
+      for (let i = 0; i < 40; i++) {
+        const { data } = await getProject({ path: { name } });
+        const s = data?.runState.status;
+        if (!s || s === "stopped" || s === "error") break;
+        await new Promise((r) => setTimeout(r, 250));
+      }
       setLogs([]);
       setRunState(
         (await runProject({ path: { name }, throwOnError: true })).data,
