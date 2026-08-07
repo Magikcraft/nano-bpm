@@ -1324,7 +1324,7 @@ impl ProcessAcc {
                     NodeKind::Service => crate::model::AdHocToolKind::ServiceTask {
                         job_type: n.job_type.clone().unwrap_or_else(|| n.id.clone()),
                     },
-                    NodeKind::User => crate::model::AdHocToolKind::UserTask,
+                    NodeKind::User => crate::model::AdHocToolKind::UserTask(n.user_task.clone()),
                     NodeKind::Call => crate::model::AdHocToolKind::CallActivity {
                         process_id: n.called_process_id.clone(),
                     },
@@ -2183,7 +2183,10 @@ mod tests {
                 job_type: "io.camunda:http-json:1".to_string()
             }
         );
-        assert_eq!(cat.tools[1].kind, crate::model::AdHocToolKind::UserTask);
+        assert_eq!(
+            cat.tools[1].kind,
+            crate::model::AdHocToolKind::UserTask(crate::model::UserTaskProps::default())
+        );
         assert_eq!(cat.tools[2].kind, crate::model::AdHocToolKind::Other);
     }
 
