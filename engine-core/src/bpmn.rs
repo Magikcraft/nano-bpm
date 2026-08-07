@@ -1331,7 +1331,18 @@ impl ProcessAcc {
                     .iter()
                     .filter(|c| c.parent.as_deref() == Some(n.id.as_str()))
                     .collect();
-                if inner.is_empty() {
+                // Zeebe requires at least one *activity* (task / sub-process /
+                // call activity), not merely any flow node: a container holding
+                // only gateways or events is still structurally invalid. Checking
+                // `inner.is_empty()` alone would wrongly accept such a model, so
+                // match on the activity node kinds explicitly.
+                let has_activity = inner.iter().any(|c| {
+                    matches!(
+                        c.kind,
+                        NodeKind::Service | NodeKind::User | NodeKind::SubProcess | NodeKind::Call
+                    )
+                });
+                if !has_activity {
                     return Err(invalid(format!(
                         "ad-hoc sub-process {} must have at least one activity",
                         n.id
@@ -2313,6 +2324,18 @@ mod tests {
     fn rejects_adhoc_subprocess_with_no_activity() {
         let td = r#"<zeebe:taskDefinition type="agent" />"#;
         let xml = adhoc_model("", td, "");
+        assert_rejected(&xml, "at least one activity");
+    }
+
+    #[test]
+    fn rejects_adhoc_subprocess_with_only_non_activity_children() {
+        // Regression guard: a container with direct children that are NOT
+        // activities (here a lone gateway) must still be rejected. A bare
+        // `inner.is_empty()` check would wrongly accept this, so the validator
+        // must require at least one task/sub-process/call activity.
+        let td = r#"<zeebe:taskDefinition type="agent" />"#;
+        let inner = r#"<bpmn:exclusiveGateway id="g" />"#;
+        let xml = adhoc_model("", td, inner);
         assert_rejected(&xml, "at least one activity");
     }
 
