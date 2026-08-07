@@ -389,7 +389,7 @@ pub enum ClientFrame {
     /// sub-process container's partition. `payload` is the original REST request
     /// body (`elements` + `cancelRemainingInstances`), re-applied locally by the
     /// owner. Answered by a `CommandResult` whose status mirrors the REST
-    /// outcome (204 / 404 / 500).
+    /// outcome (204 / 400 / 404 / 500).
     #[serde(rename_all = "camelCase")]
     ForwardAdHocActivation {
         corr: u64,
