@@ -746,6 +746,16 @@ pub enum Event {
         instance_key: Key,
         container_key: Key,
     },
+    /// The declared `<completionCondition>` was satisfied while the container's
+    /// `cancelRemainingInstances` attribute is `false`: rather than cancel the
+    /// tools still running, the container latches the fulfilment and defers its
+    /// completion until they drain (Zeebe
+    /// `BpmnAdHocSubProcessBehavior#completionConditionFulfilled`). Durable so
+    /// the latch survives replay.
+    AdHocCompletionConditionFulfilled {
+        instance_key: Key,
+        container_key: Key,
+    },
     /// An ad-hoc container completed (the agent signalled completion, or no tools
     /// remained and none were requested, or a cancel was requested). Its runtime
     /// state is dropped; the aggregated `output_collection` (when named) is
@@ -905,6 +915,7 @@ impl Event {
             | Event::AdHocToolActivated { instance_key, .. }
             | Event::AdHocToolCompleted { instance_key, .. }
             | Event::AdHocIterated { instance_key, .. }
+            | Event::AdHocCompletionConditionFulfilled { instance_key, .. }
             | Event::AdHocCompleted { instance_key, .. }
             | Event::MessageSubscriptionClosing { instance_key, .. }
             | Event::ProcessInstanceCompleted { instance_key }
@@ -1094,6 +1105,7 @@ impl Event {
             } => m = m.max(*body_key).max(*child_key),
             Event::AdHocActivated { container_key, .. }
             | Event::AdHocIterated { container_key, .. }
+            | Event::AdHocCompletionConditionFulfilled { container_key, .. }
             | Event::AdHocCompleted { container_key, .. } => m = m.max(*container_key),
             Event::AdHocToolActivated {
                 container_key,
