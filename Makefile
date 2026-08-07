@@ -304,6 +304,36 @@ engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest in
 engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)
 	cd $(WASM_DIR) && cargo check --target wasm32-unknown-unknown
 
+.PHONY: release-engine-wasm
+release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-v<pkg version> on the current commit and push it (CI OIDC-publishes). Run on `main` after the version bump + `make console-wasm` have merged.
+	@set -eu; \
+	tmpl=$$(node -p "require('$(PROJECT_ROOT)/engine-wasm/pkg.package.json').version"); \
+	built=$$(node -p "require('$(PROJECT_ROOT)/engine-wasm/pkg/package.json').version"); \
+	if [ -z "$$tmpl" ] || [ -z "$$built" ]; then \
+	  echo "could not read engine-wasm package version(s) — aborting"; exit 1; \
+	fi; \
+	if [ "$$tmpl" != "$$built" ]; then \
+	  echo "version mismatch: pkg.package.json=$$tmpl but pkg/package.json=$$built — run 'make console-wasm' first"; exit 1; \
+	fi; \
+	if [ -n "$$(git status --porcelain)" ]; then \
+	  echo "working tree is dirty — commit or stash before releasing (release must tag a clean tree)"; exit 1; \
+	fi; \
+	git fetch -q --tags origin main; \
+	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/main)" ]; then \
+	  echo "HEAD is not origin/main — cut the release from the merged main commit"; exit 1; \
+	fi; \
+	tag="bojtos-npm-v$$tmpl"; \
+	if git rev-parse -q --verify "refs/tags/$$tag" >/dev/null; then \
+	  echo "tag $$tag already exists — bump engine-wasm/pkg.package.json (+ 'make console-wasm') before releasing"; exit 1; \
+	fi; \
+	echo "Tagging $$tag on $$(git rev-parse --short HEAD) and pushing (fires release-bojtos-npm → OIDC publish)"; \
+	git tag "$$tag"; \
+	if ! git push origin "$$tag"; then \
+	  echo "push of $$tag failed — removing local tag so a rerun is retry-safe"; \
+	  git tag -d "$$tag" >/dev/null 2>&1 || true; \
+	  exit 1; \
+	fi
+
 .PHONY: processos-build
 processos-build: ## Build ProcessOS, the separate optimization-plane server (Stage T1: Insights)
 	cd processos && cargo build

@@ -516,3 +516,62 @@ jobs:
         # it is not type-checkable in-tree and no test imports it.
         run: deno test --allow-read --allow-write --allow-env server/src/console/
 
+
+  engine-wasm-release-guard:
+    name: engine-wasm (release drift guard)
+    runs-on: ubuntu-24.04
+    steps:
+      # Full history + tags: the guard compares the current tree against the last
+      # published engine-wasm release tag (`bojtos-npm-v*`).
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      # Pin Node so the `node -p` version reads below don't depend on whatever the
+      # runner happens to preinstall — matches the rest of this workflow.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Require a pending engine-wasm bump when the engine has changed
+        # Mode-1 (staleness) guard. @nanobpm/engine-wasm is a wasm build of
+        # engine-core, published only on a hand-pushed `bojtos-npm-v*` tag — so an
+        # engine-core change can silently ship without the wasm ever being
+        # rebuilt/republished (exactly what happened at v0.0.12: engine moved
+        # across 5 PRs but @nanobpm/engine-wasm stayed at 0.3.0). This fails the
+        # build if `engine-core/**`, `engine-wasm/src/**` or the version template
+        # changed since the last release tag but the version wasn't bumped past it
+        # — i.e. an UNRELEASED bump must always be pending once the engine moves.
+        # The Mode-2 (surface-gap) guard is separate and structural: an exhaustive
+        # `match` in engine-wasm/src/surface_parity.rs that fails the wasm32
+        # type-check (engine-wasm-ffi job) when a new engine `Command` lands
+        # without a decision about surfacing it.
+        run: |
+          set -euo pipefail
+          last_tag=$(git tag -l 'bojtos-npm-v*' --sort=-v:refname | head -1)
+          if [ -z "$last_tag" ]; then
+            echo "no bojtos-npm-v* tag yet — nothing to compare against"; exit 0
+          fi
+          last_ver=${last_tag#bojtos-npm-v}
+          tmpl_ver=$(node -p "require('./engine-wasm/pkg.package.json').version")
+          pkg_ver=$(node -p "require('./engine-wasm/pkg/package.json').version")
+
+          # The committed artifact version must track the template (source of truth).
+          if [ "$tmpl_ver" != "$pkg_ver" ]; then
+            echo "::error file=engine-wasm/pkg/package.json::engine-wasm/pkg.package.json is $tmpl_ver but engine-wasm/pkg/package.json is $pkg_ver — run 'make console-wasm' to resync the built artifact."
+            exit 1
+          fi
+
+          # Has the wasm-relevant source moved since the last release? Cargo.toml
+          # / Cargo.lock are inputs too: a dependency or feature change alters the
+          # produced wasm without touching engine-core or engine-wasm/src.
+          if git diff --quiet "$last_tag" -- engine-core engine-wasm/src engine-wasm/Cargo.toml engine-wasm/Cargo.lock engine-wasm/pkg.package.json; then
+            echo "engine-wasm inputs unchanged since $last_tag (v$last_ver) — ok"
+            exit 0
+          fi
+
+          # It moved → require an unreleased bump: pkg_ver must be strictly > last_ver.
+          if [ "$pkg_ver" = "$last_ver" ] || \
+             [ "$(printf '%s\n%s\n' "$last_ver" "$pkg_ver" | sort -V | tail -1)" != "$pkg_ver" ]; then
+            echo "::error file=engine-wasm/pkg.package.json::engine-core/engine-wasm changed since $last_tag but @nanobpm/engine-wasm is still $pkg_ver. Bump engine-wasm/pkg.package.json (then 'make console-wasm') so a new release is pending; it publishes when you push bojtos-npm-v<version> ('make release-engine-wasm')."
+            exit 1
+          fi
+          echo "pending engine-wasm release $pkg_ver > last published $last_ver — ok"

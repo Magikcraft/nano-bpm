@@ -24,6 +24,11 @@ use nanobpmn_engine_core::{
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
+/// Compile-time parity gate: an exhaustive match over `engine-core`'s `Command`
+/// surface that fails the build when a new engine capability is added without a
+/// conscious decision about whether to expose it here. See the module docs.
+mod surface_parity;
+
 /// A simulated engine instance bound to one modeler session.
 #[wasm_bindgen]
 pub struct TestEngine {

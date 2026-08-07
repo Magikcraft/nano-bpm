@@ -43,21 +43,23 @@ export default defineConfig({
   // in both dev (optimizeDeps) and the production build (Rollup).
   resolve: {
     dedupe: ["preact"],
-    // Match the console tsconfig's `preserveSymlinks`: `@nanobpm/engine-wasm`
-    // is a `file:` dep symlinked into `node_modules`, and the npm
-    // `@nanobpm/bojtos-*` packages import it transitively. Resolving via the
-    // engine-wasm realpath (Rollup's default) misses the hoisted copy —
-    // `Rollup failed to resolve import "@nanobpm/engine-wasm"` — so follow the
-    // symlink path rooted here instead.
+    // Match the console tsconfig's `preserveSymlinks`: `@nanobpm/nano-app-schema`
+    // is a `file:` dep (`../spec-app`) symlinked into `node_modules`. Resolving
+    // via its realpath (Rollup's default) can miss the hoisted copy, so follow
+    // the symlink path rooted here instead. `@nanobpm/engine-wasm` now comes from
+    // npm transitively (via the published `@nanobpm/bojtos-*` packages), so it no
+    // longer needs the symlink treatment — but the setting is retained for the
+    // remaining `file:` dep.
     preserveSymlinks: true,
   },
-  // `@nanobpm/engine-wasm` (the wasm-pack `--target web` output) resolves its
-  // binary via `new URL('nanobpmn_engine_bg.wasm', import.meta.url)`. Excluding
-  // it from esbuild's dependency pre-bundling keeps that asset reference intact
-  // so Vite emits the `.wasm` as a hashed asset instead of esbuild rewriting the
+  // The published `@nanobpm/engine-wasm` (wasm-pack `--target web` output) resolves
+  // its binary via `new URL('nanobpmn_engine_bg.wasm', import.meta.url)`. Excluding
+  // it from esbuild's dependency pre-bundling keeps that asset reference intact so
+  // Vite emits the `.wasm` as a hashed asset instead of esbuild rewriting the
   // `import.meta.url` and losing the binary. The Bojtos packages
-  // (`@nanobpm/bojtos-kit` / `-react`) load the engine through that same loader,
-  // so they are excluded too to keep the wasm asset reference intact end to end.
+  // (`@nanobpm/bojtos-kit` / `-react`) load the engine through that same loader and
+  // pull engine-wasm in transitively, so all three are excluded to keep the wasm
+  // asset reference intact end to end.
   optimizeDeps: {
     exclude: [
       "@nanobpm/engine-wasm",
