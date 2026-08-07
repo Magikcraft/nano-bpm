@@ -384,6 +384,19 @@ pub enum ClientFrame {
         #[serde(default)]
         payload: Option<Value>,
     },
+    /// **Intra-cluster only.** A gateway forwards the external "activate ad-hoc
+    /// activities" mutation (#614 gap 3) to the peer that owns the ad-hoc
+    /// sub-process container's partition. `payload` is the original REST request
+    /// body (`elements` + `cancelRemainingInstances`), re-applied locally by the
+    /// owner. Answered by a `CommandResult` whose status mirrors the REST
+    /// outcome (204 / 404 / 500).
+    #[serde(rename_all = "camelCase")]
+    ForwardAdHocActivation {
+        corr: u64,
+        ad_hoc_instance_key: String,
+        #[serde(default)]
+        payload: Option<Value>,
+    },
     /// **Intra-cluster only.** Carries one serialized Raft RPC (AppendEntries /
     /// Vote / InstallSnapshot) for `partition`'s replica group to the node hosting
     /// it. Answered by a `CommandResult` whose body is the serialized
@@ -1386,6 +1399,7 @@ async fn handle_client_frame(
         ClientFrame::ActivateJobs { .. } => "activate_jobs",
         ClientFrame::GetByKey { .. } => "get_by_key",
         ClientFrame::ForwardUserTask { .. } => "forward_user_task",
+        ClientFrame::ForwardAdHocActivation { .. } => "forward_ad_hoc_activation",
         ClientFrame::ForwardCreate { .. } => "forward_create",
         ClientFrame::Raft { .. } => "raft",
         ClientFrame::LeaseDigest { .. } => "lease_digest",
@@ -2098,6 +2112,24 @@ async fn handle_client_frame(
             // the REST status. Local-only ⇒ no forwarding loop.
             let (status, message) = server
                 .apply_user_task_forwarded(op, &user_task_key, payload)
+                .await;
+            conn.send(ServerFrame::CommandResult {
+                corr,
+                status,
+                body: message.map(Value::String),
+            });
+        }
+        ClientFrame::ForwardAdHocActivation {
+            corr,
+            ad_hoc_instance_key,
+            payload,
+        } => {
+            // Peer-side of ad-hoc activate-activities forwarding (#614 gap 3):
+            // re-apply the original REST mutation locally (this node owns the
+            // container's partition) and mirror the REST status. Local-only ⇒ no
+            // forwarding loop.
+            let (status, message) = server
+                .apply_ad_hoc_activation_forwarded(&ad_hoc_instance_key, payload)
                 .await;
             conn.send(ServerFrame::CommandResult {
                 corr,

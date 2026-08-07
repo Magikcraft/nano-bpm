@@ -5933,6 +5933,156 @@ impl ServerImpl {
         }
     }
 
+    /// The external "activate ad-hoc activities" endpoint (#614 gap 3, Zeebe
+    /// `AdHocSubProcessInstructionActivateProcessor` — REST
+    /// `POST /element-instances/ad-hoc-activities/{key}/activation`): activate
+    /// named tools on a running ad-hoc container without completing its agent
+    /// job. Owner-routed like every other by-key write; the owner applies the
+    /// engine `ActivateAdHocActivities` command and maps NOT_FOUND (unknown
+    /// container key or unknown element id) to 404.
+    async fn activate_ad_hoc_sub_process_activities_impl(
+        &self,
+        path_params: &models::ActivateAdHocSubProcessActivitiesPathParams,
+        body: &models::AdHocSubProcessActivateActivitiesInstruction,
+    ) -> Result<apis::ad_hoc_sub_process::ActivateAdHocSubProcessActivitiesResponse, ()> {
+        use apis::ad_hoc_sub_process::ActivateAdHocSubProcessActivitiesResponse as Resp;
+
+        let container_key: u64 = match path_params.ad_hoc_sub_process_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheAd(problem(
+                    "Ad-hoc sub-process not found",
+                    404,
+                    format!(
+                        "Ad-hoc sub-process instance key '{}' is not a valid key.",
+                        path_params.ad_hoc_sub_process_instance_key
+                    ),
+                )));
+            }
+        };
+
+        // The container element-instance key shares its process instance's
+        // partition; forward to that partition's owner in a cluster.
+        if let Some(node) = self.route_by_leader(container_key) {
+            let payload = serde_json::to_value(body).ok();
+            let (status, detail) = self
+                .forward_ad_hoc_activation(node, container_key, payload)
+                .await;
+            return Ok(match status {
+                204 => Resp::Status204_TheAd,
+                404 => Resp::Status404_TheAd(problem("Ad-hoc sub-process not found", 404, detail)),
+                400 => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem("Invalid data", 400, detail))
+                }
+                s => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Peer error",
+                    500,
+                    if detail.is_empty() {
+                        format!("peer node {node} returned status {s}")
+                    } else {
+                        detail
+                    },
+                )),
+            });
+        }
+
+        let command = adhoc_activation_command(container_key, body);
+        let result = self
+            .engine
+            .by_key(container_key)
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await;
+        match result {
+            Ok((events, commit)) => {
+                commit.wait().await;
+                self.spawn_routing_if_needed(&events);
+                Ok(Resp::Status204_TheAd)
+            }
+            Err(EngineError::AdHocSubProcessNotFound {
+                ad_hoc_instance_key,
+            }) => Ok(Resp::Status404_TheAd(problem(
+                "Ad-hoc sub-process not found",
+                404,
+                format!(
+                    "No active ad-hoc sub-process container with instance key {ad_hoc_instance_key}."
+                ),
+            ))),
+            Err(EngineError::AdHocUnknownElement {
+                instance_key: _,
+                element_id,
+            }) => Ok(Resp::Status404_TheAd(problem(
+                "Ad-hoc sub-process not found",
+                404,
+                format!("Ad-hoc sub-process has no activatable element with id '{element_id}'."),
+            ))),
+            Err(e) => Ok(
+                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                    "Internal error",
+                    500,
+                    e.to_string(),
+                )),
+            ),
+        }
+    }
+
+    /// Forwards an ad-hoc activate-activities mutation to the peer owning the
+    /// container's partition and maps its answer to `(status, detail)`.
+    async fn forward_ad_hoc_activation(
+        &self,
+        node: u32,
+        container_key: u64,
+        payload: Option<serde_json::Value>,
+    ) -> (u16, String) {
+        match self.peer_link(node).await {
+            Ok(link) => match link
+                .forward_ad_hoc_activation(container_key.to_string(), payload)
+                .await
+            {
+                Ok(r) => (
+                    r.status,
+                    r.body
+                        .and_then(|v| v.as_str().map(|s| s.to_string()))
+                        .unwrap_or_default(),
+                ),
+                Err(e) => (502, e.to_string()),
+            },
+            Err((s, m)) => (s, m),
+        }
+    }
+
+    /// Peer-side of ad-hoc activate-activities forwarding (#614 gap 3): re-apply
+    /// the original REST body locally (this node owns the container's partition)
+    /// and mirror the REST status.
+    pub(crate) async fn apply_ad_hoc_activation_forwarded(
+        &self,
+        ad_hoc_instance_key: &str,
+        payload: Option<serde_json::Value>,
+    ) -> (u16, Option<String>) {
+        use apis::ad_hoc_sub_process::ActivateAdHocSubProcessActivitiesResponse as R;
+        let body: models::AdHocSubProcessActivateActivitiesInstruction = match payload {
+            Some(v) => match serde_json::from_value(v) {
+                Ok(b) => b,
+                Err(e) => return (400, Some(e.to_string())),
+            },
+            None => return (400, Some("missing ad-hoc activation payload".to_string())),
+        };
+        let path = models::ActivateAdHocSubProcessActivitiesPathParams {
+            ad_hoc_sub_process_instance_key: ad_hoc_instance_key.to_string(),
+        };
+        match self
+            .activate_ad_hoc_sub_process_activities_impl(&path, &body)
+            .await
+        {
+            Ok(R::Status204_TheAd) => (204, None),
+            Ok(R::Status404_TheAd(p)) => (404, Some(p.detail)),
+            Ok(R::Status400_TheProvidedDataIsNotValid(p)) => (400, Some(p.detail)),
+            Ok(R::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(p)) => {
+                (500, Some(p.detail))
+            }
+            _ => (500, None),
+        }
+    }
+
     /// Forwards a `completeJob` to the peer owning the job and maps its answer to
     /// the REST response. Used when the job's partition is owned by another node.
     async fn forward_complete_job(
@@ -14806,6 +14956,32 @@ fn adhoc_result_from_completion(
         completion_condition_fulfilled: adhoc.is_completion_condition_fulfilled.unwrap_or(false),
         cancel_remaining_instances: adhoc.is_cancel_remaining_instances.unwrap_or(false),
     })
+}
+
+/// Builds the engine `ActivateAdHocActivities` command (#614 gap 3) from the
+/// external REST body, converting each activate-element reference (id + optional
+/// seed variables) into an engine `AdHocActivateElement`.
+fn adhoc_activation_command(
+    ad_hoc_instance_key: Key,
+    body: &models::AdHocSubProcessActivateActivitiesInstruction,
+) -> Command {
+    let activate_elements = body
+        .elements
+        .iter()
+        .map(|el| AdHocActivateElement {
+            element_id: el.element_id.clone(),
+            variables: el
+                .variables
+                .as_ref()
+                .map(from_object_map)
+                .unwrap_or_default(),
+        })
+        .collect();
+    Command::ActivateAdHocActivities {
+        ad_hoc_instance_key,
+        activate_elements,
+        cancel_remaining: body.cancel_remaining_instances.unwrap_or(false),
+    }
 }
 
 /// A user-task-listener job result must not be completed with variables: the
@@ -24735,6 +24911,143 @@ mod subscription_placement_tests {
             "detail explains the positive-duration contract, got {:?}",
             err.1
         );
+    }
+
+    /// Minimal agentic ad-hoc process for the gap-#3 server tests: an `agent`
+    /// container (JOB_WORKER variant, job type `agent-worker`) holding two
+    /// service-task tools `toolA`/`toolB`. Mirrors engine-core's
+    /// `adhoc_agent_process()` fixture in XML so the server can deploy it via the
+    /// ordinary REST deployment path.
+    const ADHOC_AGENT_BPMN: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="agent-proc" isExecutable="true">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="toolA" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="toolB" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    #[tokio::test]
+    async fn rest_activate_ad_hoc_activities_mints_a_tool_job_without_the_agent_job() {
+        // gap #3 (Magikcraft/nano-bpm#614): the external
+        // `activateAdHocSubProcessActivities` REST endpoint must activate a named
+        // tool on a running ad-hoc container independently of the agent job. This
+        // exercises the full stub -> impl -> engine -> 204 wiring, not just the
+        // engine seam (which the engine-core test covers).
+        use apis::ad_hoc_sub_process::ActivateAdHocSubProcessActivitiesResponse as Resp;
+        use apis::job::ActivateJobsResponse as JobResp;
+
+        let server = single_node_multi_partition();
+        server
+            .deploy_centralized(
+                vec![("agent.bpmn".into(), ADHOC_AGENT_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect("the ad-hoc agent process deploys onto every partition");
+
+        let (_instance, _) = server
+            .create_for_stream(Some("agent-proc".into()), None, Default::default())
+            .await
+            .expect("the instance is created and parks on the agent container");
+
+        // Discover the container's element-instance key via its agent job, but do
+        // NOT complete it — the external command must activate independently.
+        let mut agent_req = models::JobActivationRequest::new("agent-worker".into(), 60_000, 10);
+        agent_req.request_timeout = Some(-1);
+        let container_key = match server
+            .activate_jobs_impl(&agent_req)
+            .await
+            .expect("activate the agent job")
+        {
+            JobResp::Status200_TheListOfActivatedJobs(r) => {
+                let job = r
+                    .jobs
+                    .into_iter()
+                    .next()
+                    .expect("an agent job is emitted for the ad-hoc container");
+                job.element_instance_key.0
+            }
+            other => panic!("expected the agent job list, got {other:?}"),
+        };
+
+        // Happy path: activating a real tool returns 204 and mints the tool's job,
+        // without consuming the still-parked agent job.
+        let path = models::ActivateAdHocSubProcessActivitiesPathParams {
+            ad_hoc_sub_process_instance_key: container_key,
+        };
+        let body = models::AdHocSubProcessActivateActivitiesInstruction::new(vec![
+            models::AdHocSubProcessActivateActivityReference::new("toolA".into()),
+        ]);
+        let resp = server
+            .activate_ad_hoc_sub_process_activities_impl(&path, &body)
+            .await
+            .expect("the endpoint returns a response");
+        assert!(
+            matches!(resp, Resp::Status204_TheAd),
+            "activating a real tool is 204 No Content, got {resp:?}"
+        );
+
+        // The tool's own job now exists — proof the external activation happened.
+        let mut tool_req = models::JobActivationRequest::new("toolA".into(), 60_000, 10);
+        tool_req.request_timeout = Some(-1);
+        let tool_jobs = match server
+            .activate_jobs_impl(&tool_req)
+            .await
+            .expect("activate the tool job")
+        {
+            JobResp::Status200_TheListOfActivatedJobs(r) => r.jobs,
+            other => panic!("expected the tool job list, got {other:?}"),
+        };
+        assert_eq!(
+            tool_jobs.len(),
+            1,
+            "the external activation minted toolA's own job"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_activate_ad_hoc_activities_maps_unknown_container_to_404() {
+        // The HTTP status mapping for the two NOT_FOUND branches: a key that is
+        // not a valid number, and a well-formed key naming no live container.
+        // Both are 404 (Zeebe NOT_FOUND parity), routed through the engine on a
+        // single node (no deployed container required).
+        use apis::ad_hoc_sub_process::ActivateAdHocSubProcessActivitiesResponse as Resp;
+        let server = single_node_multi_partition();
+        let body = models::AdHocSubProcessActivateActivitiesInstruction::new(vec![
+            models::AdHocSubProcessActivateActivityReference::new("toolA".into()),
+        ]);
+
+        for bad in ["not-a-key", "999999999"] {
+            let path = models::ActivateAdHocSubProcessActivitiesPathParams {
+                ad_hoc_sub_process_instance_key: bad.to_string(),
+            };
+            let resp = server
+                .activate_ad_hoc_sub_process_activities_impl(&path, &body)
+                .await
+                .expect("the endpoint returns a response");
+            assert!(
+                matches!(resp, Resp::Status404_TheAd(_)),
+                "unknown container key {bad:?} maps to 404, got {resp:?}"
+            );
+        }
     }
 
     #[tokio::test]
