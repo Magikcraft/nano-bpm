@@ -8701,6 +8701,39 @@ fn adhoc_agent_with_user_task_tool() -> ProcessDefinition {
     crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
 }
 
+fn adhoc_agent_named_tools_process() -> ProcessDefinition {
+    // Like `adhoc_agent_process` but the two tools carry human `name`s, so the
+    // advertised tool catalog can be checked for both `elementId` and
+    // `elementName`.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA" name="Search the web">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+            <bpmn:serviceTask id="toolB" name="Send an email">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
 fn activate_element(id: &str) -> crate::model::AdHocActivateElement {
     activate_element_with(id, &[])
 }
@@ -8770,17 +8803,43 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
         .find(|j| j.element_id == "toolB")
         .expect("toolB job emitted");
 
+    // Gap #2 (#614) writes the tool catalog `adHocSubProcessElements` LOCAL to
+    // the ad-hoc container scope; activated tools are children of that scope, so
+    // — like Camunda's scope inheritance — each tool job legitimately inherits
+    // the catalog alongside its own activation seed. Assert the FULL scope
+    // exactly (seed + inherited catalog): this still guards #605's defect class,
+    // since any root bleed-through or a sibling tool's seed would break equality.
+    let expected_catalog = || {
+        Value::List(vec![
+            Value::Map(std::collections::BTreeMap::from([
+                ("elementId".to_string(), Value::Str("toolA".into())),
+                ("elementName".to_string(), Value::Str(String::new())),
+            ])),
+            Value::Map(std::collections::BTreeMap::from([
+                ("elementId".to_string(), Value::Str("toolB".into())),
+                ("elementName".to_string(), Value::Str(String::new())),
+            ])),
+        ])
+    };
     assert_eq!(
         *tool_a.variables,
-        HashMap::from([("fromActivation".to_string(), Value::Str("A".into()))]),
-        "toolA's job scope is EXACTLY its own activation seed — reaches the job \
-         with no ioMapping, and carries no root bleed-through or toolB var (#605)"
+        HashMap::from([
+            ("fromActivation".to_string(), Value::Str("A".into())),
+            ("adHocSubProcessElements".to_string(), expected_catalog()),
+        ]),
+        "toolA's job scope is its own activation seed PLUS the inherited \
+         container catalog (gap #2) — reaches the job with no ioMapping, and \
+         carries no root bleed-through or toolB seed (#605)"
     );
     assert_eq!(
         *tool_b.variables,
-        HashMap::from([("fromActivation".to_string(), Value::Str("B".into()))]),
-        "toolB's job scope is EXACTLY its own activation seed — no \
-         cross-contamination from toolA's concurrently-activated seed (#605)"
+        HashMap::from([
+            ("fromActivation".to_string(), Value::Str("B".into())),
+            ("adHocSubProcessElements".to_string(), expected_catalog()),
+        ]),
+        "toolB's job scope is its own activation seed PLUS the inherited \
+         container catalog (gap #2) — no cross-contamination from toolA's \
+         concurrently-activated seed (#605)"
     );
 
     // The exact failure mode #605 describes: a seed merged into the shared
@@ -8969,118 +9028,59 @@ fn adhoc_external_command_rejects_empty_activation() {
     );
 }
 
-/// Regression for Magikcraft/nano-bpm#614 gap 4 (Zeebe parity): an agent's
-/// `activateElements[]` instruction referencing an id that is not one of the
-/// container's tools must be REJECTED (Zeebe returns NOT_FOUND from
-/// `AdHocSubProcessInstructionActivateProcessor`), not silently turned into a
-/// phantom child. The rejection is atomic — a valid tool named in the same
-/// batch is not activated either. This asserts the whole defect class: both a
-/// lone unknown id and an unknown id mixed with a valid one are rejected, and
-/// nothing is left half-applied.
+/// Gap #2 (issue #614): a JOB_WORKER ad-hoc container must advertise its tool
+/// catalog to the agent by writing a local variable `adHocSubProcessElements`
+/// (Camunda `AdHocSubProcessProcessor.onActivate` →
+/// `AD_HOC_SUB_PROCESS_ELEMENTS`) so the agent can discover which tools it may
+/// activate — a list of `{ elementId, elementName }` entries, one per catalog
+/// tool, in document order. On `main` the agent job carries no such variable.
+/// Class-scoped: asserts the variable is present on the agent job, is a list of
+/// exactly the container's tools, and carries each tool's id and human name.
 #[test]
-fn adhoc_rejects_activation_of_unknown_element() {
+fn adhoc_container_advertises_its_tool_catalog_on_the_agent_job() {
     let mut engine = Engine::new();
     engine
-        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .apply_command(Command::DeployProcess(adhoc_agent_named_tools_process()))
         .unwrap();
-    let inst = create_instance_key(&mut engine, "p");
+    let _inst = create_instance_key(&mut engine, "p");
+
     let agent = engine
         .activate_jobs("agent-worker", "W", 10, 1_000, 0)
         .into_iter()
         .find(|j| j.element_id == "agent")
         .expect("agent job emitted for the ad-hoc container");
-    let container = agent.element_instance_key;
 
-    // A lone unknown id (`ghost`) with no valid tool alongside it is rejected
-    // on its own — the single-id path must fail with NOT_FOUND parity and leave
-    // the container untouched.
-    let lone_err = engine
-        .apply_command(Command::complete_job_with_result(
-            agent.key,
-            HashMap::new(),
-            crate::model::AdHocJobResult {
-                activate_elements: vec![activate_element("ghost")],
-                ..Default::default()
-            },
-        ))
-        .unwrap_err();
-    assert!(
-        matches!(&lone_err, EngineError::AdHocUnknownElement { element_id, .. } if element_id == "ghost"),
-        "a lone unknown activate-element id must be rejected (NOT_FOUND parity), got {lone_err:?}"
-    );
+    let catalog = agent
+        .variables
+        .get("adHocSubProcessElements")
+        .expect("the agent job advertises its tool catalog (#614 gap 2)");
+    let entries = match catalog {
+        Value::List(items) => items,
+        other => panic!("expected a list of tool metadata, got {other:?}"),
+    };
     assert_eq!(
-        engine
-            .instance(inst)
-            .unwrap()
-            .adhoc_instances
-            .get(&container)
-            .unwrap()
-            .active
-            .len(),
-        0,
-        "lone unknown id: nothing is activated"
-    );
-    assert!(
-        !engine.is_completed(inst),
-        "the agent job was not consumed by the rejected lone-unknown instruction"
+        entries.len(),
+        2,
+        "one catalog entry per activatable tool, in document order"
     );
 
-    // A batch mixing a real tool (`toolA`) with an unknown id (`ghost`) is
-    // rejected wholesale — the command fails and no state changes.
-    let err = engine
-        .apply_command(Command::complete_job_with_result(
-            agent.key,
-            HashMap::new(),
-            crate::model::AdHocJobResult {
-                activate_elements: vec![activate_element("toolA"), activate_element("ghost")],
-                ..Default::default()
-            },
-        ))
-        .unwrap_err();
-    assert!(
-        matches!(&err, EngineError::AdHocUnknownElement { element_id, .. } if element_id == "ghost"),
-        "unknown activate-element id must be rejected (NOT_FOUND parity), got {err:?}"
-    );
+    let entry = |elem_id: &str, name: &str| {
+        Value::Map(
+            [
+                ("elementId".to_string(), Value::Str(elem_id.to_string())),
+                ("elementName".to_string(), Value::Str(name.to_string())),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
     assert_eq!(
-        engine
-            .instance(inst)
-            .unwrap()
-            .adhoc_instances
-            .get(&container)
-            .unwrap()
-            .active
-            .len(),
-        0,
-        "atomic rejection: the valid `toolA` in the same batch is not activated"
-    );
-    assert!(
-        !engine.is_completed(inst),
-        "the agent job was not consumed; the container is still parked"
-    );
-
-    // The agent job is still activatable/completable: a corrected instruction
-    // (only real tools) now succeeds.
-    engine
-        .apply_command(Command::complete_job_with_result(
-            agent.key,
-            HashMap::new(),
-            crate::model::AdHocJobResult {
-                activate_elements: vec![activate_element("toolA")],
-                ..Default::default()
-            },
-        ))
-        .expect("a corrected instruction naming only real tools succeeds");
-    assert_eq!(
-        engine
-            .instance(inst)
-            .unwrap()
-            .adhoc_instances
-            .get(&container)
-            .unwrap()
-            .active
-            .len(),
-        1,
-        "the corrected instruction activated `toolA`"
+        entries,
+        &vec![
+            entry("toolA", "Search the web"),
+            entry("toolB", "Send an email"),
+        ],
+        "each entry carries the tool's id and human name"
     );
 }
 
