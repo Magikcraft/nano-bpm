@@ -8822,6 +8822,40 @@ fn adhoc_rejects_activation_of_unknown_element() {
         .expect("agent job emitted for the ad-hoc container");
     let container = agent.element_instance_key;
 
+    // A lone unknown id (`ghost`) with no valid tool alongside it is rejected
+    // on its own — the single-id path must fail with NOT_FOUND parity and leave
+    // the container untouched.
+    let lone_err = engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("ghost")],
+                ..Default::default()
+            },
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(&lone_err, EngineError::AdHocUnknownElement { element_id, .. } if element_id == "ghost"),
+        "a lone unknown activate-element id must be rejected (NOT_FOUND parity), got {lone_err:?}"
+    );
+    assert_eq!(
+        engine
+            .instance(inst)
+            .unwrap()
+            .adhoc_instances
+            .get(&container)
+            .unwrap()
+            .active
+            .len(),
+        0,
+        "lone unknown id: nothing is activated"
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "the agent job was not consumed by the rejected lone-unknown instruction"
+    );
+
     // A batch mixing a real tool (`toolA`) with an unknown id (`ghost`) is
     // rejected wholesale — the command fails and no state changes.
     let err = engine
