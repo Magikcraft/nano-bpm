@@ -327,7 +327,12 @@ release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-
 	  echo "tag $$tag already exists — bump engine-wasm/pkg.package.json (+ 'make console-wasm') before releasing"; exit 1; \
 	fi; \
 	echo "Tagging $$tag on $$(git rev-parse --short HEAD) and pushing (fires release-bojtos-npm → OIDC publish)"; \
-	git tag "$$tag" && git push origin "$$tag"
+	git tag "$$tag"; \
+	if ! git push origin "$$tag"; then \
+	  echo "push of $$tag failed — removing local tag so a rerun is retry-safe"; \
+	  git tag -d "$$tag" >/dev/null 2>&1 || true; \
+	  exit 1; \
+	fi
 
 .PHONY: processos-build
 processos-build: ## Build ProcessOS, the separate optimization-plane server (Stage T1: Insights)
