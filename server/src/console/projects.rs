@@ -6130,21 +6130,25 @@ pub fn resolve_app_ui(
             .filter(|s| !s.is_empty())
     };
 
-    // Resolve the port only when the app is enabled.
-    let port = if enabled {
-        let fixed = ui
-            .and_then(|u| u.get("port"))
-            .and_then(|v| v.as_u64())
-            .and_then(|n| u16::try_from(n).ok())
-            .filter(|&p| p != 0);
-        fixed.or_else(|| {
-            str_field("portEnv")
-                .and_then(|name| run_env.get(&name).cloned())
-                .and_then(|v| v.trim().parse::<u16>().ok())
-                .filter(|&p| p != 0)
-        })
-    } else {
+    // Resolve the port only when the app is enabled. Fixed `port` has strict
+    // precedence: if the `port` key is *present* it decides the outcome (a valid
+    // 1..=65535 integer ⇒ that port; anything else — 0, out-of-range, negative,
+    // fractional, wrong type ⇒ headless), and we never fall through to
+    // `portEnv`. `portEnv` is consulted only when no `port` key is declared.
+    let port = if !enabled {
         None
+    } else if let Some(port_val) = ui.and_then(|u| u.get("port")) {
+        // `as_u64` yields None for floats, strings, and negatives; `try_from`
+        // rejects anything above u16::MAX (no silent truncation).
+        port_val
+            .as_u64()
+            .and_then(|n| u16::try_from(n).ok())
+            .filter(|&p| p != 0)
+    } else {
+        str_field("portEnv")
+            .and_then(|name| run_env.get(&name).cloned())
+            .and_then(|v| v.trim().parse::<u16>().ok())
+            .filter(|&p| p != 0)
     };
 
     AppUi {
@@ -6194,6 +6198,16 @@ impl ProjectSupervisor {
     /// Static (manifest + config), independent of whether the app is running,
     /// so the rail can render both the icon and the running/stopped state. A
     /// missing/invalid manifest yields the default (`enabled`, headless).
+    ///
+    /// Port discovery deliberately resolves `ui.portEnv` against the
+    /// *app-declared* env only ([`resolve_run_env`]: project env overlaid with
+    /// the active run config), not the supervisor's inherited process env. The
+    /// spawned child does inherit the host env, but attributing a host-level
+    /// `PORT` (e.g. the studio's own) to every app is a misattribution hazard,
+    /// so discovery stays deterministic and per-app. Authors that want an
+    /// embedded webview declare `ui.port` or set the port in the project / run
+    /// config env. (A future slice can have the app self-report its bound URL at
+    /// boot for exact parity — the ADR 0057 handshake.)
     pub fn app_ui(&self, name: &str) -> AppUi {
         let run_env = read_config(name)
             .map(|cfg| resolve_run_env(&cfg))
@@ -9027,6 +9041,34 @@ mod tests {
             &env(&[("PORT", "3000")]),
         );
         assert_eq!(ui.port, Some(4000));
+    }
+
+    #[test]
+    fn app_ui_invalid_fixed_port_does_not_fall_through_to_port_env() {
+        // A present-but-invalid `port` must decide the outcome (headless), never
+        // silently fall back to `portEnv` — otherwise fixed-port precedence and
+        // "invalid port ⇒ headless" are both violated. `read_manifest` does no
+        // schema validation, so an out-of-range port can reach the resolver.
+        for bad in [
+            serde_json::json!({ "ui": { "port": 70000, "portEnv": "PORT" } }), // > u16::MAX
+            serde_json::json!({ "ui": { "port": 0, "portEnv": "PORT" } }),     // reserved 0
+            serde_json::json!({ "ui": { "port": -1, "portEnv": "PORT" } }),    // negative
+            serde_json::json!({ "ui": { "port": 8080.5, "portEnv": "PORT" } }), // fractional
+            serde_json::json!({ "ui": { "port": "3000", "portEnv": "PORT" } }), // wrong type
+        ] {
+            let ui = resolve_app_ui(&bad, &env(&[("PORT", "3000")]));
+            assert_eq!(ui.port, None, "invalid fixed port must be headless: {bad}");
+        }
+    }
+
+    #[test]
+    fn app_ui_out_of_range_port_env_is_headless() {
+        // Env-sourced ports are parsed as u16, so anything out of range rejects.
+        let ui = resolve_app_ui(
+            &serde_json::json!({ "ui": { "portEnv": "PORT" } }),
+            &env(&[("PORT", "70000")]),
+        );
+        assert_eq!(ui.port, None);
     }
 
     #[test]

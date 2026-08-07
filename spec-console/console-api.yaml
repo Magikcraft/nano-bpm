@@ -2115,6 +2115,46 @@ components:
         startedAtMs: { type: integer, format: int64, nullable: true }
         lastError: { type: string, nullable: true }
         compiling: { type: boolean }
+    AppUi:
+      type: object
+      description: >-
+        Console-integrated app-view descriptor (ADR 0057, issue #638), resolved
+        from the optional `ui` block in the app manifest against the project's
+        run env. The studio uses it to place a running app in the left rail and,
+        for a UI app, to locate its embedded webview. An app with no resolvable
+        UI port is headless: still listed, but shown as a control-only pane.
+        Identity/label/icon are display hints only — apps scaffolded from the
+        same template share an identical manifest — so callers key the nav entry
+        on the project name, not on these fields.
+      required: [enabled]
+      properties:
+        enabled:
+          type: boolean
+          description: >-
+            Whether the app opts in to an embedded UI. false (or no resolvable
+            port) means headless: still listed, but control-only.
+        port:
+          type: integer
+          format: int32
+          nullable: true
+          description: >-
+            The resolved integrated-UI port, when known. Absent/null means
+            headless. Discovered from the run-config env (never allocated).
+        path:
+          type: string
+          nullable: true
+          description: Path the embedded webview should open (default "/").
+        icon:
+          type: string
+          nullable: true
+          description: >-
+            Left-rail icon hint (bundled icon name). The console falls back to a
+            default glyph when absent/invalid.
+        label:
+          type: string
+          nullable: true
+          description: >-
+            Left-rail label hint. The console disambiguates on the project name.
     ProjectTemplate:
       type: object
       required: [id, label, description, lang, source]
@@ -2209,6 +2249,12 @@ components:
           type: array
           items: { $ref: '#/components/schemas/FileNode' }
         runState: { $ref: '#/components/schemas/RunState' }
+        appUi:
+          allOf: [ { $ref: '#/components/schemas/AppUi' } ]
+          description: >-
+            The console-integrated app-view descriptor (ADR 0057, issue #638).
+            Always present; `enabled: false` or a null `port` marks a headless
+            app (listed in the running-apps rail, but control-only).
         rootPath:
           type: string
           description: >-
