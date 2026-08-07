@@ -468,9 +468,6 @@ pub struct AdHocState {
     /// Element instances of tool children still running this turn. The container
     /// re-emits its agent job once this drains (and no completion was signalled).
     pub active: std::collections::BTreeSet<Key>,
-    /// Accumulated tool outputs (the agent's `outputCollection` memory), in
-    /// activation-completion order.
-    pub output_values: Vec<Value>,
     /// How many agent-job turns have run (drives the metrics + runaway guard).
     pub iterations: u32,
     /// Latched once the declared `<completionCondition>` has been satisfied with
@@ -2097,7 +2094,6 @@ pub fn apply(state: &mut State, event: &Event) {
                         output_collection: output_collection.clone(),
                         output_element: output_element.clone(),
                         active: std::collections::BTreeSet::new(),
-                        output_values: Vec::new(),
                         iterations: 0,
                         completion_condition_fulfilled: false,
                     },
@@ -2126,8 +2122,17 @@ pub fn apply(state: &mut State, event: &Event) {
         }
 
         // An ad-hoc tool child completed: append its output to the container's
-        // accumulated results and drop it from the active set. Its local scope is
-        // torn down by the child's `ElementCompleted` event.
+        // `outputCollection` variable (the single source of truth, seeded to an
+        // empty array on activation and visible in the container scope mid-run)
+        // and drop it from the active set. Its local scope is torn down by the
+        // child's `ElementCompleted` event. This applier only ever runs once the
+        // append is known to be safe: `complete_adhoc_tool` DEFERS emitting
+        // `AdHocToolCompleted` until its type guard confirms the target is an
+        // array (parking a retry-on-resolve incident on the tool otherwise), so
+        // the `Value::List` match below always holds for a declared collection.
+        // A non-list is therefore only reachable when no collection is declared or
+        // `output` is `None`, in which case nothing is appended (the output is
+        // discarded, matching the pre-collection behaviour).
         Event::AdHocToolCompleted {
             instance_key,
             container_key,
@@ -2135,10 +2140,20 @@ pub fn apply(state: &mut State, event: &Event) {
             output,
         } => {
             if let Some(instance) = state.instances.get_mut(instance_key) {
+                let name = instance
+                    .adhoc_instances
+                    .get(container_key)
+                    .and_then(|a| a.output_collection.clone());
                 if let Some(adhoc) = instance.adhoc_instances.get_mut(container_key) {
                     adhoc.active.remove(child_key);
-                    if let Some(value) = output {
-                        adhoc.output_values.push(value.clone());
+                }
+                if let (Some(name), Some(value)) = (name, output) {
+                    if let Some(Value::List(list)) = instance
+                        .scope_variables
+                        .get_mut(container_key)
+                        .and_then(|m| m.get_mut(&name))
+                    {
+                        list.push(value.clone());
                     }
                 }
             }

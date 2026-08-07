@@ -8803,12 +8803,14 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
         .find(|j| j.element_id == "toolB")
         .expect("toolB job emitted");
 
-    // Gap #2 (#614) writes the tool catalog `adHocSubProcessElements` LOCAL to
-    // the ad-hoc container scope; activated tools are children of that scope, so
-    // — like Camunda's scope inheritance — each tool job legitimately inherits
-    // the catalog alongside its own activation seed. Assert the FULL scope
-    // exactly (seed + inherited catalog): this still guards #605's defect class,
-    // since any root bleed-through or a sibling tool's seed would break equality.
+    // Gaps #2 and #8 (#614) both write LOCAL container-scope variables on
+    // activation — the tool catalog `adHocSubProcessElements` (gap #2) and the
+    // seeded `outputCollection` `results: []` (gap #8). Activated tools are
+    // children of that scope, so — like Camunda's scope inheritance — each tool
+    // job legitimately inherits BOTH alongside its own activation seed. Assert
+    // the FULL scope exactly (seed + inherited catalog + inherited empty
+    // collection): this still guards #605's defect class, since any root
+    // bleed-through or a sibling tool's seed would break equality.
     let expected_catalog = || {
         Value::List(vec![
             Value::Map(std::collections::BTreeMap::from([
@@ -8826,9 +8828,11 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
         HashMap::from([
             ("fromActivation".to_string(), Value::Str("A".into())),
             ("adHocSubProcessElements".to_string(), expected_catalog()),
+            ("results".to_string(), Value::List(vec![])),
         ]),
         "toolA's job scope is its own activation seed PLUS the inherited \
-         container catalog (gap #2) — reaches the job with no ioMapping, and \
+         container catalog (gap #2) and empty outputCollection (gap #8) — \
+         reaches the job with no ioMapping, and \
          carries no root bleed-through or toolB seed (#605)"
     );
     assert_eq!(
@@ -8836,9 +8840,11 @@ fn adhoc_activation_variables_reach_a_tool_job_without_io_mapping() {
         HashMap::from([
             ("fromActivation".to_string(), Value::Str("B".into())),
             ("adHocSubProcessElements".to_string(), expected_catalog()),
+            ("results".to_string(), Value::List(vec![])),
         ]),
         "toolB's job scope is its own activation seed PLUS the inherited \
-         container catalog (gap #2) — no cross-contamination from toolA's \
+         container catalog (gap #2) and empty outputCollection (gap #8) — \
+         no cross-contamination from toolA's \
          concurrently-activated seed (#605)"
     );
 
@@ -9233,7 +9239,14 @@ fn adhoc_agent_activates_tools_loops_and_completes_with_output_collection() {
         adhoc.iterations, 1,
         "agent job re-emitted for the next turn"
     );
-    assert_eq!(adhoc.output_values.len(), 2, "two tool outputs accumulated");
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results").map(|v| match v {
+            Value::List(l) => l.len(),
+            _ => usize::MAX,
+        }),
+        Some(2),
+        "two tool outputs accumulated in the live outputCollection",
+    );
     assert!(
         !engine.is_completed(inst),
         "container still awaiting the agent"
@@ -9382,10 +9395,15 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
         adhoc.iterations, 1,
         "agent job re-emitted for the next turn after the human finished"
     );
-    assert_eq!(
-        adhoc.output_values.len(),
-        1,
-        "the human's `result` was captured into the output collection"
+    assert!(
+        matches!(
+            container_output_collection(&engine, inst, container, "results"),
+            Some(Value::List(ref v)) if v.len() == 1
+        ),
+        "the human's `result` was appended to the container's outputCollection \
+         (gap #8 lifecycle: accumulated into the local scope variable, visible \
+         mid-run), got {:?}",
+        container_output_collection(&engine, inst, container, "results")
     );
 
     // Turn 2: agent is done → container completes and writes its collection.
@@ -9416,6 +9434,308 @@ fn adhoc_agent_activates_a_user_task_tool_and_parks_until_completed() {
         results,
         Some(Value::List(vec![Value::Str("approved".to_string())])),
         "the user-task tool's output reached the container's outputCollection"
+    );
+}
+
+// Reads the ad-hoc container's local `outputCollection` variable (`results`)
+// straight off the container scope — the live value visible mid-run, before the
+// container completes and propagates it outward.
+fn container_output_collection(
+    engine: &Engine,
+    instance_key: Key,
+    container: Key,
+    name: &str,
+) -> Option<Value> {
+    engine
+        .instance(instance_key)
+        .unwrap()
+        .scope_variables
+        .get(&container)
+        .and_then(|m| m.get(name))
+        .cloned()
+}
+
+#[test]
+fn adhoc_output_collection_is_initialised_empty_on_activation() {
+    // Zeebe parity (AdHocSubProcessProcessor.onActivate): a declared
+    // `outputCollection` is seeded to an empty array as a *local* container
+    // variable when the container activates — so the agent (and any FEEL that
+    // reads it) sees `results = []` before a single tool has run. nano used to
+    // materialise the collection only at completion, so mid-run it did not exist.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let container = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .expect("agent job emitted")
+        .element_instance_key;
+
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results"),
+        Some(Value::List(vec![])),
+        "outputCollection seeded to an empty array on activation, visible in the container scope",
+    );
+}
+
+#[test]
+fn adhoc_output_collection_grows_and_is_visible_during_the_run() {
+    // Zeebe appends each completed element's `outputElement` to the local
+    // `outputCollection` as it goes (beforeExecutionPathCompleted), so a
+    // mid-run agent turn can inspect the accumulated results. nano used to keep
+    // them in a hidden accumulator invisible until the container completed.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(adhoc_agent_process()))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA"), activate_element("toolB")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let tool_jobs = engine.activate_jobs("tool", "W", 10, 1_000, 0);
+    for (job, val) in tool_jobs.iter().zip(["A", "B"]) {
+        let mut vars = HashMap::new();
+        vars.insert("result".to_string(), Value::Str(val.to_string()));
+        engine
+            .apply_command(Command::complete_job_with(job.key, vars))
+            .unwrap();
+    }
+
+    // The container has NOT completed yet (it is awaiting the agent's next turn),
+    // but the collection is already visible and holds both tool outputs.
+    assert!(
+        !engine.is_completed(inst),
+        "container still awaiting the agent"
+    );
+    let mut got = match container_output_collection(&engine, inst, container, "results") {
+        Some(Value::List(v)) => v,
+        other => panic!("expected a live outputCollection list mid-run, got {other:?}"),
+    };
+    got.sort_by_key(|v| match v {
+        Value::Str(s) => s.clone(),
+        _ => String::new(),
+    });
+    assert_eq!(
+        got,
+        vec![Value::Str("A".to_string()), Value::Str("B".to_string())],
+        "outputCollection accumulates each tool's output as the run progresses",
+    );
+}
+
+fn adhoc_non_array_output_collection_process() -> ProcessDefinition {
+    // A container whose own input mapping overwrites the seeded `outputCollection`
+    // (`results`) with a scalar — the misconfiguration Zeebe guards against.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:adHocSubProcess id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="agent-worker" />
+              <zeebe:adHoc outputCollection="results" outputElement="=result" />
+              <zeebe:ioMapping>
+                <zeebe:input source="=5" target="results" />
+              </zeebe:ioMapping>
+            </bpmn:extensionElements>
+            <bpmn:serviceTask id="toolA">
+              <bpmn:extensionElements>
+                <zeebe:taskDefinition type="tool" />
+              </bpmn:extensionElements>
+            </bpmn:serviceTask>
+          </bpmn:adHocSubProcess>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="f2" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    crate::bpmn::parse_bpmn(xml).unwrap().remove(0)
+}
+
+#[test]
+fn adhoc_output_collection_non_array_target_raises_extract_value_incident() {
+    // Zeebe (AdHocSubProcessOutputCollectionBehavior.appendToOutputCollection)
+    // raises EXTRACT_VALUE_ERROR when the target is not an array. nano used to
+    // silently accumulate into its hidden Vec and overwrite the scalar at
+    // completion. The type guard must reject it instead — and for full parity it
+    // DEFERS the tool's completion: the incident sits on the TOOL child (so
+    // resolving it retries the append), the tool stays active with its scope
+    // intact, and the scalar target is left uncorrupted.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_non_array_output_collection_process(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+    // The container input mapping overwrote the seeded array with a scalar.
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results"),
+        Some(Value::Int(5)),
+        "input mapping set results to a non-array before any tool ran",
+    );
+
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let tool = engine
+        .activate_jobs("tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("tool job");
+    let mut vars = HashMap::new();
+    vars.insert("result".to_string(), Value::Str("x".to_string()));
+    engine
+        .apply_command(Command::complete_job_with(tool.key, vars))
+        .unwrap();
+
+    let active = engine.active_incidents();
+    assert_eq!(active.len(), 1, "exactly one incident raised");
+    assert_eq!(
+        active[0].kind,
+        state::IncidentKind::ExpressionEvaluation,
+        "non-array outputCollection maps to the EXTRACT_VALUE_ERROR taxonomy",
+    );
+    assert_eq!(
+        active[0].element_id, "toolA",
+        "incident sits on the tool child, so resolving it re-drives the append",
+    );
+    assert_eq!(
+        active[0].element_instance_key, tool.element_instance_key,
+        "incident is parked on the tool's element instance, not the container",
+    );
+    // The scalar is left untouched — no silent corruption into a list.
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results"),
+        Some(Value::Int(5)),
+        "the non-array target is not overwritten by a phantom collection",
+    );
+    assert!(
+        !engine.is_completed(inst),
+        "container parks on the incident"
+    );
+    // The tool's completion is DEFERRED (no `AdHocToolCompleted` emitted): it
+    // stays in the container's `active` set with its local scope intact so that
+    // resolving the incident retries the append against the corrected target —
+    // nothing is discarded.
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert!(
+        adhoc.active.contains(&tool.element_instance_key),
+        "the tool stays active while parked on the incident",
+    );
+}
+
+#[test]
+fn adhoc_output_collection_incident_resolution_retries_the_append() {
+    // Full Zeebe parity for the EXTRACT_VALUE_ERROR incident: it is recoverable.
+    // After correcting the `outputCollection` target to an array and resolving
+    // the incident, the deferred tool completion is re-driven — its output is
+    // appended and the tool drains — exactly like Zeebe's retry-on-resolve.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(
+            adhoc_non_array_output_collection_process(),
+        ))
+        .unwrap();
+    let inst = create_instance_key(&mut engine, "p");
+    let agent = engine
+        .activate_jobs("agent-worker", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.element_id == "agent")
+        .unwrap();
+    let container = agent.element_instance_key;
+    engine
+        .apply_command(Command::complete_job_with_result(
+            agent.key,
+            HashMap::new(),
+            crate::model::AdHocJobResult {
+                activate_elements: vec![activate_element("toolA")],
+                ..Default::default()
+            },
+        ))
+        .unwrap();
+    let tool = engine
+        .activate_jobs("tool", "W", 10, 1_000, 0)
+        .into_iter()
+        .next()
+        .expect("tool job");
+    let mut vars = HashMap::new();
+    vars.insert("result".to_string(), Value::Str("x".to_string()));
+    engine
+        .apply_command(Command::complete_job_with(tool.key, vars))
+        .unwrap();
+
+    let incident = engine.active_incidents()[0].clone();
+    assert_eq!(incident.element_id, "toolA", "parked on the tool child");
+
+    // Correct the target: overwrite the scalar with an empty array in the
+    // container's local scope (as an operator would via SetVariables).
+    engine
+        .apply_command(Command::set_variables_scoped(
+            container,
+            HashMap::from([("results".to_string(), Value::List(Vec::new()))]),
+            true,
+        ))
+        .unwrap();
+    // Resolve the incident → the deferred tool completion is re-driven.
+    engine
+        .apply_command(Command::resolve_incident(incident.key))
+        .unwrap();
+
+    assert!(
+        engine.active_incidents().is_empty(),
+        "the incident is cleared once the append succeeds",
+    );
+    // The tool's output is now appended to the corrected array.
+    assert_eq!(
+        container_output_collection(&engine, inst, container, "results"),
+        Some(Value::List(vec![Value::Str("x".to_string())])),
+        "resolving the incident retries the append against the fixed target",
+    );
+    // The tool has drained from the active set (it completed on retry).
+    let adhoc = engine
+        .instance(inst)
+        .unwrap()
+        .adhoc_instances
+        .get(&container)
+        .unwrap();
+    assert!(
+        !adhoc.active.contains(&tool.element_instance_key),
+        "the tool drains once its deferred completion is re-driven",
     );
 }
 
