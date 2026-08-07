@@ -67,10 +67,13 @@ a hand-pushed `bojtos-npm-v*` tag. Two independent drift modes are guarded in CI
 so neither can slip through unnoticed:
 
 - **Staleness (engine changed, wasm not republished).** The
-  `engine-wasm (release drift guard)` CI job fails a build when
-  `engine-core/**`, `engine-wasm/src/**` or `engine-wasm/pkg.package.json` has
-  changed since the last `bojtos-npm-v*` tag but the version hasn't been bumped
-  past it. In other words: once the engine moves, an *unreleased* version bump
+  `engine-wasm (release drift guard)` CI job fails a build when any wasm input
+  — `engine-core/**`, `engine-wasm/src/**`, `engine-wasm/Cargo.toml`,
+  `engine-wasm/Cargo.lock` or `engine-wasm/pkg.package.json` — has changed since
+  the last `bojtos-npm-v*` tag but the version hasn't been bumped past it
+  (`Cargo.toml`/`Cargo.lock` count because a dependency or feature change alters
+  the produced wasm without touching `engine-core` or `engine-wasm/src`). In
+  other words: once the engine moves, an *unreleased* version bump
   must always be pending — the pending `pkg.package.json` version must be
   **strictly greater** than the last published `bojtos-npm-v*` tag (a patch bump
   like `0.3.0 → 0.3.1` is enough; the guard compares with `sort -V`, so any

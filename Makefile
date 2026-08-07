@@ -318,7 +318,7 @@ release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-
 	if [ -n "$$(git status --porcelain)" ]; then \
 	  echo "working tree is dirty — commit or stash before releasing (release must tag a clean tree)"; exit 1; \
 	fi; \
-	git fetch -q origin main; \
+	git fetch -q --tags origin main; \
 	if [ "$$(git rev-parse HEAD)" != "$$(git rev-parse origin/main)" ]; then \
 	  echo "HEAD is not origin/main — cut the release from the merged main commit"; exit 1; \
 	fi; \
