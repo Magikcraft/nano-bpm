@@ -16,10 +16,10 @@
 use std::collections::HashMap;
 
 use nanobpmn_engine_core::{
-    bpmn::parse_bpmn, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult, Command,
-    Engine, Event, IncidentKind, IncidentState, JobState, MessageSubscriptionKind,
-    MessageSubscriptionState, ProcessInstanceState, TimerState, UserTaskChangeset, UserTaskState,
-    Value,
+    bpmn::parse_bpmn, ActivateElementInstruction, AdHocActivateElement, AdHocJobResult,
+    BreakCondition, Command, DebugSession, Engine, Event, IncidentKind, IncidentState, JobState,
+    MessageSubscriptionKind, MessageSubscriptionState, ProcessInstanceState, TimerState,
+    UserTaskChangeset, UserTaskState, Value,
 };
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
@@ -40,6 +40,13 @@ pub struct TestEngine {
     /// so `snapshot` stays O(live state) instead of re-scanning the whole event
     /// log on every (frequent) Play poll.
     history: HistoryAggregates,
+    /// The in-flight debug run, if the host is stepping a command (see the
+    /// `debug*` methods). `None` when no debug session is active. Held out of the
+    /// engine so the engine's production path is untouched.
+    debug: Option<DebugSession>,
+    /// How many of the active [`DebugSession`]'s events have already been folded
+    /// into `log`, so each `debugResume`/`debugStep` mirrors only the new tail.
+    debug_folded: usize,
 }
 
 /// The log-derived, monotonically-growing parts of a snapshot, accumulated once
@@ -70,6 +77,8 @@ impl TestEngine {
             seq: 0,
             log: Vec::new(),
             history: HistoryAggregates::default(),
+            debug: None,
+            debug_folded: 0,
         }
     }
 
@@ -90,6 +99,8 @@ impl TestEngine {
         self.seq = 0;
         self.log.clear();
         self.history = HistoryAggregates::default();
+        self.debug = None;
+        self.debug_folded = 0;
     }
 
     /// Parse and deploy a BPMN resource. Returns a JSON object
@@ -131,6 +142,88 @@ impl TestEngine {
             _ => None,
         });
         to_json(&self.snapshot_value(created))
+    }
+
+    /// Begin a **debug** run of a `CreateInstance` command: deploy first (as
+    /// usual), then call this to start the instance under the stepping executor,
+    /// pausing at the first breakpoint (or running to completion if none match).
+    ///
+    /// `breakpoints_json` is a JSON array of `{ kind, id? }`:
+    /// ```json
+    /// [{ "kind": "elementActivated", "id": "Task_Charge" },
+    ///  { "kind": "elementCompleted", "id": "Gateway_1" },
+    ///  { "kind": "processCompleted" },
+    ///  { "kind": "everyStep" }]
+    /// ```
+    /// Returns the debug state JSON (see [`TestEngine::debug_state`]). Starting a
+    /// new debug run replaces any previous session.
+    #[wasm_bindgen(js_name = debugCreateInstance)]
+    pub fn debug_create_instance(
+        &mut self,
+        process_id: &str,
+        variables_json: &str,
+        breakpoints_json: &str,
+    ) -> Result<String, JsValue> {
+        let variables = parse_vars(variables_json)?;
+        let breakpoints = parse_breakpoints(breakpoints_json)?;
+        // Start fresh: nothing of this session has been folded into `log` yet.
+        self.debug = None;
+        self.debug_folded = 0;
+        let session = self
+            .engine
+            .debug_command_at(
+                Command::CreateInstance {
+                    process_id: process_id.to_string(),
+                    variables,
+                    tags: Vec::new(),
+                    business_id: None,
+                },
+                self.now,
+                breakpoints,
+            )
+            .map_err(|e| js_err(&format!("debug create error: {e}")))?;
+        self.debug = Some(session);
+        self.fold_debug_delta();
+        to_json(&self.debug_state())
+    }
+
+    /// Resume a paused debug run until the next breakpoint or completion. No-op if
+    /// no session is active or it has already finished. Returns the debug state.
+    #[wasm_bindgen(js_name = debugResume)]
+    pub fn debug_resume(&mut self) -> Result<String, JsValue> {
+        if let Some(mut session) = self.debug.take() {
+            self.engine.debug_resume(&mut session);
+            self.debug = Some(session);
+            self.fold_debug_delta();
+        }
+        to_json(&self.debug_state())
+    }
+
+    /// Advance a paused debug run by exactly one step, then pause again (unless
+    /// that step drained the command). No-op if no session is active or it has
+    /// already finished. Returns the debug state.
+    #[wasm_bindgen(js_name = debugStep)]
+    pub fn debug_step(&mut self) -> Result<String, JsValue> {
+        if let Some(mut session) = self.debug.take() {
+            self.engine.debug_step(&mut session);
+            self.debug = Some(session);
+            self.fold_debug_delta();
+        }
+        to_json(&self.debug_state())
+    }
+
+    /// Whether a debug run is currently paused at a breakpoint.
+    #[wasm_bindgen(getter, js_name = debugIsPaused)]
+    pub fn debug_is_paused(&self) -> bool {
+        self.debug.as_ref().is_some_and(DebugSession::is_paused)
+    }
+
+    /// Discard the active debug session (the engine keeps whatever state the run
+    /// has already produced).
+    #[wasm_bindgen(js_name = debugClear)]
+    pub fn debug_clear(&mut self) {
+        self.debug = None;
+        self.debug_folded = 0;
     }
 
     /// Complete a waiting job by key, merging `variables_json` (a JSON object
@@ -602,6 +695,73 @@ impl TestEngine {
             });
         }
         Ok(events)
+    }
+
+    /// Mirror the newly-emitted tail of the active [`DebugSession`]'s event log
+    /// into `self.log` (with seq/now stamps + history folding), so `events()` and
+    /// `snapshot()` reflect the paused partial run exactly as a normal command
+    /// would. Idempotent per call: only events past `debug_folded` are appended.
+    fn fold_debug_delta(&mut self) {
+        let Some(session) = self.debug.as_ref() else {
+            return;
+        };
+        let full = session.log();
+        if self.debug_folded >= full.len() {
+            return;
+        }
+        let now = self.now;
+        let new_events: Vec<Event> = full[self.debug_folded..].to_vec();
+        self.debug_folded = full.len();
+        for ev in &new_events {
+            self.seq += 1;
+            self.fold_history(ev);
+            self.log.push(LogEntry {
+                seq: self.seq,
+                now,
+                event: ev.clone(),
+            });
+        }
+    }
+
+    /// The debug state DTO returned by every `debug*` method: whether the run is
+    /// paused, the current event count, and the elements currently active (an
+    /// `ElementActivated` with no matching `ElementCompleted`) — the set a diagram
+    /// view highlights while paused.
+    fn debug_state(&self) -> serde_json::Value {
+        serde_json::json!({
+            "paused": self.debug_is_paused(),
+            "seq": self.seq,
+            "activeElements": self.active_elements(),
+        })
+    }
+
+    /// Elements with a live token: an `ElementActivated` event whose
+    /// `element_instance_key` has no later `ElementCompleted`. Deduplicated,
+    /// in first-activation order.
+    fn active_elements(&self) -> Vec<String> {
+        let mut open: Vec<(u64, String)> = Vec::new();
+        for entry in &self.log {
+            match &entry.event {
+                Event::ElementActivated {
+                    element_instance_key,
+                    element_id,
+                    ..
+                } => {
+                    open.push((*element_instance_key, element_id.clone()));
+                }
+                Event::ElementCompleted {
+                    element_instance_key,
+                    ..
+                } => {
+                    open.retain(|(k, _)| k != element_instance_key);
+                }
+                _ => {}
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        open.into_iter()
+            .filter_map(|(_, id)| seen.insert(id.clone()).then_some(id))
+            .collect()
     }
 
     /// Fold one emitted event into the cumulative history aggregates that back
@@ -1281,6 +1441,47 @@ fn parse_vars(s: &str) -> Result<HashMap<String, Value>, JsValue> {
     }
 }
 
+/// Parse the `breakpoints_json` argument of the `debug*` methods: a JSON array of
+/// `{ kind, id? }` objects into [`BreakCondition`]s. Empty/whitespace ⇒ no
+/// breakpoints (the run drains to completion). `kind` is one of
+/// `elementActivated`, `elementCompleted`, `processCompleted`, `everyStep`; the
+/// first two require an `id`.
+fn parse_breakpoints(s: &str) -> Result<Vec<BreakCondition>, JsValue> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(t).map_err(|e| js_err(&format!("invalid breakpoints JSON: {e}")))?;
+    let serde_json::Value::Array(items) = json else {
+        return Err(js_err("breakpoints must be a JSON array"));
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let serde_json::Value::Object(obj) = item else {
+            return Err(js_err("each breakpoint must be a JSON object"));
+        };
+        let kind = match obj.get("kind") {
+            Some(serde_json::Value::String(k)) => k.as_str(),
+            _ => return Err(js_err("breakpoint `kind` must be a string")),
+        };
+        let id = || match obj.get("id") {
+            Some(serde_json::Value::String(id)) => Ok(id.clone()),
+            _ => Err(js_err(&format!(
+                "breakpoint kind `{kind}` requires a string `id`"
+            ))),
+        };
+        out.push(match kind {
+            "elementActivated" => BreakCondition::ElementActivated(id()?),
+            "elementCompleted" => BreakCondition::ElementCompleted(id()?),
+            "processCompleted" => BreakCondition::ProcessCompleted,
+            "everyStep" => BreakCondition::EveryStep,
+            other => return Err(js_err(&format!("unknown breakpoint kind: {other}"))),
+        });
+    }
+    Ok(out)
+}
+
 /// Parse a JSON changeset object for `updateUserTask` into a [`UserTaskChangeset`].
 /// Only keys present in the object become `Some`; absent keys leave that
 /// attribute unchanged. `dueDate`/`followUpDate` accept a string, or `null`/`""`
@@ -1829,6 +2030,119 @@ mod tests {
                 .iter()
                 .any(|i| i["state"] == "Active"),
             "empty result completes the container: {snap}"
+        );
+    }
+
+    const DEBUG_TWO_TASK_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="first">
+            <bpmn:extensionElements><zeebe:taskDefinition type="t1" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:serviceTask id="second">
+            <bpmn:extensionElements><zeebe:taskDefinition type="t2" /></bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="first" />
+          <bpmn:sequenceFlow id="b" sourceRef="first" targetRef="second" />
+          <bpmn:sequenceFlow id="c" sourceRef="second" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    /// A breakpoint on the start event pauses the debug run before the first job
+    /// is parked, and the reported `activeElements` names the paused element.
+    #[test]
+    fn debug_breakpoint_pauses_and_reports_active_element() {
+        let mut eng = TestEngine::new();
+        eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
+
+        let state = parse(
+            &eng.debug_create_instance("p", "{}", r#"[{"kind":"elementActivated","id":"s"}]"#)
+                .unwrap(),
+        );
+        assert_eq!(
+            state["paused"], true,
+            "paused at the start-event breakpoint"
+        );
+        assert!(eng.debug_is_paused());
+        let active = state["activeElements"].as_array().unwrap();
+        assert!(
+            active.iter().any(|e| e == "s"),
+            "start event is highlighted while paused: {state}"
+        );
+        // No job has been parked yet (we stopped before the service task).
+        let snap = parse(&eng.snapshot().unwrap());
+        assert!(
+            snap["jobs"]
+                .as_array()
+                .map(|j| j.is_empty())
+                .unwrap_or(true),
+            "no job parked at the start-event breakpoint: {snap}"
+        );
+    }
+
+    /// Resuming with no further breakpoints drains to quiescence; the mirrored
+    /// event log then matches a plain (non-debug) `createInstance` run — RTC parity
+    /// across the wasm boundary.
+    #[test]
+    fn debug_resume_matches_plain_create_instance() {
+        let plain = {
+            let mut eng = TestEngine::new();
+            eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
+            eng.create_instance("p", "{}").unwrap();
+            parse(&eng.events().unwrap())
+        };
+
+        let mut eng = TestEngine::new();
+        eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
+        eng.debug_create_instance("p", "{}", r#"[{"kind":"elementActivated","id":"s"}]"#)
+            .unwrap();
+        assert!(eng.debug_is_paused());
+        let state = parse(&eng.debug_resume().unwrap());
+        assert_eq!(state["paused"], false, "resumed to quiescence");
+        assert!(!eng.debug_is_paused());
+
+        let debugged = parse(&eng.events().unwrap());
+        assert_eq!(
+            plain, debugged,
+            "RTC parity across wasm: debug run == plain createInstance"
+        );
+        // Parked on the first job, exactly as the plain run leaves it.
+        let snap = parse(&eng.snapshot().unwrap());
+        let jobs = snap["jobs"].as_array().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0]["jobType"], "t1");
+    }
+
+    /// Single-stepping from the first step to quiescence yields the same event log
+    /// as the atomic run — the wasm surface drives the real steps, one at a time.
+    #[test]
+    fn debug_single_step_to_completion() {
+        let plain = {
+            let mut eng = TestEngine::new();
+            eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
+            eng.create_instance("p", "{}").unwrap();
+            parse(&eng.events().unwrap())
+        };
+
+        let mut eng = TestEngine::new();
+        eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
+        eng.debug_create_instance("p", "{}", r#"[{"kind":"everyStep"}]"#)
+            .unwrap();
+        assert!(eng.debug_is_paused(), "pauses after the first step");
+
+        let mut guard = 0;
+        while eng.debug_is_paused() {
+            eng.debug_step().unwrap();
+            guard += 1;
+            assert!(guard < 1000, "single-stepping must terminate");
+        }
+        let debugged = parse(&eng.events().unwrap());
+        assert_eq!(
+            plain, debugged,
+            "RTC parity across wasm: single-stepped run == plain createInstance"
         );
     }
 }
