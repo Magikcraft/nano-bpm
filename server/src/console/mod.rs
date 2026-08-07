@@ -132,6 +132,10 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/console/app-view/{name}", any(app_view_root_redirect))
         .route("/console/app-view/{name}/", any(app_view_proxy_index))
         .route("/console/app-view/{name}/{*rest}", any(app_view_proxy))
+        // App-shipped left-rail icon (ADR 0057, issue #638). When a project's
+        // `ui.icon` names a project asset path (not a bundled glyph), the rail
+        // renders it via <img> from this path-guarded, image-only route.
+        .route("/console/app-view-icon/{name}", get(app_view_icon))
         // Streaming / binary / static routes that are intentionally excluded
         // from the console OpenAPI spec stay hand-wired here. Every typed
         // `/console/api/*` operation is served by the generated rust-axum router
@@ -1135,6 +1139,118 @@ async fn app_view_proxy_inner(
         // `set-cookie` — survive intact.
         out_headers.append(k.clone(), v.clone());
     }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// App-shipped left-rail icon (ADR 0057, issue #638)
+//
+// A project's `ui.icon` is either a *bundled glyph name* (resolved client-side
+// against the console's icon set) or a *project asset path* (e.g.
+// `assets/icon.svg`). This route serves the latter: a path-guarded, image-only
+// GET so the rail can render the app's own icon via <img>.
+
+/// Whether a `ui.icon` value denotes a project asset path (served here) rather
+/// than a bundled glyph name (resolved client-side). Heuristic mirrored in the
+/// console (`isAssetIcon`): a value that contains a path separator or ends in a
+/// file extension is an asset; a bare token (`workers`, `docs`) is a glyph.
+fn app_view_icon_is_asset(icon: &str) -> bool {
+    icon.contains('/')
+        || std::path::Path::new(icon)
+            .extension()
+            .is_some_and(|e| !e.is_empty())
+}
+
+/// Map an icon file extension to the image content-type we're willing to serve.
+/// `None` ⇒ not an allow-listed image type (we refuse to serve it, so the rail
+/// falls back to the default glyph rather than leaking arbitrary project files).
+fn app_view_icon_content_type(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("svg") => Some("image/svg+xml"),
+        Some("png") => Some("image/png"),
+        Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("ico") => Some("image/x-icon"),
+        Some("avif") => Some("image/avif"),
+        _ => None,
+    }
+}
+
+/// `GET /console/app-view-icon/{name}` — serve a project's app-shipped rail
+/// icon. 404 when the project declares no asset-path icon (bundled names render
+/// client-side) or the file is missing/too large/not an allowed image type.
+async fn app_view_icon(Path(name): Path<String>) -> Response {
+    if !workspace::is_safe_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid project name").into_response();
+    }
+    let Some(icon) = projects::supervisor().app_ui(&name).icon else {
+        return (StatusCode::NOT_FOUND, "no app-shipped icon").into_response();
+    };
+    // Bundled glyph names are resolved by the console, not served as files.
+    if !app_view_icon_is_asset(&icon) {
+        return (StatusCode::NOT_FOUND, "icon is a bundled glyph name").into_response();
+    }
+    let Some(path) = projects::safe_project_path(&name, &icon) else {
+        return (StatusCode::BAD_REQUEST, "invalid icon path").into_response();
+    };
+    let Some(content_type) = app_view_icon_content_type(&path) else {
+        return (StatusCode::NOT_FOUND, "icon is not an allowed image type").into_response();
+    };
+    // `safe_project_path` is purely lexical (rejects `..` etc.), but the file it
+    // points at can still be a *symlink* escaping the project dir. Canonicalize
+    // both and require containment so this route can never read outside the
+    // project (it's unauthenticated and remotely reachable).
+    let real = match std::fs::canonicalize(&path) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "no such icon file").into_response(),
+    };
+    match projects::project_dir(&name).and_then(|d| std::fs::canonicalize(d).ok()) {
+        Some(root) if real.starts_with(&root) => {}
+        _ => return (StatusCode::NOT_FOUND, "icon resolves outside the project").into_response(),
+    }
+    // Bound the read: cap memory at MAX+1 bytes even if the file lies about its
+    // size, and reject anything over the icon limit.
+    const MAX_ICON_BYTES: u64 = 512 * 1024;
+    let bytes = {
+        use std::io::Read;
+        let file = match std::fs::File::open(&real) {
+            Ok(f) => f,
+            Err(_) => return (StatusCode::NOT_FOUND, "no such icon file").into_response(),
+        };
+        let mut buf = Vec::new();
+        if file.take(MAX_ICON_BYTES + 1).read_to_end(&mut buf).is_err() {
+            return (StatusCode::NOT_FOUND, "could not read icon").into_response();
+        }
+        buf
+    };
+    if bytes.len() as u64 > MAX_ICON_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "icon file too large").into_response();
+    }
+
+    let mut out = Response::new(axum::body::Body::from(bytes));
+    let h = out.headers_mut();
+    h.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    // Defence in depth for scripted SVGs: served for <img> (scripts don't run
+    // there), but a direct navigation to this URL would otherwise execute an
+    // embedded <script> in the console origin. `sandbox` (no allow-scripts)
+    // neutralises that even on direct load; nosniff keeps the type honest.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "sandbox; default-src 'none'; style-src 'unsafe-inline'"
+            .parse()
+            .unwrap(),
+    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    h.insert(
+        header::CACHE_CONTROL,
+        "private, max-age=60".parse().unwrap(),
+    );
     out
 }
 
@@ -3627,6 +3743,57 @@ mod app_view_proxy_tests {
             app_view_rewrite_location("//evil.example/x", "acme", 3000),
             "//evil.example/x"
         );
+    }
+}
+
+#[cfg(test)]
+mod app_view_icon_tests {
+    use std::path::Path;
+
+    use super::{app_view_icon_content_type, app_view_icon_is_asset};
+
+    #[test]
+    fn asset_paths_vs_bundled_glyph_names() {
+        // Asset paths: a separator or a file extension.
+        for icon in [
+            "assets/icon.svg",
+            "icon.png",
+            "brand/logo.webp",
+            "a/b/c.ico",
+        ] {
+            assert!(app_view_icon_is_asset(icon), "{icon} should be an asset");
+        }
+        // Bundled glyph names: a bare token, no separator, no extension.
+        for icon in ["workers", "docs", "explorer", "appDefault"] {
+            assert!(!app_view_icon_is_asset(icon), "{icon} should be a glyph");
+        }
+        // Dotfiles have no extension (matches JS + Rust `Path::extension`): a
+        // bare ".svg" is not treated as an asset, so client and server agree.
+        assert!(
+            !app_view_icon_is_asset(".svg"),
+            ".svg is a dotfile, not an asset"
+        );
+    }
+
+    #[test]
+    fn only_allow_listed_image_types_resolve_a_content_type() {
+        assert_eq!(
+            app_view_icon_content_type(Path::new("a/icon.svg")),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            app_view_icon_content_type(Path::new("ICON.PNG")),
+            Some("image/png")
+        );
+        assert_eq!(
+            app_view_icon_content_type(Path::new("logo.jpeg")),
+            Some("image/jpeg")
+        );
+        // Non-image / dangerous extensions are refused (no content-type ⇒ 404),
+        // so this route can never be used to exfiltrate a project's source.
+        for p in ["worker.ts", "app.db", "secret.env", "noext", "icon.html"] {
+            assert_eq!(app_view_icon_content_type(Path::new(p)), None, "{p}");
+        }
     }
 }
 
