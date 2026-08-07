@@ -9197,12 +9197,7 @@ fn create_instance_with_vars(
     variables: HashMap<String, Value>,
 ) -> Key {
     engine
-        .apply_command(Command::CreateInstance {
-            process_id: process_id.to_string(),
-            variables,
-            tags: Vec::new(),
-            business_id: None,
-        })
+        .apply_command(Command::create_instance_with(process_id, variables))
         .unwrap()
         .iter()
         .find_map(|e| e.instance_key())

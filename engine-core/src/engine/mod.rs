@@ -4392,13 +4392,6 @@ impl Engine {
             .unwrap_or_default()
     }
 
-    /// Activates one ad-hoc "tool" child (ADR 0023 seam 2): instantiates
-    /// `element_id` inside the container scope, seeding the agent's
-    /// activate-element `variables` as the child's local overlay, and marks it
-    /// active in the container. A service-task tool creates a job; any other kind
-    /// passes straight through to completion (which feeds the loop). v1 targets
-    /// single-activity tools (service/connector tasks); richer tool sub-graphs
-    /// are a deferred refinement.
     /// Evaluates a declarative ad-hoc container's `activeElementsCollection` FEEL
     /// expression to the ordered inner element ids to activate (Camunda BPMN_TASK
     /// variant; `AdHocSubProcessProcessor.readActivateElementsCollection`
@@ -4429,6 +4422,13 @@ impl Engine {
         }
     }
 
+    /// Activates one ad-hoc "tool" child (ADR 0023 seam 2): instantiates
+    /// `element_id` inside the container scope, seeding the agent's
+    /// activate-element `variables` as the child's local overlay, and marks it
+    /// active in the container. A service-task tool creates a job; any other kind
+    /// passes straight through to completion (which feeds the loop). v1 targets
+    /// single-activity tools (service/connector tasks); richer tool sub-graphs
+    /// are a deferred refinement.
     fn activate_adhoc_tool(
         &mut self,
         instance_key: Key,
