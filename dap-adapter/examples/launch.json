@@ -1,0 +1,13 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "nanobpmn",
+      "request": "launch",
+      "name": "Debug BPMN process",
+      "bpmn": "${workspaceFolder}/process.bpmn",
+      "processId": "my-process",
+      "variables": {}
+    }
+  ]
+}
