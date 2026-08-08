@@ -3,8 +3,10 @@
 //! breakpoints lives behind this interface, so the session file never touches
 //! wasm-init details or the JSON-string wire format.
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import initSyncDefault, { initSync, TestEngine } from '@nanobpm/engine-wasm';
 
@@ -24,6 +26,8 @@ export interface DebugState {
 
 let wasmReady = false;
 
+const WASM_FILE = 'nanobpmn_engine_bg.wasm';
+
 /**
  * `JSON.parse` that never throws: the wasm surface returns a JSON string on
  * success but may hand back an invalid-JSON error string (or malformed payload)
@@ -38,6 +42,57 @@ function safeJsonParse(json: string): unknown {
   }
 }
 
+function firstReadable(candidates: string[]): string | undefined {
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(candidate)) return candidate;
+    } catch {
+      // Ignore malformed bundle-time paths and try the next resolution strategy.
+    }
+  }
+  return undefined;
+}
+
+function bundledWasmCandidates(): string[] {
+  const candidates: string[] = [];
+  try {
+    if (typeof __dirname === 'string') {
+      candidates.push(path.join(__dirname, WASM_FILE));
+    }
+  } catch {
+    // `__dirname` is absent in native ESM output.
+  }
+  try {
+    candidates.push(fileURLToPath(new URL(`./${WASM_FILE}`, import.meta.url)));
+  } catch {
+    // `import.meta.url` may be unavailable after a CommonJS bundle transform.
+  }
+  return candidates;
+}
+
+function packageWasmCandidate(): string | undefined {
+  try {
+    const require =
+      typeof __filename === 'string' ? createRequire(__filename) : createRequire(import.meta.url);
+    return require.resolve(`@nanobpm/engine-wasm/${WASM_FILE}`);
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveWasmPath(): string {
+  const packageCandidate = packageWasmCandidate();
+  const candidates =
+    packageCandidate === undefined
+      ? bundledWasmCandidates()
+      : [...bundledWasmCandidates(), packageCandidate];
+  const wasmPath = firstReadable(candidates);
+  if (wasmPath === undefined) {
+    throw new Error(`cannot find ${WASM_FILE}; tried ${candidates.join(', ')}`);
+  }
+  return wasmPath;
+}
+
 /**
  * Initialise the wasm module once, synchronously, from the on-disk `.wasm` bytes.
  * The pkg is built `--target web` (its default init fetches a URL), which does not
@@ -45,8 +100,7 @@ function safeJsonParse(json: string): unknown {
  */
 function ensureWasm(): void {
   if (wasmReady) return;
-  const require = createRequire(import.meta.url);
-  const wasmPath = require.resolve('@nanobpm/engine-wasm/nanobpmn_engine_bg.wasm');
+  const wasmPath = resolveWasmPath();
   initSync({ module: readFileSync(wasmPath) });
   // Reference the default export so bundlers keep it; harmless at runtime.
   void initSyncDefault;

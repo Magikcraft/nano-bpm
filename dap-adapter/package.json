@@ -1,7 +1,7 @@
 {
   "name": "@nanobpm/dap-adapter",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "Debug Adapter Protocol adapter driving the nanobpmn wasm engine's stepping/breakpoint surface (issue #651).",
   "license": "Apache-2.0",
@@ -19,6 +19,10 @@
     "./sourceMap": {
       "types": "./dist/sourceMap.d.ts",
       "default": "./dist/sourceMap.js"
+    },
+    "./session": {
+      "types": "./dist/session.d.ts",
+      "default": "./dist/session.js"
     }
   },
   "files": [
