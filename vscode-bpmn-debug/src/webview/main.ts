@@ -4,6 +4,7 @@
 //! toggle-breakpoint message back to the extension host.
 
 import NavigatedViewer from 'bpmn-js/lib/NavigatedViewer';
+import { layoutProcess } from 'bpmn-auto-layout';
 // esbuild bundles these as text (see build.mjs) so we can inject them into the
 // webview iframe, which cannot load diagram-js's assets by URL under the CSP.
 import diagramCss from 'bpmn-js/dist/assets/diagram-js.css';
@@ -59,7 +60,8 @@ function safe(fn: () => void): void {
 }
 
 async function load(xml: string): Promise<void> {
-  await viewer.importXML(xml);
+  const renderableXml = hasBpmnDiagram(xml) ? xml : await layoutProcess(xml);
+  await viewer.importXML(renderableXml);
   const canvas = viewer.get<Canvas>('canvas');
   canvas.zoom('fit-viewport');
   // Reset the highlight state for the freshly loaded diagram.
@@ -67,6 +69,10 @@ async function load(xml: string): Promise<void> {
   breakpointHighlight = [];
   activeRef.ids = activeHighlight;
   bpRef.ids = breakpointHighlight;
+}
+
+function hasBpmnDiagram(xml: string): boolean {
+  return /<[^<\s:]+:BPMNDiagram\b|<BPMNDiagram\b/.test(xml);
 }
 
 // Register the click handler once: the viewer (and its eventBus) persists across

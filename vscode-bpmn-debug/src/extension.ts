@@ -14,6 +14,7 @@
 import { readFileSync } from 'node:fs';
 
 import { ACTIVE_ELEMENTS_EVENT, type ActiveElementsBody } from '@nanobpm/dap-adapter/events';
+import { NanobpmnDebugSession } from '@nanobpm/dap-adapter/session';
 import { BpmnSourceMap } from '@nanobpm/dap-adapter/sourceMap';
 import * as vscode from 'vscode';
 
@@ -30,6 +31,14 @@ let current: DiagramView | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
+    vscode.debug.registerDebugAdapterDescriptorFactory('nanobpmn', {
+      createDebugAdapterDescriptor() {
+        return new vscode.DebugAdapterInlineImplementation(new NanobpmnDebugSession());
+      },
+    }),
+  );
+
+  context.subscriptions.push(
     vscode.commands.registerCommand('nanobpmn.showDiagram', () => {
       const session = vscode.debug.activeDebugSession;
       if (session?.type === 'nanobpmn') {
@@ -37,6 +46,12 @@ export function activate(context: vscode.ExtensionContext): void {
       } else {
         void vscode.window.showInformationMessage('No active nanobpmn debug session.');
       }
+    }),
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('nanobpmn.createDebugSample', () => {
+      void createDebugSample();
     }),
   );
 
@@ -177,6 +192,57 @@ function post(message: HostToWebview): void {
   void current?.panel.webview.postMessage(message);
 }
 
+async function createDebugSample(): Promise<void> {
+  const folder = vscode.workspace.workspaceFolders?.[0];
+  if (folder === undefined) {
+    void vscode.window.showErrorMessage('nanobpmn: open a workspace folder before creating a sample.');
+    return;
+  }
+
+  const bpmnUri = vscode.Uri.joinPath(folder.uri, 'nanobpmn-debug-sample.bpmn');
+  const vscodeDir = vscode.Uri.joinPath(folder.uri, '.vscode');
+  const launchUri = vscode.Uri.joinPath(vscodeDir, 'launch.json');
+  const encoder = new TextEncoder();
+  const created: string[] = [];
+  const skipped: string[] = [];
+
+  if (await exists(bpmnUri)) {
+    skipped.push(vscode.workspace.asRelativePath(bpmnUri));
+  } else {
+    await vscode.workspace.fs.writeFile(bpmnUri, encoder.encode(SAMPLE_BPMN));
+    created.push(vscode.workspace.asRelativePath(bpmnUri));
+  }
+
+  await vscode.workspace.fs.createDirectory(vscodeDir);
+  if (await exists(launchUri)) {
+    skipped.push(vscode.workspace.asRelativePath(launchUri));
+  } else {
+    await vscode.workspace.fs.writeFile(launchUri, encoder.encode(SAMPLE_LAUNCH_JSON));
+    created.push(vscode.workspace.asRelativePath(launchUri));
+  }
+
+  if (created.length > 0) {
+    void vscode.window.showInformationMessage(`nanobpmn: created ${created.join(', ')}.`);
+  }
+  if (skipped.length > 0) {
+    void vscode.window.showInformationMessage(
+      `nanobpmn: left existing file(s) unchanged: ${skipped.join(', ')}.`,
+    );
+  }
+
+  const doc = await vscode.workspace.openTextDocument(bpmnUri);
+  await vscode.window.showTextDocument(doc);
+}
+
+async function exists(uri: vscode.Uri): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(uri);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isActiveElementsEvent(
   message: unknown,
 ): message is { type: 'event'; event: string; body: ActiveElementsBody } {
@@ -215,3 +281,38 @@ function renderHtml(webview: vscode.Webview, context: vscode.ExtensionContext): 
 </body>
 </html>`;
 }
+
+const SAMPLE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+  id="Definitions_sample" targetNamespace="https://nanobpm.dev/debug-sample">
+  <bpmn:process id="debugSample" isExecutable="true">
+    <bpmn:startEvent id="start" name="Start">
+      <bpmn:outgoing>flow_start_task</bpmn:outgoing>
+    </bpmn:startEvent>
+    <bpmn:serviceTask id="serviceTask" name="Do work">
+      <bpmn:incoming>flow_start_task</bpmn:incoming>
+      <bpmn:outgoing>flow_task_end</bpmn:outgoing>
+    </bpmn:serviceTask>
+    <bpmn:endEvent id="end" name="Done">
+      <bpmn:incoming>flow_task_end</bpmn:incoming>
+    </bpmn:endEvent>
+    <bpmn:sequenceFlow id="flow_start_task" sourceRef="start" targetRef="serviceTask" />
+    <bpmn:sequenceFlow id="flow_task_end" sourceRef="serviceTask" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>
+`;
+
+const SAMPLE_LAUNCH_JSON = `{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "nanobpmn",
+      "request": "launch",
+      "name": "Debug sample BPMN process",
+      "bpmn": "\${workspaceFolder}/nanobpmn-debug-sample.bpmn",
+      "processId": "debugSample",
+      "variables": {}
+    }
+  ]
+}
+`;
