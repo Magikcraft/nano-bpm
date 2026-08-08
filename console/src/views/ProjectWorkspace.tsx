@@ -1369,7 +1369,7 @@ function TreeNode({
             e.stopPropagation();
             onDelete(node.path);
           }}
-          className="hidden rounded px-1 text-xs text-fg-faint hover:text-danger group-hover:block"
+          className="hidden rounded px-1 text-xs text-fg-faint hover:text-danger group-hover:block [@media(hover:none)]:block"
         >
           ✕
         </button>
