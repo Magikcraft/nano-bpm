@@ -8,7 +8,6 @@ import {
   type RunState,
 } from "../gen";
 import { projectLogs, type ProjectLogLine } from "../lib/api";
-import { useTheme } from "../theme/ThemeProvider";
 import { cssVar, TOKEN_KEYS } from "../theme/themes";
 
 // The console-integrated control surface for a supervised app (ADR 0057, issue
@@ -131,32 +130,32 @@ export default function AppView() {
 
   // Theme bridge for the embedded app. The app renders in a sandboxed,
   // cross-document iframe, so the console's `--nano-*` custom properties and
-  // `data-appearance` don't cascade in. We read the *resolved* token values off
-  // <html> (which already carries built-in-palette values + any theme-pack /
-  // imported overrides applied by ThemeProvider) and postMessage them to the
-  // frame. Same-origin proxy (posture A), so we target the console origin. The
-  // Urban runtime mirrors these onto its own :root (see @nanobpm/urban).
-  const theme = useTheme();
-  const { appearance } = theme;
+  // `data-appearance` don't cascade in. We read the *resolved* token values and
+  // appearance straight off <html> — which ThemeProvider keeps current with the
+  // built-in palette plus any theme-pack / imported overrides — and postMessage
+  // them to the frame. Same-origin proxy (posture A), so we target the console
+  // origin. The Urban runtime mirrors these onto its own :root (@nanobpm/urban).
   const postTheme = useCallback(() => {
     const frame = iframeRef.current?.contentWindow;
     if (!frame) return;
-    const computed = getComputedStyle(document.documentElement);
+    const html = document.documentElement;
+    const computed = getComputedStyle(html);
     const vars: Record<string, string> = {};
     for (const key of TOKEN_KEYS) {
       const prop = cssVar(key);
       const value = computed.getPropertyValue(prop).trim();
       if (value) vars[prop] = value;
     }
+    const appearance = html.dataset.appearance === "light" ? "light" : "dark";
     frame.postMessage(
       { type: "nano-theme", appearance, vars },
       window.location.origin,
     );
-  }, [appearance]);
+  }, []);
 
   // The app announces `nano-app-ready` once its runtime installs the listener;
-  // reply with the current theme. Guard on the framing iframe's own window so a
-  // message from any other frame can't trigger a post to the wrong target.
+  // reply with the current theme. Guard on the framing iframe's own window and
+  // our own origin so a message from any other frame can't drive a post.
   useEffect(() => {
     const onMessage = (ev: MessageEvent) => {
       if (
@@ -171,11 +170,20 @@ export default function AppView() {
     return () => window.removeEventListener("message", onMessage);
   }, [postTheme]);
 
-  // Re-push whenever the console theme changes (appearance or the active
-  // selection, which covers theme-pack / imported-token swaps).
+  // Re-push whenever the resolved theme on <html> changes — its inline token
+  // overrides (theme packs / imports, which ThemeProvider may apply *async* as
+  // extension packs load, without any change to the user's selection) or
+  // `data-appearance`. Observing the DOM (as TerminalPane does) is robust to
+  // React effect ordering: ThemeProvider writes the tokens onto <html> and we
+  // read them straight back, so we never post a stale palette.
   useEffect(() => {
-    postTheme();
-  }, [postTheme, selection]);
+    const obs = new MutationObserver(() => postTheme());
+    obs.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["style", "data-appearance"],
+    });
+    return () => obs.disconnect();
+  }, [postTheme]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
