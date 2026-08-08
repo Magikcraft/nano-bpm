@@ -166,7 +166,9 @@ impl TestEngine {
     ///  { "kind": "everyStep" }]
     /// ```
     /// Returns the debug state JSON (see [`TestEngine::debug_state`]). Starting a
-    /// new debug run replaces any previous session.
+    /// new debug run replaces any previous *finished* session; it is rejected
+    /// while a run is still paused (`debugIsPaused`) — resume or clear that run
+    /// first, so its intermediate state isn't stranded live in the engine.
     #[wasm_bindgen(js_name = debugCreateInstance)]
     pub fn debug_create_instance(
         &mut self,
@@ -174,6 +176,7 @@ impl TestEngine {
         variables_json: &str,
         breakpoints_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let variables = parse_vars(variables_json)?;
         let breakpoints = parse_breakpoints(breakpoints_json)?;
         // Start fresh: nothing of this session has been folded into `log` yet.
@@ -731,7 +734,7 @@ impl TestEngine {
     fn check_not_paused(&self) -> Result<(), &'static str> {
         if self.debug_is_paused() {
             return Err(
-                "cannot mutate the engine while a debug run is paused; call debugResume, debugStep, or debugClear first",
+                "cannot mutate the engine while a debug run is paused; call debugResume, debugStep, debugClear, or reset first",
             );
         }
         Ok(())

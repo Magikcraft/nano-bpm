@@ -416,7 +416,9 @@ export class TestEngine {
      *  { "kind": "everyStep" }]
      * ```
      * Returns the debug state JSON (see [`TestEngine::debug_state`]). Starting a
-     * new debug run replaces any previous session.
+     * new debug run replaces any previous *finished* session; it is rejected
+     * while a run is still paused (`debugIsPaused`) — resume or clear that run
+     * first, so its intermediate state isn't stranded live in the engine.
      * @param {string} process_id
      * @param {string} variables_json
      * @param {string} breakpoints_json
