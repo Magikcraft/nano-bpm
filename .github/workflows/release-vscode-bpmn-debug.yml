@@ -3,13 +3,10 @@ name: release-vscode-bpmn-debug
 # Triggered by tags of the form `vscode-ext-v0.1.0`. Packages and publishes the
 # nanobpm BPMN debugger extension to the VS Code Marketplace and Open VSX.
 #
-# Marketplace tokens come from Vault via GitHub OIDC. Maintainers must provision:
-#   - Repository variable: VAULT_ADDR
-#   - Vault JWT role: nano-bpm-github-actions
-#   - Vault path: secret/data/nano-bpm/marketplace
-#   - Secret names at that path:
-#       VSCE_PAT   — Azure DevOps PAT with VS Code Marketplace publish scope
-#       OVSX_TOKEN — Open VSX publish token
+# Marketplace tokens come from GitHub Actions repository secrets (the same
+# pattern the other release workflows in this repo use). Maintainers must add:
+#   - VSCE_PAT   — Azure DevOps PAT with VS Code Marketplace publish scope
+#   - OVSX_TOKEN — Open VSX publish token
 #
 # The VSIX is self-contained: esbuild bundles the DAP adapter and the build copies
 # the wasm bytes into dist/, so packaging uses --no-dependencies.
@@ -25,7 +22,6 @@ jobs:
     name: Publish vscode-bpmn-debug
     runs-on: ubuntu-24.04
     permissions:
-      id-token: write
       contents: write
     steps:
       - uses: actions/checkout@v5
@@ -62,17 +58,6 @@ jobs:
       - name: Install marketplace CLIs
         run: npm install -g @vscode/vsce ovsx
 
-      - name: Import Marketplace tokens from Vault
-        uses: hashicorp/vault-action@v3
-        with:
-          url: ${{ vars.VAULT_ADDR }}
-          method: jwt
-          path: jwt
-          role: nano-bpm-github-actions
-          secrets: |
-            secret/data/nano-bpm/marketplace VSCE_PAT | VSCE_PAT ;
-            secret/data/nano-bpm/marketplace OVSX_TOKEN | OVSX_TOKEN
-
       - name: Package VSIX
         working-directory: vscode-bpmn-debug
         run: vsce package --no-dependencies
@@ -80,13 +65,13 @@ jobs:
       - name: Publish to VS Code Marketplace
         working-directory: vscode-bpmn-debug
         env:
-          VSCE_PAT: ${{ env.VSCE_PAT }}
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
         run: vsce publish --packagePath *.vsix -p "$VSCE_PAT"
 
       - name: Publish to Open VSX
         working-directory: vscode-bpmn-debug
         env:
-          OVSX_TOKEN: ${{ env.OVSX_TOKEN }}
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
         run: ovsx publish *.vsix -p "$OVSX_TOKEN"
 
       - name: Attach VSIX to GitHub Release
