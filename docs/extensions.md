@@ -18,7 +18,7 @@ This guide covers three things:
 The **authoritative manifest schema** is the Rust source
 [`server/src/console/extensions.rs`](../server/src/console/extensions.rs) — Nano
 BPM is the single source of truth; packs target it. First-party packs live in the
-[`jwulf/nano-ide`](https://github.com/jwulf/nano-ide) repo (see
+[`nanobpm/nano-ide`](https://github.com/nanobpm/nano-ide) repo (see
 [`docs/nano-repositories.md`](nano-repositories.md)).
 
 ---

@@ -755,7 +755,7 @@ export default function App() {
           </button>
 
           <a
-            href="https://github.com/jwulf/nano-ide/issues/new/choose"
+            href="https://github.com/nanobpm/nano-ide/issues/new/choose"
             target="_blank"
             rel="noopener noreferrer"
             className={`mx-3 ${railItemClass(false, railCollapsed)}`}

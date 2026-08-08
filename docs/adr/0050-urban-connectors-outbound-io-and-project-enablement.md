@@ -26,7 +26,7 @@ until completed and re-activated on crash, so it *is* the outbound outbox),
 ADR reuses to launch a worker),
 `clients/node-stream/nanobpm-workspace/.nanobpm/worker-sdk.ts` (`defineWorker` — the long-lived
 job-worker SDK a connector worker is written against),
-`nano-ide` `packages/connector-slack` (jwulf/nano-ide#48 — the first connector, the proving artifact
+`nano-ide` `packages/connector-slack` (nanobpm/nano-ide#48 — the first connector, the proving artifact
 for this ADR).
 
 ## Context
@@ -69,7 +69,7 @@ A **connector** is an ADR 0007 pack that may contribute, in one `nano-ide.ext.js
 - **`workers[]`** — the outbound runtime, *new here*: one long-lived job worker per `taskType`;
 - (references to) `connections[]` — the shared credential/endpoint, defined once (ADR 0025 §1).
 
-The Slack connector (jwulf/nano-ide#48) contributes all of the inbound source, the *Send Slack
+The Slack connector (nanobpm/nano-ide#48) contributes all of the inbound source, the *Send Slack
 Message* component, and its backing worker — the reference implementation for this ADR.
 
 ### 2. The outbound seam — `taskDefinition:type` == worker `type`
@@ -120,7 +120,7 @@ Per-task spawn is explicitly rejected: it would pay cold-start per job, discard 
 `maxParallelJobs` backpressure the SDK already implements, and duplicate the supervisor.
 
 > **Note (2026-08-04) — in-process hosting for now.** The `@nanobpm/urban` Node runtime
-> (jwulf/nano-ide) currently hosts connector workers **in-process** — they run inside the App
+> (nanobpm/nano-ide) currently hosts connector workers **in-process** — they run inside the App
 > process via an ESM `module.register` hook that aliases `@nanobpm/worker` to an in-process shim,
 > not as supervised child processes. This diverges from the out-of-process supervision described
 > above and **gives up process isolation** (a connector fault can affect the App process). The
@@ -189,7 +189,7 @@ is an authoring-time error with a pointer, not a silent runtime no-op. (The `nan
 
 1. **worker-contract** — `WorkerSpec` + `workers[]` in `ext-types`; the host `ExtManifest.workers`
    mirror + `all_workers()` / `worker_driver(type)` accessors in `extensions.rs` (symmetric to
-   `all_trigger_sources` / `trigger_driver`). *(pack side landed in jwulf/nano-ide#48.)*
+   `all_trigger_sources` / `trigger_driver`). *(pack side landed in nanobpm/nano-ide#48.)*
 2. **worker-supervision** — launch + supervise enabled workers via a `run_pack_worker` modeled on
    `run_pack_driver`; env injection (`NANOBPMN_BASE_URL` / `NANOBPMN_WORKER_NAME` + `configFields`);
    wired into the App run loop beside the trigger source supervisor (`projects.rs`).

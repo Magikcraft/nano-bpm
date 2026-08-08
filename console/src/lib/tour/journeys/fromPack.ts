@@ -5,7 +5,7 @@
 // deliberately free-form (`Extension.tours` is `Array<{[k: string]: unknown}>`,
 // mirroring how `components` is carried) precisely so the step union is not typed
 // in three places — Rust, OpenAPI, and here. The host is a carrier; this module is
-// the validator; `jwulf/nano-ide`'s `npm run validate` is the same rule set applied
+// the validator; `nanobpm/nano-ide`'s `npm run validate` is the same rule set applied
 // at authoring time so a pack author gets told at publish rather than by a step
 // vanishing in someone else's browser.
 //

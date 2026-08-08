@@ -4,13 +4,13 @@ Status: **Proposed.** The authoring façade is built and published as the
 `@nanobpm/workflow` package: both surfaces (`defineWorkflow` imperative
 replay + `defineFlow` declarative with signals), a `WorkflowClient` and generic
 `Worker` over REST v2, unit + integration tests (crash-resume + signal), a CI gate, and
-OIDC publishing. The package **now lives in `jwulf/nano-ide`** (`packages/workflow`),
+OIDC publishing. The package **now lives in `nanobpm/nano-ide`** (`packages/workflow`),
 not in this repo — see the relocation update below.
 Date: 2026-07-29 (relocated 2026-08-01).
 
 > **Relocation update (2026-08-01) — `@nanobpm/workflow` moved to the nano-ide repo.**
 > `@nanobpm/workflow` is a self-contained REST v2 client SDK with no coupling to the engine,
-> server, or console; it lived here by historical accident. It has moved to `jwulf/nano-ide`
+> server, or console; it lived here by historical accident. It has moved to `nanobpm/nano-ide`
 > (`packages/workflow`), alongside the app-building stack, and is published from there via that
 > repo's OIDC release flow. The `workflow/` source, `release-workflow-npm.yml`,
 > `scripts/workflow-release.mjs`, and `docs/releasing-workflow-npm.md` are removed from this repo.

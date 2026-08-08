@@ -6,7 +6,7 @@ is, where each piece lives, and how they depend on one another.
 | Repo | Product name | Role |
 | --- | --- | --- |
 | [`Magikcraft/nano-bpm`](https://github.com/Magikcraft/nano-bpm) | **Nano BPM** | The core product: engine, gateway server, web console, embeddable engine libraries (`nano-bernd`, `engine-wasm`), and schemas. The source of truth. |
-| [`jwulf/nano-ide`](https://github.com/jwulf/nano-ide) | **Nano IDE** | Console extension packs (languages, app templates, examples, themes, triggers/connectors) **and** the published code-first stack: the Urban app runtime (`@nanobpm/urban`), the `create-urban-app` scaffolder, and the code-first workflow SDK (`@nanobpm/workflow`). Published to npm. |
+| [`nanobpm/nano-ide`](https://github.com/nanobpm/nano-ide) | **Nano IDE** | Console extension packs (languages, app templates, examples, themes, triggers/connectors) **and** the published code-first stack: the Urban app runtime (`@nanobpm/urban`), the `create-urban-app` scaffolder, and the code-first workflow SDK (`@nanobpm/workflow`). Published to npm. |
 | [`jwulf/nano-sdk-js`](https://github.com/jwulf/nano-sdk-js) | **Nano SDK (JS)** | `@nanobpm/nano-sdk` — the **engine-transport spine**: a drop-in replacement for `@camunda8/orchestration-cluster-api` that transparently upgrades the hot paths to Nano's **Falcon** protocol (and offers an in-process `embedded` transport). Cross-runtime (Node, Deno, Bun). Published to npm. |
 | [`jwulf/c8ctl-plugin-nano`](https://github.com/jwulf/c8ctl-plugin-nano) | **c8ctl Nano plugin** | A `c8ctl` CLI plugin that installs, runs, and manages a local Nano BPM cluster; ships the prebuilt gateway binary; and turns CLI agents into job workers. |
 | [`nanobpm/bojtos`](https://github.com/nanobpm/bojtos) | **Bojtos** | The publishable in-browser BPMN demo framework: `@nanobpm/bojtos-kit` (framework-agnostic) and `@nanobpm/bojtos-react` (React bindings), built on `@nanobpm/engine-wasm`. Extracted from nano-bpm (ADR 0043); public, published to npm. |
@@ -54,7 +54,7 @@ Where each piece lives:
 | `spec/`, `spec-app/`, `spec-console/` | JSON Schemas / OpenAPI specs, published to `nanobpm.io`. |
 
 > **Note.** The code-first workflow SDK (`@nanobpm/workflow`) originated here under
-> `workflow/` but has been **relocated to `jwulf/nano-ide`** (`packages/workflow`)
+> `workflow/` but has been **relocated to `nanobpm/nano-ide`** (`packages/workflow`)
 > — it is a self-contained engine client with no coupling to the engine, server, or
 > console, so it now lives alongside the rest of the code-first stack and publishes
 > from there (ADR 0044 relocation note; nano-ide ADR 0054/0055).
@@ -78,7 +78,7 @@ A further npm train publishes on its own cadence from this repo:
 
 ---
 
-## 2. Nano IDE — console packs + the code-first stack (`jwulf/nano-ide`)
+## 2. Nano IDE — console packs + the code-first stack (`nanobpm/nano-ide`)
 
 A monorepo of npm packages under `packages/*`. It began as **extension packs**
 for the Nano BPM console's RAD IDE, and has grown to also host the **published
