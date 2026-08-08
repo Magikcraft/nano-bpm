@@ -12,7 +12,14 @@ import {
   type TemplateOption,
   type UpdatePlan,
 } from "../gen";
-import { Button, Card, EmptyState, Input, PageHeader } from "../components/ui";
+import {
+  Button,
+  Card,
+  EmptyState,
+  Input,
+  PageHeader,
+  Spinner,
+} from "../components/ui";
 import JourneyPicker from "../components/JourneyPicker";
 import DirectoryPicker from "../components/DirectoryPicker";
 import { isLocalhost } from "../lib/api";
@@ -79,6 +86,10 @@ export default function Projects() {
     plan: UpdatePlan;
   } | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
+  // The project whose update plan is currently being fetched (dry run). Drives
+  // an inline spinner on that card so the user sees the click landed before the
+  // review modal opens — the preview round-trips to npm and can take a moment.
+  const [previewName, setPreviewName] = useState<string | null>(null);
   // "Point your agent here" affordance (ADR 0051): reveals the /agent brief URL
   // an external coding agent can be aimed at to author an app and link it in.
   const [agentHint, setAgentHint] = useState(false);
@@ -252,6 +263,7 @@ export default function Projects() {
   /// review modal. Nothing is written until the user confirms.
   const previewUpdate = async (project: ProjectSummary) => {
     setUpdateBusy(true);
+    setPreviewName(project.name);
     try {
       const plan = (
         await updateProjectFromTemplate({
@@ -265,6 +277,7 @@ export default function Projects() {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setUpdateBusy(false);
+      setPreviewName(null);
     }
   };
 
@@ -666,10 +679,12 @@ export default function Projects() {
               onDelete={() => void remove(p)}
               onRename={() => void rename(p)}
               onUpdate={
-                p.updateAvailable && p.source !== "path" && !updateBusy
+                p.updateAvailable && p.source !== "path"
                   ? () => void previewUpdate(p)
                   : undefined
               }
+              updating={previewName === p.name}
+              updateDisabled={updateBusy}
             />
           ))}
         </div>
@@ -794,6 +809,8 @@ function ProjectTile({
   onDelete,
   onRename,
   onUpdate,
+  updating = false,
+  updateDisabled = false,
 }: {
   project: ProjectSummary;
   lang?: LangMeta;
@@ -801,20 +818,41 @@ function ProjectTile({
   onDelete: () => void;
   onRename: () => void;
   onUpdate?: () => void;
+  updating?: boolean;
+  updateDisabled?: boolean;
 }) {
   const title = project.displayName ?? project.name;
   return (
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
-      <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex focus-within:flex [@media(hover:none)]:flex">
+      <div
+        className={`absolute right-3 top-3 gap-1 group-hover:flex group-focus-within:flex [@media(hover:none)]:flex ${updating ? "flex" : "hidden"}`}
+      >
         {onUpdate && (
           <button
             type="button"
             onClick={onUpdate}
-            title={`Update from template${project.latestVersion ? ` (v${project.latestVersion} available)` : ""}`}
-            aria-label={`Update ${title} from template`}
-            className="rounded px-1.5 py-0.5 text-xs text-accent hover:bg-accent/10"
+            disabled={updateDisabled}
+            title={
+              updating
+                ? "Checking for template changes…"
+                : `Update from template${project.latestVersion ? ` (v${project.latestVersion} available)` : ""}`
+            }
+            aria-label={
+              updating
+                ? `Checking ${title} for template changes`
+                : `Update ${title} from template`
+            }
+            aria-busy={updating}
+            className="inline-flex items-center rounded px-1.5 py-0.5 text-xs text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            ↑
+            {updating ? (
+              <>
+                <Spinner />
+                <span className="sr-only">Checking for template changes…</span>
+              </>
+            ) : (
+              "↑"
+            )}
           </button>
         )}
         <button
