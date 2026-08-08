@@ -4,7 +4,7 @@ Status: Accepted
 Date: 2026-08-01
 Extends: ADR 0054 (one code-first stack), ADR 0053 (derivation is a shared library), ADR 0052 (decoupled Urban runtime)
 Supersedes: the "`@nanobpm/workflow` is dependency-free / pure REST v2" invariant (ADR 0044)
-Repo: jwulf/nano-ide (`packages/workflow`, `packages/urban`, `packages/create-urban-app`)
+Repo: nanobpm/nano-ide (`packages/workflow`, `packages/urban`, `packages/create-urban-app`)
 
 ## Context
 

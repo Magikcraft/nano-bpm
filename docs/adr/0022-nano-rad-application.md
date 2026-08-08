@@ -10,7 +10,7 @@ ADR 0009 (`0009-gui-application-projects.md`, the served-UI binary this ADR gene
 ADR 0011 (`0011-editable-model-workbench.md`, human authoring surfaces),
 ADR 0021 (`0021-process-sla-as-a-first-class-abstraction.md`),
 `console/src/components/{BpmnModeler,DmnModeler,FormEditor}.tsx` (the three model editors
-that already exist), `packages/app-deno-gui/` in `jwulf/nano-ide` (the served-UI pack this
+that already exist), `packages/app-deno-gui/` in `nanobpm/nano-ide` (the served-UI pack this
 ADR grows into an App), `server/src/console/projects.rs` (scaffold + run/compile supervisor),
 `engine-core/src/bpmn.rs` (`is_adhoc` — today's collapse-ad-hoc-to-one-job behavior, the §E.1
 parity gap), and — for Camunda agentic switch-over parity — `~/workspace/camunda/zeebe`

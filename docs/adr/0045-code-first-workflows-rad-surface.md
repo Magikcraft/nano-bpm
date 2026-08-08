@@ -43,7 +43,7 @@ first-class RAD authoring surface.
 
 Two questions this ADR must answer explicitly, because they came up directly:
 
-1. **Where does the SDK live** — nano-bpm or the `jwulf/nano-ide` monorepo (where the IDE packs
+1. **Where does the SDK live** — nano-bpm or the `nanobpm/nano-ide` monorepo (where the IDE packs
    live)?
 2. **How is it surfaced in the RAD** so a user can develop with it end-to-end (scaffold → edit →
    run → see the model)?

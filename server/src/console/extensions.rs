@@ -2073,8 +2073,8 @@ mod tests {
     fn normalize_repo_url_rewrites_git_forms() {
         let n = |s: &str| normalize_repo_url(s);
         assert_eq!(
-            n("git+https://github.com/jwulf/nano-ide.git").as_deref(),
-            Some("https://github.com/jwulf/nano-ide")
+            n("git+https://github.com/nanobpm/nano-ide.git").as_deref(),
+            Some("https://github.com/nanobpm/nano-ide")
         );
         assert_eq!(
             n("git://github.com/owner/repo.git").as_deref(),

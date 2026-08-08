@@ -152,7 +152,7 @@ PR — by then the duplicate work already happened.
   comment, with what you checked, then claim it yourself. Never silently
   double-claim — if the evidence is ambiguous, ask the user rather than risk two
   agents in one file.
-- **Cross-repo slices claim in the hub.** Work that lands in `jwulf/nano-ide`,
+- **Cross-repo slices claim in the hub.** Work that lands in `nanobpm/nano-ide`,
   `jwulf/c8ctl-plugin-nano` or a demo app is still claimed on its
   `Magikcraft/nano-bpm` issue, and the resulting PRs link back to it — one place
   to look, whatever repo the diff ends up in.

@@ -310,7 +310,7 @@ test("registerPackTours is idempotent across context refreshes", () => {
 
 /**
  * The MQTT pilot tour, copied VERBATIM from `trigger-mqtt`'s manifest in
- * jwulf/nano-ide (PR #49).
+ * nanobpm/nano-ide (PR #49).
  *
  * Synthetic fixtures prove the rules; this proves the contract holds for the data a
  * real pack actually ships. It is a copy rather than a read of the sibling checkout
