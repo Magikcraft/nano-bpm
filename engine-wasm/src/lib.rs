@@ -234,10 +234,24 @@ impl TestEngine {
         self.debug.as_ref().is_some_and(DebugSession::is_paused)
     }
 
-    /// Discard the active debug session (the engine keeps whatever state the run
-    /// has already produced).
+    /// Stop debugging, keeping the state the run produced. If the run is paused
+    /// mid-command, that in-flight command is first **finished normally** (its
+    /// breakpoints are cleared and it is resumed once) so the engine lands on the
+    /// same run-to-completion (RTC) quiescent state a plain command would produce
+    /// — never a partial, non-RTC intermediate one that later mutators could
+    /// build on (the hole [`TestEngine::guard_paused`] exists to prevent). To
+    /// discard the run's state entirely instead, use [`TestEngine::reset`].
     #[wasm_bindgen(js_name = debugClear)]
     pub fn debug_clear(&mut self) {
+        if let Some(mut session) = self.debug.take() {
+            if session.is_paused() {
+                // Drain the in-flight command to its natural RTC quiescence.
+                session.set_breakpoints(Vec::new());
+                self.engine.debug_resume(&mut session);
+                self.debug = Some(session);
+                self.fold_debug_delta();
+            }
+        }
         self.debug = None;
         self.debug_folded = 0;
         self.debug_now = 0;
@@ -2207,12 +2221,22 @@ mod tests {
 
     /// While a debug run is paused mid-command the engine holds an intermediate
     /// state; other mutating calls must be rejected so they can't build on a
-    /// state a normal RTC engine can't represent. `debugClear` lifts the block.
-    /// (Asserted against `check_not_paused`, the `&str`-typed core every mutator
-    /// funnels through via `guard_paused` — the `JsValue` wrapper aborts off the
-    /// wasm target, so the mutators' own reject paths aren't native-testable.)
+    /// state a normal RTC engine can't represent. `debugClear` lifts the block by
+    /// *finishing* the in-flight command (RTC parity), not by stranding the
+    /// partial state. (Asserted against `check_not_paused`, the `&str`-typed core
+    /// every mutator funnels through via `guard_paused` — the `JsValue` wrapper
+    /// aborts off the wasm target, so the mutators' own reject paths aren't
+    /// native-testable.)
     #[test]
     fn paused_debug_run_rejects_other_mutators() {
+        // Reference: the RTC state a plain createInstance leaves (parked on t1).
+        let plain = {
+            let mut eng = TestEngine::new();
+            eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
+            eng.create_instance("p", "{}").unwrap();
+            parse(&eng.events().unwrap())
+        };
+
         let mut eng = TestEngine::new();
         eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
         eng.debug_create_instance("p", "{}", r#"[{"kind":"elementActivated","id":"s"}]"#)
@@ -2226,9 +2250,15 @@ mod tests {
             "mutators are rejected while a debug run is paused"
         );
 
-        // Clearing the run lifts the block.
+        // Clearing while paused finishes the command (RTC parity) and lifts the block.
         eng.debug_clear();
         assert!(!eng.debug_is_paused());
+        assert_eq!(
+            plain,
+            parse(&eng.events().unwrap()),
+            "debugClear drains the in-flight command to the plain-createInstance RTC state, \
+             not a stranded partial one"
+        );
         assert!(
             eng.check_not_paused().is_ok(),
             "mutators allowed again once the debug run is cleared"
