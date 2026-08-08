@@ -163,3 +163,76 @@ fn breakpoint_pauses_before_the_job_is_parked() {
     assert_eq!(engine.pending_jobs().len(), 1, "parked on the reserve job");
     assert_eq!(engine.pending_jobs()[0].job_type, "inventory");
 }
+
+/// A `ProcessCompleted` breakpoint must actually pause the debug run at the
+/// instance-completion event. This guards issue #647: completion is emitted by the
+/// engine's terminal tail, which historically ran *after* `run_with` returned — so
+/// the stepping driver never observed it and the breakpoint was dead. Folding
+/// completion into the fixpoint drain point makes it observable. Uses a
+/// wait-state-free process (`start -> end`) that runs to completion within the
+/// single create command.
+#[test]
+fn process_completed_breakpoint_pauses_at_completion() {
+    fn straight_through() -> nanobpmn_engine_core::ProcessDefinition {
+        ProcessBuilder::new("straight")
+            .start_event("start")
+            .end_event("end")
+            .connect("start", "end")
+            .build()
+            .expect("valid process")
+    }
+
+    let atomic = {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(straight_through()))
+            .expect("deploy");
+        engine
+            .apply_command(Command::create_instance("straight"))
+            .expect("create")
+    };
+    assert!(
+        atomic
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceCompleted { .. })),
+        "sanity: the wait-state-free process completes within the create command"
+    );
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(straight_through()))
+        .expect("deploy");
+    let mut session = engine
+        .debug_command_at(
+            Command::create_instance("straight"),
+            0,
+            vec![BreakCondition::ProcessCompleted],
+        )
+        .expect("debug create");
+
+    assert!(
+        session.is_paused(),
+        "the ProcessCompleted breakpoint pauses the run at completion"
+    );
+    assert!(
+        matches!(
+            session.log().last(),
+            Some(Event::ProcessInstanceCompleted { .. })
+        ),
+        "paused exactly at the process-completion event"
+    );
+
+    // Resuming from the completion pause drains the (idempotent) tail and finishes,
+    // with the full log identical to the atomic command: completion is emitted
+    // exactly once (RTC parity holds across the folded completion step).
+    engine.debug_resume(&mut session);
+    assert!(
+        !session.is_paused(),
+        "resumed past completion to quiescence"
+    );
+    assert_eq!(
+        atomic,
+        session.into_log(),
+        "RTC parity: completion emitted exactly once across pause + resume"
+    );
+}

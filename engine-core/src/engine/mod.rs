@@ -846,17 +846,17 @@ impl Engine {
     ) -> Result<Vec<Event>, EngineError> {
         let (mut log, queue) = self.plan_command_at(command, now)?;
         self.run(&mut log, queue);
-        self.finish_command(&mut log);
+        self.finish_command(&log);
         Ok(log)
     }
 
     /// Post-drain tail shared by [`apply_command_at`](Self::apply_command_at) and
-    /// the debug entrypoints: completes any instance whose tokens have all
-    /// retired, then reaps a tombstoned-but-now-materialised instance (a
-    /// follower-only async-learner race). Runs after the queue has drained to
-    /// quiescence.
-    fn finish_command(&mut self, log: &mut Vec<Event>) {
-        self.complete_finished_instances(log);
+    /// the debug entrypoints. Instance completion now happens at the fixpoint
+    /// drain point inside [`run_with`](Self::run_with) (so a debug
+    /// `ProcessCompleted` breakpoint can observe it through the driver); the only
+    /// work left here is the follower-only tombstone reap, which is orthogonal to
+    /// completion. Runs after the queue has drained to quiescence.
+    fn finish_command(&mut self, log: &[Event]) {
         // Follower-only safety net: if a retirement digest raced ahead of an
         // instance's create on this replica (leader-durable async-learner lag), the
         // key was tombstoned; now that the create has materialized the instance,
@@ -2718,9 +2718,26 @@ impl Engine {
             // interrupting an activity, or spawning a non-interrupting token),
             // which enqueues more work — so this runs inside the same fixpoint loop.
             cursor = self.reevaluate_conditionals(log, &mut queue, cursor);
-            if queue.is_empty() {
-                return None;
+            if !queue.is_empty() {
+                continue;
             }
+            // Token quiescence. Complete any instance whose tokens have all
+            // retired — the terminal tail shared with `apply_command_at`, folded
+            // into the loop (rather than run post-return in `finish_command`) so a
+            // `ProcessCompleted` breakpoint can observe the completion through the
+            // driver, exactly like every other event. Idempotent: a completed
+            // instance is no longer `Active`, so a resume pass and
+            // `finish_command`'s tombstone tail find nothing left to complete, and
+            // the production (`RunToCompletion`) log is byte-identical — completion
+            // is still emitted once, at the same quiescence point.
+            let completed_from = log.len();
+            self.complete_finished_instances(log);
+            if log.len() > completed_from {
+                if let Drive::Pause = driver.after_step(&log[completed_from..]) {
+                    return Some(Paused { queue, cursor });
+                }
+            }
+            return None;
         }
     }
 

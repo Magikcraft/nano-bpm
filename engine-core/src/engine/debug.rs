@@ -183,7 +183,7 @@ impl Engine {
         match result {
             Some(paused) => session.paused = Some(paused),
             None => {
-                self.finish_command(&mut session.log);
+                self.finish_command(&session.log);
                 session.paused = None;
             }
         }
