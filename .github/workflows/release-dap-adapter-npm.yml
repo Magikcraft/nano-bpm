@@ -1,0 +1,75 @@
+name: release-dap-adapter-npm
+
+# Triggered by tags of the form `dap-adapter-npm-v0.1.0`. Builds & publishes
+# @nanobpm/dap-adapter to the npm registry.
+#
+# Authentication is npm OIDC trusted publishing — NO NPM_TOKEN. @nanobpm/dap-adapter
+# must have a Trusted Publisher configured on npmjs.com pointing at this repo +
+# this workflow file. @nanobpm/engine-wasm >= 0.4.0 must be published first
+# (Magikcraft/nano-bpm#665 Task 0), because the release rewrites the local file:
+# dependency to the published engine-wasm semver range at pack/publish time.
+#
+# Note: npm provenance is intentionally disabled (NPM_CONFIG_PROVENANCE=false) —
+# provenance requires a public source repository, and nano-bpm is private.
+
+on:
+  push:
+    tags:
+      - 'dap-adapter-npm-v*'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    name: Publish @nanobpm/dap-adapter
+    runs-on: ubuntu-24.04
+    permissions:
+      # id-token: write lets npm exchange the GitHub OIDC token for a
+      # short-lived publish token (trusted publishing).
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      # npm OIDC trusted publishing needs npm CLI >= 11.5.1; pin a known-good
+      # version (explicit, not @latest) so the publish pipeline is reproducible.
+      - name: Upgrade npm (OIDC-capable)
+        run: npm install -g npm@11.5.1
+
+      - name: Install
+        working-directory: dap-adapter
+        run: npm ci
+
+      - name: Verify tag matches package version
+        working-directory: dap-adapter
+        run: |
+          set -euo pipefail
+          pkg_version=$(node -p "require('./package.json').version")
+          tag_version="${GITHUB_REF_NAME#dap-adapter-npm-v}"
+          if [[ "$pkg_version" != "$tag_version" ]]; then
+            echo "::error::tag $tag_version does not match package.json version $pkg_version"
+            exit 1
+          fi
+          echo "releasing @nanobpm/dap-adapter $pkg_version"
+
+      - name: Build
+        working-directory: dap-adapter
+        run: npm run build
+
+      - name: Rewrite local engine-wasm dependency for npm
+        working-directory: dap-adapter
+        run: |
+          set -euo pipefail
+          engine_version=$(node -p "require('../engine-wasm/pkg/package.json').version")
+          node -e "const fs=require('node:fs'); const pkg=JSON.parse(fs.readFileSync('package.json','utf8')); pkg.dependencies['@nanobpm/engine-wasm']='^${engine_version}'; fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');"
+          node -p "require('./package.json').dependencies['@nanobpm/engine-wasm']"
+
+      - name: Publish
+        working-directory: dap-adapter
+        env:
+          NPM_CONFIG_PROVENANCE: 'false'
+        run: npm publish --access public
