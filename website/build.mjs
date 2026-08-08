@@ -289,7 +289,7 @@ function homeHtml() {
 
 <section class="hero">
   <p class="eyebrow"><span class="arp">Advanced Research Prototype</span></p>
-  <h1>Agent Graph Orchestration<br>for the <span class="grad">Developer Workstation.</span></h1>
+  <h1>Agent Graph Orchestration<br><span class="hl-sub">for the <span class="grad">Developer Workstation.</span></span></h1>
   <p class="subhead">Graphs that run the loops.</p>
   <p class="lede">A RAAD — Rapid Agent Application Development — environment that runs on
   your machine. Compose coding agents, tools, and human approvals into durable workflows.
@@ -550,6 +550,7 @@ function homePage(title, body) {
     color: var(--sky); margin: 0 0 1rem;
   }
   .hero h1 { font-size: clamp(2.2rem, 5.6vw, 3.7rem); margin: 0 0 .6rem; font-weight: 700; }
+  .hero h1 .hl-sub { font-size: .68em; font-weight: 600; }
   .subhead { font-size: clamp(1.2rem, 2.8vw, 1.55rem); color: var(--ink); font-weight: 600; max-width: 40rem; margin: 0 auto 1.6rem; letter-spacing: -0.01em; }
   .grad {
     background: linear-gradient(90deg, var(--emerald), var(--sky));
