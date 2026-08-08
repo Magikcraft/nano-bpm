@@ -66,6 +66,7 @@ jobs:
     outputs:
       processos: ${{ steps.filter.outputs.processos }}
       console: ${{ steps.filter.outputs.console }}
+      dapadapter: ${{ steps.filter.outputs.dapadapter }}
     steps:
       - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
@@ -83,6 +84,9 @@ jobs:
             console:
               - 'console/**'
               - 'spec-console/**'
+              - '.github/workflows/ci.yml'
+            dapadapter:
+              - 'dap-adapter/**'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -294,6 +298,32 @@ jobs:
         # example can never drift from the real defineFlow API.
         run: npm ci && npm run typecheck
         working-directory: website/snippets
+
+  dap-adapter:
+    name: dap-adapter (typecheck + test)
+    runs-on: ubuntu-24.04
+    # Change-gated: only run when the adapter (or this workflow) changes. A
+    # skipped required check counts as success for branch protection (see the
+    # `changes` job), so unrelated PRs don't pay for a Node install + wasm run.
+    needs: changes
+    if: ${{ github.event_name == 'merge_group' || needs.changes.outputs.dapadapter == 'true' }}
+    defaults:
+      run:
+        working-directory: dap-adapter
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+      - name: Install (locked)
+        # The adapter depends on @nanobpm/engine-wasm via a committed file: path
+        # (engine-wasm/pkg), so no artifact download is needed — npm ci resolves
+        # it from the tree.
+        run: npm ci
+      - name: Typecheck (src + tests)
+        run: npm run typecheck
+      - name: 'Test (vitest: source map unit + headless DAP e2e)'
+        run: npm test
 
   processos:
     name: processos (clippy + test)

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:zeebe="http://camunda.org/schema/zeebe/1.0" id="defs" targetNamespace="http://nanobpm/debug">
+  <bpmn:process id="p" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="first"><bpmn:extensionElements><zeebe:taskDefinition type="t1" /></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:serviceTask id="second"><bpmn:extensionElements><zeebe:taskDefinition type="t2" /></bpmn:extensionElements></bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="first" />
+    <bpmn:sequenceFlow id="b" sourceRef="first" targetRef="second" />
+    <bpmn:sequenceFlow id="c" sourceRef="second" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>
