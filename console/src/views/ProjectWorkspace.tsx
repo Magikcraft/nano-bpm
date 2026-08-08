@@ -254,6 +254,11 @@ export default function ProjectWorkspace() {
         const d = (await getProject({ path: { name }, throwOnError: true }))
           .data;
         setRunState(d.runState);
+        // Refresh the app-view descriptor too: the ADR 0057 boot handshake
+        // reports the app's real bound port a moment AFTER it starts, so a
+        // stale `detail.appUi` (captured before start) would leave "Open app"
+        // and the served-URL probe pointing at the old/guessed port.
+        setDetail((prev) => (prev ? { ...prev, appUi: d.appUi } : prev));
       } catch {
         /* ignore */
       }
@@ -287,7 +292,14 @@ export default function ProjectWorkspace() {
   // is React error #310 ("Rendered more hooks than during the previous render").
   const servedUrl =
     running && isUrbanApp && detail
-      ? servedAppUrl(window.location.origin, servedAppPort(detail.config))
+      ? servedAppUrl(
+          window.location.origin,
+          // The ADR 0057 boot handshake reports the port the app actually bound
+          // (surfaced as `appUi.port`); prefer it over the legacy manifest/env
+          // guess so "Open app" opens the real port even when the app picks it
+          // at runtime behind a custom env var.
+          detail.appUi?.port ?? servedAppPort(detail.config),
+        )
       : null;
   useEffect(() => {
     if (servedUrl) {
