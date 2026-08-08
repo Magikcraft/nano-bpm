@@ -25,7 +25,7 @@ const Diff = envelope("Diff", { diff: "string" });
 const Verdict = envelope("Verdict", { verdict: "string" });
 const Merged = envelope("Merged", { merged: "boolean" });
 
-// urban-pr-review — an agentic convergence loop, authored as code.
+// urban-pr-review — an agent convergence loop, authored as code.
 // The same app the Model-first tab runs live on the wasm engine.
 export const prReview = defineFlow(
   "urban-pr-review",
