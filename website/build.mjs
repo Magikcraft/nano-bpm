@@ -289,7 +289,7 @@ function homeHtml() {
 
 <section class="hero">
   <p class="eyebrow"><span class="arp">Advanced Research Prototype</span></p>
-  <h1>Agentic Orchestration<br>for the <span class="grad">Developer Workstation.</span></h1>
+  <h1>Agent Graph Orchestration<br>for the <span class="grad">Developer Workstation.</span></h1>
   <p class="subhead">Graphs that run the loops.</p>
   <p class="lede">A RAAD — Rapid Agentic Application Development — environment that runs on
   your machine. Compose coding agents, tools, and human approvals into durable workflows.
@@ -465,7 +465,7 @@ ${langChips()}
 })();
 </script>`;
 
-  return homePage("nanobpm.io — Agentic Orchestration for the Developer Workstation", body);
+  return homePage("nanobpm.io — Agent Graph Orchestration for the Developer Workstation", body);
 }
 
 // Minimal, dependency-free TS/JS highlighter for the fixed hero snippet. Ordered
