@@ -7930,6 +7930,12 @@ mod tests {
         assert!(files.is_empty(), "autoDeploy: [] must skip discovery");
     }
 
+    // Holds the std env-lock across `.await` (app_ui reads the process-global
+    // NANOBPMN_PROJECTS_DIR): benign here — the only await is a tokio mutex in
+    // `entry()` that cannot deadlock with the env-lock, and nextest process-
+    // isolates these tests anyway. The lock just serializes the shared env for
+    // in-process `cargo test`.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn app_ui_detected_handshake_port_wins_over_declared() {
         let _g = lock();
@@ -7967,6 +7973,7 @@ mod tests {
         assert_eq!(ui.label.as_deref(), Some("Nano Workforce"));
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn app_ui_ignores_detected_port_when_ui_disabled() {
         let _g = lock();
