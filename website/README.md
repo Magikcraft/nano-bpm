@@ -23,7 +23,7 @@ served files can only ever agree.
 
 | Path | Content | Source |
 |---|---|---|
-| `/` | Marketing landing page ("The load-bearing runtime for agentic systems") | `homeHtml()` in [`build.mjs`](build.mjs) — always generated (pure static HTML, no toolchain) |
+| `/` | Marketing landing page ("The load-bearing runtime for agent systems") | `homeHtml()` in [`build.mjs`](build.mjs) — always generated (pure static HTML, no toolchain) |
 | `/demo/` | The in-browser Bojtos demo (ADR 0043), a live wasm-engine run | [`website/demo/`](demo) Vite app (`base: "/demo/"`); copied in when its `dist/` has been built |
 | `/schemas/` | The published-schema registry (the table of the URLs above) | `schemasHtml()` in [`build.mjs`](build.mjs) |
 
