@@ -6221,6 +6221,13 @@ impl ProjectSupervisor {
             .clone()
     }
 
+    /// Looks up an existing supervisor entry without creating one. Unlike
+    /// [`entry`], this never inserts, so read-only callers (e.g. `app_ui`)
+    /// can't grow the map with arbitrary/untracked names.
+    async fn existing_entry(&self, name: &str) -> Option<Arc<ProjectInner>> {
+        self.projects.lock().await.get(name).cloned()
+    }
+
     /// Run state for one project (defaults to stopped if unknown).
     pub async fn run_state(&self, name: &str) -> RunStateDto {
         self.entry(name).await.dto().await
@@ -6262,7 +6269,11 @@ impl ProjectSupervisor {
             },
         };
         if ui.enabled {
-            let detected = self.entry(name).await.detected_port.load(Ordering::Relaxed);
+            let detected = self
+                .existing_entry(name)
+                .await
+                .map(|inner| inner.detected_port.load(Ordering::Relaxed))
+                .unwrap_or(0);
             if let Ok(port) = u16::try_from(detected)
                 && port != 0
             {
@@ -8002,6 +8013,35 @@ mod tests {
         assert_eq!(
             ui.port, None,
             "a headless app stays headless even if it bound a port"
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn app_ui_does_not_insert_supervisor_entry() {
+        let _g = lock();
+        let root = temp_root();
+        let dir = root.join("ghost");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "name": "ghost", "ui": { "enabled": true, "port": 8090 } }"#,
+        )
+        .unwrap();
+
+        let sup = ProjectSupervisor {
+            projects: tokio::sync::Mutex::new(HashMap::new()),
+        };
+
+        // Reading app_ui for an untracked/stopped project must not grow the
+        // supervisor map — otherwise arbitrary names (e.g. from repeated
+        // icon/detail requests) could balloon it unbounded.
+        let ui = sup.app_ui("ghost").await;
+        assert!(ui.enabled);
+        assert_eq!(ui.port, Some(8090));
+        assert!(
+            sup.projects.lock().await.is_empty(),
+            "app_ui must not insert a supervisor entry for an untracked project"
         );
     }
 
