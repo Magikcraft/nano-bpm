@@ -357,8 +357,20 @@ jobs:
           git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/${PLUGIN_REPO}.git" "$tmp"
 
-          # Previous bundled server version, read BEFORE we overwrite the marker.
+          # Previous bundled server version + commit, read BEFORE we overwrite
+          # the marker.
           prev="$(jq -r '.version // empty' "$tmp/nanobpmn-binary.json" 2>/dev/null || true)"
+          prev_sha="$(jq -r '.commit // empty' "$tmp/nanobpmn-binary.json" 2>/dev/null || true)"
+
+          # Idempotency guard: skip when the marker already records this exact
+          # version+commit. We compare the persisted fields rather than a
+          # post-write `git diff`, because the `updated` timestamp is rewritten
+          # on every run and would always leave the file dirty — defeating any
+          # no-op detection and causing redundant plugin releases on re-runs.
+          if [ "$prev" = "$ver" ] && [ "$prev_sha" = "$sha" ]; then
+            echo "marker already at ${ver} (${sha}); nothing to release."
+            exit 0
+          fi
 
           # Pick the conventional-commit type from the server SemVer delta.
           # "feat" when the significant field (pre-1.0: minor; else major/minor)
@@ -388,10 +400,6 @@ jobs:
           }
           JSON
           cd "$tmp"
-          if git diff --quiet -- nanobpmn-binary.json; then
-            echo "marker unchanged; nothing to release."
-            exit 0
-          fi
           msg="${type}(binary): bundle nanobpmn ${ver} (${sha})"
           body="Bundled nano server ${prev:-unknown} -> ${ver}."
           # The plugin repo's `main` ruleset requires every change to arrive via a
@@ -401,10 +409,10 @@ jobs:
           # short-lived branch, open a PR, and merge it via the API. The ruleset
           # requires 0 approvals and its Copilot review is non-blocking, so the
           # squash-merge is immediate and — landing a commit on `main` — triggers
-          # the plugin's semantic-release exactly as the old direct push did. The
-          # squash commit subject IS the conventional-commit message (semantic
-          # -release reads it), so it must carry `$msg`.
-          branch="release/bundle-nanobpmn-${ver}-${GITHUB_RUN_ID}"
+          # the plugin's semantic-release exactly as the old direct push did.
+          # The squash commit subject IS the conventional-commit message that
+          # semantic-release parses, so it must carry `$msg`.
+          branch="release/bundle-nanobpmn-${ver}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           git config user.name "nanobpmn-ci"
           git config user.email "nanobpmn-ci@users.noreply.github.com"
           git switch -c "$branch"
