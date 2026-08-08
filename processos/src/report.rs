@@ -72,7 +72,8 @@ pub struct LabelCount {
 pub struct RedundantRecompute {
     /// The instance the recompute happened in.
     pub instance: String,
-    /// The recurring knowledge key (`dedupeKey` when present, else the body).
+    /// The recurring knowledge key: the app's stable `dedupeKey` (never the
+    /// unbounded free-text `body`, which is deliberately not used as a key).
     pub key: String,
     /// Distinct sibling actors that each independently produced it.
     pub actors: Vec<String>,
@@ -230,18 +231,18 @@ fn fold_domain_signals(details: &[InstanceTrace]) -> DomainContent {
                 agent_priors += 1;
             }
             if measured && s.role == Role::Knowledge {
-                if let Some(actor) = s.scope.actor.clone() {
-                    let inst = s
-                        .scope
-                        .instance
-                        .clone()
-                        .unwrap_or_else(|| t.instance_key.clone());
-                    let key = s
-                        .dedupe_key
-                        .clone()
-                        .or_else(|| s.body.clone())
-                        .unwrap_or_default();
+                // Aggregate only on the app's stable idempotency key. We deliberately
+                // do NOT fall back to the free-text `body`: it is unbounded, would bloat
+                // the fold and the `/api/insights` payload, and could duplicate sensitive
+                // text into a top-level summary. A knowledge signal without a dedupe key
+                // simply doesn't participate in recompute detection.
+                if let (Some(actor), Some(key)) = (s.scope.actor.clone(), s.dedupe_key.clone()) {
                     if !key.is_empty() {
+                        let inst = s
+                            .scope
+                            .instance
+                            .clone()
+                            .unwrap_or_else(|| t.instance_key.clone());
                         recompute
                             .entry(inst)
                             .or_default()
@@ -603,6 +604,24 @@ mod tests {
         assert_eq!(rr.key, "shared");
         assert_eq!(rr.occurrences, 2);
         assert_eq!(rr.actors, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn redundant_recompute_ignores_knowledge_without_a_dedupe_key() {
+        let mut no_key = signal(Role::Knowledge, "a", "unused", None);
+        no_key.dedupe_key = None;
+        no_key.body = Some("a very long free-text body that must never become a key".into());
+        let mut no_key_sibling = signal(Role::Knowledge, "b", "unused", None);
+        no_key_sibling.dedupe_key = None;
+        no_key_sibling.body = no_key.body.clone();
+        let t = InstanceTrace {
+            instance_key: "i1".into(),
+            domain_signals: vec![no_key, no_key_sibling],
+            ..Default::default()
+        };
+        let c = fold_domain_signals(&[t]);
+        // Two sibling actors, same body, but no dedupe key => not a finding.
+        assert!(c.redundant_recompute.is_empty());
     }
 
     #[test]
