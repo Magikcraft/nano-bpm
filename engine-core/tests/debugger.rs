@@ -236,3 +236,80 @@ fn process_completed_breakpoint_pauses_at_completion() {
         "RTC parity: completion emitted exactly once across pause + resume"
     );
 }
+
+/// A breakpoint on an embedded sub-process's completion must pause. The
+/// sub-process's own `ElementCompleted` is emitted by `complete_drained_subprocesses`
+/// during the fixpoint drain sweep — not by a `process_step` — so this guards the
+/// drain-sweep driver consult. Same defect class as #647's `ProcessCompleted`:
+/// events emitted outside the step loop must still be observable to breakpoints,
+/// or the breakpoint silently misses them.
+#[test]
+fn element_completed_breakpoint_pauses_on_subprocess_drain_completion() {
+    fn nested() -> nanobpmn_engine_core::ProcessDefinition {
+        // start -> sub{ sub_start -> sub_end } -> done, no wait states: the whole
+        // run completes within the create command, and `sub` completes via the
+        // drain sweep (its inner scope empties, then it is swept to completion).
+        ProcessBuilder::new("nested")
+            .start_event("start")
+            .sub_process("sub", "sub_start")
+            .start_event("sub_start")
+            .contained_in("sub_start", "sub")
+            .end_event("sub_end")
+            .contained_in("sub_end", "sub")
+            .end_event("done")
+            .connect("start", "sub")
+            .connect("sub_start", "sub_end")
+            .connect("sub", "done")
+            .build()
+            .expect("valid process")
+    }
+
+    let atomic = {
+        let mut engine = Engine::new();
+        engine
+            .apply_command(Command::DeployProcess(nested()))
+            .expect("deploy");
+        engine
+            .apply_command(Command::create_instance("nested"))
+            .expect("create")
+    };
+    assert!(
+        atomic.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_id, .. } if element_id == "sub"
+        )),
+        "sanity: the sub-process completes within the create command"
+    );
+
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(nested()))
+        .expect("deploy");
+    let mut session = engine
+        .debug_command_at(
+            Command::create_instance("nested"),
+            0,
+            vec![BreakCondition::ElementCompleted("sub".to_string())],
+        )
+        .expect("debug create");
+
+    assert!(
+        session.is_paused(),
+        "the sub-process ElementCompleted breakpoint pauses the run"
+    );
+    assert!(
+        session.log().iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_id, .. } if element_id == "sub"
+        )),
+        "the pause point includes the sub-process completion event"
+    );
+
+    engine.debug_resume(&mut session);
+    assert!(!session.is_paused(), "resumed to quiescence");
+    assert_eq!(
+        atomic,
+        session.into_log(),
+        "RTC parity: identical log across the drain-sweep pause + resume"
+    );
+}

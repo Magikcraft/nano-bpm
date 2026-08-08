@@ -2710,6 +2710,7 @@ impl Engine {
             // emptied completes now and routes along its outgoing flow; that may
             // enqueue more work (and, in turn, drain an enclosing sub-process), so
             // loop until nothing more completes.
+            let drain_from = log.len();
             let followups = self.complete_drained_subprocesses(log);
             queue.extend(followups);
             // Re-evaluate any conditional-event subscriptions whose condition may
@@ -2718,6 +2719,19 @@ impl Engine {
             // interrupting an activity, or spawning a non-interrupting token),
             // which enqueues more work — so this runs inside the same fixpoint loop.
             cursor = self.reevaluate_conditionals(log, &mut queue, cursor);
+            // Consult the driver on the events the drain sweep itself emitted
+            // (a sub-process's own `ElementCompleted`, a conditional/boundary
+            // firing) — these do not pass through `process_step`, so without this a
+            // breakpoint on such an event would be silently missed. Both sweeps are
+            // idempotent (a completed sub-process leaves `instance.active`;
+            // `reevaluate_conditionals` advances `cursor`), so a pause here resumes
+            // safely: re-entering re-runs them to a no-op. `RunToCompletion` never
+            // pauses, so the production path is unchanged.
+            if log.len() > drain_from {
+                if let Drive::Pause = driver.after_step(&log[drain_from..]) {
+                    return Some(Paused { queue, cursor });
+                }
+            }
             if !queue.is_empty() {
                 continue;
             }
