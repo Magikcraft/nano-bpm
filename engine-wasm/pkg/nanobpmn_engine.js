@@ -397,6 +397,136 @@ export class TestEngine {
         }
     }
     /**
+     * Stop debugging, keeping the state the run produced. If the run is paused
+     * mid-command, that in-flight command is first **finished normally** (its
+     * breakpoints are cleared and it is resumed once) so the engine lands on the
+     * same run-to-completion (RTC) quiescent state a plain command would produce
+     * — never a partial, non-RTC intermediate one that later mutators could
+     * build on (the hole [`TestEngine::guard_paused`] exists to prevent). To
+     * discard the run's state entirely instead, use [`TestEngine::reset`].
+     */
+    debugClear() {
+        wasm.testengine_debugClear(this.__wbg_ptr);
+    }
+    /**
+     * Begin a **debug** run of a `CreateInstance` command: deploy first (as
+     * usual), then call this to start the instance under the stepping executor,
+     * pausing at the first breakpoint (or running to completion if none match).
+     *
+     * `breakpoints_json` is a JSON array of `{ kind, id? }`:
+     * ```json
+     * [{ "kind": "elementActivated", "id": "Task_Charge" },
+     *  { "kind": "elementCompleted", "id": "Gateway_1" },
+     *  { "kind": "processCompleted" },
+     *  { "kind": "everyStep" }]
+     * ```
+     * Returns the debug state JSON (see [`TestEngine::debug_state`]). Starting a
+     * new debug run replaces any previous *finished* session; it is rejected
+     * while a run is still paused (`debugIsPaused`) — resume or clear that run
+     * first, so its intermediate state isn't stranded live in the engine.
+     * @param {string} process_id
+     * @param {string} variables_json
+     * @param {string} breakpoints_json
+     * @returns {string}
+     */
+    debugCreateInstance(process_id, variables_json, breakpoints_json) {
+        let deferred5_0;
+        let deferred5_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            const ptr0 = passStringToWasm0(process_id, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len0 = WASM_VECTOR_LEN;
+            const ptr1 = passStringToWasm0(variables_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len1 = WASM_VECTOR_LEN;
+            const ptr2 = passStringToWasm0(breakpoints_json, wasm.__wbindgen_export, wasm.__wbindgen_export2);
+            const len2 = WASM_VECTOR_LEN;
+            wasm.testengine_debugCreateInstance(retptr, this.__wbg_ptr, ptr0, len0, ptr1, len1, ptr2, len2);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr4 = r0;
+            var len4 = r1;
+            if (r3) {
+                ptr4 = 0; len4 = 0;
+                throw takeObject(r2);
+            }
+            deferred5_0 = ptr4;
+            deferred5_1 = len4;
+            return getStringFromWasm0(ptr4, len4);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred5_0, deferred5_1, 1);
+        }
+    }
+    /**
+     * Whether a debug run is currently paused at a breakpoint.
+     * @returns {boolean}
+     */
+    get debugIsPaused() {
+        const ret = wasm.testengine_debugIsPaused(this.__wbg_ptr);
+        return ret !== 0;
+    }
+    /**
+     * Resume a paused debug run until the next breakpoint or completion. No-op if
+     * no session is active or it has already finished. Returns the debug state.
+     * @returns {string}
+     */
+    debugResume() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.testengine_debugResume(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr1 = r0;
+            var len1 = r1;
+            if (r3) {
+                ptr1 = 0; len1 = 0;
+                throw takeObject(r2);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
+     * Advance a paused debug run by exactly one step, then pause again (unless
+     * that step drained the command). No-op if no session is active or it has
+     * already finished. Returns the debug state.
+     * @returns {string}
+     */
+    debugStep() {
+        let deferred2_0;
+        let deferred2_1;
+        try {
+            const retptr = wasm.__wbindgen_add_to_stack_pointer(-16);
+            wasm.testengine_debugStep(retptr, this.__wbg_ptr);
+            var r0 = getDataViewMemory0().getInt32(retptr + 4 * 0, true);
+            var r1 = getDataViewMemory0().getInt32(retptr + 4 * 1, true);
+            var r2 = getDataViewMemory0().getInt32(retptr + 4 * 2, true);
+            var r3 = getDataViewMemory0().getInt32(retptr + 4 * 3, true);
+            var ptr1 = r0;
+            var len1 = r1;
+            if (r3) {
+                ptr1 = 0; len1 = 0;
+                throw takeObject(r2);
+            }
+            deferred2_0 = ptr1;
+            deferred2_1 = len1;
+            return getStringFromWasm0(ptr1, len1);
+        } finally {
+            wasm.__wbindgen_add_to_stack_pointer(16);
+            wasm.__wbindgen_export3(deferred2_0, deferred2_1, 1);
+        }
+    }
+    /**
      * Parse and deploy a BPMN resource. Returns a JSON object
      * `{ "processIds": [...], "snapshot": {...} }` on success, or throws a
      * JS error carrying the parse/deploy failure message.

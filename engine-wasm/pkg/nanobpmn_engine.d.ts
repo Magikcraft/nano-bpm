@@ -89,6 +89,45 @@ export class TestEngine {
      */
     createInstance(process_id: string, variables_json: string): string;
     /**
+     * Stop debugging, keeping the state the run produced. If the run is paused
+     * mid-command, that in-flight command is first **finished normally** (its
+     * breakpoints are cleared and it is resumed once) so the engine lands on the
+     * same run-to-completion (RTC) quiescent state a plain command would produce
+     * — never a partial, non-RTC intermediate one that later mutators could
+     * build on (the hole [`TestEngine::guard_paused`] exists to prevent). To
+     * discard the run's state entirely instead, use [`TestEngine::reset`].
+     */
+    debugClear(): void;
+    /**
+     * Begin a **debug** run of a `CreateInstance` command: deploy first (as
+     * usual), then call this to start the instance under the stepping executor,
+     * pausing at the first breakpoint (or running to completion if none match).
+     *
+     * `breakpoints_json` is a JSON array of `{ kind, id? }`:
+     * ```json
+     * [{ "kind": "elementActivated", "id": "Task_Charge" },
+     *  { "kind": "elementCompleted", "id": "Gateway_1" },
+     *  { "kind": "processCompleted" },
+     *  { "kind": "everyStep" }]
+     * ```
+     * Returns the debug state JSON (see [`TestEngine::debug_state`]). Starting a
+     * new debug run replaces any previous *finished* session; it is rejected
+     * while a run is still paused (`debugIsPaused`) — resume or clear that run
+     * first, so its intermediate state isn't stranded live in the engine.
+     */
+    debugCreateInstance(process_id: string, variables_json: string, breakpoints_json: string): string;
+    /**
+     * Resume a paused debug run until the next breakpoint or completion. No-op if
+     * no session is active or it has already finished. Returns the debug state.
+     */
+    debugResume(): string;
+    /**
+     * Advance a paused debug run by exactly one step, then pause again (unless
+     * that step drained the command). No-op if no session is active or it has
+     * already finished. Returns the debug state.
+     */
+    debugStep(): string;
+    /**
      * Parse and deploy a BPMN resource. Returns a JSON object
      * `{ "processIds": [...], "snapshot": {...} }` on success, or throws a
      * JS error carrying the parse/deploy failure message.
@@ -180,6 +219,10 @@ export class TestEngine {
      */
     updateUserTask(user_task_key: string, changeset_json: string): string;
     /**
+     * Whether a debug run is currently paused at a breakpoint.
+     */
+    readonly debugIsPaused: boolean;
+    /**
      * The current virtual clock (milliseconds).
      */
     readonly now: number;
@@ -200,6 +243,11 @@ export interface InitOutput {
     readonly testengine_completeUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_debugClear: (a: number) => void;
+    readonly testengine_debugCreateInstance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
+    readonly testengine_debugIsPaused: (a: number) => number;
+    readonly testengine_debugResume: (a: number, b: number) => void;
+    readonly testengine_debugStep: (a: number, b: number) => void;
     readonly testengine_deploy: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_events: (a: number, b: number) => void;
     readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
