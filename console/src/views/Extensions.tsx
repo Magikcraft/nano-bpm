@@ -21,6 +21,7 @@ import {
   ErrorText,
   Input,
   PageHeader,
+  Spinner,
 } from "../components/ui";
 
 // The extension authoring & publishing guide, bundled into the offline docs site
@@ -251,7 +252,13 @@ export default function Extensions() {
             onClick={() => void install(m.name)}
             disabled={busy === m.name}
           >
-            {busy === m.name ? "Updating…" : "Update"}
+            {busy === m.name ? (
+              <>
+                <Spinner /> Updating…
+              </>
+            ) : (
+              "Update"
+            )}
           </Button>
           <button
             onClick={() => void remove(m.name, m.name)}
@@ -280,7 +287,13 @@ export default function Extensions() {
           onClick={() => void install(m.name)}
           disabled={busy === m.name}
         >
-          {busy === m.name ? "Installing…" : "Install"}
+          {busy === m.name ? (
+            <>
+              <Spinner /> Installing…
+            </>
+          ) : (
+            "Install"
+          )}
         </Button>
       )}
     </Card>
@@ -478,7 +491,13 @@ export default function Extensions() {
                     onClick={() => void install(readmePkg.name)}
                     disabled={busy === readmePkg.name}
                   >
-                    {busy === readmePkg.name ? "Installing…" : "Install"}
+                    {busy === readmePkg.name ? (
+                      <>
+                        <Spinner /> Installing…
+                      </>
+                    ) : (
+                      "Install"
+                    )}
                   </Button>
                 )}
                 <button
