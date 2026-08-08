@@ -20,8 +20,49 @@ use crate::state::{self, Key, ProcessInstanceState, State};
 
 mod api;
 mod boundary;
+mod debug;
 mod memory;
 mod resolve;
+
+pub use debug::{BreakCondition, DebugSession};
+
+/// Whether the fixpoint loop should keep draining after a processed step, or pause
+/// and hand control back to a debugger. See [`StepDriver`].
+enum Drive {
+    Continue,
+    Pause,
+}
+
+/// Consulted by [`Engine::run_with`] after every processed [`Step`], with the
+/// slice of events that step emitted. Production uses [`RunToCompletion`] (never
+/// pauses); the debugger supplies pausing drivers so the *same* loop can single-
+/// step or break, without forking the step semantics in [`Engine::process_step`].
+trait StepDriver {
+    fn after_step(&mut self, events: &[Event]) -> Drive;
+}
+
+/// The run-to-completion driver: never pauses. This is what real workers see;
+/// because `run_with` is generic over the driver, the `RunToCompletion`
+/// instantiation monomorphizes and its `#[inline]` `after_step` (always
+/// `Continue`) optimizes away, so the production path keeps the old `run` loop's
+/// codegen — no vtable, no per-step call.
+struct RunToCompletion;
+
+impl StepDriver for RunToCompletion {
+    #[inline]
+    fn after_step(&mut self, _events: &[Event]) -> Drive {
+        Drive::Continue
+    }
+}
+
+/// The captured mid-drain state of the fixpoint loop: the still-pending work queue
+/// and the conditional-reevaluation cursor. Returned by [`Engine::run_with`] when a
+/// driver pauses, and fed back in to resume exactly where it left off. Opaque to
+/// callers (wraps the private [`Step`] queue), owned by a [`DebugSession`].
+struct Paused {
+    queue: VecDeque<Step>,
+    cursor: usize,
+}
 
 /// A compact, serializable capture of an [`Engine`]: its materialized [`State`]
 /// plus the scalar generator and clock metadata required to resume operation
@@ -792,11 +833,58 @@ impl Engine {
     /// returning, so on success the returned events are the complete record of
     /// everything that happened. `now` is the host's clock reading for this
     /// command; the engine never reads a wall clock itself.
+    ///
+    /// Structure: [`plan_command_at`](Self::plan_command_at) translates the
+    /// command into an initial `(log, queue)`, the RTC [`run`](Self::run) drives
+    /// the queue to quiescence, and [`finish_command`](Self::finish_command)
+    /// performs the post-drain tail. The debug entrypoints reuse the same
+    /// planner + tail with a *stepping* driver in place of `run`.
     pub fn apply_command_at(
         &mut self,
         command: Command,
         now: u64,
     ) -> Result<Vec<Event>, EngineError> {
+        let (mut log, queue) = self.plan_command_at(command, now)?;
+        self.run(&mut log, queue);
+        self.finish_command(&log);
+        Ok(log)
+    }
+
+    /// Post-drain tail shared by [`apply_command_at`](Self::apply_command_at) and
+    /// the debug entrypoints. Instance completion now happens at the fixpoint
+    /// drain point inside [`run_with`](Self::run_with) (so a debug
+    /// `ProcessCompleted` breakpoint can observe it through the driver); the only
+    /// work left here is the follower-only tombstone reap, which is orthogonal to
+    /// completion. Runs after the queue has drained to quiescence.
+    fn finish_command(&mut self, log: &[Event]) {
+        // Follower-only safety net: if a retirement digest raced ahead of an
+        // instance's create on this replica (leader-durable async-learner lag), the
+        // key was tombstoned; now that the create has materialized the instance,
+        // reap it immediately so it cannot linger as a never-retired `Active` shell.
+        // Near-free when nothing is pending (a leader never tombstones).
+        if !self.retired_tombstones.is_empty() {
+            let created: Vec<Key> = log
+                .iter()
+                .filter_map(|e| match e {
+                    Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
+                    _ => None,
+                })
+                .collect();
+            if !created.is_empty() {
+                self.reap_tombstoned(&created);
+            }
+        }
+    }
+
+    /// Translates `command` into the initial `(log, queue)` the fixpoint loop
+    /// drives, without running it. Splitting planning from driving is what makes
+    /// stepping possible: the production path calls `run` on the queue, the
+    /// debugger drives it one step at a time. `now` stamps timestamped events.
+    fn plan_command_at(
+        &mut self,
+        command: Command,
+        now: u64,
+    ) -> Result<(Vec<Event>, VecDeque<Step>), EngineError> {
         self.now = now;
         let mut log: Vec<Event> = Vec::new();
         let mut queue: VecDeque<Step> = VecDeque::new();
@@ -2567,46 +2655,62 @@ impl Engine {
             }
         }
 
-        self.run(&mut log, queue);
-        self.complete_finished_instances(&mut log);
-        // Follower-only safety net: if a retirement digest raced ahead of an
-        // instance's create on this replica (leader-durable async-learner lag), the
-        // key was tombstoned; now that the create has materialized the instance,
-        // reap it immediately so it cannot linger as a never-retired `Active` shell.
-        // Near-free when nothing is pending (a leader never tombstones).
-        if !self.retired_tombstones.is_empty() {
-            let created: Vec<Key> = log
-                .iter()
-                .filter_map(|e| match e {
-                    Event::ProcessInstanceCreated { instance_key, .. } => Some(*instance_key),
-                    _ => None,
-                })
-                .collect();
-            if !created.is_empty() {
-                self.reap_tombstoned(&created);
-            }
-        }
-        Ok(log)
+        Ok((log, queue))
     }
 
     /// Drains the work queue, applying events and enqueuing follow-up steps until
-    /// the instance is quiescent.
-    fn run(&mut self, log: &mut Vec<Event>, mut queue: VecDeque<Step>) {
-        let mut cursor = 0usize;
+    /// the instance is quiescent. This is the production run-to-completion (RTC)
+    /// path: a thin wrapper over [`Engine::run_with`] with a driver that never
+    /// pauses. The debugger uses the same `run_with` with a pausing driver, so
+    /// the step semantics (`process_step`) are shared, never forked.
+    fn run(&mut self, log: &mut Vec<Event>, queue: VecDeque<Step>) {
+        let paused = self.run_with(log, queue, 0, &mut RunToCompletion);
+        debug_assert!(
+            paused.is_none(),
+            "RunToCompletion must always drain to quiescence"
+        );
+    }
+
+    /// The engine's single fixpoint loop, parameterised by a [`StepDriver`] that
+    /// is consulted after every processed [`Step`]. When the driver returns
+    /// [`Drive::Pause`] the loop returns the captured mid-drain state ([`Paused`])
+    /// so a debugger can resume exactly where it left off; when it drains to
+    /// quiescence it returns `None`.
+    ///
+    /// Production code (`run`) passes [`RunToCompletion`], which always continues.
+    /// Because this function is generic over the driver, that call site
+    /// monomorphizes and the `#[inline]` `Continue` collapses away, so the RTC
+    /// instantiation optimizes back down to the old drain loop — same codegen, no
+    /// vtable, no per-step overhead. Pausing is strictly additive and only
+    /// reachable through the debug entrypoints (which pass their own concrete
+    /// drivers) — the RTC contract for real workers is unchanged.
+    fn run_with<D: StepDriver>(
+        &mut self,
+        log: &mut Vec<Event>,
+        mut queue: VecDeque<Step>,
+        mut cursor: usize,
+        driver: &mut D,
+    ) -> Option<Paused> {
         loop {
             while let Some(step) = queue.pop_front() {
                 let (events, followups) = self.process_step(step);
+                let emitted_from = log.len();
                 for event in events {
                     self.emit(log, event);
                 }
                 for f in followups {
                     queue.push_back(f);
                 }
+                // Consult the driver with exactly the events this step emitted.
+                if let Drive::Pause = driver.after_step(&log[emitted_from..]) {
+                    return Some(Paused { queue, cursor });
+                }
             }
             // The queue is drained. Any embedded sub-process whose inner scope has
             // emptied completes now and routes along its outgoing flow; that may
             // enqueue more work (and, in turn, drain an enclosing sub-process), so
             // loop until nothing more completes.
+            let drain_from = log.len();
             let followups = self.complete_drained_subprocesses(log);
             queue.extend(followups);
             // Re-evaluate any conditional-event subscriptions whose condition may
@@ -2615,9 +2719,39 @@ impl Engine {
             // interrupting an activity, or spawning a non-interrupting token),
             // which enqueues more work — so this runs inside the same fixpoint loop.
             cursor = self.reevaluate_conditionals(log, &mut queue, cursor);
-            if queue.is_empty() {
-                break;
+            // Consult the driver on the events the drain sweep itself emitted
+            // (a sub-process's own `ElementCompleted`, a conditional/boundary
+            // firing) — these do not pass through `process_step`, so without this a
+            // breakpoint on such an event would be silently missed. Both sweeps are
+            // idempotent (a completed sub-process leaves `instance.active`;
+            // `reevaluate_conditionals` advances `cursor`), so a pause here resumes
+            // safely: re-entering re-runs them to a no-op. `RunToCompletion` never
+            // pauses, so the production path is unchanged.
+            if log.len() > drain_from {
+                if let Drive::Pause = driver.after_step(&log[drain_from..]) {
+                    return Some(Paused { queue, cursor });
+                }
             }
+            if !queue.is_empty() {
+                continue;
+            }
+            // Token quiescence. Complete any instance whose tokens have all
+            // retired — the terminal tail shared with `apply_command_at`, folded
+            // into the loop (rather than run post-return in `finish_command`) so a
+            // `ProcessCompleted` breakpoint can observe the completion through the
+            // driver, exactly like every other event. Idempotent: a completed
+            // instance is no longer `Active`, so a resume pass and
+            // `finish_command`'s tombstone tail find nothing left to complete, and
+            // the production (`RunToCompletion`) log is byte-identical — completion
+            // is still emitted once, at the same quiescence point.
+            let completed_from = log.len();
+            self.complete_finished_instances(log);
+            if log.len() > completed_from {
+                if let Drive::Pause = driver.after_step(&log[completed_from..]) {
+                    return Some(Paused { queue, cursor });
+                }
+            }
+            return None;
         }
     }
 

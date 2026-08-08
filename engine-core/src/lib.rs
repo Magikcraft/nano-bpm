@@ -89,6 +89,7 @@ pub use command::{ActivateElementInstruction, Command, UserTaskChangeset};
 pub use engine::EngineSnapshot;
 pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};
 pub use engine::{ActivatedJob, DecisionEvaluation, Engine, EngineError};
+pub use engine::{BreakCondition, DebugSession};
 pub use event::Event;
 pub use feel::FeelError;
 pub use model::{
