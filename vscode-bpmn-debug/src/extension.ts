@@ -51,7 +51,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('nanobpmn.createDebugSample', () => {
-      void createDebugSample();
+      void createDebugSample().catch((err: unknown) => {
+        void vscode.window.showErrorMessage(
+          `nanobpmn: could not create debug sample: ${formatError(err)}`,
+        );
+      });
     }),
   );
 
@@ -243,18 +247,22 @@ async function exists(uri: vscode.Uri): Promise<boolean> {
   }
 }
 
+function formatError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function isActiveElementsEvent(
   message: unknown,
 ): message is { type: 'event'; event: string; body: ActiveElementsBody } {
-  if (typeof message !== 'object' || message === null) return false;
-  const m = message as Record<string, unknown>;
-  if (m.type !== 'event' || m.event !== ACTIVE_ELEMENTS_EVENT) return false;
-  const body = m.body;
-  return (
-    typeof body === 'object' &&
-    body !== null &&
-    Array.isArray((body as { elements?: unknown }).elements)
-  );
+  if (!isRecord(message)) return false;
+  if (message.type !== 'event' || message.event !== ACTIVE_ELEMENTS_EVENT) return false;
+  const body = message.body;
+  if (!isRecord(body) || !Array.isArray(body.elements)) return false;
+  return body.elements.every((element) => typeof element === 'string');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
 }
 
 function renderHtml(webview: vscode.Webview, context: vscode.ExtensionContext): string {
