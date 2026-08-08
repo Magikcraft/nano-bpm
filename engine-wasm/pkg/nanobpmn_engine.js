@@ -397,8 +397,13 @@ export class TestEngine {
         }
     }
     /**
-     * Discard the active debug session (the engine keeps whatever state the run
-     * has already produced).
+     * Stop debugging, keeping the state the run produced. If the run is paused
+     * mid-command, that in-flight command is first **finished normally** (its
+     * breakpoints are cleared and it is resumed once) so the engine lands on the
+     * same run-to-completion (RTC) quiescent state a plain command would produce
+     * — never a partial, non-RTC intermediate one that later mutators could
+     * build on (the hole [`TestEngine::guard_paused`] exists to prevent). To
+     * discard the run's state entirely instead, use [`TestEngine::reset`].
      */
     debugClear() {
         wasm.testengine_debugClear(this.__wbg_ptr);
@@ -416,7 +421,9 @@ export class TestEngine {
      *  { "kind": "everyStep" }]
      * ```
      * Returns the debug state JSON (see [`TestEngine::debug_state`]). Starting a
-     * new debug run replaces any previous session.
+     * new debug run replaces any previous *finished* session; it is rejected
+     * while a run is still paused (`debugIsPaused`) — resume or clear that run
+     * first, so its intermediate state isn't stranded live in the engine.
      * @param {string} process_id
      * @param {string} variables_json
      * @param {string} breakpoints_json

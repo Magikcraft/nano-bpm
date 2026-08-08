@@ -12,7 +12,6 @@ import { readFileSync } from 'node:fs';
 import { basename } from 'node:path';
 
 import {
-  Event,
   InitializedEvent,
   LoggingDebugSession,
   OutputEvent,
@@ -26,7 +25,6 @@ import {
 import type { DebugProtocol } from '@vscode/debugprotocol';
 
 import { type BreakCondition, DebugEngine, type DebugState } from './engine.js';
-import { ACTIVE_ELEMENTS_EVENT } from './events.js';
 import { BpmnSourceMap } from './sourceMap.js';
 
 /** DAP `launch` arguments for a nanobpmn process debug session. */
@@ -260,11 +258,9 @@ export class NanobpmnDebugSession extends LoggingDebugSession {
   private reportStopOrTerminate(state: DebugState, reason: 'breakpoint' | 'step'): void {
     if (state.paused) {
       this.activeElements = state.activeElements;
-      this.sendEvent(new Event(ACTIVE_ELEMENTS_EVENT, { elements: state.activeElements }));
       this.sendEvent(new StoppedEvent(reason, THREAD_ID));
     } else {
       this.activeElements = [];
-      this.sendEvent(new Event(ACTIVE_ELEMENTS_EVENT, { elements: [] }));
       this.sendEvent(new TerminatedEvent());
     }
   }

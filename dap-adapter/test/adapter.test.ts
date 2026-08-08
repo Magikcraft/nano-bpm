@@ -40,7 +40,6 @@ describe('nanobpmn DAP adapter', () => {
     expect(bp.body.breakpoints[0]?.verified).toBe(true);
 
     // configurationDone starts the run; it should stop at the start event.
-    const activeEvt = client.waitForEvent('nanobpmn/activeElements');
     const stopped = client.waitForEvent('stopped');
     await client.configurationDoneRequest();
     await launched;
@@ -48,9 +47,6 @@ describe('nanobpmn DAP adapter', () => {
     expect(stop.body.reason).toBe('breakpoint');
     const threadId = stop.body.threadId ?? 1;
 
-    // The custom webview event reports the paused element(s).
-    const active = await activeEvt;
-    expect(active.body.elements).toContain('s');
     // The paused frame is anchored to the start-event line.
     const stack = await client.stackTraceRequest({ threadId });
     expect(stack.body.stackFrames[0]?.line).toBe(START_EVENT_LINE);

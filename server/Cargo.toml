@@ -36,7 +36,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 # Falcon protocol it serves (axum's `ws` feature is server-only). Pinned
 # to the same tungstenite the server already pulls in via axum. No TLS — the
 # cluster mesh is a trusted private network; `ws://` only.
-reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls", "http2"] }
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls", "http2", "stream"] }
 tokio-tungstenite = "0.29"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

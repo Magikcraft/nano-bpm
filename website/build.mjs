@@ -229,6 +229,7 @@ function langChips() {
     ["rust", "Rust"],
     ["python", "Python"],
     ["csharp", "C#"],
+    ["go", "Go"],
   ];
   return langs
     .map(([id, label]) => {
@@ -288,9 +289,9 @@ function homeHtml() {
 
 <section class="hero">
   <p class="eyebrow"><span class="arp">Advanced Research Prototype</span></p>
-  <h1>Agentic Orchestration<br>for the <span class="grad">Developer Workstation.</span></h1>
+  <h1>Agent Graph Orchestration<br><span class="hl-sub">for the <span class="grad">Developer Workstation.</span></span></h1>
   <p class="subhead">Graphs that run the loops.</p>
-  <p class="lede">A RAAD — Rapid Agentic Application Development — environment that runs on
+  <p class="lede">A RAAD — Rapid Agent Application Development — environment that runs on
   your machine. Compose coding agents, tools, and human approvals into durable workflows.
   Code-first or Model-first Graphs, provider-agnostic, and small enough to start on a Raspberry Pi.</p>
   <div class="cta">
@@ -334,14 +335,14 @@ function homeHtml() {
     <h2>New levels of abstraction demand new primitives.</h2>
     <p>You're already orchestrating agents to write, review, and test code — but the wiring is a
     pile of shell scripts and retries. When the machine reboots overnight — a crash, or an
-    IT-forced update — the run dies, the state is gone, and the tokens are re-spent. Agentic
+    IT-forced update — the run dies, the state is gone, and the tokens are re-spent. Agent
     systems need durable, inspectable primitives, not more glue.</p>
   </div>
 </section>
 
 <section class="pillars wrap">
   <article>
-    <h3>DRY your agentic SDLC</h3>
+    <h3>DRY your agent SDLC</h3>
     <p>Declare durable steps with <code>w.run</code> and durable waits with <code>w.signal</code>.
     Nano derives the model, job types, correlation, and workers — one source of truth, no copy-paste
     orchestration across every workflow.</p>
@@ -408,8 +409,8 @@ ${langChips()}
 
 <section class="band backbone">
   <div class="wrap">
-    <h2>RAAD.<br><span class="grad">Rapid Agentic Application Development.</span></h2>
-    <p class="raad-sub">An Advanced Research Prototype for agentic orchestration on the developer
+    <h2>RAAD.<br><span class="grad">Rapid Agent Application Development.</span></h2>
+    <p class="raad-sub">An Advanced Research Prototype for agent graph orchestration on the developer
     workstation. Start in three lines.</p>
     <div class="install multi center" aria-label="Get started">
       <code>npm i -g @camunda8/cli</code>
@@ -464,7 +465,7 @@ ${langChips()}
 })();
 </script>`;
 
-  return homePage("nanobpm.io — Agentic Orchestration for the Developer Workstation", body);
+  return homePage("nanobpm.io — Agent Graph Orchestration for the Developer Workstation", body);
 }
 
 // Minimal, dependency-free TS/JS highlighter for the fixed hero snippet. Ordered
@@ -505,7 +506,7 @@ function homePage(title, body) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title>
-<meta name="description" content="Nano is an Advanced Research Prototype for agentic orchestration on the developer workstation: a RAAD — Rapid Agentic Application Development — environment that composes coding agents, tools, and human approvals into durable, code-first or model-first workflows, provider-agnostic across frontier and local LLMs.">
+<meta name="description" content="Nano is an Advanced Research Prototype for agent graph orchestration on the developer workstation: a RAAD — Rapid Agent Application Development — environment that composes coding agents, tools, and human approvals into durable, code-first or model-first workflows, provider-agnostic across frontier and local LLMs.">
 <style>
   :root {
     --bg: #08080a; --panel: rgba(22,24,30,.55); --line: rgba(120,130,150,.16);
@@ -549,6 +550,7 @@ function homePage(title, body) {
     color: var(--sky); margin: 0 0 1rem;
   }
   .hero h1 { font-size: clamp(2.2rem, 5.6vw, 3.7rem); margin: 0 0 .6rem; font-weight: 700; }
+  .hero h1 .hl-sub { font-size: .68em; font-weight: 600; }
   .subhead { font-size: clamp(1.2rem, 2.8vw, 1.55rem); color: var(--ink); font-weight: 600; max-width: 40rem; margin: 0 auto 1.6rem; letter-spacing: -0.01em; }
   .grad {
     background: linear-gradient(90deg, var(--emerald), var(--sky));

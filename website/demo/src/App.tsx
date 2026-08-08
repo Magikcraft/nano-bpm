@@ -169,7 +169,7 @@ export function App() {
               <span className="grad">running in your browser.</span>
             </h1>
             <p className="sub">
-              nanobpm is the load-bearing runtime for agentic systems — a from-scratch process
+              nanobpm is the load-bearing runtime for agent systems — a from-scratch process
               orchestration engine in a single Rust binary. The workflow below is the real{" "}
               <code>urban-pr-review</code> convergence loop, executing live on the WebAssembly build
               of the very same engine — no server, no mocks in the runtime.

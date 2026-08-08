@@ -463,6 +463,10 @@ export type GlobList1 = string[];
  */
 export type GlobList2 = string[];
 /**
+ * `{{name}}` template sources substituted into model resources at deploy time (e.g. `prompts/*.md`). A template's name is its file stem (`prompts/review-round.md` → `{{review-round}}`).
+ */
+export type GlobList3 = string[];
+/**
  * A ${VAR} or ${VAR:-default} boot-time substitution reference (ADR 0027 §5). Resolved at App boot / IDE Run, never persisted. The validator checks the reference shape, not the resolved value.
  */
 export type EnvTemplate = string;
@@ -634,6 +638,7 @@ export interface Models {
 	processes?: GlobList;
 	decisions?: GlobList1;
 	forms?: GlobList2;
+	templates?: GlobList3;
 }
 /**
  * Named datasources — the BDE-alias abstraction (ADR 0024). Consumers bind by name, never by driver, so the same bundle runs on SQLite in the IDE and Postgres in production by flipping env only.
@@ -910,7 +915,7 @@ export interface AppUi {
 	 */
 	path?: string;
 	/**
-	 * Left-rail icon: a bundled icon name (project asset support may come later). Display hint only; the console falls back to a default glyph when absent/invalid.
+	 * Left-rail icon: either a bundled glyph name (e.g. "workers") resolved by the console, or a project-relative asset path the app ships itself (e.g. "assets/icon.svg"), served path-guarded and image-only from /console/app-view-icon/<project>. Display hint only; the console falls back to a default glyph when absent/invalid/unresolvable.
 	 */
 	icon?: string;
 	/**
