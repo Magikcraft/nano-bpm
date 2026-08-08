@@ -292,7 +292,7 @@ function renderHtml(webview: vscode.Webview, context: vscode.ExtensionContext): 
 
 const SAMPLE_BPMN = `<?xml version="1.0" encoding="UTF-8"?>
 <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-  id="Definitions_sample" targetNamespace="https://nanobpm.dev/debug-sample">
+  id="Definitions_sample" targetNamespace="https://nanobpm.io/debug-sample">
   <bpmn:process id="debugSample" isExecutable="true">
     <bpmn:startEvent id="start" name="Start">
       <bpmn:outgoing>flow_start_task</bpmn:outgoing>
