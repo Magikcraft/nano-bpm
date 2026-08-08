@@ -194,7 +194,8 @@
       "properties": {
         "processes": { "$ref": "#/$defs/globList", "description": "BPMN process globs." },
         "decisions": { "$ref": "#/$defs/globList", "description": "DMN decision globs." },
-        "forms": { "$ref": "#/$defs/globList", "description": "form-js form globs." }
+        "forms": { "$ref": "#/$defs/globList", "description": "form-js form globs." },
+        "templates": { "$ref": "#/$defs/globList", "description": "`{{name}}` template sources substituted into model resources at deploy time (e.g. `prompts/*.md`). A template's name is its file stem (`prompts/review-round.md` → `{{review-round}}`)." }
       }
     },
     "globList": {
