@@ -6638,7 +6638,6 @@ impl ProjectSupervisor {
         }
         cmd.env("NO_COLOR", "1")
             .env("NANOBPMN_BASE_URL", &base_url)
-            .env("NANOBPMN_APP_HANDSHAKE", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -6651,6 +6650,9 @@ impl ProjectSupervisor {
         for (k, v) in resolve_run_env(&cfg) {
             cmd.env(k, v);
         }
+        // The ADR 0057 boot-handshake opt-in is a reserved supervisor variable:
+        // set it LAST so an app's own env can neither clear nor spoof it.
+        cmd.env("NANOBPMN_APP_HANDSHAKE", "1");
 
         // Own process group so Stop can reap the whole tree (see
         // `kill_process_group`). No-op / unsupported off Unix.
@@ -6769,7 +6771,6 @@ impl ProjectSupervisor {
             .args(&argv[1..])
             .env("NO_COLOR", "1")
             .env("NANOBPMN_BASE_URL", &base_url)
-            .env("NANOBPMN_APP_HANDSHAKE", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -6779,6 +6780,9 @@ impl ProjectSupervisor {
         for (k, v) in resolve_run_env(cfg) {
             cmd.env(k, v);
         }
+        // The ADR 0057 boot-handshake opt-in is a reserved supervisor variable:
+        // set it LAST so an app's own env can neither clear nor spoof it.
+        cmd.env("NANOBPMN_APP_HANDSHAKE", "1");
         // Own process group so Stop can reap the whole tree — e.g. `uv run`
         // forks a `python` worker child that must die with it.
         #[cfg(unix)]
@@ -6936,6 +6940,7 @@ impl ProjectSupervisor {
                     // post-shutdown introspection/logging lie about a process we
                     // just killed.
                     inner.pid.store(0, Ordering::Relaxed);
+                    inner.detected_port.store(0, Ordering::Relaxed);
                     *inner.last_error.lock().await =
                         Some("stop_all: reap timed out; process group hard-killed".to_string());
                     *inner.phase.lock().await = Phase::Stopped;

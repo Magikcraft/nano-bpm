@@ -254,6 +254,11 @@ export default function ProjectWorkspace() {
         const d = (await getProject({ path: { name }, throwOnError: true }))
           .data;
         setRunState(d.runState);
+        // Refresh the app-view descriptor too: the ADR 0057 boot handshake
+        // reports the app's real bound port a moment AFTER it starts, so a
+        // stale `detail.appUi` (captured before start) would leave "Open app"
+        // and the served-URL probe pointing at the old/guessed port.
+        setDetail((prev) => (prev ? { ...prev, appUi: d.appUi } : prev));
       } catch {
         /* ignore */
       }
