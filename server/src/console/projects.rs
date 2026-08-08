@@ -6231,9 +6231,12 @@ impl ProjectSupervisor {
     /// the project's run env so the studio can place the app in the left rail
     /// and, for a UI app, locate its embedded webview.
     ///
-    /// Static (manifest + config), independent of whether the app is running,
-    /// so the rail can render both the icon and the running/stopped state. A
-    /// missing/invalid manifest yields the default (`enabled`, headless).
+    /// The descriptor's shape (enabled/headless, icon, declared port) is derived
+    /// from the manifest + config, so the rail can render both the icon and the
+    /// running/stopped state. A missing/invalid manifest yields the default
+    /// (`enabled`, headless). The resolved `ui.port`, however, is *not* static:
+    /// a running app's handshake-detected port overrides the declared value (see
+    /// below).
     ///
     /// Port discovery resolves the *declared* `ui.port`/`ui.portEnv` against the
     /// app-declared env only ([`resolve_run_env`]: project env overlaid with the
