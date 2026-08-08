@@ -57,6 +57,18 @@ impl BreakCondition {
 /// [`Engine::debug_step`]. When [`is_paused`](Self::is_paused) is false the command
 /// has run to completion and the session's [`log`](Self::log) is the same event
 /// list a plain `apply_command` would have returned.
+///
+/// # Exclusive access while paused
+///
+/// A paused session holds a snapshot of the engine's mid-drain work queue, and
+/// resuming replays it against the *live* engine. It therefore assumes the engine
+/// has **not** been mutated by anything else since the pause: while a session is
+/// paused you must not apply other commands (or drive another session) on the same
+/// [`Engine`], or the resumed run will operate on inconsistent state and the
+/// RTC-parity contract no longer holds. Treat the engine as exclusively borrowed by
+/// the session until it finishes (`is_paused()` returns `false`). This is not
+/// enforced at compile time because the session is owned by the caller rather than
+/// holding a `&mut Engine`.
 pub struct DebugSession {
     log: Vec<Event>,
     paused: Option<Paused>,
@@ -89,13 +101,10 @@ impl DebugSession {
 }
 
 /// Pauses after processing exactly one step.
-struct SingleStep {
-    stepped: bool,
-}
+struct SingleStep;
 
 impl StepDriver for SingleStep {
     fn after_step(&mut self, _events: &[Event]) -> Drive {
-        self.stepped = true;
         Drive::Pause
     }
 }
@@ -162,7 +171,7 @@ impl Engine {
         let Some(paused) = session.paused.take() else {
             return;
         };
-        let mut driver = SingleStep { stepped: false };
+        let mut driver = SingleStep;
         let result = self.run_with(&mut session.log, paused.queue, paused.cursor, &mut driver);
         self.settle(session, result);
     }
