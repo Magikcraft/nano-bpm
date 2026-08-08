@@ -10,12 +10,24 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./dist/index.js",
+    "./events": {
+      "types": "./dist/events.d.ts",
+      "default": "./dist/events.js"
+    },
+    "./sourceMap": {
+      "types": "./dist/sourceMap.d.ts",
+      "default": "./dist/sourceMap.js"
+    }
+  },
   "files": [
     "dist",
     "examples"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "pretest": "tsc -p tsconfig.json",
     "test": "vitest run"
