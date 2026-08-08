@@ -12,11 +12,13 @@ ADR 0051 (`0051-nano-workforce.md`, the crew orchestrator — this ADR supplies 
 registry, and visibility, and resolves its open "crewmate transport" and "lease home" questions),
 ADR 0028 (`0028-urban-app-user-auth-identity-authorization.md`, the identity the app — and therefore
 this channel — already authenticates under),
-ADR 0050 (Urban I/O surface / **App View** — the console-embedded app-view this ADR's cockpit rides
-in),
+ADR 0057 (`0057-console-app-view-embedded-urban-apps.md`, **Console App View** — the
+console-embedded app-view this ADR's cockpit rides in; rewritten alongside this ADR),
+ADR 0050 (`0050-urban-connectors-outbound-io-and-project-enablement.md`, the Urban outbound-I/O edge —
+the connector surface these agent workers act through),
 `@nanobpm/urban` (the generic Urban runtime — the home of this capability, not any one app),
-`nano-workforce/app/blackboard.ts` (the per-plan advisory blackboard — the seed this ADR generalizes
-into a first-class channel family),
+`app/blackboard.ts` in the `nanobpm/nano-workforce` repo (the per-plan advisory blackboard — the seed
+this ADR generalizes into a first-class channel family),
 and the MIT-licensed prior art the relay machinery cribs its hard parts from:
 [`stablyai/orca`](https://github.com/stablyai/orca) — a desktop ADE for parallel coding agents whose
 relay (`src/relay/`, `src/shared/relay-frame-decoder.ts`, `src/relay/pty-source-credit-record.ts`)
