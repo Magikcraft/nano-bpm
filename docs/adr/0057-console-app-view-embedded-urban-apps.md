@@ -93,6 +93,31 @@ A small message contract, versioned, everything inert/mediated:
 No message grants host-privileged access; `navigate`/`resize`/`title` are requests the console
 honours at its discretion.
 
+### 4a. Boot handshake — the app self-reports its bound port
+
+Framing an app view requires knowing the port the app actually bound. The manifest `ui` block can
+*declare* a port (`ui.port`) or an env var to read it from (`ui.portEnv`), but neither covers an app
+that picks its port at runtime — e.g. behind a custom env var the console does not set, so the port
+lives only in the app's own code. Guessing a default (the legacy "Open app" button hardcoded `8090`)
+opens the wrong port and the left rail reports the app "headless".
+
+The **boot handshake** closes this gap. When the supervising host spawns the app it sets
+`NANOBPMN_APP_HANDSHAKE` in the child env; the `@nanobpm/urban` runtime, once its HTTP server has
+bound, announces the real port on a machine-readable **stdout control line**:
+
+```
+@@NBPM_LISTENING@@{"port":3000}
+```
+
+This joins the existing host↔child stdout control family (`@@NBPM_METRIC@@`, `@@NBPM_STATUS@@`): the
+supervisor scrapes the line, records the detected port, and swallows the raw token (surfacing a
+friendly "app listening on port N" instead). The detected port takes **strict precedence** over any
+declared `ui.port`/`ui.portEnv`, so the console frames the webview and "Open app" opens the exact
+port regardless of how the app chose it — no manifest or env port declaration required. The emit is
+gated on `NANOBPMN_APP_HANDSHAKE` so direct terminal runs (`npm start`) are not cluttered with the
+machine token, and it is emitted from the host-agnostic runtime core so both the Node and Deno hosts
+honour it.
+
 ### 5. Standalone parity — framing is additive
 
 The **same** app is served framed or standalone; the handshake **degrades gracefully** when there is

@@ -541,7 +541,7 @@ export type AppUi = {
      */
     enabled: boolean;
     /**
-     * The resolved integrated-UI port, when known. Absent/null means headless. Discovered from the run-config env (never allocated).
+     * The resolved integrated-UI port, when known. Absent/null means headless. Discovered from the ADR 0057 boot handshake (the port the app reports it actually bound), falling back to the run-config env (never allocated).
      */
     port?: number | null;
     /**
