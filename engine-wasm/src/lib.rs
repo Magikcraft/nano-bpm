@@ -47,6 +47,12 @@ pub struct TestEngine {
     /// How many of the active [`DebugSession`]'s events have already been folded
     /// into `log`, so each `debugResume`/`debugStep` mirrors only the new tail.
     debug_folded: usize,
+    /// The virtual clock captured when the active debug run was started. A single
+    /// command is applied at a single `now` (see [`TestEngine::apply`]), so every
+    /// event folded from the session is stamped with this value rather than the
+    /// live `self.now` at fold time — keeping the mirrored log identical to a
+    /// plain command even if the clock were to move between steps.
+    debug_now: u64,
 }
 
 /// The log-derived, monotonically-growing parts of a snapshot, accumulated once
@@ -79,6 +85,7 @@ impl TestEngine {
             history: HistoryAggregates::default(),
             debug: None,
             debug_folded: 0,
+            debug_now: 0,
         }
     }
 
@@ -101,12 +108,14 @@ impl TestEngine {
         self.history = HistoryAggregates::default();
         self.debug = None;
         self.debug_folded = 0;
+        self.debug_now = 0;
     }
 
     /// Parse and deploy a BPMN resource. Returns a JSON object
     /// `{ "processIds": [...], "snapshot": {...} }` on success, or throws a
     /// JS error carrying the parse/deploy failure message.
     pub fn deploy(&mut self, xml: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let defs = parse_bpmn(xml).map_err(|e| js_err(&format!("parse error: {e}")))?;
         let ids: Vec<String> = defs.iter().map(|d| d.id.clone()).collect();
         self.apply(Command::DeployResources(defs))
@@ -128,6 +137,7 @@ impl TestEngine {
         process_id: &str,
         variables_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let variables = parse_vars(variables_json)?;
         let events = self
             .apply(Command::CreateInstance {
@@ -156,7 +166,9 @@ impl TestEngine {
     ///  { "kind": "everyStep" }]
     /// ```
     /// Returns the debug state JSON (see [`TestEngine::debug_state`]). Starting a
-    /// new debug run replaces any previous session.
+    /// new debug run replaces any previous *finished* session; it is rejected
+    /// while a run is still paused (`debugIsPaused`) — resume or clear that run
+    /// first, so its intermediate state isn't stranded live in the engine.
     #[wasm_bindgen(js_name = debugCreateInstance)]
     pub fn debug_create_instance(
         &mut self,
@@ -164,11 +176,15 @@ impl TestEngine {
         variables_json: &str,
         breakpoints_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let variables = parse_vars(variables_json)?;
         let breakpoints = parse_breakpoints(breakpoints_json)?;
         // Start fresh: nothing of this session has been folded into `log` yet.
         self.debug = None;
         self.debug_folded = 0;
+        // A command is applied at a single virtual clock; capture it now so every
+        // folded event carries the command's `now`, not the clock at fold time.
+        self.debug_now = self.now;
         let session = self
             .engine
             .debug_command_at(
@@ -218,12 +234,27 @@ impl TestEngine {
         self.debug.as_ref().is_some_and(DebugSession::is_paused)
     }
 
-    /// Discard the active debug session (the engine keeps whatever state the run
-    /// has already produced).
+    /// Stop debugging, keeping the state the run produced. If the run is paused
+    /// mid-command, that in-flight command is first **finished normally** (its
+    /// breakpoints are cleared and it is resumed once) so the engine lands on the
+    /// same run-to-completion (RTC) quiescent state a plain command would produce
+    /// — never a partial, non-RTC intermediate one that later mutators could
+    /// build on (the hole [`TestEngine::guard_paused`] exists to prevent). To
+    /// discard the run's state entirely instead, use [`TestEngine::reset`].
     #[wasm_bindgen(js_name = debugClear)]
     pub fn debug_clear(&mut self) {
+        if let Some(mut session) = self.debug.take() {
+            if session.is_paused() {
+                // Drain the in-flight command to its natural RTC quiescence.
+                session.set_breakpoints(Vec::new());
+                self.engine.debug_resume(&mut session);
+                self.debug = Some(session);
+                self.fold_debug_delta();
+            }
+        }
         self.debug = None;
         self.debug_folded = 0;
+        self.debug_now = 0;
     }
 
     /// Complete a waiting job by key, merging `variables_json` (a JSON object
@@ -231,6 +262,7 @@ impl TestEngine {
     /// already, so the UI can complete a freshly-created job directly.
     #[wasm_bindgen(js_name = completeJob)]
     pub fn complete_job(&mut self, job_key: &str, variables_json: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(job_key)?;
         let variables = parse_vars(variables_json)?;
         self.ensure_activated(key)?;
@@ -270,6 +302,7 @@ impl TestEngine {
         variables_json: &str,
         agent_result_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(job_key)?;
         let variables = parse_vars(variables_json)?;
         let adhoc_result = parse_adhoc_result(agent_result_json)?;
@@ -293,6 +326,7 @@ impl TestEngine {
         retries: i32,
         message: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(job_key)?;
         self.ensure_activated(key)?;
         self.apply(Command::FailJob {
@@ -317,6 +351,7 @@ impl TestEngine {
         correlation_key: &str,
         variables_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let variables = parse_vars(variables_json)?;
         self.apply(Command::CorrelateMessage {
             message_name: message_name.to_string(),
@@ -331,6 +366,7 @@ impl TestEngine {
     /// become due and expiring any lapsed job locks.
     #[wasm_bindgen(js_name = advanceTime)]
     pub fn advance_time(&mut self, by_ms: f64) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let delta = if by_ms.is_finite() && by_ms > 0.0 {
             by_ms as u64
         } else {
@@ -351,6 +387,7 @@ impl TestEngine {
     /// clock never moves backwards. Returns the snapshot.
     #[wasm_bindgen(js_name = tickNow)]
     pub fn tick_now(&mut self, now_ms: f64) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let now = if now_ms.is_finite() && now_ms > 0.0 {
             now_ms as u64
         } else {
@@ -379,6 +416,7 @@ impl TestEngine {
         timeout_ms: f64,
         worker: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let now = self.now;
         let timeout = if timeout_ms.is_finite() && timeout_ms > 0.0 {
             timeout_ms as u64
@@ -447,6 +485,7 @@ impl TestEngine {
         error_code: &str,
         error_message: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(job_key)?;
         self.ensure_activated(key)?;
         self.apply(Command::throw_job_error(
@@ -463,6 +502,7 @@ impl TestEngine {
     /// unblock the job. Returns the snapshot.
     #[wasm_bindgen(js_name = updateRetries)]
     pub fn update_retries(&mut self, job_key: &str, retries: i32) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(job_key)?;
         self.apply(Command::update_job_retries(key, retries))
             .map_err(|e| js_err(&format!("update retries error: {e}")))?;
@@ -475,6 +515,7 @@ impl TestEngine {
     /// incident re-creates the service-task job). Returns the snapshot.
     #[wasm_bindgen(js_name = resolveIncident)]
     pub fn resolve_incident(&mut self, incident_key: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(incident_key)?;
         self.apply(Command::ResolveIncident {
             incident_key: key,
@@ -495,6 +536,7 @@ impl TestEngine {
         variables_json: &str,
         local: bool,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(scope_key)?;
         let variables = parse_vars(variables_json)?;
         self.apply(Command::SetVariables {
@@ -516,6 +558,7 @@ impl TestEngine {
         signal_name: &str,
         variables_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let variables = parse_vars(variables_json)?;
         self.apply(Command::BroadcastSignal {
             signal_name: signal_name.to_string(),
@@ -530,6 +573,7 @@ impl TestEngine {
     /// `Terminated`. Returns the snapshot.
     #[wasm_bindgen(js_name = cancelInstance)]
     pub fn cancel_instance(&mut self, instance_key: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(instance_key)?;
         self.apply(Command::CancelInstance { instance_key: key })
             .map_err(|e| js_err(&format!("cancel instance error: {e}")))?;
@@ -551,6 +595,7 @@ impl TestEngine {
         activate_instructions_json: &str,
         terminate_instructions_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(instance_key)?;
         let activate_instructions = parse_activate_instructions(activate_instructions_json)?;
         let terminate_instructions = parse_terminate_instructions(terminate_instructions_json)?;
@@ -572,6 +617,7 @@ impl TestEngine {
         user_task_key: &str,
         variables_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(user_task_key)?;
         let variables = parse_vars(variables_json)?;
         self.apply(Command::CompleteUserTask {
@@ -592,6 +638,7 @@ impl TestEngine {
         assignee: &str,
         allow_override: bool,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(user_task_key)?;
         self.apply(Command::AssignUserTask {
             user_task_key: key,
@@ -606,6 +653,7 @@ impl TestEngine {
     /// Returns the snapshot.
     #[wasm_bindgen(js_name = unassignUserTask)]
     pub fn unassign_user_task(&mut self, user_task_key: &str) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(user_task_key)?;
         self.apply(Command::UnassignUserTask { user_task_key: key })
             .map_err(|e| js_err(&format!("unassign user task error: {e}")))?;
@@ -623,6 +671,7 @@ impl TestEngine {
         user_task_key: &str,
         changeset_json: &str,
     ) -> Result<String, JsValue> {
+        self.guard_paused()?;
         let key = parse_key(user_task_key)?;
         let changeset = parse_user_task_changeset(changeset_json)?;
         self.apply(Command::UpdateUserTask {
@@ -680,6 +729,31 @@ impl Default for TestEngine {
 }
 
 impl TestEngine {
+    /// Reject a state-mutating call while a debug run is paused mid-command. The
+    /// paused engine holds an *intermediate* state — a partially-applied command
+    /// that a normal run-to-completion (RTC) engine can never observe. Letting
+    /// another command (`completeJob`, `advanceTime`, `tickNow`, …) build on it
+    /// would produce states the production engine cannot represent, so the
+    /// contract is: while `debugIsPaused`, the only permitted mutations are
+    /// `debugResume`, `debugStep`, `debugClear`, and `reset`. Everything else
+    /// must first finish or discard the run.
+    fn guard_paused(&self) -> Result<(), JsValue> {
+        self.check_not_paused().map_err(js_err)
+    }
+
+    /// Native-testable core of [`TestEngine::guard_paused`]: `Err(msg)` while a
+    /// debug run is paused, `Ok` otherwise. Kept `&str`-typed (not `JsValue`) so
+    /// unit tests can assert the rejection without constructing a `JsValue`,
+    /// which aborts off the wasm target.
+    fn check_not_paused(&self) -> Result<(), &'static str> {
+        if self.debug_is_paused() {
+            return Err(
+                "cannot mutate the engine while a debug run is paused; call debugResume, debugStep, debugClear, or reset first",
+            );
+        }
+        Ok(())
+    }
+
     /// Apply a command at the current virtual clock, recording the emitted
     /// events in the log.
     fn apply(&mut self, command: Command) -> Result<Vec<Event>, nanobpmn_engine_core::EngineError> {
@@ -709,16 +783,19 @@ impl TestEngine {
         if self.debug_folded >= full.len() {
             return;
         }
-        let now = self.now;
+        // Copy the new tail out of the session so the immutable `&self.debug`
+        // borrow ends before we mutate `self.seq`/`self.log`/`self.history`
+        // below; the events are then *moved* (not re-cloned) into `self.log`.
+        let now = self.debug_now;
         let new_events: Vec<Event> = full[self.debug_folded..].to_vec();
         self.debug_folded = full.len();
-        for ev in &new_events {
+        for ev in new_events {
             self.seq += 1;
-            self.fold_history(ev);
+            self.fold_history(&ev);
             self.log.push(LogEntry {
                 seq: self.seq,
                 now,
-                event: ev.clone(),
+                event: ev,
             });
         }
     }
@@ -735,31 +812,27 @@ impl TestEngine {
         })
     }
 
-    /// Elements with a live token: an `ElementActivated` event whose
-    /// `element_instance_key` has no later `ElementCompleted`. Deduplicated,
-    /// in first-activation order.
+    /// Elements with a live token, read straight from the engine's authoritative
+    /// per-instance active-token map (the same source [`TestEngine::snapshot_value`]
+    /// uses) rather than re-scanning the event log. Deduplicated, ordered by
+    /// element-instance key (creation order) — the set a diagram view highlights
+    /// while paused.
     fn active_elements(&self) -> Vec<String> {
-        let mut open: Vec<(u64, String)> = Vec::new();
-        for entry in &self.log {
-            match &entry.event {
-                Event::ElementActivated {
-                    element_instance_key,
-                    element_id,
-                    ..
-                } => {
-                    open.push((*element_instance_key, element_id.clone()));
-                }
-                Event::ElementCompleted {
-                    element_instance_key,
-                    ..
-                } => {
-                    open.retain(|(k, _)| k != element_instance_key);
-                }
-                _ => {}
-            }
-        }
+        let mut tokens: Vec<(String, String)> = self
+            .engine
+            .state()
+            .instances
+            .values()
+            .flat_map(|inst| {
+                inst.active
+                    .iter()
+                    .map(|(k, eid)| (k.to_string(), eid.clone()))
+            })
+            .collect();
+        tokens.sort_by(|a, b| cmp_key(&a.0, &b.0));
         let mut seen = std::collections::HashSet::new();
-        open.into_iter()
+        tokens
+            .into_iter()
             .filter_map(|(_, id)| seen.insert(id.clone()).then_some(id))
             .collect()
     }
@@ -2143,6 +2216,56 @@ mod tests {
         assert_eq!(
             plain, debugged,
             "RTC parity across wasm: single-stepped run == plain createInstance"
+        );
+    }
+
+    /// While a debug run is paused mid-command the engine holds an intermediate
+    /// state; other mutating calls must be rejected so they can't build on a
+    /// state a normal RTC engine can't represent. `debugClear` lifts the block by
+    /// *finishing* the in-flight command (RTC parity), not by stranding the
+    /// partial state. (Asserted against `check_not_paused`, the `&str`-typed core
+    /// every mutator funnels through via `guard_paused` — the `JsValue` wrapper
+    /// aborts off the wasm target, so the mutators' own reject paths aren't
+    /// native-testable.)
+    #[test]
+    fn paused_debug_run_rejects_other_mutators() {
+        // Reference: the RTC state a plain createInstance leaves (parked on t1).
+        let plain = {
+            let mut eng = TestEngine::new();
+            eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
+            eng.create_instance("p", "{}").unwrap();
+            parse(&eng.events().unwrap())
+        };
+
+        let mut eng = TestEngine::new();
+        eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
+        eng.debug_create_instance("p", "{}", r#"[{"kind":"elementActivated","id":"s"}]"#)
+            .unwrap();
+        assert!(
+            eng.debug_is_paused(),
+            "paused at the start-event breakpoint"
+        );
+        assert!(
+            eng.check_not_paused().is_err(),
+            "mutators are rejected while a debug run is paused"
+        );
+
+        // Clearing while paused finishes the command (RTC parity) and lifts the block.
+        eng.debug_clear();
+        assert!(!eng.debug_is_paused());
+        assert_eq!(
+            plain,
+            parse(&eng.events().unwrap()),
+            "debugClear drains the in-flight command to the plain-createInstance RTC state, \
+             not a stranded partial one"
+        );
+        assert!(
+            eng.check_not_paused().is_ok(),
+            "mutators allowed again once the debug run is cleared"
+        );
+        assert!(
+            eng.advance_time(1000.0).is_ok(),
+            "a real mutator succeeds once unblocked"
         );
     }
 }

@@ -7,7 +7,10 @@
 # Prerequisites
 # -------------
 # 1. Secret C8CTL_PLUGIN_REPO_TOKEN: a fine-grained PAT (or GitHub App token)
-#    with "Contents: read & write" on jwulf/c8ctl-plugin-nano ONLY.
+#    with "Contents: read & write" AND "Pull requests: read & write" on
+#    jwulf/c8ctl-plugin-nano ONLY. The PR scope is required because the plugin's
+#    `main` ruleset rejects direct pushes, so the marker bump is landed via a
+#    pull request that the workflow opens and merges (see the `publish` job).
 # 2. Codegen needs Java (JDK 17) + uv (Python); the web console needs Node.
 #    Both run ONCE in the `prepare` job (Linux) and are shared with every build
 #    leg as an artifact, so the cross-compile legs only need Rust.
@@ -324,16 +327,18 @@ jobs:
           gh release upload binaries dist/* --repo "$PLUGIN_REPO" --clobber
 
       # Bump the bundled-binary marker in the plugin repo. Because the plugin's
-      # npm version is decoupled from the nanobpmn version, this commit on main
-      # is what makes semantic-release cut a release that ships the binaries just
-      # uploaded above. The conventional-commit TYPE is chosen from the server
-      # SemVer delta so the plugin's bump magnitude reflects how much the bundled
-      # server changed (issue #1):
+      # npm version is decoupled from the nanobpmn version, landing this commit on
+      # main is what makes semantic-release cut a release that ships the binaries
+      # just uploaded above. The plugin's `main` ruleset requires a PR, so the
+      # commit is landed via an auto-merged pull request (see the step body)
+      # rather than a direct push. The conventional-commit TYPE is chosen from the
+      # server SemVer delta so the plugin's bump magnitude reflects how much the
+      # bundled server changed (issue #1):
       #   * server minor-or-higher bump -> feat(binary):  -> plugin MINOR
       #   * server patch bump (or commit-only)-> fix(binary): -> plugin PATCH
       # A server MAJOR is deliberately NOT mapped to a plugin major (that would
       # imply the plugin's own CLI surface broke); it maps to feat like a minor.
-      # No `!`/`BREAKING CHANGE:` is ever emitted. No-ops (skips push) if
+      # No `!`/`BREAKING CHANGE:` is ever emitted. No-ops (skips the PR) if
       # unchanged. semantic-release still takes the MAX bump across all commits,
       # so a bigger plugin-own change in the same window wins.
       - name: Bump bundled-binary marker (triggers npm release)
@@ -352,8 +357,20 @@ jobs:
           git clone --depth 1 \
             "https://x-access-token:${GH_TOKEN}@github.com/${PLUGIN_REPO}.git" "$tmp"
 
-          # Previous bundled server version, read BEFORE we overwrite the marker.
+          # Previous bundled server version + commit, read BEFORE we overwrite
+          # the marker.
           prev="$(jq -r '.version // empty' "$tmp/nanobpmn-binary.json" 2>/dev/null || true)"
+          prev_sha="$(jq -r '.commit // empty' "$tmp/nanobpmn-binary.json" 2>/dev/null || true)"
+
+          # Idempotency guard: skip when the marker already records this exact
+          # version+commit. We compare the persisted fields rather than a
+          # post-write `git diff`, because the `updated` timestamp is rewritten
+          # on every run and would always leave the file dirty — defeating any
+          # no-op detection and causing redundant plugin releases on re-runs.
+          if [ "$prev" = "$ver" ] && [ "$prev_sha" = "$sha" ]; then
+            echo "marker already at ${ver} (${sha}); nothing to release."
+            exit 0
+          fi
 
           # Pick the conventional-commit type from the server SemVer delta.
           # "feat" when the significant field (pre-1.0: minor; else major/minor)
@@ -383,14 +400,29 @@ jobs:
           }
           JSON
           cd "$tmp"
-          if git diff --quiet -- nanobpmn-binary.json; then
-            echo "marker unchanged; nothing to release."
-            exit 0
-          fi
+          msg="${type}(binary): bundle nanobpmn ${ver} (${sha})"
+          body="Bundled nano server ${prev:-unknown} -> ${ver}."
+          # The plugin repo's `main` ruleset requires every change to arrive via a
+          # pull request (a direct `git push origin HEAD:main` is rejected with
+          # GH013, and a ruleset bypass actor cannot be added on a personal repo
+          # — see jwulf/c8ctl-plugin-nano#29). So land the marker bump on a
+          # short-lived branch, open a PR, and merge it via the API. The ruleset
+          # requires 0 approvals and its Copilot review is non-blocking, so the
+          # squash-merge is immediate and — landing a commit on `main` — triggers
+          # the plugin's semantic-release exactly as the old direct push did.
+          # The squash commit subject IS the conventional-commit message that
+          # semantic-release parses, so it must carry `$msg`.
+          branch="release/bundle-nanobpmn-${ver}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           git config user.name "nanobpmn-ci"
           git config user.email "nanobpmn-ci@users.noreply.github.com"
+          git switch -c "$branch"
           git add nanobpmn-binary.json
-          git commit \
-            -m "${type}(binary): bundle nanobpmn ${ver} (${sha})" \
-            -m "Bundled nano server ${prev:-unknown} -> ${ver}."
-          git push origin HEAD:main
+          git commit -m "$msg" -m "$body"
+          git push origin "$branch"
+          # gh authenticates via GH_TOKEN (C8CTL_PLUGIN_REPO_TOKEN); needs
+          # `Pull requests: write` in addition to `Contents: write`.
+          pr_url="$(gh pr create --repo "$PLUGIN_REPO" --base main --head "$branch" \
+            --title "$msg" --body "$body")"
+          echo "opened marker PR: $pr_url"
+          gh pr merge "$pr_url" --repo "$PLUGIN_REPO" --squash --delete-branch \
+            --subject "$msg" --body "$body"
