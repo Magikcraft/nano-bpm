@@ -41,8 +41,11 @@ trait StepDriver {
     fn after_step(&mut self, events: &[Event]) -> Drive;
 }
 
-/// The run-to-completion driver: never pauses. This is what real workers see, so
-/// `run_with(_, _, _, &mut RunToCompletion)` is byte-for-byte the old `run` loop.
+/// The run-to-completion driver: never pauses. This is what real workers see;
+/// because `run_with` is generic over the driver, the `RunToCompletion`
+/// instantiation monomorphizes and its `#[inline]` `after_step` (always
+/// `Continue`) optimizes away, so the production path keeps the old `run` loop's
+/// codegen — no vtable, no per-step call.
 struct RunToCompletion;
 
 impl StepDriver for RunToCompletion {
@@ -2674,16 +2677,19 @@ impl Engine {
     /// so a debugger can resume exactly where it left off; when it drains to
     /// quiescence it returns `None`.
     ///
-    /// Production code (`run`) passes a driver that always continues, so this is
-    /// byte-for-byte the old loop. Pausing is strictly additive and only reachable
-    /// through the debug entrypoints — the RTC contract for real workers is
-    /// unchanged.
-    fn run_with(
+    /// Production code (`run`) passes [`RunToCompletion`], which always continues.
+    /// Because this function is generic over the driver, that call site
+    /// monomorphizes and the `#[inline]` `Continue` collapses away, so the RTC
+    /// instantiation optimizes back down to the old drain loop — same codegen, no
+    /// vtable, no per-step overhead. Pausing is strictly additive and only
+    /// reachable through the debug entrypoints (which pass their own concrete
+    /// drivers) — the RTC contract for real workers is unchanged.
+    fn run_with<D: StepDriver>(
         &mut self,
         log: &mut Vec<Event>,
         mut queue: VecDeque<Step>,
         mut cursor: usize,
-        driver: &mut dyn StepDriver,
+        driver: &mut D,
     ) -> Option<Paused> {
         loop {
             while let Some(step) = queue.pop_front() {
