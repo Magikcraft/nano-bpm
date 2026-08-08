@@ -825,7 +825,7 @@ function ProjectTile({
   return (
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
       <div
-        className={`absolute right-3 top-3 gap-1 group-hover:flex focus-within:flex [@media(hover:none)]:flex ${updating ? "flex" : "hidden"}`}
+        className={`absolute right-3 top-3 gap-1 group-hover:flex group-focus-within:flex [@media(hover:none)]:flex ${updating ? "flex" : "hidden"}`}
       >
         {onUpdate && (
           <button
@@ -837,11 +837,22 @@ function ProjectTile({
                 ? "Checking for template changes…"
                 : `Update from template${project.latestVersion ? ` (v${project.latestVersion} available)` : ""}`
             }
-            aria-label={`Update ${title} from template`}
+            aria-label={
+              updating
+                ? `Checking ${title} for template changes`
+                : `Update ${title} from template`
+            }
             aria-busy={updating}
             className="inline-flex items-center rounded px-1.5 py-0.5 text-xs text-accent hover:bg-accent/10 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {updating ? <Spinner /> : "↑"}
+            {updating ? (
+              <>
+                <Spinner />
+                <span className="sr-only">Checking for template changes…</span>
+              </>
+            ) : (
+              "↑"
+            )}
           </button>
         )}
         <button
