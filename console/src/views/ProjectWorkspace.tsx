@@ -1365,6 +1365,9 @@ function TreeNode({
         <span className="truncate">{node.name}</span>
         <span className="flex-1" />
         <button
+          type="button"
+          title={`Delete ${node.name}`}
+          aria-label={`Delete ${node.name}`}
           onClick={(e) => {
             e.stopPropagation();
             onDelete(node.path);
