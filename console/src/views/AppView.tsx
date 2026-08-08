@@ -136,7 +136,8 @@ export default function AppView() {
   // imported overrides applied by ThemeProvider) and postMessage them to the
   // frame. Same-origin proxy (posture A), so we target the console origin. The
   // Urban runtime mirrors these onto its own :root (see @nanobpm/urban).
-  const { appearance, selection } = useTheme();
+  const theme = useTheme();
+  const { appearance } = theme;
   const postTheme = useCallback(() => {
     const frame = iframeRef.current?.contentWindow;
     if (!frame) return;
