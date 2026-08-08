@@ -1377,11 +1377,14 @@ function TreeNode({
         <span className="truncate">{node.name}</span>
         <span className="flex-1" />
         <button
+          type="button"
+          title={`Delete ${node.name}`}
+          aria-label={`Delete ${node.name}`}
           onClick={(e) => {
             e.stopPropagation();
             onDelete(node.path);
           }}
-          className="hidden rounded px-1 text-xs text-fg-faint hover:text-danger group-hover:block"
+          className="hidden rounded px-1 text-xs text-fg-faint hover:text-danger group-hover:block [@media(hover:none)]:block"
         >
           ✕
         </button>

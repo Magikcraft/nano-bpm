@@ -805,7 +805,7 @@ function ProjectTile({
   const title = project.displayName ?? project.name;
   return (
     <Card className="group relative flex flex-col p-4 transition-colors hover:border-edge-strong">
-      <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex focus-within:flex">
+      <div className="absolute right-3 top-3 hidden gap-1 group-hover:flex focus-within:flex [@media(hover:none)]:flex">
         {onUpdate && (
           <button
             type="button"
