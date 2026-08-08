@@ -287,7 +287,14 @@ export default function ProjectWorkspace() {
   // is React error #310 ("Rendered more hooks than during the previous render").
   const servedUrl =
     running && isUrbanApp && detail
-      ? servedAppUrl(window.location.origin, servedAppPort(detail.config))
+      ? servedAppUrl(
+          window.location.origin,
+          // The ADR 0057 boot handshake reports the port the app actually bound
+          // (surfaced as `appUi.port`); prefer it over the legacy manifest/env
+          // guess so "Open app" opens the real port even when the app picks it
+          // at runtime behind a custom env var.
+          detail.appUi?.port ?? servedAppPort(detail.config),
+        )
       : null;
   useEffect(() => {
     if (servedUrl) {

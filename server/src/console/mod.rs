@@ -1053,7 +1053,7 @@ async fn app_view_proxy_inner(
     if !sup.is_running(&name).await {
         return (StatusCode::SERVICE_UNAVAILABLE, "app is not running").into_response();
     }
-    let ui = sup.app_ui(&name);
+    let ui = sup.app_ui(&name).await;
     let port = match ui.port {
         Some(p) if ui.enabled => p,
         _ => {
@@ -1189,7 +1189,7 @@ async fn app_view_icon(Path(name): Path<String>) -> Response {
     if !workspace::is_safe_name(&name) {
         return (StatusCode::BAD_REQUEST, "invalid project name").into_response();
     }
-    let Some(icon) = projects::supervisor().app_ui(&name).icon else {
+    let Some(icon) = projects::supervisor().app_ui(&name).await.icon else {
         return (StatusCode::NOT_FOUND, "no app-shipped icon").into_response();
     };
     // Bundled glyph names are resolved by the console, not served as files.
@@ -2968,7 +2968,7 @@ pub(super) async fn projects_list() -> ApiResult {
         // resolve the app-view descriptor lazily for those (avoids a manifest +
         // config read per stopped project on every listing).
         if p.running {
-            p.app_ui = Some(sup.app_ui(&p.name));
+            p.app_ui = Some(sup.app_ui(&p.name).await);
         }
         out.push(p);
     }
@@ -3201,11 +3201,12 @@ pub(super) async fn project_detail(name: &str) -> ApiResult {
             .to_string_lossy()
             .into_owned()
     });
+    let app_ui = sup.app_ui(name).await;
     Ok(serde_json::json!({
         "config": cfg,
         "files": tree,
         "runState": sup.run_state(name).await,
-        "appUi": sup.app_ui(name),
+        "appUi": app_ui,
         "denoAvailable": sup.deno_available(),
         "nodeAvailable": sup.node_available(),
         // Presence of the `@nanobpm/urban` CLI (epic #514 host dry-out). The

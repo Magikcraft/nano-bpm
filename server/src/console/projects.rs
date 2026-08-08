@@ -233,6 +233,11 @@ const NODE_REGISTER_MJS: &str = include_str!("node_register.mjs");
 const NODE_DENO_SHIM_MJS: &str = include_str!("node_deno_shim.mjs");
 const METRIC_PREFIX: &str = "@@NBPM_METRIC@@";
 const STATUS_PREFIX: &str = "@@NBPM_STATUS@@";
+/// ADR 0057 boot handshake: a supervised Urban app announces the port it
+/// actually bound on this stdout control line (`@@NBPM_LISTENING@@{"port":N}`),
+/// so the studio discovers the real UI port instead of guessing a default. The
+/// `@nanobpm/urban` runtime emits it when the studio sets `NANOBPMN_APP_HANDSHAKE`.
+const LISTENING_PREFIX: &str = "@@NBPM_LISTENING@@";
 const LOG_RING_CAP: usize = 1000;
 
 /// Upper bound on how long [`ProjectSupervisor::stop_all`] waits for every
@@ -5838,6 +5843,11 @@ struct ProjectInner {
     stop: Notify,
     logs_tx: broadcast::Sender<LogLine>,
     log_ring: Mutex<VecDeque<LogLine>>,
+    /// The port the running app announced via the ADR 0057 boot handshake
+    /// (`@@NBPM_LISTENING@@`), or 0 when unknown (not running, or the runtime
+    /// predates the handshake). Atomic so [`ProjectSupervisor::app_ui`] can read
+    /// it without awaiting. Cleared on each (re)start and on exit.
+    detected_port: AtomicU32,
 }
 
 impl ProjectInner {
@@ -5853,6 +5863,7 @@ impl ProjectInner {
             stop: Notify::new(),
             logs_tx,
             log_ring: Mutex::new(VecDeque::with_capacity(LOG_RING_CAP)),
+            detected_port: AtomicU32::new(0),
         })
     }
 
@@ -5887,6 +5898,22 @@ impl ProjectInner {
         };
         if line.starts_with(METRIC_PREFIX) {
             return; // per-worker metric telemetry — not shown
+        }
+        if let Some(rest) = line.strip_prefix(LISTENING_PREFIX) {
+            // ADR 0057 boot handshake: the app reports the port it actually
+            // bound. Record it (detected port wins over any declared UI port in
+            // `app_ui`) and surface a friendly line; swallow the raw token.
+            if let Some(port) = serde_json::from_str::<serde_json::Value>(rest)
+                .ok()
+                .and_then(|v| v.get("port").and_then(|p| p.as_u64()))
+                .and_then(|p| u16::try_from(p).ok())
+                .filter(|p| *p != 0)
+            {
+                self.detected_port.store(u32::from(port), Ordering::Relaxed);
+                self.push_log("sys", format!("app listening on port {port}"))
+                    .await;
+            }
+            return;
         }
         if let Some(rest) = line.strip_prefix(STATUS_PREFIX) {
             let msg = serde_json::from_str::<serde_json::Value>(rest)
@@ -6208,26 +6235,38 @@ impl ProjectSupervisor {
     /// so the rail can render both the icon and the running/stopped state. A
     /// missing/invalid manifest yields the default (`enabled`, headless).
     ///
-    /// Port discovery deliberately resolves `ui.portEnv` against the
-    /// *app-declared* env only ([`resolve_run_env`]: project env overlaid with
-    /// the active run config), not the supervisor's inherited process env. The
+    /// Port discovery resolves the *declared* `ui.port`/`ui.portEnv` against the
+    /// app-declared env only ([`resolve_run_env`]: project env overlaid with the
+    /// active run config), not the supervisor's inherited process env. The
     /// spawned child does inherit the host env, but attributing a host-level
     /// `PORT` (e.g. the studio's own) to every app is a misattribution hazard,
-    /// so discovery stays deterministic and per-app. Authors that want an
-    /// embedded webview declare `ui.port` or set the port in the project / run
-    /// config env. (A future slice can have the app self-report its bound URL at
-    /// boot for exact parity — the ADR 0057 handshake.)
-    pub fn app_ui(&self, name: &str) -> AppUi {
+    /// so discovery stays deterministic and per-app.
+    ///
+    /// On top of that, the ADR 0057 boot handshake wins: once a running app has
+    /// announced the port it actually bound (`@@NBPM_LISTENING@@`, recorded on
+    /// [`ProjectInner::detected_port`]), that port overrides any declared value,
+    /// so the studio locates the embedded webview and "Open app" exactly even
+    /// when the app picks its port at runtime (e.g. behind a custom env var).
+    pub async fn app_ui(&self, name: &str) -> AppUi {
         let run_env = read_config(name)
             .map(|cfg| resolve_run_env(&cfg))
             .unwrap_or_default();
-        match super::triggers::read_manifest(name) {
+        let mut ui = match super::triggers::read_manifest(name) {
             Ok(manifest) => resolve_app_ui(&manifest, &run_env),
             Err(_) => AppUi {
                 enabled: true,
                 ..AppUi::default()
             },
+        };
+        if ui.enabled {
+            let detected = self.entry(name).await.detected_port.load(Ordering::Relaxed);
+            if let Ok(port) = u16::try_from(detected)
+                && port != 0
+            {
+                ui.port = Some(port);
+            }
         }
+        ui
     }
 
     pub async fn is_running(&self, name: &str) -> bool {
@@ -6599,6 +6638,7 @@ impl ProjectSupervisor {
         }
         cmd.env("NO_COLOR", "1")
             .env("NANOBPMN_BASE_URL", &base_url)
+            .env("NANOBPMN_APP_HANDSHAKE", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -6625,6 +6665,7 @@ impl ProjectSupervisor {
         };
         let pid = child.id().unwrap_or(0);
         inner.pid.store(pid, Ordering::Relaxed);
+        inner.detected_port.store(0, Ordering::Relaxed);
         inner.desired_running.store(true, Ordering::Relaxed);
         *inner.phase.lock().await = Phase::Running;
         *inner.started_at_ms.lock().await = Some(now_ms());
@@ -6669,6 +6710,7 @@ impl ProjectSupervisor {
                 st = child.wait() => st.ok(),
             };
             inner.pid.store(0, Ordering::Relaxed);
+            inner.detected_port.store(0, Ordering::Relaxed);
             let desired = inner.desired_running.load(Ordering::Relaxed);
             let code = status.and_then(|s| s.code());
             if !desired {
@@ -6727,6 +6769,7 @@ impl ProjectSupervisor {
             .args(&argv[1..])
             .env("NO_COLOR", "1")
             .env("NANOBPMN_BASE_URL", &base_url)
+            .env("NANOBPMN_APP_HANDSHAKE", "1")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -6749,6 +6792,7 @@ impl ProjectSupervisor {
         };
         let pid = child.id().unwrap_or(0);
         inner.pid.store(pid, Ordering::Relaxed);
+        inner.detected_port.store(0, Ordering::Relaxed);
         inner.desired_running.store(true, Ordering::Relaxed);
         *inner.phase.lock().await = Phase::Running;
         *inner.started_at_ms.lock().await = Some(now_ms());
@@ -6784,6 +6828,7 @@ impl ProjectSupervisor {
                 st = child.wait() => st.ok(),
             };
             inner.pid.store(0, Ordering::Relaxed);
+            inner.detected_port.store(0, Ordering::Relaxed);
             let desired = inner.desired_running.load(Ordering::Relaxed);
             let code = status.and_then(|s| s.code());
             if !desired || code == Some(0) {
@@ -7878,6 +7923,116 @@ mod tests {
         touch(&root.join("models/x.bpmn"), "<x/>");
         let files = ProjectSupervisor::discover_deployables(&root, &[]).await;
         assert!(files.is_empty(), "autoDeploy: [] must skip discovery");
+    }
+
+    #[tokio::test]
+    async fn app_ui_detected_handshake_port_wins_over_declared() {
+        let _g = lock();
+        let root = temp_root();
+        // A project whose manifest declares a fixed UI port (8090). Without the
+        // handshake, app_ui would surface 8090.
+        let dir = root.join("workforce");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "name": "workforce", "ui": { "enabled": true, "port": 8090, "label": "Nano Workforce" } }"#,
+        )
+        .unwrap();
+
+        let sup = ProjectSupervisor {
+            projects: tokio::sync::Mutex::new(HashMap::new()),
+        };
+
+        // Before any handshake, the declared port is surfaced.
+        assert_eq!(sup.app_ui("workforce").await.port, Some(8090));
+
+        // Simulate the boot handshake recording the real bound port.
+        sup.entry("workforce")
+            .await
+            .detected_port
+            .store(3000, Ordering::Relaxed);
+
+        let ui = sup.app_ui("workforce").await;
+        assert!(ui.enabled);
+        assert_eq!(
+            ui.port,
+            Some(3000),
+            "detected handshake port overrides the declared manifest port"
+        );
+        assert_eq!(ui.label.as_deref(), Some("Nano Workforce"));
+    }
+
+    #[tokio::test]
+    async fn app_ui_ignores_detected_port_when_ui_disabled() {
+        let _g = lock();
+        let root = temp_root();
+        let dir = root.join("headless");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "name": "headless", "ui": { "enabled": false } }"#,
+        )
+        .unwrap();
+
+        let sup = ProjectSupervisor {
+            projects: tokio::sync::Mutex::new(HashMap::new()),
+        };
+        sup.entry("headless")
+            .await
+            .detected_port
+            .store(3000, Ordering::Relaxed);
+
+        let ui = sup.app_ui("headless").await;
+        assert!(!ui.enabled);
+        assert_eq!(
+            ui.port, None,
+            "a headless app stays headless even if it bound a port"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_stdout_line_records_boot_handshake_port() {
+        let inner = ProjectInner::new();
+        assert_eq!(inner.detected_port.load(Ordering::Relaxed), 0);
+
+        // A valid handshake records the port and emits a friendly sys line,
+        // swallowing the raw control token.
+        inner
+            .ingest_stdout_line(format!("{LISTENING_PREFIX}{{\"port\":3000}}"))
+            .await;
+        assert_eq!(inner.detected_port.load(Ordering::Relaxed), 3000);
+
+        // A CRLF-terminated handshake still parses (trailing \r stripped).
+        inner
+            .ingest_stdout_line(format!("{LISTENING_PREFIX}{{\"port\":4173}}\r"))
+            .await;
+        assert_eq!(inner.detected_port.load(Ordering::Relaxed), 4173);
+
+        // Invalid / out-of-range / zero ports are ignored (no clobber, no log).
+        inner
+            .ingest_stdout_line(format!("{LISTENING_PREFIX}not-json"))
+            .await;
+        inner
+            .ingest_stdout_line(format!("{LISTENING_PREFIX}{{\"port\":0}}"))
+            .await;
+        inner
+            .ingest_stdout_line(format!("{LISTENING_PREFIX}{{\"port\":70000}}"))
+            .await;
+        assert_eq!(inner.detected_port.load(Ordering::Relaxed), 4173);
+
+        let ring = inner.log_ring.lock().await;
+        let seen: Vec<(String, String)> = ring
+            .iter()
+            .map(|l| (l.stream.clone(), l.text.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("sys".to_string(), "app listening on port 3000".to_string()),
+                ("sys".to_string(), "app listening on port 4173".to_string()),
+            ],
+            "valid handshakes recorded + logged; token swallowed; bad ports ignored"
+        );
     }
 
     #[tokio::test]
