@@ -8,6 +8,8 @@ import {
   type RunState,
 } from "../gen";
 import { projectLogs, type ProjectLogLine } from "../lib/api";
+import { useTheme } from "../theme/ThemeProvider";
+import { cssVar, TOKEN_KEYS } from "../theme/themes";
 
 // The console-integrated control surface for a supervised app (ADR 0057, issue
 // #638 — Slice 5). Reached from the left-rail running-apps entry. Headless apps
@@ -57,6 +59,7 @@ export default function AppView() {
   const [logs, setLogs] = useState<KeyedLogLine[]>([]);
   const [tab, setTab] = useState<"app" | "logs">("app");
   const logRef = useRef<HTMLDivElement | null>(null);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
   // Monotonic id source for stable React keys: assigning a per-line id on
   // ingest means trimming the front of the capped buffer never shifts an
   // existing line's key, so React re-renders only the changed rows instead of
@@ -125,6 +128,53 @@ export default function AppView() {
     const t = window.setInterval(() => void refresh(), 1500);
     return () => window.clearInterval(t);
   }, [runState, refresh, notFound]);
+
+  // Theme bridge for the embedded app. The app renders in a sandboxed,
+  // cross-document iframe, so the console's `--nano-*` custom properties and
+  // `data-appearance` don't cascade in. We read the *resolved* token values off
+  // <html> (which already carries built-in-palette values + any theme-pack /
+  // imported overrides applied by ThemeProvider) and postMessage them to the
+  // frame. Same-origin proxy (posture A), so we target the console origin. The
+  // Urban runtime mirrors these onto its own :root (see @nanobpm/urban).
+  const { appearance, selection } = useTheme();
+  const postTheme = useCallback(() => {
+    const frame = iframeRef.current?.contentWindow;
+    if (!frame) return;
+    const computed = getComputedStyle(document.documentElement);
+    const vars: Record<string, string> = {};
+    for (const key of TOKEN_KEYS) {
+      const prop = cssVar(key);
+      const value = computed.getPropertyValue(prop).trim();
+      if (value) vars[prop] = value;
+    }
+    frame.postMessage(
+      { type: "nano-theme", appearance, vars },
+      window.location.origin,
+    );
+  }, [appearance]);
+
+  // The app announces `nano-app-ready` once its runtime installs the listener;
+  // reply with the current theme. Guard on the framing iframe's own window so a
+  // message from any other frame can't trigger a post to the wrong target.
+  useEffect(() => {
+    const onMessage = (ev: MessageEvent) => {
+      if (
+        ev.origin === window.location.origin &&
+        ev.source === iframeRef.current?.contentWindow &&
+        (ev.data as { type?: unknown } | null)?.type === "nano-app-ready"
+      ) {
+        postTheme();
+      }
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [postTheme]);
+
+  // Re-push whenever the console theme changes (appearance or the active
+  // selection, which covers theme-pack / imported-token swaps).
+  useEffect(() => {
+    postTheme();
+  }, [postTheme, selection]);
 
   useEffect(() => {
     logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
@@ -440,9 +490,11 @@ export default function AppView() {
               // leaking console URLs. No `allow-top-navigation` — a framed app
               // can't navigate the studio away.
               key={appSrc}
+              ref={iframeRef}
               title={`${appUi?.label || displayName} UI`}
               src={appSrc}
-              className="min-h-0 flex-1 border-0 bg-white"
+              onLoad={postTheme}
+              className="min-h-0 flex-1 border-0 bg-app"
               sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-downloads"
               referrerPolicy="no-referrer"
             />
