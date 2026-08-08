@@ -28,6 +28,7 @@ worker internals, and the physical resources/deployment at the bottom.
 | 3 | [`processos-latent-process-exploration.md`](./processos-latent-process-exploration.md) | The **pattern taxonomy** (7 families, on a performance/quality/side-effect safety spectrum), the **data** needed to assess each pattern, and how to **discover patterns we did not hand-code** (static analysis, corpus mining, simulate-and-generalize, LLM-as-proposer, diagnosis-as-index). | you want the breadth of optimization patterns and how new ones are found. |
 | 4 | [`processos-deployment-cooptimization.md`](./processos-deployment-cooptimization.md) | Structure, binding, and **resourcing** as coupled layers of one process→deployment mapping; the **observability/actuation regimes** (offline engine-sim / queueing-model-sim / live act-and-measure); the full layer taxonomy incl. **cross-process/portfolio** contention; and the ProcessOS additions implied (a third **scaling** control verb, a second **queueing** simulator, portfolio-scoped ingest). | you're reasoning about cluster/worker resources, scaling, and why they escape isolated-engine simulation. |
 | 5 | [`processos-worker-and-semantic-layers.md`](./processos-worker-and-semantic-layers.md) | The two **ends** of the stack: **worker-internal logic** (SDK instrumentation → OTel sub-spans, auto-harvested side-effect/purity safety data, observe→configure→transform actuation) and the **business-semantic layer** (where the verifier's safety model inverts, autonomy drops to advisory, and a *grounded* LLM becomes a business-redesign copilot). | you want the bottom (worker internals) and top (business redesign) of the space. |
+| 6 | [`processos-domain-signal-plane.md`](./processos-domain-signal-plane.md) | **Process + content**: a generic **domain-signal plane** that projects an app's application-domain execution data (blackboard, DataLayer rows, work products) into the trace — join-keyed, typed, role-tagged — so the reasoner can find **domain inefficiencies** (rework, re-derived knowledge, contention, defect classes), not just timing/resource. Generalizes the `__cost` channel; lifts the mechanism + substrate bindings to **urban** (domain observability for free); nano-workforce is the first target; held to doc 5's inverted safety model. | you want optimizations from the *application domain*, and how any Urban app gets them for free. |
 
 ### Companion: implemented features
 
@@ -55,7 +56,8 @@ across the process, the deployment, inside the worker, and above the process.
 The stack, top (most value / least autonomy) to bottom (most autonomy):
 
 ```
-  business semantics      (doc 5 §2)  advisory — human decides, numbers are evidence
+  business semantics      (doc 5 §2)  advisory — human decides, external/RAG evidence
+  domain content          (doc 6)     advisory — human decides, execution-data evidence
   process structure       (docs 1,3)  verifier-gated transforms
   task binding            (docs 1,3)  model/provider routing, quality-gated
   worker internals        (doc 5 §1)  observe → configure → transform
