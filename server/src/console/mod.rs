@@ -18,13 +18,13 @@ use std::time::Duration;
 
 use axum::{
     Router,
-    extract::{ConnectInfo, Path, Query, State},
+    extract::{ConnectInfo, Path, Query, RawQuery, State},
     http::{HeaderMap, StatusCode, header},
     response::{
-        IntoResponse, Json, Response,
+        IntoResponse, Json, Redirect, Response,
         sse::{Event, KeepAlive, Sse},
     },
-    routing::get,
+    routing::{any, get},
 };
 use futures_util::stream::{Stream, unfold};
 use nanobpmn_engine_core::bpmn::parse_bpmn;
@@ -123,6 +123,19 @@ pub fn router(server: ServerImpl) -> Router {
                 .delete(gateway_proxy)
                 .patch(gateway_proxy),
         )
+        // Console App View reverse proxy (ADR 0057, issue #638 — Slice 5). A dumb
+        // same-origin HTTP passthrough to a *running* app's declared UI port on
+        // loopback, so the studio can frame the app's own UI even when the host
+        // isn't the user's machine (and without mixed content). It injects no
+        // auth (the app authenticates itself) and does NOT proxy WebSocket/other
+        // streams (ADR 0057 §3 — the console never becomes a stream proxy).
+        .route("/console/app-view/{name}", any(app_view_root_redirect))
+        .route("/console/app-view/{name}/", any(app_view_proxy_index))
+        .route("/console/app-view/{name}/{*rest}", any(app_view_proxy))
+        // App-shipped left-rail icon (ADR 0057, issue #638). When a project's
+        // `ui.icon` names a project asset path (not a bundled glyph), the rail
+        // renders it via <img> from this path-guarded, image-only route.
+        .route("/console/app-view-icon/{name}", get(app_view_icon))
         // Streaming / binary / static routes that are intentionally excluded
         // from the console OpenAPI spec stay hand-wired here. Every typed
         // `/console/api/*` operation is served by the generated rust-axum router
@@ -891,6 +904,353 @@ async fn gateway_proxy(
     if let Some(v) = cd {
         out.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Console App View reverse proxy (ADR 0057, issue #638 — Slice 5)
+//
+// A same-origin HTTP passthrough to a *running* app's declared UI port on
+// loopback. Same-origin (posture A) so the console can embed the app in a
+// sandboxed iframe without mixed-content or cross-origin fetch breakage; the
+// app authenticates itself (the console injects no credentials) and we never
+// proxy its WebSocket / SSE stream (ADR 0057 §3 — WS deferred, replies 501).
+
+/// Request headers we must never forward verbatim to the upstream: hop-by-hop
+/// headers (recomputed per-connection) plus `accept-encoding` — reqwest is
+/// built without the `gzip` feature so it can't transparently decode a
+/// compressed body, and we forward the body untouched. Forcing identity keeps
+/// the response coherent (no `content-encoding` lie).
+/// Request headers we must never forward verbatim to the upstream: hop-by-hop
+/// headers are recomputed per-connection. `accept-encoding` IS forwarded so the
+/// app can compress — reqwest is built without any decode feature, so it hands
+/// back the coded bytes untouched and we relay `content-encoding` verbatim (see
+/// [`app_view_strip_response_header`]), keeping metadata and body coherent.
+fn app_view_strip_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "host"
+            | "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "content-length"
+    )
+}
+
+/// Response headers we must not copy back: hop-by-hop, length/transfer framing
+/// (the body is re-streamed by axum), the framing guards (`x-frame-options`,
+/// `content-security-policy*`) that would otherwise stop the console from
+/// embedding the app, and `service-worker-allowed` (a framed app must not be
+/// able to widen a service-worker scope beyond its own proxy path onto the
+/// console origin). CSP is dropped wholesale rather than surgically edited: an
+/// app's own CSP has no authority over the console origin that now frames it,
+/// and partial rewriting is error-prone. `content-encoding` is deliberately
+/// NOT stripped — reqwest doesn't decode it, so the relayed bytes still match.
+fn app_view_strip_response_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-connection"
+            | "transfer-encoding"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "content-length"
+            | "x-frame-options"
+            | "content-security-policy"
+            | "content-security-policy-report-only"
+            | "service-worker-allowed"
+    )
+}
+
+/// Rewrite an upstream `Location` (redirect) header so the browser stays inside
+/// the proxied namespace. Handles root-relative (`/foo`) and absolute-loopback
+/// (`http://127.0.0.1:{port}/foo`) targets; anything else (cross-host absolute,
+/// relative) is passed through unchanged.
+fn app_view_rewrite_location(value: &str, name: &str, port: u16) -> String {
+    let prefix = format!("/console/app-view/{name}");
+    for origin in [
+        format!("http://127.0.0.1:{port}"),
+        format!("http://localhost:{port}"),
+    ] {
+        if let Some(rest) = value.strip_prefix(&origin) {
+            let rest = if rest.is_empty() { "/" } else { rest };
+            return format!("{prefix}{rest}");
+        }
+    }
+    if value.starts_with('/') && !value.starts_with("//") {
+        return format!("{prefix}{value}");
+    }
+    value.to_string()
+}
+
+/// Base path (`/console/app-view/{name}`) → redirect to the trailing-slash form
+/// so the app's root-relative asset URLs resolve under the proxied namespace.
+async fn app_view_root_redirect(Path(name): Path<String>) -> Response {
+    if !workspace::is_safe_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid project name").into_response();
+    }
+    Redirect::permanent(&format!("/console/app-view/{name}/")).into_response()
+}
+
+/// Trailing-slash root (`/console/app-view/{name}/`) — proxies path `""`.
+async fn app_view_proxy_index(
+    Path(name): Path<String>,
+    RawQuery(query): RawQuery,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    app_view_proxy_inner(name, String::new(), query, method, headers, body).await
+}
+
+/// Wildcard (`/console/app-view/{name}/{*rest}`).
+async fn app_view_proxy(
+    Path((name, rest)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    app_view_proxy_inner(name, rest, query, method, headers, body).await
+}
+
+async fn app_view_proxy_inner(
+    name: String,
+    rest: String,
+    query: Option<String>,
+    method: axum::http::Method,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if !workspace::is_safe_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid project name").into_response();
+    }
+
+    // Refuse to proxy WebSocket / other Upgrade streams: the console never
+    // becomes a stream proxy (ADR 0057 §3). Urban's page runtime polls over
+    // plain HTTP, so UI apps still work.
+    if headers
+        .get(header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("upgrade"))
+        .unwrap_or(false)
+        || headers.contains_key(header::UPGRADE)
+    {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "WebSocket/Upgrade proxying is not supported for the app view",
+        )
+            .into_response();
+    }
+
+    let sup = projects::supervisor();
+    if !sup.is_running(&name).await {
+        return (StatusCode::SERVICE_UNAVAILABLE, "app is not running").into_response();
+    }
+    let ui = sup.app_ui(&name);
+    let port = match ui.port {
+        Some(p) if ui.enabled => p,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                "app declares no embedded UI (headless)",
+            )
+                .into_response();
+        }
+    };
+
+    let url = match query.as_deref() {
+        Some(q) if !q.is_empty() => format!("http://127.0.0.1:{port}/{rest}?{q}"),
+        _ => format!("http://127.0.0.1:{port}/{rest}"),
+    };
+
+    // Don't follow redirects: we rewrite `Location` so the browser stays inside
+    // the proxied namespace.
+    let client = match reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("proxy client init: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let up_method = match reqwest::Method::from_bytes(method.as_str().as_bytes()) {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad method: {e}")).into_response(),
+    };
+
+    let mut req = client.request(up_method, &url);
+    for (k, v) in headers.iter() {
+        if app_view_strip_request_header(k.as_str()) {
+            continue;
+        }
+        req = req.header(k, v);
+    }
+    if !body.is_empty() {
+        req = req.body(body.to_vec());
+    }
+
+    let upstream = match req.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("upstream {url}: {e}")).into_response();
+        }
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let up_headers = upstream.headers().clone();
+    // Stream the upstream body rather than buffering it: a running app can emit
+    // an arbitrarily large (or long-lived) response — e.g. a file download — and
+    // buffering it whole in the console would be a memory-exhaustion hazard.
+    let body_stream = axum::body::Body::from_stream(upstream.bytes_stream());
+
+    let mut out = Response::new(body_stream);
+    *out.status_mut() = status;
+    let out_headers = out.headers_mut();
+    for (k, v) in up_headers.iter() {
+        let key = k.as_str();
+        if app_view_strip_response_header(key) {
+            continue;
+        }
+        if key == "location" {
+            if let Ok(loc) = v.to_str() {
+                let rewritten = app_view_rewrite_location(loc, &name, port);
+                if let Ok(hv) = axum::http::HeaderValue::from_str(&rewritten) {
+                    out_headers.append(header::LOCATION, hv);
+                }
+            }
+            continue;
+        }
+        // `append` (not `insert`) so multi-valued headers — notably
+        // `set-cookie` — survive intact.
+        out_headers.append(k.clone(), v.clone());
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// App-shipped left-rail icon (ADR 0057, issue #638)
+//
+// A project's `ui.icon` is either a *bundled glyph name* (resolved client-side
+// against the console's icon set) or a *project asset path* (e.g.
+// `assets/icon.svg`). This route serves the latter: a path-guarded, image-only
+// GET so the rail can render the app's own icon via <img>.
+
+/// Whether a `ui.icon` value denotes a project asset path (served here) rather
+/// than a bundled glyph name (resolved client-side). Heuristic mirrored in the
+/// console (`isAssetIcon`): a value that contains a path separator or ends in a
+/// file extension is an asset; a bare token (`workers`, `docs`) is a glyph.
+fn app_view_icon_is_asset(icon: &str) -> bool {
+    icon.contains('/')
+        || std::path::Path::new(icon)
+            .extension()
+            .is_some_and(|e| !e.is_empty())
+}
+
+/// Map an icon file extension to the image content-type we're willing to serve.
+/// `None` ⇒ not an allow-listed image type (we refuse to serve it, so the rail
+/// falls back to the default glyph rather than leaking arbitrary project files).
+fn app_view_icon_content_type(path: &std::path::Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("svg") => Some("image/svg+xml"),
+        Some("png") => Some("image/png"),
+        Some("webp") => Some("image/webp"),
+        Some("gif") => Some("image/gif"),
+        Some("jpg") | Some("jpeg") => Some("image/jpeg"),
+        Some("ico") => Some("image/x-icon"),
+        Some("avif") => Some("image/avif"),
+        _ => None,
+    }
+}
+
+/// `GET /console/app-view-icon/{name}` — serve a project's app-shipped rail
+/// icon. 404 when the project declares no asset-path icon (bundled names render
+/// client-side) or the file is missing/too large/not an allowed image type.
+async fn app_view_icon(Path(name): Path<String>) -> Response {
+    if !workspace::is_safe_name(&name) {
+        return (StatusCode::BAD_REQUEST, "invalid project name").into_response();
+    }
+    let Some(icon) = projects::supervisor().app_ui(&name).icon else {
+        return (StatusCode::NOT_FOUND, "no app-shipped icon").into_response();
+    };
+    // Bundled glyph names are resolved by the console, not served as files.
+    if !app_view_icon_is_asset(&icon) {
+        return (StatusCode::NOT_FOUND, "icon is a bundled glyph name").into_response();
+    }
+    let Some(path) = projects::safe_project_path(&name, &icon) else {
+        return (StatusCode::BAD_REQUEST, "invalid icon path").into_response();
+    };
+    let Some(content_type) = app_view_icon_content_type(&path) else {
+        return (StatusCode::NOT_FOUND, "icon is not an allowed image type").into_response();
+    };
+    // `safe_project_path` is purely lexical (rejects `..` etc.), but the file it
+    // points at can still be a *symlink* escaping the project dir. Canonicalize
+    // both and require containment so this route can never read outside the
+    // project (it's unauthenticated and remotely reachable).
+    let real = match std::fs::canonicalize(&path) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "no such icon file").into_response(),
+    };
+    match projects::project_dir(&name).and_then(|d| std::fs::canonicalize(d).ok()) {
+        Some(root) if real.starts_with(&root) => {}
+        _ => return (StatusCode::NOT_FOUND, "icon resolves outside the project").into_response(),
+    }
+    // Bound the read: cap memory at MAX+1 bytes even if the file lies about its
+    // size, and reject anything over the icon limit.
+    const MAX_ICON_BYTES: u64 = 512 * 1024;
+    let bytes = {
+        use std::io::Read;
+        let file = match std::fs::File::open(&real) {
+            Ok(f) => f,
+            Err(_) => return (StatusCode::NOT_FOUND, "no such icon file").into_response(),
+        };
+        let mut buf = Vec::new();
+        if file.take(MAX_ICON_BYTES + 1).read_to_end(&mut buf).is_err() {
+            return (StatusCode::NOT_FOUND, "could not read icon").into_response();
+        }
+        buf
+    };
+    if bytes.len() as u64 > MAX_ICON_BYTES {
+        return (StatusCode::PAYLOAD_TOO_LARGE, "icon file too large").into_response();
+    }
+
+    let mut out = Response::new(axum::body::Body::from(bytes));
+    let h = out.headers_mut();
+    h.insert(header::CONTENT_TYPE, content_type.parse().unwrap());
+    // Defence in depth for scripted SVGs: served for <img> (scripts don't run
+    // there), but a direct navigation to this URL would otherwise execute an
+    // embedded <script> in the console origin. `sandbox` (no allow-scripts)
+    // neutralises that even on direct load; nosniff keeps the type honest.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        "sandbox; default-src 'none'; style-src 'unsafe-inline'"
+            .parse()
+            .unwrap(),
+    );
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    h.insert(
+        header::CACHE_CONTROL,
+        "private, max-age=60".parse().unwrap(),
+    );
     out
 }
 
@@ -2604,6 +2964,12 @@ pub(super) async fn projects_list() -> ApiResult {
     let mut out = Vec::with_capacity(list.len());
     for mut p in list.drain(..) {
         p.running = sup.is_running(&p.name).await;
+        // Only running apps appear in the left-rail running-apps surface, so
+        // resolve the app-view descriptor lazily for those (avoids a manifest +
+        // config read per stopped project on every listing).
+        if p.running {
+            p.app_ui = Some(sup.app_ui(&p.name));
+        }
         out.push(p);
     }
     Ok(serde_json::json!({
@@ -3282,6 +3648,152 @@ mod loopback_gate_tests {
         ));
         // Opaque origins (sandboxed iframe, file://) present as "null".
         assert!(!req("127.0.0.1", "localhost:8080", Some("null")));
+    }
+}
+
+#[cfg(test)]
+mod app_view_proxy_tests {
+    use super::{
+        app_view_rewrite_location, app_view_strip_request_header, app_view_strip_response_header,
+    };
+
+    #[test]
+    fn strips_hop_by_hop_but_forwards_accept_encoding_requests() {
+        for h in [
+            "host",
+            "connection",
+            "content-length",
+            "upgrade",
+            "transfer-encoding",
+        ] {
+            assert!(app_view_strip_request_header(h), "should strip {h}");
+        }
+        // accept-encoding is forwarded (relayed content-encoding stays coherent).
+        for h in [
+            "cookie",
+            "authorization",
+            "content-type",
+            "accept",
+            "accept-encoding",
+        ] {
+            assert!(!app_view_strip_request_header(h), "should forward {h}");
+        }
+    }
+
+    #[test]
+    fn strips_framing_guards_and_length_from_responses() {
+        for h in [
+            "x-frame-options",
+            "content-security-policy",
+            "content-security-policy-report-only",
+            "service-worker-allowed",
+            "content-length",
+            "connection",
+        ] {
+            assert!(app_view_strip_response_header(h), "should strip {h}");
+        }
+        // content-encoding is relayed (reqwest doesn't decode; bytes still match).
+        for h in [
+            "content-type",
+            "set-cookie",
+            "location",
+            "etag",
+            "vary",
+            "content-encoding",
+        ] {
+            assert!(!app_view_strip_response_header(h), "should keep {h}");
+        }
+    }
+
+    #[test]
+    fn rewrites_root_relative_and_loopback_absolute_locations() {
+        assert_eq!(
+            app_view_rewrite_location("/login", "acme", 3000),
+            "/console/app-view/acme/login"
+        );
+        assert_eq!(
+            app_view_rewrite_location("http://127.0.0.1:3000/next", "acme", 3000),
+            "/console/app-view/acme/next"
+        );
+        assert_eq!(
+            app_view_rewrite_location("http://localhost:3000/", "acme", 3000),
+            "/console/app-view/acme/"
+        );
+        // Bare origin (no path) still lands on the namespaced root.
+        assert_eq!(
+            app_view_rewrite_location("http://127.0.0.1:3000", "acme", 3000),
+            "/console/app-view/acme/"
+        );
+    }
+
+    #[test]
+    fn passes_through_foreign_and_protocol_relative_locations() {
+        // Cross-host absolute: leave alone.
+        assert_eq!(
+            app_view_rewrite_location("https://accounts.google.com/o", "acme", 3000),
+            "https://accounts.google.com/o"
+        );
+        // Different loopback port: not ours, leave alone.
+        assert_eq!(
+            app_view_rewrite_location("http://127.0.0.1:9999/x", "acme", 3000),
+            "http://127.0.0.1:9999/x"
+        );
+        // Protocol-relative (`//host/...`) must NOT be treated as root-relative.
+        assert_eq!(
+            app_view_rewrite_location("//evil.example/x", "acme", 3000),
+            "//evil.example/x"
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_view_icon_tests {
+    use std::path::Path;
+
+    use super::{app_view_icon_content_type, app_view_icon_is_asset};
+
+    #[test]
+    fn asset_paths_vs_bundled_glyph_names() {
+        // Asset paths: a separator or a file extension.
+        for icon in [
+            "assets/icon.svg",
+            "icon.png",
+            "brand/logo.webp",
+            "a/b/c.ico",
+        ] {
+            assert!(app_view_icon_is_asset(icon), "{icon} should be an asset");
+        }
+        // Bundled glyph names: a bare token, no separator, no extension.
+        for icon in ["workers", "docs", "explorer", "appDefault"] {
+            assert!(!app_view_icon_is_asset(icon), "{icon} should be a glyph");
+        }
+        // Dotfiles have no extension (matches JS + Rust `Path::extension`): a
+        // bare ".svg" is not treated as an asset, so client and server agree.
+        assert!(
+            !app_view_icon_is_asset(".svg"),
+            ".svg is a dotfile, not an asset"
+        );
+    }
+
+    #[test]
+    fn only_allow_listed_image_types_resolve_a_content_type() {
+        assert_eq!(
+            app_view_icon_content_type(Path::new("a/icon.svg")),
+            Some("image/svg+xml")
+        );
+        assert_eq!(
+            app_view_icon_content_type(Path::new("ICON.PNG")),
+            Some("image/png")
+        );
+        assert_eq!(
+            app_view_icon_content_type(Path::new("logo.jpeg")),
+            Some("image/jpeg")
+        );
+        // Non-image / dangerous extensions are refused (no content-type ⇒ 404),
+        // so this route can never be used to exfiltrate a project's source.
+        for p in ["worker.ts", "app.db", "secret.env", "noext", "icon.html"] {
+            assert_eq!(app_view_icon_content_type(Path::new(p)), None, "{p}");
+        }
     }
 }
 

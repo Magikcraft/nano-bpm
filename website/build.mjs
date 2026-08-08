@@ -229,6 +229,7 @@ function langChips() {
     ["rust", "Rust"],
     ["python", "Python"],
     ["csharp", "C#"],
+    ["go", "Go"],
   ];
   return langs
     .map(([id, label]) => {

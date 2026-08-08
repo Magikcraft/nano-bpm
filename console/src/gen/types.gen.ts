@@ -452,6 +452,10 @@ export type ProjectSummary = {
      * The installed scaffolding pack's current version, when it differs from `scaffoldedFrom.version` (the target of an update). Absent when up to date or not scaffolded from a pack.
      */
     latestVersion?: string;
+    /**
+     * Console-integrated app-view descriptor (ADR 0057, issue #638), present only for a running app so the left rail can render it as a running-app entry without a per-project detail fetch. Absent for stopped projects (the rail lists running apps only).
+     */
+    appUi?: AppUi;
 };
 
 export type ProjectRunConfig = {
