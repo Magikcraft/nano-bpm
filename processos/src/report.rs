@@ -5,11 +5,11 @@
 //!
 //! Pure aggregation over the read-contract DTOs — no engine, no LLM, no writes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
-use crate::contracts::{InstanceTrace, Metrics, NanoClient, TraceSummary};
+use crate::contracts::{InstanceTrace, Metrics, NanoClient, Role, TraceSummary};
 use crate::dataset::TraceSource;
 
 /// The full Insights document served at `GET /api/insights`.
@@ -30,6 +30,68 @@ pub struct Insights {
     pub live: Option<Metrics>,
     pub processes: Vec<ProcessInsight>,
     pub incident_clusters: Vec<IncidentCluster>,
+    /// **G1 content fold** (doc #6): the application-domain signals projected onto
+    /// the sampled traces, aggregated domain-free by generic [`Role`]/`Scope`. This is
+    /// the "content" half of process+content — surfaced faithfully, never scored here.
+    pub content: DomainContent,
+}
+
+/// Domain-free rollup of the [`crate::contracts::DomainSignal`]s present on the
+/// sampled traces (doc #6 G1). Keys strictly on generic `role`/`scope`, never on an
+/// app `kind`, so the reasoner stays domain-independent.
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainContent {
+    /// Total domain signals projected across the sampled instances.
+    pub signals: usize,
+    /// Of those, how many are agent priors/hypotheses (not measured evidence).
+    /// Surfaced but excluded from the measured pattern folds below.
+    pub agent_priors: usize,
+    /// Signal counts by generic role.
+    pub by_role: Vec<LabelCount>,
+    /// Redundant-recompute: a `knowledge` signal independently re-derived across
+    /// ≥2 sibling actors within one instance (measured evidence only). The flagship
+    /// domain-inefficiency (doc #6 §1.2), expressed purely over role + scope.
+    pub redundant_recompute: Vec<RedundantRecompute>,
+    /// Delayed correctness/value rollup, when instances supply `outcomeTruth`.
+    pub outcome_truth: Option<OutcomeTruthRollup>,
+}
+
+/// A generic `{label, count}` tally, reused for role and status breakdowns.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelCount {
+    pub label: String,
+    pub count: usize,
+}
+
+/// One redundant-recompute finding: the same knowledge key produced independently
+/// by multiple sibling actors within a single instance.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedundantRecompute {
+    /// The instance the recompute happened in.
+    pub instance: String,
+    /// The recurring knowledge key (`dedupeKey` when present, else the body).
+    pub key: String,
+    /// Distinct sibling actors that each independently produced it.
+    pub actors: Vec<String>,
+    /// Number of distinct actors (== `actors.len()`), the recompute multiplicity.
+    pub occurrences: usize,
+}
+
+/// Aggregate of the per-instance `outcomeTruth` signals.
+#[derive(Debug, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeTruthRollup {
+    /// Instances that supplied an `outcomeTruth`.
+    pub instances: usize,
+    /// Count by the richer `status` (e.g. `merged | escalated | abandoned`).
+    pub by_status: Vec<LabelCount>,
+    /// Mean `roundsToConverge` over instances that reported it.
+    pub avg_rounds_to_converge: Option<f64>,
+    /// Mean `reworkEvents` over instances that reported it.
+    pub avg_rework_events: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -112,6 +174,7 @@ pub async fn build_over(
 
     let processes = fold_processes(&details);
     let incident_clusters = fold_incident_clusters(&details);
+    let content = fold_domain_signals(&details);
 
     Ok(Insights {
         generated_at_ms: now_ms(),
@@ -122,6 +185,7 @@ pub async fn build_over(
         live,
         processes,
         incident_clusters,
+        content,
     })
 }
 
@@ -141,7 +205,119 @@ fn totals_of(summaries: &[TraceSummary]) -> Totals {
     t
 }
 
-/// Per-element running aggregate while folding instance traces.
+/// **G1 content fold** (doc #6): aggregate the [`crate::contracts::DomainSignal`]s
+/// present on the sampled traces into a domain-free [`DomainContent`]. Keys strictly
+/// on generic `role`/`scope`; app `kind` is never inspected. Only **measured**
+/// signals feed the pattern folds — agent priors are counted separately.
+fn fold_domain_signals(details: &[InstanceTrace]) -> DomainContent {
+    let mut by_role: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut signals = 0usize;
+    let mut agent_priors = 0usize;
+    // instance -> knowledge key -> distinct sibling actors (measured evidence only).
+    let mut recompute: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
+
+    let mut ot_instances = 0usize;
+    let mut status_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut rounds: Vec<u32> = Vec::new();
+    let mut rework: Vec<u32> = Vec::new();
+
+    for t in details {
+        for s in &t.domain_signals {
+            signals += 1;
+            *by_role.entry(s.role.as_str()).or_default() += 1;
+            let measured = s.is_measured();
+            if !measured {
+                agent_priors += 1;
+            }
+            if measured && s.role == Role::Knowledge {
+                if let Some(actor) = s.scope.actor.clone() {
+                    let inst = s
+                        .scope
+                        .instance
+                        .clone()
+                        .unwrap_or_else(|| t.instance_key.clone());
+                    let key = s
+                        .dedupe_key
+                        .clone()
+                        .or_else(|| s.body.clone())
+                        .unwrap_or_default();
+                    if !key.is_empty() {
+                        recompute
+                            .entry(inst)
+                            .or_default()
+                            .entry(key)
+                            .or_default()
+                            .insert(actor);
+                    }
+                }
+            }
+        }
+        if let Some(ot) = &t.outcome_truth {
+            ot_instances += 1;
+            if let Some(st) = &ot.status {
+                *status_counts.entry(st.clone()).or_default() += 1;
+            }
+            if let Some(r) = ot.rounds_to_converge {
+                rounds.push(r);
+            }
+            if let Some(r) = ot.rework_events {
+                rework.push(r);
+            }
+        }
+    }
+
+    let mut redundant_recompute: Vec<RedundantRecompute> = recompute
+        .into_iter()
+        .flat_map(|(inst, keys)| {
+            keys.into_iter()
+                .filter(|(_, actors)| actors.len() >= 2)
+                .map(move |(key, actors)| RedundantRecompute {
+                    instance: inst.clone(),
+                    key,
+                    occurrences: actors.len(),
+                    actors: actors.into_iter().collect(),
+                })
+        })
+        .collect();
+    // Worst-first, then stable by instance/key.
+    redundant_recompute.sort_by(|a, b| {
+        b.occurrences
+            .cmp(&a.occurrences)
+            .then_with(|| a.instance.cmp(&b.instance))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+
+    let by_role = by_role
+        .into_iter()
+        .map(|(label, count)| LabelCount {
+            label: label.to_string(),
+            count,
+        })
+        .collect();
+
+    let outcome_truth = (ot_instances > 0).then(|| {
+        let mean = |v: &[u32]| {
+            (!v.is_empty()).then(|| v.iter().map(|x| *x as f64).sum::<f64>() / v.len() as f64)
+        };
+        OutcomeTruthRollup {
+            instances: ot_instances,
+            by_status: status_counts
+                .into_iter()
+                .map(|(label, count)| LabelCount { label, count })
+                .collect(),
+            avg_rounds_to_converge: mean(&rounds),
+            avg_rework_events: mean(&rework),
+        }
+    });
+
+    DomainContent {
+        signals,
+        agent_priors,
+        by_role,
+        redundant_recompute,
+        outcome_truth,
+    }
+}
 #[derive(Default)]
 struct ElemAcc {
     count: usize,
@@ -303,6 +479,7 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::{DomainSignal, Scope};
 
     #[test]
     fn percentile_nearest_rank() {
@@ -355,6 +532,8 @@ mod tests {
             creation_variables: None,
             stimuli: None,
             stimuli_truncated: false,
+            domain_signals: vec![],
+            outcome_truth: None,
         };
         let procs = fold_processes(std::slice::from_ref(&t));
         assert_eq!(procs.len(), 1);
@@ -367,5 +546,102 @@ mod tests {
         assert_eq!(clusters.len(), 1);
         assert_eq!(clusters[0].element_id, "slow");
         assert_eq!(clusters[0].top_reason, "boom");
+    }
+
+    fn signal(role: Role, actor: &str, key: &str, provenance: Option<&str>) -> DomainSignal {
+        DomainSignal {
+            role,
+            scope: Scope {
+                instance: Some("i1".into()),
+                actor: Some(actor.into()),
+                ..Default::default()
+            },
+            dedupe_key: Some(key.into()),
+            provenance: provenance.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn fold_domain_signals_counts_by_role_and_flags_agent_priors() {
+        let t = InstanceTrace {
+            instance_key: "i1".into(),
+            domain_signals: vec![
+                signal(Role::Knowledge, "a", "k", None),
+                signal(Role::Claim, "a", "c", None),
+                signal(Role::Defect, "b", "d", Some("agent-retro")),
+            ],
+            ..Default::default()
+        };
+        let c = fold_domain_signals(&[t]);
+        assert_eq!(c.signals, 3);
+        assert_eq!(c.agent_priors, 1);
+        let role = |r: &str| c.by_role.iter().find(|x| x.label == r).map(|x| x.count);
+        assert_eq!(role("knowledge"), Some(1));
+        assert_eq!(role("claim"), Some(1));
+        assert_eq!(role("defect"), Some(1));
+    }
+
+    #[test]
+    fn redundant_recompute_needs_two_sibling_actors_and_ignores_priors() {
+        let t = InstanceTrace {
+            instance_key: "i1".into(),
+            domain_signals: vec![
+                // Same key re-derived by two measured sibling actors => a finding.
+                signal(Role::Knowledge, "a", "shared", None),
+                signal(Role::Knowledge, "b", "shared", None),
+                // A single-actor key => not a finding.
+                signal(Role::Knowledge, "a", "solo", None),
+                // An agent prior for the same key must NOT count as measured evidence.
+                signal(Role::Knowledge, "c", "shared", Some("agent-hypothesis")),
+            ],
+            ..Default::default()
+        };
+        let c = fold_domain_signals(&[t]);
+        assert_eq!(c.redundant_recompute.len(), 1);
+        let rr = &c.redundant_recompute[0];
+        assert_eq!(rr.key, "shared");
+        assert_eq!(rr.occurrences, 2);
+        assert_eq!(rr.actors, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn outcome_truth_rollup_averages_present_fields() {
+        use crate::contracts::OutcomeTruth;
+        let mk = |status: &str, rounds: Option<u32>, rework: Option<u32>| InstanceTrace {
+            outcome_truth: Some(OutcomeTruth {
+                status: Some(status.into()),
+                rounds_to_converge: rounds,
+                rework_events: rework,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let c = fold_domain_signals(&[
+            mk("merged", Some(2), Some(1)),
+            mk("merged", Some(4), None),
+            mk("escalated", None, Some(3)),
+        ]);
+        let ot = c.outcome_truth.unwrap();
+        assert_eq!(ot.instances, 3);
+        assert_eq!(
+            ot.by_status
+                .iter()
+                .find(|x| x.label == "merged")
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(ot.avg_rounds_to_converge, Some(3.0));
+        assert_eq!(ot.avg_rework_events, Some(2.0));
+    }
+
+    #[test]
+    fn content_absent_is_empty_and_safe() {
+        let c = fold_domain_signals(&[InstanceTrace::default()]);
+        assert_eq!(c.signals, 0);
+        assert!(c.by_role.is_empty());
+        assert!(c.redundant_recompute.is_empty());
+        assert!(c.outcome_truth.is_none());
     }
 }

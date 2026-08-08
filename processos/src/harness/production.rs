@@ -148,6 +148,7 @@ mod tests {
             live: None,
             processes,
             incident_clusters: Vec::new(),
+            content: Default::default(),
         }
     }
 
