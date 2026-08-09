@@ -235,21 +235,24 @@ fn fold_domain_signals(details: &[InstanceTrace]) -> DomainContent {
                 // do NOT fall back to the free-text `body`: it is unbounded, would bloat
                 // the fold and the `/api/insights` payload, and could duplicate sensitive
                 // text into a top-level summary. A knowledge signal without a dedupe key
-                // simply doesn't participate in recompute detection.
-                if let (Some(actor), Some(key)) = (s.scope.actor.clone(), s.dedupe_key.clone()) {
-                    if !key.is_empty() {
-                        let inst = s
-                            .scope
-                            .instance
-                            .clone()
-                            .unwrap_or_else(|| t.instance_key.clone());
-                        recompute
-                            .entry(inst)
-                            .or_default()
-                            .entry(key)
-                            .or_default()
-                            .insert(actor);
-                    }
+                // simply doesn't participate in recompute detection. Optional wire
+                // fields that arrive as empty strings are treated as absent (like
+                // `dedupeKey`) so we never key a finding under an empty actor/instance.
+                let actor = s.scope.actor.clone().filter(|a| !a.is_empty());
+                let key = s.dedupe_key.clone().filter(|k| !k.is_empty());
+                if let (Some(actor), Some(key)) = (actor, key) {
+                    let inst = s
+                        .scope
+                        .instance
+                        .clone()
+                        .filter(|i| !i.is_empty())
+                        .unwrap_or_else(|| t.instance_key.clone());
+                    recompute
+                        .entry(inst)
+                        .or_default()
+                        .entry(key)
+                        .or_default()
+                        .insert(actor);
                 }
             }
         }
@@ -622,6 +625,37 @@ mod tests {
         let c = fold_domain_signals(&[t]);
         // Two sibling actors, same body, but no dedupe key => not a finding.
         assert!(c.redundant_recompute.is_empty());
+    }
+
+    #[test]
+    fn redundant_recompute_treats_empty_actor_and_instance_as_absent() {
+        // Empty-string actor => no finding, even with matching dedupe keys.
+        let mut a = signal(Role::Knowledge, "", "k", None);
+        a.scope.instance = Some(String::new());
+        let mut b = signal(Role::Knowledge, "", "k", None);
+        b.scope.instance = Some(String::new());
+        let empty_actor = InstanceTrace {
+            instance_key: "i1".into(),
+            domain_signals: vec![a, b],
+            ..Default::default()
+        };
+        assert!(fold_domain_signals(&[empty_actor])
+            .redundant_recompute
+            .is_empty());
+
+        // Empty-string instance falls back to the trace instance_key, not an "" group.
+        let mut c1 = signal(Role::Knowledge, "a", "k", None);
+        c1.scope.instance = Some(String::new());
+        let mut c2 = signal(Role::Knowledge, "b", "k", None);
+        c2.scope.instance = Some(String::new());
+        let empty_inst = InstanceTrace {
+            instance_key: "fallback".into(),
+            domain_signals: vec![c1, c2],
+            ..Default::default()
+        };
+        let rr = fold_domain_signals(&[empty_inst]).redundant_recompute;
+        assert_eq!(rr.len(), 1);
+        assert_eq!(rr[0].instance, "fallback");
     }
 
     #[test]
