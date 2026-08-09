@@ -135,6 +135,7 @@ const published = [];
 // when its dist has been built, is served at `/demo/` (its Vite `base`). The
 // published schema/namespace URLs are unaffected (they own their own paths).
 write(join(outDir, "index.html"), homeHtml());
+write(join(outDir, "architecture", "index.html"), architectureHtml());
 write(join(outDir, "schemas", "index.html"), schemasHtml(published));
 
 // --- Bundled documentation site: console/public/docs -> /docs -----------------
@@ -278,18 +279,11 @@ function homeHtml() {
   // convergence loop the Model-first tab runs live (same task ids / signal / key).
   const heroCode = readSnippetRegion("snippets/hero-pr-review.ts", "hero");
 
-  const body = `<header class="nav">
-  <a class="brand" href="/">nanobpm<span class="dim">.io</span></a>
-  <nav>
-    <a href="/demo/">Demo</a>
-    ${docsPresent ? '<a href="/docs/">Docs</a>' : ""}
-    <a href="/schemas/">Schemas</a>
-  </nav>
-</header>
+  const body = `${siteNav()}
 
 <section class="hero">
   <p class="eyebrow"><span class="arp">Advanced Research Prototype</span></p>
-  <h1>Agent Graph Orchestration<br><span class="hl-sub">for the <span class="grad">Developer Workstation.</span></span></h1>
+  <h1>Agent Graph Orchestration<br><span class="hl-sub">for the Developer Workstation.</span></h1>
   <p class="subhead">Graphs that run the loops.</p>
   <p class="lede">A RAAD — Rapid Agent Application Development — environment that runs on
   your machine. Compose coding agents, tools, and human approvals into durable workflows.
@@ -424,7 +418,7 @@ ${langChips()}
 </section>
 
 <footer class="site-foot wrap">
-  <p><a href="/demo/">Browser demo</a>${docsPresent ? ' · <a href="/docs/">Documentation</a>' : ""} · <a href="/schemas/">Published schemas</a></p>
+  <p><a href="/architecture/">Architecture</a> · <a href="/demo/">Browser demo</a>${docsPresent ? ' · <a href="/docs/">Documentation</a>' : ""} · <a href="/schemas/">Published schemas</a></p>
   <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
 </footer>
 
@@ -466,6 +460,166 @@ ${langChips()}
 </script>`;
 
   return homePage("nanobpm.io — Agent Graph Orchestration for the Developer Workstation", body);
+}
+
+// The shared site header/nav. Emitted verbatim on every full-page (homePage
+// shell) surface so the brand + link set can't drift between the landing page
+// and the architecture page. `docsPresent` is a module-level const (computed
+// up-front), so /docs/ is advertised here on exactly the builds that ship it.
+function siteNav() {
+  return `<header class="nav">
+  <a class="brand" href="/">nanobpm<span class="dim">.io</span></a>
+  <nav>
+    <a href="/architecture/">Architecture</a>
+    <a href="/demo/">Demo</a>
+    ${docsPresent ? '<a href="/docs/">Docs</a>' : ""}
+    <a href="/schemas/">Schemas</a>
+  </nav>
+</header>`;
+}
+
+// The stack, top (application) to bottom (engine foundation). Single source of
+// truth for the architecture page: the diagram and the layer detail are all
+// derived from this array, so they can never disagree. Declared inside the
+// function so it stays in scope at call time (module-level `const` would be in
+// the temporal dead zone when the emit runs above).
+function architectureHtml() {
+  const ARCH_LAYERS = [
+    {
+      name: "Nano Workforce",
+      role: "Application",
+      tagline: "Agent-powered SDLC Orchestration",
+      desc:
+        "The application at the top of the stack. Hire agents and coding harnesses, " +
+        "then orchestrate the whole software-development lifecycle — write, review, test, " +
+        "merge — as durable graphs that resume across crashes and reboots.",
+      tags: ["Agent orchestration", "SDLC", "Durable runs"],
+    },
+    {
+      name: "Urban",
+      role: "Application framework",
+      tagline: "The Nano application framework",
+      desc:
+        "Author Nano apps as code or model. You write steps and handlers; Urban derives " +
+        "the executable model, job types, message correlation, and a generic worker — one " +
+        "source of truth, no hand-wired orchestration.",
+      tags: ["TypeScript-only", "More languages coming", "Code-first or Model-first"],
+    },
+    {
+      name: "Nano Studio",
+      role: "IDE",
+      tagline: "Rapid Agent Application Development IDE",
+      desc:
+        "The RAAD environment — a polyglot IDE to scaffold, run, and inspect agent " +
+        "applications on your workstation. Model-and-run, live traces, and the web console " +
+        "in one place.",
+      tags: ["Polyglot", "RAAD", "On-workstation"],
+    },
+    {
+      name: "Nano",
+      role: "Engine · foundation",
+      tagline: "Durable Agent Graph engine",
+      desc:
+        "The load-bearing runtime, written in Rust and compatible with the Camunda 8 API. " +
+        "Durable by default: on restart a graph resumes at the exact step it left off — " +
+        "completed activities aren't re-run and tokens aren't re-spent. Small enough to " +
+        "start on a Raspberry Pi.",
+      tags: ["Rust", "Camunda 8 API compatible", "Durable · exactly-once"],
+      foundation: true,
+    },
+  ];
+
+  const layers = ARCH_LAYERS.map((l, i) => {
+    const tags = l.tags
+      .map((t) => `<span>${esc(t)}</span>`)
+      .join("");
+    const connector =
+      i < ARCH_LAYERS.length - 1
+        ? '\n  <div class="rung" aria-hidden="true"><span>runs on</span></div>'
+        : "";
+    return `<article class="layer${l.foundation ? " foundation" : ""}">
+    <div class="layer-head">
+      <span class="depth" aria-hidden="true">${i + 1}</span>
+      <div>
+        <p class="role">${esc(l.role)}</p>
+        <h3>${esc(l.name)} <span class="tagline">— ${esc(l.tagline)}</span></h3>
+      </div>
+    </div>
+    <p>${esc(l.desc)}</p>
+    <div class="tags">${tags}</div>
+  </article>${connector}`;
+  }).join("\n");
+
+  const body = `${siteNav()}
+
+<style>
+  .arch-hero { max-width: var(--wrap); margin-inline: auto; padding: 3.6rem 1.4rem 1rem; text-align: center; }
+  .arch-hero h1 { font-size: clamp(2rem, 5vw, 3.1rem); margin: .4rem 0 .6rem; font-weight: 700; }
+  .arch-hero .lede { font-size: clamp(1.02rem, 2.2vw, 1.2rem); color: var(--muted); max-width: 42rem; margin: 0 auto; }
+
+  .stack { display: flex; flex-direction: column; gap: 0; max-width: 52rem; margin: 2.6rem auto 0; }
+  .layer {
+    border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel);
+    backdrop-filter: blur(6px); padding: 1.3rem 1.5rem 1.3rem 1.7rem; position: relative; overflow: hidden;
+  }
+  .layer::before {
+    content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+    background: linear-gradient(180deg, var(--emerald), var(--sky));
+  }
+  .layer.foundation { box-shadow: 0 0 0 1px rgba(52,211,153,.25), 0 24px 60px -30px rgba(56,189,248,.5); }
+  .layer-head { display: flex; align-items: flex-start; gap: .9rem; }
+  .layer .depth {
+    flex: none; width: 1.9rem; height: 1.9rem; border-radius: 8px; background: rgba(255,255,255,.05);
+    border: 1px solid var(--line); color: var(--sky); font-weight: 700;
+    display: grid; place-items: center; font-size: .95rem;
+  }
+  .layer .role { text-transform: uppercase; letter-spacing: .14em; font-size: .72rem; font-weight: 700; color: var(--sky); margin: .15rem 0 .1rem; }
+  .layer h3 { font-size: 1.25rem; margin: 0; }
+  .layer h3 .tagline { color: var(--muted); font-weight: 500; font-size: .95rem; }
+  .layer > p { margin: .7rem 0 0; color: var(--muted); font-size: .98rem; }
+  .layer .tags { margin-top: .85rem; display: flex; gap: .5rem; flex-wrap: wrap; }
+  .layer .tags span {
+    border: 1px solid var(--line); background: rgba(255,255,255,.04); padding: .28rem .7rem;
+    border-radius: 999px; font-size: .82rem; color: var(--ink); font-weight: 500;
+  }
+  .rung { display: grid; place-items: center; height: 2.1rem; position: relative; }
+  .rung::before { content: ""; width: 1px; height: 100%; background: linear-gradient(180deg, var(--sky), transparent); position: absolute; }
+  .rung span {
+    position: relative; font-size: .72rem; text-transform: uppercase; letter-spacing: .14em;
+    color: var(--muted); background: var(--bg); padding: 0 .5rem;
+  }
+
+  .arch-foot { max-width: 52rem; margin: 2.8rem auto 0; text-align: center; }
+  .arch-foot .cta { display: flex; gap: .8rem; justify-content: center; flex-wrap: wrap; margin-top: 1.4rem; }
+</style>
+
+<section class="arch-hero">
+  <p class="eyebrow"><span class="arp">Architecture</span></p>
+  <h1>One stack, <span class="grad">four layers.</span></h1>
+  <p class="lede">From the agent-powered application at the top to the durable Rust engine at
+  the foundation — each layer builds on the one below it.</p>
+</section>
+
+<section class="wrap">
+  <div class="stack">
+${layers}
+  </div>
+</section>
+
+<section class="arch-foot wrap">
+  <p class="muted">Nano is the load-bearing runtime; every layer above is optional and composes on top of it.</p>
+  <div class="cta">
+    <a class="btn primary" href="/demo/">Try it in your browser →</a>
+    ${docsPresent ? '<a class="btn ghost" href="/docs/">Read the docs →</a>' : '<a class="btn ghost" href="/schemas/">Published schemas →</a>'}
+  </div>
+</section>
+
+<footer class="site-foot wrap">
+  <p><a href="/">Home</a> · <a href="/demo/">Browser demo</a>${docsPresent ? ' · <a href="/docs/">Documentation</a>' : ""} · <a href="/schemas/">Published schemas</a></p>
+  <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
+</footer>`;
+
+  return homePage("nanobpm.io — Architecture", body);
 }
 
 // Minimal, dependency-free TS/JS highlighter for the fixed hero snippet. Ordered
@@ -549,8 +703,13 @@ function homePage(title, body) {
     text-transform: uppercase; letter-spacing: 0.18em; font-size: .78rem; font-weight: 700;
     color: var(--sky); margin: 0 0 1rem;
   }
-  .hero h1 { font-size: clamp(2.2rem, 5.6vw, 3.7rem); margin: 0 0 .6rem; font-weight: 700; }
-  .hero h1 .hl-sub { font-size: .68em; font-weight: 600; }
+  .hero h1 {
+    font-size: clamp(2.2rem, 5.6vw, 3.7rem); margin: 0 0 .6rem; font-weight: 700;
+    /* Match the console landing page's heading gradient (server/src/console/landing.html). */
+    background: linear-gradient(135deg, #ffffff 0%, var(--sky) 55%, var(--emerald) 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero h1 .hl-sub { font-size: .68em; font-weight: 600; font-style: italic; }
   .subhead { font-size: clamp(1.2rem, 2.8vw, 1.55rem); color: var(--ink); font-weight: 600; max-width: 40rem; margin: 0 auto 1.6rem; letter-spacing: -0.01em; }
   .grad {
     background: linear-gradient(90deg, var(--emerald), var(--sky));
