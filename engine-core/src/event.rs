@@ -258,6 +258,11 @@ pub enum Event {
         instance_key: Key,
         worker: String,
         deadline: u64,
+        /// The logical instant the lock was acquired (the activating command's
+        /// `now`). `deadline - activated_at` is the requested lock duration.
+        /// Defaults to `0` for events serialized before this field existed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        activated_at: u64,
     },
     /// A job's activation lock expired (its `deadline` passed); it becomes
     /// activatable again. Emitted by an `ExpireJobs` tick.

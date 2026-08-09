@@ -297,6 +297,7 @@ mod tests {
             state: JobState::Created,
             worker: None,
             deadline: None,
+            activated_at: None,
             activated: false,
             retries: 3,
             priority: nanobpmn_engine_core::DEFAULT_JOB_PRIORITY,

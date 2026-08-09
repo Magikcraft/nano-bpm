@@ -170,6 +170,14 @@ pub struct Job {
     /// Compared against the caller-supplied `now`; the engine never reads a
     /// wall clock itself.
     pub deadline: Option<u64>,
+    /// Logical instant at which the current activation lock was acquired, if
+    /// locked (the `now` carried on the activating `ActivateJobs` command). Set
+    /// alongside [`Job::deadline`] and cleared whenever the lock is released, so
+    /// the requested lock duration is observable as `deadline - activated_at`.
+    /// `None` for a job that is not currently activated. Defaults to `None` for
+    /// records serialized before the engine carried this field.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub activated_at: Option<u64>,
     /// Whether this job has ever been activated. Completion is permitted for any
     /// job that has been activated at least once and is not yet completed —
     /// regardless of which worker currently holds (or held) the lock. This is
@@ -1349,6 +1357,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     state: JobState::Created,
                     worker: None,
                     deadline: None,
+                    activated_at: None,
                     activated: false,
                     retries: *retries,
                     priority: *priority,
@@ -1387,6 +1396,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     state: JobState::Created,
                     worker: None,
                     deadline: None,
+                    activated_at: None,
                     activated: false,
                     retries: *retries,
                     priority: DEFAULT_JOB_PRIORITY,
@@ -1429,6 +1439,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     state: JobState::Created,
                     worker: None,
                     deadline: None,
+                    activated_at: None,
                     activated: false,
                     retries: *retries,
                     priority: DEFAULT_JOB_PRIORITY,
@@ -1480,12 +1491,14 @@ pub fn apply(state: &mut State, event: &Event) {
             job_key,
             worker,
             deadline,
+            activated_at,
             ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Activated;
                 job.worker = Some(worker.clone());
                 job.deadline = Some(*deadline);
+                job.activated_at = Some(*activated_at);
                 job.activated = true;
             }
             resync_job_index(state, *job_key);
@@ -1497,6 +1510,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.state = JobState::Created;
                     job.worker = None;
                     job.deadline = None;
+                    job.activated_at = None;
                 }
             }
             resync_job_index(state, *job_key);
@@ -1509,6 +1523,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.retries = *retries;
                 job.worker = None;
                 job.deadline = None;
+                job.activated_at = None;
                 // With retries left the job returns to the activatable pool; with
                 // none it parks (an incident is raised alongside this event).
                 job.state = if *retries > 0 {
@@ -1525,6 +1540,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.state = JobState::Errored;
                 job.worker = None;
                 job.deadline = None;
+                job.activated_at = None;
             }
             resync_job_index(state, *job_key);
         }
@@ -1534,6 +1550,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.state = JobState::Completed;
                 job.worker = None;
                 job.deadline = None;
+                job.activated_at = None;
             }
             resync_job_index(state, *job_key);
         }
@@ -1690,6 +1707,7 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.state = JobState::Created;
                     job.worker = None;
                     job.deadline = None;
+                    job.activated_at = None;
                 }
                 resync_job_index(state, *job_key);
             }
@@ -1791,6 +1809,7 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.state = JobState::Canceled;
                 job.worker = None;
                 job.deadline = None;
+                job.activated_at = None;
             }
             resync_job_index(state, *job_key);
         }

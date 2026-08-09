@@ -1492,6 +1492,20 @@ components:
         retries: { type: integer, format: int32 }
         worker: { type: string, nullable: true }
         deadline_ms: { type: integer, format: int64, nullable: true }
+        activated_at_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            Logical instant (ms since epoch) the current activation lock was
+            acquired. Populated only for a job the engine reports as Activated.
+        timeout_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            The lock duration the job was activated with (deadline_ms −
+            activated_at_ms), i.e. the worker's job timeout. Null unless activated.
     Incident:
       type: object
       required: [key, element_id, kind, state, reason, created_at_ms]

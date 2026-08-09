@@ -90,6 +90,16 @@ export type Job = {
     retries: number;
     worker: string | null;
     deadline_ms: number | null;
+    /**
+     * Logical instant (ms since epoch) the current activation lock was acquired. Populated only for a job the engine reports as Activated.
+     *
+     */
+    activated_at_ms?: number | null;
+    /**
+     * The lock duration the job was activated with (deadline_ms − activated_at_ms), i.e. the worker's job timeout. Null unless activated.
+     *
+     */
+    timeout_ms?: number | null;
 };
 
 export type Incident = {

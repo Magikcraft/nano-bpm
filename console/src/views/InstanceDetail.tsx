@@ -4,6 +4,7 @@ import { getInstance, resolveIncident, setInstanceVariables } from "../gen";
 import { fetchProcessXml } from "../lib/api";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import BpmnViewer from "../components/BpmnViewer";
+import { fmtClock, fmtDuration } from "../components/TraceTimeline";
 import { Badge, Button, Input, SectionLabel } from "../components/ui";
 
 export default function InstanceDetail({
@@ -165,7 +166,7 @@ export default function InstanceDetail({
           {jobs.length === 0 ? (
             <Empty>No jobs.</Empty>
           ) : (
-            <Table head={["Element", "Type", "State", "Retries", "Worker"]}>
+            <Table head={["Element", "Type", "State", "Retries", "Worker", "Activated", "Timeout"]}>
               {jobs.map((j) => (
                 <tr key={j.key} className="border-b border-edge">
                   <Td>{j.element_id}</Td>
@@ -173,6 +174,12 @@ export default function InstanceDetail({
                   <Td>{j.state}</Td>
                   <Td>{j.retries}</Td>
                   <Td className="text-fg-faint">{j.worker ?? "—"}</Td>
+                  <Td className="text-fg-faint">
+                    {j.activated_at_ms != null ? fmtClock(j.activated_at_ms) : "—"}
+                  </Td>
+                  <Td className="text-fg-faint">
+                    {j.timeout_ms != null ? fmtDuration(j.timeout_ms) : "—"}
+                  </Td>
                 </tr>
               ))}
             </Table>
