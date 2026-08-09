@@ -104,13 +104,15 @@ export default function AppView() {
   // burst (e.g. `stop requested` → `application stopped` → the app re-binding),
   // so debounce them into a single `getProject` fetch on the trailing edge.
   const refreshTimer = useRef<number | null>(null);
-  const scheduleRefresh = useCallback(() => {
-    if (refreshTimer.current != null) return;
-    refreshTimer.current = window.setTimeout(() => {
-      refreshTimer.current = null;
-      void refresh();
-    }, 150);
-  }, [refresh]);
+const scheduleRefresh = useCallback(() => {
+  if (refreshTimer.current != null) {
+    window.clearTimeout(refreshTimer.current);
+  }
+  refreshTimer.current = window.setTimeout(() => {
+    refreshTimer.current = null;
+    void refresh();
+  }, 150);
+}, [refresh]);
   useEffect(
     () => () => {
       if (refreshTimer.current != null)
