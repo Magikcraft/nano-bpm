@@ -65,8 +65,10 @@ export default function BpmnViewer({
 
   // Stable dep keys: the parent hands new array identities every render, so
   // depend on their content, not their reference, to avoid needless re-runs.
-  const activeKey = activeElementIds.join(",");
-  const incidentKey = incidentElementIds.join(",");
+  // Sort a copy first so the key is stable for the same *set* of ids even if
+  // the backend reorders jobs/incidents between SSE ticks.
+  const activeKey = [...activeElementIds].sort().join(",");
+  const incidentKey = [...incidentElementIds].sort().join(",");
 
   useEffect(() => {
     const viewer = viewerRef.current;
