@@ -67,6 +67,7 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0052](0052-urban-runtime-decoupled-manifest-interpreter.md) | The Urban runtime: a decoupled manifest interpreter (`@nanobpm/urban-runtime`), a scaffolder, and interchangeable hosts | Proposed | 2026-07-31 |
 | [0056](0056-agent-relay-command-stream-plane.md) | The Nano agentic protocol: an app-tier channel for agent networks, visibility, and coordination | Proposed | 2026-08-09 |
 | [0057](0057-console-app-view-embedded-urban-apps.md) | Console App View: mounting bespoke Urban app UIs (iframe-sandboxed) | Proposed | 2026-08-09 |
+| [0058](0058-openapi-endpoint-surface.md) | OpenAPI endpoint surface (contract-first controllers, ejectable to imperative) | Proposed | 2026-08-09 |
 
 ## Reading paths
 

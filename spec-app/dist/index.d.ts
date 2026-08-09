@@ -608,6 +608,7 @@ export interface AppManifest {
 	 * App-authored action handler overrides (ADR 0055 §3): each binds a route to a handler module that wraps the generic pages start/cancel/message actions. Mounted before the generic routes, so an exact override shadows the generic one.
 	 */
 	actions?: ActionDecl[];
+	api?: ApiBinding;
 	/**
 	 * Service-task handlers: referenced files, an llm binding, or a connector supplied by an installed pack (ADR 0022 §E, ADR 0050).
 	 */
@@ -821,6 +822,31 @@ export interface ActionDecl {
 	 * Match `path` as a prefix rather than exactly.
 	 */
 	prefix?: boolean;
+}
+/**
+ * The OpenAPI endpoint surface (ADR 0058): a contract-first API where the toolkit derives the controller layer (typed request/response contracts + runtime validators + route table) from an OpenAPI document and the author writes only the delegated implementation per `operationId`. Coexists with `actions[]` (both mount together, first-match-wins) and is ejectable — `eject` (whole surface) or an `x-urban-eject: true` vendor extension on an operation skips generated validation and hands the delegate the raw request. Every operation MUST carry a unique `operationId` (the delegate module key + type stem); `urban check` fails closed otherwise.
+ */
+export interface ApiBinding {
+	/**
+	 * OpenAPI 3.x document, app-root-relative (e.g. "openapi.json"). JSON is supported first; YAML is a fast-follow (ADR 0058 open questions).
+	 */
+	spec: string;
+	/**
+	 * Directory (app-root-relative) holding the per-`operationId` delegate modules; each default-exports an operation handler (or a named `handler`).
+	 */
+	dir?: string;
+	/**
+	 * Route prefix the derived operation paths mount under.
+	 */
+	base?: string;
+	/**
+	 * When to run the derived response validators: "dev" (IDE/Run only), "always", or "never". Response validation is off in production by default for perf.
+	 */
+	validateResponses?: "dev" | "always" | "never";
+	/**
+	 * Opt the whole surface out of generated request validation: routes + docs are still mounted, but every delegate receives the raw request. Per-operation opt-out uses the `x-urban-eject: true` OpenAPI vendor extension instead.
+	 */
+	eject?: boolean;
 }
 export interface LlmBinding {
 	/**
