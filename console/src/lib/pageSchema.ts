@@ -295,7 +295,16 @@ const str = (x: unknown, fallback = ""): string =>
 
 function parseColumnLink(raw: unknown): GridColumnLink | undefined {
   if (!isRecord(raw)) return undefined;
-  if (raw.kind === "processExplorer") {
+  const kind = raw.kind;
+  // Guard against unknown kinds via the single source of truth so the parser
+  // can't drift from GRID_COLUMN_LINK_KINDS; each known kind then validates its
+  // own fields below.
+  if (
+    typeof kind !== "string" ||
+    !GRID_COLUMN_LINK_KINDS.some((k) => k === kind)
+  )
+    return undefined;
+  if (kind === "processExplorer") {
     const keyField = str(raw.keyField);
     if (keyField === "") return undefined;
     return { kind: "processExplorer", keyField };

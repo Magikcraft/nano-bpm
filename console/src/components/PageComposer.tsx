@@ -550,16 +550,19 @@ function Settings({
             onChange={(rows) =>
               set(
                 "columns",
-                rows.map((r, i) => {
+                rows.map((r) => {
                   // Preserve the structured `link` an existing column carries —
                   // it isn't editable in this string-cell ListEditor (see the
                   // ColumnLinks editor below), so rebuilding from field/header
-                  // alone would silently drop it.
-                  const prev = (props.columns as GridColumn[] | undefined)?.[i];
-                  const col: GridColumn = {
-                    field: r.field ?? "",
-                    header: r.header ?? "",
-                  };
+                  // alone would silently drop it. Match the previous column by
+                  // `field` (its stable identity), not by array index: deleting
+                  // a column shifts indices, so an index match would mis-attach
+                  // a link to the wrong column.
+                  const field = r.field ?? "";
+                  const prev = (
+                    props.columns as GridColumn[] | undefined
+                  )?.find((c) => c.field === field);
+                  const col: GridColumn = { field, header: r.header ?? "" };
                   return prev?.link ? { ...col, link: prev.link } : col;
                 }),
               )
@@ -782,7 +785,11 @@ function ColumnLinks({
                 e.target.value === "processExplorer"
                   ? {
                       kind: "processExplorer",
-                      keyField: c.link?.keyField ?? "",
+                      // Default the key field to the first suggested column when
+                      // the author hasn't picked one — a link with an empty
+                      // keyField is intentionally dropped on save/round-trip, so
+                      // pre-filling keeps a just-selected link from vanishing.
+                      keyField: c.link?.keyField || fields[0] || "",
                     }
                   : undefined,
               )
