@@ -358,6 +358,8 @@ mod tests {
             creation_variables: None,
             stimuli: None,
             stimuli_truncated: false,
+            domain_signals: vec![],
+            outcome_truth: None,
         }
     }
 

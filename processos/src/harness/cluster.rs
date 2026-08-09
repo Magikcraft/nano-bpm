@@ -470,6 +470,8 @@ mod tests {
             creation_variables: None,
             stimuli: None,
             stimuli_truncated: false,
+            domain_signals: vec![],
+            outcome_truth: None,
         };
         let summaries = vec![summary("1", "order", "completed", 0, 100, 100)];
         let s = summarize_run("order", &summaries, &[detail]);
@@ -512,6 +514,8 @@ mod tests {
             creation_variables: None,
             stimuli: None,
             stimuli_truncated: false,
+            domain_signals: vec![],
+            outcome_truth: None,
         };
         let summaries = vec![summary("1", "order", "completed", 0, 160, 160)];
         let s = summarize_run("order", &summaries, &[detail]);
