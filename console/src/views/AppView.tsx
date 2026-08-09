@@ -60,10 +60,11 @@ export default function AppView() {
   const [logs, setLogs] = useState<KeyedLogLine[]>([]);
   const [tab, setTab] = useState<"app" | "logs">("app");
   // Hide the header icon when the server 404s a missing/oversized/wrong-type
-  // asset, mirroring the rail's fallback. Reset when the icon hint changes so a
-  // fixed/renamed icon recovers without a remount.
+  // asset, mirroring the rail's fallback. Reset when the icon hint or the app
+  // route changes so a fixed/renamed icon — or a different app that reuses the
+  // same icon string — recovers without a remount.
   const [iconFailed, setIconFailed] = useState(false);
-  useEffect(() => setIconFailed(false), [appUi?.icon]);
+  useEffect(() => setIconFailed(false), [name, appUi?.icon]);
   const logRef = useRef<HTMLDivElement | null>(null);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   // Monotonic id source for stable React keys: assigning a per-line id on
