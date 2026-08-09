@@ -351,8 +351,9 @@ function homeHtml() {
   <article>
     <h3>Durable by default</h3>
     <p>Survives crashes and forced reboots. On restart a workflow resumes at the exact step it left
-    off — completed activities aren't re-run and tokens aren't re-spent.</p>
-    <p class="proof">SIGKILL → cold restart → exactly-once. With a negative control.</p>
+    off — completed steps aren't replayed. Delivery is at-least-once, so activities stay idempotent
+    and effectively run once.</p>
+    <p class="proof">SIGKILL → cold restart → completed steps never replay. With a negative control.</p>
   </article>
 </section>
 
@@ -522,9 +523,9 @@ function architectureHtml() {
       desc:
         "The load-bearing runtime, written in Rust and compatible with the Camunda 8 API. " +
         "Durable by default: on restart a graph resumes at the exact step it left off — " +
-        "completed activities aren't re-run and tokens aren't re-spent. Small enough to " +
-        "start on a Raspberry Pi.",
-      tags: ["Rust", "Camunda 8 API compatible", "Durable · exactly-once"],
+        "completed (journal-committed) steps are never replayed. Delivery is at-least-once, " +
+        "so activities must be idempotent. Small enough to start on a Raspberry Pi.",
+      tags: ["Rust", "Camunda 8 API compatible", "At-least-once · idempotent recovery"],
       foundation: true,
     },
   ];
