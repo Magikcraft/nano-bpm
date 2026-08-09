@@ -433,6 +433,78 @@ test("v2 dataGrid survives a Craft.js round-trip unchanged", () => {
   assert.deepEqual(back, v2Grid);
 });
 
+test("parsePageDoc keeps a processExplorer column link and round-trips it", () => {
+  const doc = {
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "dataGrid" as const,
+        id: "g",
+        props: {
+          title: "",
+          data: { kind: "datasource" as const, source: "app", table: "t" },
+          columns: [
+            {
+              field: "status",
+              header: "Status",
+              link: {
+                kind: "processExplorer" as const,
+                keyField: "process_key",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const r = parsePageDoc(doc);
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const grid = r.ok && r.doc.nodes[0];
+  const col =
+    grid && grid.type === "dataGrid" ? grid.props.columns[0] : undefined;
+  assert.deepEqual(col?.link, {
+    kind: "processExplorer",
+    keyField: "process_key",
+  });
+  // Survives a Craft.js round-trip unchanged.
+  const back = toPageDoc(fromPageDoc(r.ok ? r.doc : doc), doc.title);
+  const backGrid = back.nodes[0];
+  assert.deepEqual(
+    backGrid.type === "dataGrid" ? backGrid.props.columns[0].link : undefined,
+    { kind: "processExplorer", keyField: "process_key" },
+  );
+});
+
+test("parsePageDoc drops a column link with an unknown kind or empty keyField", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "dataGrid",
+        id: "g",
+        props: {
+          data: { kind: "datasource", source: "app", table: "t" },
+          columns: [
+            { field: "a", header: "A", link: { kind: "wat", keyField: "k" } },
+            {
+              field: "b",
+              header: "B",
+              link: { kind: "processExplorer", keyField: "" },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const grid = r.ok && r.doc.nodes[0];
+  const cols = grid && grid.type === "dataGrid" ? grid.props.columns : [];
+  assert.equal(cols[0]?.link, undefined);
+  assert.equal(cols[1]?.link, undefined);
+});
+
 test("parsePageDoc drops a row action with an unknown kind", () => {
   const r = parsePageDoc({
     schemaVersion: PAGE_SCHEMA_VERSION,

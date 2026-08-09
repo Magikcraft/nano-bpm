@@ -24,9 +24,14 @@ import {
 } from "@craftjs/core";
 import type { ComposerEntity } from "../lib/shapeComposer";
 import {
+  emptyPage,
+  GRID_COLUMN_LINK_KINDS,
+  parsePageDoc,
   type ActionFormField,
   type GridColumn,
+  type GridColumnLink,
   type NavItem,
+  type PageDoc,
   type TextVariant,
 } from "../lib/pageSchema";
 import {
@@ -545,12 +550,27 @@ function Settings({
             onChange={(rows) =>
               set(
                 "columns",
-                rows.map((r) => ({
-                  field: r.field ?? "",
-                  header: r.header ?? "",
-                })),
+                rows.map((r, i) => {
+                  // Preserve the structured `link` an existing column carries —
+                  // it isn't editable in this string-cell ListEditor (see the
+                  // ColumnLinks editor below), so rebuilding from field/header
+                  // alone would silently drop it.
+                  const prev = (props.columns as GridColumn[] | undefined)?.[i];
+                  const col: GridColumn = {
+                    field: r.field ?? "",
+                    header: r.header ?? "",
+                  };
+                  return prev?.link ? { ...col, link: prev.link } : col;
+                }),
               )
             }
+          />
+          <ColumnLinks
+            columns={(props.columns as GridColumn[]) ?? []}
+            fields={tableFields(
+              qualifyTable(props.data as { source?: string; table?: string }),
+            )}
+            onChange={(cols) => set("columns", cols)}
           />
           <GridAdvanced props={props} set={set} />
         </>
@@ -717,8 +737,89 @@ function ListEditor({
   );
 }
 
-// ── the imperative bridge (get/set page.json from inside <Editor>) ───────────
+/** Per-column structured-link editor for a `dataGrid`'s columns. The string-cell
+ * ListEditor above owns field/header; this owns each column's optional `link`.
+ * Today the only link kind is `processExplorer` — the cell value becomes a deep
+ * link to the Nano console's explorer view for the process instance whose key is
+ * held in the chosen row field (`keyField`). Selecting "None" clears the link. */
+function ColumnLinks({
+  columns,
+  fields,
+  onChange,
+}: {
+  columns: GridColumn[];
+  fields: string[];
+  onChange: (columns: GridColumn[]) => void;
+}): ReactElement | null {
+  if (!columns.length) return null;
+  const setLink = (i: number, link: GridColumnLink | undefined) => {
+    onChange(
+      columns.map((c, j) => {
+        if (j !== i) return c;
+        if (!link) {
+          return { field: c.field, header: c.header };
+        }
+        return { ...c, link };
+      }),
+    );
+  };
+  const listId = "pc-link-keyfields";
+  return (
+    <div className="pc-list">
+      <div className="pc-row">
+        <span>Column links</span>
+      </div>
+      {columns.map((c, i) => (
+        <div key={i} className="pc-list-row">
+          <span className="pc-col-name">
+            {c.header || c.field || `#${i + 1}`}
+          </span>
+          <select
+            value={c.link?.kind ?? ""}
+            onChange={(e) =>
+              setLink(
+                i,
+                e.target.value === "processExplorer"
+                  ? {
+                      kind: "processExplorer",
+                      keyField: c.link?.keyField ?? "",
+                    }
+                  : undefined,
+              )
+            }
+          >
+            <option value="">No link</option>
+            {GRID_COLUMN_LINK_KINDS.map((k) => (
+              <option key={k} value={k}>
+                {k === "processExplorer" ? "Process explorer" : k}
+              </option>
+            ))}
+          </select>
+          {c.link?.kind === "processExplorer" && (
+            <input
+              list={listId}
+              placeholder="key field"
+              value={c.link.keyField}
+              onChange={(e) =>
+                setLink(i, {
+                  kind: "processExplorer",
+                  keyField: e.target.value,
+                })
+              }
+            />
+          )}
+        </div>
+      ))}
+      <datalist id={listId}>
+        {fields.map((f) => (
+          <option key={f} value={f} />
+        ))}
+      </datalist>
+    </div>
+  );
+}
 
+// ── the imperative bridge (get/set page.json from inside <Editor>) ───────────
 const Bridge = forwardRef<
   PageComposerHandle,
   {

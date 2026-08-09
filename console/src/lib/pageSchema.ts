@@ -55,10 +55,31 @@ export interface DatasourceBinding {
   orderBy?: GridOrder;
 }
 
+/** A structured, engine-aware link a grid column's value can carry. `kind` is a
+ * discriminant so more link targets can be added without breaking existing
+ * pages; the runtime renders an unrecognised kind as plain text. Today the only
+ * kind is `processExplorer`: the cell text links to the Nano console's explorer
+ * view for the process instance whose key is held in the row field `keyField`. */
+export interface ProcessExplorerColumnLink {
+  kind: "processExplorer";
+  /** The row field holding the process-instance key to open in the explorer. */
+  keyField: string;
+}
+
+export type GridColumnLink = ProcessExplorerColumnLink;
+
+/** The set of supported column-link kinds (single source of truth for the
+ * schema parser and the Studio editor's link-kind picker). */
+export const GRID_COLUMN_LINK_KINDS = ["processExplorer"] as const;
+
 export interface GridColumn {
   /** A column name on the bound table/entity. */
   field: string;
   header: string;
+  /** An optional structured link the cell value becomes (e.g. a process-explorer
+   * deep link). Distinct from the runtime's legacy `linkField` (a row field
+   * holding a full URL); a column may still carry a raw URL via page JSON. */
+  link?: GridColumnLink;
 }
 
 /** A tab over a single grid — selecting it swaps the active row filter
@@ -272,10 +293,24 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 const str = (x: unknown, fallback = ""): string =>
   typeof x === "string" ? x : fallback;
 
+function parseColumnLink(raw: unknown): GridColumnLink | undefined {
+  if (!isRecord(raw)) return undefined;
+  if (raw.kind === "processExplorer") {
+    const keyField = str(raw.keyField);
+    if (keyField === "") return undefined;
+    return { kind: "processExplorer", keyField };
+  }
+  return undefined;
+}
+
 function parseColumns(raw: unknown): GridColumn[] {
   return (Array.isArray(raw) ? raw : [])
     .filter(isRecord)
-    .map((c) => ({ field: str(c.field), header: str(c.header) }))
+    .map((c) => {
+      const link = parseColumnLink(c.link);
+      const col: GridColumn = { field: str(c.field), header: str(c.header) };
+      return link ? { ...col, link } : col;
+    })
     .filter((c) => c.field !== "");
 }
 
