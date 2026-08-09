@@ -178,11 +178,15 @@ jobs:
             zig: true
             glibc: '2.31'
           - target: aarch64-unknown-linux-gnu
-            # Native arm64 runner: builds on aarch64 hardware instead of
-            # cross-compiling from x64, removing the cross codegen penalty. zig is
-            # kept because the runner's native glibc (2.39) would otherwise bake in
-            # GLIBC_2.39 symbol refs — zigbuild still pins the 2.31 floor.
-            os: ubuntu-24.04-arm
+            # Cross-compiled from x64 with cargo-zigbuild (like the other Linux
+            # legs), NOT a native `ubuntu-24.04-arm` runner. The native-arm
+            # experiment (#635) intermittently SIGTERM-killed this leg (exit 143 at
+            # ~20 min, the hosted arm runner being preempted/OOM'd), wedging the
+            # publish job on v0.0.13. The x64 zigbuild path shipped arm64 cleanly
+            # for every release v0.0.5–v0.0.11, so it's the reliable default. zig
+            # cross-compiles the target regardless of host arch and pins the 2.31
+            # glibc floor.
+            os: ubuntu-24.04
             asset: nanobpm-gateway-rest-server-linux-arm64
             zig: true
             glibc: '2.31'
