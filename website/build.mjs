@@ -351,9 +351,9 @@ function homeHtml() {
   <article>
     <h3>Durable by default</h3>
     <p>Survives crashes and forced reboots. On restart a workflow resumes at the exact step it left
-    off — completed steps aren't replayed. Delivery is at-least-once, so activities stay idempotent
-    and effectively run once.</p>
-    <p class="proof">SIGKILL → cold restart → completed steps never replay. With a negative control.</p>
+    off — completed steps aren't replayed. Delivery is at-least-once: make your activities idempotent
+    (e.g. with idempotency keys) and they run effectively once.</p>
+    <p class="proof">SIGKILL → cold restart → completed steps are never replayed. With a negative control.</p>
   </article>
 </section>
 
