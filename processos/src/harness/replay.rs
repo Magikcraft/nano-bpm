@@ -1586,6 +1586,8 @@ mod tests {
             creation_variables: None,
             stimuli: Some(vec![]),
             stimuli_truncated: true,
+            domain_signals: vec![],
+            outcome_truth: None,
         };
         assert!(matches!(
             RecordedInstance::from_trace(&trace),
@@ -1607,6 +1609,8 @@ mod tests {
             creation_variables: None,
             stimuli: None,
             stimuli_truncated: false,
+            domain_signals: vec![],
+            outcome_truth: None,
         };
         assert!(matches!(
             RecordedInstance::from_trace(&trace),
@@ -1639,6 +1643,8 @@ mod tests {
                 variables: None,
             }]),
             stimuli_truncated: false,
+            domain_signals: vec![],
+            outcome_truth: None,
         };
         assert!(matches!(
             RecordedInstance::from_trace(&trace),
@@ -1689,6 +1695,8 @@ mod tests {
                 },
             ]),
             stimuli_truncated: false,
+            domain_signals: vec![],
+            outcome_truth: None,
         };
         let r = RecordedInstance::from_trace(&trace).unwrap();
         assert_eq!(r.started_at, 500);

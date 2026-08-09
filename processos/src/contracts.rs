@@ -34,7 +34,7 @@ pub struct TraceSummary {
 }
 
 /// `GET /console/api/traces/{key}` (a `trace::InstanceTraceDto`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct InstanceTrace {
     pub instance_key: String,
@@ -62,6 +62,170 @@ pub struct InstanceTrace {
     /// then incomplete and the instance is not safe to replay.
     #[serde(default)]
     pub stimuli_truncated: bool,
+    /// Application-domain **content** signals projected onto the trace (ProcessOS
+    /// domain-signal plane, `docs/processos-domain-signal-plane.md` §2). Additive
+    /// and absent-safe: a trace that projects none deserializes exactly as before
+    /// (empty vec). The reasoner keys on the generic `role`/`scope` here, never on
+    /// an app's own `kind` — see [`DomainSignal`].
+    #[serde(default)]
+    pub domain_signals: Vec<DomainSignal>,
+    /// The delayed correctness/value signal (outcome-truth, doc 3 §2), when the app
+    /// supplies a richer one than the instance's terminal `outcome`. Absent by
+    /// default; consumers fall back to `outcome` when this is `None`.
+    #[serde(default)]
+    pub outcome_truth: Option<OutcomeTruth>,
+}
+
+/// The **generic, closed** role vocabulary the reasoner keys on — the domain-free
+/// projection of an app's own signal `kind` (doc #6 §2.2). Patterns are expressed
+/// over `role`, never over app `kind`s, so the reasoner stays domain-agnostic. An
+/// unknown/unmapped app role deserializes to [`Role::Note`] (`#[serde(other)]`), so
+/// a new app kind can never leak an unhandled variant into the reasoner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum Role {
+    /// A durable fact/learning discovered during execution (e.g. blackboard `learning`).
+    Knowledge,
+    /// An assertion of ownership/intent over a resource (e.g. a file `claim`).
+    Claim,
+    /// A constraint/decision that narrows later work (e.g. `constraint-change`).
+    Constraint,
+    /// An observed defect/failure class.
+    Defect,
+    /// A handoff of work/context between actors.
+    Handoff,
+    /// A decision record.
+    Decision,
+    /// The catch-all: an unclassified note, and the fallback for any unknown app role.
+    #[default]
+    #[serde(other)]
+    Note,
+}
+
+impl Role {
+    /// The stable lowercase label for this role (matches the serde wire form).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Knowledge => "knowledge",
+            Role::Claim => "claim",
+            Role::Constraint => "constraint",
+            Role::Defect => "defect",
+            Role::Handoff => "handoff",
+            Role::Decision => "decision",
+            Role::Note => "note",
+        }
+    }
+}
+
+/// A generic scope bag: *what* a signal is about, in domain-free dimensions. This is
+/// what lets the reasoner express sibling-scope patterns — "repeated across sibling
+/// `actor`s within one `instance`" (redundant-recompute / contention) — with no
+/// domain word (doc #6 §1.2). Extra generic dims (e.g. `wave`) are preserved in
+/// `extra` rather than requiring a named field.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct Scope {
+    /// The process instance the signal is about (the ambient `__instance` join key).
+    #[serde(default)]
+    pub instance: Option<String>,
+    /// The BPMN element the signal is about, when narrower than the instance.
+    #[serde(default)]
+    pub element: Option<String>,
+    /// The actor/worker the signal is about (e.g. nano-workforce `author_task`).
+    #[serde(default)]
+    pub actor: Option<String>,
+    /// A partition/cohort dimension (e.g. a `wave`), when the app scopes by one.
+    #[serde(default)]
+    pub partition: Option<String>,
+    /// Any further generic scope dimensions the app supplies (e.g. `wave` as a
+    /// number), preserved verbatim without inventing a named field per domain.
+    #[serde(flatten, default)]
+    pub extra: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// One application-domain content signal projected onto a trace (doc #6 §2). It is
+/// **observation, never replay input** (blackboard/domain content is non-replayable).
+/// Two generic dimensions — [`Role`] and [`Scope`] — carry the reasoning weight and
+/// keep the reasoner domain-free.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DomainSignal {
+    /// App-declared namespace, e.g. `"nano-workforce/blackboard"`.
+    #[serde(default)]
+    pub ns: String,
+    /// The app's own signal kind (its domain vocabulary), mapped onto `role`.
+    #[serde(default)]
+    pub kind: String,
+    /// The generic role the reasoner keys on (unknown → [`Role::Note`]).
+    #[serde(default)]
+    pub role: Role,
+    /// The generic scope: which instance/element/actor/partition the signal is about.
+    #[serde(default)]
+    pub scope: Scope,
+    /// Best-effort BPMN element anchor (may be absent).
+    #[serde(default)]
+    pub element_id: Option<String>,
+    /// Signal timestamp (ms since epoch), when known.
+    #[serde(default)]
+    pub at: Option<u64>,
+    /// Free-text payload / description.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// Idempotency key mirroring the app's own dedupe key, when present.
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    /// Origin marker distinguishing **measured** evidence from an **agent prior**
+    /// (e.g. `"measured"`, `"blackboard"`, `"agent-retro"`). A non-measured origin
+    /// enters the reasoner strictly as a **prior that raises a pattern's prior** and
+    /// must be confirmed by measured cross-corpus evidence + `outcomeTruth` before any
+    /// suggestion — measured evidence and agent priors are never conflated
+    /// ("retro nominates, ProcessOS measures, human decides"). Absent → treated as
+    /// measured/observed.
+    #[serde(default)]
+    pub provenance: Option<String>,
+    /// Prior strength in `0.0..=1.0` for a hypothesis-origin signal; absent for
+    /// measured observations.
+    #[serde(default)]
+    pub confidence: Option<f64>,
+}
+
+impl DomainSignal {
+    /// True when this signal is measured/observed evidence rather than an agent
+    /// prior/hypothesis. Absent provenance ⇒ measured. Origins mentioning `agent`,
+    /// `retro`, `hypothesis`, or `prior` are treated as non-measured priors, which
+    /// the reasoner must confirm with measured evidence before acting on.
+    pub fn is_measured(&self) -> bool {
+        match self.provenance.as_deref() {
+            None => true,
+            Some(p) => {
+                let p = p.to_ascii_lowercase();
+                !(p.contains("agent")
+                    || p.contains("retro")
+                    || p.contains("hypothesis")
+                    || p.contains("prior"))
+            }
+        }
+    }
+}
+
+/// The delayed correctness/value signal for an instance (doc #6 §2, doc 3 §2). All
+/// fields optional and absent-safe; consumers fall back to the instance `outcome`
+/// when the whole struct is `None`.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct OutcomeTruth {
+    /// A richer status than the terminal `outcome`, e.g. `merged | escalated | abandoned`.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// How many rounds the instance took to converge, when meaningful.
+    #[serde(default)]
+    pub rounds_to_converge: Option<u32>,
+    /// Count of rework events observed on the instance.
+    #[serde(default)]
+    pub rework_events: Option<u32>,
+    /// An optional scalar objective value for the §6 objective.
+    #[serde(default)]
+    pub value: Option<f64>,
 }
 
 /// A captured variable map on a trace (mirrors the gateway's `VariablesDto`).
@@ -327,5 +491,70 @@ impl NanoClient {
         res.json::<serde_json::Value>()
             .await
             .map_err(|e| format!("decode {url}: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instance_trace_roundtrips_with_domain_signals_and_outcome_truth() {
+        let json = serde_json::json!({
+            "instanceKey": "i1",
+            "processId": "p",
+            "outcome": "completed",
+            "startedAt": 0,
+            "domainSignals": [{
+                "ns": "nano-workforce/blackboard",
+                "kind": "claim",
+                "role": "claim",
+                "scope": { "instance": "i1", "actor": "author_task", "wave": 2 },
+                "dedupeKey": "k1",
+                "provenance": "measured"
+            }],
+            "outcomeTruth": { "status": "merged", "roundsToConverge": 3, "reworkEvents": 1 }
+        });
+        let t: InstanceTrace = serde_json::from_value(json).unwrap();
+        assert_eq!(t.domain_signals.len(), 1);
+        let s = &t.domain_signals[0];
+        assert_eq!(s.role, Role::Claim);
+        assert_eq!(s.scope.actor.as_deref(), Some("author_task"));
+        // A generic extra scope dim is preserved verbatim, not dropped.
+        assert_eq!(s.scope.extra.get("wave"), Some(&serde_json::json!(2)));
+        assert!(s.is_measured());
+        assert_eq!(
+            t.outcome_truth.as_ref().unwrap().rounds_to_converge,
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn instance_trace_without_the_slot_is_absent_safe() {
+        let json = serde_json::json!({
+            "instanceKey": "i1", "processId": "p", "outcome": "active", "startedAt": 0
+        });
+        let t: InstanceTrace = serde_json::from_value(json).unwrap();
+        assert!(t.domain_signals.is_empty());
+        assert!(t.outcome_truth.is_none());
+    }
+
+    #[test]
+    fn unknown_app_role_deserializes_to_note() {
+        let s: DomainSignal =
+            serde_json::from_value(serde_json::json!({ "role": "some-app-specific-role" }))
+                .unwrap();
+        assert_eq!(s.role, Role::Note);
+    }
+
+    #[test]
+    fn provenance_marks_agent_origin_as_unmeasured() {
+        let measured: DomainSignal = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(measured.is_measured());
+        for p in ["agent-retro", "hypothesis", "PRIOR", "agent"] {
+            let s: DomainSignal =
+                serde_json::from_value(serde_json::json!({ "provenance": p })).unwrap();
+            assert!(!s.is_measured(), "{p} should be a prior");
+        }
     }
 }
