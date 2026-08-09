@@ -4742,6 +4742,81 @@ impl ServerImpl {
         }
     }
 
+    /// Console operator "Resolve incident": the Operate-style one-click retry.
+    ///
+    /// The engine keeps Zeebe parity and REFUSES to resolve a `JobNoRetries` incident whose parked
+    /// job still has 0 retries — an `UpdateJobRetries` must come first (see the engine's
+    /// "still has no retries; update its retries first" guard). The public `/v2` API preserves that
+    /// strict two-step contract, but the Process Explorer's single "Resolve incident" button is
+    /// expected to just work, exactly as Camunda Operate's incident "Retry" does. So we resolve
+    /// through the shared core first and, only if the engine refuses that one specific case, grant
+    /// the parked job a single retry and resolve again; every other incident (and a job that still
+    /// has retries) resolves on the first attempt — the engine, not a read-model snapshot, decides
+    /// whether a grant is needed.
+    ///
+    /// This is a thin operator-convenience composition over the two existing surface-independent
+    /// primitives (`update_job_retries_*` + `resolve_incident_core`) — it introduces no new engine
+    /// semantics and leaves the `/v2` surface untouched.
+    #[cfg(any(feature = "console", test))]
+    pub(crate) async fn resolve_incident_operator(
+        &self,
+        incident_key: u64,
+    ) -> ResolveIncidentOutcome {
+        use ResolveIncidentOutcome as Out;
+
+        // Let the ENGINE decide whether a retry is needed: attempt the strict shared core first.
+        // Any outcome other than a "not resolvable" refusal (Resolved / NotFound / Internal) is
+        // final. Resolving first is what keeps this honest — we never grant a retry (which would
+        // clobber the job's retry count to 1) when the engine would have resolved the incident on
+        // its own, and we never act on a stale read-model snapshot of the job's retries.
+        let refusal = match self.resolve_incident_core(incident_key, None).await {
+            Out::NotResolvable(reason) => reason,
+            final_outcome => return final_outcome,
+        };
+
+        // The engine refused. The only refusal the console's one-click "Resolve" heals is a
+        // JobNoRetries incident whose parked job is out of retries (Operate's incident "Retry"):
+        // grant that job a single retry, then resolve again. The read model is consulted ONLY to
+        // find the incident's parked job — the *decision* to grant was the engine's refusal above.
+        let job_key = self
+            .store
+            .incidents()
+            .into_iter()
+            .find(|i| i.key == incident_key)
+            .filter(|i| matches!(i.kind, IncidentKind::JobNoRetries))
+            .and_then(|i| i.job_key);
+        let Some(job_key) = job_key else {
+            // Not a job-exhaustion incident (or its job isn't in the read model): the engine's
+            // refusal stands, verbatim.
+            return Out::NotResolvable(refusal);
+        };
+
+        // Grant exactly one retry so the resolution has something to hand back to a worker. Route
+        // to the job's owning partition (leader-forward when this node isn't it) using the same
+        // primitives the `/v2` job-update handler uses.
+        let granted = match self.route_by_leader(job_key) {
+            Some(node) => {
+                self.forward_update_job_retries(node, job_key, 1, None)
+                    .await
+            }
+            None => self.update_job_retries_local(job_key, 1, None).await,
+        };
+        if let Err((status, detail)) = granted {
+            // The retry grant failed, so the incident stays unresolvable. Surface that as
+            // `NotResolvable` (or `Internal` for a server-side failure) — never `NotFound`, which
+            // is documented as "no incident with the given key" and would misreport an incident
+            // that plainly exists (we just resolved-then-refused it above).
+            return if status >= 500 {
+                Out::Internal(detail)
+            } else {
+                Out::NotResolvable(detail)
+            };
+        }
+
+        // Retry granted — the engine will now accept the resolution.
+        self.resolve_incident_core(incident_key, None).await
+    }
+
     /// Surface-independent core of "merge variables into a scope". Mirrors
     /// [`Self::resolve_incident_core`]: leader-forward or apply
     /// [`Command::set_variables_scoped`]. `variables` is the raw JSON object as
@@ -20242,6 +20317,129 @@ mod clustered_startup_tests {
             server.resolve_incident_core(incident_key, None).await,
             ResolveIncidentOutcome::NotFound(_)
         ));
+    }
+
+    /// The console's single "Resolve incident" button, applied to a JobNoRetries incident, must
+    /// behave like Operate's incident "Retry": grant the parked job a retry and resolve in one
+    /// click. The public `/v2` surface (and the shared `resolve_incident_core`) stay strict — they
+    /// keep Zeebe parity and refuse to resolve while the job is out of retries.
+    #[tokio::test]
+    async fn console_operator_resolve_retries_a_job_exhaustion_incident() {
+        let server = ServerImpl::default();
+
+        let proc = ProcessBuilder::new("job-failer")
+            .start_event("s")
+            .service_task("work", "do-work")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .build()
+            .expect("valid definition");
+        let mut names = std::collections::HashMap::new();
+        names.insert("job-failer".to_string(), "job-failer.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("job-failer".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create the instance");
+
+        // Activate the job and fail it with zero retries → a JobNoRetries incident parks the token.
+        let jobs = server
+            .activate_for_stream("do-work", "w", 10, 60_000, None)
+            .await;
+        assert_eq!(jobs.len(), 1, "one service-task job is parked");
+        let job_key: u64 = jobs[0].job_key.0.parse().expect("numeric job key");
+        server
+            .fail_job_for_stream(job_key, 0, "boom".to_string())
+            .await
+            .expect("fail the job")
+            .wait()
+            .await;
+
+        // The job-exhaustion incident projects into the read model.
+        let mut incident_key = None;
+        for _ in 0..200 {
+            if let Some(i) = server
+                .store
+                .incidents()
+                .into_iter()
+                .find(|i| i.instance_key == instance_key && i.state == IncidentState::Active)
+            {
+                assert!(
+                    matches!(i.kind, IncidentKind::JobNoRetries),
+                    "the parked job with 0 retries raises a JobNoRetries incident"
+                );
+                incident_key = Some(i.key);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let incident_key = incident_key.expect("incident projects");
+
+        // RED: the strict shared core (what `/v2` uses) refuses — the job still has no retries.
+        // This is the exact "job has no retries" dead-end the Process Explorer button hit.
+        assert!(
+            matches!(
+                server.resolve_incident_core(incident_key, None).await,
+                ResolveIncidentOutcome::NotResolvable(_)
+            ),
+            "the shared core keeps Zeebe parity and refuses a 0-retry job incident"
+        );
+
+        // GREEN: the operator action grants the parked job a retry, then resolves — one click.
+        assert!(matches!(
+            server.resolve_incident_operator(incident_key).await,
+            ResolveIncidentOutcome::Resolved
+        ));
+
+        // The incident clears and the job is back in the pool with a positive retry count.
+        let mut recovered = false;
+        for _ in 0..200 {
+            let still_open = server
+                .store
+                .incidents()
+                .into_iter()
+                .any(|i| i.instance_key == instance_key && i.state == IncidentState::Active);
+            let retried = server
+                .store
+                .jobs()
+                .into_iter()
+                .find(|j| j.key == job_key)
+                .is_some_and(|j| j.retries >= 1);
+            if !still_open && retried {
+                recovered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            recovered,
+            "the operator resolve grants a retry, clears the incident, and returns the job"
+        );
+
+        // A second click does not silently re-grant a retry and re-resolve: the engine reports the
+        // incident is already resolved (NotResolvable) or gone (NotFound) — never Resolved again.
+        let second = server.resolve_incident_operator(incident_key).await;
+        assert!(
+            matches!(
+                second,
+                ResolveIncidentOutcome::NotResolvable(_) | ResolveIncidentOutcome::NotFound(_)
+            ),
+            "a second resolve must not re-resolve an already-cleared incident"
+        );
     }
 
     /// Exercises [`ServerImpl::cancel_instance_core`] — the surface-independent
