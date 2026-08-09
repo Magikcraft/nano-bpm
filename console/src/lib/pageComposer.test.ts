@@ -153,7 +153,7 @@ test("Craft.js round-trip preserves a nav node", () => {
   assert.deepEqual(back, navWitness);
 });
 
-test("nav item: page wins over href, empties are dropped (matches urban navLink)", () => {
+test("nav item: page wins over href, empty items are dropped (matches urban navLink)", () => {
   const r = parsePageDoc({
     schemaVersion: PAGE_SCHEMA_VERSION,
     title: "x",
@@ -165,7 +165,8 @@ test("nav item: page wins over href, empties are dropped (matches urban navLink)
           variant: "bogus", // → defaults to "bar"
           items: [
             { label: "Both", page: "home", href: "https://x.test" }, // page wins
-            { label: "", href: "" }, // no target → bare label item
+            { label: "Docs", href: "https://docs.test" }, // external kept
+            { label: "", href: "" }, // no label + no target → dropped entirely
           ],
         },
       },
@@ -178,7 +179,41 @@ test("nav item: page wins over href, empties are dropped (matches urban navLink)
     id: "n",
     props: {
       variant: "bar",
-      items: [{ label: "Both", page: "home" }, { label: "" }],
+      items: [
+        { label: "Both", page: "home" },
+        { label: "Docs", href: "https://docs.test" },
+      ],
+    },
+  });
+});
+
+test("nav item: an unsafe href scheme is dropped (only http(s) is persisted)", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "nav",
+        id: "n",
+        props: {
+          items: [
+            { label: "XSS", href: "javascript:alert(1)" }, // scheme stripped
+            { label: "Rel", href: "/relative/path" }, // non-http(s) stripped
+          ],
+        },
+      },
+    ],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const nav = r.ok && r.doc.nodes[0];
+  // Both hrefs are unsafe/non-http(s) → dropped, leaving bare-label items (they
+  // still have a label, so they are not removed as empty).
+  assert.deepEqual(nav, {
+    type: "nav",
+    id: "n",
+    props: {
+      variant: "bar",
+      items: [{ label: "XSS" }, { label: "Rel" }],
     },
   });
 });

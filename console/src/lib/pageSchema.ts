@@ -504,18 +504,31 @@ export function parsePageDoc(
         if (rawItems === "auto" || rawItems === undefined) {
           items = "auto";
         } else if (Array.isArray(rawItems)) {
-          items = rawItems.filter(isRecord).map((it): NavItem => {
-            const page = typeof it.page === "string" ? it.page : "";
-            const href = typeof it.href === "string" ? it.href : "";
-            const label = typeof it.label === "string" ? it.label : "";
-            const icon = typeof it.icon === "string" ? it.icon : "";
-            return {
-              label,
-              // `page` wins over `href` (mirrors urban's navLink precedence).
-              ...(page ? { page } : href ? { href } : {}),
-              ...(icon ? { icon } : {}),
-            };
-          });
+          items = rawItems
+            .filter(isRecord)
+            .map((it): NavItem => {
+              const page = typeof it.page === "string" ? it.page : "";
+              // Mirror urban's navLink: an external link is only honoured when it
+              // is an http(s) URL. Canonicalize here so an unsafe scheme (e.g.
+              // `javascript:`) can never be persisted through the composer.
+              const href =
+                typeof it.href === "string" && /^https?:\/\//i.test(it.href)
+                  ? it.href
+                  : "";
+              const label = typeof it.label === "string" ? it.label : "";
+              const icon = typeof it.icon === "string" ? it.icon : "";
+              return {
+                label,
+                // `page` wins over `href` (mirrors urban's navLink precedence).
+                ...(page ? { page } : href ? { href } : {}),
+                ...(icon ? { icon } : {}),
+              };
+            })
+            // Drop fully-empty items (no label and no target): they render as
+            // nothing, so they are noise in the persisted document.
+            .filter(
+              (it) => it.label !== "" || it.page != null || it.href != null,
+            );
         } else {
           items = "auto";
         }
