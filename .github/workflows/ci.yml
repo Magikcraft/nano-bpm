@@ -67,6 +67,7 @@ jobs:
       processos: ${{ steps.filter.outputs.processos }}
       console: ${{ steps.filter.outputs.console }}
       dapadapter: ${{ steps.filter.outputs.dapadapter }}
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - uses: actions/checkout@v5
       - uses: dorny/paths-filter@v3
@@ -76,6 +77,11 @@ jobs:
           # against the SHA the group was based on so detection reflects the
           # combined batch. push/PR events auto-detect their base (empty string).
           base: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || '' }}
+          # `some-with-excludes`: a file matches a filter only when it matches at
+          # least one positive pattern AND none of the negated (`!`) patterns. The
+          # positive/negative filters below have no negations, so this is a no-op
+          # for them; it exists for the `code` filter's exclude patterns.
+          predicate-quantifier: 'some-with-excludes'
           filters: |
             processos:
               - 'processos/**'
@@ -88,10 +94,26 @@ jobs:
             dapadapter:
               - 'dap-adapter/**'
               - '.github/workflows/ci.yml'
+            # True unless EVERY changed file is pure presentation — the marketing
+            # website (`website/**`, built + drift-guarded by the always-on
+            # `schemas`/`website snippet` jobs) or the console landing page HTML
+            # (embedded via `include_str!`, so its content can't break clippy or
+            # any test). The heavy Rust/engine/npm jobs gate on this so a
+            # website- or landing-only PR skips them (a skipped required check
+            # counts as success for branch protection) and still merges.
+            code:
+              - '**'
+              - '!website/**'
+              - '!server/src/console/landing.html'
 
   fmt:
     name: rustfmt (pinned nightly)
     runs-on: ubuntu-24.04
+    # Heavy Rust/engine/npm jobs skip when a PR only touches the marketing
+    # website or the console landing page (see the `code` filter above). Manual
+    # dispatch and the merge queue always run the full suite.
+    needs: changes
+    if: &code_gate ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.code == 'true' }}
     steps:
       - uses: actions/checkout@v5
       # Keep this version in lockstep with FMT_TOOLCHAIN in the Makefile. The
@@ -113,6 +135,8 @@ jobs:
   engine-core:
     name: engine-core (clippy + test)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
     # sccache gives a content-addressed rustc cache shared across CI runs (and
     # across the engine-core/server/processos jobs that all compile this crate as
     # a path dep). Unlike Swatinem's all-or-nothing target restore, sccache still
@@ -151,6 +175,8 @@ jobs:
   engine-wasm-ffi-dist:
     name: engine-wasm-ffi (dist + verify)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
     env:
       SCCACHE_GHA_ENABLED: 'true'
       RUSTC_WRAPPER: 'sccache'
@@ -189,7 +215,8 @@ jobs:
   nano-bernd-npm:
     name: '@nanobpm/nano-bernd (build + test)'
     runs-on: ubuntu-24.04
-    needs: engine-wasm-ffi-dist
+    needs: [engine-wasm-ffi-dist, changes]
+    if: *code_gate
     defaults:
       run:
         working-directory: clients/nano-bernd
@@ -215,7 +242,8 @@ jobs:
   nano-bernd-jvm:
     name: 'io.github.jwulf:nano-bernd (JVM, Chicory)'
     runs-on: ubuntu-24.04
-    needs: engine-wasm-ffi-dist
+    needs: [engine-wasm-ffi-dist, changes]
+    if: *code_gate
     defaults:
       run:
         working-directory: clients/nano-bernd-jvm
@@ -239,6 +267,8 @@ jobs:
   spec-app:
     name: spec-app (Urban App manifest)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
     defaults:
       run:
         working-directory: spec-app
@@ -388,6 +418,8 @@ jobs:
   server:
     name: server (clippy + test)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
     env:
       SCCACHE_GHA_ENABLED: 'true'
       RUSTC_WRAPPER: 'sccache'
@@ -442,6 +474,8 @@ jobs:
   console:
     name: console (typecheck + test)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
     defaults:
       run:
         working-directory: console
@@ -526,6 +560,8 @@ jobs:
   console-deno:
     name: console (deno typecheck + test)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
     steps:
       - uses: actions/checkout@v5
       - uses: denoland/setup-deno@v2
@@ -550,6 +586,8 @@ jobs:
   engine-wasm-release-guard:
     name: engine-wasm (release drift guard)
     runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
     steps:
       # Full history + tags: the guard compares the current tree against the last
       # published engine-wasm release tag (`bojtos-npm-v*`).
