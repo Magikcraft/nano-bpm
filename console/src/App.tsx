@@ -25,6 +25,7 @@ import {
   type ProjectSummary,
 } from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
+import { isAssetIcon, isSvgIcon } from "./lib/appRailIcon";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 import { IS_STUDIO, CONSOLE_PROFILE } from "./lib/profile";
 import { useProductTour } from "./lib/tour/useProductTour";
@@ -169,14 +170,8 @@ const icons = {
 
 // A running app's left-rail `icon` hint is either a *bundled glyph name*
 // (resolved against the console's icon set) or a *project asset path* the app
-// ships itself (e.g. `assets/icon.svg`), served path-guarded from
-// `/console/app-view-icon/<name>`. Heuristic mirrored server-side
-// (`app_view_icon_is_asset`): a separator, or a real extension (a dot with a
-// non-separator char before it, so a dotfile like `.svg` is NOT an extension —
-// matching Rust's `Path::extension`), ⇒ asset path.
-function isAssetIcon(icon: string | null | undefined): boolean {
-  return !!icon && (icon.includes("/") || /[^/]\.[a-z0-9]+$/i.test(icon));
-}
+// ships itself. Classification helpers (`isAssetIcon`, `isSvgIcon`) live in
+// `./lib/appRailIcon` so they can be unit-tested without a DOM.
 
 // Resolve a running app's left-rail glyph from its manifest `icon` hint,
 // falling back to the default app glyph when the hint is absent or names an
@@ -189,10 +184,15 @@ function appRailIcon(icon: string | null | undefined): ReactNode {
   return icons.appDefault;
 }
 
-// The rail glyph for one running app: an app-shipped image icon (rendered via
-// <img>, which never executes a scripted SVG) when `icon` is an asset path,
-// else the resolved bundled glyph. A failed image load (missing/oversized/
-// wrong type ⇒ the server 404s) falls back to the default glyph.
+// The rail glyph for one running app. An SVG app icon is a monochrome
+// silhouette authored against `currentColor` (like the bundled glyphs), but an
+// `<img>`-loaded SVG can't inherit `currentColor` — it resolves to the SVG's
+// own default (black), so a dark-stroked icon vanishes on the dark theme. We
+// therefore paint the rail's foreground *through* the SVG as a CSS `mask`, so it
+// themes with the rail; a mask-image (like `<img>`) never executes scripted SVG.
+// Raster icons (png/jpeg) carry their own colour and are shown via `<img>` as
+// before. A failed image load (missing/oversized/wrong type ⇒ the server 404s)
+// falls back to the default glyph.
 function AppRailGlyph({
   name,
   icon,
@@ -205,12 +205,44 @@ function AppRailGlyph({
   // icon recovers without a full remount.
   useEffect(() => setFailed(false), [icon]);
   if (isAssetIcon(icon) && !failed) {
+    // The path is manifest-fixed; `v` cache-busts a changed icon hint.
+    const src = `/console/app-view-icon/${encodeURIComponent(
+      name,
+    )}?v=${encodeURIComponent(icon ?? "")}`;
+    if (isSvgIcon(icon)) {
+      return (
+        <>
+          {/* A masked <span> can't report a failed load, so a hidden probe
+              <img> drives the default-glyph fallback on a 404. It shares the
+              browser cache with the mask below (same URL ⇒ one fetch). */}
+          <img
+            src={src}
+            alt=""
+            aria-hidden="true"
+            className="hidden"
+            onError={() => setFailed(true)}
+          />
+          <span
+            aria-hidden="true"
+            className="h-4 w-4 shrink-0"
+            style={{
+              backgroundColor: "currentColor",
+              maskImage: `url("${src}")`,
+              WebkitMaskImage: `url("${src}")`,
+              maskSize: "contain",
+              WebkitMaskSize: "contain",
+              maskRepeat: "no-repeat",
+              WebkitMaskRepeat: "no-repeat",
+              maskPosition: "center",
+              WebkitMaskPosition: "center",
+            }}
+          />
+        </>
+      );
+    }
     return (
       <img
-        // The path is manifest-fixed; `v` cache-busts a changed icon hint.
-        src={`/console/app-view-icon/${encodeURIComponent(name)}?v=${encodeURIComponent(
-          icon ?? "",
-        )}`}
+        src={src}
         alt=""
         aria-hidden="true"
         className="h-4 w-4 shrink-0 rounded-sm object-contain"
