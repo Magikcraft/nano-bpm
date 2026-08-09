@@ -4748,9 +4748,11 @@ impl ServerImpl {
     /// job still has 0 retries — an `UpdateJobRetries` must come first (see the engine's
     /// "still has no retries; update its retries first" guard). The public `/v2` API preserves that
     /// strict two-step contract, but the Process Explorer's single "Resolve incident" button is
-    /// expected to just work, exactly as Camunda Operate's incident "Retry" does. So for that one
-    /// case we grant the parked job a single retry before resolving; every other incident kind (and
-    /// a job that already has retries left) resolves directly through the shared core.
+    /// expected to just work, exactly as Camunda Operate's incident "Retry" does. So we resolve
+    /// through the shared core first and, only if the engine refuses that one specific case, grant
+    /// the parked job a single retry and resolve again; every other incident (and a job that still
+    /// has retries) resolves on the first attempt — the engine, not a read-model snapshot, decides
+    /// whether a grant is needed.
     ///
     /// This is a thin operator-convenience composition over the two existing surface-independent
     /// primitives (`update_job_retries_*` + `resolve_incident_core`) — it introduces no new engine
@@ -4762,47 +4764,56 @@ impl ServerImpl {
     ) -> ResolveIncidentOutcome {
         use ResolveIncidentOutcome as Out;
 
-        // Does this incident need a retry grant before it can be resolved? Inspect the read model
-        // (an owned snapshot, aggregated across partitions) for a JobNoRetries incident whose job
-        // is out of retries. The snapshot is dropped before the await below — no lock is held.
-        let job_to_retry: Option<u64> = self
+        // Let the ENGINE decide whether a retry is needed: attempt the strict shared core first.
+        // Any outcome other than a "not resolvable" refusal (Resolved / NotFound / Internal) is
+        // final. Resolving first is what keeps this honest — we never grant a retry (which would
+        // clobber the job's retry count to 1) when the engine would have resolved the incident on
+        // its own, and we never act on a stale read-model snapshot of the job's retries.
+        let refusal = match self.resolve_incident_core(incident_key, None).await {
+            Out::NotResolvable(reason) => reason,
+            final_outcome => return final_outcome,
+        };
+
+        // The engine refused. The only refusal the console's one-click "Resolve" heals is a
+        // JobNoRetries incident whose parked job is out of retries (Operate's incident "Retry"):
+        // grant that job a single retry, then resolve again. The read model is consulted ONLY to
+        // find the incident's parked job — the *decision* to grant was the engine's refusal above.
+        let job_key = self
             .store
             .incidents()
             .into_iter()
             .find(|i| i.key == incident_key)
             .filter(|i| matches!(i.kind, IncidentKind::JobNoRetries))
-            .and_then(|i| i.job_key)
-            .filter(|&job_key| {
-                // Needs a grant when the job is out of retries — or has already been dropped from
-                // the read model (treat a missing job as "grant and let resolve report the truth").
-                match self.store.jobs().into_iter().find(|j| j.key == job_key) {
-                    Some(j) => j.retries <= 0,
-                    None => true,
-                }
-            });
+            .and_then(|i| i.job_key);
+        let Some(job_key) = job_key else {
+            // Not a job-exhaustion incident (or its job isn't in the read model): the engine's
+            // refusal stands, verbatim.
+            return Out::NotResolvable(refusal);
+        };
 
-        if let Some(job_key) = job_to_retry {
-            // Grant exactly one retry so the resolution has something to hand back to a worker.
-            // Route to the job's owning partition (leader-forward when this node isn't it) using
-            // the same primitives the `/v2` job-update handler uses.
-            let res = match self.route_by_leader(job_key) {
-                Some(node) => {
-                    self.forward_update_job_retries(node, job_key, 1, None)
-                        .await
-                }
-                None => self.update_job_retries_local(job_key, 1, None).await,
-            };
-            if let Err((status, detail)) = res {
-                // The retry grant failed, so resolution can't proceed — surface why rather than
-                // letting the engine reject with the opaque "still has no retries" message.
-                return match status {
-                    404 => Out::NotFound(detail),
-                    409 => Out::NotResolvable(detail),
-                    _ => Out::Internal(detail),
-                };
+        // Grant exactly one retry so the resolution has something to hand back to a worker. Route
+        // to the job's owning partition (leader-forward when this node isn't it) using the same
+        // primitives the `/v2` job-update handler uses.
+        let granted = match self.route_by_leader(job_key) {
+            Some(node) => {
+                self.forward_update_job_retries(node, job_key, 1, None)
+                    .await
             }
+            None => self.update_job_retries_local(job_key, 1, None).await,
+        };
+        if let Err((status, detail)) = granted {
+            // The retry grant failed, so the incident stays unresolvable. Surface that as
+            // `NotResolvable` (or `Internal` for a server-side failure) — never `NotFound`, which
+            // is documented as "no incident with the given key" and would misreport an incident
+            // that plainly exists (we just resolved-then-refused it above).
+            return if status >= 500 {
+                Out::Internal(detail)
+            } else {
+                Out::NotResolvable(detail)
+            };
         }
 
+        // Retry granted — the engine will now accept the resolution.
         self.resolve_incident_core(incident_key, None).await
     }
 
