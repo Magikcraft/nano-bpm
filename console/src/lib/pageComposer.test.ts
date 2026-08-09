@@ -10,6 +10,8 @@ import {
 } from "./pageSchema.ts";
 import {
   fromPageDoc,
+  loadPageJson,
+  serializePageNodes,
   toPageDoc,
   ROOT_ID,
   makeNode,
@@ -110,6 +112,153 @@ test("wrong schemaVersion is an error", () => {
   assert.ok(!r.ok);
 });
 
+// ── nav node (regression: Nano Workforce pages opened blank + "unsaved" because
+// the Console schema lacked `nav`, which urban's renderer supports — issue #705) ──
+
+const navWitness: PageDoc = {
+  schemaVersion: PAGE_SCHEMA_VERSION,
+  title: "Nav witness",
+  nodes: [
+    {
+      type: "nav",
+      id: "topbar",
+      props: {
+        variant: "bar",
+        title: "Nano Workforce",
+        items: [
+          { label: "Convergence", page: "home" },
+          { label: "Docs", href: "https://nanobpm.io", icon: "📖" },
+        ],
+      },
+    },
+    {
+      type: "nav",
+      id: "side",
+      props: { variant: "rail", items: "auto" },
+    },
+  ],
+};
+
+test("parsePageDoc accepts a nav page (bar+rail, explicit items and auto) unchanged", () => {
+  const r = parsePageDoc(navWitness);
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  assert.deepEqual(r.doc, navWitness);
+});
+
+test("Craft.js round-trip preserves a nav node", () => {
+  const state = fromPageDoc(navWitness);
+  assert.deepEqual(state[ROOT_ID].nodes, ["topbar", "side"]);
+  assert.equal(state["topbar"].parent, ROOT_ID);
+  const back = toPageDoc(state, navWitness.title);
+  assert.deepEqual(back, navWitness);
+});
+
+test("nav item: page wins over href, empties are dropped (matches urban navLink)", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "nav",
+        id: "n",
+        props: {
+          variant: "bogus", // → defaults to "bar"
+          items: [
+            { label: "Both", page: "home", href: "https://x.test" }, // page wins
+            { label: "", href: "" }, // no target → bare label item
+          ],
+        },
+      },
+    ],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const nav = r.ok && r.doc.nodes[0];
+  assert.deepEqual(nav, {
+    type: "nav",
+    id: "n",
+    props: {
+      variant: "bar",
+      items: [{ label: "Both", page: "home" }, { label: "" }],
+    },
+  });
+});
+
+// ── load-path data-loss guard (issue #705): a page that fails to parse must NOT
+// yield a blank editable doc — a blank + Save would overwrite the real file. ──
+
+test("loadPageJson: blank string is a new empty page (ok)", () => {
+  const r = loadPageJson("   ", "Home");
+  assert.ok(r.ok);
+  assert.equal(r.ok && r.doc.nodes.length, 0);
+  assert.equal(r.ok && r.doc.title, "Home");
+});
+
+test("loadPageJson: an unknown node type is a load error, NOT a blank doc", () => {
+  const raw = JSON.stringify({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "Real page",
+    nodes: [{ type: "chart", id: "c1", props: {} }],
+  });
+  const r = loadPageJson(raw, "Home");
+  assert.ok(!r.ok, "must not silently succeed with a blank page");
+  assert.match(
+    (r as { errors: string[] }).errors.join(" "),
+    /not a known node type/,
+  );
+});
+
+test("loadPageJson: invalid JSON is a load error, NOT a blank doc", () => {
+  const r = loadPageJson("{ not json", "Home");
+  assert.ok(!r.ok);
+  assert.match((r as { errors: string[] }).errors.join(" "), /not valid JSON/);
+});
+
+test("loadPageJson: a valid nav page loads (regression for Nano Workforce)", () => {
+  const r = loadPageJson(JSON.stringify(navWitness), "x");
+  assert.ok(r.ok, r.ok ? "" : (r as { errors: string[] }).errors.join("; "));
+  assert.deepEqual(r.ok && r.doc, navWitness);
+});
+
+// The dirty signal is DERIVED from serializePageNodes, not from raw Craft change
+// events. Guards the false-"unsaved" failure mode: loading a page (and the initial
+// canvas mount) fire onNodesChange, but the node serialization is unchanged, so the
+// composer must not report a pristine load as an edit.
+test("serializePageNodes: loading a page is not an edit (baseline matches itself)", () => {
+  const state = fromPageDoc(navWitness);
+  const baseline = serializePageNodes(state);
+  // Re-deriving from the same loaded state (what onNodesChange sees for a load /
+  // mount echo) yields the identical baseline → no false dirty.
+  assert.equal(serializePageNodes(fromPageDoc(navWitness)), baseline);
+});
+
+test("serializePageNodes: title differences do NOT read as a canvas edit", () => {
+  // Title lives outside the node list (it is signalled separately), so a title-only
+  // change must not flip the node-derived dirty signal.
+  const a = serializePageNodes(fromPageDoc({ ...navWitness, title: "A" }));
+  const b = serializePageNodes(fromPageDoc({ ...navWitness, title: "B" }));
+  assert.equal(a, b);
+});
+
+test("serializePageNodes: a genuine node change IS detected as an edit", () => {
+  const baseline = serializePageNodes(fromPageDoc(navWitness));
+  const edited = fromPageDoc(navWitness);
+  // Append a real node — what a palette "+ Text" drop does.
+  const added = makeNode("text");
+  edited[added.id] = {
+    type: { resolvedName: "TextNode" },
+    isCanvas: false,
+    props: added.props as Record<string, unknown>,
+    displayName: "TextNode",
+    custom: {},
+    hidden: false,
+    nodes: [],
+    linkedNodes: {},
+    parent: ROOT_ID,
+  };
+  edited[ROOT_ID].nodes = [...(edited[ROOT_ID].nodes ?? []), added.id];
+  assert.notEqual(serializePageNodes(edited), baseline);
+});
+
 test("Craft.js round-trip: fromPageDoc → toPageDoc is identity", () => {
   const state = fromPageDoc(witness);
   // ROOT canvas orders the three children.
@@ -144,7 +293,7 @@ test("toPageDoc skips unknown Craft components + preserves child order", () => {
 });
 
 test("makeNode produces a validatable node of the requested type", () => {
-  for (const type of ["text", "actionForm", "dataGrid"] as const) {
+  for (const type of ["text", "nav", "actionForm", "dataGrid"] as const) {
     const n = makeNode(type);
     const r = parsePageDoc({
       schemaVersion: PAGE_SCHEMA_VERSION,

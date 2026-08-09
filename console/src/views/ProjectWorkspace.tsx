@@ -2033,7 +2033,18 @@ function EditorPane({
         isEmpty ? ed.createBlank().then(seeded) : ed.importSchema(content)
       ).catch(() => void 0);
     } else if (kind === "page" && pageRef.current) {
-      pageRef.current.setPageJson(content);
+      const res = pageRef.current.setPageJson(content);
+      if (!res.ok) {
+        // The page uses a shape this Console build can't parse (e.g. a newer node
+        // type). Surface it read-only instead of loading a blank editable canvas —
+        // a blank + Save would overwrite the real file. The file on disk is intact.
+        setLoadError(
+          `This page can't be opened in the Page Composer:\n\n${res.errors.join("\n")}\n\n` +
+            `Your file on disk is unchanged. This usually means the page uses a newer ` +
+            `component than this Console build supports — update the Console, or edit the ` +
+            `page.json directly.`,
+        );
+      }
     }
     // Only when the document first arrives for this path — or once the lazy
     // editor becomes ready, whichever is later (`editorReady` guarantees the
@@ -2251,7 +2262,11 @@ function EditorPane({
   }, [kind, save]);
 
   if (loadError) {
-    return <div className="p-6 text-sm text-danger">{loadError}</div>;
+    return (
+      <div className="p-6 text-sm text-danger whitespace-pre-wrap">
+        {loadError}
+      </div>
+    );
   }
   if (meta == null) {
     return <div className="p-6 text-sm text-fg-faint">Loading {path}…</div>;
