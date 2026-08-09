@@ -253,6 +253,21 @@ function columnsOf(rows: Record<string, unknown>[]): string[] {
 
 const MIGRATIONS_TABLE = "_nano_migrations";
 
+/// True when this process is running inside an Urban-shaped app — i.e. a
+/// `nano.app.json` manifest sits at the project root (the process cwd). For such
+/// apps the `@nanobpm/urban` runtime owns schema migration (it keeps its own
+/// `_urban_migrations` ledger), so the console must not run a second, competing
+/// migration pass on the run path. See the `domaintypes` op and #673.
+async function isUrbanShapedApp(): Promise<boolean> {
+  try {
+    for (const e of await RT.readDir(".")) {
+      if (e.isFile && e.name === "nano.app.json") return true;
+    }
+  } catch {    // unreadable cwd — treat as not-Urban (fall through to legacy behaviour)
+  }
+  return false;
+}
+
 /// Split a migration file into individual statements on `;` boundaries,
 /// dropping blank and comment-only fragments. A minimal splitter for the
 /// common DDL case (ADR 0024's "minimal dialect stance"); it does not parse
@@ -407,8 +422,22 @@ async function run(req: Request): Promise<unknown> {
       // Gated on a real (persisting) regen: the `write:false` composer preview is
       // latency-sensitive and must stay read-only (no DB side-effects per
       // keystroke).
+      //
+      // Also gated off for an Urban-shaped app (a `nano.app.json` at the project
+      // root — the process cwd): there the `@nanobpm/urban` runtime (`urban run`)
+      // owns schema migration and records it in its own ledger. This op runs on
+      // the run path (the supervisor's boot hook regenerates domain types before
+      // starting the app), so auto-migrating here would apply the app's migrations
+      // a *second* time, into the console's separate `_nano_migrations` ledger —
+      // and a non-idempotent `ALTER TABLE … ADD COLUMN` in a later migration then
+      // crashes the `urban run` pass with "duplicate column" (one DB, two ledgers;
+      // Magikcraft/nano-bpm#673). One owner, one ledger: for Urban apps, urban
+      // migrates. Domain types for Urban apps come from `urban gen` (derived from
+      // the manifest, not the live schema), so skipping the console's schema-first
+      // regen here costs nothing. The explicit `migrate` op is unaffected — it is
+      // a user-initiated authoring action, not part of the run path.
       const migrated: Record<string, string[]> = {};
-      if (req.write !== false) {
+      if (req.write !== false && !(await isUrbanShapedApp())) {
         for (const s of sources) {
           const applied = await applyPendingMigrations(s.name);
           if (applied.length) migrated[s.name] = applied;
