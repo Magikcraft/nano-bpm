@@ -547,26 +547,31 @@ function Settings({
             suggestions={tableFields(
               qualifyTable(props.data as { source?: string; table?: string }),
             )}
-            onChange={(rows) =>
+            onChange={(rows) => {
+              // Preserve the structured `link` an existing column carries — it
+              // isn't editable in this string-cell ListEditor (see the
+              // ColumnLinks editor below), so rebuilding from field/header alone
+              // would silently drop it. The ListEditor mutates one column at a
+              // time: an add appends and an edit keeps order + count, so indices
+              // of existing columns are stable and a positional match preserves
+              // a link across a `field` rename. A delete shortens the list and
+              // shifts indices, so there we match the stable `field` identity
+              // instead, to avoid mis-attaching a link to a neighbour.
+              const prevCols =
+                (props.columns as GridColumn[] | undefined) ?? [];
+              const deleted = rows.length < prevCols.length;
               set(
                 "columns",
-                rows.map((r) => {
-                  // Preserve the structured `link` an existing column carries —
-                  // it isn't editable in this string-cell ListEditor (see the
-                  // ColumnLinks editor below), so rebuilding from field/header
-                  // alone would silently drop it. Match the previous column by
-                  // `field` (its stable identity), not by array index: deleting
-                  // a column shifts indices, so an index match would mis-attach
-                  // a link to the wrong column.
+                rows.map((r, i) => {
                   const field = r.field ?? "";
-                  const prev = (
-                    props.columns as GridColumn[] | undefined
-                  )?.find((c) => c.field === field);
+                  const prev = deleted
+                    ? prevCols.find((c) => c.field === field)
+                    : prevCols[i];
                   const col: GridColumn = { field, header: r.header ?? "" };
                   return prev?.link ? { ...col, link: prev.link } : col;
                 }),
-              )
-            }
+              );
+            }}
           />
           <ColumnLinks
             columns={(props.columns as GridColumn[]) ?? []}
@@ -773,7 +778,7 @@ function ColumnLinks({
         <span>Column links</span>
       </div>
       {columns.map((c, i) => (
-        <div key={i} className="pc-list-row">
+        <div key={c.field || `__col_${i}`} className="pc-list-row">
           <span className="pc-col-name">
             {c.header || c.field || `#${i + 1}`}
           </span>
