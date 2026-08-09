@@ -159,6 +159,37 @@ export interface TextNode {
   props: { text: string; variant: TextVariant };
 }
 
+/** One entry in a `nav` node. Either an internal `page` link (a page id) or an
+ *  external `href` (an http(s) URL); a `page` wins if both are set. `label` is the
+ *  visible text and `icon` an optional leading glyph. Mirrors urban's `navLink`. */
+export interface NavItem {
+  label: string;
+  /** Internal page id to link to (renders as `#/<page>`). */
+  page?: string;
+  /** External URL (http/https) — used only when `page` is absent. */
+  href?: string;
+  /** Optional leading icon/glyph. */
+  icon?: string;
+}
+
+export type NavVariant = "bar" | "rail";
+
+/** A navigation node: a top `bar` or side `rail` linking the app's pages. `items`
+ *  is either the literal string `"auto"` (enumerate every page at render time) or an
+ *  explicit ordered list. Matches urban's `renderNav`/`fillNav` contract exactly so
+ *  the Composer and the runtime renderer never disagree. */
+export interface NavNode {
+  type: "nav";
+  id: string;
+  props: {
+    variant: NavVariant;
+    /** Optional heading shown before the links. */
+    title?: string;
+    /** `"auto"` = link every page; otherwise an explicit ordered list. */
+    items: "auto" | NavItem[];
+  };
+}
+
 export interface ActionFormNode {
   type: "actionForm";
   id: string;
@@ -190,11 +221,12 @@ export interface DataGridNode {
   };
 }
 
-export type PageNode = TextNode | ActionFormNode | DataGridNode;
+export type PageNode = TextNode | NavNode | ActionFormNode | DataGridNode;
 export type PageNodeType = PageNode["type"];
 
 export const PAGE_NODE_TYPES: PageNodeType[] = [
   "text",
+  "nav",
   "actionForm",
   "dataGrid",
 ];
@@ -215,6 +247,8 @@ export function defaultProps(type: PageNodeType): PageNode["props"] {
   switch (type) {
     case "text":
       return { text: "Text", variant: "body" };
+    case "nav":
+      return { variant: "bar", title: "Navigation", items: "auto" };
     case "actionForm":
       return {
         title: "Action",
@@ -463,6 +497,52 @@ export function parsePageDoc(
           },
         });
         break;
+      case "nav": {
+        const variant = props.variant === "rail" ? "rail" : "bar";
+        const rawItems = props.items;
+        let items: "auto" | NavItem[];
+        if (rawItems === "auto" || rawItems === undefined) {
+          items = "auto";
+        } else if (Array.isArray(rawItems)) {
+          items = rawItems
+            .filter(isRecord)
+            .map((it): NavItem => {
+              const page = typeof it.page === "string" ? it.page : "";
+              // Mirror urban's navLink: an external link is only honoured when it
+              // is an http(s) URL. Canonicalize here so an unsafe scheme (e.g.
+              // `javascript:`) can never be persisted through the composer.
+              const href =
+                typeof it.href === "string" && /^https?:\/\//i.test(it.href)
+                  ? it.href
+                  : "";
+              const label = typeof it.label === "string" ? it.label : "";
+              const icon = typeof it.icon === "string" ? it.icon : "";
+              return {
+                label,
+                // `page` wins over `href` (mirrors urban's navLink precedence).
+                ...(page ? { page } : href ? { href } : {}),
+                ...(icon ? { icon } : {}),
+              };
+            })
+            // Drop fully-empty items (no label and no target): they render as
+            // nothing, so they are noise in the persisted document.
+            .filter(
+              (it) => it.label !== "" || it.page != null || it.href != null,
+            );
+        } else {
+          items = "auto";
+        }
+        nodes.push({
+          type: "nav",
+          id,
+          props: {
+            variant,
+            ...(typeof props.title === "string" ? { title: props.title } : {}),
+            items,
+          },
+        });
+        break;
+      }
       case "actionForm": {
         const action = isRecord(props.action) ? props.action : {};
         const fields = Array.isArray(props.fields) ? props.fields : [];

@@ -7,6 +7,7 @@
 
 import {
   defaultProps,
+  emptyPage,
   type PageDoc,
   type PageNode,
   type PageNodeType,
@@ -14,6 +15,40 @@ import {
   PAGE_SCHEMA_VERSION,
   parsePageDoc,
 } from "./pageSchema.ts";
+
+/** The result of loading a persisted `page.json` string for the composer. A blank
+ *  string is a NEW page (`ok` with an empty doc). Non-empty content that fails to
+ *  parse or validate is `ok:false` with human-readable errors — the caller must NOT
+ *  fall back to a blank editable canvas (a blank + Save would overwrite the file). */
+export type LoadPageResult =
+  { ok: true; doc: PageDoc } | { ok: false; errors: string[] };
+
+/**
+ * Pure decision for opening a `page.json` in the composer. Kept React/Craft-free so
+ * the "load vs. surface-an-error" rule (the data-loss guard) is unit-testable.
+ *  - blank/whitespace → a fresh empty page titled `title` (new file).
+ *  - not valid JSON → `ok:false` (do not blank the canvas).
+ *  - valid JSON but schema-invalid (e.g. an unknown/newer node type) → `ok:false`.
+ *  - valid → `ok:true` with the canonicalized doc.
+ */
+export function loadPageJson(text: string, title: string): LoadPageResult {
+  const trimmed = text.trim();
+  if (!trimmed) return { ok: true, doc: emptyPage(title) };
+  let value: unknown;
+  try {
+    value = JSON.parse(trimmed);
+  } catch (e) {
+    return {
+      ok: false,
+      errors: [
+        `page.json is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+      ],
+    };
+  }
+  const parsed = parsePageDoc(value);
+  if (!parsed.ok) return { ok: false, errors: parsed.errors };
+  return { ok: true, doc: parsed.doc };
+}
 
 /** The Craft.js resolver name for our root canvas. */
 export const ROOT_ID = "ROOT";
@@ -25,6 +60,7 @@ export const PAGE_CANVAS_NAME = "PageCanvas";
  * under these names, so the mapping is identity for the leaf nodes. */
 const CRAFT_NAME: Record<PageNodeType, string> = {
   text: "TextNode",
+  nav: "NavNode",
   actionForm: "ActionFormNode",
   dataGrid: "DataGridNode",
 };
@@ -77,6 +113,21 @@ export function toPageDoc(state: CraftState, title: string): PageDoc {
   return parsed.ok
     ? parsed.doc
     : { schemaVersion: PAGE_SCHEMA_VERSION, title, nodes };
+}
+
+/**
+ * Canonical serialization of a Craft.js state's ordered node list. This is the
+ * single source of truth for "does the canvas differ from what was loaded?": the
+ * composer captures this at load time and compares against it on every Craft
+ * `onNodesChange` to decide dirtiness, rather than treating each change event
+ * (which also fires for the programmatic load and the initial mount) as a user
+ * edit. Deriving dirtiness this way makes the signal deterministic and immune to
+ * load/mount echo — no timing guesswork. Title is intentionally excluded: title
+ * edits are signalled separately by the title input, and excluding it keeps the
+ * comparison independent of async title state.
+ */
+export function serializePageNodes(state: CraftState): string {
+  return JSON.stringify(toPageDoc(state, "").nodes);
 }
 
 /**

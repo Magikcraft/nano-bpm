@@ -10,6 +10,7 @@
 import {
   forwardRef,
   useImperativeHandle,
+  useRef,
   useState,
   type ReactElement,
 } from "react";
@@ -23,20 +24,29 @@ import {
 } from "@craftjs/core";
 import type { ComposerEntity } from "../lib/shapeComposer";
 import {
-  emptyPage,
-  parsePageDoc,
   type ActionFormField,
   type GridColumn,
-  type PageDoc,
+  type NavItem,
   type TextVariant,
 } from "../lib/pageSchema";
-import { fromPageDoc, toPageDoc, type CraftState } from "../lib/pageComposer";
+import {
+  fromPageDoc,
+  loadPageJson,
+  serializePageNodes,
+  toPageDoc,
+  type CraftState,
+} from "../lib/pageComposer";
 
 export interface PageComposerHandle {
   /** Serialize the canvas down to the owned `page.json`. */
   getPageJson(): string;
-  /** Load a `page.json` (or empty when the string is blank) into the canvas. */
-  setPageJson(text: string): void;
+  /**
+   * Load a `page.json` into the canvas. Returns `{ ok: true }` on success (including
+   * a blank/new page). Returns `{ ok: false, errors }` when non-empty content fails to
+   * parse or validate — in that case the canvas is left untouched (NOT reset to blank),
+   * so the caller can surface the errors and block a save that would overwrite the file.
+   */
+  setPageJson(text: string): { ok: true } | { ok: false; errors: string[] };
 }
 
 interface PageComposerProps {
@@ -79,6 +89,47 @@ const TextNode: UserComponent<{ text: string; variant: TextVariant }> = ({
 TextNode.craft = {
   displayName: "TextNode",
   props: { text: "Text", variant: "body" },
+};
+
+const NavNode: UserComponent<{
+  variant: "bar" | "rail";
+  title?: string;
+  items:
+    "auto" | { label: string; page?: string; href?: string; icon?: string }[];
+}> = ({ variant, title, items }) => {
+  const ref = useSelectableRef();
+  const auto = items === "auto";
+  const list = auto ? [] : items;
+  return (
+    <nav
+      ref={ref}
+      className={`pc-node pc-nav ${variant === "rail" ? "pc-rail" : "pc-bar"}`}
+    >
+      {title != null && title !== "" && (
+        <div className="pc-nav-title">{title}</div>
+      )}
+      <div className="pc-nav-items">
+        {auto ? (
+          <span className="pc-nav-auto opacity-40">
+            (auto: links every page)
+          </span>
+        ) : list.length ? (
+          list.map((it, i) => (
+            <span key={i} className="pc-nav-link">
+              {it.icon ? <span className="pc-nav-icon">{it.icon}</span> : null}
+              {it.label || it.page || it.href || "(item)"}
+            </span>
+          ))
+        ) : (
+          <span className="pc-nav-empty opacity-40">No items</span>
+        )}
+      </div>
+    </nav>
+  );
+};
+NavNode.craft = {
+  displayName: "NavNode",
+  props: { variant: "bar", title: "Navigation", items: "auto" },
 };
 
 const ActionFormNode: UserComponent<{
@@ -176,7 +227,13 @@ const PageCanvas: UserComponent<{ children?: React.ReactNode }> = ({
 };
 PageCanvas.craft = { displayName: "PageCanvas" };
 
-const RESOLVER = { PageCanvas, TextNode, ActionFormNode, DataGridNode };
+const RESOLVER = {
+  PageCanvas,
+  TextNode,
+  NavNode,
+  ActionFormNode,
+  DataGridNode,
+};
 
 // ── palette (click-to-add) ───────────────────────────────────────────────────
 
@@ -196,6 +253,21 @@ function Palette(): ReactElement {
         }
       >
         + Text
+      </button>
+      <button
+        className="pc-palette-item"
+        onClick={() =>
+          add(
+            <Element
+              is={NavNode}
+              variant="bar"
+              title="Navigation"
+              items="auto"
+            />,
+          )
+        }
+      >
+        + Nav
       </button>
       <button
         className="pc-palette-item"
@@ -305,6 +377,70 @@ function Settings({
               <option value="sub">sub</option>
             </select>
           </Row>
+        </>
+      )}
+
+      {name === "NavNode" && (
+        <>
+          <Row label="Variant">
+            <select
+              value={String(props.variant ?? "bar")}
+              onChange={(e) => set("variant", e.target.value)}
+            >
+              <option value="bar">bar</option>
+              <option value="rail">rail</option>
+            </select>
+          </Row>
+          <Row label="Title">
+            <input
+              value={String(props.title ?? "")}
+              onChange={(e) => set("title", e.target.value)}
+            />
+          </Row>
+          <Row label="Items">
+            <select
+              value={props.items === "auto" ? "auto" : "manual"}
+              onChange={(e) =>
+                set("items", e.target.value === "auto" ? "auto" : [])
+              }
+            >
+              <option value="auto">auto (every page)</option>
+              <option value="manual">manual list</option>
+            </select>
+          </Row>
+          {props.items !== "auto" && (
+            <ListEditor
+              label="Links"
+              rows={
+                ((props.items as NavItem[]) ?? []) as unknown as Record<
+                  string,
+                  string
+                >[]
+              }
+              columns={[
+                { key: "label", label: "label" },
+                { key: "page", label: "page" },
+                { key: "href", label: "href" },
+                { key: "icon", label: "icon" },
+              ]}
+              onChange={(rows) =>
+                set(
+                  "items",
+                  rows.map((r) => ({
+                    label: r.label ?? "",
+                    // `page` wins over `href`; only keep the set ones so the
+                    // persisted item matches urban's navLink precedence.
+                    ...(r.page
+                      ? { page: r.page }
+                      : r.href
+                        ? { href: r.href }
+                        : {}),
+                    ...(r.icon ? { icon: r.icon } : {}),
+                  })),
+                )
+              }
+            />
+          )}
         </>
       )}
 
@@ -585,8 +721,12 @@ function ListEditor({
 
 const Bridge = forwardRef<
   PageComposerHandle,
-  { title: string; onTitleChange: (t: string) => void }
->(function Bridge({ title, onTitleChange }, ref) {
+  {
+    title: string;
+    onTitleChange: (t: string) => void;
+    baselineRef: React.MutableRefObject<string | null>;
+  }
+>(function Bridge({ title, onTitleChange, baselineRef }, ref) {
   const { query, actions } = useEditor();
   useImperativeHandle(
     ref,
@@ -596,24 +736,29 @@ const Bridge = forwardRef<
         const doc = toPageDoc(state, title);
         return JSON.stringify(doc, null, 2);
       },
-      setPageJson(text: string): void {
-        let doc: PageDoc = emptyPage(title);
-        const trimmed = text.trim();
-        if (trimmed) {
-          try {
-            const parsed = parsePageDoc(JSON.parse(trimmed));
-            if (parsed.ok) doc = parsed.doc;
-          } catch {
-            // Invalid/partial JSON (mid-edit, a merge conflict): fall back to an
-            // empty page rather than throwing and crashing the editor pane.
-          }
+      setPageJson(
+        text: string,
+      ): { ok: true } | { ok: false; errors: string[] } {
+        const res = loadPageJson(text, title);
+        if (!res.ok) {
+          // Non-empty content that failed to parse/validate. Leave the canvas
+          // untouched and report — never silently blank (a blank + Save would
+          // overwrite the real file). The pure decision lives in loadPageJson.
+          return { ok: false, errors: res.errors };
         }
         // Preserve the loaded page's title so a round-trip save doesn't clobber it.
-        onTitleChange(doc.title);
-        actions.deserialize(JSON.stringify(fromPageDoc(doc)));
+        onTitleChange(res.doc.title);
+        // Capture the loaded canvas as the pristine baseline BEFORE deserialize.
+        // Dirtiness is then derived by comparing the live canvas against this, so
+        // the load's own onNodesChange (and the initial mount) never reads as an
+        // edit — deterministic, no timing guard needed.
+        const state = fromPageDoc(res.doc);
+        baselineRef.current = serializePageNodes(state);
+        actions.deserialize(JSON.stringify(state));
+        return { ok: true };
       },
     }),
-    [query, actions, title, onTitleChange],
+    [query, actions, title, onTitleChange, baselineRef],
   );
   return null;
 });
@@ -623,11 +768,31 @@ const Bridge = forwardRef<
 const PageComposer = forwardRef<PageComposerHandle, PageComposerProps>(
   function PageComposer({ onChange, entities = [], processes = [] }, ref) {
     const [title, setTitle] = useState("Page");
+    // Pristine baseline (serialized node list) captured at load time. Dirtiness is
+    // derived by comparing the live canvas against this on every Craft change, so
+    // the programmatic load and the initial mount — which both fire onNodesChange —
+    // are never misreported as user edits. `null` until the first load: while null,
+    // there is nothing to be dirty against, so changes are ignored.
+    const baselineRef = useRef<string | null>(null);
     return (
       <div className="pc-root">
         <style>{PAGE_COMPOSER_CSS}</style>
-        <Editor resolver={RESOLVER} onNodesChange={() => onChange?.()}>
-          <Bridge ref={ref} title={title} onTitleChange={setTitle} />
+        <Editor
+          resolver={RESOLVER}
+          onNodesChange={(query) => {
+            const baseline = baselineRef.current;
+            if (baseline == null) return;
+            const state = JSON.parse(query.serialize()) as CraftState;
+            if (serializePageNodes(state) === baseline) return;
+            onChange?.();
+          }}
+        >
+          <Bridge
+            ref={ref}
+            title={title}
+            onTitleChange={setTitle}
+            baselineRef={baselineRef}
+          />
           <div className="pc-toolbar">
             <label className="pc-row">
               <span>Page title</span>
@@ -678,6 +843,14 @@ const PAGE_COMPOSER_CSS = `
 .pc-sub { opacity:.7; }
 .pc-card { border:1px solid var(--color-edge,#d0d0d8); border-radius:.5rem; padding:.75rem; }
 .pc-card-title { font-weight:600; margin-bottom:.5rem; }
+.pc-nav { border:1px solid var(--color-edge,#d0d0d8); border-radius:.5rem; padding:.5rem .65rem; }
+.pc-nav.pc-bar { display:flex; align-items:center; gap:.6rem; flex-wrap:wrap; }
+.pc-nav.pc-rail { display:flex; flex-direction:column; gap:.35rem; max-width:14rem; }
+.pc-nav-title { font-weight:650; }
+.pc-nav-items { display:flex; gap:.35rem; flex-wrap:wrap; }
+.pc-nav.pc-rail .pc-nav-items { flex-direction:column; }
+.pc-nav-link { display:inline-flex; align-items:center; gap:.35rem; padding:.25rem .55rem; border-radius:.35rem; background:rgba(120,120,160,.12); font-size:.85rem; }
+.pc-nav-icon { opacity:.8; }
 .pc-field { display:flex; flex-direction:column; gap:.15rem; margin-bottom:.4rem; }
 .pc-field label { font-size:.75rem; opacity:.7; }
 .pc-field input { padding:.3rem .4rem; border:1px solid var(--color-edge,#d0d0d8); border-radius:.3rem; background:transparent; color:inherit; }
