@@ -76,7 +76,7 @@ export default function InstanceDetail({
   // first because it cannot be undone; refreshes the detail so the state badge
   // flips to Terminated and the overlay clears.
   const onCancelInstance = (processId: string) => {
-    if (!window.confirm(cancelConfirmMessage(processId))) return;
+    if (!window.confirm(cancelConfirmMessage(processId, instanceKey))) return;
     setBusy(true);
     setActionError(null);
     cancelInstance({ path: { key: instanceKey }, throwOnError: true })

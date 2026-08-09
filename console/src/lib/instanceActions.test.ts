@@ -18,7 +18,10 @@ test("isCancellable is false for finished or transient states", () => {
 });
 
 test("cancelConfirmMessage names the instance and warns it is irreversible", () => {
-  const msg = cancelConfirmMessage("order-fulfilment");
+  const msg = cancelConfirmMessage("order-fulfilment", "2251799813685249");
   assert.match(msg, /order-fulfilment/);
+  // The instance key must appear so an operator can't confuse two runs of the
+  // same process definition (processId is not unique across instances).
+  assert.match(msg, /2251799813685249/);
   assert.match(msg, /cannot be undone/i);
 });

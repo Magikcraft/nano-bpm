@@ -13,6 +13,12 @@ export function isCancellable(state: string): boolean {
 
 // Confirmation copy for the (destructive, irreversible) cancel action. Kept
 // here so the exact wording is asserted by a test rather than buried in JSX.
-export function cancelConfirmMessage(processId: string): string {
-  return `Cancel process instance "${processId}"? This discards all its tokens (pending jobs, timers, message subscriptions) and terminates it. This cannot be undone.`;
+// The instance key is included because a processId is NOT unique across
+// instances — the operator must be able to see exactly which run they are
+// terminating before confirming.
+export function cancelConfirmMessage(
+  processId: string,
+  instanceKey: string,
+): string {
+  return `Cancel process instance "${processId}" (${instanceKey})? This discards all its tokens (pending jobs, timers, message subscriptions) and terminates it. This cannot be undone.`;
 }
