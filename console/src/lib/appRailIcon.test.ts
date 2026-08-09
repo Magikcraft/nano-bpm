@@ -15,6 +15,19 @@ test("isAssetIcon: a path or a real extension is an app-shipped asset", () => {
   }
 });
 
+test("isAssetIcon: any non-empty extension counts, matching Rust Path::extension", () => {
+  // Guards the drift class where the TS mirror only accepted `[a-z0-9]`
+  // extensions while the server (Path::extension) accepts any non-empty run —
+  // e.g. underscores/hyphens would have diverged.
+  for (const icon of ["icon.my_ext", "icon.weird-ext", "icon.tar.gz"]) {
+    assert.equal(isAssetIcon(icon), true, icon);
+  }
+});
+
+test("isAssetIcon: a trailing dot is not an extension", () => {
+  assert.equal(isAssetIcon("icon."), false);
+});
+
 test("isAssetIcon: a bundled glyph name (or a dotfile) is not an asset", () => {
   // A dotfile like ".svg" has no char before the dot, so — matching Rust's
   // Path::extension — it is a bundled name, not an asset path.
