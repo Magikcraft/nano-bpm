@@ -25,6 +25,8 @@ import {
   type ProjectSummary,
 } from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
+import { isAssetIcon } from "./lib/appRailIcon";
+import { AppIcon } from "./components/AppIcon";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 import { IS_STUDIO, CONSOLE_PROFILE } from "./lib/profile";
 import { useProductTour } from "./lib/tour/useProductTour";
@@ -169,14 +171,8 @@ const icons = {
 
 // A running app's left-rail `icon` hint is either a *bundled glyph name*
 // (resolved against the console's icon set) or a *project asset path* the app
-// ships itself (e.g. `assets/icon.svg`), served path-guarded from
-// `/console/app-view-icon/<name>`. Heuristic mirrored server-side
-// (`app_view_icon_is_asset`): a separator, or a real extension (a dot with a
-// non-separator char before it, so a dotfile like `.svg` is NOT an extension —
-// matching Rust's `Path::extension`), ⇒ asset path.
-function isAssetIcon(icon: string | null | undefined): boolean {
-  return !!icon && (icon.includes("/") || /[^/]\.[a-z0-9]+$/i.test(icon));
-}
+// ships itself. Classification helpers (`isAssetIcon`, `isSvgIcon`) live in
+// `./lib/appRailIcon` so they can be unit-tested without a DOM.
 
 // Resolve a running app's left-rail glyph from its manifest `icon` hint,
 // falling back to the default app glyph when the hint is absent or names an
@@ -189,10 +185,11 @@ function appRailIcon(icon: string | null | undefined): ReactNode {
   return icons.appDefault;
 }
 
-// The rail glyph for one running app: an app-shipped image icon (rendered via
-// <img>, which never executes a scripted SVG) when `icon` is an asset path,
-// else the resolved bundled glyph. A failed image load (missing/oversized/
-// wrong type ⇒ the server 404s) falls back to the default glyph.
+// The rail glyph for one running app: the shared `AppIcon` renderer (which
+// themes SVG icons via a CSS mask so they don't vanish on the dark rail) for an
+// app-shipped asset, else the resolved bundled glyph. A failed image load
+// (missing/oversized/wrong type ⇒ the server 404s) falls back to the default
+// glyph.
 function AppRailGlyph({
   name,
   icon,
@@ -206,14 +203,10 @@ function AppRailGlyph({
   useEffect(() => setFailed(false), [icon]);
   if (isAssetIcon(icon) && !failed) {
     return (
-      <img
-        // The path is manifest-fixed; `v` cache-busts a changed icon hint.
-        src={`/console/app-view-icon/${encodeURIComponent(name)}?v=${encodeURIComponent(
-          icon ?? "",
-        )}`}
-        alt=""
-        aria-hidden="true"
-        className="h-4 w-4 shrink-0 rounded-sm object-contain"
+      <AppIcon
+        name={name}
+        icon={icon}
+        sizeClass="h-4 w-4 rounded-sm"
         onError={() => setFailed(true)}
       />
     );
