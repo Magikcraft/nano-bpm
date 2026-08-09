@@ -107,7 +107,13 @@ jobs:
               - '**'
               - '!website/**'
               - '!server/src/console/landing.html'
-
+      - name: Guard landing.html removal while still referenced by include_str!
+        run: |
+          set -euo pipefail
+          if [ ! -f server/src/console/landing.html ] && grep -q 'include_str!("landing.html")' server/src/console/mod.rs; then
+            echo '::error file=server/src/console/mod.rs::server/src/console/landing.html is missing but server/src/console/mod.rs still include_str!("landing.html").'
+            exit 1
+          fi
   fmt:
     name: rustfmt (pinned nightly)
     runs-on: ubuntu-24.04
