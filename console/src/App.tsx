@@ -224,7 +224,7 @@ function AppRailGlyph({
           />
           <span
             aria-hidden="true"
-            className="h-4 w-4 shrink-0"
+            className="inline-block h-4 w-4 shrink-0"
             style={{
               backgroundColor: "currentColor",
               maskImage: `url("${src}")`,
