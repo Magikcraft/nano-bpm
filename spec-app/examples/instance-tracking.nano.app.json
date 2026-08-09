@@ -1,0 +1,34 @@
+{
+  "$schema": "https://nanobpm.io/spec-app/nano-app.schema.json",
+  "schemaVersion": 1,
+  "id": "workforce",
+  "name": "Workforce",
+  "models": {
+    "processes": ["processes/*.bpmn"]
+  },
+  "data": {
+    "default": "app",
+    "sources": {
+      "app": {
+        "driver": "sqlite",
+        "url": "file:./app.db",
+        "migrations": "db/migrations"
+      }
+    }
+  },
+  "instanceTracking": [
+    {
+      "table": "plans",
+      "keyField": "process_key",
+      "statusField": "status",
+      "activeStatuses": ["planning", "dispatched"],
+      "onTerminated": {
+        "set": {
+          "status": "abandoned",
+          "open_task_escalation_id": null
+        }
+      },
+      "pollMs": 15000
+    }
+  ]
+}

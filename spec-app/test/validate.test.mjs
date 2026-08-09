@@ -81,6 +81,40 @@ test("manifest-only mode (no index) skips model rules but keeps intra-manifest r
   assert.deepEqual(codesFor(result, "/surfaces/chat/agent"), ["unknown-llm"]);
 });
 
+test("instanceTracking activeStatuses without statusField is incoherent", () => {
+  const m = manifest();
+  m.instanceTracking = [
+    {
+      table: "plans",
+      keyField: "process_key",
+      activeStatuses: ["planning"], // no statusField to read them from
+      onTerminated: { set: { status: "abandoned" } },
+    },
+  ];
+  const result = validateManifest(m); // intra-manifest rule; no index needed
+  assert.equal(result.ok, false);
+  assert.deepEqual(
+    codesFor(result, "/instanceTracking/0/activeStatuses"),
+    ["instance-tracking-incoherent"],
+  );
+});
+
+test("instanceTracking with statusField + activeStatuses is coherent", () => {
+  const m = manifest();
+  m.instanceTracking = [
+    {
+      table: "plans",
+      keyField: "process_key",
+      statusField: "status",
+      activeStatuses: ["planning"],
+      onTerminated: { set: { status: "abandoned" } },
+    },
+  ];
+  const result = validateManifest(m);
+  assert.equal(result.ok, true);
+  assert.deepEqual(codesFor(result, "/instanceTracking/0/activeStatuses"), []);
+});
+
 // ── Domain type registry (ADR 0029 §4 / ADR 0031) ─────────────────────────────
 import { resolveDomainTypes } from "../src/domain-types.ts";
 
