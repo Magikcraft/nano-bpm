@@ -186,10 +186,20 @@ jobs:
             # for every release v0.0.5–v0.0.11, so it's the reliable default. zig
             # cross-compiles the target regardless of host arch and pins the 2.31
             # glibc floor.
+            #
+            # `lto_fast` (thin LTO + 16 codegen-units, see the build steps and
+            # #634): since v0.0.11 the `console` feature grew (portable-pty #496,
+            # reqwest `stream`), and the enlarged final crate pushed fat LTO's
+            # single-threaded, whole-graph codegen past this leg's time/memory
+            # budget — the exact wedge that hung v0.0.13 (stuck on the final crate,
+            # not `dunce`). Thin LTO parallelizes the final stage and caps peak
+            # memory; the arm64 gateway plugin binary tolerates the ~2–8% size
+            # bump. Mirrors the armv6/armv7 legs below.
             os: ubuntu-24.04
             asset: nanobpm-gateway-rest-server-linux-arm64
             zig: true
             glibc: '2.31'
+            lto_fast: true
           # 32-bit ARM legs relax the release profile's fat LTO (see `lto_fast`
           # handling in the build steps). `[profile.release]` uses `lto = true` +
           # `codegen-units = 1`, which collapses every crate into one LLVM module
