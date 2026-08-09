@@ -94,12 +94,12 @@ export type Job = {
      * Logical instant (ms since epoch) the current activation lock was acquired. Populated only for a job the engine reports as Activated.
      *
      */
-    activated_at_ms?: number | null;
+    activated_at_ms: number | null;
     /**
-     * The lock duration the job was activated with (deadline_ms − activated_at_ms), i.e. the worker's job timeout. Null unless activated.
+     * The original activation timeout (the worker-requested lock duration), frozen by the engine at activation. May differ from the current deadline_ms − activated_at_ms after an UpdateJobTimeout lock extension. Null unless activated.
      *
      */
-    timeout_ms?: number | null;
+    timeout_ms: number | null;
 };
 
 export type Incident = {
