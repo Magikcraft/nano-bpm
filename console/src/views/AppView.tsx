@@ -8,6 +8,8 @@ import {
   type RunState,
 } from "../gen";
 import { projectLogs, type ProjectLogLine } from "../lib/api";
+import { isAssetIcon } from "../lib/appRailIcon";
+import { AppIcon } from "../components/AppIcon";
 import { cssVar, TOKEN_KEYS } from "../theme/themes";
 
 // The console-integrated control surface for a supervised app (ADR 0057, issue
@@ -364,13 +366,11 @@ export default function AppView() {
     }
     return appViewBase;
   })();
-  // An app-shipped image icon (see App.tsx `isAssetIcon`) is served path-guarded
-  // from the icon route; bundled glyph names are a rail-only concern. Mirror the
-  // rail heuristic exactly (a real extension needs a non-slash char before the
-  // dot, matching Rust's `Path::extension`).
-  const iconIsAsset =
-    !!appUi?.icon &&
-    (appUi.icon.includes("/") || /[^/]\.[a-z0-9]+$/i.test(appUi.icon));
+  // An app-shipped image icon is served path-guarded from the icon route;
+  // bundled glyph names are a rail-only concern. Classification + themed
+  // rendering are shared with the rail via `isAssetIcon` / `AppIcon` (single
+  // source of truth — no drift).
+  const iconIsAsset = isAssetIcon(appUi?.icon);
   const btn =
     "rounded-md px-3 py-1.5 text-sm font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-50";
 
@@ -379,13 +379,10 @@ export default function AppView() {
       <header className="border-b border-edge px-6 py-4">
         <div className="flex items-center gap-3">
           {iconIsAsset && (
-            <img
-              src={`/console/app-view-icon/${encodeURIComponent(name)}?v=${encodeURIComponent(
-                appUi?.icon ?? "",
-              )}`}
-              alt=""
-              aria-hidden="true"
-              className="h-6 w-6 shrink-0 rounded object-contain"
+            <AppIcon
+              name={name}
+              icon={appUi?.icon}
+              sizeClass="h-6 w-6 rounded"
             />
           )}
           <span

@@ -25,7 +25,8 @@ import {
   type ProjectSummary,
 } from "./gen";
 import { registerFileTypesFromOverview } from "./lib/editorLang";
-import { isAssetIcon, isSvgIcon } from "./lib/appRailIcon";
+import { isAssetIcon } from "./lib/appRailIcon";
+import { AppIcon } from "./components/AppIcon";
 import { setIntellisenseFromOverview } from "./lib/langIntellisense";
 import { IS_STUDIO, CONSOLE_PROFILE } from "./lib/profile";
 import { useProductTour } from "./lib/tour/useProductTour";
@@ -184,15 +185,11 @@ function appRailIcon(icon: string | null | undefined): ReactNode {
   return icons.appDefault;
 }
 
-// The rail glyph for one running app. An SVG app icon is a monochrome
-// silhouette authored against `currentColor` (like the bundled glyphs), but an
-// `<img>`-loaded SVG can't inherit `currentColor` — it resolves to the SVG's
-// own default (black), so a dark-stroked icon vanishes on the dark theme. We
-// therefore paint the rail's foreground *through* the SVG as a CSS `mask`, so it
-// themes with the rail; a mask-image (like `<img>`) never executes scripted SVG.
-// Raster icons (png/jpeg) carry their own colour and are shown via `<img>` as
-// before. A failed image load (missing/oversized/wrong type ⇒ the server 404s)
-// falls back to the default glyph.
+// The rail glyph for one running app: the shared `AppIcon` renderer (which
+// themes SVG icons via a CSS mask so they don't vanish on the dark rail) for an
+// app-shipped asset, else the resolved bundled glyph. A failed image load
+// (missing/oversized/wrong type ⇒ the server 404s) falls back to the default
+// glyph.
 function AppRailGlyph({
   name,
   icon,
@@ -205,47 +202,11 @@ function AppRailGlyph({
   // icon recovers without a full remount.
   useEffect(() => setFailed(false), [icon]);
   if (isAssetIcon(icon) && !failed) {
-    // The path is manifest-fixed; `v` cache-busts a changed icon hint.
-    const src = `/console/app-view-icon/${encodeURIComponent(
-      name,
-    )}?v=${encodeURIComponent(icon ?? "")}`;
-    if (isSvgIcon(icon)) {
-      return (
-        <>
-          {/* A masked <span> can't report a failed load, so a hidden probe
-              <img> drives the default-glyph fallback on a 404. It shares the
-              browser cache with the mask below (same URL ⇒ one fetch). */}
-          <img
-            src={src}
-            alt=""
-            aria-hidden="true"
-            className="hidden"
-            onError={() => setFailed(true)}
-          />
-          <span
-            aria-hidden="true"
-            className="inline-block h-4 w-4 shrink-0"
-            style={{
-              backgroundColor: "currentColor",
-              maskImage: `url("${src}")`,
-              WebkitMaskImage: `url("${src}")`,
-              maskSize: "contain",
-              WebkitMaskSize: "contain",
-              maskRepeat: "no-repeat",
-              WebkitMaskRepeat: "no-repeat",
-              maskPosition: "center",
-              WebkitMaskPosition: "center",
-            }}
-          />
-        </>
-      );
-    }
     return (
-      <img
-        src={src}
-        alt=""
-        aria-hidden="true"
-        className="h-4 w-4 shrink-0 rounded-sm object-contain"
+      <AppIcon
+        name={name}
+        icon={icon}
+        sizeClass="h-4 w-4 rounded-sm"
         onError={() => setFailed(true)}
       />
     );
