@@ -1,7 +1,13 @@
 import { useState, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { getInstance, resolveIncident, setInstanceVariables } from "../gen";
+import {
+  cancelInstance,
+  getInstance,
+  resolveIncident,
+  setInstanceVariables,
+} from "../gen";
 import { fetchProcessXml } from "../lib/api";
+import { isCancellable, cancelConfirmMessage } from "../lib/instanceActions";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import BpmnViewer from "../components/BpmnViewer";
 import { fmtClock, fmtDuration } from "../components/TraceTimeline";
@@ -66,6 +72,19 @@ export default function InstanceDetail({
       .finally(() => setBusy(false));
   };
 
+  // Destructive: discard every token and terminate the instance. Confirmed
+  // first because it cannot be undone; refreshes the detail so the state badge
+  // flips to Terminated and the overlay clears.
+  const onCancelInstance = (processId: string) => {
+    if (!window.confirm(cancelConfirmMessage(processId, instanceKey))) return;
+    setBusy(true);
+    setActionError(null);
+    cancelInstance({ path: { key: instanceKey }, throwOnError: true })
+      .then(refresh)
+      .catch((e) => setActionError(String(e)))
+      .finally(() => setBusy(false));
+  };
+
   if (isLoading) return <p className="p-8 text-fg-muted">Loading…</p>;
   if (error)
     return <p className="p-8 text-danger">Failed to load: {String(error)}</p>;
@@ -91,6 +110,17 @@ export default function InstanceDetail({
           </h1>
           <Badge tone="neutral">{instance.state}</Badge>
           {instance.has_incident && <Badge tone="danger">Incident</Badge>}
+          {isCancellable(instance.state) && (
+            <Button
+              size="sm"
+              variant="danger"
+              disabled={busy}
+              className="ml-auto"
+              onClick={() => onCancelInstance(instance.process_id)}
+            >
+              Cancel instance
+            </Button>
+          )}
         </div>
         <div className="mt-1 font-mono text-xs text-fg-faint">
           instance {instance.key} · definition {instance.process_definition_key}{" "}

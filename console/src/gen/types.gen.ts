@@ -1588,6 +1588,37 @@ export type ResolveIncidentResponses = {
 
 export type ResolveIncidentResponse = ResolveIncidentResponses[keyof ResolveIncidentResponses];
 
+export type CancelInstanceData = {
+    body?: never;
+    path: {
+        key: string;
+    };
+    query?: never;
+    url: '/instances/{key}/cancellation';
+};
+
+export type CancelInstanceErrors = {
+    /**
+     * Not found
+     */
+    404: string;
+    /**
+     * Internal error
+     */
+    500: string;
+};
+
+export type CancelInstanceError = CancelInstanceErrors[keyof CancelInstanceErrors];
+
+export type CancelInstanceResponses = {
+    /**
+     * The instance was cancelled
+     */
+    204: void;
+};
+
+export type CancelInstanceResponse = CancelInstanceResponses[keyof CancelInstanceResponses];
+
 export type SetInstanceVariablesData = {
     body: SetInstanceVariablesRequest;
     path: {

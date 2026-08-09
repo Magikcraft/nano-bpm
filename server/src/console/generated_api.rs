@@ -382,6 +382,36 @@ impl apis::instances::Instances for ServerImpl {
         })
     }
 
+    async fn cancel_instance(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        path_params: &models::CancelInstancePathParams,
+    ) -> Result<apis::instances::CancelInstanceResponse, ()> {
+        use apis::instances::CancelInstanceResponse as Resp;
+
+        use crate::CancelInstanceOutcome as Out;
+
+        let instance_key: u64 = match path_params.key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_NotFound(format!(
+                    "Instance key '{}' is not a valid key.",
+                    path_params.key
+                )));
+            }
+        };
+
+        // Console operator action: reuses the same engine-command + leader-forward
+        // core as `POST /v2/process-instances/{key}/cancellation`.
+        Ok(match self.cancel_instance_core(instance_key).await {
+            Out::Canceled => Resp::Status204_TheInstanceWasCancelled,
+            Out::NotFound(d) => Resp::Status404_NotFound(d),
+            Out::Internal(d) => Resp::Status500_InternalError(d),
+        })
+    }
+
     async fn set_instance_variables(
         &self,
         _method: &Method,

@@ -4179,38 +4179,23 @@ impl ServerImpl {
             }
         };
 
-        if let Some(node) = self.route_by_leader(instance_key) {
-            return Ok(self.forward_cancel_instance(node, instance_key).await);
-        }
-
-        let result = self
-            .engine
-            .by_key(instance_key)
-            .with(move |engine| {
-                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
-            })
-            .await;
-        match result {
-            Ok((events, commit)) => {
-                commit.wait().await;
-                self.spawn_routing_if_needed(&events);
-                Ok(Resp::Status204_TheProcessInstanceIsCanceled)
-            }
-            Err(EngineError::InstanceNotFound { instance_key }) => {
-                Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
+        Ok(match self.cancel_instance_core(instance_key).await {
+            CancelInstanceOutcome::Canceled => Resp::Status204_TheProcessInstanceIsCanceled,
+            CancelInstanceOutcome::NotFound(detail) => {
+                Resp::Status404_TheProcessInstanceIsNotFound(problem(
                     "Process instance not found",
                     404,
-                    format!("No active process instance with key {instance_key}."),
-                )))
+                    detail,
+                ))
             }
-            Err(e) => Ok(
+            CancelInstanceOutcome::Internal(detail) => {
                 Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
                     "Internal error",
                     500,
-                    e.to_string(),
-                )),
-            ),
-        }
+                    detail,
+                ))
+            }
+        })
     }
 
     async fn complete_job_impl(
@@ -4660,6 +4645,47 @@ impl ServerImpl {
         }
 
         Ok(Resp::Status204_TheJobWasUpdatedSuccessfully)
+    }
+
+    /// Surface-independent core of "cancel a running process instance". Mirrors
+    /// [`Self::resolve_incident_core`]: leader-forward to the partition owner or
+    /// apply [`Command::cancel_instance`] locally. Shared by the v2 REST endpoint
+    /// (`POST /v2/process-instances/{key}/cancellation`) and the console
+    /// operator endpoint so the engine-command and clustering semantics have a
+    /// single source of truth.
+    pub(crate) async fn cancel_instance_core(&self, instance_key: u64) -> CancelInstanceOutcome {
+        use CancelInstanceOutcome as Out;
+
+        if let Some(node) = self.route_by_leader(instance_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link.cancel_instance(instance_key.to_string()).await {
+                    Ok(r) if is_ok_status(r.status) => Out::Canceled,
+                    Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+
+        match self
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| {
+                engine.apply_command_at(Command::cancel_instance(instance_key), now_millis())
+            })
+            .await
+        {
+            Ok((events, commit)) => {
+                commit.wait().await;
+                self.spawn_routing_if_needed(&events);
+                Out::Canceled
+            }
+            Err(EngineError::InstanceNotFound { instance_key }) => Out::NotFound(format!(
+                "No active process instance with key {instance_key}."
+            )),
+            Err(e) => Out::Internal(e.to_string()),
+        }
     }
 
     /// Surface-independent core of "resolve an incident": leader-forward when
@@ -6349,42 +6375,6 @@ impl ServerImpl {
                     .unwrap_or_default()
             }
             _ => Vec::new(),
-        }
-    }
-
-    /// Forwards a `cancelProcessInstance` to the peer owning the instance.
-    async fn forward_cancel_instance(
-        &self,
-        node: u32,
-        instance_key: u64,
-    ) -> apis::process_instance::CancelProcessInstanceResponse {
-        use apis::process_instance::CancelProcessInstanceResponse as Resp;
-        let res =
-            match self.peer_link(node).await {
-                Ok(link) => link.cancel_instance(instance_key.to_string()).await,
-                Err((s, m)) => {
-                    return Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
-                        problem("Peer error", s, m),
-                    );
-                }
-            };
-        match res {
-            Ok(r) if is_ok_status(r.status) => Resp::Status204_TheProcessInstanceIsCanceled,
-            Ok(r) if r.status == 404 => Resp::Status404_TheProcessInstanceIsNotFound(problem(
-                "Process instance not found",
-                404,
-                peer_detail(&r),
-            )),
-            Ok(r) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                500,
-                peer_detail(&r),
-            )),
-            Err(e) => Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
-                "Peer error",
-                502,
-                e.to_string(),
-            )),
         }
     }
 
@@ -15194,6 +15184,19 @@ pub(crate) enum ResolveIncidentOutcome {
     Internal(String),
 }
 
+/// Surface-independent outcome of [`ServerImpl::cancel_instance_core`], mapped
+/// to each API's own response type (v2 REST and console) so the
+/// `Command::cancel_instance` and clustering (leader-forward) semantics have a
+/// single source of truth.
+pub(crate) enum CancelInstanceOutcome {
+    /// The instance was cancelled (every token discarded, state TERMINATED).
+    Canceled,
+    /// No active process instance with the given key exists (404).
+    NotFound(String),
+    /// An unexpected engine/peer error occurred (500).
+    Internal(String),
+}
+
 /// Surface-independent outcome of [`ServerImpl::set_variables_core`].
 pub(crate) enum SetVariablesOutcome {
     /// The variables were merged into the scope.
@@ -20241,6 +20244,101 @@ mod clustered_startup_tests {
         ));
     }
 
+    /// Exercises [`ServerImpl::cancel_instance_core`] — the surface-independent
+    /// core the v2 REST API and the console Explorer share — on a running
+    /// instance, plus its not-found outcome.
+    #[tokio::test]
+    async fn cancel_instance_via_shared_core() {
+        let server = ServerImpl::default();
+
+        // A service task waits for a job no worker ever activates, so the
+        // instance stays Active — exactly the state an operator cancels from the
+        // Explorer.
+        let proc = ProcessBuilder::new("waits-forever")
+            .start_event("s")
+            .service_task("work", "never-served")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .build()
+            .expect("valid definition");
+        let mut names = std::collections::HashMap::new();
+        names.insert(
+            "waits-forever".to_string(),
+            "waits-forever.bpmn".to_string(),
+        );
+        server
+            .deploy_resources_locally(
+                vec![proc],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("waits-forever".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create the instance");
+
+        // The instance projects as Active (waiting on the service-task job).
+        let mut active = false;
+        for _ in 0..200 {
+            if server
+                .store
+                .process_instance(instance_key)
+                .is_some_and(|r| r.state == ProcessInstanceState::Active)
+            {
+                active = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            active,
+            "the instance projects as Active before cancellation"
+        );
+
+        // A bogus key is reported as not-found, not silently swallowed.
+        assert!(matches!(
+            server.cancel_instance_core(999_999_999).await,
+            CancelInstanceOutcome::NotFound(_)
+        ));
+
+        // Cancelling discards the token and terminates the instance.
+        assert!(matches!(
+            server.cancel_instance_core(instance_key).await,
+            CancelInstanceOutcome::Canceled
+        ));
+        let mut terminated = false;
+        for _ in 0..200 {
+            if server
+                .store
+                .process_instance(instance_key)
+                .is_some_and(|r| r.state == ProcessInstanceState::Terminated)
+            {
+                terminated = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            terminated,
+            "cancelling transitions the instance to Terminated"
+        );
+
+        // Cancelling an already-finished instance is now a not-found.
+        assert!(matches!(
+            server.cancel_instance_core(instance_key).await,
+            CancelInstanceOutcome::NotFound(_)
+        ));
+    }
+
     #[tokio::test]
     async fn dmn_deployment_is_queryable_via_definition_and_requirements_endpoints() {
         // Deploying a `.dmn` projects one decision-requirements graph and one
@@ -20583,20 +20681,22 @@ mod clustered_startup_tests {
             .collect();
         let node1 = build_server_in_memory(journals, topology);
 
-        let owner = node1
-            .remote_owner_of(instance_key)
-            .expect("the instance's partition is owned by a peer");
-        use apis::process_instance::CancelProcessInstanceResponse as R;
-        let resp = node1.forward_cancel_instance(owner, instance_key).await;
         assert!(
-            matches!(resp, R::Status204_TheProcessInstanceIsCanceled),
-            "the forwarded cancel should succeed (204)"
+            node1.remote_owner_of(instance_key).is_some(),
+            "the instance's partition is owned by a peer, so the core must forward"
+        );
+        // cancel_instance_core routes by leader: node1 doesn't own the
+        // partition, so this exercises the peer-forward path.
+        let resp = node1.cancel_instance_core(instance_key).await;
+        assert!(
+            matches!(resp, CancelInstanceOutcome::Canceled),
+            "the forwarded cancel should succeed"
         );
         // Cancelling again is rejected (the instance is already terminal),
         // proving the first cancel took effect on the owner.
-        let again = node1.forward_cancel_instance(owner, instance_key).await;
+        let again = node1.cancel_instance_core(instance_key).await;
         assert!(
-            matches!(again, R::Status404_TheProcessInstanceIsNotFound(_)),
+            matches!(again, CancelInstanceOutcome::NotFound(_)),
             "re-cancelling a terminated instance must 404"
         );
     }

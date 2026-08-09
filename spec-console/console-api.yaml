@@ -138,6 +138,25 @@ paths:
         '409': { $ref: '#/components/responses/Conflict' }
         '500': { $ref: '#/components/responses/InternalError' }
 
+  /instances/{key}/cancellation:
+    post:
+      operationId: cancelInstance
+      tags: [instances]
+      summary: Cancel a running process instance
+      description: >
+        Operator action from the Process Explorer. Discards every token
+        (cancels pending jobs, disarms timers and message subscriptions, closes
+        any active incident) and transitions the instance to TERMINATED. Reuses
+        the same engine command and leader-forward core as the v2 REST endpoint
+        POST /v2/process-instances/{key}/cancellation. An unknown or
+        already-finished instance is a 404.
+      parameters:
+        - { name: key, in: path, required: true, schema: { type: string } }
+      responses:
+        '204': { description: The instance was cancelled }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /instances/{key}/variables:
     put:
       operationId: setInstanceVariables
