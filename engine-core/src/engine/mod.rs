@@ -1466,7 +1466,7 @@ impl Engine {
                             instance_key,
                             worker: worker.clone(),
                             deadline,
-                            activated_at: now,
+                            activated_at: Some(now),
                         },
                     );
                 }

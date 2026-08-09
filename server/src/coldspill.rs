@@ -298,6 +298,7 @@ mod tests {
             worker: None,
             deadline: None,
             activated_at: None,
+            activation_timeout: None,
             activated: false,
             retries: 3,
             priority: nanobpmn_engine_core::DEFAULT_JOB_PRIORITY,
