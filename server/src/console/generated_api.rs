@@ -372,9 +372,11 @@ impl apis::instances::Instances for ServerImpl {
         };
 
         // Console operator action: no operationReference (that is a client
-        // idempotency token on the public v2 API). Reuses the same engine-command
-        // + leader-forward core as `POST /v2/incidents/{key}/resolution`.
-        Ok(match self.resolve_incident_core(incident_key, None).await {
+        // idempotency token on the public v2 API). Operate-style one-click retry:
+        // a JobNoRetries incident's parked job is granted a retry before the
+        // shared resolve core runs, so the single button doesn't dead-end on the
+        // engine's Zeebe-parity "update its retries first" guard.
+        Ok(match self.resolve_incident_operator(incident_key).await {
             Out::Resolved => Resp::Status204_TheIncidentWasResolved,
             Out::NotFound(d) => Resp::Status404_NotFound(d),
             Out::NotResolvable(d) => Resp::Status409_AlreadyExists(d),
