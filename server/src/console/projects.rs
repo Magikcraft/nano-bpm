@@ -9859,6 +9859,97 @@ mod tests {
         assert!(gone["rows"].as_array().unwrap().is_empty());
     }
 
+    /// Regression for #673 (dual-runner migration collision). An Urban-shaped app
+    /// (a `nano.app.json` at the project root) has its schema migrated by the
+    /// `@nanobpm/urban` runtime (`urban run`), which keeps its own
+    /// `_urban_migrations` ledger. The console's `domaintypes` op runs on the run
+    /// path (the supervisor regenerates domain types before boot), so it must NOT
+    /// auto-apply the app's migrations a *second* time into the console's separate
+    /// `_nano_migrations` ledger — a later non-idempotent
+    /// `ALTER TABLE … ADD COLUMN` then crashes the `urban run` pass with
+    /// "duplicate column". The explicit, user-initiated `migrate` op is unaffected.
+    ///
+    /// Class-scoped: asserts the whole automatic derive path (`domaintypes`) is
+    /// inert for Urban apps — no migration applied, no schema change — while the
+    /// explicit op still works, so no automatic run-path caller can seed the
+    /// console ledger for an Urban app.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env; guard must span the run_data_op awaits
+    async fn domaintypes_does_not_auto_migrate_urban_shaped_apps() {
+        let _g = lock();
+        if workers::usable_node().is_none() && workers::find_deno().is_none() {
+            eprintln!("skipping: no JS runtime (Node >= 22.6 or Deno) installed");
+            return;
+        }
+        let root = temp_root();
+        let name = "urbanapp";
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("db/migrations")).unwrap();
+        // `nano.app.json` marks this as an Urban-shaped app (urban owns migration).
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{ "data": { "default": "app", "sources": {
+                "app": { "driver": "sqlite", "url": "file:./app.db", "migrations": "db/migrations" }
+            } } }"#,
+        )
+        .unwrap();
+        // A non-idempotent second migration: applying it twice raises
+        // "duplicate column name: note" — exactly the #673 crash.
+        std::fs::write(
+            dir.join("db/migrations/001_init.sql"),
+            "CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("db/migrations/002_add_note.sql"),
+            "ALTER TABLE notes ADD COLUMN note TEXT;",
+        )
+        .unwrap();
+        ensure_project_sdk(name).unwrap();
+
+        // The automatic derive path (domaintypes) must NOT migrate an Urban app.
+        run_data_op(name, serde_json::json!({ "op": "domaintypes" }))
+            .await
+            .expect("domaintypes");
+
+        // No migration file is recorded as applied in the console ledger …
+        let ms = run_data_op(name, serde_json::json!({ "op": "migrations" }))
+            .await
+            .expect("migrations");
+        for e in ms["entries"].as_array().unwrap() {
+            assert_eq!(
+                e["applied"], false,
+                "domaintypes must not auto-apply {} for an Urban app",
+                e["name"]
+            );
+        }
+
+        // … and the schema is untouched: the `notes` table does not exist yet.
+        let sc = run_data_op(name, serde_json::json!({ "op": "schema" }))
+            .await
+            .expect("schema");
+        let tables: Vec<String> = sc["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert!(
+            !tables.contains(&"notes".to_string()),
+            "domaintypes auto-migrated an Urban app (schema changed): {tables:?}"
+        );
+
+        // The explicit, user-initiated `migrate` op is unaffected — it still
+        // applies the pending migrations (Data-panel authoring stays functional).
+        let mig = run_data_op(name, serde_json::json!({ "op": "migrate" }))
+            .await
+            .expect("migrate");
+        assert_eq!(
+            mig["applied"],
+            serde_json::json!(["001_init.sql", "002_add_note.sql"])
+        );
+    }
+
     /// The `domaintypes` op (ADR 0029 §4.1/§6) reifies the live schema into
     /// `nano-generated/domain-rows.d.ts`: one interface per table + a `DomainTables` map,
     /// written next to the SDK and returned as text. Runs through the same
