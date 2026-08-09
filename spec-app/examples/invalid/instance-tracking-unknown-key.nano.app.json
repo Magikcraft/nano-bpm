@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "id": "instance-tracking-unknown-key",
+  "name": "instanceTracking with an unknown key",
+  "instanceTracking": [
+    {
+      "table": "plans",
+      "keyField": "process_key",
+      "onTerminated": { "set": { "status": "abandoned" } },
+      "bogus": true
+    }
+  ]
+}

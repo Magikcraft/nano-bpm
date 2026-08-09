@@ -598,6 +598,10 @@ export interface AppManifest {
 	 */
 	bindings?: Binding[];
 	/**
+	 * Declarative process-instance lifecycle bindings. Each entry names a datasource table whose rows track a process instance by a key column; the runtime polls the engine and, when an instance reaches a terminal state (completed/terminated) while its row is still marked active, applies the declared `onTerminated` patch. This reconciles rows whose instance ended without a completion worker running — an operator cancel/termination, a crash, or a fire-and-forget row-cancel — so a UI derived from the read model reflects the engine's real state.
+	 */
+	instanceTracking?: InstanceTracking[];
+	/**
 	 * Named connections (credentials/endpoint) referenced by triggers/workers by id, so configs carry no inline secrets (ADR 0025 §1).
 	 */
 	connections?: {
@@ -744,6 +748,47 @@ export interface Trigger {
 	 */
 	bodyType?: string;
 	action: TriggerAction;
+}
+/**
+ * One process-instance lifecycle binding: reconcile rows of `table` when their tracked instance reaches a terminal engine state.
+ */
+export interface InstanceTracking {
+	/**
+	 * Datasource table whose rows each track one process instance.
+	 */
+	table: string;
+	/**
+	 * Column holding the tracked process instance key.
+	 */
+	keyField: string;
+	/**
+	 * Column governing whether a row is still active. Combined with `activeStatuses` to select the rows worth polling; when omitted, every row of `table` is polled.
+	 */
+	statusField?: string;
+	/**
+	 * Values of `statusField` considered still-open. Only rows in one of these states are polled; a row already in a terminal status is skipped. When omitted, every row is polled (use with care on large tables).
+	 *
+	 * @minItems 1
+	 */
+	activeStatuses?: [
+		string,
+		...string[]
+	];
+	/**
+	 * The reconciliation applied to a row whose instance has reached a terminal engine state.
+	 */
+	onTerminated: {
+		/**
+		 * Column → literal value patch written to the row (e.g. set the status to an abandoned/terminal value and clear open-task pointers).
+		 */
+		set: {
+			[k: string]: string | number | boolean | null;
+		};
+	};
+	/**
+	 * Poll interval in milliseconds. Default 15000.
+	 */
+	pollMs?: number;
 }
 /**
  * A named connection (credentials/endpoint). Shape is source-specific; secrets should be env templates, never inline literals (ADR 0025 §1).
