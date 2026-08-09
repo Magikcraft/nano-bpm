@@ -492,8 +492,9 @@ function architectureHtml() {
       tagline: "Agent-powered SDLC Orchestration",
       desc:
         "The application at the top of the stack. Hire agents and coding harnesses, " +
-        "then orchestrate the whole software-development lifecycle — write, review, test, " +
-        "merge — as durable graphs that resume across crashes and reboots.",
+        "then orchestrate the whole software-development lifecycle — plan, implement, " +
+        "review, test, merge, QA, and run retrospectives — as durable graphs that resume " +
+        "across crashes and reboots.",
       tags: ["Agent orchestration", "SDLC", "Durable runs"],
     },
     {
