@@ -1483,7 +1483,7 @@ components:
             not found on any ancestor).
     Job:
       type: object
-      required: [key, element_id, job_type, state, retries, worker, deadline_ms]
+      required: [key, element_id, job_type, state, retries, worker, deadline_ms, activated_at_ms, timeout_ms]
       properties:
         key: { type: string }
         element_id: { type: string }
@@ -1492,6 +1492,22 @@ components:
         retries: { type: integer, format: int32 }
         worker: { type: string, nullable: true }
         deadline_ms: { type: integer, format: int64, nullable: true }
+        activated_at_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            Logical instant (ms since epoch) the current activation lock was
+            acquired. Populated only for a job the engine reports as Activated.
+        timeout_ms:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            The original activation timeout (the worker-requested lock
+            duration), frozen by the engine at activation. May differ from the
+            current deadline_ms − activated_at_ms after an UpdateJobTimeout lock
+            extension. Null unless activated.
     Incident:
       type: object
       required: [key, element_id, kind, state, reason, created_at_ms]

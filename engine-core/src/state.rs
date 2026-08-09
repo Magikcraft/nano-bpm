@@ -170,6 +170,20 @@ pub struct Job {
     /// Compared against the caller-supplied `now`; the engine never reads a
     /// wall clock itself.
     pub deadline: Option<u64>,
+    /// Logical instant at which the current activation lock was acquired, if
+    /// locked (the `now` carried on the activating `ActivateJobs` command).
+    /// Cleared whenever the lock is released. `None` for a job that is not
+    /// currently activated, or for records serialized before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub activated_at: Option<u64>,
+    /// The lock duration the job was activated with (the activating command's
+    /// `timeout`), frozen at activation. Unlike `deadline - activated_at`, this
+    /// is immune to later `UpdateJobTimeout` lock extensions (which move
+    /// [`Job::deadline`] but not the originally-requested timeout), so it always
+    /// reflects what the worker asked for. Cleared when the lock is released;
+    /// `None` when not activated or for pre-field records.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub activation_timeout: Option<u64>,
     /// Whether this job has ever been activated. Completion is permitted for any
     /// job that has been activated at least once and is not yet completed —
     /// regardless of which worker currently holds (or held) the lock. This is
@@ -1349,6 +1363,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     state: JobState::Created,
                     worker: None,
                     deadline: None,
+                    activated_at: None,
+                    activation_timeout: None,
                     activated: false,
                     retries: *retries,
                     priority: *priority,
@@ -1387,6 +1403,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     state: JobState::Created,
                     worker: None,
                     deadline: None,
+                    activated_at: None,
+                    activation_timeout: None,
                     activated: false,
                     retries: *retries,
                     priority: DEFAULT_JOB_PRIORITY,
@@ -1429,6 +1447,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     state: JobState::Created,
                     worker: None,
                     deadline: None,
+                    activated_at: None,
+                    activation_timeout: None,
                     activated: false,
                     retries: *retries,
                     priority: DEFAULT_JOB_PRIORITY,
@@ -1480,12 +1500,18 @@ pub fn apply(state: &mut State, event: &Event) {
             job_key,
             worker,
             deadline,
+            activated_at,
             ..
         } => {
             if let Some(job) = state.jobs.get_mut(job_key) {
                 job.state = JobState::Activated;
                 job.worker = Some(worker.clone());
                 job.deadline = Some(*deadline);
+                job.activated_at = *activated_at;
+                // Freeze the requested lock duration at activation, from the two
+                // instants the event carries (deadline = activated_at + timeout).
+                // Immune to later UpdateJobTimeout extensions that move `deadline`.
+                job.activation_timeout = activated_at.map(|a| deadline.saturating_sub(a));
                 job.activated = true;
             }
             resync_job_index(state, *job_key);
@@ -1497,6 +1523,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.state = JobState::Created;
                     job.worker = None;
                     job.deadline = None;
+                    job.activated_at = None;
+                    job.activation_timeout = None;
                 }
             }
             resync_job_index(state, *job_key);
@@ -1509,6 +1537,8 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.retries = *retries;
                 job.worker = None;
                 job.deadline = None;
+                job.activated_at = None;
+                job.activation_timeout = None;
                 // With retries left the job returns to the activatable pool; with
                 // none it parks (an incident is raised alongside this event).
                 job.state = if *retries > 0 {
@@ -1525,6 +1555,8 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.state = JobState::Errored;
                 job.worker = None;
                 job.deadline = None;
+                job.activated_at = None;
+                job.activation_timeout = None;
             }
             resync_job_index(state, *job_key);
         }
@@ -1534,6 +1566,8 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.state = JobState::Completed;
                 job.worker = None;
                 job.deadline = None;
+                job.activated_at = None;
+                job.activation_timeout = None;
             }
             resync_job_index(state, *job_key);
         }
@@ -1690,6 +1724,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     job.state = JobState::Created;
                     job.worker = None;
                     job.deadline = None;
+                    job.activated_at = None;
+                    job.activation_timeout = None;
                 }
                 resync_job_index(state, *job_key);
             }
@@ -1791,6 +1827,8 @@ pub fn apply(state: &mut State, event: &Event) {
                 job.state = JobState::Canceled;
                 job.worker = None;
                 job.deadline = None;
+                job.activated_at = None;
+                job.activation_timeout = None;
             }
             resync_job_index(state, *job_key);
         }
