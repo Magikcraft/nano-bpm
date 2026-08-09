@@ -598,7 +598,7 @@ export interface AppManifest {
 	 */
 	bindings?: Binding[];
 	/**
-	 * Declarative process-instance lifecycle bindings. Each entry names a datasource table whose rows track a process instance by a key column; the runtime polls the engine and, when an instance reaches a terminal state (completed/terminated) while its row is still marked active, applies the declared `onTerminated` patch. This reconciles rows whose instance ended without a completion worker running — an operator cancel/termination, a crash, or a fire-and-forget row-cancel — so a UI derived from the read model reflects the engine's real state.
+	 * Declarative process-instance lifecycle bindings. Each entry names a datasource table whose rows track a process instance by a key column; the runtime polls the engine and, when an instance reaches the TERMINATED state while its row is still marked active, applies the declared `onTerminated` patch. Reconciliation is scoped to TERMINATED only — never COMPLETED, whose terminal row-write is owned by the app's own completion (finalize) worker, so reconciling it here would race that worker and could clobber a legitimately-completed row. This closes rows whose instance ended with no completion worker running — an operator cancel/termination, a crash, or a fire-and-forget row-cancel — so a UI derived from the read model reflects the engine's real state.
 	 */
 	instanceTracking?: InstanceTracking[];
 	/**
@@ -750,7 +750,7 @@ export interface Trigger {
 	action: TriggerAction;
 }
 /**
- * One process-instance lifecycle binding: reconcile rows of `table` when their tracked instance reaches a terminal engine state.
+ * One process-instance lifecycle binding: reconcile rows of `table` when their tracked instance reaches the TERMINATED engine state (never COMPLETED — see the top-level `instanceTracking` description).
  */
 export interface InstanceTracking {
 	/**
@@ -775,7 +775,7 @@ export interface InstanceTracking {
 		...string[]
 	];
 	/**
-	 * The reconciliation applied to a row whose instance has reached a terminal engine state.
+	 * The reconciliation applied to a row whose instance has reached the TERMINATED engine state.
 	 */
 	onTerminated: {
 		/**

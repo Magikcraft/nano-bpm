@@ -111,6 +111,7 @@ test("instanceTracking with statusField + activeStatuses is coherent", () => {
     },
   ];
   const result = validateManifest(m);
+  assert.equal(result.ok, true);
   assert.deepEqual(codesFor(result, "/instanceTracking/0/activeStatuses"), []);
 });
 
