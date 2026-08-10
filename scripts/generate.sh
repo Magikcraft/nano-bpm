@@ -89,8 +89,9 @@ echo "  output: ${OUTPUT_REL}"
 # (merged) output through openapi-log-filter.awk, which hides ONLY those exact
 # known-noise shapes, passes every other line through, tees the full unfiltered
 # output to build/openapi-generate.log, and prints a count of what it hid. Set
-# GEN_VERBOSE=1 to see everything. The `set -euo pipefail` at the top of this
-# script preserves java's non-zero exit through the pipe (awk always exits 0).
+# GEN_VERBOSE=1 to see everything. The awk filter's exit status is independent
+# of java's, so the `set -euo pipefail` at the top of this script is what
+# preserves the generator's non-zero exit through the pipe.
 GEN_LOG="${PROJECT_ROOT}/build/openapi-generate.log"
 mkdir -p "$(dirname "${GEN_LOG}")"
 : >"${GEN_LOG}"
