@@ -116,12 +116,19 @@ export default function AppView() {
       void refresh();
     }, 150);
   }, [refresh]);
+  // Cancel any pending debounce not just on unmount, but whenever `refresh`
+  // changes — i.e. when the routed app (`name`) changes. React Router keeps
+  // `AppView` mounted across `/apps/a` → `/apps/b`, so a timer armed for the
+  // previous app would otherwise fire and overwrite state with the wrong
+  // project's `getProject` result via the stale closure.
   useEffect(
     () => () => {
-      if (refreshTimer.current != null)
+      if (refreshTimer.current != null) {
         window.clearTimeout(refreshTimer.current);
+        refreshTimer.current = null;
+      }
     },
-    [],
+    [refresh],
   );
 
   // Initial load whenever the routed app changes.
