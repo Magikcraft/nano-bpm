@@ -102,13 +102,32 @@ echo "Generating stub trait implementations for the server"
 # are formatted: the whole generated/ crate, and the single generated
 # server/src/stub_impls.rs. The server's hand-written sources are left untouched
 # so regeneration never churns tracked, manually formatted code.
+# Format the generated Rust. rustfmt.toml enables the unstable `group_imports`
+# option, which only the pinned nightly rustfmt (the `make fmt` / CI fmt gate —
+# see FMT_TOOLCHAIN in the Makefile) can apply. Stable rustfmt silently ignores it
+# and prints a noisy "can't set `group_imports` … unstable features are only
+# available in nightly channel" warning on every `make`/generate. Prefer the
+# pinned nightly when it's installed (so generated output matches CI); otherwise
+# fall back to the default toolchain and drop that one expected warning.
+FMT_TOOLCHAIN="${FMT_TOOLCHAIN:-nightly-2026-06-26}"
+FMT_LABEL=""
+if command -v rustup >/dev/null 2>&1 && rustup run "${FMT_TOOLCHAIN}" rustfmt --version >/dev/null 2>&1; then
+  FMT_LABEL=" (${FMT_TOOLCHAIN})"
+  run_fmt() { rustup run "${FMT_TOOLCHAIN}" "$@"; }
+else
+  run_fmt() { "$@"; }
+fi
+# Suppress the expected stable-channel warning about the unstable group_imports
+# option (harmless: stable can't apply it, and the nightly path never emits it).
+strip_fmt_warn() { grep -v -e 'group_imports' -e 'unstable features are only available in nightly channel' || true; }
+
 if command -v cargo >/dev/null 2>&1; then
-  echo "Formatting generated crate with cargo fmt"
-  (cd "${PROJECT_ROOT}/${OUTPUT_REL}" && cargo fmt) || true
+  echo "Formatting generated crate with cargo fmt${FMT_LABEL}"
+  ( cd "${PROJECT_ROOT}/${OUTPUT_REL}" && run_fmt cargo fmt ) 2>&1 | strip_fmt_warn || true
 fi
 if command -v rustfmt >/dev/null 2>&1; then
-  echo "Formatting generated server stub impls with rustfmt"
-  rustfmt --edition 2024 "${PROJECT_ROOT}/server/src/stub_impls.rs" || true
+  echo "Formatting generated server stub impls with rustfmt${FMT_LABEL}"
+  run_fmt rustfmt --edition 2024 "${PROJECT_ROOT}/server/src/stub_impls.rs" 2>&1 | strip_fmt_warn || true
 fi
 
 echo "Done. Generated crate is in ${OUTPUT_REL}"
