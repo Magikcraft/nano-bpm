@@ -11,6 +11,7 @@ import {
 import {
   fromPageDoc,
   loadPageJson,
+  reconcileGridColumns,
   serializePageNodes,
   toPageDoc,
   ROOT_ID,
@@ -431,6 +432,126 @@ test("v2 dataGrid survives a Craft.js round-trip unchanged", () => {
   const state = fromPageDoc(v2Grid);
   const back = toPageDoc(state, v2Grid.title);
   assert.deepEqual(back, v2Grid);
+});
+
+test("parsePageDoc keeps a processExplorer column link and round-trips it", () => {
+  const doc = {
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "dataGrid" as const,
+        id: "g",
+        props: {
+          title: "",
+          data: { kind: "datasource" as const, source: "app", table: "t" },
+          columns: [
+            {
+              field: "status",
+              header: "Status",
+              link: {
+                kind: "processExplorer" as const,
+                keyField: "process_key",
+              },
+            },
+          ],
+        },
+      },
+    ],
+  };
+  const r = parsePageDoc(doc);
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const grid = r.ok && r.doc.nodes[0];
+  const col =
+    grid && grid.type === "dataGrid" ? grid.props.columns[0] : undefined;
+  assert.deepEqual(col?.link, {
+    kind: "processExplorer",
+    keyField: "process_key",
+  });
+  // Survives a Craft.js round-trip unchanged.
+  const back = toPageDoc(fromPageDoc(r.ok ? r.doc : doc), doc.title);
+  const backGrid = back.nodes[0];
+  assert.deepEqual(
+    backGrid.type === "dataGrid" ? backGrid.props.columns[0].link : undefined,
+    { kind: "processExplorer", keyField: "process_key" },
+  );
+});
+
+const peLink = { kind: "processExplorer" as const, keyField: "k" };
+
+test("reconcileGridColumns preserves a link across a field rename (edit keeps count)", () => {
+  const prev = [
+    { field: "status", header: "Status", link: peLink },
+    { field: "url", header: "URL" },
+  ];
+  // The user renamed the first column's `field`; count is unchanged.
+  const out = reconcileGridColumns(prev, [
+    { field: "state", header: "Status" },
+    { field: "url", header: "URL" },
+  ]);
+  assert.deepEqual(out[0], { field: "state", header: "Status", link: peLink });
+  assert.equal(out[1].link, undefined);
+});
+
+test("reconcileGridColumns preserves links by identity when a column is deleted", () => {
+  const prev = [
+    { field: "a", header: "A" },
+    { field: "status", header: "Status", link: peLink },
+    { field: "b", header: "B" },
+  ];
+  // Deleted the first column — indices shift, so a positional match would
+  // mis-attach the link to `a`. Identity match keeps it on `status`.
+  const out = reconcileGridColumns(prev, [
+    { field: "status", header: "Status" },
+    { field: "b", header: "B" },
+  ]);
+  assert.deepEqual(out[0], { field: "status", header: "Status", link: peLink });
+  assert.equal(out[1].link, undefined);
+});
+
+test("reconcileGridColumns drops a link when the delete match is ambiguous", () => {
+  // Two columns share `field`+`header`; only one carries a link. On delete we
+  // can't tell which survivor should keep it, so we drop rather than mis-attach.
+  const prev = [
+    { field: "dup", header: "Dup", link: peLink },
+    { field: "dup", header: "Dup" },
+    { field: "c", header: "C" },
+  ];
+  const out = reconcileGridColumns(prev, [
+    { field: "dup", header: "Dup" },
+    { field: "c", header: "C" },
+  ]);
+  assert.equal(out[0].link, undefined);
+  assert.equal(out[1].link, undefined);
+});
+
+test("parsePageDoc drops a column link with an unknown kind or empty keyField", () => {
+  const r = parsePageDoc({
+    schemaVersion: PAGE_SCHEMA_VERSION,
+    title: "x",
+    nodes: [
+      {
+        type: "dataGrid",
+        id: "g",
+        props: {
+          data: { kind: "datasource", source: "app", table: "t" },
+          columns: [
+            { field: "a", header: "A", link: { kind: "wat", keyField: "k" } },
+            {
+              field: "b",
+              header: "B",
+              link: { kind: "processExplorer", keyField: "" },
+            },
+          ],
+        },
+      },
+    ],
+  });
+  assert.ok(r.ok, r.ok ? "" : r.errors.join("; "));
+  const grid = r.ok && r.doc.nodes[0];
+  const cols = grid && grid.type === "dataGrid" ? grid.props.columns : [];
+  assert.equal(cols[0]?.link, undefined);
+  assert.equal(cols[1]?.link, undefined);
 });
 
 test("parsePageDoc drops a row action with an unknown kind", () => {

@@ -55,10 +55,46 @@ export interface DatasourceBinding {
   orderBy?: GridOrder;
 }
 
+/** A structured, engine-aware link a grid column's value can carry. `kind` is a
+ * discriminant so more link targets can be added without breaking existing
+ * pages; the runtime renders an unrecognised kind as plain text. Today the only
+ * kind is `processExplorer`: the cell text links to the Nano console's explorer
+ * view for the process instance whose key is held in the row field `keyField`. */
+export interface ProcessExplorerColumnLink {
+  kind: "processExplorer";
+  /** The row field holding the process-instance key to open in the explorer. */
+  keyField: string;
+}
+
+export type GridColumnLink = ProcessExplorerColumnLink;
+
+/** The discriminant union of supported column-link kinds. */
+export type GridColumnLinkKind = GridColumnLink["kind"];
+
+/** The set of supported column-link kinds (single source of truth for the
+ * schema parser and the Studio editor's link-kind picker). */
+export const GRID_COLUMN_LINK_KINDS = ["processExplorer"] as const;
+
+/** Narrow an arbitrary string (e.g. a `<select>` value) to a supported
+ * column-link kind, or `undefined` for "no link"/unknown. */
+export function asGridColumnLinkKind(
+  value: string,
+): GridColumnLinkKind | undefined {
+  return (GRID_COLUMN_LINK_KINDS as readonly string[]).includes(value)
+    ? (value as GridColumnLinkKind)
+    : undefined;
+}
+
 export interface GridColumn {
   /** A column name on the bound table/entity. */
   field: string;
   header: string;
+  /** An optional structured link the cell value becomes (e.g. a process-explorer
+   * deep link). This is the only per-column link mechanism the parser preserves
+   * — `parseColumns` keeps `field`, `header`, and `link` and drops anything
+   * else. (Not to be confused with `DetailSpec.linkField`, which is a
+   * detail-panel concern, unrelated to grid columns.) */
+  link?: GridColumnLink;
 }
 
 /** A tab over a single grid — selecting it swaps the active row filter
@@ -272,10 +308,33 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 const str = (x: unknown, fallback = ""): string =>
   typeof x === "string" ? x : fallback;
 
+function parseColumnLink(raw: unknown): GridColumnLink | undefined {
+  if (!isRecord(raw)) return undefined;
+  const kind = raw.kind;
+  // Guard against unknown kinds via the single source of truth so the parser
+  // can't drift from GRID_COLUMN_LINK_KINDS; each known kind then validates its
+  // own fields below.
+  if (
+    typeof kind !== "string" ||
+    !GRID_COLUMN_LINK_KINDS.some((k) => k === kind)
+  )
+    return undefined;
+  if (kind === "processExplorer") {
+    const keyField = str(raw.keyField);
+    if (keyField === "") return undefined;
+    return { kind: "processExplorer", keyField };
+  }
+  return undefined;
+}
+
 function parseColumns(raw: unknown): GridColumn[] {
   return (Array.isArray(raw) ? raw : [])
     .filter(isRecord)
-    .map((c) => ({ field: str(c.field), header: str(c.header) }))
+    .map((c) => {
+      const link = parseColumnLink(c.link);
+      const col: GridColumn = { field: str(c.field), header: str(c.header) };
+      return link ? { ...col, link } : col;
+    })
     .filter((c) => c.field !== "");
 }
 
