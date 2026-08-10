@@ -22,7 +22,9 @@
 BEGIN { renamed = 0; wrote = 0; banner = 0 }
 
 { if (raw != "") print $0 >> raw }              # full audit trail, always
-verbose != "" { print; next }                    # --verbose: show everything
+# GEN_VERBOSE truthy (1/true/yes) prints every line unfiltered; empty/0/false
+# keeps filtering, so an explicit `GEN_VERBOSE=0` is NOT treated as verbose.
+verbose == "1" || verbose == "true" || verbose == "yes" { print; next }
 
 # Benign identifier sanitization: "<x> cannot be used as a <kind> name. Renamed to <y>"
 /^\[main\] WARN .*AbstractRustCodegen - .+ cannot be used as a .+ name\. Renamed to .+$/ {
@@ -34,8 +36,9 @@ verbose != "" { print; next }                    # --verbose: show everything
 /^\[main\] INFO .*TemplateManager - writing file / { wrote++; next }
 /^\[main\] INFO .*TemplateManager - Skipped /      { wrote++; next }
 
-# Donation banner (border rule + the three known text lines).
-/^#####/                                                          { banner++; next }
+# Donation banner: a hash-only border rule (^#+$, so a future diagnostic that
+# merely starts with '#' is never swallowed) plus the three known text lines.
+/^#+$/                                                             { banner++; next }
 /^# (Thanks for using OpenAPI|We appreciate your support|https:\/\/opencollective)/ { banner++; next }
 
 { print }
