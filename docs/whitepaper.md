@@ -118,31 +118,6 @@ primitive stands **now** — agent *graphs* orchestrated over durable processes;
 closed Step-4 loop (where most agents are kicked off by other agents, at thousands of
 concurrent workers) is the trajectory this opens, not a claim of arrival.
 
-## Loops vs. graphs vs. agent networks
-
-The current discourse names two units of agentic engineering. **Loop engineering** is
-getting one agent's iterate–verify–repeat cycle right: the prompt, the tools, the
-self-check, the stop condition. **Graph engineering** is wiring those loops into a
-workflow — steps, branches, and waits composed into a single process. Both are real,
-and Nano does both well; but both hold *one agent* or *one process* in view. Steps 2–4
-are past that. When one engineer is steering ~10, then ~100, then ~1,000+ agents, the
-unit that has to be engineered is the **network**: many graphs and many directors,
-running at once, fanning out, coordinating over shared work, converging, and escalating
-by exception.
-
-| Unit | What you engineer | In view | Where it runs out |
-|---|---|---|---|
-| **Loop** | one agent's iterate–verify–repeat cycle | a single agent | it can't coordinate a *second* agent |
-| **Graph** | loops wired into one durable workflow | a single process instance | many concurrent graphs sharing work and contending for agents |
-| **Agent network** | many graphs + many directors as one system | the whole fleet | — (this is the frontier) |
-
-Nano's subject is therefore **agent network engineering** and **agent network
-orchestration**: authoring, running, observing, and steering the entire network as one
-durable, inspectable system — with the capability-addressed workforce and the app-tier
-coordination plane described below as its machinery — rather than hand-tending a loop or
-a lone graph. Loop and graph are what you engineer *inside* a node; the network is the
-thing you now orchestrate.
-
 ## Decomposition vs. integration
 
 The deeper reason a chat surface cannot hold Steps 2–4 of Boris Cherny's Steps of
