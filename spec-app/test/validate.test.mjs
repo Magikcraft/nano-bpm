@@ -250,6 +250,17 @@ test("a worker inputType must name a declared domain type (ADR 0033 §3)", async
   assert.deepEqual(codesFor(result, "/workers/1/inputType"), ["unknown-type"]);
 });
 
+test("a task type declared external must not also be wired in workers[]", async () => {
+  const index = await buildSymbolIndex(models);
+  const m = manifest();
+  // "read-thermostat" is app-hosted in workers[]; declaring it external too is contradictory,
+  // while a genuinely external type (serviced by an out-of-process fleet) is fine.
+  m.externalTaskTypes = ["read-thermostat", "senior:review"];
+  const result = validateManifest(m, index);
+  assert.deepEqual(codesFor(result, "/externalTaskTypes/0"), ["external-task-conflict"]);
+  assert.deepEqual(codesFor(result, "/externalTaskTypes/1"), []);
+});
+
 test("a form field's datasource binding must name a declared source (ADR 0024 §5)", async () => {
   const boundForm = JSON.stringify({
     id: "orders",
