@@ -1,5 +1,4 @@
 import {
-  lazy,
   Suspense,
   useEffect,
   useRef,
@@ -36,6 +35,7 @@ import { languageForFile } from "../lib/editorLang";
 import type { ExtraModel } from "../components/CodeEditor";
 import { Button, PageHeader, SectionLabel } from "../components/ui";
 import { IS_STUDIO } from "../lib/profile";
+import { lazyImport } from "../lib/lazyWithReload";
 
 type CodeEditorProps = {
   value: string;
@@ -55,9 +55,17 @@ type CodeEditorProps = {
 // bundles) from that build during transform. The `() => null` fallback keeps the
 // type honest and can never render (its call sites live behind IS_STUDIO).
 const CodeEditor: ComponentType<CodeEditorProps> = __STUDIO__
-  ? (lazy(
-      () => import("../components/CodeEditor"),
-    ) as ComponentType<CodeEditorProps>)
+  ? // Wrap the lazy component in a typed shim rather than asserting its type:
+    // spreading `CodeEditorProps` into the real lazy component makes TS verify the
+    // props stay compatible with `../components/CodeEditor` (so future prop drift
+    // is caught here), while the `import()` literal stays inside the `__STUDIO__`
+    // branch so esbuild still drops the Monaco chunk from the observe build.
+    ((): ComponentType<CodeEditorProps> => {
+      const LazyCodeEditor = lazyImport(
+        () => import("../components/CodeEditor"),
+      );
+      return (props) => <LazyCodeEditor {...props} />;
+    })()
   : () => null;
 
 function phaseBadge(phase: WorkerPhase): {

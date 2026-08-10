@@ -1,5 +1,4 @@
 import {
-  lazy,
   Suspense,
   useCallback,
   useEffect,
@@ -38,6 +37,7 @@ import ChangelogPanel from "./components/ChangelogPanel";
 import type { ChangelogDoc } from "./lib/changelog";
 import { hasUnseenSince, gatewayLabel } from "./lib/changelog";
 import { RouteErrorBoundary } from "./components/RouteErrorBoundary";
+import { lazyImport } from "./lib/lazyWithReload";
 
 // Route views are code-split so heavy editors (bpmn-js modeler + properties
 // panel, monaco) stay out of the initial bundle and load on navigation.
@@ -50,19 +50,23 @@ import { RouteErrorBoundary } from "./components/RouteErrorBoundary";
 // produced. The anchors must guard on the raw `__STUDIO__` define, not the
 // imported `IS_STUDIO` const: an imported binding only tree-shakes after
 // transform, too late to stop the worker emit (see profile.ts).
-const Projects = __STUDIO__ ? lazy(() => import("./views/Projects")) : null;
-const ProjectWorkspace = __STUDIO__
-  ? lazy(() => import("./views/ProjectWorkspace"))
+const Projects = __STUDIO__
+  ? lazyImport(() => import("./views/Projects"))
   : null;
-const Extensions = __STUDIO__ ? lazy(() => import("./views/Extensions")) : null;
-const AppView = __STUDIO__ ? lazy(() => import("./views/AppView")) : null;
+const ProjectWorkspace = __STUDIO__
+  ? lazyImport(() => import("./views/ProjectWorkspace"))
+  : null;
+const Extensions = __STUDIO__
+  ? lazyImport(() => import("./views/Extensions"))
+  : null;
+const AppView = __STUDIO__ ? lazyImport(() => import("./views/AppView")) : null;
 // Operator surface — always present in both profiles.
-const Workers = lazy(() => import("./views/Workers"));
-const Metrics = lazy(() => import("./views/Metrics"));
-const Traces = lazy(() => import("./views/Traces"));
-const Explorer = lazy(() => import("./views/Explorer"));
-const Config = lazy(() => import("./views/Config"));
-const Credits = lazy(() => import("./views/Credits"));
+const Workers = lazyImport(() => import("./views/Workers"));
+const Metrics = lazyImport(() => import("./views/Metrics"));
+const Traces = lazyImport(() => import("./views/Traces"));
+const Explorer = lazyImport(() => import("./views/Explorer"));
+const Config = lazyImport(() => import("./views/Config"));
+const Credits = lazyImport(() => import("./views/Credits"));
 
 // 24×24 stroke icons, drawn to lucide-style metrics so the rail reads as one
 // family.
