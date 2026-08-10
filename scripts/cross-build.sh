@@ -1,32 +1,41 @@
 #!/usr/bin/env bash
 # cross-build.sh — cross-compile the gateway (nanobpm-gateway-rest-server) for a
-# Linux target locally, mirroring the CI recipe in
-# .github/workflows/publish-c8ctl-binaries.yml (cargo-zigbuild + a glibc floor).
+# Linux or Windows target locally, mirroring the CI recipe in
+# .github/workflows/publish-c8ctl-binaries.yml.
 #
-# This lets you produce dev builds for e.g. a Linux x86-64 box or a Raspberry Pi
-# (ARMv7) from any host (macOS/Linux) without Docker or a per-target gcc — zig
-# provides the cross C compiler/linker for the bundled C deps (rusqlite,
-# jemalloc-sys) and pins a minimum glibc so the `-gnu` binaries run on older
-# distros.
+# Two backends, picked automatically from the target triple:
+#   * Linux (`*-unknown-linux-gnu*`): cargo-zigbuild + a glibc floor. zig provides
+#     the cross C compiler/linker for the bundled C deps (rusqlite, jemalloc-sys)
+#     and pins a minimum glibc so the `-gnu` binaries run on older distros. This
+#     lets you build for e.g. a Linux x86-64 box or a Raspberry Pi (ARMv7) from
+#     any host (macOS/Linux) without Docker or a per-target gcc.
+#   * Windows (`*-pc-windows-msvc`): cargo-xwin, which downloads the MSVC CRT +
+#     Windows SDK import libs and links with lld — so you get the SAME msvc ABI
+#     the released `.exe` uses (CI builds it natively on a windows-2022 runner),
+#     cross-compiled from macOS/Linux. `--glibc` is ignored for Windows.
 #
 # It does NOT regenerate the REST layer or the web console: the git-ignored
 # generated/ + server/src/stub_impls.rs must already exist (plus generated-console/
 # and console/dist for the default console build; --no-console needs neither). The
 # Makefile `cross-*` targets share `release`'s prerequisites, so
-# `make cross-linux-x64` builds those for you first — prefer the make targets.
+# `make cross-linux-x64` / `make cross-windows` build those for you first — prefer
+# the make targets.
 #
 # Prerequisites (verified below, with install hints):
 #   * rustup + the target's std (auto-added via `rustup target add`)
-#   * zig                 (brew install zig      | https://ziglang.org/download)
-#   * cargo-zigbuild      (cargo install cargo-zigbuild)
+#   * Linux targets:   zig (brew install zig) + cargo-zigbuild (cargo install cargo-zigbuild)
+#   * Windows targets: cargo-xwin (cargo install cargo-xwin) + the lld linker
+#                      (brew install llvm, or `rustup component add llvm-tools`)
 #
 # Usage:
 #   scripts/cross-build.sh <target-triple> [--glibc <ver>] [--no-console] [--out <path>]
 #
 #   <target-triple>  e.g. x86_64-unknown-linux-gnu, armv7-unknown-linux-gnueabihf,
-#                    aarch64-unknown-linux-gnu, arm-unknown-linux-gnueabihf
+#                    aarch64-unknown-linux-gnu, arm-unknown-linux-gnueabihf,
+#                    x86_64-pc-windows-msvc
 #   --glibc <ver>    minimum glibc to link against (default: 2.31 = Debian 11
 #                    "bullseye" / Ubuntu 20.04 — matches CI). Use "" to disable.
+#                    Ignored for Windows targets.
 #   --no-console     build the API-only gateway (skip the embedded web console);
 #                    faster, and does not require console/dist.
 #   --console        build with the embedded web console (the default; provided
@@ -67,23 +76,35 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$TARGET" ] || die "missing <target-triple> (e.g. x86_64-unknown-linux-gnu). See --help."
 
+# Windows targets use a different backend (cargo-xwin) and produce a `.exe`.
+case "$TARGET" in
+  *-pc-windows-*) WINDOWS=1 ;;
+  *)              WINDOWS=0 ;;
+esac
+
 # Map the Rust triple to the CI asset name so local artifacts match the released
-# ones (nanobpm-gateway-rest-server-linux-{x64,arm64,armv7,armv6}).
+# ones (nanobpm-gateway-rest-server-{linux-x64,linux-arm64,…,win32-x64.exe}).
 asset_for() {
   case "$1" in
     x86_64-unknown-linux-gnu)       echo "$BIN_NAME-linux-x64" ;;
     aarch64-unknown-linux-gnu)      echo "$BIN_NAME-linux-arm64" ;;
     armv7-unknown-linux-gnueabihf)  echo "$BIN_NAME-linux-armv7" ;;
     arm-unknown-linux-gnueabihf)    echo "$BIN_NAME-linux-armv6" ;;
-    *)                              echo "$BIN_NAME-$1" ;;
+    x86_64-pc-windows-msvc)         echo "$BIN_NAME-win32-x64.exe" ;;
+    aarch64-pc-windows-msvc)        echo "$BIN_NAME-win32-arm64.exe" ;;
+    *)                              echo "$BIN_NAME-$1$([ "$WINDOWS" = 1 ] && echo .exe)" ;;
   esac
 }
 [ -n "$OUT" ] || OUT="$PROJECT_ROOT/dist/$(asset_for "$TARGET")"
 
 # --- toolchain checks -------------------------------------------------------
 command -v rustup  >/dev/null 2>&1 || die "rustup not found — install Rust from https://rustup.rs"
-command -v zig     >/dev/null 2>&1 || die "zig not found — 'brew install zig' or https://ziglang.org/download"
-command -v cargo-zigbuild >/dev/null 2>&1 || die "cargo-zigbuild not found — 'cargo install cargo-zigbuild'"
+if [ "$WINDOWS" = 1 ]; then
+  command -v cargo-xwin >/dev/null 2>&1 || die "cargo-xwin not found — 'cargo install cargo-xwin'"
+else
+  command -v zig     >/dev/null 2>&1 || die "zig not found — 'brew install zig' or https://ziglang.org/download"
+  command -v cargo-zigbuild >/dev/null 2>&1 || die "cargo-zigbuild not found — 'cargo install cargo-zigbuild'"
+fi
 
 if ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then
   echo "cross-build: adding rust std for $TARGET (rustup target add $TARGET)"
@@ -99,9 +120,10 @@ if [ "$CONSOLE" = 1 ]; then
 fi
 
 # The `.<glibc>` suffix pins the minimum glibc; zigbuild still writes to the
-# unsuffixed target dir (server/target/<triple>/release/).
+# unsuffixed target dir (server/target/<triple>/release/). Windows (cargo-xwin)
+# has no glibc floor and builds the plain triple.
 zig_target="$TARGET"
-[ -n "$GLIBC" ] && zig_target="$TARGET.$GLIBC"
+[ "$WINDOWS" = 0 ] && [ -n "$GLIBC" ] && zig_target="$TARGET.$GLIBC"
 
 features=(--bin "$BIN_NAME")
 if [ "$CONSOLE" = 1 ]; then
@@ -111,15 +133,25 @@ if [ "$CONSOLE" = 1 ]; then
   touch "$PROJECT_ROOT/server/src/console/mod.rs"
 fi
 
-echo "cross-build: $BIN_NAME -> $TARGET (glibc floor: ${GLIBC:-none}, console: $CONSOLE)"
+if [ "$WINDOWS" = 1 ]; then
+  echo "cross-build: $BIN_NAME -> $TARGET (backend: cargo-xwin/msvc, console: $CONSOLE)"
+else
+  echo "cross-build: $BIN_NAME -> $TARGET (backend: cargo-zigbuild, glibc floor: ${GLIBC:-none}, console: $CONSOLE)"
+fi
 start=$(date +%s)
 (
   cd "$PROJECT_ROOT/server"
-  cargo zigbuild --release --target "$zig_target" "${features[@]}"
+  if [ "$WINDOWS" = 1 ]; then
+    cargo xwin build --release --target "$zig_target" "${features[@]}"
+  else
+    cargo zigbuild --release --target "$zig_target" "${features[@]}"
+  fi
 )
 secs=$(( $(date +%s) - start ))
 
-built="$PROJECT_ROOT/server/target/$TARGET/release/$BIN_NAME"
+bin_file="$BIN_NAME"
+[ "$WINDOWS" = 1 ] && bin_file="$BIN_NAME.exe"
+built="$PROJECT_ROOT/server/target/$TARGET/release/$bin_file"
 [ -f "$built" ] || die "expected binary not found at $built"
 mkdir -p "$(dirname "$OUT")"
 cp "$built" "$OUT"
