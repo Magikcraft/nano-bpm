@@ -770,8 +770,8 @@ function FileBrowser({
   // Persist which directories are collapsed/expanded, per project, so the tree
   // reopens as the user left it across navigation, live refetches, and reloads.
   // Divergences from the depth-based default are stored under this key; folders
-  // absent from the map use the default (top two levels open). See
-  // explorerDirState.ts.
+  // absent from the map use the default (all folders collapsed on first open).
+  // See explorerDirState.ts.
   const dirStateKey = `nano.project.${name}.explorerDirs`;
   const [dirState, setDirState] = useState<DirState>(() => {
     try {

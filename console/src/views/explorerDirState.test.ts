@@ -17,9 +17,9 @@ import {
 // to a plain object before comparing against plain-object expectations.
 const own = (s: DirState): Record<string, boolean> => ({ ...s });
 
-test("defaultDirOpen opens the top two levels only", () => {
-  assert.equal(defaultDirOpen(0), true);
-  assert.equal(defaultDirOpen(1), true);
+test("defaultDirOpen collapses every folder on first open", () => {
+  assert.equal(defaultDirOpen(0), false);
+  assert.equal(defaultDirOpen(1), false);
   assert.equal(defaultDirOpen(2), false);
   assert.equal(defaultDirOpen(3), false);
 });
@@ -72,34 +72,34 @@ test("dangerous folder names never pollute the prototype or throw", () => {
   assert.equal(isDirOpen(toggled, "__proto__", 3), false);
 });
 
-test("isDirOpen falls back to the depth default when no override exists", () => {
-  assert.equal(isDirOpen({}, "top", 0), true);
+test("isDirOpen falls back to the collapsed default when no override exists", () => {
+  assert.equal(isDirOpen({}, "top", 0), false);
   assert.equal(isDirOpen({}, "deep", 3), false);
 });
 
 test("isDirOpen honours a stored override over the default", () => {
-  // A shallow dir the user collapsed.
-  assert.equal(isDirOpen({ top: false }, "top", 0), false);
+  // A shallow dir the user expanded away from the collapsed default.
+  assert.equal(isDirOpen({ top: true }, "top", 0), true);
   // A deep dir the user expanded.
   assert.equal(isDirOpen({ deep: true }, "deep", 3), true);
 });
 
 test("isDirOpen ignores stale paths without error", () => {
-  const state: DirState = { "gone/dir": false };
-  // Looking up a different, still-present path is unaffected.
-  assert.equal(isDirOpen(state, "present", 0), true);
+  const state: DirState = { "gone/dir": true };
+  // Looking up a different, still-present path is unaffected (default collapsed).
+  assert.equal(isDirOpen(state, "present", 0), false);
 });
 
 test("toggleDir stores a divergence from the default", () => {
-  // Collapse a shallow (default-open) dir → stored as false.
-  assert.deepEqual(own(toggleDir({}, "top", 0)), { top: false });
+  // Expand a shallow (default-collapsed) dir → stored as true.
+  assert.deepEqual(own(toggleDir({}, "top", 0)), { top: true });
   // Expand a deep (default-collapsed) dir → stored as true.
   assert.deepEqual(own(toggleDir({}, "deep", 3)), { deep: true });
 });
 
 test("toggleDir drops the entry when it returns to the default", () => {
-  // top was collapsed (divergent); toggling back to open matches default → gone.
-  assert.deepEqual(own(toggleDir({ top: false }, "top", 0)), {});
+  // top was expanded (divergent); toggling back to collapsed matches default → gone.
+  assert.deepEqual(own(toggleDir({ top: true }, "top", 0)), {});
   // deep was expanded (divergent); toggling back to collapsed matches default → gone.
   assert.deepEqual(own(toggleDir({ deep: true }, "deep", 3)), {});
 });

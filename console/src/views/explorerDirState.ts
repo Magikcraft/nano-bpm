@@ -31,12 +31,19 @@ function emptyDirState(): DirState {
 }
 
 /**
- * Directories at depth 0 and 1 (top two levels) default to open; everything
- * deeper defaults to collapsed. This preserves the original first-open UX.
+ * How many top levels of the tree start expanded on first open, before the user
+ * has toggled anything. `0` means **every** folder starts collapsed — the user
+ * opens what they need. (Was `2`; changed so a freshly-opened project defaults to
+ * all folders collapsed.)
  */
-export const DEFAULT_OPEN_DEPTH = 2;
+export const DEFAULT_OPEN_DEPTH = 0;
 
-/** The default open/closed state for a directory at `depth`, absent any override. */
+/**
+ * The default open/closed state for a directory at `depth`, absent any override.
+ * A directory is open by default only when it sits within the top
+ * {@link DEFAULT_OPEN_DEPTH} levels; with `DEFAULT_OPEN_DEPTH === 0` that band is
+ * empty, so every folder defaults to collapsed.
+ */
 export function defaultDirOpen(depth: number): boolean {
   return depth < DEFAULT_OPEN_DEPTH;
 }
