@@ -24,8 +24,9 @@
 # Prerequisites (verified below, with install hints):
 #   * rustup + the target's std (auto-added via `rustup target add`)
 #   * Linux targets:   zig (brew install zig) + cargo-zigbuild (cargo install cargo-zigbuild)
-#   * Windows targets: cargo-xwin (cargo install cargo-xwin) + the lld linker
-#                      (brew install llvm, or `rustup component add llvm-tools`)
+#   * Windows targets: cargo-xwin (cargo install cargo-xwin) + an `lld-link`
+#                      linker on PATH, which cargo-xwin invokes for the msvc
+#                      target (brew install llvm | apt-get install lld clang)
 #
 # Usage:
 #   scripts/cross-build.sh <target-triple> [--glibc <ver>] [--no-console] [--out <path>]
@@ -76,10 +77,14 @@ while [ $# -gt 0 ]; do
 done
 [ -n "$TARGET" ] || die "missing <target-triple> (e.g. x86_64-unknown-linux-gnu). See --help."
 
-# Windows targets use a different backend (cargo-xwin) and produce a `.exe`.
+# Windows targets use a different backend (cargo-xwin, msvc ABI) and produce a
+# `.exe`. Only the msvc target is supported here; a `-gnu` Windows triple would
+# need a MinGW toolchain (not cargo-xwin), so reject it with a clear message
+# rather than routing it through cargo-xwin and failing cryptically.
 case "$TARGET" in
-  *-pc-windows-*) WINDOWS=1 ;;
-  *)              WINDOWS=0 ;;
+  *-pc-windows-msvc) WINDOWS=1 ;;
+  *-pc-windows-gnu*) die "$TARGET is a MinGW (gnu) target, which cargo-xwin can't build. Use the msvc triple instead, e.g. ${TARGET%-gnu*}-msvc." ;;
+  *)                 WINDOWS=0 ;;
 esac
 
 # Map the Rust triple to the CI asset name so local artifacts match the released
@@ -101,6 +106,9 @@ asset_for() {
 command -v rustup  >/dev/null 2>&1 || die "rustup not found — install Rust from https://rustup.rs"
 if [ "$WINDOWS" = 1 ]; then
   command -v cargo-xwin >/dev/null 2>&1 || die "cargo-xwin not found — 'cargo install cargo-xwin'"
+  # cargo-xwin links msvc targets with lld-link; without it the build fails deep
+  # in the link step with an opaque error, so check for it up front.
+  command -v lld-link >/dev/null 2>&1 || die "lld-link not found on PATH — cargo-xwin needs it to link the msvc target ('brew install llvm' | 'apt-get install lld clang')."
 else
   command -v zig     >/dev/null 2>&1 || die "zig not found — 'brew install zig' or https://ziglang.org/download"
   command -v cargo-zigbuild >/dev/null 2>&1 || die "cargo-zigbuild not found — 'cargo install cargo-zigbuild'"
