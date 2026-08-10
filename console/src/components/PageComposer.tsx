@@ -25,9 +25,11 @@ import {
 import type { ComposerEntity } from "../lib/shapeComposer";
 import {
   GRID_COLUMN_LINK_KINDS,
+  asGridColumnLinkKind,
   type ActionFormField,
   type GridColumn,
   type GridColumnLink,
+  type GridColumnLinkKind,
   type NavItem,
   type TextVariant,
 } from "../lib/pageSchema";
@@ -729,6 +731,42 @@ function ListEditor({
   );
 }
 
+/** Build the `link` for a newly selected picker value. Exhaustive over
+ * `GridColumnLinkKind` so adding a kind to `GRID_COLUMN_LINK_KINDS` is a
+ * compile error here until it's handled (rather than silently clearing the
+ * link). `undefined` kind = the "No link" option. */
+function buildColumnLink(
+  kind: GridColumnLinkKind | undefined,
+  prev: GridColumnLink | undefined,
+  fields: string[],
+): GridColumnLink | undefined {
+  if (kind === undefined) return undefined;
+  switch (kind) {
+    case "processExplorer":
+      return {
+        kind: "processExplorer",
+        // Default the key field to the first suggested column when the author
+        // hasn't picked one — a link with an empty keyField is intentionally
+        // dropped on save/round-trip, so pre-filling keeps a just-selected
+        // link from vanishing.
+        keyField:
+          (prev?.kind === "processExplorer" ? prev.keyField : "") ||
+          fields[0] ||
+          "",
+      };
+    default: {
+      const _exhaustive: never = kind;
+      return _exhaustive;
+    }
+  }
+}
+
+/** Human labels for the link-kind picker. A `Record` over the union keeps this
+ * exhaustive: a new kind won't compile until it's labelled. */
+const LINK_KIND_LABELS: Record<GridColumnLinkKind, string> = {
+  processExplorer: "Process explorer",
+};
+
 /** Per-column structured-link editor for a `dataGrid`'s columns. The string-cell
  * ListEditor above owns field/header; this owns each column's optional `link`.
  * Today the only link kind is `processExplorer` — the cell value becomes a deep
@@ -771,23 +809,18 @@ function ColumnLinks({
             onChange={(e) =>
               setLink(
                 i,
-                e.target.value === "processExplorer"
-                  ? {
-                      kind: "processExplorer",
-                      // Default the key field to the first suggested column when
-                      // the author hasn't picked one — a link with an empty
-                      // keyField is intentionally dropped on save/round-trip, so
-                      // pre-filling keeps a just-selected link from vanishing.
-                      keyField: c.link?.keyField || fields[0] || "",
-                    }
-                  : undefined,
+                buildColumnLink(
+                  asGridColumnLinkKind(e.target.value),
+                  c.link,
+                  fields,
+                ),
               )
             }
           >
             <option value="">No link</option>
             {GRID_COLUMN_LINK_KINDS.map((k) => (
               <option key={k} value={k}>
-                {k === "processExplorer" ? "Process explorer" : k}
+                {LINK_KIND_LABELS[k]}
               </option>
             ))}
           </select>

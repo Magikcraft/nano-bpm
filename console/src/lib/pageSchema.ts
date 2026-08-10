@@ -68,9 +68,22 @@ export interface ProcessExplorerColumnLink {
 
 export type GridColumnLink = ProcessExplorerColumnLink;
 
+/** The discriminant union of supported column-link kinds. */
+export type GridColumnLinkKind = GridColumnLink["kind"];
+
 /** The set of supported column-link kinds (single source of truth for the
  * schema parser and the Studio editor's link-kind picker). */
 export const GRID_COLUMN_LINK_KINDS = ["processExplorer"] as const;
+
+/** Narrow an arbitrary string (e.g. a `<select>` value) to a supported
+ * column-link kind, or `undefined` for "no link"/unknown. */
+export function asGridColumnLinkKind(
+  value: string,
+): GridColumnLinkKind | undefined {
+  return (GRID_COLUMN_LINK_KINDS as readonly string[]).includes(value)
+    ? (value as GridColumnLinkKind)
+    : undefined;
+}
 
 export interface GridColumn {
   /** A column name on the bound table/entity. */
