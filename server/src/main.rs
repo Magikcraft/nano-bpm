@@ -1090,8 +1090,6 @@ struct ParsedDeploy {
 
 /// Parses every deployment resource up front so a deploy is all-or-nothing.
 /// A resource whose file name ends in `.dmn` is parsed as a DMN decision
-/// Parses every deployment resource up front so a deploy is all-or-nothing.
-/// A resource whose file name ends in `.dmn` is parsed as a DMN decision
 /// requirements graph; a `.form` resource (form-js JSON) is registered as a form
 /// (stored, not executed); everything else is parsed as BPMN (`.bpmn` or
 /// unnamed). `Err` is `(title, detail)` for a 400 response.
