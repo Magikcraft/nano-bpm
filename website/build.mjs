@@ -88,6 +88,14 @@ const docsPresent = existsSync(
   join(repoRoot, "console", "public", "docs", "index.html"),
 );
 
+// Same graceful pattern for the whitepaper: the console build renders
+// docs/whitepaper.md into console/public/whitepaper/index.html; we publish that
+// self-contained page verbatim to /whitepaper and only advertise it on builds
+// that actually ship it (the zero-dep schemas CI run skips the console build).
+const whitepaperPresent = existsSync(
+  join(repoRoot, "console", "public", "whitepaper", "index.html"),
+);
+
 const published = [];
 
 // --- 1. Urban App manifest JSON Schema (spec-app/nano-app.schema.json) --------
@@ -166,6 +174,20 @@ if (docsPresent) {
     mkdirSync(dir, { recursive: true });
     copyFileSync(join(docsDist, entry.name), join(dir, "index.html"));
   }
+}
+
+// --- Bundled whitepaper: console/public/whitepaper -> /whitepaper -------------
+// The design paper is rendered from docs/whitepaper.md by
+// console/scripts/build-whitepaper.mjs into console/public/whitepaper/index.html
+// — the SAME self-contained page the gateway serves at a node's /whitepaper. We
+// publish it verbatim so one renderer feeds both surfaces (no drift). Omitted on
+// builds that didn't run the console build, exactly like /docs above.
+if (whitepaperPresent) {
+  cpSync(
+    join(repoRoot, "console", "public", "whitepaper"),
+    join(outDir, "whitepaper"),
+    { recursive: true },
+  );
 }
 
 const demoDist = join(here, "demo", "dist");
@@ -376,8 +398,10 @@ function homeHtml() {
 <section class="band polyglot">
   <div class="wrap">
     <h2>Polyglot by design. <span class="grad">Meet your stack.</span></h2>
-    <p>Drive workflows and workers from the language your team already ships in — one durable engine,
-    first-class SDKs across the stack:</p>
+    <p>Because Nano speaks the Camunda 8 REST API, it inherits Camunda's polyglot SDK surface —
+    drive workflows and workers from the language your team already ships in, with first-class
+    Camunda 8 SDKs across the stack — plus the wider ecosystem of tooling built on that API, which
+    works against Nano unchanged:</p>
     <div class="provs langs" aria-label="Supported SDK languages">
 ${langChips()}
     </div>
@@ -473,6 +497,7 @@ function siteNav() {
   <nav>
     <a href="/architecture/">Architecture</a>
     <a href="/demo/">Demo</a>
+    ${whitepaperPresent ? '<a href="/whitepaper/">Whitepaper</a>' : ""}
     ${docsPresent ? '<a href="/docs/">Docs</a>' : ""}
     <a href="/schemas/">Schemas</a>
   </nav>
@@ -502,9 +527,10 @@ function architectureHtml() {
       role: "Application framework",
       tagline: "The Nano application framework",
       desc:
-        "Author Nano apps as code or model. You write steps and handlers; Urban derives " +
-        "the executable model, job types, message correlation, and a generic worker — one " +
-        "source of truth, no hand-wired orchestration.",
+        "Author Nano apps as code or model. Go code-first and Urban derives the executable " +
+        "model, job types, message correlation, and a generic worker from your code; go " +
+        "model-first and the authored BPMN model is the source of truth. Either way, one " +
+        "source of truth — no hand-wired orchestration.",
       tags: ["TypeScript-only", "More languages coming", "Code-first or Model-first"],
     },
     {
