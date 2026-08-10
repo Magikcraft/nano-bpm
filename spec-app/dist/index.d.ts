@@ -618,6 +618,10 @@ export interface AppManifest {
 	 */
 	workers?: Worker[];
 	/**
+	 * Service-task types that are serviced by an EXTERNAL worker (a coding-agent harness, an out-of-process fleet, another deployment) and are deliberately NOT hosted by this app. `urban gen` skips these when scaffolding write-once worker stubs, so they never appear as missing-stub drift or get auto-wired into `workers[]`. Declaring one is an explicit assertion that the app owns the model but not the handler (ADR 0056).
+	 */
+	externalTaskTypes?: string[];
+	/**
 	 * Named LLM bindings usable as workers or as a chat surface agent (ADR 0022 §E).
 	 */
 	llm?: {

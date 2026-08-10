@@ -68,6 +68,12 @@
       "items": { "$ref": "#/$defs/worker" },
       "description": "Service-task handlers: referenced files, an llm binding, or a connector supplied by an installed pack (ADR 0022 §E, ADR 0050)."
     },
+    "externalTaskTypes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true,
+      "description": "Service-task types that are serviced by an EXTERNAL worker (a coding-agent harness, an out-of-process fleet, another deployment) and are deliberately NOT hosted by this app. `urban gen` skips these when scaffolding write-once worker stubs, so they never appear as missing-stub drift or get auto-wired into `workers[]`. Declaring one is an explicit assertion that the app owns the model but not the handler (ADR 0056)."
+    },
     "llm": {
       "type": "object",
       "description": "Named LLM bindings usable as workers or as a chat surface agent (ADR 0022 §E).",

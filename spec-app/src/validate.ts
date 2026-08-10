@@ -152,6 +152,9 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
 
   // workers[].llm names a declared llm; workers[].outputType names a declared type.
   const workers: any[] = manifest.workers ?? [];
+  const wiredTaskTypes = new Set(
+    workers.map((w) => w?.taskType).filter((t): t is string => typeof t === "string" && t.length > 0),
+  );
   workers.forEach((w, i) => {
     if (w.llm != null && !llmNames.has(w.llm)) {
       push(`/workers/${i}/llm`, `worker llm "${w.llm}" is not declared in llm`, "unknown-llm");
@@ -161,6 +164,18 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     }
     if (w.outputType != null && !typeIds.has(w.outputType)) {
       push(`/workers/${i}/outputType`, `outputType "${w.outputType}" is not a declared domain type`, "unknown-type");
+    }
+  });
+
+  // A task type declared external must NOT also be hosted in workers[] — it is one or the other.
+  const externalTaskTypes: any[] = manifest.externalTaskTypes ?? [];
+  externalTaskTypes.forEach((t, i) => {
+    if (typeof t === "string" && wiredTaskTypes.has(t)) {
+      push(
+        `/externalTaskTypes/${i}`,
+        `task type "${t}" is declared external but also wired in workers[] — an external task cannot be app-hosted`,
+        "external-task-conflict",
+      );
     }
   });
 
