@@ -18,6 +18,7 @@ on:
       - 'USERGUIDE.md'
       - 'docs/**'
       - 'console/scripts/build-docs.mjs'
+      - 'console/scripts/build-whitepaper.mjs'
       - 'spec-app/nano-app.schema.json'
       - 'console/src/moddle/nanoShapes.ts'
       - '.github/workflows/pages.yml'
@@ -64,6 +65,14 @@ jobs:
         run: |
           npm ci
           DOCS_SITE_BUILD=1 node scripts/build-docs.mjs
+      - name: Build whitepaper (served at /whitepaper on nanobpm.io)
+        # docs/whitepaper.md is the single source of truth; this generator renders
+        # it into console/public/whitepaper/index.html (git-ignored), which
+        # website/build.mjs then copies into _site/whitepaper. Same source powers
+        # the in-app /whitepaper page — one generator, two surfaces. Reuses the
+        # console node_modules installed by the docs step above.
+        working-directory: console
+        run: node scripts/build-whitepaper.mjs
       - name: Build site
         run: node website/build.mjs
       - uses: actions/upload-pages-artifact@v3
