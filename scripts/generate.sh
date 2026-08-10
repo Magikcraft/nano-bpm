@@ -83,12 +83,24 @@ echo "  output: ${OUTPUT_REL}"
 # The spec entrypoint $refs sibling YAML files; pointing the generator at the
 # sanitized copy under the project root keeps those relative references
 # resolvable.
+#
+# The rust-axum generator drowns real diagnostics under ~2350 identical benign
+# "identifier renamed" WARNs and per-file "writing file" INFO lines. Pipe its
+# (merged) output through openapi-log-filter.awk, which hides ONLY those exact
+# known-noise shapes, passes every other line through, tees the full unfiltered
+# output to build/openapi-generate.log, and prints a count of what it hid. Set
+# GEN_VERBOSE=1 to see everything. pipefail (set -o via set -e above) preserves
+# java's non-zero exit through the pipe.
+GEN_LOG="${PROJECT_ROOT}/build/openapi-generate.log"
+mkdir -p "$(dirname "${GEN_LOG}")"
+: >"${GEN_LOG}"
 java -jar "${JAR}" generate \
   -g rust-axum \
   -i "${PROJECT_ROOT}/${SPEC_REL}" \
   -o "${PROJECT_ROOT}/${OUTPUT_REL}" \
   -c "${PROJECT_ROOT}/${CONFIG_REL}" \
-  --skip-validate-spec
+  --skip-validate-spec \
+  2>&1 | awk -f "${SCRIPT_DIR}/openapi-log-filter.awk" -v raw="${GEN_LOG}" -v verbose="${GEN_VERBOSE:-}"
 
 echo "Post-processing generated code to fix known rust-axum generator bugs"
 "${PY[@]}" "${SCRIPT_DIR}/postprocess-generated.py" "${PROJECT_ROOT}/${OUTPUT_REL}"
