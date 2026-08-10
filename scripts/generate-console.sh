@@ -58,19 +58,52 @@ echo "Generating console API Rust layer with openapi-generator-cli ${OPENAPI_GEN
 echo "  spec:   ${SPEC_REL}"
 echo "  output: ${OUTPUT_REL}"
 
+# Filter the generator's benign identifier-rename WARNs + per-file INFO progress
+# (see scripts/openapi-log-filter.awk); the full unfiltered log is teed to
+# build/openapi-generate-console.log and a count of hidden lines is printed. Any
+# other message passes through. GEN_VERBOSE=1 shows everything.
+GEN_LOG="${PROJECT_ROOT}/build/openapi-generate-console.log"
+mkdir -p "$(dirname "${GEN_LOG}")"
+: >"${GEN_LOG}"
 java -jar "${JAR}" generate \
   -g rust-axum \
   -i "${PROJECT_ROOT}/${SPEC_REL}" \
   -o "${PROJECT_ROOT}/${OUTPUT_REL}" \
   -c "${PROJECT_ROOT}/${CONFIG_REL}" \
-  --skip-validate-spec
+  --skip-validate-spec \
+  2>&1 | awk -f "${SCRIPT_DIR}/openapi-log-filter.awk" -v raw="${GEN_LOG}" -v verbose="${GEN_VERBOSE:-}"
 
 echo "Post-processing generated code to fix known rust-axum generator bugs"
 "${PY[@]}" "${SCRIPT_DIR}/postprocess-generated.py" "${PROJECT_ROOT}/${OUTPUT_REL}"
 
-if command -v cargo >/dev/null 2>&1; then
-  echo "Formatting generated console crate with cargo fmt"
-  (cd "${PROJECT_ROOT}/${OUTPUT_REL}" && cargo fmt) || true
+# Format the generated console crate. rustfmt.toml enables the unstable
+# `group_imports` option, which only the pinned nightly rustfmt (the `make fmt`
+# / CI fmt gate — see FMT_TOOLCHAIN in the Makefile) can apply. Stable rustfmt
+# silently ignores it and prints a noisy "can't set `group_imports` … unstable
+# features are only available in nightly channel" warning on every generate.
+# Prefer the pinned nightly when installed (so generated output matches CI);
+# otherwise fall back to the default toolchain and drop that one expected
+# warning. This mirrors scripts/generate.sh.
+FMT_TOOLCHAIN="${FMT_TOOLCHAIN:-nightly-2026-06-26}"
+FMT_LABEL=""
+if command -v rustup >/dev/null 2>&1 && rustup run "${FMT_TOOLCHAIN}" rustfmt --version >/dev/null 2>&1; then
+  FMT_LABEL=" (${FMT_TOOLCHAIN})"
+  run_fmt() { rustup run "${FMT_TOOLCHAIN}" "$@"; }
+else
+  run_fmt() { "$@"; }
+fi
+# Suppress ONLY the expected stable-channel warning about the unstable
+# group_imports option (harmless: stable can't apply it, and the nightly path
+# never emits it). Require both substrings on the same line so unrelated future
+# rustfmt diagnostics are never accidentally swallowed.
+strip_fmt_warn() { grep -v -E 'group_imports.*unstable features are only available in nightly channel' || true; }
+
+# Gate on whether the SELECTED formatter toolchain can actually run the tool,
+# not on a bare PATH shim: `rustup run <toolchain> cargo` can succeed even when
+# `cargo` isn't on PATH (and vice-versa).
+if run_fmt cargo --version >/dev/null 2>&1; then
+  echo "Formatting generated console crate with cargo fmt${FMT_LABEL}"
+  (cd "${PROJECT_ROOT}/${OUTPUT_REL}" && run_fmt cargo fmt) 2>&1 | strip_fmt_warn || true
 fi
 
 echo "Done. Generated console crate is in ${OUTPUT_REL}"
