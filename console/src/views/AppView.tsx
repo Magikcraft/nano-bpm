@@ -100,6 +100,37 @@ export default function AppView() {
     setError(null);
   }, [name]);
 
+  // Coalesced authoritative re-read. Several push notifications can land in a
+  // burst (e.g. `stop requested` → `application stopped` → the app re-binding),
+  // so debounce them into a single `getProject` fetch on the trailing edge.
+  const refreshTimer = useRef<number | null>(null);
+  const scheduleRefresh = useCallback(() => {
+    // Trailing-edge debounce: clear and re-arm on each call so a burst of
+    // `sys` lines collapses into a single trailing `getProject`, rather than
+    // firing on the leading edge and ignoring the rest of the burst.
+    if (refreshTimer.current != null) {
+      window.clearTimeout(refreshTimer.current);
+    }
+    refreshTimer.current = window.setTimeout(() => {
+      refreshTimer.current = null;
+      void refresh();
+    }, 150);
+  }, [refresh]);
+  // Cancel any pending debounce not just on unmount, but whenever `refresh`
+  // changes — i.e. when the routed app (`name`) changes. React Router keeps
+  // `AppView` mounted across `/apps/a` → `/apps/b`, so a timer armed for the
+  // previous app would otherwise fire and overwrite state with the wrong
+  // project's `getProject` result via the stale closure.
+  useEffect(
+    () => () => {
+      if (refreshTimer.current != null) {
+        window.clearTimeout(refreshTimer.current);
+        refreshTimer.current = null;
+      }
+    },
+    [refresh],
+  );
+
   // Initial load whenever the routed app changes.
   useEffect(() => {
     setLogs([]);
@@ -108,6 +139,15 @@ export default function AppView() {
   }, [refresh]);
 
   // Live logs for the life of this view (history replays first, then tail).
+  // The same per-project SSE doubles as our lifecycle *notification* channel:
+  // the supervisor emits a `sys` line at every state transition — including
+  // `app listening on port N` the instant the ADR 0057 boot handshake re-detects
+  // the port after a (re)start, plus stop/exit/compile notes. Re-reading the
+  // authoritative run state on each `sys` line (and on stream (re)connect) keeps
+  // the badge, ports and headless/embedded state fresh with zero polling — and,
+  // crucially, recovers from an *out-of-band* restart (an agent restarting the
+  // app while this view is open) that a self-disabling poller used to miss,
+  // leaving the app stuck showing "running headless" until a manual remount.
   useEffect(() => {
     if (!name || notFound) return;
     const src = projectLogs(name, (line) => {
@@ -119,22 +159,17 @@ export default function AppView() {
         next.push({ ...line, _key: logKeyRef.current++ });
         return next;
       });
+      if (line.stream === "sys") scheduleRefresh();
     });
-    return () => src.close();
-  }, [name, notFound]);
-
-  // Poll run state while the app is in a transient/active phase, so the badge
-  // and buttons settle after an async start/stop without a manual reload.
-  useEffect(() => {
-    const active =
-      !notFound &&
-      runState &&
-      (runState.status !== "stopped" || runState.compiling) &&
-      runState.status !== "error";
-    if (!active) return;
-    const t = window.setInterval(() => void refresh(), 1500);
-    return () => window.clearInterval(t);
-  }, [runState, refresh, notFound]);
+    // On (re)connect — including EventSource's automatic reconnect after the
+    // host restarts or the stream drops — reconcile any state changed while we
+    // were disconnected.
+    src.addEventListener("open", scheduleRefresh);
+    return () => {
+      src.removeEventListener("open", scheduleRefresh);
+      src.close();
+    };
+  }, [name, notFound, scheduleRefresh]);
 
   // Theme bridge for the embedded app. The app renders in a sandboxed,
   // cross-document iframe, so the console's `--nano-*` custom properties and
