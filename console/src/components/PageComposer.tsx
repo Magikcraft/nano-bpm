@@ -24,19 +24,17 @@ import {
 } from "@craftjs/core";
 import type { ComposerEntity } from "../lib/shapeComposer";
 import {
-  emptyPage,
   GRID_COLUMN_LINK_KINDS,
-  parsePageDoc,
   type ActionFormField,
   type GridColumn,
   type GridColumnLink,
   type NavItem,
-  type PageDoc,
   type TextVariant,
 } from "../lib/pageSchema";
 import {
   fromPageDoc,
   loadPageJson,
+  reconcileGridColumns,
   serializePageNodes,
   toPageDoc,
   type CraftState,
@@ -551,26 +549,12 @@ function Settings({
               // Preserve the structured `link` an existing column carries — it
               // isn't editable in this string-cell ListEditor (see the
               // ColumnLinks editor below), so rebuilding from field/header alone
-              // would silently drop it. The ListEditor mutates one column at a
-              // time: an add appends and an edit keeps order + count, so indices
-              // of existing columns are stable and a positional match preserves
-              // a link across a `field` rename. A delete shortens the list and
-              // shifts indices, so there we match the stable `field` identity
-              // instead, to avoid mis-attaching a link to a neighbour.
+              // would silently drop it. `reconcileGridColumns` is the pure,
+              // unit-tested rule (positional on add/edit, `field`+`header`
+              // identity on delete, dropping ambiguous matches).
               const prevCols =
                 (props.columns as GridColumn[] | undefined) ?? [];
-              const deleted = rows.length < prevCols.length;
-              set(
-                "columns",
-                rows.map((r, i) => {
-                  const field = r.field ?? "";
-                  const prev = deleted
-                    ? prevCols.find((c) => c.field === field)
-                    : prevCols[i];
-                  const col: GridColumn = { field, header: r.header ?? "" };
-                  return prev?.link ? { ...col, link: prev.link } : col;
-                }),
-              );
+              set("columns", reconcileGridColumns(prevCols, rows));
             }}
           />
           <ColumnLinks
@@ -778,7 +762,7 @@ function ColumnLinks({
         <span>Column links</span>
       </div>
       {columns.map((c, i) => (
-        <div key={c.field || `__col_${i}`} className="pc-list-row">
+        <div key={`${c.field || "__col"}_${i}`} className="pc-list-row">
           <span className="pc-col-name">
             {c.header || c.field || `#${i + 1}`}
           </span>

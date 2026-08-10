@@ -8,6 +8,7 @@
 import {
   defaultProps,
   emptyPage,
+  type GridColumn,
   type PageDoc,
   type PageNode,
   type PageNodeType,
@@ -50,9 +51,42 @@ export function loadPageJson(text: string, title: string): LoadPageResult {
   return { ok: true, doc: parsed.doc };
 }
 
+/**
+ * Reconcile a grid's edited `field`/`header` rows (from the string-cell
+ * ListEditor) back onto the structured `GridColumn[]`, carrying over each
+ * column's non-editable `link`. The ListEditor mutates one column at a time:
+ *  - add/edit keeps order + count, so existing columns keep their index and a
+ *    positional match preserves a link across a `field` rename.
+ *  - delete shortens the list and shifts indices, so we instead match on the
+ *    stable `field`+`header` identity. Columns may legitimately share a
+ *    `field`, so a link is only carried over when EXACTLY ONE previous column
+ *    matches — an ambiguous (or absent) match drops the link rather than risk
+ *    re-attaching it to the wrong neighbour.
+ */
+export function reconcileGridColumns(
+  prevCols: GridColumn[],
+  rows: { field?: string; header?: string }[],
+): GridColumn[] {
+  const deleted = rows.length < prevCols.length;
+  return rows.map((r, i) => {
+    const field = r.field ?? "";
+    const header = r.header ?? "";
+    let prev: GridColumn | undefined;
+    if (deleted) {
+      const matches = prevCols.filter(
+        (c) => c.field === field && (c.header ?? "") === header,
+      );
+      prev = matches.length === 1 ? matches[0] : undefined;
+    } else {
+      prev = prevCols[i];
+    }
+    const col: GridColumn = { field, header };
+    return prev?.link ? { ...col, link: prev.link } : col;
+  });
+}
+
 /** The Craft.js resolver name for our root canvas. */
 export const ROOT_ID = "ROOT";
-
 /** The single Craft.js component that hosts the ordered node list (a canvas). */
 export const PAGE_CANVAS_NAME = "PageCanvas";
 
