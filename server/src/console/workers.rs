@@ -420,12 +420,12 @@ impl WorkerSupervisor {
                 // (materialised beside the SDK). `node:sqlite`/WebSocket are built in.
                 runtime_label = "node";
                 cmd = Command::new(node);
-                cmd.current_dir(&dir)
-                    .arg("--experimental-strip-types")
-                    .arg("--no-warnings")
-                    .arg("--import")
-                    .arg(workspace::sdk_dir().join("node-register.mjs"))
-                    .arg("worker.ts");
+                cmd.current_dir(&dir);
+                super::projects::node_fallback_command(
+                    &mut cmd,
+                    &workspace::sdk_dir().join("node-register.mjs"),
+                );
+                cmd.arg("worker.ts");
             }
         }
         cmd.env("NO_COLOR", "1")
