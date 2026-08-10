@@ -1092,6 +1092,19 @@ GET /console/api/traces/{instanceKey}
 > model, canary experiments, and an LLM-in-the-loop reasoning plane built on the
 > engine's event-sourced core.
 
+## Debugging BPMN processes
+
+An **in-engine process debugger** (proof-of-concept) lets you set a breakpoint on
+a flow node, pause a process instance *inside the engine* mid-command, inspect its
+variables, and step or resume — with the paused element highlighted on the diagram
+in VS Code. It is a four-piece stack: the engine-core stepping executor →
+`engine-wasm` debug surface → the standalone [`dap-adapter`](dap-adapter/) (Debug
+Adapter Protocol) → the [`vscode-bpmn-debug`](vscode-bpmn-debug/) extension.
+
+For a copy-pasteable runbook — a 30-second **headless proof** (no VS Code) and the
+full **F5 click-the-diagram** walkthrough — see
+[**`docs/debugger-getting-started.md`**](docs/debugger-getting-started.md).
+
 ## Building from source
 
 End users do not need to build anything — the [c8ctl plugin](#quick-start-with-c8ctl)
