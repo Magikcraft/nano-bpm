@@ -63,6 +63,22 @@ pub enum Event {
         version: i32,
     },
 
+    /// A form (`form-js` `.form` JSON) was registered as part of a deployment.
+    /// The engine assigns a unique `form_key` and a `version` that increments per
+    /// `form_id` across deployments. The engine does not execute forms; it stores
+    /// them so they can be served by `GetFormByKey` (Zeebe parity).
+    FormDeployed {
+        deployment_key: Key,
+        form_key: Key,
+        version: i32,
+        /// The user-provided form identifier (the form-js document's `id`).
+        form_id: String,
+        /// The deploy resource name (e.g. `greeting.form`).
+        resource_name: String,
+        /// The verbatim form-js JSON document.
+        schema: String,
+    },
+
     /// A decision was evaluated — by a `businessRuleTask` (with `instance_key` /
     /// `element_id` set) or by the standalone EvaluateDecision API (both `0` /
     /// empty). Carries the root output and the per-decision audit trail for
@@ -931,6 +947,7 @@ impl Event {
             Event::ProcessDeployed { .. }
             | Event::DecisionRequirementsDeployed { .. }
             | Event::DecisionDeployed { .. }
+            | Event::FormDeployed { .. }
             | Event::DeploymentCreated { .. }
             | Event::MessagePublished { .. }
             | Event::SignalBroadcast { .. }
@@ -973,6 +990,11 @@ impl Event {
                     .max(*decision_requirements_key)
                     .max(*decision_key)
             }
+            Event::FormDeployed {
+                deployment_key,
+                form_key,
+                ..
+            } => m = m.max(*deployment_key).max(*form_key),
             Event::DecisionEvaluated {
                 element_instance_key,
                 decision_key,

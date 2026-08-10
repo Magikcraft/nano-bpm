@@ -26,6 +26,11 @@ pub enum Command {
     /// decision-requirements key and a per-DRG-id version; each decision it
     /// contains is indexed by id for `businessRuleTask`/EvaluateDecision lookup.
     DeployDecisionRequirements(Vec<crate::dmn::DecisionRequirementsGraph>),
+    /// Atomically register one or more forms (`form-js` `.form` resources) as a
+    /// deployment. Each form is assigned a form key and a per-form-id version. The
+    /// engine does not execute forms; it stores them so they can be served by
+    /// `GetFormByKey`.
+    DeployForms(Vec<FormResource>),
     /// Mark a decision instance (all rows sharing a `decision_evaluation_key`) for
     /// deletion in the read model. `instance_key` is the owning process instance,
     /// carried so the emitted [`Event::DecisionInstanceDeleted`] is journaled and
@@ -317,6 +322,20 @@ pub enum Command {
     },
 }
 
+/// A form (`form-js` `.form` resource) to register in a [`Command::DeployForms`].
+/// The engine stores it verbatim; it does not parse or execute the form beyond
+/// carrying its identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FormResource {
+    /// The user-provided form identifier (the form-js document's `id`).
+    pub id: String,
+    /// The deploy resource name (e.g. `greeting.form`).
+    pub resource_name: String,
+    /// The verbatim form-js JSON document.
+    pub schema: String,
+}
+
 /// One activation instruction of a [`Command::ModifyInstance`]: place a new
 /// token at `element_id`, first merging `variables` into the instance's root
 /// scope. (Zeebe's activate instruction also carries an ancestor-scope selector
@@ -372,6 +391,7 @@ impl Command {
             Command::DeployProcess(_) => "deploy_process",
             Command::DeployResources(_) => "deploy_resources",
             Command::DeployDecisionRequirements(_) => "deploy_decision_requirements",
+            Command::DeployForms(_) => "deploy_forms",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
             Command::CreateInstance { .. } => "create_instance",
             Command::CompleteJob { .. } => "complete_job",

@@ -910,6 +910,11 @@ pub struct State {
     /// to so required-decision chains resolve.
     #[cfg_attr(feature = "serde", serde(default))]
     pub decisions: HashMap<String, DeployedDecision>,
+    /// Latest deployed form (`form-js` `.form` JSON), keyed by form id. Versioned
+    /// per form id across deployments, like processes. The engine does not execute
+    /// forms; it retains them so `GetFormByKey` can serve the stored schema.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub forms: HashMap<String, DeployedForm>,
 }
 
 /// A deployed decision requirements graph together with the identity the engine
@@ -942,6 +947,24 @@ pub struct DeployedDecision {
     /// The full DRG this decision is part of, so evaluation can follow
     /// `requiredDecision` references natively.
     pub drg: crate::dmn::DecisionRequirementsGraph,
+}
+
+/// A deployed form together with the identity the engine assigned it at deploy
+/// time. The engine stores forms but does not execute them — they are served
+/// verbatim by `GetFormByKey`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeployedForm {
+    /// Unique key for this specific form (and version).
+    pub key: Key,
+    /// Version, incremented per form id across deployments (starts 1).
+    pub version: i32,
+    /// The user-provided form identifier (the form-js document's `id`).
+    pub form_id: String,
+    /// The deploy resource name (e.g. `greeting.form`).
+    pub resource_name: String,
+    /// The verbatim form-js JSON document.
+    pub schema: String,
 }
 
 /// A self-contained snapshot of one process instance and every entity it owns
@@ -1164,6 +1187,26 @@ pub fn apply(state: &mut State, event: &Event) {
                     },
                 );
             }
+        }
+
+        Event::FormDeployed {
+            form_key,
+            version,
+            form_id,
+            resource_name,
+            schema,
+            ..
+        } => {
+            state.forms.insert(
+                form_id.clone(),
+                DeployedForm {
+                    key: *form_key,
+                    version: *version,
+                    form_id: form_id.clone(),
+                    resource_name: resource_name.clone(),
+                    schema: schema.clone(),
+                },
+            );
         }
 
         Event::DecisionEvaluated { .. } => {

@@ -420,6 +420,7 @@ impl Engine {
                 Event::ProcessDeployed { .. }
                     | Event::DecisionRequirementsDeployed { .. }
                     | Event::DecisionDeployed { .. }
+                    | Event::FormDeployed { .. }
             ) {
                 state::apply(&mut self.state, event);
             }
@@ -478,6 +479,19 @@ impl Engine {
                     .decisions
                     .get(decision_id)
                     .map(|d| *version > d.version)
+                    .unwrap_or(true);
+                if newer {
+                    state::apply(&mut self.state, event);
+                }
+            } else if let Event::FormDeployed {
+                form_id, version, ..
+            } = event
+            {
+                let newer = self
+                    .state
+                    .forms
+                    .get(form_id)
+                    .map(|f| *version > f.version)
                     .unwrap_or(true);
                 if newer {
                     state::apply(&mut self.state, event);
@@ -774,6 +788,51 @@ impl Engine {
         Ok(())
     }
 
+    /// Registers one or more forms as a deployment, mirroring
+    /// [`Engine::deploy_decisions`]: a shared deployment key and one
+    /// [`Event::FormDeployed`] per form (versioned per form id). An idempotent
+    /// redeploy of the identical latest form is skipped. The engine does not
+    /// execute forms; it stores them so `GetFormByKey` can serve the schema.
+    fn deploy_forms(
+        &mut self,
+        log: &mut Vec<Event>,
+        forms: Vec<crate::command::FormResource>,
+    ) -> Result<(), EngineError> {
+        let deployment_key = self.mint_key();
+        self.emit(log, Event::DeploymentCreated { deployment_key });
+
+        for form in forms {
+            if self
+                .state
+                .forms
+                .get(&form.id)
+                .is_some_and(|existing| existing.schema == form.schema)
+            {
+                // Idempotent redeploy of the identical latest form: skip.
+                continue;
+            }
+            let version = self
+                .state
+                .forms
+                .get(&form.id)
+                .map(|f| f.version + 1)
+                .unwrap_or(1);
+            let form_key = self.mint_key();
+            self.emit(
+                log,
+                Event::FormDeployed {
+                    deployment_key,
+                    form_key,
+                    version,
+                    form_id: form.id,
+                    resource_name: form.resource_name,
+                    schema: form.schema,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Evaluates a deployed decision on demand for the standalone
     /// EvaluateDecision API. Resolves the decision by id (latest version) or, if
     /// `by_id` is `None`, by decision key, evaluates it against `variables`
@@ -900,6 +959,10 @@ impl Engine {
 
             Command::DeployDecisionRequirements(graphs) => {
                 self.deploy_decisions(&mut log, graphs)?;
+            }
+
+            Command::DeployForms(forms) => {
+                self.deploy_forms(&mut log, forms)?;
             }
 
             Command::DeleteDecisionInstance {

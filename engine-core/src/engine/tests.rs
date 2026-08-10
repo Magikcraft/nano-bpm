@@ -8589,6 +8589,71 @@ fn deploy_decision_requirements_indexes_decisions_and_is_idempotent() {
 }
 
 #[test]
+fn deploy_forms_mints_a_form_key_versions_per_id_and_is_idempotent() {
+    use crate::command::FormResource;
+    let mut engine = Engine::new();
+    let form = |schema: &str| FormResource {
+        id: "greeting-form".to_string(),
+        resource_name: "greeting.form".to_string(),
+        schema: schema.to_string(),
+    };
+    let v1 = r#"{"id":"greeting-form","type":"default","components":[]}"#;
+
+    let events = engine
+        .apply_command(Command::DeployForms(vec![form(v1)]))
+        .unwrap();
+    let deployed = events
+        .iter()
+        .find_map(|e| match e {
+            Event::FormDeployed {
+                form_key,
+                version,
+                form_id,
+                schema,
+                ..
+            } => Some((*form_key, *version, form_id.clone(), schema.clone())),
+            _ => None,
+        })
+        .expect("a FormDeployed event is emitted");
+    assert_eq!(deployed.1, 1, "the first deploy is version 1");
+    assert_eq!(deployed.2, "greeting-form");
+    assert_eq!(deployed.3, v1, "the raw schema is carried on the event");
+    let stored = &engine.state().forms["greeting-form"];
+    assert_eq!(stored.key, deployed.0);
+    assert_eq!(stored.version, 1);
+
+    // Redeploying the identical form is a no-op (only DeploymentCreated).
+    let again = engine
+        .apply_command(Command::DeployForms(vec![form(v1)]))
+        .unwrap();
+    assert!(
+        !again
+            .iter()
+            .any(|e| matches!(e, Event::FormDeployed { .. })),
+        "an identical redeploy emits no FormDeployed"
+    );
+    assert_eq!(engine.state().forms["greeting-form"].version, 1);
+
+    // A changed schema bumps the version and re-mints a key.
+    let v2 = r#"{"id":"greeting-form","type":"default","components":[{"type":"textfield","key":"who"}]}"#;
+    let changed = engine
+        .apply_command(Command::DeployForms(vec![form(v2)]))
+        .unwrap();
+    let bumped = changed
+        .iter()
+        .find_map(|e| match e {
+            Event::FormDeployed {
+                form_key, version, ..
+            } => Some((*form_key, *version)),
+            _ => None,
+        })
+        .expect("a changed form redeploys");
+    assert_eq!(bumped.1, 2, "a changed schema is version 2");
+    assert_ne!(bumped.0, deployed.0, "a new form key is minted");
+    assert_eq!(engine.state().forms["greeting-form"].version, 2);
+}
+
+#[test]
 fn business_rule_task_spreads_map_output_without_result_variable() {
     // A two-output decision table yields a map output; with no result variable
     // its entries are spread into the instance scope.

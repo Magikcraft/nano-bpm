@@ -217,6 +217,15 @@ CREATE TABLE message_subscriptions (
     correlation_key        TEXT NOT NULL
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
+CREATE TABLE forms (
+    form_id       TEXT PRIMARY KEY,
+    form_key      INTEGER NOT NULL,
+    version       INTEGER NOT NULL,
+    schema        TEXT NOT NULL,
+    resource_name TEXT NOT NULL DEFAULT '',
+    tenant_id     TEXT NOT NULL DEFAULT '<default>'
+);
+CREATE INDEX idx_forms_key ON forms(form_key);
 ";
 
 // --- enum <-> integer code mappings (kept beside the engine enums) ---
@@ -589,6 +598,17 @@ pub struct DecisionDefinitionRow {
     pub decision_requirements_id: String,
     pub decision_requirements_name: String,
     pub decision_requirements_version: i32,
+}
+
+/// A projected form row (latest version per form id).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FormRow {
+    pub form_id: String,
+    pub form_key: Key,
+    pub version: i32,
+    pub schema: String,
+    pub resource_name: String,
+    pub tenant_id: String,
 }
 
 /// WAL autocheckpoint threshold in pages for the read-model store. Default 12288
@@ -1622,6 +1642,20 @@ impl ReadStore {
         .expect("query decision_definition_xml")
     }
 
+    /// A single deployed form by its numeric key (only the latest version per form
+    /// id is retained, mirroring the engine). `None` when no such form is
+    /// projected.
+    pub fn form_by_key(&self, key: Key) -> Option<FormRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!("SELECT {FORM_COLS} FROM forms WHERE form_key = ?1"),
+            params![key as i64],
+            map_form,
+        )
+        .optional()
+        .expect("query form_by_key")
+    }
+
     /// when no such definition is projected (only the latest version per process
     /// id is retained, mirroring the engine). Empty-string XML (a definition
     /// built programmatically rather than parsed) is returned as `Some("")`.
@@ -1858,6 +1892,15 @@ impl ReadModel {
         for s in &self.shards {
             if let Some(xml) = s.decision_definition_xml(key) {
                 return Some(xml);
+            }
+        }
+        None
+    }
+
+    pub fn form_by_key(&self, key: Key) -> Option<FormRow> {
+        for s in &self.shards {
+            if let Some(row) = s.form_by_key(key) {
+                return Some(row);
             }
         }
         None
@@ -2186,6 +2229,19 @@ fn map_decision_definition(r: &rusqlite::Row) -> rusqlite::Result<DecisionDefini
         decision_requirements_id: r.get(5)?,
         decision_requirements_name: r.get(6)?,
         decision_requirements_version: r.get(7)?,
+    })
+}
+
+const FORM_COLS: &str = "form_id, form_key, version, schema, resource_name, tenant_id";
+
+fn map_form(r: &rusqlite::Row) -> rusqlite::Result<FormRow> {
+    Ok(FormRow {
+        form_id: r.get(0)?,
+        form_key: r.get::<_, i64>(1)? as Key,
+        version: r.get(2)?,
+        schema: r.get(3)?,
+        resource_name: r.get(4)?,
+        tenant_id: r.get(5)?,
     })
 }
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
@@ -3079,6 +3135,33 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     drg_id,
                     drg_name,
                     drg_version,
+                ],
+            )?;
+        }
+
+        Event::FormDeployed {
+            form_key,
+            version,
+            form_id,
+            resource_name,
+            schema,
+            ..
+        } => {
+            // Latest version per form id (a redeploy replaces), mirroring the
+            // engine's `state.forms`.
+            tx.cexecute(
+                "INSERT INTO forms (form_id, form_key, version, schema, resource_name, tenant_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(form_id) DO UPDATE SET form_key = excluded.form_key, \
+                 version = excluded.version, schema = excluded.schema, \
+                 resource_name = excluded.resource_name, tenant_id = excluded.tenant_id",
+                params![
+                    form_id,
+                    *form_key as i64,
+                    version,
+                    schema,
+                    resource_name,
+                    "<default>",
                 ],
             )?;
         }
