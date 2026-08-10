@@ -4,7 +4,6 @@ import {
   useMemo,
   useRef,
   useState,
-  lazy,
   Suspense,
 } from "react";
 import { Link, useParams } from "react-router-dom";
@@ -22,6 +21,7 @@ import PageComposer, {
   type PageComposerHandle,
 } from "../components/PageComposer";
 import type { MetaEntry, ShapeDecl, ShapeOp } from "../lib/shapeCarrier";
+import { lazyImport } from "../lib/lazyWithReload";
 import { envelopeEditableFields } from "../lib/shapeCarrier";
 import type { ComposerEntity } from "../lib/shapeComposer";
 import { SCALAR_KEYWORDS } from "../lib/shapeComposer";
@@ -110,15 +110,19 @@ import {
 // kind is open, so lazy-loading them splits ~megabytes out of the
 // ProjectWorkspace chunk and defers the cost until you actually edit that file
 // type. Each modeler usage is wrapped in <Suspense fallback={modelerFallback}>.
-const TestRunPanel = lazy(() => import("../components/TestRunPanel"));
-const DataPanel = lazy(() => import("../components/DataPanel"));
-const TriggersPanel = lazy(() => import("../components/TriggersPanel"));
-const ConnectorsPanel = lazy(() => import("../components/ConnectorsPanel"));
-const DerivedModelPanel = lazy(() => import("../components/DerivedModelPanel"));
-const BpmnModeler = lazy(() => import("../components/BpmnModeler"));
-const DmnModeler = lazy(() => import("../components/DmnModeler"));
-const FormEditor = lazy(() => import("../components/FormEditor"));
-const FormPreview = lazy(() => import("../components/FormPreview"));
+const TestRunPanel = lazyImport(() => import("../components/TestRunPanel"));
+const DataPanel = lazyImport(() => import("../components/DataPanel"));
+const TriggersPanel = lazyImport(() => import("../components/TriggersPanel"));
+const ConnectorsPanel = lazyImport(
+  () => import("../components/ConnectorsPanel"),
+);
+const DerivedModelPanel = lazyImport(
+  () => import("../components/DerivedModelPanel"),
+);
+const BpmnModeler = lazyImport(() => import("../components/BpmnModeler"));
+const DmnModeler = lazyImport(() => import("../components/DmnModeler"));
+const FormEditor = lazyImport(() => import("../components/FormEditor"));
+const FormPreview = lazyImport(() => import("../components/FormPreview"));
 
 const modelerFallback = (
   <div className="flex h-full items-center justify-center text-sm text-fg-faint">

@@ -1,5 +1,4 @@
 import {
-  lazy,
   Suspense,
   useEffect,
   useRef,
@@ -36,6 +35,7 @@ import { languageForFile } from "../lib/editorLang";
 import type { ExtraModel } from "../components/CodeEditor";
 import { Button, PageHeader, SectionLabel } from "../components/ui";
 import { IS_STUDIO } from "../lib/profile";
+import { lazyImport } from "../lib/lazyWithReload";
 
 type CodeEditorProps = {
   value: string;
@@ -55,7 +55,7 @@ type CodeEditorProps = {
 // bundles) from that build during transform. The `() => null` fallback keeps the
 // type honest and can never render (its call sites live behind IS_STUDIO).
 const CodeEditor: ComponentType<CodeEditorProps> = __STUDIO__
-  ? (lazy(
+  ? (lazyImport(
       () => import("../components/CodeEditor"),
     ) as ComponentType<CodeEditorProps>)
   : () => null;
