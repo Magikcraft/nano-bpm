@@ -3,7 +3,7 @@ import {
   CHUNK_RELOAD_AT_KEY,
   shouldReloadForChunkError,
   withinReloadBudget,
-} from "./chunkReload";
+} from "./chunkReload.ts";
 
 function lastReloadAt(): number | null {
   try {
@@ -68,14 +68,21 @@ export function lazyImport<T extends ComponentType<any>>(
   });
 }
 
+let backstopInstalled = false;
+
 /**
  * Install a global backstop for Vite's module-preload failures. The
  * `<link rel="modulepreload">` path fires a `vite:preloadError` event rather
  * than rejecting an `import()` factory, so `lazyImport` alone can't catch it.
- * Call once at startup (see `main.tsx`).
+ * Call once at startup (see `main.tsx`). Idempotent: a module-scoped guard
+ * ensures only one listener is ever attached even under dev/HMR or an
+ * accidental double call, so a single preload error can't fan out to duplicate
+ * reload attempts.
  */
 export function installChunkReloadBackstop(): void {
   if (typeof window === "undefined") return;
+  if (backstopInstalled) return;
+  backstopInstalled = true;
   window.addEventListener("vite:preloadError", (event) => {
     if (withinReloadBudget(lastReloadAt(), Date.now())) {
       event.preventDefault();
