@@ -196,17 +196,20 @@ release-gateway: $(GENERATED_DIR)/Cargo.toml $(STUB_IMPLS) ## Build the optimize
 	@echo "Built API-only gateway: $(PROJECT_ROOT)/server/target/release/nanobpm-gateway-rest-server"
 
 # ---------------------------------------------------------------------------
-# Local cross-compilation of the gateway for Linux targets — the same recipe CI
-# uses in .github/workflows/publish-c8ctl-binaries.yml (cargo-zigbuild + a glibc
-# floor), so you can produce dev builds for a Linux x86-64 box or a Raspberry Pi
-# (ARMv7) from any host without Docker. Needs zig + cargo-zigbuild (the script
-# checks and prints install hints). Output lands in dist/ (git-ignored).
+# Local cross-compilation of the gateway for Linux and Windows targets — the same
+# recipe CI uses in .github/workflows/publish-c8ctl-binaries.yml. Linux uses
+# cargo-zigbuild + a glibc floor; Windows uses cargo-xwin (the msvc ABI CI ships,
+# which CI builds natively on a windows-2022 runner). So you can produce dev builds
+# for a Linux x86-64 box, a Raspberry Pi (ARMv7), or Windows x64 from any host
+# without Docker. Needs zig + cargo-zigbuild (Linux) or cargo-xwin (Windows); the
+# script checks and prints install hints. Output lands in dist/ (git-ignored).
 #
 #   make cross-linux-x64      -> Linux x86-64  (x86_64-unknown-linux-gnu)
 #   make cross-linux-armv7    -> Raspberry Pi  (armv7-unknown-linux-gnueabihf)
 #   make cross-linux-arm64    -> Linux ARM64   (aarch64-unknown-linux-gnu)
 #   make cross-linux-armv6    -> ARMv6 (Pi 1/Zero)  (arm-unknown-linux-gnueabihf)
 #   make cross-linux          -> x64 + armv7 (the two you test on)
+#   make cross-windows        -> Windows x64   (x86_64-pc-windows-msvc)
 #   make cross TARGET=<triple> [GLIBC=2.31] [CROSS_ARGS=--no-console]  -> generic
 #
 # These share `release`'s prerequisites, so the REST layer + embedded console are
@@ -244,6 +247,10 @@ cross-linux-armv6: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embed
 
 .PHONY: cross-linux
 cross-linux: cross-linux-x64 cross-linux-armv7 ## Cross-compile the gateway for both Linux x86-64 and Raspberry Pi ARMv7 -> dist/
+
+.PHONY: cross-windows
+cross-windows: $(CROSS_PREREQS) ## Cross-compile the gateway (release; embedded console unless CROSS_ARGS=--no-console) for Windows x64 (msvc) -> dist/
+	$(PROJECT_ROOT)/scripts/cross-build.sh x86_64-pc-windows-msvc $(CROSS_ARGS)
 
 .PHONY: console-frontend
 console-frontend: console-wasm ## Build the web console SPA (console/ -> console/dist)
