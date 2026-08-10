@@ -77,8 +77,10 @@ export interface GridColumn {
   field: string;
   header: string;
   /** An optional structured link the cell value becomes (e.g. a process-explorer
-   * deep link). Distinct from the runtime's legacy `linkField` (a row field
-   * holding a full URL); a column may still carry a raw URL via page JSON. */
+   * deep link). This is the only per-column link mechanism the parser preserves
+   * — `parseColumns` keeps `field`, `header`, and `link` and drops anything
+   * else. (Not to be confused with `DetailSpec.linkField`, which is a
+   * detail-panel concern, unrelated to grid columns.) */
   link?: GridColumnLink;
 }
 
