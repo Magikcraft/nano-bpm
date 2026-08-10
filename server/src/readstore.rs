@@ -600,7 +600,7 @@ pub struct DecisionDefinitionRow {
     pub decision_requirements_version: i32,
 }
 
-/// A projected form row (latest version per form id).
+/// A projected form row, one per deployed form version (keyed by `form_key`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FormRow {
     pub form_id: String,
