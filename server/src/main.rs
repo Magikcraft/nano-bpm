@@ -20916,6 +20916,72 @@ mod clustered_startup_tests {
         assert_eq!(got.version, 1);
         assert_eq!(got.schema, schema, "the raw form-js JSON round-trips");
 
+        // Redeploying a CHANGED schema mints a new key at version 2. Both the old
+        // and the new key must remain retrievable (each version keyed by its own
+        // form_key), so an in-flight instance still resolving the old key is safe.
+        let schema_v2 = r#"{"id":"greeting-form","type":"default","schemaVersion":16,"components":[{"label":"Name","type":"textfield","key":"name"}]}"#;
+        let (result_v2, _events) = server
+            .deploy_resources_locally_with_forms(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![nanobpmn_engine_core::FormResource {
+                    id: "greeting-form".to_string(),
+                    resource_name: "greeting.form".to_string(),
+                    schema: schema_v2.to_string(),
+                }],
+                "<default>",
+            )
+            .await
+            .expect("form redeploy succeeds");
+        let form_meta_v2 = result_v2
+            .deployments
+            .iter()
+            .find_map(|d| match &d.form {
+                nanobpm_gateway_rest::types::Nullable::Present(f) => Some(f.clone()),
+                nanobpm_gateway_rest::types::Nullable::Null => None,
+            })
+            .expect("the redeploy result includes the form metadata");
+        assert_eq!(
+            form_meta_v2.version, 2,
+            "a changed schema bumps the version"
+        );
+        let form_key_v2 = form_meta_v2.form_key.0.clone();
+        assert_ne!(form_key_v2, form_key, "a new form key is minted");
+
+        // The new key resolves to version 2 (poll for its projection).
+        let mut got_v2 = None;
+        for _ in 0..200 {
+            let resp = server
+                .get_form_by_key_impl(&models::GetFormByKeyPathParams {
+                    form_key: form_key_v2.clone(),
+                })
+                .await
+                .expect("get returns a response");
+            if let FormGet::Status200_TheFormIsSuccessfullyReturned(f) = resp {
+                got_v2 = Some(f);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got_v2 = got_v2.expect("the redeployed form version is retrievable");
+        assert_eq!(got_v2.version, 2);
+        assert_eq!(got_v2.schema, schema_v2);
+
+        // The ORIGINAL key still resolves to version 1 (not overwritten).
+        let resp = server
+            .get_form_by_key_impl(&models::GetFormByKeyPathParams {
+                form_key: form_key.clone(),
+            })
+            .await
+            .expect("get returns a response");
+        let FormGet::Status200_TheFormIsSuccessfullyReturned(still_v1) = resp else {
+            panic!("the original form key must remain retrievable after a redeploy");
+        };
+        assert_eq!(still_v1.version, 1);
+        assert_eq!(still_v1.schema, schema);
+
         // Unknown and malformed keys are 404s.
         assert!(matches!(
             server

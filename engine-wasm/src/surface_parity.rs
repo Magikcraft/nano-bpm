@@ -123,6 +123,9 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeployDecisionRequirements(..) => Surface::NotSurfaced {
             reason: "DMN deployment; the in-browser test engine exercises BPMN execution only",
         },
+        Command::DeployForms(..) => Surface::NotSurfaced {
+            reason: "form storage; the in-browser test engine exercises BPMN execution only",
+        },
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },

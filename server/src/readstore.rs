@@ -218,14 +218,14 @@ CREATE TABLE message_subscriptions (
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
 CREATE TABLE forms (
-    form_id       TEXT PRIMARY KEY,
-    form_key      INTEGER NOT NULL,
+    form_key      INTEGER PRIMARY KEY,
+    form_id       TEXT NOT NULL,
     version       INTEGER NOT NULL,
     schema        TEXT NOT NULL,
     resource_name TEXT NOT NULL DEFAULT '',
     tenant_id     TEXT NOT NULL DEFAULT '<default>'
 );
-CREATE INDEX idx_forms_key ON forms(form_key);
+CREATE INDEX idx_forms_id ON forms(form_id);
 ";
 
 // --- enum <-> integer code mappings (kept beside the engine enums) ---
@@ -1642,8 +1642,9 @@ impl ReadStore {
         .expect("query decision_definition_xml")
     }
 
-    /// A single deployed form by its numeric key (only the latest version per form
-    /// id is retained, mirroring the engine). `None` when no such form is
+    /// A single deployed form by its per-version numeric key. Each deployed form
+    /// version is retained under its own `form_key`, so a redeploy that mints a
+    /// new key never invalidates an earlier one. `None` when no such form is
     /// projected.
     pub fn form_by_key(&self, key: Key) -> Option<FormRow> {
         let conn = self.conn.lock().expect("read store poisoned");
@@ -3147,17 +3148,18 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             schema,
             ..
         } => {
-            // Latest version per form id (a redeploy replaces), mirroring the
-            // engine's `state.forms`.
+            // One row per deployed form version, keyed by its unique form_key so
+            // GetFormByKey resolves every version. The upsert is idempotent on a
+            // journal replay (the same event re-projects identical data).
             tx.cexecute(
-                "INSERT INTO forms (form_id, form_key, version, schema, resource_name, tenant_id) \
+                "INSERT INTO forms (form_key, form_id, version, schema, resource_name, tenant_id) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-                 ON CONFLICT(form_id) DO UPDATE SET form_key = excluded.form_key, \
+                 ON CONFLICT(form_key) DO UPDATE SET form_id = excluded.form_id, \
                  version = excluded.version, schema = excluded.schema, \
                  resource_name = excluded.resource_name, tenant_id = excluded.tenant_id",
                 params![
-                    form_id,
                     *form_key as i64,
+                    form_id,
                     version,
                     schema,
                     resource_name,
