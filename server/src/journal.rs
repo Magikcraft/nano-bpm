@@ -1194,6 +1194,7 @@ impl Journal {
                     Event::ProcessDeployed { .. }
                         | Event::DecisionRequirementsDeployed { .. }
                         | Event::DecisionDeployed { .. }
+                        | Event::FormDeployed { .. }
                 )
             })
             .cloned()

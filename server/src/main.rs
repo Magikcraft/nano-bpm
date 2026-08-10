@@ -1059,6 +1059,18 @@ fn deployment_replication_events(deploy_journal: &Journal) -> Vec<Event> {
             });
         }
     }
+    // Re-emit each deployed form so a freshly seeded replica can serve it via
+    // GetFormByKey. Forms are independent (no sub-resources), so order is free.
+    for form in state.forms.values() {
+        events.push(Event::FormDeployed {
+            deployment_key: 0,
+            form_key: form.key,
+            version: form.version,
+            form_id: form.form_id.clone(),
+            resource_name: form.resource_name.clone(),
+            schema: form.schema.clone(),
+        });
+    }
     events
 }
 
@@ -1071,22 +1083,22 @@ struct ParsedDeploy {
     decisions: Vec<nanobpmn_engine_core::dmn::DecisionRequirementsGraph>,
     /// DRG id -> resource name.
     drg_resource_names: std::collections::HashMap<String, String>,
+    /// Forms (`form-js` `.form` resources) to register. The engine stores them
+    /// so `GetFormByKey` can serve the schema; it does not execute forms.
+    forms: Vec<nanobpmn_engine_core::FormResource>,
 }
 
 /// Parses every deployment resource up front so a deploy is all-or-nothing.
 /// A resource whose file name ends in `.dmn` is parsed as a DMN decision
-/// requirements graph; a `.form` resource (form-js JSON) is accepted but
-/// skipped — the engine does not execute forms, they are UI artifacts rendered
-/// by the hosted surfaces (see server/src/console/projects.rs). Everything else
-/// is parsed as BPMN (`.bpmn` or unnamed). `Err` is `(title, detail)` for a 400
-/// response.
+/// requirements graph; a `.form` resource (form-js JSON) is registered as a form
+/// (stored, not executed); everything else is parsed as BPMN (`.bpmn` or
+/// unnamed). `Err` is `(title, detail)` for a 400 response.
 ///
-/// Tolerating (rather than rejecting) forms matters because clients deploy a
-/// mixed resource set: the console POSTs each resource individually so a form
-/// failure was merely logged, but `@nanobpm/urban`'s runtime batches processes,
-/// decisions and forms into ONE createDeployment call — so BPMN-parsing a form
-/// there aborted the whole deploy, the process included. This also matches
-/// Camunda/Zeebe, whose createDeployment accepts form resources.
+/// Collecting (rather than rejecting) forms matters because clients deploy a
+/// mixed resource set: `@nanobpm/urban`'s runtime batches processes, decisions
+/// and forms into ONE createDeployment call, so BPMN-parsing a form there would
+/// abort the whole deploy, the process included. This also matches Camunda/Zeebe,
+/// whose createDeployment accepts and stores form resources.
 fn parse_deploy_resources(
     resources: &[(String, String)],
 ) -> Result<ParsedDeploy, (&'static str, String)> {
@@ -1096,6 +1108,7 @@ fn parse_deploy_resources(
     let mut decisions = Vec::new();
     let mut drg_resource_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut forms = Vec::new();
     for (resource_name, xml) in resources {
         let lower = resource_name.to_ascii_lowercase();
         if lower.ends_with(".dmn") {
@@ -1113,12 +1126,26 @@ fn parse_deploy_resources(
             }
             continue;
         }
-        // Forms (form-js `.form` JSON) are not engine-executable — the engine
-        // does not model or run them (they are rendered by the hosted human
-        // surfaces). Accept and skip them so a mixed deploy (process + form in
-        // one createDeployment call, as `@nanobpm/urban` sends) succeeds rather
-        // than failing when the form is parsed as BPMN.
+        // Forms (form-js `.form` JSON) are stored, not executed. Extract the
+        // form-js document's `id` for versioning/lookup; a form without a string
+        // `id` is a client error (mirrors Zeebe, which requires a form id).
         if lower.ends_with(".form") {
+            match form_id_of(xml) {
+                Some(id) => forms.push(nanobpmn_engine_core::FormResource {
+                    id,
+                    resource_name: resource_name.clone(),
+                    schema: xml.clone(),
+                }),
+                None => {
+                    return Err((
+                        "Invalid form",
+                        format!(
+                            "Failed to parse '{resource_name}': not a valid form-js document \
+                             (expected a JSON object with a string \"id\")."
+                        ),
+                    ));
+                }
+            }
             continue;
         }
         match parse_bpmn(xml) {
@@ -1141,7 +1168,18 @@ fn parse_deploy_resources(
         process_resource_names,
         decisions,
         drg_resource_names,
+        forms,
     })
+}
+
+/// Extracts the form-js document `id` from a `.form` resource's JSON. Returns
+/// `None` when the body is not a JSON object or lacks a non-empty string `id`.
+fn form_id_of(schema: &str) -> Option<String> {
+    let doc: serde_json::Value = serde_json::from_str(schema).ok()?;
+    doc.get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 impl Default for ServerImpl {
@@ -1247,6 +1285,7 @@ fn rebuild_read_model_legacy(
             Event::ProcessDeployed { .. }
                 | Event::DecisionRequirementsDeployed { .. }
                 | Event::DecisionDeployed { .. }
+                | Event::FormDeployed { .. }
         ) {
             for bucket in per_shard.values_mut() {
                 bucket.push(e);
@@ -7886,6 +7925,36 @@ impl ServerImpl {
         }
     }
 
+    async fn get_form_by_key_impl(
+        &self,
+        path_params: &models::GetFormByKeyPathParams,
+    ) -> Result<apis::form::GetFormByKeyResponse, ()> {
+        use apis::form::GetFormByKeyResponse as Resp;
+
+        let raw = &path_params.form_key;
+        let key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheFormWithTheGivenKeyWasNotFound(problem(
+                    "Form not found",
+                    404,
+                    format!("Form key '{raw}' is not a valid key."),
+                )));
+            }
+        };
+
+        match self.store.form_by_key(key) {
+            Some(row) => Ok(Resp::Status200_TheFormIsSuccessfullyReturned(form_result(
+                &row,
+            ))),
+            None => Ok(Resp::Status404_TheFormWithTheGivenKeyWasNotFound(problem(
+                "Form not found",
+                404,
+                format!("No form with key {key}."),
+            ))),
+        }
+    }
+
     async fn search_decision_definitions_impl(
         &self,
         body: &Option<models::DecisionDefinitionSearchQuery>,
@@ -9213,11 +9282,12 @@ impl ServerImpl {
                 }
             };
             match self
-                .deploy_resources_locally(
+                .deploy_resources_locally_with_forms(
                     parsed.processes,
                     &parsed.process_resource_names,
                     parsed.decisions,
                     &parsed.drg_resource_names,
+                    parsed.forms,
                     &tenant_id,
                 )
                 .await
@@ -9441,6 +9511,7 @@ impl ServerImpl {
     /// to its other owned partitions. Returns the typed deployment result and the
     /// minted deployment events (for cross-node broadcast). The caller must be the
     /// partition-0 owner. `Err` carries `(title, detail)` for a 400.
+    #[cfg(test)]
     async fn deploy_resources_locally(
         &self,
         processes: Vec<ProcessDefinition>,
@@ -9449,8 +9520,30 @@ impl ServerImpl {
         drg_resource_names: &std::collections::HashMap<String, String>,
         tenant_id: &str,
     ) -> Result<(models::DeploymentResult, Arc<Vec<Event>>), (&'static str, String)> {
+        self.deploy_resources_locally_with_forms(
+            processes,
+            resource_names,
+            decisions,
+            drg_resource_names,
+            Vec::new(),
+            tenant_id,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn deploy_resources_locally_with_forms(
+        &self,
+        processes: Vec<ProcessDefinition>,
+        resource_names: &std::collections::HashMap<String, String>,
+        decisions: Vec<nanobpmn_engine_core::dmn::DecisionRequirementsGraph>,
+        drg_resource_names: &std::collections::HashMap<String, String>,
+        forms: Vec<nanobpmn_engine_core::FormResource>,
+        tenant_id: &str,
+    ) -> Result<(models::DeploymentResult, Arc<Vec<Event>>), (&'static str, String)> {
         let requested_ids: Vec<String> = processes.iter().map(|p| p.id.clone()).collect();
         let requested_drg_ids: Vec<String> = decisions.iter().map(|d| d.id.clone()).collect();
+        let requested_form_ids: Vec<String> = forms.iter().map(|f| f.id.clone()).collect();
         // The closure returns, besides the emitted events and commit, the
         // resolved (key, version) for every *requested* process id read back from
         // post-apply state. An idempotent redeploy emits no event but must still
@@ -9461,6 +9554,8 @@ impl ServerImpl {
         type ResolvedDecisions = Vec<(String, String, u64, i32, String, u64)>;
         // Resolved DRGs: (drg_id, name, key, version).
         type ResolvedDrgs = Vec<(String, String, u64, i32)>;
+        // Resolved forms: (form_id, key, version, resource_name).
+        type ResolvedForms = Vec<(String, u64, i32, String)>;
         #[allow(clippy::type_complexity)]
         let deploy_result: Result<
             (
@@ -9469,76 +9564,103 @@ impl ServerImpl {
                 Resolved,
                 ResolvedDrgs,
                 ResolvedDecisions,
+                ResolvedForms,
             ),
             String,
-        > = self
-            .engine
-            .deploy_partition()
-            .with(move |engine| {
-                let (events, commit) = engine
-                    .apply_command(Command::DeployResources(processes))
-                    .map_err(|e| e.to_string())?;
-                // Deploy any DMN decisions in the same durable batch. Their events
-                // are appended so the whole deployment broadcasts/replicates as one.
-                let mut all_events = (*events).clone();
-                let mut commit = commit;
-                if !decisions.is_empty() {
-                    let (dec_events, dec_commit) = engine
-                        .apply_command(Command::DeployDecisionRequirements(decisions))
+        > =
+            self.engine
+                .deploy_partition()
+                .with(move |engine| {
+                    let (events, commit) = engine
+                        .apply_command(Command::DeployResources(processes))
                         .map_err(|e| e.to_string())?;
-                    all_events.extend((*dec_events).iter().cloned());
-                    commit = dec_commit;
-                }
-                let events = Arc::new(all_events);
-                let resolved: Resolved = requested_ids
-                    .iter()
-                    .filter_map(|id| {
-                        engine
-                            .state()
-                            .processes
-                            .get(id)
-                            .map(|d| (id.clone(), d.key, d.version))
-                    })
-                    .collect();
-                let resolved_drgs: ResolvedDrgs = requested_drg_ids
-                    .iter()
-                    .filter_map(|id| {
-                        engine
-                            .state()
-                            .decision_requirements
-                            .get(id)
-                            .map(|d| (id.clone(), d.drg.name.clone(), d.key, d.version))
-                    })
-                    .collect();
-                let resolved_decisions: ResolvedDecisions = requested_drg_ids
-                    .iter()
-                    .filter_map(|id| engine.state().decision_requirements.get(id))
-                    .flat_map(|drg| {
-                        drg.drg
-                            .decisions
+                    // Deploy any DMN decisions in the same durable batch. Their events
+                    // are appended so the whole deployment broadcasts/replicates as one.
+                    let mut all_events = (*events).clone();
+                    let mut commit = commit;
+                    if !decisions.is_empty() {
+                        let (dec_events, dec_commit) = engine
+                            .apply_command(Command::DeployDecisionRequirements(decisions))
+                            .map_err(|e| e.to_string())?;
+                        all_events.extend((*dec_events).iter().cloned());
+                        commit = dec_commit;
+                    }
+                    // Deploy any forms in the same durable batch so the whole
+                    // deployment broadcasts/replicates as one.
+                    if !forms.is_empty() {
+                        let (form_events, form_commit) = engine
+                            .apply_command(Command::DeployForms(forms))
+                            .map_err(|e| e.to_string())?;
+                        all_events.extend((*form_events).iter().cloned());
+                        commit = form_commit;
+                    }
+                    let events = Arc::new(all_events);
+                    let resolved: Resolved = requested_ids
+                        .iter()
+                        .filter_map(|id| {
+                            engine
+                                .state()
+                                .processes
+                                .get(id)
+                                .map(|d| (id.clone(), d.key, d.version))
+                        })
+                        .collect();
+                    let resolved_drgs: ResolvedDrgs = requested_drg_ids
+                        .iter()
+                        .filter_map(|id| {
+                            engine
+                                .state()
+                                .decision_requirements
+                                .get(id)
+                                .map(|d| (id.clone(), d.drg.name.clone(), d.key, d.version))
+                        })
+                        .collect();
+                    let resolved_decisions: ResolvedDecisions = requested_drg_ids
+                        .iter()
+                        .filter_map(|id| engine.state().decision_requirements.get(id))
+                        .flat_map(|drg| {
+                            drg.drg
+                                .decisions
+                                .iter()
+                                .filter_map(|d| {
+                                    engine.state().decisions.get(&d.id).map(|dep| {
+                                        (
+                                            dep.decision_id.clone(),
+                                            dep.decision_name.clone(),
+                                            dep.key,
+                                            dep.version,
+                                            drg.drg.id.clone(),
+                                            drg.key,
+                                        )
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    let resolved_forms: ResolvedForms =
+                        requested_form_ids
                             .iter()
-                            .filter_map(|d| {
-                                engine.state().decisions.get(&d.id).map(|dep| {
-                                    (
-                                        dep.decision_id.clone(),
-                                        dep.decision_name.clone(),
-                                        dep.key,
-                                        dep.version,
-                                        drg.drg.id.clone(),
-                                        drg.key,
-                                    )
+                            .filter_map(|id| {
+                                engine.state().forms.get(id).map(|f| {
+                                    (id.clone(), f.key, f.version, f.resource_name.clone())
                                 })
                             })
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
-                Ok((events, commit, resolved, resolved_drgs, resolved_decisions))
-            })
-            .await;
-        let (events, commit, resolved, resolved_drgs, resolved_decisions) = match deploy_result {
-            Ok(t) => t,
-            Err(e) => return Err(("Invalid deployment", e)),
-        };
+                            .collect();
+                    Ok((
+                        events,
+                        commit,
+                        resolved,
+                        resolved_drgs,
+                        resolved_decisions,
+                        resolved_forms,
+                    ))
+                })
+                .await;
+        let (events, commit, resolved, resolved_drgs, resolved_decisions, resolved_forms) =
+            match deploy_result {
+                Ok(t) => t,
+                Err(e) => return Err(("Invalid deployment", e)),
+            };
         // Replicate the new definition(s) to the other local partitions so any of
         // them can instantiate the process (the deployment itself is journaled
         // only on partition 0; replication is in-memory and re-derived on restart).
@@ -9617,6 +9739,23 @@ impl ServerImpl {
                 nanobpm_gateway_rest::types::Nullable::Null,
             ));
         }
+        // One metadata entry per deployed form (`form` slot of the metadata).
+        for (form_id, form_key, version, resource_name) in resolved_forms {
+            let form_result = models::DeploymentFormResult::new(
+                form_id,
+                version,
+                resource_name,
+                tenant_id.to_string(),
+                models::FormKey(form_key.to_string()),
+            );
+            deployments.push(models::DeploymentMetadataResult::new(
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Present(form_result),
+                nanobpm_gateway_rest::types::Nullable::Null,
+            ));
+        }
 
         let result = models::DeploymentResult::new(
             models::DeploymentKey(deployment_key),
@@ -9639,11 +9778,12 @@ impl ServerImpl {
     ) -> Result<serde_json::Value, (u16, String)> {
         let parsed = parse_deploy_resources(&resources).map_err(|(_, detail)| (400u16, detail))?;
         let (result, events) = self
-            .deploy_resources_locally(
+            .deploy_resources_locally_with_forms(
                 parsed.processes,
                 &parsed.process_resource_names,
                 parsed.decisions,
                 &parsed.drg_resource_names,
+                parsed.forms,
                 &tenant_id,
             )
             .await
@@ -9728,6 +9868,7 @@ impl ServerImpl {
                     Event::ProcessDeployed { .. }
                         | Event::DecisionRequirementsDeployed { .. }
                         | Event::DecisionDeployed { .. }
+                        | Event::FormDeployed { .. }
                 )
             })
             .cloned()
@@ -14372,6 +14513,16 @@ fn decision_definition_result(
     )
 }
 
+fn form_result(row: &readstore::FormRow) -> models::FormResult {
+    models::FormResult::new(
+        row.tenant_id.clone(),
+        row.form_id.clone(),
+        row.schema.clone(),
+        row.version as i64,
+        models::FormKey(row.form_key.to_string()),
+    )
+}
+
 fn decision_requirements_result(
     row: &readstore::DecisionRequirementsRow,
 ) -> models::DecisionRequirementsResult {
@@ -16626,6 +16777,7 @@ async fn main() {
                             Event::ProcessDeployed { .. }
                                 | Event::DecisionRequirementsDeployed { .. }
                                 | Event::DecisionDeployed { .. }
+                                | Event::FormDeployed { .. }
                         ) {
                             for bucket in per_owned.values_mut() {
                                 bucket.push(event.clone());
@@ -20699,6 +20851,153 @@ mod clustered_startup_tests {
                 .await
                 .unwrap(),
             ReqXml::Status404_TheDecisionRequirementsWithTheGivenKeyWasNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_deployed_form_is_retrievable_via_get_form_by_key() {
+        // Deploying a `.form` stores the raw form-js schema; the deploy result
+        // carries the minted form metadata, and GetFormByKey serves the schema.
+        use apis::form::GetFormByKeyResponse as FormGet;
+        let server = ServerImpl::default();
+
+        let schema = r#"{"id":"greeting-form","type":"default","schemaVersion":16,"components":[{"label":"Who","type":"textfield","key":"who"}]}"#;
+        let form = nanobpmn_engine_core::FormResource {
+            id: "greeting-form".to_string(),
+            resource_name: "greeting.form".to_string(),
+            schema: schema.to_string(),
+        };
+        let (result, _events) = server
+            .deploy_resources_locally_with_forms(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![form],
+                "<default>",
+            )
+            .await
+            .expect("form-only deploy succeeds");
+
+        // The deploy result carries exactly one form metadata entry.
+        let form_meta = result
+            .deployments
+            .iter()
+            .find_map(|d| match &d.form {
+                nanobpm_gateway_rest::types::Nullable::Present(f) => Some(f.clone()),
+                nanobpm_gateway_rest::types::Nullable::Null => None,
+            })
+            .expect("the deploy result includes the form metadata");
+        assert_eq!(form_meta.form_id, "greeting-form");
+        assert_eq!(form_meta.version, 1);
+        assert_eq!(form_meta.resource_name, "greeting.form");
+        let form_key = form_meta.form_key.0.clone();
+
+        // GetFormByKey returns the stored schema verbatim (poll: the read model
+        // is projected asynchronously by the exporter).
+        let mut got = None;
+        for _ in 0..200 {
+            let resp = server
+                .get_form_by_key_impl(&models::GetFormByKeyPathParams {
+                    form_key: form_key.clone(),
+                })
+                .await
+                .expect("get returns a response");
+            if let FormGet::Status200_TheFormIsSuccessfullyReturned(f) = resp {
+                got = Some(f);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got = got.expect("the form is projected and retrievable by key");
+        assert_eq!(got.form_id, "greeting-form");
+        assert_eq!(got.version, 1);
+        assert_eq!(got.schema, schema, "the raw form-js JSON round-trips");
+
+        // Redeploying a CHANGED schema mints a new key at version 2. Both the old
+        // and the new key must remain retrievable (each version keyed by its own
+        // form_key), so an in-flight instance still resolving the old key is safe.
+        let schema_v2 = r#"{"id":"greeting-form","type":"default","schemaVersion":16,"components":[{"label":"Name","type":"textfield","key":"name"}]}"#;
+        let (result_v2, _events) = server
+            .deploy_resources_locally_with_forms(
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![nanobpmn_engine_core::FormResource {
+                    id: "greeting-form".to_string(),
+                    resource_name: "greeting.form".to_string(),
+                    schema: schema_v2.to_string(),
+                }],
+                "<default>",
+            )
+            .await
+            .expect("form redeploy succeeds");
+        let form_meta_v2 = result_v2
+            .deployments
+            .iter()
+            .find_map(|d| match &d.form {
+                nanobpm_gateway_rest::types::Nullable::Present(f) => Some(f.clone()),
+                nanobpm_gateway_rest::types::Nullable::Null => None,
+            })
+            .expect("the redeploy result includes the form metadata");
+        assert_eq!(
+            form_meta_v2.version, 2,
+            "a changed schema bumps the version"
+        );
+        let form_key_v2 = form_meta_v2.form_key.0.clone();
+        assert_ne!(form_key_v2, form_key, "a new form key is minted");
+
+        // The new key resolves to version 2 (poll for its projection).
+        let mut got_v2 = None;
+        for _ in 0..200 {
+            let resp = server
+                .get_form_by_key_impl(&models::GetFormByKeyPathParams {
+                    form_key: form_key_v2.clone(),
+                })
+                .await
+                .expect("get returns a response");
+            if let FormGet::Status200_TheFormIsSuccessfullyReturned(f) = resp {
+                got_v2 = Some(f);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let got_v2 = got_v2.expect("the redeployed form version is retrievable");
+        assert_eq!(got_v2.version, 2);
+        assert_eq!(got_v2.schema, schema_v2);
+
+        // The ORIGINAL key still resolves to version 1 (not overwritten).
+        let resp = server
+            .get_form_by_key_impl(&models::GetFormByKeyPathParams {
+                form_key: form_key.clone(),
+            })
+            .await
+            .expect("get returns a response");
+        let FormGet::Status200_TheFormIsSuccessfullyReturned(still_v1) = resp else {
+            panic!("the original form key must remain retrievable after a redeploy");
+        };
+        assert_eq!(still_v1.version, 1);
+        assert_eq!(still_v1.schema, schema);
+
+        // Unknown and malformed keys are 404s.
+        assert!(matches!(
+            server
+                .get_form_by_key_impl(&models::GetFormByKeyPathParams {
+                    form_key: "999999".to_string(),
+                })
+                .await
+                .unwrap(),
+            FormGet::Status404_TheFormWithTheGivenKeyWasNotFound(_)
+        ));
+        assert!(matches!(
+            server
+                .get_form_by_key_impl(&models::GetFormByKeyPathParams {
+                    form_key: "not-a-key".to_string(),
+                })
+                .await
+                .unwrap(),
+            FormGet::Status404_TheFormWithTheGivenKeyWasNotFound(_)
         ));
     }
 
@@ -26008,12 +26307,19 @@ mod parse_deploy_resources_tests {
             !parsed.process_resource_names.contains_key("greeting-form"),
             "the form is not registered as a process resource"
         );
+        assert_eq!(parsed.forms.len(), 1, "the form is collected for storage");
+        assert_eq!(parsed.forms[0].id, "greeting-form");
+        assert_eq!(parsed.forms[0].resource_name, "greeting.form");
+        assert_eq!(
+            parsed.forms[0].schema, GREETING_FORM,
+            "the raw form-js JSON is stored verbatim"
+        );
     }
 
     #[test]
     fn a_form_only_deploy_is_accepted_and_empty() {
-        // Deploying only forms is a no-op the engine tolerates (they are UI
-        // artifacts), rather than a hard failure.
+        // Deploying only forms is a no-op for processes/decisions, but the form
+        // itself is still collected for storage.
         let parsed = match parse_deploy_resources(&[("greeting.form".into(), GREETING_FORM.into())])
         {
             Ok(p) => p,
@@ -26021,6 +26327,24 @@ mod parse_deploy_resources_tests {
         };
         assert!(parsed.processes.is_empty());
         assert!(parsed.decisions.is_empty());
+        assert_eq!(parsed.forms.len(), 1);
+        assert_eq!(parsed.forms[0].id, "greeting-form");
+    }
+
+    #[test]
+    fn a_form_without_a_string_id_is_rejected() {
+        // A form-js document must carry a string `id` (used for versioning and
+        // GetFormByKey lookup); a body lacking one is a client error.
+        match parse_deploy_resources(&[(
+            "bad.form".into(),
+            r#"{ "components": [], "type": "default" }"#.into(),
+        )]) {
+            Ok(_) => panic!("a form without an id must be rejected"),
+            Err((title, detail)) => {
+                assert_eq!(title, "Invalid form");
+                assert!(detail.contains("bad.form"), "got: {detail}");
+            }
+        }
     }
 
     #[test]
