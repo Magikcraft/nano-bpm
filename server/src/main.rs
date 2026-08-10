@@ -1075,8 +1075,18 @@ struct ParsedDeploy {
 
 /// Parses every deployment resource up front so a deploy is all-or-nothing.
 /// A resource whose file name ends in `.dmn` is parsed as a DMN decision
-/// requirements graph; everything else is parsed as BPMN (`.bpmn` or unnamed).
-/// `Err` is `(title, detail)` for a 400 response.
+/// requirements graph; a `.form` resource (form-js JSON) is accepted but
+/// skipped — the engine does not execute forms, they are UI artifacts rendered
+/// by the hosted surfaces (see server/src/console/projects.rs). Everything else
+/// is parsed as BPMN (`.bpmn` or unnamed). `Err` is `(title, detail)` for a 400
+/// response.
+///
+/// Tolerating (rather than rejecting) forms matters because clients deploy a
+/// mixed resource set: the console POSTs each resource individually so a form
+/// failure was merely logged, but `@nanobpm/urban`'s runtime batches processes,
+/// decisions and forms into ONE createDeployment call — so BPMN-parsing a form
+/// there aborted the whole deploy, the process included. This also matches
+/// Camunda/Zeebe, whose createDeployment accepts form resources.
 fn parse_deploy_resources(
     resources: &[(String, String)],
 ) -> Result<ParsedDeploy, (&'static str, String)> {
@@ -1087,7 +1097,8 @@ fn parse_deploy_resources(
     let mut drg_resource_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     for (resource_name, xml) in resources {
-        if resource_name.to_ascii_lowercase().ends_with(".dmn") {
+        let lower = resource_name.to_ascii_lowercase();
+        if lower.ends_with(".dmn") {
             match nanobpmn_engine_core::dmn::parse_dmn(xml) {
                 Ok(drg) => {
                     drg_resource_names.insert(drg.id.clone(), resource_name.clone());
@@ -1100,6 +1111,14 @@ fn parse_deploy_resources(
                     ));
                 }
             }
+            continue;
+        }
+        // Forms (form-js `.form` JSON) are not engine-executable — the engine
+        // does not model or run them (they are rendered by the hosted human
+        // surfaces). Accept and skip them so a mixed deploy (process + form in
+        // one createDeployment call, as `@nanobpm/urban` sends) succeeds rather
+        // than failing when the form is parsed as BPMN.
+        if lower.ends_with(".form") {
             continue;
         }
         match parse_bpmn(xml) {
@@ -25944,6 +25963,87 @@ mod data_dir_tests {
         let err = ensure_data_dir(&file).expect_err("a file is not a usable data dir");
         assert!(err.contains("not a directory"), "got: {err}");
         std::fs::remove_file(&file).ok();
+    }
+}
+
+#[cfg(test)]
+mod parse_deploy_resources_tests {
+    use super::parse_deploy_resources;
+
+    const MINIMAL_BPMN: &str = r#"
+      <bpmn:definitions
+          xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+        <bpmn:process id="greet">
+          <bpmn:startEvent id="s" />
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="f0" sourceRef="s" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    // A form-js form (JSON) as scaffolded by create-urban-app — NOT BPMN.
+    const GREETING_FORM: &str = r#"{
+      "components": [{ "label": "Who", "type": "textfield", "key": "who" }],
+      "type": "default",
+      "id": "greeting-form",
+      "schemaVersion": 16
+    }"#;
+
+    #[test]
+    fn form_is_skipped_so_a_mixed_deploy_still_parses_the_process() {
+        // Regression for the scaffolded Urban app: `@nanobpm/urban` batches the
+        // process AND the form into ONE createDeployment call. The form must be
+        // accepted+skipped, not BPMN-parsed (which failed with "no <process>
+        // element found" and aborted the whole deploy).
+        let parsed = match parse_deploy_resources(&[
+            ("greet.bpmn".into(), MINIMAL_BPMN.into()),
+            ("greeting.form".into(), GREETING_FORM.into()),
+        ]) {
+            Ok(p) => p,
+            Err((title, detail)) => panic!("expected success, got {title}: {detail}"),
+        };
+        assert_eq!(parsed.processes.len(), 1, "the process is deployed");
+        assert_eq!(parsed.processes[0].id, "greet");
+        assert!(parsed.decisions.is_empty(), "a form is not a decision");
+        assert!(
+            !parsed.process_resource_names.contains_key("greeting-form"),
+            "the form is not registered as a process resource"
+        );
+    }
+
+    #[test]
+    fn a_form_only_deploy_is_accepted_and_empty() {
+        // Deploying only forms is a no-op the engine tolerates (they are UI
+        // artifacts), rather than a hard failure.
+        let parsed = match parse_deploy_resources(&[("greeting.form".into(), GREETING_FORM.into())])
+        {
+            Ok(p) => p,
+            Err((title, detail)) => panic!("expected success, got {title}: {detail}"),
+        };
+        assert!(parsed.processes.is_empty());
+        assert!(parsed.decisions.is_empty());
+    }
+
+    #[test]
+    fn a_malformed_bpmn_still_errors() {
+        // Guard that tolerating forms did not weaken BPMN validation: a genuine
+        // `.bpmn` that is not a process still fails with the BPMN error.
+        match parse_deploy_resources(&[("broken.bpmn".into(), "<not-bpmn/>".into())]) {
+            Ok(_) => panic!("a malformed BPMN must still be rejected"),
+            Err((title, detail)) => {
+                assert_eq!(title, "Invalid BPMN");
+                assert!(detail.contains("broken.bpmn"), "got: {detail}");
+            }
+        }
+    }
+
+    #[test]
+    fn form_extension_match_is_case_insensitive() {
+        let parsed = match parse_deploy_resources(&[("Greeting.FORM".into(), GREETING_FORM.into())])
+        {
+            Ok(p) => p,
+            Err((title, detail)) => panic!("expected success, got {title}: {detail}"),
+        };
+        assert!(parsed.processes.is_empty());
     }
 }
 
