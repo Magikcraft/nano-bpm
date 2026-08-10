@@ -66,6 +66,7 @@ jobs:
     outputs:
       processos: ${{ steps.filter.outputs.processos }}
       console: ${{ steps.filter.outputs.console }}
+      docs: ${{ steps.filter.outputs.docs }}
       dapadapter: ${{ steps.filter.outputs.dapadapter }}
       code: ${{ steps.filter.outputs.code }}
     steps:
@@ -93,20 +94,41 @@ jobs:
               - 'console/**'
               - 'spec-console/**'
               - '.github/workflows/ci.yml'
+            # Documentation prose consumed only by the console docs/whitepaper
+            # build (scripts/build-docs.mjs reads USERGUIDE.md + docs/*.md;
+            # scripts/build-whitepaper.mjs reads docs/whitepaper.md) — NOT by any
+            # Rust crate. Drives the cheap `console` job's doc-build guard so a
+            # docs edit is still validated, without paying for the Rust suite.
+            # Note: only `*.md` (+ USERGUIDE.md); `docs/falcon.asyncapi.yaml` is
+            # `include_str!`d by server/src/falcon.rs, so it deliberately stays in
+            # the `code` filter (below) to keep triggering the server build.
+            docs:
+              - 'docs/**/*.md'
+              - 'USERGUIDE.md'
+              - '.github/workflows/ci.yml'
             dapadapter:
               - 'dap-adapter/**'
               - '.github/workflows/ci.yml'
-            # True unless EVERY changed file is pure presentation — the marketing
-            # website (`website/**`, built + drift-guarded by the always-on
-            # `schemas`/`website snippet` jobs) or the console landing page HTML
+            # True unless EVERY changed file is pure presentation/frontend — the
+            # marketing website (`website/**`), the console landing page HTML
             # (embedded via `include_str!`, so its content can't break clippy or
-            # any test). The heavy Rust/engine/npm jobs gate on this so a
-            # website- or landing-only PR skips them (a skipped required check
-            # counts as success for branch protection) and still merges.
+            # any test), the console SPA (`console/**`; its built bundle is
+            # rust-embedded but CI stubs `console/dist`, so the SPA source never
+            # affects the Rust build/tests — the `console`/`console-e2e` jobs own
+            # it), or documentation markdown (`docs/**/*.md` + `USERGUIDE.md`;
+            # owned by the `docs` filter). The heavy Rust/engine/npm jobs gate on
+            # this so a website-, SPA-, or docs-only PR skips them (a skipped
+            # required check counts as success for branch protection) and still
+            # merges. `spec-console/**` is intentionally NOT excluded: an API
+            # spec change alters the generated Rust axum traits, so the server
+            # build must re-validate that `generated_api.rs` still satisfies them.
             code:
               - '**'
               - '!website/**'
               - '!server/src/console/landing.html'
+              - '!console/**'
+              - '!docs/**/*.md'
+              - '!USERGUIDE.md'
       - name: Guard landing.html removal while still referenced by include_str!
         run: |
           set -euo pipefail
@@ -483,7 +505,11 @@ jobs:
     name: console (typecheck + test)
     runs-on: ubuntu-24.04
     needs: changes
-    if: *code_gate
+    # Runs on SPA/spec changes (`console` filter) and on documentation-prose
+    # changes (`docs` filter) so the doc-build guard still validates a docs edit.
+    # NOT on `*code_gate`: a Rust-only change no longer needs the Node console
+    # lane, and a pure SPA/docs change no longer needs the Rust suite.
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.console == 'true' || needs.changes.outputs.docs == 'true' }}
     defaults:
       run:
         working-directory: console
@@ -515,15 +541,18 @@ jobs:
       - name: Test (node:test unit tests)
         run: npm test
       - name: Build bundled docs (guard)
-        # Fail PR-time if USERGUIDE.md or any docs/*.md guide breaks the docs
-        # generator that feeds both /docs in the app and nanobpm.io/docs, rather
-        # than discovering it only at Pages-deploy time. Exercise BOTH variants:
-        # the default in-app build and the DOCS_SITE_BUILD=1 path pages.yml uses
-        # to publish (it omits app-only top-bar links), so neither can silently
-        # break the deploy after merge.
+        # Fail PR-time if USERGUIDE.md, any docs/*.md guide, or docs/whitepaper.md
+        # breaks the generators that feed both the in-app pages and nanobpm.io,
+        # rather than discovering it only at Pages-deploy time. Exercise BOTH docs
+        # variants: the default in-app build and the DOCS_SITE_BUILD=1 path
+        # pages.yml uses to publish (it omits app-only top-bar links), so neither
+        # can silently break the deploy after merge. The whitepaper build is the
+        # only PR-time guard on docs/whitepaper.md (these docs-prose changes now
+        # gate this job via the `docs` filter, not the Rust suite).
         run: |
           node scripts/build-docs.mjs
           DOCS_SITE_BUILD=1 node scripts/build-docs.mjs
+          node scripts/build-whitepaper.mjs
 
   console-e2e:
     name: console (journey e2e)
