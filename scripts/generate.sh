@@ -117,15 +117,20 @@ if command -v rustup >/dev/null 2>&1 && rustup run "${FMT_TOOLCHAIN}" rustfmt --
 else
   run_fmt() { "$@"; }
 fi
-# Suppress the expected stable-channel warning about the unstable group_imports
-# option (harmless: stable can't apply it, and the nightly path never emits it).
-strip_fmt_warn() { grep -v -e 'group_imports' -e 'unstable features are only available in nightly channel' || true; }
+# Suppress ONLY the expected stable-channel warning about the unstable
+# group_imports option (harmless: stable can't apply it, and the nightly path
+# never emits it). Require both substrings on the same line so unrelated future
+# rustfmt diagnostics are never accidentally swallowed.
+strip_fmt_warn() { grep -v -E 'group_imports.*unstable features are only available in nightly channel' || true; }
 
-if command -v cargo >/dev/null 2>&1; then
+# Gate on whether the SELECTED formatter toolchain can actually run the tool,
+# not on a bare PATH shim: `rustup run <toolchain> cargo/rustfmt` can succeed
+# even when `cargo`/`rustfmt` aren't on PATH (and vice-versa).
+if run_fmt cargo --version >/dev/null 2>&1; then
   echo "Formatting generated crate with cargo fmt${FMT_LABEL}"
   ( cd "${PROJECT_ROOT}/${OUTPUT_REL}" && run_fmt cargo fmt ) 2>&1 | strip_fmt_warn || true
 fi
-if command -v rustfmt >/dev/null 2>&1; then
+if run_fmt rustfmt --version >/dev/null 2>&1; then
   echo "Formatting generated server stub impls with rustfmt${FMT_LABEL}"
   run_fmt rustfmt --edition 2024 "${PROJECT_ROOT}/server/src/stub_impls.rs" 2>&1 | strip_fmt_warn || true
 fi
