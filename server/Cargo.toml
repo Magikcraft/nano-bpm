@@ -52,6 +52,13 @@ anyhow = "1.0.102"
 rust-embed = { version = "8", optional = true }
 mime_guess = { version = "2", optional = true }
 
+# Console-only: build a `file://` URL for the Node loader-bootstrap passed via
+# `--import`. Node's ESM loader rejects a raw absolute path on Windows (a
+# `C:\...` argument parses as URL scheme `c:` → ERR_UNSUPPORTED_ESM_URL_SCHEME),
+# so paths outside the child CWD must be handed over as file URLs. Already in the
+# dependency graph transitively; declared here only to use it directly.
+url = { version = "2", optional = true }
+
 # Cross-platform PTY for the IDE's integrated terminal (issue #496): wezterm's
 # `portable-pty` abstracts over Unix openpty and Windows ConPTY so one code path
 # serves all hosts. Console-only + loopback-gated + opt-in (NANO_CONSOLE_TERMINAL)
@@ -100,7 +107,7 @@ serde_json = "1"
 # gateway binary. Off by default — the production gateway build is unaffected and
 # does not require a built frontend under ../console/dist.
 [features]
-console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:portable-pty", "tokio/process", "tokio/io-util"]
+console = ["dep:nanobpm-console-api", "dep:rust-embed", "dep:mime_guess", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:portable-pty", "dep:url", "tokio/process", "tokio/io-util"]
 # ADR 0034: build the console with the lean "observe" operator profile instead of
 # the full "studio" IDE. Additive over `console` — it only swaps the embedded
 # bundle from `console/dist` to `console/dist-observe` (~158KB gzip vs ~4.7MB),

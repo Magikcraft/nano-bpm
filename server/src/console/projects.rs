@@ -1298,6 +1298,37 @@ pub fn write_config(name: &str, cfg: &ProjectConfig) -> std::io::Result<()> {
 /// path joins use `dir.join(GEN_DIR)`.
 pub(crate) const GEN_DIR: &str = "nano-generated";
 
+/// Append the Node fallback runtime flags to `cmd`: strip TS types, silence the
+/// `--experimental-strip-types` warning, and preload the loader bootstrap
+/// (`node-register.mjs`, ADR 0036) via `--import`.
+///
+/// `register` is the **absolute** path to the bootstrap module. It is always
+/// handed to Node as a `file://` URL (see [`file_url_arg`]): a raw absolute path
+/// breaks Node's ESM loader on Windows, where a `C:\...` argument is parsed as a
+/// URL whose scheme is the drive letter (`c:`), yielding
+/// `ERR_UNSUPPORTED_ESM_URL_SCHEME` and crashing every Node-runtime spawn before
+/// the app boots.
+///
+/// This is the single source of truth for the Node fallback incantation — the
+/// three spawn sites (project run, project CLI/data op, standalone worker) call
+/// it so their flags can't drift apart.
+pub(crate) fn node_fallback_command<'a>(cmd: &'a mut Command, register: &Path) -> &'a mut Command {
+    cmd.arg("--experimental-strip-types")
+        .arg("--no-warnings")
+        .arg("--import")
+        .arg(file_url_arg(register))
+}
+
+/// A `file://` URL for `path`, suitable for handing an absolute module path to
+/// Node's `--import`. `Url::from_file_path` yields the portable `file:///…` form
+/// with correct percent-encoding; on the unexpected failure path we fall back to
+/// the lossy path string so behaviour is never worse than a raw path.
+pub(crate) fn file_url_arg(path: &Path) -> String {
+    url::Url::from_file_path(path)
+        .map(Into::into)
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
 /// Resolve the `{GEN}` directory marker in a scaffold template against
 /// [`GEN_DIR`], so every emitted import map / config derives the directory name
 /// from one constant.
@@ -3421,12 +3452,9 @@ pub async fn run_data_op(
             // `./data-sdk.ts` and `node:sqlite` specifiers resolve. Node has no
             // capability sandbox; the gateway only touches the project dir.
             let mut c = Command::new(node);
-            c.current_dir(&dir)
-                .arg("--experimental-strip-types")
-                .arg("--no-warnings")
-                .arg("--import")
-                .arg(dir.join(GEN_DIR).join("node-register.mjs"))
-                .arg(&cli);
+            c.current_dir(&dir);
+            node_fallback_command(&mut c, &dir.join(GEN_DIR).join("node-register.mjs"));
+            c.arg(&cli);
             c
         }
     };
@@ -6642,12 +6670,9 @@ impl ProjectSupervisor {
                 // has no capability sandbox — App code is the maker's own trusted code.
                 runtime_label = "node";
                 cmd = Command::new(node);
-                cmd.current_dir(&dir)
-                    .arg("--experimental-strip-types")
-                    .arg("--no-warnings")
-                    .arg("--import")
-                    .arg(dir.join(GEN_DIR).join("node-register.mjs"))
-                    .arg(&cfg.main);
+                cmd.current_dir(&dir);
+                node_fallback_command(&mut cmd, &dir.join(GEN_DIR).join("node-register.mjs"));
+                cmd.arg(&cfg.main);
             }
         }
         cmd.env("NO_COLOR", "1")
@@ -7215,7 +7240,43 @@ mod tests {
 
     use super::*;
 
-    /// Serializes tests that mutate the process-global `NANOBPMN_PROJECTS_DIR`.
+    /// `file_url_arg` yields a `file://` URL (never a raw path), so Node's ESM
+    /// loader accepts it on Windows where a bare `C:\...` argument would be
+    /// parsed as URL scheme `c:` (ERR_UNSUPPORTED_ESM_URL_SCHEME).
+    #[test]
+    fn file_url_arg_produces_file_scheme() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(GEN_DIR).join("node-register.mjs");
+        let url = file_url_arg(&path);
+        assert!(
+            url.starts_with("file://"),
+            "expected a file:// URL, got {url:?}",
+        );
+        assert!(
+            url.ends_with("node-register.mjs"),
+            "URL should point at the bootstrap module, got {url:?}",
+        );
+        // The raw drive-letter / backslash form must never leak through.
+        assert!(
+            !url.contains('\\'),
+            "file URL must use forward slashes, got {url:?}",
+        );
+    }
+
+    /// A path with a space is percent-encoded, so the resulting `--import`
+    /// argument is still a single well-formed URL.
+    #[test]
+    fn file_url_arg_encodes_spaces() {
+        let path = std::env::temp_dir().join("a b").join("node-register.mjs");
+        let url = file_url_arg(&path);
+        assert!(url.starts_with("file://"), "got {url:?}");
+        assert!(
+            !url.contains("a b"),
+            "spaces must be percent-encoded in the file URL, got {url:?}",
+        );
+        assert!(url.contains("a%20b"), "got {url:?}");
+    }
+
     fn lock() -> MutexGuard<'static, ()> {
         static L: OnceLock<Mutex<()>> = OnceLock::new();
         L.get_or_init(|| Mutex::new(()))
