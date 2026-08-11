@@ -601,7 +601,7 @@ function compareHtml() {
     {
       label: "License",
       cells: [
-        ["ARP — free to evaluate"],
+        ["Free to evaluate & personal use"],
         ["MIT"],
         ["Apache-2.0"],
         ["Proprietary"],
