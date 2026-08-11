@@ -30,6 +30,11 @@ use super::workspace;
 /// stays a single source of truth with the running server.
 const WORKER_SDK_TS: &str = include_str!("worker_sdk.ts");
 
+/// The vendored `@nanobpm/urban` public type surface, baked into the binary and
+/// served to the Studio editor so Monaco resolves an Urban app's `@nanobpm/urban`
+/// imports with full IntelliSense. See `scripts/vendor-urban-types.md`.
+const URBAN_TYPES_DTS: &str = include_str!("urban_types.d.ts");
+
 /// Top-level folder the zip extracts into (so unzipping never splats into cwd).
 const APP_ROOT: &str = "nano-workers-app";
 
@@ -138,6 +143,14 @@ pub fn worker_sdk_source() -> &'static str {
 /// don't collide with the editor's `dom` lib.
 pub fn deno_namespace_types() -> &'static str {
     DENO_NS_DTS
+}
+
+/// The vendored `@nanobpm/urban` type surface, served to the Studio editor as a
+/// Monaco extra-lib so an Urban app's `@nanobpm/urban` imports (`AppJobHandler`,
+/// `OperationHandler`, `runFromEnv`, `selectHost`, the engine client, …) resolve
+/// with full IntelliSense — fully offline, like the worker SDK and Deno types.
+pub fn urban_types_source() -> &'static str {
+    URBAN_TYPES_DTS
 }
 
 const DENO_NS_DTS: &str = include_str!("deno_ns.d.ts");

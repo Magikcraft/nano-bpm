@@ -142,6 +142,11 @@ pub fn router(server: ServerImpl) -> Router {
         // (see `generated_api` and the merge in `main.rs`).
         .route("/console/api/stream", get(stream))
         .route("/console/api/workers/{name}/logs", get(worker_logs))
+        // The vendored `@nanobpm/urban` type surface for the Studio editor's
+        // Monaco IntelliSense. Hand-wired (not in the OpenAPI spec) like the
+        // embedded worker SDK / Deno types it sits beside: a static text asset
+        // baked into the binary, served verbatim.
+        .route("/console/api/urban-types", get(urban_types))
         // GET on this path returns text OR a binary descriptor via `X-File-*`
         // headers, so it stays hand-wired; PUT/POST/DELETE are owned by the
         // generated router (axum merges the differing methods on the same path).
@@ -2696,6 +2701,22 @@ pub(super) fn worker_sdk_source() -> String {
 /// `GET /console/api/deno-types` — the embedded Deno namespace ambient types.
 pub(super) fn deno_types_source() -> String {
     worker_export::deno_namespace_types().to_string()
+}
+
+/// `GET /console/api/urban-types` — the vendored `@nanobpm/urban` type surface,
+/// served so the Studio editor's Monaco TS service resolves an Urban app's
+/// `@nanobpm/urban` imports with full IntelliSense (offline; see
+/// `scripts/vendor-urban-types.md`).
+async fn urban_types() -> Response {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; charset=utf-8".to_string(),
+        )],
+        worker_export::urban_types_source(),
+    )
+        .into_response()
 }
 
 /// Body for `POST /console/api/export-workers-app`.
