@@ -4257,10 +4257,10 @@ pub struct UpdatePlan {
     /// Files present locally but absent from the new pack — kept, listed.
     pub orphans: Vec<String>,
     /// Project-relative path of the pre-update snapshot taken before writing the
-    /// overlay (clean apply only — `None` for a dry run). Copying this
-    /// directory's contents back over the project restores files the update
-    /// modified or removed, but does not delete files the update newly created —
-    /// those must be removed manually for a full revert.
+    /// overlay (any apply — including a conflict-skipping one; `None` for a dry
+    /// run). Copying this directory's contents back over the project restores
+    /// files the update modified or removed, but does not delete files the
+    /// update newly created — those must be removed manually for a full revert.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<String>,
     /// Set only when the pre-update snapshot could not be taken (best-effort):

@@ -913,7 +913,13 @@ function ProjectTile({
         tabIndex={0}
         onClick={onOpen}
         onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
+          // Only the tile itself opens on Enter/Space. Key events bubbling up
+          // from nested controls (e.g. the "↑ update" badge) must not also
+          // trigger onOpen — guard on the event originating on this element.
+          if (
+            e.target === e.currentTarget &&
+            (e.key === "Enter" || e.key === " ")
+          ) {
             e.preventDefault();
             onOpen();
           }

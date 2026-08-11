@@ -786,7 +786,7 @@ export type UpdatePlan = {
      */
     orphans: Array<string>;
     /**
-     * Project-relative path of the snapshot taken before the overlay wrote anything (clean apply only; absent on a dry run). Restore the project to its pre-update state by copying this directory's contents back over it. Snapshots exclude `.git/`, `node_modules/`, `nano-generated/` and `.nano/`, and the newest few are retained.
+     * Project-relative path of the snapshot taken before the overlay wrote anything (any apply, including a conflict-skipping one; absent on a dry run). Copying this directory's contents back over the project restores files the update modified or removed, but does not delete files the update newly created — remove those manually for a full revert. Snapshots exclude `.git/`, `node_modules/`, `nano-generated/` and `.nano/`, and the newest few are retained.
      */
     checkpoint?: string;
     /**
