@@ -249,8 +249,14 @@ function VariableRow({
   onSave: (parsed: unknown) => Promise<unknown>;
 }) {
   const [editing, setEditing] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const [draft, setDraft] = useState(value);
   const [parseError, setParseError] = useState<string | null>(null);
+
+  // A value worth collapsing: multi-line, or too long to sit on one row without
+  // blowing out the panel (e.g. an LLM prompt). Short scalars render as-is with
+  // no toggle so the common case stays quiet.
+  const isLong = value.length > 80 || value.includes("\n");
 
   const start = () => {
     setDraft(value);
@@ -279,9 +285,38 @@ function VariableRow({
 
   if (!editing) {
     return (
-      <tr className="border-b border-edge">
+      <tr className="border-b border-edge align-top">
         <Td className="font-medium">{name}</Td>
-        <Td className="font-mono text-fg-muted">{value}</Td>
+        <Td className="font-mono text-fg-muted">
+          <div className="flex max-w-[36rem] items-start gap-1.5">
+            {isLong && (
+              <button
+                type="button"
+                aria-label={expanded ? "Collapse value" : "Expand value"}
+                aria-expanded={expanded}
+                onClick={() => setExpanded((x) => !x)}
+                className="mt-px shrink-0 select-none text-fg-faint hover:text-fg"
+              >
+                {expanded ? "▼" : "▶"}
+              </button>
+            )}
+            {expanded ? (
+              <pre className="min-w-0 flex-1 whitespace-pre-wrap break-words">
+                {value}
+              </pre>
+            ) : (
+              <span
+                className={`min-w-0 flex-1 truncate ${
+                  isLong ? "cursor-pointer" : ""
+                }`}
+                title={isLong ? "Click to expand" : undefined}
+                onClick={isLong ? () => setExpanded(true) : undefined}
+              >
+                {value}
+              </span>
+            )}
+          </div>
+        </Td>
         <Td className="font-mono text-fg-faint">{scopeKey}</Td>
         <Td className="text-right">
           <Button size="sm" variant="ghost" disabled={busy} onClick={start}>
