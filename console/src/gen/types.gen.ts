@@ -785,6 +785,14 @@ export type UpdatePlan = {
      * Files present locally but absent from the new pack — kept (never deleted), listed for review.
      */
     orphans: Array<string>;
+    /**
+     * Project-relative path of the snapshot taken before the overlay wrote anything (any apply, including a conflict-skipping one; absent on a dry run). Copying this directory's contents back over the project restores files the update modified or removed, but does not delete files the update newly created — remove those manually for a full revert. Snapshots exclude `.git/`, `node_modules/`, `nano-generated/` and `.nano/`, and the newest few are retained.
+     */
+    checkpoint?: string;
+    /**
+     * Present only when the pre-update snapshot could not be taken (best-effort): the update still proceeded, but no restore point was created.
+     */
+    checkpointWarning?: string;
     postUpdate?: PostUpdateOutcome;
 };
 

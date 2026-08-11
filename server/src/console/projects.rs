@@ -4256,6 +4256,18 @@ pub struct UpdatePlan {
     pub conflicts: Vec<String>,
     /// Files present locally but absent from the new pack — kept, listed.
     pub orphans: Vec<String>,
+    /// Project-relative path of the pre-update snapshot taken before writing the
+    /// overlay (any apply — including a conflict-skipping one; `None` for a dry
+    /// run). Copying this directory's contents back over the project restores
+    /// files the update modified or removed, but does not delete files the
+    /// update newly created — those must be removed manually for a full revert.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    /// Set only when the pre-update snapshot could not be taken (best-effort):
+    /// the update still proceeded, but no restore point was created. `None` when
+    /// a snapshot was taken or none was attempted (dry run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_warning: Option<String>,
     /// Outcome of the automatic post-apply refresh (npm install + `urban gen`).
     /// Present only on a clean apply (no conflicts); `None` for a dry run or when
     /// conflicts remain (nothing was refreshed).
@@ -4530,6 +4542,81 @@ fn is_symlink_safe(root: &Path, rel: &Path) -> bool {
     true
 }
 
+/// How many most-recent pre-update snapshots to keep under
+/// `<project>/.nano/checkpoints/`; older ones are pruned so repeated updates
+/// don't grow the project unbounded.
+const MAX_UPDATE_CHECKPOINTS: usize = 5;
+
+/// Snapshot the project's authored source tree into
+/// `.nano/checkpoints/<epoch-ms>/` before an update overwrites/merges files in
+/// place, so a maker can recover their pre-update state without needing git.
+///
+/// The snapshot excludes the same heavy/derived/VCS subtrees the overlay itself
+/// never touches (`UPDATE_PRESERVE_DIRS`: `.git`, `node_modules`,
+/// `nano-generated`, `.nano`), so it captures exactly the authored files an
+/// update can mutate, is cheap, and — because `.nano` is excluded — never copies
+/// prior checkpoints into themselves. Symlinked entries are skipped (never
+/// copied through), mirroring the overlay's own symlink guard. Best-effort and
+/// side-effect-free beyond the snapshot dir: returns the project-relative
+/// snapshot path on success.
+fn checkpoint_before_update(dir: &Path) -> Result<String, String> {
+    let rel = format!(".nano/checkpoints/{}", now_ms());
+    let dest_root = dir.join(&rel);
+
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut pruned: BTreeSet<String> = BTreeSet::new();
+    collect_rel_files(dir, dir, &mut files, &mut pruned);
+
+    // Create the snapshot root up-front so an otherwise empty project still
+    // yields a (possibly empty) restore point and prune has a dir to scan.
+    std::fs::create_dir_all(&dest_root).map_err(|e| format!("create {rel}: {e}"))?;
+
+    for relf in &files {
+        // `collect_rel_files` records symlinked entries (so the overlay can flag
+        // them) — never copy through a symlink, and never read via a symlinked
+        // path component, mirroring the overlay's own guard.
+        if !is_symlink_safe(dir, relf) {
+            continue;
+        }
+        let src = dir.join(relf);
+        match std::fs::symlink_metadata(&src) {
+            Ok(md) if md.file_type().is_file() => {}
+            _ => continue,
+        }
+        let dst = dest_root.join(relf);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+        std::fs::copy(&src, &dst).map_err(|e| format!("copy {}: {e}", relf.to_string_lossy()))?;
+    }
+
+    prune_old_checkpoints(dir, MAX_UPDATE_CHECKPOINTS);
+    Ok(rel)
+}
+
+/// Keep only the `keep` most-recent snapshots under `.nano/checkpoints/`,
+/// removing older ones. Snapshot dir names are fixed-width millisecond epoch
+/// stamps, so a lexical sort is chronological. Best-effort: a prune failure
+/// never fails the update it accompanies.
+fn prune_old_checkpoints(dir: &Path, keep: usize) {
+    let root = dir.join(".nano").join("checkpoints");
+    let Ok(rd) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let mut snaps: Vec<PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    snaps.sort();
+    if snaps.len() > keep {
+        for old in &snaps[..snaps.len() - keep] {
+            let _ = std::fs::remove_dir_all(old);
+        }
+    }
+}
+
 /// Overlay a newer version of a project's scaffolding pack onto it, using the
 /// recorded scaffold version as a 3-way merge base so a user's edits to
 /// upstream-unchanged files survive and only genuine conflicts surface. See the
@@ -4633,6 +4720,25 @@ pub fn update_from_template(
         _ => None,
     };
 
+    // Snapshot the project before the overlay overwrites/merges files in place,
+    // so a maker can recover their pre-update state without git. Best-effort: a
+    // snapshot failure is surfaced as a warning on the plan rather than blocking
+    // the (safe, conflict-skipping) update itself. Only on apply — a dry run
+    // writes nothing to recover from.
+    let (checkpoint, checkpoint_warning) = if apply {
+        match checkpoint_before_update(&dir) {
+            Ok(rel) => (Some(rel), None),
+            Err(e) => (
+                None,
+                Some(format!(
+                    "could not snapshot the project before updating (no restore point was created): {e}"
+                )),
+            ),
+        }
+    } else {
+        (None, None)
+    };
+
     let plan = overlay_plan(
         &dir,
         &new_src,
@@ -4649,6 +4755,8 @@ pub fn update_from_template(
             return Err(e);
         }
     };
+    plan.checkpoint = checkpoint;
+    plan.checkpoint_warning = checkpoint_warning;
 
     // Bump the recorded scaffold version only on a clean apply (no conflicts),
     // preserving the old merge base for a later re-run when conflicts remain.
@@ -12456,6 +12564,66 @@ mod tests {
         assert_eq!(plan.create, vec!["sub/b.txt"]);
         assert_eq!(read(&proj, "a.txt"), "2\n");
         assert_eq!(read(&proj, "sub/b.txt"), "hi\n");
+    }
+
+    #[test]
+    fn checkpoint_before_update_snapshots_authored_files_and_excludes_heavy_dirs() {
+        let _g = lock();
+        let proj = tree(&[
+            ("main.ts", "user code\n"),
+            ("sub/util.ts", "helper\n"),
+            ("node_modules/dep/index.js", "vendored\n"), // excluded
+            ("nano-generated/gen.ts", "derived\n"),      // excluded
+            (".git/config", "[core]\n"),                 // excluded
+        ]);
+
+        let rel = checkpoint_before_update(&proj).unwrap();
+        assert!(rel.starts_with(".nano/checkpoints/"));
+        let snap = proj.join(&rel);
+
+        // Authored files are copied verbatim…
+        assert_eq!(read(&snap, "main.ts"), "user code\n");
+        assert_eq!(read(&snap, "sub/util.ts"), "helper\n");
+        // …and the heavy/derived/VCS subtrees are never snapshotted.
+        assert!(!snap.join("node_modules").exists());
+        assert!(!snap.join("nano-generated").exists());
+        assert!(!snap.join(".git").exists());
+        // The snapshot lives under the excluded `.nano/`, so it can never be
+        // captured into a later checkpoint of itself.
+        assert!(snap.starts_with(proj.join(".nano")));
+    }
+
+    #[test]
+    fn prune_old_checkpoints_keeps_only_the_newest() {
+        let _g = lock();
+        let proj = tree(&[("main.ts", "x\n")]);
+        let root = proj.join(".nano").join("checkpoints");
+        // Fixed-width epoch-ms names sort chronologically; create six.
+        for name in [
+            "1000000000000",
+            "1000000000001",
+            "1000000000002",
+            "1000000000003",
+            "1000000000004",
+            "1000000000005",
+        ] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+        }
+        prune_old_checkpoints(&proj, 3);
+        let mut kept: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            vec![
+                "1000000000003".to_string(),
+                "1000000000004".to_string(),
+                "1000000000005".to_string(),
+            ]
+        );
     }
 
     #[test]
