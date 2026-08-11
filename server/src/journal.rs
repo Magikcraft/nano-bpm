@@ -2167,6 +2167,13 @@ impl Journal {
         self.seg.is_some()
     }
 
+    /// This journal's live engine [`State`], as recovered at boot (snapshot +
+    /// surviving-tail replay). Used to reproject a read model that has fallen
+    /// below the journal compaction floor (issue #732).
+    pub fn engine_state(&self) -> &nanobpmn_engine_core::State {
+        self.engine.state()
+    }
+
     /// The global partition id this journal's engine owns (0 for single-partition).
     pub fn partition_id(&self) -> u64 {
         self.partition_id

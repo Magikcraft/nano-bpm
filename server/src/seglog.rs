@@ -1310,13 +1310,26 @@ pub fn plan_catch_up(exported: u64, floor: u64, surviving: u64) -> CatchUpPlan {
 /// canonical [`plan_catch_up`] decision. `surviving` are this shard's surviving
 /// events (log-ordered, spanning `[floor, floor + surviving.len())`).
 ///
-/// Unlike the previous inline logic at each boot site, a [`CatchUpPlan::CompactedGap`]
-/// is **never** silently resumed: by default it aborts (the pre-compaction
-/// process instances are unrecoverable by replay, so coming up with a partial or
-/// empty read model would silently lose them — issue #600). Set
-/// `NANOBPMN_READ_MODEL_LOSSY_REBUILD=1` to instead rebuild from the surviving
-/// tail and accept the loss, logged loudly.
-pub fn catch_up_shard(shard: &crate::readstore::ReadStore, floor: u64, surviving: &[&Event]) {
+/// `reseed_state` is this shard's authoritative engine [`State`] as rebuilt for
+/// boot (snapshot + surviving tail). When a [`CatchUpPlan::CompactedGap`] is hit —
+/// the read model has been wiped/reset (e.g. a schema-fingerprint change across a
+/// binary upgrade, or an unreadable `read-model.sqlite`) below the journal
+/// compaction floor, so the events that would replay into it are gone — the shard
+/// is REPROJECTED from that engine state instead of aborting (issue #732). The
+/// compaction invariant guarantees the snapshot covers everything below the floor,
+/// so every operationally-live entity is recovered losslessly; only terminal audit
+/// history the engine already evicted (which only ever lived in the read model) is
+/// not restored. This is logged loudly.
+///
+/// If no engine state is available (`reseed_state` is `None`), the historical
+/// behaviour applies: abort with a panic, unless `NANOBPMN_READ_MODEL_LOSSY_REBUILD=1`
+/// opts into a lossy rebuild from the (possibly empty) surviving tail — see #600.
+pub fn catch_up_shard(
+    shard: &crate::readstore::ReadStore,
+    floor: u64,
+    surviving: &[&Event],
+    reseed_state: Option<&nanobpmn_engine_core::State>,
+) {
     let exported = shard.exported_position() as u64;
     match plan_catch_up(exported, floor, surviving.len() as u64) {
         CatchUpPlan::Resume { skip } => {
@@ -1335,16 +1348,33 @@ pub fn catch_up_shard(shard: &crate::readstore::ReadStore, floor: u64, surviving
             );
         }
         CatchUpPlan::CompactedGap { missing } => {
-            if read_model_lossy_rebuild_enabled() {
+            if let Some(state) = reseed_state {
+                let total = floor.saturating_add(surviving.len() as u64);
+                tracing::warn!(
+                    exported,
+                    floor,
+                    missing,
+                    total,
+                    "read model sits below the journal compaction floor (wiped or reset while \
+                     the journal was compacted): {missing} events were compacted out of the \
+                     journal and cannot be replayed. Reprojecting the read model from the \
+                     authoritative engine snapshot instead (issue #732) — all live process \
+                     instances, jobs, incidents, user tasks, variables, subscriptions and \
+                     definitions are recovered; terminal/completed audit history that predates \
+                     this boot (already evicted from the engine) is NOT restored."
+                );
+                reseed_from_engine_state(shard, total, state);
+            } else if read_model_lossy_rebuild_enabled() {
                 tracing::error!(
                     exported,
                     floor,
                     missing,
                     "read model sits below the journal compaction floor (wiped or reset while \
                      the journal was compacted): {missing} events were compacted out of the \
-                     journal and cannot be replayed. NANOBPMN_READ_MODEL_LOSSY_REBUILD is set — \
-                     rebuilding from the surviving journal tail and PERMANENTLY DROPPING the \
-                     compacted history."
+                     journal and cannot be replayed. No engine snapshot is available to \
+                     reproject from and NANOBPMN_READ_MODEL_LOSSY_REBUILD is set — rebuilding \
+                     from the surviving journal tail and PERMANENTLY DROPPING the compacted \
+                     history."
                 );
                 rebuild_from_surviving_tail(
                     shard,
@@ -1357,16 +1387,39 @@ pub fn catch_up_shard(shard: &crate::readstore::ReadStore, floor: u64, surviving
                     "read model at exported_position={exported} is below the journal compaction \
                      floor={floor}: {missing} events were compacted out of the journal (folded \
                      into the engine snapshot) and can no longer be replayed to rebuild the read \
-                     model. This happens when the read model is wiped or reset — e.g. a \
-                     schema-fingerprint change across a binary upgrade, or an unreadable \
-                     read-model.sqlite — while the segmented journal has already been compacted. \
-                     Proceeding would SILENTLY lose every pre-compaction process instance. \
-                     Restore the read model (read-model.sqlite) from a backup, or set \
-                     NANOBPMN_READ_MODEL_LOSSY_REBUILD=1 to rebuild from the surviving journal \
-                     tail and accept the loss. See issue #600."
+                     model, and no engine snapshot was available to reproject from. This happens \
+                     when the read model is wiped or reset — e.g. a schema-fingerprint change \
+                     across a binary upgrade, or an unreadable read-model.sqlite — while the \
+                     segmented journal has already been compacted. Proceeding would SILENTLY lose \
+                     every pre-compaction process instance. Restore the read model \
+                     (read-model.sqlite) from a backup, or set NANOBPMN_READ_MODEL_LOSSY_REBUILD=1 \
+                     to rebuild from the surviving journal tail and accept the loss. See issues \
+                     #600 and #732."
                 );
             }
         }
+    }
+}
+
+/// Resets a shard and reprojects it from the authoritative boot engine `state`,
+/// then plants the absolute cursor at `total` (== `floor + surviving.len()`, the
+/// full projected event count this state already reflects). Setting the cursor is
+/// essential: `exported_position` is an ABSOLUTE event index checked against the
+/// compaction floor on every boot, so leaving it below the floor would re-trip
+/// [`CatchUpPlan::CompactedGap`] on the next boot and reproject forever.
+fn reseed_from_engine_state(
+    shard: &crate::readstore::ReadStore,
+    total: u64,
+    state: &nanobpmn_engine_core::State,
+) {
+    shard.reset().expect("reset read store");
+    shard
+        .seed_from_engine_state(state)
+        .expect("reproject read model from engine snapshot");
+    if total > 0 {
+        shard
+            .advance_exported(total as usize)
+            .expect("advance exported_position to the recovered event count");
     }
 }
 
@@ -2365,7 +2418,7 @@ mod tests {
         let prev = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
         let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            catch_up_shard(&store, recovery.first_index, &surviving);
+            catch_up_shard(&store, recovery.first_index, &surviving, None);
         }));
         std::panic::set_hook(prev);
         assert!(
@@ -2382,7 +2435,7 @@ mod tests {
         // Safe from cross-test env races: this is the only test touching this var.
         unsafe { std::env::set_var("NANOBPMN_READ_MODEL_LOSSY_REBUILD", "1") };
         let rebuilt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            catch_up_shard(&store, recovery.first_index, &surviving);
+            catch_up_shard(&store, recovery.first_index, &surviving, None);
         }));
         unsafe { std::env::remove_var("NANOBPMN_READ_MODEL_LOSSY_REBUILD") };
         assert!(rebuilt.is_ok(), "the escape hatch must rebuild, not abort");
@@ -2405,6 +2458,100 @@ mod tests {
                 skip: surviving.len()
             },
             "the rebuilt cursor must resume, not re-abort, on the next boot"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #732: a read model wiped below the journal compaction floor is
+    /// REPROJECTED from the authoritative engine snapshot (the default when the
+    /// boot engine state is available) — no panic, no lossy env flag — recovering
+    /// every live entity, and lands the absolute cursor at `total_events`.
+    #[test]
+    fn wiped_read_model_reprojects_from_engine_snapshot() {
+        use nanobpmn_engine_core::Command;
+
+        use crate::readstore::ReadStore;
+
+        let dir = temp_dir("readmodel-reproject-732");
+
+        // Same setup as the #600 test: compact history into the snapshot so
+        // `first_index > 0`, then leave a self-consistent post-compaction tail
+        // holding a live instance (its service task => a live job).
+        {
+            let (mut journal, recovery) =
+                crate::journal::Journal::open_segmented(&dir).expect("open segmented");
+            let shared = Arc::clone(&recovery.shared);
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+            let (snap, covered) = journal.snapshot_and_rotate().expect("snapshot+rotate");
+            write_snapshot(&dir, snap, covered).expect("write snapshot");
+            assert_eq!(compact(&shared, covered), 1, "sealed prefix compacted away");
+            // Post-compaction tail: a second live instance.
+            let _ = journal
+                .apply_command(Command::DeployProcess(demo()))
+                .unwrap();
+            let _ = journal
+                .apply_command(Command::create_instance("demo"))
+                .unwrap();
+        }
+
+        // Reopen: the reconstructed engine (snapshot + surviving tail) is the
+        // authoritative live state; the surviving tail sits above a non-zero floor.
+        let (engine, recovery) =
+            crate::journal::Journal::open_segmented(&dir).expect("reopen segmented");
+        assert!(recovery.first_index > 0, "must reproduce a non-zero floor");
+        let surviving: Vec<&Event> = recovery.events.iter().collect();
+        let live_instances = engine.engine_state().instances.len();
+        let live_jobs = engine.engine_state().jobs.len();
+        assert!(
+            live_instances >= 2 && live_jobs >= 2,
+            "the engine must hold the live instances/jobs to reproject"
+        );
+
+        // A freshly wiped read model (exported_position == 0, below the floor).
+        let store = ReadStore::open(None).expect("fresh in-memory read store");
+        assert_eq!(store.exported_position(), 0);
+
+        // Default path (no env flag): reproject from the engine snapshot. No panic.
+        catch_up_shard(
+            &store,
+            recovery.first_index,
+            &surviving,
+            Some(engine.engine_state()),
+        );
+
+        assert_eq!(
+            store.exported_position() as u64,
+            recovery.total_events,
+            "reprojection must plant the absolute cursor at total_events"
+        );
+        assert_eq!(
+            store.process_instances().len(),
+            live_instances,
+            "every live process instance must be recovered from the snapshot"
+        );
+        assert_eq!(
+            store.jobs().len(),
+            live_jobs,
+            "every live job must be recovered from the snapshot"
+        );
+
+        // Regression guard: the planted cursor resumes cleanly on the next boot.
+        assert_eq!(
+            plan_catch_up(
+                store.exported_position() as u64,
+                recovery.first_index,
+                surviving.len() as u64,
+            ),
+            CatchUpPlan::Resume {
+                skip: surviving.len()
+            },
+            "the reprojected cursor must resume, not re-abort, on the next boot"
         );
 
         let _ = fs::remove_dir_all(&dir);

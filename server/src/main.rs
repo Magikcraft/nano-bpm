@@ -1263,7 +1263,14 @@ fn catch_up_read_model(shards: &[(u64, Arc<ReadStore>)], recovery: &seglog::Mult
             .filter(|(tag, _)| tag == pid)
             .map(|(_, e)| e)
             .collect();
-        seglog::catch_up_shard(shard, base_p, &p_events);
+        // This partition's boot engine state, to reproject the shard from if it
+        // has fallen below the compaction floor (issue #732).
+        let reseed_state = recovery
+            .engines
+            .iter()
+            .find(|(p, _)| p == pid)
+            .map(|(_, e)| e.state());
+        seglog::catch_up_shard(shard, base_p, &p_events, reseed_state);
     }
 }
 
@@ -16563,7 +16570,12 @@ async fn main() {
                     // journal) is refused rather than silently resumed — see
                     // issue #600.
                     let surviving: Vec<&Event> = recovery.events.iter().collect();
-                    seglog::catch_up_shard(&shard, recovery.first_index, &surviving);
+                    seglog::catch_up_shard(
+                        &shard,
+                        recovery.first_index,
+                        &surviving,
+                        Some(journal.engine_state()),
+                    );
                     let recovered = !journal.is_fresh();
                     (vec![journal], recovered, read_model)
                 } else {
