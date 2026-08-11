@@ -85,6 +85,13 @@ export default function Projects() {
     project: ProjectSummary;
     plan: UpdatePlan;
   } | null>(null);
+  // A clean update pending a lightweight Continue/Cancel confirm (the hybrid
+  // badge flow): the dry-run plan had changes and no conflicts, so we skip the
+  // full diff modal and ask for a one-tap confirmation before applying.
+  const [confirmUpdate, setConfirmUpdate] = useState<{
+    project: ProjectSummary;
+    plan: UpdatePlan;
+  } | null>(null);
   const [updateBusy, setUpdateBusy] = useState(false);
   // The project whose update plan is currently being fetched (dry run). Drives
   // an inline spinner on that card so the user sees the click landed before the
@@ -259,9 +266,12 @@ export default function Projects() {
     }
   };
 
-  /// Preview a template update (dry run): fetch the overlay plan and open the
-  /// review modal. Nothing is written until the user confirms.
-  const previewUpdate = async (project: ProjectSummary) => {
+  /// Begin a template update from a project card (badge or ↑ action). Runs the
+  /// dry run, then routes by outcome (the "hybrid" flow): a clean plan with
+  /// changes gets a lightweight Continue/Cancel confirm; conflicts (or a stale
+  /// "nothing to do") open the full diff/plan review modal. Nothing is written
+  /// until the user confirms in either surface.
+  const startUpdate = async (project: ProjectSummary) => {
     setUpdateBusy(true);
     setPreviewName(project.name);
     try {
@@ -272,7 +282,13 @@ export default function Projects() {
           throwOnError: true,
         })
       ).data;
-      setUpdatePlan({ project, plan });
+      const changes =
+        plan.create.length + plan.overwrite.length + plan.merged.length;
+      if (plan.conflicts.length > 0 || changes === 0) {
+        setUpdatePlan({ project, plan });
+      } else {
+        setConfirmUpdate({ project, plan });
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -281,19 +297,22 @@ export default function Projects() {
     }
   };
 
-  /// Apply the reviewed plan: write the non-conflicting subset, then reload.
-  const applyUpdate = async () => {
-    if (!updatePlan) return;
+  /// Apply the update for a project: write the non-conflicting subset (taking a
+  /// pre-update snapshot first, server-side), then show the applied result in
+  /// the full modal so the user sees what changed and where the restore point
+  /// is, and reload. Shared by the confirm dialog and the diff/plan modal.
+  const applyUpdate = async (project: ProjectSummary) => {
     setUpdateBusy(true);
     try {
       const plan = (
         await updateProjectFromTemplate({
-          path: { name: updatePlan.project.name },
+          path: { name: project.name },
           body: { apply: true },
           throwOnError: true,
         })
       ).data;
-      setUpdatePlan({ project: updatePlan.project, plan });
+      setConfirmUpdate(null);
+      setUpdatePlan({ project, plan });
       await reload();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -680,7 +699,7 @@ export default function Projects() {
               onRename={() => void rename(p)}
               onUpdate={
                 p.updateAvailable && p.source !== "path"
-                  ? () => void previewUpdate(p)
+                  ? () => void startUpdate(p)
                   : undefined
               }
               updating={previewName === p.name}
@@ -689,12 +708,23 @@ export default function Projects() {
           ))}
         </div>
       )}
+      {confirmUpdate && (
+        <ConfirmUpdateModal
+          project={confirmUpdate.project}
+          plan={confirmUpdate.plan}
+          busy={updateBusy}
+          onConfirm={() => void applyUpdate(confirmUpdate.project)}
+          onCancel={() => {
+            if (!updateBusy) setConfirmUpdate(null);
+          }}
+        />
+      )}
       {updatePlan && (
         <UpdatePlanModal
           project={updatePlan.project}
           plan={updatePlan.plan}
           busy={updateBusy}
-          onApply={() => void applyUpdate()}
+          onApply={() => void applyUpdate(updatePlan.project)}
           onClose={() => {
             // Ignore close (backdrop/✕) while an apply is in flight: the pending
             // request resolves into setUpdatePlan(...) and would otherwise race
@@ -878,7 +908,18 @@ function ProjectTile({
           ✕
         </button>
       </div>
-      <button onClick={onOpen} className="flex flex-1 flex-col text-left">
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={onOpen}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            onOpen();
+          }
+        }}
+        className="flex flex-1 cursor-pointer flex-col text-left"
+      >
         <div className="flex items-center gap-2">
           <LangIcon langId={project.lang} lang={lang} />
           <span
@@ -899,13 +940,20 @@ function ProjectTile({
               ⧉ linked
             </span>
           )}
-          {project.updateAvailable && project.source !== "path" && (
-            <span
-              title={`A newer template is available${project.latestVersion ? ` (v${project.latestVersion})` : ""} — hover and click ↑ to review the update`}
-              className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent"
+          {onUpdate && project.updateAvailable && project.source !== "path" && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onUpdate();
+              }}
+              disabled={updateDisabled}
+              title={`A newer template is available${project.latestVersion ? ` (v${project.latestVersion})` : ""} — click to review and apply the update`}
+              aria-label={`Update ${title} from template`}
+              className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
             >
               ↑ update
-            </span>
+            </button>
           )}
           {project.running && (
             <span className="inline-flex items-center gap-1 rounded-full bg-ok/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-ok">
@@ -926,7 +974,7 @@ function ProjectTile({
         <div className="mt-2 truncate text-[11px] text-fg-faint">
           → {project.deployTarget}
         </div>
-      </button>
+      </div>
     </Card>
   );
 }
@@ -952,6 +1000,67 @@ function TemplateProvenance({ project }: { project: ProjectSummary }) {
         <span className="text-fg-muted">{project.template}</span>
         <span className="text-fg-faint"> · {origin}</span>
       </span>
+    </div>
+  );
+}
+
+/// The lightweight Continue/Cancel confirm for the "hybrid" badge flow: shown
+/// when the dry-run plan is clean (has changes, no conflicts), so the user gets
+/// a one-tap confirmation instead of the full diff modal. A pre-update snapshot
+/// is always taken server-side before anything is written.
+function ConfirmUpdateModal({
+  project,
+  plan,
+  busy,
+  onConfirm,
+  onCancel,
+}: {
+  project: ProjectSummary;
+  plan: UpdatePlan;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const title = project.displayName ?? project.name;
+  const changes =
+    plan.create.length + plan.overwrite.length + plan.merged.length;
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !busy) onCancel();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onCancel, busy]);
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      onClick={onCancel}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-update-title"
+        className="w-full max-w-md rounded-lg border border-edge bg-panel p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h2 id="confirm-update-title" className="text-sm font-semibold text-fg">
+          Update “{title}”?
+        </h2>
+        <p className="mt-2 text-sm text-fg-faint">
+          This will update your local project to the latest extension ({changes}{" "}
+          file{changes === 1 ? "" : "s"}
+          {plan.toVersion ? `, v${plan.toVersion}` : ""}). A snapshot of your
+          current project is saved first so you can roll back.
+        </p>
+        <div className="mt-4 flex items-center justify-end gap-2">
+          <Button variant="ghost" onClick={onCancel} disabled={busy}>
+            Cancel
+          </Button>
+          <Button onClick={onConfirm} disabled={busy}>
+            {busy ? "Updating…" : "Continue"}
+          </Button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1029,6 +1138,18 @@ function UpdatePlanModal({
               {plan.conflicts.length === 1 ? "" : "s"} changed both upstream and
               locally — these are <strong>not</strong> written. Resolve them by
               hand, then re-run the update.
+            </p>
+          )}
+          {plan.applied && plan.checkpoint && (
+            <p className="rounded-md border border-edge bg-bg-subtle px-3 py-2 text-xs text-fg-faint">
+              A snapshot of your project was saved to{" "}
+              <code className="text-fg-muted">{plan.checkpoint}</code> before
+              this update. To undo, copy its contents back over the project.
+            </p>
+          )}
+          {plan.applied && plan.checkpointWarning && (
+            <p className="rounded-md border border-danger/40 bg-danger/10 px-3 py-2 text-xs text-danger">
+              ⚠ {plan.checkpointWarning}
             </p>
           )}
           <PlanGroup label="New files" tone="ok" items={plan.create} />

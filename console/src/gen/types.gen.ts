@@ -785,6 +785,14 @@ export type UpdatePlan = {
      * Files present locally but absent from the new pack — kept (never deleted), listed for review.
      */
     orphans: Array<string>;
+    /**
+     * Project-relative path of the snapshot taken before the overlay wrote anything (clean apply only; absent on a dry run). Restore the project to its pre-update state by copying this directory's contents back over it. Snapshots exclude `.git/`, `node_modules/`, `nano-generated/` and `.nano/`, and the newest few are retained.
+     */
+    checkpoint?: string;
+    /**
+     * Present only when the pre-update snapshot could not be taken (best-effort): the update still proceeded, but no restore point was created.
+     */
+    checkpointWarning?: string;
 };
 
 export type ActiveRunConfigRequest = {
