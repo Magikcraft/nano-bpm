@@ -1049,6 +1049,37 @@ function UpdatePlanModal({
             tone="muted"
             items={plan.orphans}
           />
+          {plan.postUpdate && (
+            <div className="rounded-md border border-edge bg-bg-subtle px-3 py-2 text-xs">
+              <p className="font-semibold text-fg">
+                {plan.postUpdate.installedDeps || plan.postUpdate.generated
+                  ? "✓ Project refreshed"
+                  : "Project refresh"}
+              </p>
+              <ul className="mt-1 space-y-0.5 text-fg-faint">
+                {plan.postUpdate.installedDeps && (
+                  <li>Reinstalled npm dependencies.</li>
+                )}
+                {plan.postUpdate.generated && (
+                  <li>Regenerated app artifacts (urban gen).</li>
+                )}
+                {!plan.postUpdate.installedDeps &&
+                  !plan.postUpdate.generated &&
+                  (plan.postUpdate.warnings?.length ?? 0) === 0 && (
+                    <li>
+                      Already up to date — nothing to reinstall or regenerate.
+                    </li>
+                  )}
+              </ul>
+              {(plan.postUpdate.warnings?.length ?? 0) > 0 && (
+                <ul className="mt-1 space-y-0.5 text-danger">
+                  {plan.postUpdate.warnings?.map((w, i) => (
+                    <li key={`${i}-${w}`}>⚠ {w}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
           {nothingToDo && (
             <p className="text-fg-faint">
               This project is already up to date with the template.
