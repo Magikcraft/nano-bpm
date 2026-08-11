@@ -651,10 +651,13 @@ function compareHtml() {
           const toneCls = tone ? ` ${tone}` : "";
           const text = value === "" ? "" : esc(value);
           // The ✓/~/— glyphs are CSS `::before` content, which assistive tech
-          // often does not announce — expose the tone as an aria-label so the
-          // yes/partial/no signal reaches screen readers reliably.
-          const toneAria = tone ? ` aria-label="${TONE_LABELS[tone]}"` : "";
-          return `      <td class="${colClass(cols[i]).trim()}"><span class="cell${toneCls}"${toneAria}>${text}</span></td>`;
+          // often does not announce — prepend visually-hidden text so the
+          // yes/partial/no signal reaches screen readers without overriding the
+          // cell's visible descriptive text (as an aria-label would).
+          const toneLabel = tone
+            ? `<span class="visually-hidden">${TONE_LABELS[tone]}</span>`
+            : "";
+          return `      <td class="${colClass(cols[i]).trim()}"><span class="cell${toneCls}">${toneLabel}${text}</span></td>`;
         })
         .join("\n");
       return `    <tr>\n      <th scope="row" class="rowlabel">${esc(r.label)}</th>\n${tds}\n    </tr>`;
