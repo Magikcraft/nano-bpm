@@ -1019,7 +1019,8 @@ impl ReadStore {
     /// `total_events`). Used only by the below-compaction-floor recovery
     /// path (issue #732), where the journal events that would replay into the read
     /// model have been compacted away but the authoritative engine snapshot still
-    /// holds every live entity. Idempotent (every insert is an upsert), so it is
+    /// holds every live entity. Idempotent — reused rows are guarded with
+    /// `ON CONFLICT ... DO NOTHING` (mirroring the event projector), so it is
     /// safe over a freshly `reset()` shard.
     pub fn seed_from_engine_state(
         &self,
@@ -2559,9 +2560,7 @@ fn project_engine_state(
                 params![inst.process_id],
                 |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?)),
             )
-            .optional()
-            .ok()
-            .flatten()
+            .optional()?
             .map(|(k, v)| (k.to_string(), v))
             .unwrap_or_else(|| ("-1".to_string(), 0));
         tx.cexecute(
