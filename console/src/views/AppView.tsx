@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import {
   getProject,
   runProject,
@@ -11,6 +11,7 @@ import { projectLogs, type ProjectLogLine } from "../lib/api";
 import { isAssetIcon } from "../lib/appRailIcon";
 import { AppIcon } from "../components/AppIcon";
 import { cssVar, TOKEN_KEYS } from "../theme/themes";
+import { decideAppViewMessage } from "../lib/appViewMessage";
 
 // The console-integrated control surface for a supervised app (ADR 0057, issue
 // #638 — Slice 5). Reached from the left-rail running-apps entry. Headless apps
@@ -51,6 +52,7 @@ type KeyedLogLine = ProjectLogLine & { _key: number };
 
 export default function AppView() {
   const { name = "" } = useParams<{ name: string }>();
+  const navigate = useNavigate();
   const [runState, setRunState] = useState<RunState | null>(null);
   const [appUi, setAppUi] = useState<AppUi | null>(null);
   const [displayName, setDisplayName] = useState<string>(name);
@@ -196,22 +198,29 @@ export default function AppView() {
     );
   }, []);
 
-  // The app announces `nano-app-ready` once its runtime installs the listener;
-  // reply with the current theme. Guard on the framing iframe's own window and
-  // our own origin so a message from any other frame can't drive a post.
+  // The app announces `nano-app-ready` once its runtime installs the listener
+  // (→ reply with the current theme), and posts `nano-navigate` when an embedded
+  // link should route the console in-host instead of opening a new window (→
+  // navigate). Guard on the framing iframe's own window and our own origin so a
+  // message from any other frame can't drive a post or a navigation; the routing
+  // decision (incl. target whitelist + host-side path construction) lives in the
+  // pure `decideAppViewMessage` helper.
   useEffect(() => {
     const onMessage = (ev: MessageEvent) => {
       if (
-        ev.origin === window.location.origin &&
-        ev.source === iframeRef.current?.contentWindow &&
-        (ev.data as { type?: unknown } | null)?.type === "nano-app-ready"
+        ev.origin !== window.location.origin ||
+        ev.source !== iframeRef.current?.contentWindow
       ) {
-        postTheme();
+        return;
       }
+      const action = decideAppViewMessage(ev.data);
+      if (!action) return;
+      if (action.kind === "theme") postTheme();
+      else navigate(action.path);
     };
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [postTheme]);
+  }, [postTheme, navigate]);
 
   // Re-push whenever the resolved theme on <html> changes — its inline token
   // overrides (theme packs / imports, which ThemeProvider may apply *async* as
