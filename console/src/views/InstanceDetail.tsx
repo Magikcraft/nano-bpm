@@ -249,13 +249,20 @@ function VariableRow({
   onSave: (parsed: unknown) => Promise<unknown>;
 }) {
   const [editing, setEditing] = useState(false);
-  // Track the value the row is expanded *for*, not a bare boolean: InstanceDetail
-  // stays mounted and VariableRow keys are stable (`scope_key:name`), so a bare
-  // flag would keep a row expanded when the underlying value changes (switching
-  // instances or after a refresh). Deriving `expanded` from the current value
-  // makes it collapse automatically whenever the value changes.
-  const [expandedFor, setExpandedFor] = useState<string | null>(null);
-  const expanded = expandedFor === value;
+  // Collapse the row whenever the underlying value changes (switching instances
+  // or after a refresh). InstanceDetail stays mounted and VariableRow keys are
+  // stable (`scope_key:name`), so a bare boolean would persist across value
+  // changes — and deriving `expanded` from the value itself breaks when a value
+  // recurs (expand A → switch to B → back to A would auto-expand A). Instead we
+  // remember the value we last rendered and reset `expanded` during render when
+  // it changes: React's recommended "adjust state when a prop changes" pattern,
+  // no effect flash, and correct even when a value recurs.
+  const [expanded, setExpanded] = useState(false);
+  const [renderedValue, setRenderedValue] = useState(value);
+  if (renderedValue !== value) {
+    setRenderedValue(value);
+    setExpanded(false);
+  }
   const [draft, setDraft] = useState(value);
   const [parseError, setParseError] = useState<string | null>(null);
 
@@ -300,7 +307,7 @@ function VariableRow({
                 type="button"
                 aria-label={expanded ? "Collapse value" : "Expand value"}
                 aria-expanded={expanded}
-                onClick={() => setExpandedFor(expanded ? null : value)}
+                onClick={() => setExpanded(!expanded)}
                 className="mt-px shrink-0 select-none text-fg-faint hover:text-fg"
               >
                 {expanded ? "▼" : "▶"}
@@ -313,10 +320,8 @@ function VariableRow({
             ) : (
               <span
                 className={`min-w-0 flex-1 ${
-                  isLong ? "cursor-pointer truncate" : "break-words"
+                  isLong ? "truncate" : "break-words"
                 }`}
-                title={isLong ? "Click to expand" : undefined}
-                onClick={isLong ? () => setExpandedFor(value) : undefined}
               >
                 {value}
               </span>
