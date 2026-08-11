@@ -1073,8 +1073,8 @@ function UpdatePlanModal({
               </ul>
               {(plan.postUpdate.warnings?.length ?? 0) > 0 && (
                 <ul className="mt-1 space-y-0.5 text-danger">
-                  {plan.postUpdate.warnings?.map((w) => (
-                    <li key={w}>⚠ {w}</li>
+                  {plan.postUpdate.warnings?.map((w, i) => (
+                    <li key={`${i}-${w}`}>⚠ {w}</li>
                   ))}
                 </ul>
               )}
