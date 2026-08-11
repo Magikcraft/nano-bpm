@@ -46,4 +46,6 @@ EOF
 
 Keep the provenance header (the first comment block) in
 `server/src/console/urban_types.d.ts`, bump its version line, then replace
-everything after the `---` rule with the freshly rolled `urban.runtime.d.ts`.
+everything after the `// ---------------------------------------------------------------------------`
+separator line (the last line of the header comment block) with the freshly
+rolled `urban.runtime.d.ts`.

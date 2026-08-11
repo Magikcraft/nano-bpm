@@ -136,7 +136,6 @@ async function ensureUrbanLib(): Promise<void> {
     monaco.languages.typescript.typescriptDefaults.addExtraLib(
       JSON.stringify({
         name: "@nanobpm/urban",
-        version: "0.38.0",
         types: "index.d.ts",
       }),
       "file:///node_modules/@nanobpm/urban/package.json",

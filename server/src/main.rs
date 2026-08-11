@@ -16092,6 +16092,7 @@ const CONSOLE_AUTHORING_PREFIXES: &[&str] = &[
     "/console/api/extensions",
     "/console/api/worker-sdk",
     "/console/api/deno-types",
+    "/console/api/urban-types",
     "/console/api/config/ide",
 ];
 
