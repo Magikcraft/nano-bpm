@@ -546,13 +546,25 @@ export default function AppView() {
               // its fetches/cookies work; `referrerpolicy=no-referrer` avoids
               // leaking console URLs. No `allow-top-navigation` — a framed app
               // can't navigate the studio away.
+              //
+              // `allow-popups-to-escape-sandbox` pairs with `allow-popups`: an
+              // app's external links (a grid `linkField` PR URL, the "API docs"
+              // badge — plain `target=_blank rel=noopener noreferrer` anchors)
+              // must open as a normal new tab. With only `allow-popups`, the
+              // popup would INHERIT this sandbox, and Safari then refuses to open
+              // it on a trusted left-click (right-click "open in new tab" bypasses
+              // the frame sandbox, which is why that still worked). The escape
+              // flag lets the new tab drop the sandbox; `rel=noopener noreferrer`
+              // already severs any back-reference to the opener. In-host targets
+              // (processExplorer) don't rely on this — they route via the
+              // nano-navigate postMessage bridge, no popup.
               key={appSrc}
               ref={iframeRef}
               title={`${appUi?.label || displayName} UI`}
               src={appSrc}
               onLoad={postTheme}
               className="min-h-0 flex-1 border-0 bg-app"
-              sandbox="allow-scripts allow-forms allow-popups allow-same-origin allow-downloads"
+              sandbox="allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-same-origin allow-downloads"
               referrerPolicy="no-referrer"
             />
           ) : (
