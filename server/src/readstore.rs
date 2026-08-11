@@ -1013,6 +1013,30 @@ impl ReadStore {
         })
     }
 
+    /// Rebuilds this (reset) shard's rows from a boot engine [`State`] snapshot,
+    /// WITHOUT advancing `exported_position` — the caller then plants the cursor
+    /// at the absolute event count this `State` already reflects (typically
+    /// `total_events`). Used only by the below-compaction-floor recovery
+    /// path (issue #732), where the journal events that would replay into the read
+    /// model have been compacted away but the authoritative engine snapshot still
+    /// holds every live entity. Idempotent — reused rows are guarded with
+    /// `ON CONFLICT ... DO NOTHING` (mirroring the event projector), so it is
+    /// safe over a freshly `reset()` shard.
+    pub fn seed_from_engine_state(
+        &self,
+        state: &nanobpmn_engine_core::State,
+    ) -> rusqlite::Result<()> {
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("read store write lock poisoned");
+        let mut conn = self.conn.lock().expect("read store poisoned");
+        let tx = conn.transaction()?;
+        project_engine_state(&tx, state, now_ms())?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Caps retained *terminal* (Completed/Terminated) process instances at
     /// `max_keep`, deleting the oldest beyond the cap together with all their
     /// dependent rows (variables, jobs, incidents, user tasks). Active instances
@@ -2407,6 +2431,308 @@ fn instance_version(tx: &rusqlite::Transaction, instance_key: Key) -> i32 {
     .ok()
     .flatten()
     .unwrap_or(1)
+}
+
+/// Projects the LIVE materialized engine [`State`] (from a boot snapshot) into an
+/// empty read model, row-for-row matching what the event projector [`project`]
+/// would have produced — the recovery path for a read model that has fallen below
+/// the journal compaction floor (issue #732). The engine snapshot is the
+/// authoritative capture the compaction invariant guarantees covers everything
+/// below the floor, so this rebuilds every operationally-live entity losslessly.
+///
+/// Deliberately NOT reconstructable here (only ever lived in the read model,
+/// already evicted from the engine): terminal-instance audit history and decision
+/// evaluation history. Insertion order mirrors the event stream's causal order so
+/// the denormalizing `instance_def`/`instance_version`/`definition_elements`
+/// lookups resolve: definitions and decisions first, then instances (+ their
+/// variables), then per-instance element instances / jobs / incidents / user
+/// tasks / message subscriptions.
+fn project_engine_state(
+    tx: &rusqlite::Transaction,
+    state: &nanobpmn_engine_core::State,
+    now_ms: u64,
+) -> rusqlite::Result<()> {
+    // 1) Process definitions + their element metadata. `state.processes` holds
+    //    only the latest deployed version per id (the engine retains no older
+    //    definitions), so older-version rows the event log once projected are not
+    //    reconstructable — an in-flight instance on a superseded version resolves
+    //    to the latest, exactly as the event projector's "latest so far" lookup
+    //    would if only the latest definition were on record.
+    for deployed in state.processes.values() {
+        let def = &deployed.definition;
+        tx.cexecute(
+            "INSERT INTO process_definitions (process_id, key, version, xml) VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, xml = excluded.xml",
+            params![def.id, deployed.key as i64, deployed.version, def.xml],
+        )?;
+        for (element_id, element) in &def.elements {
+            tx.cexecute(
+                "INSERT INTO definition_elements (process_definition_key, element_id, element_type, element_name) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(process_definition_key, element_id) DO UPDATE SET \
+                 element_type = excluded.element_type, element_name = excluded.element_name",
+                params![
+                    deployed.key as i64,
+                    element_id,
+                    element.kind.type_name(),
+                    element.name.as_ref(),
+                ],
+            )?;
+        }
+    }
+
+    // 2) Decision requirements graphs (before decisions: the decision row's
+    //    denormalized DRG identity is resolved from this table).
+    for dep in state.decision_requirements.values() {
+        tx.cexecute(
+            "INSERT INTO decision_requirements (drg_id, drg_key, name, version, resource_name, xml) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(drg_id) DO UPDATE SET drg_key = excluded.drg_key, \
+             name = excluded.name, version = excluded.version, \
+             resource_name = excluded.resource_name, xml = excluded.xml",
+            // `resource_name` is not retained in engine state; default to '' as
+            // the column does (it only backs a display field).
+            params![dep.drg.id, dep.key as i64, dep.drg.name, dep.version, "", dep.drg.xml],
+        )?;
+    }
+
+    // 3) Decision definitions.
+    for dep in state.decisions.values() {
+        let (drg_id, drg_name, drg_version): (String, String, i32) = tx
+            .cquery_row(
+                "SELECT drg_id, name, version FROM decision_requirements WHERE drg_key = ?1",
+                params![dep.decision_requirements_key as i64],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .unwrap_or_default();
+        tx.cexecute(
+            "INSERT INTO decision_definitions \
+             (decision_id, decision_key, name, version, decision_requirements_key, \
+              decision_requirements_id, decision_requirements_name, decision_requirements_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+             ON CONFLICT(decision_id) DO UPDATE SET decision_key = excluded.decision_key, \
+             name = excluded.name, version = excluded.version, \
+             decision_requirements_key = excluded.decision_requirements_key, \
+             decision_requirements_id = excluded.decision_requirements_id, \
+             decision_requirements_name = excluded.decision_requirements_name, \
+             decision_requirements_version = excluded.decision_requirements_version",
+            params![
+                dep.decision_id,
+                dep.key as i64,
+                dep.decision_name,
+                dep.version,
+                dep.decision_requirements_key as i64,
+                drg_id,
+                drg_name,
+                drg_version,
+            ],
+        )?;
+    }
+
+    // 4) Forms.
+    for dep in state.forms.values() {
+        tx.cexecute(
+            "INSERT INTO forms (form_key, form_id, version, schema, resource_name, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(form_key) DO UPDATE SET form_id = excluded.form_id, \
+             version = excluded.version, schema = excluded.schema, \
+             resource_name = excluded.resource_name, tenant_id = excluded.tenant_id",
+            // `tenant_id` is not modeled in engine state; default to '<default>'.
+            params![
+                dep.key as i64,
+                dep.form_id,
+                dep.version,
+                dep.schema,
+                dep.resource_name,
+                "<default>"
+            ],
+        )?;
+    }
+
+    // 5) Process instances (+ their variables). Resolve the deployed identity the
+    //    same way the create projection does (latest version on record).
+    for inst in state.instances.values() {
+        let (def_key, version): (String, i32) = tx
+            .cquery_row(
+                "SELECT key, version FROM process_definitions WHERE process_id = ?1 \
+                 ORDER BY version DESC LIMIT 1",
+                params![inst.process_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i32>(1)?)),
+            )
+            .optional()?
+            .map(|(k, v)| (k.to_string(), v))
+            .unwrap_or_else(|| ("-1".to_string(), 0));
+        tx.cexecute(
+            "INSERT INTO process_instances (key, process_id, process_definition_id, \
+             process_definition_key, version, state, start_date_ms, has_incident, tags, business_id) \
+             VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8) \
+             ON CONFLICT(key) DO NOTHING",
+            params![
+                inst.key as i64,
+                inst.process_id,
+                def_key,
+                version,
+                instance_state_code(inst.state),
+                inst.created_at as i64,
+                inst.tags.join(","),
+                inst.business_id.as_ref(),
+            ],
+        )?;
+        // Process-level variables (scope == instance key), then each nested scope.
+        // A spilled instance carries no variables in the snapshot (they live in
+        // the authoritative var store); those are re-materialized on demand, not
+        // here.
+        upsert_variables(tx, inst.key, inst.key, inst.variables.as_ref())?;
+        for (scope, vars) in &inst.scope_variables {
+            upsert_variables(tx, inst.key, *scope, vars)?;
+        }
+    }
+
+    // 6) Live element instances (all ACTIVE — the engine only tracks open tokens).
+    for inst in state.instances.values() {
+        for (eik, element_id) in &inst.active {
+            upsert_element_instance(
+                tx,
+                now_ms,
+                inst.key,
+                *eik,
+                element_id.as_str(),
+                inst.scopes.get(eik).copied(),
+            )?;
+        }
+    }
+
+    // 7) Jobs (carry their current state/worker/deadline/kind directly).
+    for job in state.jobs.values() {
+        let (def_id, def_key) = instance_def(tx, job.instance_key);
+        let (kind_code, event_code) = job_kind_codes(&job.kind);
+        tx.cexecute(
+            "INSERT INTO jobs (key, instance_key, element_instance_key, element_id, job_type, \
+             state, retries, worker, deadline_ms, process_definition_id, process_definition_key, \
+             job_kind, listener_event_type) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+             ON CONFLICT(key) DO UPDATE SET state = excluded.state, retries = excluded.retries, \
+             worker = excluded.worker, deadline_ms = excluded.deadline_ms",
+            params![
+                job.key as i64,
+                job.instance_key as i64,
+                job.element_instance_key as i64,
+                job.element_id,
+                job.job_type,
+                job_state_code(job.state),
+                job.retries,
+                job.worker.as_ref(),
+                job.deadline.map(|d| d as i64),
+                def_id,
+                def_key,
+                kind_code,
+                event_code,
+            ],
+        )?;
+    }
+
+    // 8) Incidents (+ surface their flag on the owning instance/element while active).
+    for inc in state.incidents.values() {
+        let (def_id, def_key) = instance_def(tx, inc.instance_key);
+        tx.cexecute(
+            "INSERT INTO incidents (key, instance_key, element_instance_key, element_id, kind, \
+             state, reason, job_key, created_at_ms, process_definition_id, process_definition_key) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT(key) DO UPDATE SET state = excluded.state",
+            params![
+                inc.key as i64,
+                inc.instance_key as i64,
+                inc.element_instance_key as i64,
+                inc.element_id,
+                incident_kind_code(inc.kind),
+                incident_state_code(inc.state),
+                inc.reason,
+                inc.job_key.map(|k| k as i64),
+                inc.created_at as i64,
+                def_id,
+                def_key,
+            ],
+        )?;
+        if inc.state == IncidentState::Active {
+            tx.cexecute(
+                "UPDATE process_instances SET has_incident = 1 WHERE key = ?1",
+                params![inc.instance_key as i64],
+            )?;
+            tx.cexecute(
+                "UPDATE element_instances SET has_incident = 1, incident_key = ?2 \
+                 WHERE element_instance_key = ?1",
+                params![inc.element_instance_key as i64, inc.key as i64],
+            )?;
+        }
+    }
+
+    // 9) User tasks.
+    for ut in state.user_tasks.values() {
+        let (def_id, def_key) = instance_def(tx, ut.instance_key);
+        let version = instance_version(tx, ut.instance_key);
+        let groups = serde_json::to_string(&ut.candidate_groups).unwrap_or_else(|_| "[]".into());
+        let users = serde_json::to_string(&ut.candidate_users).unwrap_or_else(|_| "[]".into());
+        tx.cexecute(
+            "INSERT INTO user_tasks (key, instance_key, element_instance_key, element_id, \
+             state, assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
+             priority, created_at_ms, process_definition_id, process_definition_key, \
+             process_definition_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+             ON CONFLICT(key) DO UPDATE SET state = excluded.state",
+            params![
+                ut.key as i64,
+                ut.instance_key as i64,
+                ut.element_instance_key as i64,
+                ut.element_id,
+                user_task_state_code(ut.state),
+                ut.assignee.as_ref(),
+                groups,
+                users,
+                ut.due_date.as_ref(),
+                ut.follow_up_date.as_ref(),
+                ut.priority,
+                ut.created_at as i64,
+                def_id,
+                def_key,
+                version,
+            ],
+        )?;
+    }
+
+    // 10) Open message subscriptions (waiting states). A settled subscription
+    //     (Correlated/Canceled) is retained in engine state as an audit trail but
+    //     is not a live wait, so the event projector deletes its read-model row;
+    //     mirror that by projecting only the open ones.
+    for sub in state.message_subscriptions.values() {
+        let open = matches!(
+            sub.state,
+            nanobpmn_engine_core::MessageSubscriptionState::Open
+                | nanobpmn_engine_core::MessageSubscriptionState::Opening
+        );
+        if open && sub.element_instance_key != 0 {
+            tx.cexecute(
+                "INSERT INTO message_subscriptions (subscription_key, instance_key, \
+                 element_instance_key, element_id, message_name, correlation_key) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(subscription_key) DO UPDATE SET \
+                 element_instance_key = excluded.element_instance_key, \
+                 element_id = excluded.element_id, \
+                 message_name = excluded.message_name, \
+                 correlation_key = excluded.correlation_key",
+                params![
+                    sub.key as i64,
+                    sub.instance_key as i64,
+                    sub.element_instance_key as i64,
+                    sub.element_id,
+                    sub.message_name,
+                    sub.correlation_key,
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Applies a single event to the read model. Only events that surface in a
