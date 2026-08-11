@@ -16092,6 +16092,7 @@ const CONSOLE_AUTHORING_PREFIXES: &[&str] = &[
     "/console/api/extensions",
     "/console/api/worker-sdk",
     "/console/api/deno-types",
+    "/console/api/urban-types",
     "/console/api/config/ide",
 ];
 
@@ -16193,6 +16194,8 @@ mod console_observe_guard_tests {
             "/console/api/extensions/marketplace",
             "/console/api/worker-sdk",
             "/console/api/deno-types",
+            "/console/api/urban-types",
+            "/console/api/urban-types/index.d.ts",
             "/console/api/config/ide",
         ] {
             assert!(

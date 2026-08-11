@@ -104,6 +104,47 @@ async function ensureSdkLib(): Promise<void> {
   }
 }
 
+// --- IntelliSense: the @nanobpm/urban runtime SDK --------------------------
+// A modern Urban app (ADR 0055/0059) imports its APIs from `@nanobpm/urban`:
+// `import type { AppJobHandler } from "@nanobpm/urban"` in workers,
+// `import { runFromEnv, selectHost } from "@nanobpm/urban"` in main.ts, and the
+// generated `controller.ts`/`api-io.d.ts` import `OperationHandler` from it too.
+// Fetch the gateway's embedded, self-contained rollup of that type surface once
+// and register it under a node_modules path so a bare `@nanobpm/urban` import
+// resolves with full types, signatures and JSDoc. Fully offline (served by the
+// gateway from its baked-in copy — see server `urban_types.d.ts`).
+let urbanLibRegistered = false;
+async function ensureUrbanLib(): Promise<void> {
+  if (urbanLibRegistered) return;
+  urbanLibRegistered = true;
+  try {
+    const res = await fetch("/console/api/urban-types");
+    if (!res.ok) {
+      urbanLibRegistered = false;
+      return;
+    }
+    const src = await res.text();
+    monaco.languages.typescript.typescriptDefaults.addExtraLib(
+      src,
+      "file:///node_modules/@nanobpm/urban/index.d.ts",
+    );
+    // Node module resolution of a bare `@nanobpm/urban` specifier only finds the
+    // declaration file above when a `package.json` names it via `types` — a bare
+    // directory with just `index.d.ts` (and no manifest) fails with TS2307, so
+    // every symbol would silently fall back to `any`. Register a minimal
+    // manifest so the specifier resolves with full types.
+    monaco.languages.typescript.typescriptDefaults.addExtraLib(
+      JSON.stringify({
+        name: "@nanobpm/urban",
+        types: "index.d.ts",
+      }),
+      "file:///node_modules/@nanobpm/urban/package.json",
+    );
+  } catch {
+    urbanLibRegistered = false; // let a later mount retry
+  }
+}
+
 // --- IntelliSense: the project's *typed* @nanobpm SDK surface --------------
 // `ensureSdkLib()` above wires up the generic, untyped worker SDK so a bare
 // `@nanobpm/worker` import at least resolves. But a real Urban app reifies a
@@ -322,6 +363,7 @@ export default function CodeEditor({
   useEffect(() => {
     void ensureSdkLib();
     void ensureDenoLib();
+    void ensureUrbanLib();
     if (isCode) {
       void ensureProjectSdkLibs(sdkProject);
       acquireTypes(value);
