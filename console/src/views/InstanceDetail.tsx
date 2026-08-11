@@ -312,8 +312,8 @@ function VariableRow({
               </pre>
             ) : (
               <span
-                className={`min-w-0 flex-1 truncate ${
-                  isLong ? "cursor-pointer" : ""
+                className={`min-w-0 flex-1 ${
+                  isLong ? "cursor-pointer truncate" : "break-words"
                 }`}
                 title={isLong ? "Click to expand" : undefined}
                 onClick={isLong ? () => setExpandedFor(value) : undefined}
