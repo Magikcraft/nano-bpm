@@ -609,9 +609,33 @@ function compareHtml() {
     },
   ];
 
-  const colClass = (c) => (c.key === "nano" ? " col-nano" : "");
+  // Tone vocabulary — the only values a cell's optional second element may take.
+  // Both the shape check below and the accessible labels are derived from it, so
+  // there is a single source of truth for what a valid tone is.
+  const TONE_LABELS = { yes: "Yes", partial: "Partial", no: "No" };
+
+  // Fail fast with a clear message if the data drifts out of shape. Without this,
+  // a mismatched row/column count surfaces later as an opaque
+  // `Cannot read properties of undefined` while rendering.
+  rows.forEach((r, ri) => {
+    if (r.cells.length !== cols.length) {
+      throw new Error(
+        `compareHtml: row ${ri} ("${r.label}") has ${r.cells.length} cell(s) but there are ${cols.length} column(s)`,
+      );
+    }
+    r.cells.forEach((cell, ci) => {
+      const tone = cell[1];
+      if (tone !== undefined && !(tone in TONE_LABELS)) {
+        throw new Error(
+          `compareHtml: row ${ri} ("${r.label}"), column ${ci} has invalid tone "${tone}" (expected one of ${Object.keys(TONE_LABELS).join(", ")})`,
+        );
+      }
+    });
+  });
+
+  const colClass = (c) => (c?.key === "nano" ? " col-nano" : "");
   const head =
-    `      <th scope="col"></th>\n` +
+    `      <th scope="col"><span class="visually-hidden">Capability</span></th>\n` +
     cols
       .map(
         (c) =>
@@ -626,7 +650,11 @@ function compareHtml() {
           const [value, tone] = cell;
           const toneCls = tone ? ` ${tone}` : "";
           const text = value === "" ? "" : esc(value);
-          return `      <td class="${colClass(cols[i]).trim()}"><span class="cell${toneCls}">${text}</span></td>`;
+          // The ✓/~/— glyphs are CSS `::before` content, which assistive tech
+          // often does not announce — expose the tone as an aria-label so the
+          // yes/partial/no signal reaches screen readers reliably.
+          const toneAria = tone ? ` aria-label="${TONE_LABELS[tone]}"` : "";
+          return `      <td class="${colClass(cols[i]).trim()}"><span class="cell${toneCls}"${toneAria}>${text}</span></td>`;
         })
         .join("\n");
       return `    <tr>\n      <th scope="row" class="rowlabel">${esc(r.label)}</th>\n${tds}\n    </tr>`;
@@ -1061,6 +1089,10 @@ function homePage(title, body) {
   .compare-table thead th.brandcol { color: var(--sky); }
   .compare-table tbody th.rowlabel { color: var(--muted); font-weight: 600; white-space: nowrap; }
   .compare-table .cell { display: block; color: var(--ink); }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
   .compare-table .cell.yes::before { content: "✓ "; color: var(--emerald); font-weight: 700; }
   .compare-table .cell.partial::before { content: "~ "; color: var(--sky); font-weight: 700; }
   .compare-table .cell.no { color: var(--muted); }
