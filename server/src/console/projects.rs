@@ -4256,6 +4256,30 @@ pub struct UpdatePlan {
     pub conflicts: Vec<String>,
     /// Files present locally but absent from the new pack — kept, listed.
     pub orphans: Vec<String>,
+    /// Outcome of the automatic post-apply refresh (npm install + `urban gen`).
+    /// Present only on a clean apply (no conflicts); `None` for a dry run or when
+    /// conflicts remain (nothing was refreshed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub post_update: Option<PostUpdateOutcome>,
+}
+
+/// Result of the best-effort refresh run after a clean template apply, so an
+/// updated project is immediately runnable without a manual `npm install` /
+/// `urban gen`. All steps are best-effort: a failure is reported as a `warning`
+/// rather than failing the (already-written) overlay.
+#[derive(Serialize, Default, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PostUpdateOutcome {
+    /// True when `npm install` ran to materialise missing/out-of-range deps that
+    /// the update introduced (e.g. a bumped `@nanobpm/urban` range).
+    pub installed_deps: bool,
+    /// True when `urban gen` regenerated the project's `nano-generated/`
+    /// artifacts from the updated manifest/models.
+    pub generated: bool,
+    /// Non-fatal problems (npm/urban unavailable, an install or gen failure).
+    /// The overlay itself still succeeded; these tell the maker what to re-run.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
 }
 
 /// Directory names (any depth) whose entire subtree is preserved across an
@@ -4639,6 +4663,56 @@ pub fn update_from_template(
 
     cleanup(&tmp_dirs);
     Ok(plan)
+}
+
+/// Refresh a project after a clean template apply so it is immediately runnable
+/// without the maker having to run `npm install` + `urban gen` by hand (the
+/// exact two steps a Windows user hit after a marketplace pack update). Both
+/// steps are best-effort: a newer pack may bump the `@nanobpm/urban` range or
+/// add deps, and it (re)writes the manifest/models the generated `nano-generated/`
+/// artifacts derive from — so we materialise missing/out-of-range deps and, for
+/// an Urban-shaped app, re-run `urban gen`. Failures are collected as warnings
+/// rather than surfaced as errors: the overlay already succeeded, so a flaky
+/// install or a missing toolchain must not present the update as failed.
+pub async fn finalize_after_update(name: &str) -> PostUpdateOutcome {
+    let mut outcome = PostUpdateOutcome::default();
+    let Some(dir) = project_dir(name) else {
+        outcome
+            .warnings
+            .push("could not resolve the project directory to refresh".into());
+        return outcome;
+    };
+
+    // 1. Materialise any dependency the update left missing or out of its
+    //    declared range (mirrors the lazy install the run flow does), so a
+    //    bumped `@nanobpm/urban` resolves before the next run/gen.
+    if !node_modules_needing_install(&dir).is_empty() {
+        let install_dir = dir.clone();
+        match tokio::task::spawn_blocking(move || install_project_node_modules(&install_dir)).await
+        {
+            Ok(Ok(())) => outcome.installed_deps = true,
+            Ok(Err(e)) => outcome
+                .warnings
+                .push(format!("npm install failed — run it manually: {e}")),
+            Err(e) => outcome
+                .warnings
+                .push(format!("npm install task did not complete: {e}")),
+        }
+    }
+
+    // 2. Regenerate the derived artifacts for an Urban-shaped app. `urban gen`
+    //    resolves `@nanobpm/urban` from `node_modules`, so it runs after the
+    //    install above. A legacy-shaped project has no manifest to gen from.
+    if is_urban_app(name) {
+        match gen_via_urban(name).await {
+            Ok(()) => outcome.generated = true,
+            Err(e) => outcome
+                .warnings
+                .push(format!("urban gen failed — run it manually: {e}")),
+        }
+    }
+
+    outcome
 }
 
 /// Write `to_version` into the project's `scaffolded_from.version` breadcrumb.
@@ -10365,6 +10439,67 @@ mod tests {
             argline.contains("gen") && argline.contains("--no-models"),
             "urban not invoked with `gen --no-models`: {sentinel:?}"
         );
+    }
+
+    /// After a clean template apply, `finalize_after_update` refreshes the
+    /// project so the maker doesn't have to run `npm install` + `urban gen` by
+    /// hand (the exact steps a Windows user hit after a marketplace pack update).
+    /// An Urban-shaped app with no dependency drift skips the install and runs
+    /// `urban gen`, reporting `generated: true` with no warnings.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn finalize_after_update_regenerates_urban_app() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "finalize-urban";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"finalize-urban"}"#,
+        )
+        .unwrap();
+        // No dependencies ⇒ the install step is a no-op (keeps the test hermetic,
+        // no real npm needed); only the `urban gen` step should run.
+        std::fs::write(dir.join("package.json"), r#"{"name":"finalize-urban"}"#).unwrap();
+
+        let stub = root.join("urban-finalize.sh");
+        write_urban_stub(&stub, "");
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+
+        let outcome = finalize_after_update(name).await;
+
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+
+        assert!(!outcome.installed_deps, "no deps ⇒ no npm install");
+        assert!(outcome.generated, "urban gen should have run: {outcome:?}");
+        assert!(
+            outcome.warnings.is_empty(),
+            "unexpected warnings: {:?}",
+            outcome.warnings
+        );
+    }
+
+    /// A legacy-shaped project (no `nano.app.json`) has nothing to gen: the
+    /// refresh is a clean no-op, never spuriously reporting a gen or a warning.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn finalize_after_update_is_a_noop_for_legacy_projects() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "finalize-legacy";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("nanobpm.project.json"), "{}").unwrap();
+        std::fs::write(dir.join("package.json"), r#"{"name":"finalize-legacy"}"#).unwrap();
+
+        let outcome = finalize_after_update(name).await;
+
+        assert!(!outcome.installed_deps);
+        assert!(!outcome.generated, "legacy app is not Urban-shaped");
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
     }
 
     /// A unique, env-free temp directory for tests that pass explicit paths and

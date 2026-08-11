@@ -785,6 +785,25 @@ export type UpdatePlan = {
      * Files present locally but absent from the new pack — kept (never deleted), listed for review.
      */
     orphans: Array<string>;
+    postUpdate?: PostUpdateOutcome;
+};
+
+/**
+ * Outcome of the automatic refresh run after a clean template apply (`npm install` + `urban gen`), so the updated project is immediately runnable without those two manual steps. Present only on a clean apply (no conflicts); omitted for a dry run or when conflicts remain.
+ */
+export type PostUpdateOutcome = {
+    /**
+     * True when `npm install` ran to materialise dependencies the update introduced or bumped out of the installed range.
+     */
+    installedDeps: boolean;
+    /**
+     * True when `urban gen` regenerated the project's `nano-generated/` artifacts from the updated manifest/models (Urban-shaped apps only).
+     */
+    generated: boolean;
+    /**
+     * Non-fatal problems (npm/urban unavailable, an install or gen failure). The overlay itself still succeeded; these tell the maker what to re-run by hand.
+     */
+    warnings?: Array<string>;
 };
 
 export type ActiveRunConfigRequest = {

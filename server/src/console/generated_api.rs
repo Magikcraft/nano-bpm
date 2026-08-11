@@ -1164,12 +1164,20 @@ impl apis::projects::Projects for ServerImpl {
         let apply = body.as_ref().and_then(|b| b.apply).unwrap_or(false);
         let version = body.as_ref().and_then(|b| b.version.clone());
         // npm pack + filesystem work — keep it off the async runtime.
+        let update_name = name.clone();
         let res = tokio::task::spawn_blocking(move || {
-            super::projects::update_from_template(&name, apply, version.as_deref())
+            super::projects::update_from_template(&update_name, apply, version.as_deref())
         })
         .await;
         match res {
-            Ok(Ok(plan)) => {
+            Ok(Ok(mut plan)) => {
+                // On a clean apply, refresh the project (npm install + `urban gen`)
+                // so it runs without the maker manually re-installing deps and
+                // regenerating artifacts after a pack update. Best-effort: any
+                // problem is reported as a warning on the plan, not a failure.
+                if apply && plan.applied && plan.conflicts.is_empty() {
+                    plan.post_update = Some(super::projects::finalize_after_update(&name).await);
+                }
                 let v = serde_json::to_value(plan).expect("update plan serializes");
                 Ok(R::Status200_TheOverlayPlan(from_val(v)))
             }
