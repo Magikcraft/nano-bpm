@@ -1014,8 +1014,9 @@ impl ReadStore {
     }
 
     /// Rebuilds this (reset) shard's rows from a boot engine [`State`] snapshot,
-    /// WITHOUT advancing `exported_position` — the caller sets the cursor to the
-    /// snapshot/tail boundary. Used only by the below-compaction-floor recovery
+    /// WITHOUT advancing `exported_position` — the caller then plants the cursor
+    /// at the absolute event count this `State` already reflects (typically
+    /// `total_events`). Used only by the below-compaction-floor recovery
     /// path (issue #732), where the journal events that would replay into the read
     /// model have been compacted away but the authoritative engine snapshot still
     /// holds every live entity. Idempotent (every insert is an upsert), so it is
@@ -2502,9 +2503,7 @@ fn project_engine_state(
                 params![dep.decision_requirements_key as i64],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .optional()
-            .ok()
-            .flatten()
+            .optional()?
             .unwrap_or_default();
         tx.cexecute(
             "INSERT INTO decision_definitions \
