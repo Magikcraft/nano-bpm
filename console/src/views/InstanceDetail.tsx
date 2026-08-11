@@ -249,7 +249,13 @@ function VariableRow({
   onSave: (parsed: unknown) => Promise<unknown>;
 }) {
   const [editing, setEditing] = useState(false);
-  const [expanded, setExpanded] = useState(false);
+  // Track the value the row is expanded *for*, not a bare boolean: InstanceDetail
+  // stays mounted and VariableRow keys are stable (`scope_key:name`), so a bare
+  // flag would keep a row expanded when the underlying value changes (switching
+  // instances or after a refresh). Deriving `expanded` from the current value
+  // makes it collapse automatically whenever the value changes.
+  const [expandedFor, setExpandedFor] = useState<string | null>(null);
+  const expanded = expandedFor === value;
   const [draft, setDraft] = useState(value);
   const [parseError, setParseError] = useState<string | null>(null);
 
@@ -294,7 +300,7 @@ function VariableRow({
                 type="button"
                 aria-label={expanded ? "Collapse value" : "Expand value"}
                 aria-expanded={expanded}
-                onClick={() => setExpanded((x) => !x)}
+                onClick={() => setExpandedFor(expanded ? null : value)}
                 className="mt-px shrink-0 select-none text-fg-faint hover:text-fg"
               >
                 {expanded ? "▼" : "▶"}
@@ -310,7 +316,7 @@ function VariableRow({
                   isLong ? "cursor-pointer" : ""
                 }`}
                 title={isLong ? "Click to expand" : undefined}
-                onClick={isLong ? () => setExpanded(true) : undefined}
+                onClick={isLong ? () => setExpandedFor(value) : undefined}
               >
                 {value}
               </span>
