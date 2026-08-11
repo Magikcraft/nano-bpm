@@ -307,7 +307,7 @@ function VariableRow({
                 type="button"
                 aria-label={expanded ? "Collapse value" : "Expand value"}
                 aria-expanded={expanded}
-                onClick={() => setExpanded(!expanded)}
+                onClick={() => setExpanded((v) => !v)}
                 className="mt-px shrink-0 select-none text-fg-faint hover:text-fg"
               >
                 {expanded ? "▼" : "▶"}
