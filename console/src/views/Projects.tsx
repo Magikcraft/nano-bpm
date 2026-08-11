@@ -1050,7 +1050,8 @@ function ConfirmUpdateModal({
           This will update your local project to the latest extension ({changes}{" "}
           file{changes === 1 ? "" : "s"}
           {plan.toVersion ? `, v${plan.toVersion}` : ""}). A snapshot of your
-          current project is saved first so you can roll back.
+          current project is saved first as a restore point (note: rolling back
+          restores changed files but won't remove newly-added ones).
         </p>
         <div className="mt-4 flex items-center justify-end gap-2">
           <Button variant="ghost" onClick={onCancel} disabled={busy}>
@@ -1144,7 +1145,9 @@ function UpdatePlanModal({
             <p className="rounded-md border border-edge bg-bg-subtle px-3 py-2 text-xs text-fg-faint">
               A snapshot of your project was saved to{" "}
               <code className="text-fg-muted">{plan.checkpoint}</code> before
-              this update. To undo, copy its contents back over the project.
+              this update. To undo, copy its contents back over the project —
+              this restores changed files but won't remove any files the update
+              newly added, so delete those by hand for a full revert.
             </p>
           )}
           {plan.applied && plan.checkpointWarning && (
