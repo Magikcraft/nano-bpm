@@ -624,7 +624,17 @@ function compareHtml() {
       );
     }
     r.cells.forEach((cell, ci) => {
-      const tone = cell[1];
+      if (!Array.isArray(cell) || cell.length < 1 || cell.length > 2) {
+        throw new Error(
+          `compareHtml: row ${ri} ("${r.label}"), column ${ci} must be a [value] or [value, tone] tuple`,
+        );
+      }
+      const [value, tone] = cell;
+      if (typeof value !== "string") {
+        throw new Error(
+          `compareHtml: row ${ri} ("${r.label}"), column ${ci} value must be a string`,
+        );
+      }
       if (tone !== undefined && !Object.hasOwn(TONE_LABELS, tone)) {
         throw new Error(
           `compareHtml: row ${ri} ("${r.label}"), column ${ci} has invalid tone "${tone}" (expected one of ${Object.keys(TONE_LABELS).join(", ")})`,
@@ -671,7 +681,7 @@ function compareHtml() {
   <p class="compare-sub">The agent-tooling landscape spans desktop IDEs, terminal runtimes, and in-model
   scripting. Nano Workforce is the durable engine underneath — the one that keeps running when the
   machine doesn't.</p>
-  <div class="compare-scroll">
+  <div class="compare-scroll" role="region" aria-label="How Nano compares, horizontally scrollable table" tabindex="0">
     <table class="compare-table">
       <thead>
         <tr>
@@ -1081,6 +1091,7 @@ function homePage(title, body) {
   .band.compare h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); margin: 0 0 .6rem; }
   .band.compare .compare-sub { color: var(--muted); max-width: 46rem; margin: 0 auto 1.8rem; font-size: 1.02rem; }
   .compare-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--radius); }
+  .compare-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   .compare-table {
     width: 100%; min-width: 760px; border-collapse: collapse; text-align: left;
     margin-inline: auto; font-size: .93rem;
