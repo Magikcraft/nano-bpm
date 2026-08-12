@@ -12386,6 +12386,11 @@ fn migration_remaps_active_service_task_and_its_job() {
         instance.process_id, "target",
         "instance re-homed to target id"
     );
+    assert_eq!(
+        instance.process_definition_key, target_key,
+        "instance re-pinned to the target definition version, so `definition_for` \
+         resolves execution against the migrated-to model, not the source"
+    );
     assert!(
         instance.active.values().any(|e| e == "b"),
         "active token re-pointed at target element b"

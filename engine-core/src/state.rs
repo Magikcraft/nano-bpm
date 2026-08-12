@@ -1898,8 +1898,8 @@ pub fn apply(state: &mut State, event: &Event) {
         Event::ProcessInstanceMigrated {
             instance_key,
             target_process_id,
+            target_process_definition_key,
             element_mappings,
-            ..
         } => {
             let remap: HashMap<&str, &str> = element_mappings
                 .iter()
@@ -1919,6 +1919,10 @@ pub fn apply(state: &mut State, event: &Event) {
                 .map(|i| i.process_id.clone());
             if let Some(instance) = state.instances.get_mut(instance_key) {
                 instance.process_id = target_process_id.clone();
+                // Re-pin the instance to the target definition's version so
+                // `definition_for` resolves execution against the migrated-to
+                // model rather than the source it was created on.
+                instance.process_definition_key = *target_process_definition_key;
                 for element_id in instance.active.values_mut() {
                     remap_id(element_id);
                 }
