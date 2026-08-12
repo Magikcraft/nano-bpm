@@ -625,7 +625,7 @@ function compareHtml() {
     }
     r.cells.forEach((cell, ci) => {
       const tone = cell[1];
-      if (tone !== undefined && !(tone in TONE_LABELS)) {
+      if (tone !== undefined && !Object.hasOwn(TONE_LABELS, tone)) {
         throw new Error(
           `compareHtml: row ${ri} ("${r.label}"), column ${ci} has invalid tone "${tone}" (expected one of ${Object.keys(TONE_LABELS).join(", ")})`,
         );
