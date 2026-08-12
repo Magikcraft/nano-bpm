@@ -8741,11 +8741,18 @@ impl ServerImpl {
                 "tenantId" => query::SortVal::Str("<default>".to_string()),
                 _ => query::SortVal::Num(e.message_key as i64),
             },
-            |e| e.message_key,
+            // A single published message can fan out to multiple subscriptions,
+            // and a non-interrupting boundary subscription correlates repeatedly,
+            // so neither key is unique on its own. The composite PK
+            // (message_key, subscription_key) is, so tiebreak and page on the pair
+            // to keep cursor paging unambiguous and the order stable.
+            |e| (e.message_key, e.subscription_key),
         );
 
-        let sorted: Vec<(u64, CorrEntry)> =
-            matched.into_iter().map(|e| (e.message_key, e)).collect();
+        let sorted: Vec<((u64, u64), CorrEntry)> = matched
+            .into_iter()
+            .map(|e| ((e.message_key, e.subscription_key), e))
+            .collect();
         let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
         let items: Vec<models::CorrelatedMessageSubscriptionResult> = page
             .items
