@@ -123,6 +123,19 @@ export type InstanceDetail = {
     variables: Array<Variable>;
     jobs: Array<Job>;
     incidents: Array<Incident>;
+    /**
+     * Element instances currently in the Active state for this instance — the live token positions. Unlike jobs (service tasks only), this also covers wait states with no job: intermediate catch events, receive tasks, timers, event-based gateways and active (sub)process bodies. Drives the Process Explorer token overlay so a waiting instance still shows where it is parked.
+     */
+    active_elements: Array<ActiveElement>;
+};
+
+export type ActiveElement = {
+    element_id: string;
+    /**
+     * Camunda element type spelling (e.g. INTERMEDIATE_CATCH_EVENT).
+     */
+    element_type: string;
+    element_name: string | null;
 };
 
 export type TraceOutcome = 'active' | 'completed' | 'terminated';

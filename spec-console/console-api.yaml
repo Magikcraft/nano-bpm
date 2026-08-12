@@ -1549,7 +1549,7 @@ components:
         pageSize: { type: integer, format: int32 }
     InstanceDetail:
       type: object
-      required: [instance, variables, jobs, incidents]
+      required: [instance, variables, jobs, incidents, active_elements]
       properties:
         instance: { $ref: '#/components/schemas/Instance' }
         variables:
@@ -1561,6 +1561,26 @@ components:
         incidents:
           type: array
           items: { $ref: '#/components/schemas/Incident' }
+        active_elements:
+          description: >-
+            Element instances currently in the Active state for this instance —
+            the live token positions. Unlike jobs (service tasks only), this also
+            covers wait states with no job: intermediate catch events, receive
+            tasks, timers, event-based gateways and active (sub)process bodies.
+            Drives the Process Explorer token overlay so a waiting instance still
+            shows where it is parked.
+          type: array
+          items: { $ref: '#/components/schemas/ActiveElement' }
+
+    ActiveElement:
+      type: object
+      required: [element_id, element_type, element_name]
+      properties:
+        element_id: { type: string }
+        element_type:
+          description: Camunda element type spelling (e.g. INTERMEDIATE_CATCH_EVENT).
+          type: string
+        element_name: { type: string, nullable: true }
 
     # ---- Traces (camelCase wire fields) ----------------------------------
     TraceOutcome:
