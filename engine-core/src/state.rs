@@ -1886,6 +1886,13 @@ pub fn apply(state: &mut State, event: &Event) {
                     remap_id(&mut incident.element_id);
                 }
             }
+            // The scope tree (`scopes` / `scope_parents` / `scope_variables`) is
+            // intentionally NOT remapped: the command handler rejects any
+            // instance whose active tokens live inside a non-root flow scope
+            // (embedded sub-process, multi-instance, or ad-hoc) as unsupported,
+            // so an instance that reaches this applier is flat (root scope only)
+            // and has nothing to remap. See the "flow scope unchanged"
+            // precondition in `Command::MigrateInstance` validation.
         }
 
         Event::ProcessInstanceTerminated { instance_key } => {

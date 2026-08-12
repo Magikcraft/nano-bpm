@@ -3725,8 +3725,14 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 )?;
                 tx.cexecute(
                     "UPDATE jobs SET element_id = ?3 \
-                     WHERE instance_key = ?1 AND element_id = ?2 AND state IN (0, 1)",
-                    params![ik, source_id, t],
+                     WHERE instance_key = ?1 AND element_id = ?2 AND state IN (?4, ?5)",
+                    params![
+                        ik,
+                        source_id,
+                        t,
+                        job_state_code(JobState::Created),
+                        job_state_code(JobState::Activated)
+                    ],
                 )?;
                 tx.cexecute(
                     "UPDATE user_tasks SET element_id = ?3 \
@@ -4965,11 +4971,13 @@ mod element_instance_tests {
         // longer runs under.
         let store = ReadStore::open(None).unwrap();
 
-        // Target definition `p2` carries the mapped target element `await2` (its
-        // metadata must be resolvable in `definition_elements`).
+        // Target definition `p2` carries the mapped target element `await2` as a
+        // message intermediate catch event (matching the source token's
+        // `IntermediateCatch` subscription kind and the realistic
+        // `definition_elements` metadata/type), so its metadata is resolvable.
         let target = ProcessBuilder::new("p2")
             .start_event("s2")
-            .service_task("await2", "worker")
+            .message_intermediate_catch_event("await2", "OrderPlaced", "=orderId")
             .end_event("e2")
             .connect("s2", "await2")
             .connect("await2", "e2")

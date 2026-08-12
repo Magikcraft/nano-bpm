@@ -2760,6 +2760,41 @@ impl Engine {
                     });
                 }
 
+                //    (d) Zeebe's "flow scope unchanged" precondition, enforced
+                //        categorically. The applier (`state::apply`) re-points
+                //        element ids but deliberately does NOT remap the scope
+                //        tree (`scopes` / `scope_parents` / `scope_variables`),
+                //        so an active element sitting inside a non-root flow
+                //        scope cannot be migrated without desyncing that tree.
+                //        Every element type that can own such a scope today is
+                //        already rejected above — an active embedded sub-process
+                //        appears in `active` (a), and multi-instance / ad-hoc
+                //        bodies via their bookkeeping maps (c) — so in the current
+                //        supported subset this is a defense-in-depth backstop.
+                //        Keeping it as an explicit precondition (rather than an
+                //        emergent property of those specific guards) prevents a
+                //        future scope-owning element type from silently slipping a
+                //        nested-scope token past them into the non-remapping
+                //        applier. `instance.scopes` keys are exactly the active
+                //        element instances that live in a non-root scope.
+                let mut scoped_active: Vec<String> = instance
+                    .scopes
+                    .keys()
+                    .filter_map(|element_instance_key| {
+                        instance.active.get(element_instance_key).cloned()
+                    })
+                    .collect();
+                scoped_active.sort();
+                scoped_active.dedup();
+                if let Some(element_id) = scoped_active.into_iter().next() {
+                    return Err(EngineError::UnsupportedMigration {
+                        instance_key,
+                        element_id,
+                        reason: "elements inside a nested flow scope are not migratable yet"
+                            .to_string(),
+                    });
+                }
+
                 // 5. Every active element instance must have a mapping.
                 for eid in &active_ids {
                     if !mapped.contains_key(eid) {

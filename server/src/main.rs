@@ -4326,11 +4326,13 @@ impl ServerImpl {
                     ))
                 }
                 MigrateInstanceOutcome::NotFound(detail) => {
-                    Resp::Status404_TheProcessInstanceIsNotFound(problem(
-                        "Process instance not found",
-                        404,
-                        detail,
-                    ))
+                    // This 404 covers two distinct missing resources — the
+                    // process instance itself and the target process definition
+                    // (both map to 404 in `migrate_instance_local`). Use a neutral
+                    // title and let `detail` name the specific resource, rather
+                    // than hard-coding "Process instance not found" (misleading
+                    // when the target definition is what's missing).
+                    Resp::Status404_TheProcessInstanceIsNotFound(problem("Not found", 404, detail))
                 }
                 MigrateInstanceOutcome::Conflict(detail) => {
                     Resp::Status409_TheProcessInstanceMigrationFailed(problem(

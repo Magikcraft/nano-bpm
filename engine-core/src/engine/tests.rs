@@ -12692,3 +12692,55 @@ fn migration_rejects_active_multi_instance_body() {
             if element_id == "each" && reason.contains("multi-instance")
     ));
 }
+
+#[test]
+fn migration_rejects_active_token_inside_a_nested_flow_scope() {
+    // Defect class (Zeebe's "flow scope unchanged" precondition): an active
+    // token resting inside an embedded sub-process lives in a non-root flow
+    // scope. The applier re-points element ids but does NOT remap the scope
+    // tree (`scopes` / `scope_parents` / `scope_variables`), so migrating such
+    // an instance would leave its scope tree pointing at the source structure.
+    // Migration must be rejected as unsupported. (Here the enclosing sub-process
+    // is itself active and trips the sub-process guard first; the explicit
+    // flow-scope backstop guarantees the class stays rejected even if a future
+    // scope-owning element type is not caught by a more specific guard.)
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(subprocess_with_input_mapping(
+            Vec::new(),
+        )))
+        .unwrap();
+    // The instance parks a token on the `work` job INSIDE sub-process `sub`, so
+    // `instance.scopes` is non-empty.
+    let inst =
+        create_instance_with_vars(&mut engine, "sub-scope", vars(&[("seed", Value::Int(4))]));
+    assert!(
+        !engine.instance(inst).unwrap().scopes.is_empty(),
+        "precondition: the token must sit inside a non-root flow scope"
+    );
+
+    // A flat target carrying the inner task at process level.
+    let target = ProcessBuilder::new("flat-target")
+        .start_event("s")
+        .service_task("inner", "work")
+        .end_event("e")
+        .connect("s", "inner")
+        .connect("inner", "e")
+        .build()
+        .unwrap();
+    let target_key = deploy_for_migration(&mut engine, target);
+
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("inner".to_string(), "inner".to_string())],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(err, EngineError::UnsupportedMigration { .. }),
+        "an instance with an active token in a nested flow scope must not migrate; got {err:?}"
+    );
+    // The instance stays on its source definition — nothing was migrated.
+    assert_eq!(engine.instance(inst).unwrap().process_id, "sub-scope");
+}
