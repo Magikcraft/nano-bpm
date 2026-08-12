@@ -8245,6 +8245,207 @@ impl ServerImpl {
         ))
     }
 
+    /// Searches open message subscriptions (Zeebe `searchMessageSubscriptions`).
+    ///
+    /// Backed by the `message_subscriptions` read-model table, which retains only
+    /// *open*, instance-scoped subscriptions (a running element instance parked on
+    /// a message catch), dropped on correlate/cancel/terminate. Every retained row
+    /// therefore surfaces with `state = CREATED` and `type = PROCESS_EVENT`;
+    /// settled subscriptions and message-*start* (`START_EVENT`) subscriptions are
+    /// not materialised and so are not returned. Process-definition attributes are
+    /// resolved by joining each subscription's instance to `process_instances`.
+    async fn search_message_subscriptions_impl(
+        &self,
+        body: &Option<models::MessageSubscriptionSearchQuery>,
+    ) -> Result<apis::message_subscription::SearchMessageSubscriptionsResponse, ()> {
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+
+        // Every open read-model subscription is a created, process-event catch.
+        let state_str = models::MessageSubscriptionStateEnum::Created.to_string();
+        let type_str = models::MessageSubscriptionTypeEnum::ProcessEvent.to_string();
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let subs = self.store.message_subscriptions();
+
+        // Resolve process-definition attributes by joining to the owning instance.
+        let instances = self.store.process_instances();
+        let by_instance: std::collections::HashMap<u64, &readstore::ProcessInstanceRow> =
+            instances.iter().map(|inst| (inst.key, inst)).collect();
+
+        struct MsgSubEntry {
+            subscription_key: u64,
+            process_definition_id: String,
+            process_definition_key: Option<String>,
+            process_instance_key: u64,
+            element_id: String,
+            element_instance_key: u64,
+            last_updated_ms: u64,
+            message_name: String,
+            correlation_key: String,
+            process_definition_version: Option<i32>,
+        }
+
+        let entries: Vec<MsgSubEntry> = subs
+            .into_iter()
+            .map(|sub| {
+                let inst = by_instance.get(&sub.instance_key);
+                MsgSubEntry {
+                    subscription_key: sub.subscription_key,
+                    process_definition_id: inst
+                        .map(|i| i.process_definition_id.clone())
+                        .unwrap_or_default(),
+                    process_definition_key: inst.map(|i| i.process_definition_key.clone()),
+                    process_instance_key: sub.instance_key,
+                    element_id: sub.element_id,
+                    element_instance_key: sub.element_instance_key,
+                    last_updated_ms: sub.created_at_ms,
+                    message_name: sub.message_name,
+                    correlation_key: sub.correlation_key,
+                    process_definition_version: inst.map(|i| i.version),
+                }
+            })
+            .collect();
+
+        // `processDefinitionVersion` (Integer) and `lastUpdatedDate` (DateTime)
+        // filters are not yet supported; all other Zeebe filters are honoured.
+        let mut matched: Vec<MsgSubEntry> = entries
+            .into_iter()
+            .filter(|e| match filter {
+                None => true,
+                Some(f) => {
+                    query::match_message_subscription_key(
+                        &f.message_subscription_key,
+                        &e.subscription_key.to_string(),
+                    ) && query::match_process_definition_key(
+                        &f.process_definition_key,
+                        e.process_definition_key.as_deref().unwrap_or(""),
+                    ) && query::match_string(&f.process_definition_id, &e.process_definition_id)
+                        && query::match_process_instance_key(
+                            &f.process_instance_key,
+                            &e.process_instance_key.to_string(),
+                        )
+                        && query::match_string(&f.element_id, &e.element_id)
+                        && query::match_element_instance_key(
+                            &f.element_instance_key,
+                            &e.element_instance_key.to_string(),
+                        )
+                        && query::match_string(&f.message_name, &e.message_name)
+                        && query::match_string(&f.correlation_key, &e.correlation_key)
+                        && query::match_message_subscription_state(
+                            &f.message_subscription_state,
+                            &state_str,
+                        )
+                        && query::match_message_subscription_type(
+                            &f.message_subscription_type,
+                            &type_str,
+                        )
+                        && query::match_string(&f.tenant_id, "<default>")
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::MessageSubscriptionSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |e, field| match field {
+                "processDefinitionId" => query::SortVal::Str(e.process_definition_id.clone()),
+                "processDefinitionKey" => query::SortVal::Num(
+                    e.process_definition_key
+                        .as_deref()
+                        .and_then(|k| k.parse().ok())
+                        .unwrap_or(0),
+                ),
+                "processDefinitionVersion" => {
+                    query::SortVal::Num(e.process_definition_version.unwrap_or(0) as i64)
+                }
+                "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
+                "elementId" => query::SortVal::Str(e.element_id.clone()),
+                "elementInstanceKey" => query::SortVal::Num(e.element_instance_key as i64),
+                "messageName" => query::SortVal::Str(e.message_name.clone()),
+                "correlationKey" => query::SortVal::Str(e.correlation_key.clone()),
+                "lastUpdatedDate" => query::SortVal::Num(e.last_updated_ms as i64),
+                _ => query::SortVal::Num(e.subscription_key as i64),
+            },
+            |e| e.subscription_key,
+        );
+
+        let sorted: Vec<(u64, MsgSubEntry)> = matched
+            .into_iter()
+            .map(|e| (e.subscription_key, e))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::MessageSubscriptionResult> = page
+            .items
+            .into_iter()
+            .map(|e| {
+                let last_updated = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                    e.last_updated_ms as i64,
+                )
+                .unwrap_or_else(epoch);
+                models::MessageSubscriptionResult::new(
+                    models::MessageSubscriptionKey(e.subscription_key.to_string()),
+                    e.process_definition_id,
+                    match e.process_definition_key {
+                        Some(k) => types::Nullable::Present(models::ProcessDefinitionKey(k)),
+                        None => types::Nullable::Null,
+                    },
+                    types::Nullable::Present(models::ProcessInstanceKey(
+                        e.process_instance_key.to_string(),
+                    )),
+                    types::Nullable::Null,
+                    e.element_id,
+                    types::Nullable::Present(models::ElementInstanceKey(
+                        e.element_instance_key.to_string(),
+                    )),
+                    models::MessageSubscriptionStateEnum::Created,
+                    last_updated,
+                    e.message_name,
+                    types::Nullable::Present(e.correlation_key),
+                    models::MessageSubscriptionTypeEnum::ProcessEvent,
+                    std::collections::HashMap::new(),
+                    types::Nullable::Null,
+                    match e.process_definition_version {
+                        Some(v) => types::Nullable::Present(v),
+                        None => types::Nullable::Null,
+                    },
+                    types::Nullable::Null,
+                    types::Nullable::Null,
+                    "<default>".to_string(),
+                )
+            })
+            .collect();
+
+        Ok(Resp::Status200_TheMessageSubscriptionSearchResult(
+            models::MessageSubscriptionSearchQueryResult::new(page.response, items),
+        ))
+    }
+
+    /// Searches correlated message subscriptions (Zeebe
+    /// `searchCorrelatedMessageSubscriptions`). Nano does not yet retain a
+    /// correlation-history read model, so this returns an empty, eventually-
+    /// consistent result rather than a 500. The endpoint contract (filter/sort/
+    /// pagination) is honoured against the empty set.
+    async fn search_correlated_message_subscriptions_impl(
+        &self,
+        body: &Option<models::CorrelatedMessageSubscriptionSearchQuery>,
+    ) -> Result<apis::message_subscription::SearchCorrelatedMessageSubscriptionsResponse, ()> {
+        use apis::message_subscription::SearchCorrelatedMessageSubscriptionsResponse as Resp;
+        let empty: Vec<(u64, models::CorrelatedMessageSubscriptionResult)> = Vec::new();
+        let page = query::paginate(empty, body.as_ref().and_then(|q| q.page.as_ref()));
+        Ok(
+            Resp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(
+                models::CorrelatedMessageSubscriptionSearchQueryResult::new(
+                    page.response,
+                    page.items,
+                ),
+            ),
+        )
+    }
+
     async fn search_jobs_impl(
         &self,
         body: &Option<models::JobSearchQuery>,
@@ -20075,6 +20276,137 @@ mod clustered_startup_tests {
         };
         assert_eq!(result.items.len(), 1);
         assert_eq!(result.items[0].element_id, "charge");
+    }
+
+    #[tokio::test]
+    async fn search_message_subscriptions_surfaces_open_subscriptions_and_filters() {
+        // Message-subscription parity: searchMessageSubscriptions reports every
+        // open, instance-scoped subscription as a CREATED / PROCESS_EVENT catch,
+        // joined to its instance for process-definition attributes, and honours
+        // the Zeebe filter contract.
+        use apis::message_subscription::SearchMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+
+        let waiter = ProcessBuilder::new("waiter")
+            .start_event("s")
+            .message_intermediate_catch_event("await", "OrderPlaced", "orderId")
+            .end_event("e")
+            .connect("s", "await")
+            .connect("await", "e")
+            .build()
+            .expect("valid message-catch process");
+        let mut names = std::collections::HashMap::new();
+        names.insert("waiter".to_string(), "waiter.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![waiter],
+                &names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy succeeds");
+
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("orderId".to_string(), Value::Str("A1".to_string()));
+        let (waiter_key, _) = server
+            .create_for_stream(Some("waiter".into()), None, vars)
+            .await
+            .expect("create waiter");
+
+        // Poll until the subscription is projected.
+        let mut items = Vec::new();
+        for _ in 0..200 {
+            let resp = server
+                .search_message_subscriptions_impl(&None)
+                .await
+                .expect("search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            if !result.items.is_empty() {
+                items = result.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(items.len(), 1, "one open subscription is projected");
+        let sub = &items[0];
+        assert_eq!(sub.element_id, "await");
+        assert_eq!(sub.message_name, "OrderPlaced");
+        assert_eq!(sub.process_definition_id, "waiter");
+        assert_eq!(
+            sub.correlation_key,
+            types::Nullable::Present("A1".to_string())
+        );
+        assert_eq!(
+            sub.process_instance_key,
+            types::Nullable::Present(models::ProcessInstanceKey(waiter_key.to_string()))
+        );
+        assert_eq!(
+            sub.message_subscription_state,
+            models::MessageSubscriptionStateEnum::Created
+        );
+        assert_eq!(
+            sub.message_subscription_type,
+            models::MessageSubscriptionTypeEnum::ProcessEvent
+        );
+        assert_eq!(sub.process_definition_version, types::Nullable::Present(1));
+        assert_eq!(sub.tenant_id, "<default>");
+
+        // Filter by messageName = OrderPlaced matches; a different name excludes.
+        let hit = models::MessageSubscriptionFilter {
+            message_name: Some(models::StringFilterProperty::String(
+                "OrderPlaced".to_string(),
+            )),
+            ..models::MessageSubscriptionFilter::new()
+        };
+        let resp = server
+            .search_message_subscriptions_impl(&Some(models::MessageSubscriptionSearchQuery {
+                page: None,
+                sort: None,
+                filter: Some(hit),
+            }))
+            .await
+            .expect("filtered search returns");
+        let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert_eq!(result.items.len(), 1);
+
+        let miss = models::MessageSubscriptionFilter {
+            message_name: Some(models::StringFilterProperty::String("Nope".to_string())),
+            ..models::MessageSubscriptionFilter::new()
+        };
+        let resp = server
+            .search_message_subscriptions_impl(&Some(models::MessageSubscriptionSearchQuery {
+                page: None,
+                sort: None,
+                filter: Some(miss),
+            }))
+            .await
+            .expect("filtered search returns");
+        let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert!(result.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_correlated_message_subscriptions_returns_empty_result() {
+        // Nano has no correlation-history read model yet: the endpoint honours its
+        // contract with an empty, eventually-consistent result rather than a 500.
+        use apis::message_subscription::SearchCorrelatedMessageSubscriptionsResponse as Resp;
+        let server = ServerImpl::default();
+        let resp = server
+            .search_correlated_message_subscriptions_impl(&None)
+            .await
+            .expect("search returns");
+        let Resp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert!(result.items.is_empty());
     }
 
     /// Polls `searchElementInstanceWaitStates` until at least `want` items are

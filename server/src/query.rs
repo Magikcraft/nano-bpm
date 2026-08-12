@@ -351,6 +351,66 @@ pub fn match_variable_key(filter: &Option<models::VariableKeyFilterProperty>, va
     }
 }
 
+/// Matches a `MessageSubscriptionKeyFilterProperty` against a key's decimal string.
+pub fn match_message_subscription_key(
+    filter: &Option<models::MessageSubscriptionKeyFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::MessageSubscriptionKeyFilterProperty::MessageSubscriptionKey(k)) => {
+            k.0 == value
+        }
+        Some(
+            models::MessageSubscriptionKeyFilterProperty::AdvancedMessageSubscriptionKeyFilter(a),
+        ) => ops!(a, |k: &models::MessageSubscriptionKey| k.0.clone()).matches(Some(value)),
+    }
+}
+
+/// Matches a `MessageSubscriptionStateFilterProperty` against a state's wire spelling.
+pub fn match_message_subscription_state(
+    filter: &Option<models::MessageSubscriptionStateFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::MessageSubscriptionStateFilterProperty::MessageSubscriptionStateEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(
+            models::MessageSubscriptionStateFilterProperty::AdvancedMessageSubscriptionStateFilter(
+                a,
+            ),
+        ) => ops!(
+            a,
+            |e: &models::MessageSubscriptionStateEnum| e.to_string(),
+            like_no_notin
+        )
+        .matches(Some(value)),
+    }
+}
+
+/// Matches a `MessageSubscriptionTypeFilterProperty` against a type's wire spelling.
+pub fn match_message_subscription_type(
+    filter: &Option<models::MessageSubscriptionTypeFilterProperty>,
+    value: &str,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::MessageSubscriptionTypeFilterProperty::MessageSubscriptionTypeEnum(e)) => {
+            e.to_string() == value
+        }
+        Some(
+            models::MessageSubscriptionTypeFilterProperty::AdvancedMessageSubscriptionTypeFilter(a),
+        ) => ops!(
+            a,
+            |e: &models::MessageSubscriptionTypeEnum| e.to_string(),
+            like_no_notin
+        )
+        .matches(Some(value)),
+    }
+}
+
 /// Matches a `ScopeKeyFilterProperty` against a key's decimal string.
 pub fn match_scope_key(filter: &Option<models::ScopeKeyFilterProperty>, value: &str) -> bool {
     match filter {

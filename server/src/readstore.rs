@@ -214,7 +214,8 @@ CREATE TABLE message_subscriptions (
     element_instance_key   INTEGER NOT NULL,
     element_id             TEXT NOT NULL,
     message_name           TEXT NOT NULL,
-    correlation_key        TEXT NOT NULL
+    correlation_key        TEXT NOT NULL,
+    created_at_ms          INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
 CREATE TABLE forms (
@@ -516,6 +517,9 @@ pub struct MessageSubscriptionRow {
     pub element_id: String,
     pub message_name: String,
     pub correlation_key: String,
+    /// Projection-time timestamp (ms since epoch) of when this subscription row
+    /// was first materialised; surfaces as `lastUpdatedDate` in the search API.
+    pub created_at_ms: u64,
 }
 
 pub struct ProcessDefinitionRow {
@@ -2213,7 +2217,7 @@ fn map_element_instance(r: &rusqlite::Row) -> rusqlite::Result<ElementInstanceRo
 
 /// Column list for `message_subscriptions` selects.
 const MESSAGE_SUBSCRIPTION_COLS: &str = "subscription_key, instance_key, element_instance_key, \
-     element_id, message_name, correlation_key";
+     element_id, message_name, correlation_key, created_at_ms";
 
 fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscriptionRow> {
     Ok(MessageSubscriptionRow {
@@ -2223,6 +2227,7 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
         element_id: r.get(3)?,
         message_name: r.get(4)?,
         correlation_key: r.get(5)?,
+        created_at_ms: r.get::<_, i64>(6)? as u64,
     })
 }
 
@@ -2745,8 +2750,8 @@ fn project_engine_state(
         if open && sub.element_instance_key != 0 {
             tx.cexecute(
                 "INSERT INTO message_subscriptions (subscription_key, instance_key, \
-                 element_instance_key, element_id, message_name, correlation_key) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 element_instance_key, element_id, message_name, correlation_key, created_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                  ON CONFLICT(subscription_key) DO UPDATE SET \
                  element_instance_key = excluded.element_instance_key, \
                  element_id = excluded.element_id, \
@@ -2759,6 +2764,7 @@ fn project_engine_state(
                     sub.element_id,
                     sub.message_name,
                     sub.correlation_key,
+                    now_ms as i64,
                 ],
             )?;
         }
@@ -3012,8 +3018,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             if *element_instance_key != 0 {
                 tx.cexecute(
                     "INSERT INTO message_subscriptions (subscription_key, instance_key, \
-                     element_instance_key, element_id, message_name, correlation_key) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                     element_instance_key, element_id, message_name, correlation_key, created_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
                      ON CONFLICT(subscription_key) DO UPDATE SET \
                      element_instance_key = excluded.element_instance_key, \
                      element_id = excluded.element_id, \
@@ -3026,6 +3032,7 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                         element_id,
                         message_name,
                         correlation_key,
+                        now_ms as i64,
                     ],
                 )?;
             }
