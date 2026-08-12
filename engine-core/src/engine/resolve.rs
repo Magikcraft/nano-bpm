@@ -8,16 +8,39 @@ impl Engine {
     /// instance variables (a bare name like `orderId` is just a variable
     /// reference; `order.id` reads a context member). A missing variable, an
     /// empty key, or an evaluation error yields the empty string (matching the
-    /// REST default `correlationKey` of `""`).
+    /// REST default `correlationKey` of `""`). Callers that must distinguish a
+    /// declared-but-unevaluable key from a legitimately empty one (to raise an
+    /// incident) use [`Self::resolve_correlation_value_checked`] instead.
     pub(crate) fn resolve_correlation_value(
         &self,
         vars: &HashMap<String, Value>,
         correlation_key: &str,
     ) -> String {
+        self.resolve_correlation_value_checked(vars, correlation_key)
+            .unwrap_or_default()
+    }
+
+    /// Like [`Self::resolve_correlation_value`] but distinguishes an
+    /// *evaluation failure* from a legitimately empty key.
+    ///
+    /// A declared (non-empty) correlation-key expression that fails to evaluate
+    /// — a missing variable, a `null` result, or a type error such as
+    /// concatenating a string with `null` — returns `Err(reason)` so the caller
+    /// can raise an incident instead of silently opening an unmatchable
+    /// subscription with an empty key (Zeebe raises a correlation-key incident
+    /// in exactly this case). An absent declaration (empty string) resolves to
+    /// `Ok("")`, matching the REST default `correlationKey` of `""`.
+    pub(crate) fn resolve_correlation_value_checked(
+        &self,
+        vars: &HashMap<String, Value>,
+        correlation_key: &str,
+    ) -> Result<String, String> {
         if correlation_key.is_empty() {
-            return String::new();
+            return Ok(String::new());
         }
-        crate::feel::eval_string(correlation_key, vars).unwrap_or_default()
+        crate::feel::eval_string(correlation_key, vars).map_err(|e| {
+            format!("failed to evaluate correlation key expression '{correlation_key}': {e}")
+        })
     }
 
     /// Resolves a message or signal event `name` at subscription-open time.

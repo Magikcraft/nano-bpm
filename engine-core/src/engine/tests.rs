@@ -12227,3 +12227,86 @@ fn event_based_gateway_never_force_completes_non_catch_sibling() {
         "a non-catch sibling must not be force-completed (its job must survive)"
     );
 }
+
+// ---- Correlation-key evaluation incident (durable fix for the silent hang) ----
+
+// A catch whose correlation key concatenates a scalar (`planKey`) with a member
+// of a variable (`task.id`) that is not yet a Map when the subscription opens.
+// The FEEL `+` errors ("+ not defined for string and null"), which previously
+// collapsed to an empty key and parked the token forever with no error.
+fn process_with_concat_correlation_key() -> ProcessDefinition {
+    ProcessBuilder::new("concat-corr")
+        .start_event("start")
+        .message_intermediate_catch_event("await", "answered", "=planKey + \":\" + task.id")
+        .end_event("end")
+        .connect("start", "await")
+        .connect("await", "end")
+        .build()
+        .unwrap()
+}
+
+#[test]
+fn errored_correlation_key_raises_incident_and_reopens_on_resolve() {
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(process_with_concat_correlation_key()))
+        .unwrap();
+    // `task` is absent at open time, so `task.id` is null and the concat errors.
+    let created = engine
+        .apply_command(Command::create_instance_with(
+            "concat-corr",
+            vars(&[("planKey", Value::Str("plan#1".into()))]),
+        ))
+        .unwrap();
+    let instance_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // No unmatchable subscription is opened; instead an incident is raised.
+    assert!(
+        engine.message_subscriptions().is_empty(),
+        "an unevaluable correlation key must not open a subscription"
+    );
+    let incident_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::IncidentRaised {
+                incident_key, kind, ..
+            } if *kind == state::IncidentKind::ExpressionEvaluation => Some(*incident_key),
+            _ => None,
+        })
+        .expect("an ExpressionEvaluation incident is raised");
+    assert!(
+        !engine.is_completed(instance_key),
+        "the token must still be parked"
+    );
+    assert_eq!(engine.instance(instance_key).unwrap().incidents.len(), 1);
+
+    // Correct the variable so the key can evaluate, then resolve the incident.
+    let mut task_map = std::collections::BTreeMap::new();
+    task_map.insert("id".to_string(), Value::Str("w1".into()));
+    engine
+        .apply_command(Command::set_variables(
+            instance_key,
+            vars(&[("task", Value::Map(task_map))]),
+        ))
+        .unwrap();
+    engine
+        .apply_command(Command::resolve_incident(incident_key))
+        .unwrap();
+
+    // Resolving re-opens the subscription with the now-correct key (it does NOT
+    // complete the catch and skip the wait).
+    assert!(
+        !engine.is_completed(instance_key),
+        "the catch must keep waiting"
+    );
+    let subs = engine.message_subscriptions();
+    assert_eq!(subs.len(), 1, "the subscription is re-opened on resolve");
+    assert_eq!(subs[0].correlation_key, "plan#1:w1");
+    assert!(engine.instance(instance_key).unwrap().incidents.is_empty());
+
+    // A matching message now correlates and drives the instance to completion.
+    engine
+        .apply_command(Command::correlate_message("answered", "plan#1:w1"))
+        .unwrap();
+    assert!(engine.is_completed(instance_key));
+}
