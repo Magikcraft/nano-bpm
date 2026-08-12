@@ -426,6 +426,8 @@ ${langChips()}
   </ol>
 </section>
 
+${compareHtml()}
+
 <section class="band backbone">
   <div class="wrap">
     <h2>RAAD.<br><span class="grad">Rapid Agent Application Development.</span></h2>
@@ -485,6 +487,216 @@ ${langChips()}
 </script>`;
 
   return homePage("nanobpm.io — Agent Graph Orchestration for the Developer Workstation", body);
+}
+
+// A landscape comparison grid, rendered from a single source of truth so the
+// header set and every row stay aligned. Nano Workforce is the first product
+// column and is visually highlighted (`col-nano`) — the column each peer is
+// read against. Cells carry an optional tone (`yes` / `partial` / `no`) that decorates
+// them with a ✓ / ~ / — marker; plain cells are descriptive. Every claim traces
+// to the tool's own docs (onorca.dev, herdr.dev, code.claude.com/docs) and is
+// kept deliberately fair — these tools solve overlapping-but-distinct problems.
+function compareHtml() {
+  // Product columns, in render order. Nano first (highlighted), then the peers.
+  const cols = [
+    { key: "nano", label: "Nano Workforce", brand: true },
+    { key: "orca", label: "Orca" },
+    { key: "herdr", label: "Herdr" },
+    { key: "claude", label: "Claude Dynamic Workflows" },
+  ];
+
+  // Rows, in render order. Each cell is `[value]` (plain, descriptive) or
+  // `[value, tone]` where tone ∈ {yes, partial, no}. Order matches `cols`.
+  const rows = [
+    {
+      label: "What it is",
+      cells: [
+        ["Durable agent-workflow engine"],
+        ["Desktop orchestrator IDE"],
+        ["Terminal runtime for agents"],
+        ["In-Claude subagent scripting"],
+      ],
+    },
+    {
+      label: "Orchestration lives in",
+      cells: [
+        ["The durable graph"],
+        ["You, in the GUI"],
+        ["You / agents via socket"],
+        ["The JavaScript the model writes"],
+      ],
+    },
+    {
+      label: "Authoring surface",
+      cells: [
+        ["Code-first & Model-first (BPMN)"],
+        ["Manual, worktree GUI"],
+        ["Interactive + socket API"],
+        ["A script Claude writes"],
+      ],
+    },
+    {
+      label: "Survives crash / reboot",
+      cells: [
+        ["Journal-backed step resume", "yes"],
+        ["Scrollback only", "partial"],
+        ["Terminals reattach", "partial"],
+        ["Resumes in the session", "partial"],
+      ],
+    },
+    {
+      label: "Human approval steps",
+      cells: [
+        ["First-class durable waits", "yes"],
+        ["", "no"],
+        ["Flags a blocked agent", "partial"],
+        ["", "no"],
+      ],
+    },
+    {
+      label: "Agent harnesses",
+      cells: [
+        ["Provider-agnostic"],
+        ["Codex, Claude, OpenCode, Pi"],
+        ["Claude, Codex, Cursor, Grok…"],
+        ["Claude only"],
+      ],
+    },
+    {
+      label: "Frontier + local models",
+      cells: [
+        ["Mix both on one box", "yes"],
+        ["Via the harness", "partial"],
+        ["Via the harness", "partial"],
+        ["Anthropic only", "no"],
+      ],
+    },
+    {
+      label: "Headless / server / CI",
+      cells: [
+        ["Engine + Camunda 8 REST", "yes"],
+        ["Desktop app", "no"],
+        ["Background server", "partial"],
+        ["Inside Claude Code", "partial"],
+      ],
+    },
+    {
+      label: "Distributed fleet",
+      cells: [
+        ["Any mix of hardware, local to fleet", "yes"],
+        ["One desktop (+ SSH box)", "partial"],
+        ["One host, reattach over SSH", "partial"],
+        ["Single machine", "no"],
+      ],
+    },
+    {
+      label: "Footprint",
+      cells: [
+        ["Small — runs on a Raspberry Pi"],
+        ["Electron desktop"],
+        ["One Rust binary"],
+        ["Claude Code"],
+      ],
+    },
+    {
+      label: "License",
+      cells: [
+        ["Free to evaluate & personal use"],
+        ["MIT"],
+        ["Apache-2.0"],
+        ["Proprietary"],
+      ],
+    },
+  ];
+
+  // Tone vocabulary — the only values a cell's optional second element may take.
+  // Both the shape check below and the accessible labels are derived from it, so
+  // there is a single source of truth for what a valid tone is.
+  const TONE_LABELS = { yes: "Yes", partial: "Partial", no: "No" };
+
+  // Fail fast with a clear message if the data drifts out of shape. Without this,
+  // a mismatched row/column count surfaces later as an opaque
+  // `Cannot read properties of undefined` while rendering.
+  rows.forEach((r, ri) => {
+    if (r.cells.length !== cols.length) {
+      throw new Error(
+        `compareHtml: row ${ri} ("${r.label}") has ${r.cells.length} cell(s) but there are ${cols.length} column(s)`,
+      );
+    }
+    r.cells.forEach((cell, ci) => {
+      if (!Array.isArray(cell) || cell.length < 1 || cell.length > 2) {
+        throw new Error(
+          `compareHtml: row ${ri} ("${r.label}"), column ${ci} must be a [value] or [value, tone] tuple`,
+        );
+      }
+      const [value, tone] = cell;
+      if (typeof value !== "string") {
+        throw new Error(
+          `compareHtml: row ${ri} ("${r.label}"), column ${ci} value must be a string`,
+        );
+      }
+      if (tone !== undefined && !Object.hasOwn(TONE_LABELS, tone)) {
+        throw new Error(
+          `compareHtml: row ${ri} ("${r.label}"), column ${ci} has invalid tone "${tone}" (expected one of ${Object.keys(TONE_LABELS).join(", ")})`,
+        );
+      }
+    });
+  });
+
+  const colClass = (c) => (c?.key === "nano" ? " col-nano" : "");
+  const head =
+    `      <th scope="col"><span class="visually-hidden">Capability</span></th>\n` +
+    cols
+      .map(
+        (c) =>
+          `      <th scope="col" class="${c.brand ? "brandcol" : ""}${colClass(c)}">${esc(c.label)}</th>`,
+      )
+      .join("\n");
+
+  const body = rows
+    .map((r) => {
+      const tds = r.cells
+        .map((cell, i) => {
+          const [value, tone] = cell;
+          const toneCls = tone ? ` ${tone}` : "";
+          const text = value === "" ? "" : esc(value);
+          // The ✓/~/— glyphs are CSS `::before` content, which assistive tech
+          // often does not announce — prepend visually-hidden text so the
+          // yes/partial/no signal reaches screen readers without overriding the
+          // cell's visible descriptive text (as an aria-label would). A trailing
+          // ": " (only when the cell has visible text) makes it read as
+          // "Yes: …" with a reliable pause, instead of "YesJournal-backed…".
+          const toneLabel = tone
+            ? `<span class="visually-hidden">${TONE_LABELS[tone]}${text ? ": " : ""}</span>`
+            : "";
+          return `      <td class="${colClass(cols[i]).trim()}"><span class="cell${toneCls}">${toneLabel}${text}</span></td>`;
+        })
+        .join("\n");
+      return `    <tr>\n      <th scope="row" class="rowlabel">${esc(r.label)}</th>\n${tds}\n    </tr>`;
+    })
+    .join("\n");
+
+  return `<section class="band compare wrap">
+  <h2>How Nano compares.</h2>
+  <p class="compare-sub">The agent-tooling landscape spans desktop IDEs, terminal runtimes, and in-model
+  scripting. Nano Workforce is the durable engine underneath — the one that keeps running when the
+  machine doesn't.</p>
+  <div class="compare-scroll" role="region" aria-label="How Nano compares, horizontally scrollable table" tabindex="0">
+    <table class="compare-table">
+      <thead>
+        <tr>
+${head}
+        </tr>
+      </thead>
+      <tbody>
+${body}
+      </tbody>
+    </table>
+  </div>
+  <p class="compare-foot">Overlapping but distinct: Orca and Herdr host the interactive terminals your
+  agents run in, and Nano can drive those same harnesses as durable workers. This grid maps each tool to
+  the job it leads on. Sourced from each project's own docs; corrections welcome.</p>
+</section>`;
 }
 
 // The shared site header/nav. Emitted verbatim on every full-page (homePage
@@ -874,6 +1086,38 @@ function homePage(title, body) {
   .site-foot p { margin: .3rem 0; }
   .site-foot .muted, .muted { color: var(--muted); }
   .site-foot .muted { font-size: .9rem; max-width: 42rem; }
+
+  .band.compare { text-align: center; margin-top: 4rem; }
+  .band.compare h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); margin: 0 0 .6rem; }
+  .band.compare .compare-sub { color: var(--muted); max-width: 46rem; margin: 0 auto 1.8rem; font-size: 1.02rem; }
+  .compare-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border-radius: var(--radius); }
+  .compare-scroll:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .compare-table {
+    width: 100%; min-width: 760px; border-collapse: collapse; text-align: left;
+    margin-inline: auto; font-size: .93rem;
+  }
+  .compare-table th, .compare-table td {
+    padding: .72rem .85rem; border-bottom: 1px solid var(--line); vertical-align: top;
+  }
+  .compare-table thead th {
+    font-size: .82rem; letter-spacing: -0.01em; color: var(--ink); font-weight: 700;
+  }
+  .compare-table thead th.brandcol { color: var(--sky); }
+  .compare-table tbody th.rowlabel { color: var(--muted); font-weight: 600; white-space: nowrap; }
+  .compare-table .cell { display: block; color: var(--ink); }
+  .visually-hidden {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
+  .compare-table .cell.yes::before { content: "✓ "; color: var(--emerald); font-weight: 700; }
+  .compare-table .cell.partial::before { content: "~ "; color: var(--sky); font-weight: 700; }
+  .compare-table .cell.no { color: var(--muted); }
+  .compare-table .cell.no::before { content: "— "; color: var(--muted); }
+  .compare-table .col-nano { background: rgba(56,189,248,.06); }
+  .compare-table thead th.col-nano { background: rgba(56,189,248,.12); }
+  .compare-table th.col-nano, .compare-table td.col-nano { border-inline: 1px solid rgba(56,189,248,.20); }
+  .compare-table tbody tr:last-child td, .compare-table tbody tr:last-child th { border-bottom: 0; }
+  .compare-foot { color: var(--muted); font-size: .88rem; margin: 1.3rem auto 0; max-width: 48rem; }
 
   @media (max-width: 800px) { .pillars { grid-template-columns: 1fr; } .demo-frame { height: 460px; } }
   @media (prefers-reduced-motion: reduce) { #field { display: none; } }
