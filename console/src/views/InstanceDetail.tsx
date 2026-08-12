@@ -90,13 +90,17 @@ export default function InstanceDetail({
     return <p className="p-8 text-danger">Failed to load: {String(error)}</p>;
   if (!data) return null;
 
-  const { instance, variables, jobs, incidents } = data;
-  // Active service tasks (pending jobs) and open-incident elements drive the
-  // overlay. Incidents project with state "Active" once raised (they become
-  // "Resolved" — kept for history — after an operator clears them).
-  const activeEls = jobs
+  const { instance, variables, jobs, incidents, active_elements } = data;
+  // Live token positions drive the overlay. Active element instances cover every
+  // wait state — including catch events, timers, receive tasks and event-based
+  // gateways that have no job — so an instance parked on one still shows a token.
+  // Union with pending-job element ids (belt and suspenders) and dedupe.
+  const jobEls = jobs
     .filter((j) => j.state === "Created" || j.state === "Activated")
     .map((j) => j.element_id);
+  const activeEls = Array.from(
+    new Set([...jobEls, ...active_elements.map((e) => e.element_id)]),
+  );
   const incidentEls = incidents
     .filter((i) => i.state === "Active")
     .map((i) => i.element_id);
