@@ -3684,7 +3684,18 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     |r| r.get::<_, i32>(0),
                 )
                 .optional()?
-                .unwrap_or(0);
+                .ok_or_else(|| {
+                    // The engine validated the target definition is deployed
+                    // before emitting this event, so a missing row is read-model
+                    // corruption — fail loudly rather than writing version=0.
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                        Some(format!(
+                            "migration projection: target process definition key {target_key_i} \
+                             missing from process_definitions"
+                        )),
+                    )
+                })?;
 
             // 1) Re-point the instance row itself.
             tx.cexecute(
@@ -3727,6 +3738,16 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                      WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
                     params![ik, source_id, t, active_inc],
                 )?;
+                // Message subscriptions in the read model are all live (rows are
+                // dropped on correlation/cancel/termination), and carry no
+                // definition-identity columns, so remap by original element id
+                // with no state filter. A migrated instance waiting on a message
+                // catch event must re-home its subscription alongside the token.
+                tx.cexecute(
+                    "UPDATE message_subscriptions SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
+                )?;
             }
 
             // Phase B — resolve temp ids to the target id + re-home the
@@ -3745,7 +3766,19 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                         |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
                     )
                     .optional()?
-                    .unwrap_or((None, String::new()));
+                    .ok_or_else(|| {
+                        // The engine validated every mapped target element exists
+                        // before emitting this event, so missing metadata is read
+                        // model corruption — fail loudly rather than overwriting
+                        // `element_type` with an empty string.
+                        rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                            Some(format!(
+                                "migration projection: target element '{target_id}' missing from \
+                                 definition_elements for process definition key {target_key_i}"
+                            )),
+                        )
+                    })?;
                 tx.cexecute(
                     "UPDATE element_instances SET element_id = ?2, element_name = ?3, \
                      element_type = ?4, process_definition_id = ?5, process_definition_key = ?6 \
@@ -3782,6 +3815,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     "UPDATE incidents SET element_id = ?2, process_definition_id = ?3, \
                      process_definition_key = ?4 WHERE instance_key = ?1 AND element_id = ?5",
                     params![ik, target_id, target_process_id, target_key_str, t],
+                )?;
+                // Resolve the temp-stamped message subscriptions (they carry no
+                // definition identity, so only the element id moves).
+                tx.cexecute(
+                    "UPDATE message_subscriptions SET element_id = ?2 \
+                     WHERE instance_key = ?1 AND element_id = ?3",
+                    params![ik, target_id, t],
                 )?;
             }
 
@@ -4913,5 +4953,69 @@ mod element_instance_tests {
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
+    }
+
+    #[test]
+    fn migration_remaps_live_message_subscription_onto_target_element() {
+        use nanobpmn_engine_core::MessageSubscriptionKind;
+        // An instance waiting on a message catch event carries a live
+        // `message_subscriptions` row. Migrating it must re-home that row's
+        // `element_id` onto the mapped target element, alongside the token —
+        // otherwise the read model points at the source element id the engine no
+        // longer runs under.
+        let store = ReadStore::open(None).unwrap();
+
+        // Target definition `p2` carries the mapped target element `await2` (its
+        // metadata must be resolvable in `definition_elements`).
+        let target = ProcessBuilder::new("p2")
+            .start_event("s2")
+            .service_task("await2", "worker")
+            .end_event("e2")
+            .connect("s2", "await2")
+            .connect("await2", "e2")
+            .build()
+            .unwrap();
+        let target_key: u64 = 600;
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::ProcessDeployed {
+                    deployment_key: 2,
+                    process_definition_key: target_key,
+                    version: 3,
+                    process: target,
+                },
+                &Event::MessageSubscriptionCreated {
+                    subscription_key: 4001,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "await".to_string(),
+                    message_name: "OrderPlaced".to_string(),
+                    correlation_key: "A1".to_string(),
+                    kind: MessageSubscriptionKind::IntermediateCatch,
+                },
+            ])
+            .unwrap();
+        assert_eq!(store.message_subscriptions()[0].element_id, "await");
+
+        store
+            .export(&[&Event::ProcessInstanceMigrated {
+                instance_key: INST,
+                target_process_id: "p2".to_string(),
+                target_process_definition_key: target_key,
+                element_mappings: vec![("await".to_string(), "await2".to_string())],
+            }])
+            .unwrap();
+
+        // The subscription re-homes onto the target element id; the instance row
+        // re-homes onto the target definition + its version (looked up loudly).
+        let subs = store.message_subscriptions();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].element_id, "await2");
+        let inst = store.process_instance(INST).unwrap();
+        assert_eq!(inst.process_definition_id, "p2");
+        assert_eq!(inst.process_definition_key, target_key.to_string());
+        assert_eq!(inst.version, 3);
     }
 }

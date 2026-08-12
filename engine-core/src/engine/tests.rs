@@ -12636,3 +12636,59 @@ fn migration_rejects_unsupported_boundary_event() {
         EngineError::UnsupportedMigration { element_id, .. } if element_id == "boundary"
     ));
 }
+
+#[test]
+fn migration_rejects_active_multi_instance_body() {
+    // An active parallel multi-instance body keeps per-element bookkeeping in
+    // `ProcessInstance.multi_instances` that this phase does not remap, so
+    // migration is rejected as "not supported yet" (Zeebe parity), matching the
+    // boundary-event rejection above.
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployProcess(multi_instance_service_process(
+            false,
+        )))
+        .unwrap();
+    let target = ProcessBuilder::new("mi-target")
+        .start_event("start")
+        .service_task("each", "handle")
+        .with_multi_instance(
+            "each",
+            crate::model::MultiInstance {
+                input_collection: "=items".to_string(),
+                input_element: Some("item".to_string()),
+                output_collection: Some("results".to_string()),
+                output_element: Some("=item * 2".to_string()),
+                completion_condition: None,
+                sequential: false,
+            },
+        )
+        .service_task("sink", "sink-work")
+        .end_event("end")
+        .connect("start", "each")
+        .connect("each", "sink")
+        .connect("sink", "end")
+        .build()
+        .unwrap();
+    let target_key = deploy_for_migration(&mut engine, target);
+    let inst = create_instance_with_vars(
+        &mut engine,
+        "mi",
+        vars(&[(
+            "items",
+            Value::List(vec![Value::Int(10), Value::Int(20), Value::Int(30)]),
+        )]),
+    );
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("each".to_string(), "each".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::UnsupportedMigration { element_id, reason, .. }
+            if element_id == "each" && reason.contains("multi-instance")
+    ));
+}

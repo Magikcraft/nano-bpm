@@ -2730,6 +2730,36 @@ impl Engine {
                     });
                 }
 
+                //    (c) an active multi-instance body or ad-hoc sub-process
+                //        container. Their per-element bookkeeping lives in
+                //        `ProcessInstance.multi_instances` / `adhoc_instances`,
+                //        which the applier (`state::apply`) does not remap, so
+                //        migrating one would leave that bookkeeping pointing at
+                //        the source element id and desync engine runtime. Zeebe
+                //        rejects these as "not supported yet"; reproducing the
+                //        rejection is parity.
+                let mut unremappable: Vec<String> = instance
+                    .multi_instances
+                    .values()
+                    .map(|mi| mi.element_id.clone())
+                    .chain(
+                        instance
+                            .adhoc_instances
+                            .values()
+                            .map(|adhoc| adhoc.element_id.clone()),
+                    )
+                    .collect();
+                unremappable.sort();
+                if let Some(element_id) = unremappable.into_iter().next() {
+                    return Err(EngineError::UnsupportedMigration {
+                        instance_key,
+                        element_id,
+                        reason: "multi-instance and ad-hoc sub-process activities are not \
+                                 migratable yet"
+                            .to_string(),
+                    });
+                }
+
                 // 5. Every active element instance must have a mapping.
                 for eid in &active_ids {
                     if !mapped.contains_key(eid) {

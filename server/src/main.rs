@@ -4288,9 +4288,12 @@ impl ServerImpl {
         {
             Ok(k) => k,
             Err(_) => {
-                return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
-                    "Target process definition not found",
-                    404,
+                // A malformed body field is invalid input, not a missing
+                // resource: Zeebe parity returns 400 INVALID_ARGUMENT here and
+                // reserves 404 for well-formed keys that don't resolve.
+                return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
+                    "Invalid migration",
+                    400,
                     format!(
                         "Target process definition key '{}' is not a valid key.",
                         body.target_process_definition_key.0
