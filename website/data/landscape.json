@@ -1,0 +1,96 @@
+{
+  "note": "Single source of truth for the 'Where Nano sits in the landscape' positioning table. Rendered by website/build.mjs into BOTH the public /architecture#landscape page and the in-app console /stack page (server/src/console/landscape.gen.html, a checked-in derived artifact injected into stack.html at serve time). Edit this file, then run `node website/build.mjs` to regenerate — never hand-edit the rendered tables.",
+  "columns": [
+    { "label": "Capability" },
+    {
+      "label": "Interactive coding agents",
+      "sub": "Copilot CLI, Claude Code, OpenCode, Cursor, Aider"
+    },
+    {
+      "label": "Autonomous SWE agents",
+      "sub": "Devin & hosted coding agents"
+    },
+    { "label": "Nano Workforce", "nano": true }
+  ],
+  "rows": [
+    {
+      "feature": "Primary role",
+      "cells": [
+        { "text": "Edit code in a session" },
+        { "text": "Complete one task autonomously" },
+        { "text": "Orchestrate many agents into a delivery workflow", "nano": true }
+      ]
+    },
+    {
+      "feature": "Interaction model",
+      "cells": [
+        { "text": "Interactive, human-in-the-loop" },
+        { "text": "Fire-and-check, mostly hosted UI" },
+        { "text": "Modelled graph; human only on escalation/approval", "nano": true }
+      ]
+    },
+    {
+      "feature": "Unit of work",
+      "cells": [
+        { "text": "A prompt / a task" },
+        { "text": "A task / a ticket" },
+        { "text": "An issue → a graph of PRs", "nano": true }
+      ]
+    },
+    {
+      "feature": "Multi-agent fan-out",
+      "cells": [
+        { "text": "No", "tone": "no" },
+        { "text": "Limited", "tone": "partial" },
+        { "text": "Yes — levelized task graph", "tone": "yes", "nano": true }
+      ]
+    },
+    {
+      "feature": "Durable across restart / failure",
+      "cells": [
+        { "text": "Ephemeral session", "tone": "no" },
+        { "text": "Vendor-hosted state", "tone": "partial" },
+        { "text": "Yes — engine journal", "tone": "yes", "nano": true }
+      ]
+    },
+    {
+      "feature": "Review-convergence loop",
+      "cells": [
+        { "text": "Manual", "tone": "no" },
+        { "text": "Varies", "tone": "partial" },
+        { "text": "Built-in, multi-round, capped", "tone": "yes", "nano": true }
+      ]
+    },
+    {
+      "feature": "Merge automation",
+      "cells": [
+        { "text": "You merge", "tone": "no" },
+        { "text": "Opens a PR", "tone": "partial" },
+        { "text": "CI-aware merge loop", "tone": "yes", "nano": true }
+      ]
+    },
+    {
+      "feature": "Model / provider",
+      "cells": [
+        { "text": "Provider-agnostic (mostly)" },
+        { "text": "Proprietary / fixed" },
+        { "text": "Provider-agnostic; agents are pluggable", "nano": true }
+      ]
+    },
+    {
+      "feature": "Where it runs",
+      "cells": [
+        { "text": "Your workstation" },
+        { "text": "Vendor cloud" },
+        { "text": "Your machine — or across an HA fleet", "nano": true }
+      ]
+    },
+    {
+      "feature": "Relationship to the others",
+      "cells": [
+        { "text": "Point tools — the hands that write code", "span": 2 },
+        { "text": "Hires the tools on the left as workers", "tone": "yes", "nano": true }
+      ]
+    }
+  ]
+}

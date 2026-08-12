@@ -342,6 +342,13 @@ jobs:
         # nanobpm.io. This is the same build pages.yml deploys on merge, so a
         # green PR here guarantees the site publishes cleanly.
         run: node website/build.mjs
+      - name: Fail if the console landscape artifact is stale
+        # website/build.mjs also renders the shared landscape table into
+        # server/src/console/landscape.gen.html (single source of truth for both
+        # /architecture#landscape and the console /stack page). Fail if the
+        # committed artifact doesn't match a fresh render (the maker edited
+        # website/data/landscape.json but forgot `node website/build.mjs`).
+        run: git diff --exit-code -- server/src/console/landscape.gen.html
 
   website-snippet:
     name: website snippet (typecheck)

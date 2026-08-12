@@ -14,6 +14,7 @@
 //!   is unaffected.
 
 use std::convert::Infallible;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use axum::{
@@ -88,6 +89,26 @@ const OPTIMIZATION_HTML: &str = include_str!("optimization.html");
 /// Nano BPM and Nano Workforce sit relative to coding agents, served at
 /// `/stack`.
 const STACK_HTML: &str = include_str!("stack.html");
+
+/// The "Where Nano sits in the landscape" comparison table, generated from
+/// `website/data/landscape.json` by `website/build.mjs` — the single source of
+/// truth it shares with the public `/architecture#landscape` page. Injected into
+/// [`STACK_HTML`] at the `<!--LANDSCAPE_TABLE-->` marker so the console copy can
+/// never drift from the public one. Regenerate with `node website/build.mjs`.
+const LANDSCAPE_TABLE_HTML: &str = include_str!("landscape.gen.html");
+
+/// Marker in `stack.html` where the generated landscape table is spliced in.
+const LANDSCAPE_MARKER: &str = "<!--LANDSCAPE_TABLE-->";
+
+/// The fully assembled `/stack` page: [`STACK_HTML`] with the generated
+/// landscape table spliced in at [`LANDSCAPE_MARKER`]. Built once on first use.
+static STACK_PAGE: LazyLock<String> = LazyLock::new(|| {
+    debug_assert!(
+        STACK_HTML.contains(LANDSCAPE_MARKER),
+        "stack.html is missing the {LANDSCAPE_MARKER} landscape-table marker",
+    );
+    STACK_HTML.replace(LANDSCAPE_MARKER, LANDSCAPE_TABLE_HTML.trim())
+});
 
 /// Result of a console API core handler: a JSON body on success, or an HTTP
 /// status + message on failure. The generated trait layer (`generated_api`)
@@ -407,9 +428,38 @@ async fn optimization() -> Response {
 async fn stack() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        STACK_HTML,
+        STACK_PAGE.as_str(),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod stack_page_tests {
+    use super::*;
+
+    #[test]
+    fn stack_html_carries_the_landscape_marker() {
+        // The single-source-of-truth splice depends on this marker existing; if a
+        // future edit drops it, STACK_PAGE would silently serve no landscape table.
+        assert!(
+            STACK_HTML.contains(LANDSCAPE_MARKER),
+            "stack.html must contain the {LANDSCAPE_MARKER} landscape-table marker",
+        );
+    }
+
+    #[test]
+    fn assembled_page_injects_the_generated_table_and_drops_the_marker() {
+        let page = STACK_PAGE.as_str();
+        assert!(
+            !page.contains(LANDSCAPE_MARKER),
+            "assembled /stack page still contains the un-substituted marker",
+        );
+        // Content that only exists in the generated landscape table (from
+        // website/data/landscape.json) must be present after injection.
+        assert!(page.contains("<table class=\"landscape\">"));
+        assert!(page.contains("Review-convergence loop"));
+        assert!(page.contains("Hires the tools on the left as workers"));
+    }
 }
 
 /// Reconstructs the `scheme://host` base URL a client used to reach this node,

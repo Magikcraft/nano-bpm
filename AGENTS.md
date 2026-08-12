@@ -261,3 +261,14 @@ change to one does **not** appear on the other.
    SPA, `/swagger`, `/docs`. These ship *inside* the binary and are only visible
    on a running node — **not** on nanobpm.io.
 
+**The landscape positioning table is shared, not duplicated.** The "Where Nano
+sits in the landscape" comparison table appears on *both* surfaces (public
+`/architecture#landscape` and the console `/stack` page), so it has a single
+source of truth: `website/data/landscape.json`. `website/build.mjs` renders it
+into `/architecture` **and** writes `server/src/console/landscape.gen.html`, a
+checked-in derived artifact the server splices into `stack.html` at the
+`<!--LANDSCAPE_TABLE-->` marker (`STACK_PAGE` in `mod.rs`). Edit the JSON, then
+run `node website/build.mjs` to regenerate — never hand-edit either rendered
+table. The `schemas` CI job runs the build and `git diff --exit-code`s the
+artifact, so a forgotten regeneration fails the build instead of shipping drift.
+

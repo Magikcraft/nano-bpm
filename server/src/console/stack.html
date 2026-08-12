@@ -277,6 +277,15 @@
       thead th.nano {
         color: var(--emerald);
       }
+      thead th small {
+        display: block;
+        font-weight: 400;
+        text-transform: none;
+        letter-spacing: 0;
+        font-size: 0.82em;
+        opacity: 0.8;
+        margin-top: 0.15rem;
+      }
       tbody tr:last-child td {
         border-bottom: none;
       }
@@ -477,78 +486,13 @@
             already know.
           </p>
 
+          <!-- The landscape table below is @generated from
+               website/data/landscape.json — the single source of truth shared
+               with the public /architecture#landscape page — and injected here at
+               serve time from landscape.gen.html. Do not hand-edit; run
+               `node website/build.mjs` to regenerate both surfaces. -->
           <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Capability</th>
-                  <th>Interactive coding agents<br /><span style="font-weight:400;text-transform:none;letter-spacing:0">Copilot CLI, Claude Code, OpenCode, Cursor, Aider</span></th>
-                  <th>Autonomous SWE agents<br /><span style="font-weight:400;text-transform:none;letter-spacing:0">Devin &amp; hosted coding agents</span></th>
-                  <th class="nano">Nano Workforce</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td class="feature">Primary role</td>
-                  <td>Edit code in a session</td>
-                  <td>Complete one task autonomously</td>
-                  <td class="nano">Orchestrate many agents into a delivery workflow</td>
-                </tr>
-                <tr>
-                  <td class="feature">Interaction model</td>
-                  <td>Interactive, human-in-the-loop</td>
-                  <td>Fire-and-check, mostly hosted UI</td>
-                  <td class="nano">Modelled process; human only on escalation/approval</td>
-                </tr>
-                <tr>
-                  <td class="feature">Unit of work</td>
-                  <td>A prompt / a task</td>
-                  <td>A task / a ticket</td>
-                  <td class="nano">An issue &rarr; a graph of PRs</td>
-                </tr>
-                <tr>
-                  <td class="feature">Multi-agent fan-out</td>
-                  <td><span class="no">No</span></td>
-                  <td><span class="partial">Limited</span></td>
-                  <td class="nano"><span class="yes">Yes &mdash; levelized task graph</span></td>
-                </tr>
-                <tr>
-                  <td class="feature">Durable across restart / failure</td>
-                  <td><span class="no">Ephemeral session</span></td>
-                  <td><span class="partial">Vendor-hosted state</span></td>
-                  <td class="nano"><span class="yes">Yes &mdash; BPMN engine state</span></td>
-                </tr>
-                <tr>
-                  <td class="feature">Review-convergence loop</td>
-                  <td><span class="no">Manual</span></td>
-                  <td><span class="partial">Varies</span></td>
-                  <td class="nano"><span class="yes">Built-in, multi-round, capped</span></td>
-                </tr>
-                <tr>
-                  <td class="feature">Merge automation</td>
-                  <td><span class="no">You merge</span></td>
-                  <td><span class="partial">Opens a PR</span></td>
-                  <td class="nano"><span class="yes">CI-aware merge loop</span></td>
-                </tr>
-                <tr>
-                  <td class="feature">Model / provider</td>
-                  <td>Provider-agnostic (mostly)</td>
-                  <td>Proprietary / fixed</td>
-                  <td class="nano">Provider-agnostic; agents are pluggable</td>
-                </tr>
-                <tr>
-                  <td class="feature">Where it runs</td>
-                  <td>Your workstation</td>
-                  <td>Vendor cloud</td>
-                  <td class="nano">Your machine &mdash; or across an HA fleet</td>
-                </tr>
-                <tr>
-                  <td class="feature">Relationship to the others</td>
-                  <td colspan="2">Point tools &mdash; the hands that write code</td>
-                  <td class="nano"><span class="yes">Hires the tools on the left as workers</span></td>
-                </tr>
-              </tbody>
-            </table>
+            <!--LANDSCAPE_TABLE-->
           </div>
           <p class="note">
             Categories blur and vendors move fast; this is an indicative
