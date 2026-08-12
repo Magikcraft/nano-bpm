@@ -2805,6 +2805,51 @@ impl Engine {
                     }
                 }
 
+                // 5b. An already-*open* parallel-gateway join (a token has
+                //     arrived on some but not all of its incoming flows) carries
+                //     durable count-vs-threshold state: `join_counts` holds the
+                //     partial arrival count, but the threshold it is compared
+                //     against is read *live from the definition* at fire time
+                //     (`arrive_at_parallel_join` calls `incoming_count`, which
+                //     resolves against the instance's current process). Migration
+                //     swaps that definition, so mapping an open join onto a target
+                //     gateway with a different incoming-flow count silently
+                //     re-interprets the partial count against a new threshold:
+                //     the join can early-fire (target arity <= tokens already
+                //     arrived) or deadlock (target arity is unreachable because
+                //     the missing source flows do not exist in the target). The
+                //     discriminant-only type check in step 3 does not catch this
+                //     — both are `ParallelGateway`. Require incoming-flow-count
+                //     parity for every open join. This is the general guard for
+                //     the failure-mode class "durable count state whose threshold
+                //     lives in the definition being migrated away"; parallel-join
+                //     is the only such element today. Only *open* joins are
+                //     guarded: a join with no arrivals yet has no durable count to
+                //     re-interpret, so it may safely adopt the target's arity.
+                let instance = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .expect("instance existence checked above");
+                let mut open_joins: Vec<String> = instance.join_instances.keys().cloned().collect();
+                open_joins.sort();
+                for src in open_joins {
+                    let tgt = mapped
+                        .get(&src)
+                        .expect("an open join is active, so step 5 guarantees it is mapped");
+                    let source_incoming_count = source_def.definition.incoming_count(&src);
+                    let target_incoming_count = target.definition.incoming_count(tgt);
+                    if source_incoming_count != target_incoming_count {
+                        return Err(EngineError::MigratedParallelJoinArityChanged {
+                            instance_key,
+                            source_element_id: src,
+                            target_element_id: tgt.clone(),
+                            source_incoming_count,
+                            target_incoming_count,
+                        });
+                    }
+                }
+
                 // 6. All preconditions hold: emit the migration fact. The applier
                 //    rewrites the instance's process id and re-points every active
                 //    element instance and its attached runtime.
@@ -7461,6 +7506,19 @@ pub enum EngineError {
         source_element_id: String,
         target_element_id: String,
     },
+    /// A `MigrateInstance` mapped an already-open parallel-gateway *join* (a
+    /// token has arrived on some but not all of its incoming flows) onto a
+    /// target gateway with a different number of incoming sequence flows. The
+    /// join's partial arrival count is compared against the target definition's
+    /// incoming-flow count at fire time, so a mismatch would early-fire or
+    /// deadlock the migrated join. Maps to HTTP 409.
+    MigratedParallelJoinArityChanged {
+        instance_key: Key,
+        source_element_id: String,
+        target_element_id: String,
+        source_incoming_count: usize,
+        target_incoming_count: usize,
+    },
     /// A `MigrateInstance` targeted an instance that contains an active element
     /// class this phase does not yet support migrating (boundary events, event
     /// subprocesses, multi-instance bodies, call activities, event-based-gateway
@@ -7671,6 +7729,21 @@ impl std::fmt::Display for EngineError {
                 write!(
                     f,
                     "migration of instance {instance_key} maps element {source_element_id} to {target_element_id} of a different type"
+                )
+            }
+            EngineError::MigratedParallelJoinArityChanged {
+                instance_key,
+                source_element_id,
+                target_element_id,
+                source_incoming_count,
+                target_incoming_count,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} maps open parallel-join {source_element_id} \
+                     ({source_incoming_count} incoming flows) to {target_element_id} \
+                     ({target_incoming_count} incoming flows); an in-flight join can only map to a \
+                     gateway with the same number of incoming sequence flows"
                 )
             }
             EngineError::UnsupportedMigration {

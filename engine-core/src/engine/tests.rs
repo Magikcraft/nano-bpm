@@ -12538,6 +12538,105 @@ fn migration_remaps_both_parallel_join_maps_together() {
     );
 }
 
+/// An already-*open* parallel join (branch `a` has arrived, so a partial count
+/// of 1 is durably recorded) cannot be migrated onto a target join with a
+/// *different* number of incoming flows: the partial count is compared against
+/// the target definition's incoming-flow count at fire time, so a 2-flow join
+/// half-open at count 1, remapped onto a 3-flow join, would deadlock (its third
+/// flow never arrives) — and a wider-to-narrower remap would early-fire.
+/// Reject with `MigratedParallelJoinArityChanged`. Red/Green guard for the
+/// failure-mode class "durable count state whose threshold lives in the
+/// definition being migrated away".
+#[test]
+fn migration_rejects_open_join_with_different_incoming_arity() {
+    fn par_join_2(id: &str, split: &str, a: &str, b: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .parallel_gateway(split)
+            .service_task(a, "ja")
+            .service_task(b, "jb")
+            .parallel_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, a)
+            .connect(split, b)
+            .connect(a, join)
+            .connect(b, join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+    // Target join `join2` has THREE incoming flows, versus the source's two.
+    fn par_join_3(id: &str, split: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .parallel_gateway(split)
+            .service_task("a2", "ja")
+            .service_task("b2", "jb")
+            .service_task("c2", "jc")
+            .parallel_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, "a2")
+            .connect(split, "b2")
+            .connect(split, "c2")
+            .connect("a2", join)
+            .connect("b2", join)
+            .connect("c2", join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, par_join_2("source", "split", "a", "b", "join"));
+    let target_key = deploy_for_migration(&mut engine, par_join_3("target", "split2", "join2"));
+
+    let inst = create_instance_key(&mut engine, "source");
+    // Open the join: branch `a` arrives, leaving the join half-open at count 1.
+    complete_one(&mut engine, "ja");
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "precondition: the join is open before migration"
+    );
+
+    // Active elements now: parked task `b` and the open `join`. Map both, but
+    // point the open join at the 3-flow target join.
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("b".to_string(), "b2".to_string()),
+                ("join".to_string(), "join2".to_string()),
+            ],
+        ))
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            EngineError::MigratedParallelJoinArityChanged {
+                source_element_id,
+                target_element_id,
+                source_incoming_count: 2,
+                target_incoming_count: 3,
+                ..
+            } if source_element_id == "join" && target_element_id == "join2"
+        ),
+        "an open 2-flow join mapped onto a 3-flow join is rejected, got {err:?}"
+    );
+
+    // The rejection is all-or-nothing: the instance is untouched (still on the
+    // source definition, join still open on the source id).
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(instance.process_id, "source", "instance not migrated");
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "the open join is left intact on the source id"
+    );
+}
+
 #[test]
 fn migration_rejects_unknown_instance() {
     let mut engine = Engine::new();

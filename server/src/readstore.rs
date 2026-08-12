@@ -3711,8 +3711,6 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             //    mapping's source (loops / swaps). Job types are preserved (the
             //    worker keeps its lease), matching the applier.
             let active_el = element_instance_state_code(ElementInstanceState::Active);
-            let live_ut = user_task_state_code(UserTaskState::Created);
-            let active_inc = incident_state_code(IncidentState::Active);
             let tmp = |target: &str| format!("\u{1}mig:{target}");
 
             // Phase A — stamp matched live rows with a collision-free temp id.
@@ -3723,16 +3721,24 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                      WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
                     params![ik, source_id, t, active_el],
                 )?;
-                // No state filter: the engine applier re-points `element_id` on
-                // *every* job the instance owns (it loops all of `state.jobs`
-                // and never removes terminal rows), so a job that is live-but-
-                // parked (`Failed` with retries=0) or terminal (`Errored`/
-                // `Completed`/`Canceled`) is remapped there too. Filtering to
-                // `Created`/`Activated` here would be a narrower, divergent
-                // notion of "live" than the single source of truth (the engine)
-                // and would silently drift the read model — and adding a new
-                // job state would silently widen that drift. Mirror the applier
-                // exactly and remap by original element id alone.
+                // No state filter on jobs / user_tasks / incidents: the engine
+                // applier re-points `element_id` on *every* such row the instance
+                // owns — it loops all of `state.jobs`, `state.user_tasks` and
+                // `state.incidents` filtering only by `instance_key`, and never
+                // removes terminal rows — so a job that is live-but-parked
+                // (`Failed` with retries=0) or terminal (`Errored`/`Completed`/
+                // `Canceled`), a user task that is `Completed`/`Canceled`, and a
+                // `Resolved` incident are all remapped there too. Filtering to a
+                // "live" state here (`Created` user tasks / `Active` incidents)
+                // would be a narrower, divergent notion of "live" than the single
+                // source of truth (the engine) and would silently leave terminal
+                // rows pointing at stale source element ids (and, for those tables
+                // re-homed in Phase B, stale definition identity) — and adding a
+                // new state would silently widen that drift. Mirror the applier
+                // exactly and remap by original element id alone. (Only the
+                // `element_instances` remap keeps a state filter, because the
+                // applier likewise remaps only *active* element instances — the
+                // ids in `instance.active`.)
                 tx.cexecute(
                     "UPDATE jobs SET element_id = ?3 \
                      WHERE instance_key = ?1 AND element_id = ?2",
@@ -3740,13 +3746,13 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 )?;
                 tx.cexecute(
                     "UPDATE user_tasks SET element_id = ?3 \
-                     WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
-                    params![ik, source_id, t, live_ut],
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
                 )?;
                 tx.cexecute(
                     "UPDATE incidents SET element_id = ?3 \
-                     WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
-                    params![ik, source_id, t, active_inc],
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
                 )?;
                 // Message subscriptions in the read model are all live (rows are
                 // dropped on correlation/cancel/termination), and carry no

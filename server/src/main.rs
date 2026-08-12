@@ -15867,6 +15867,7 @@ fn migration_error_status(e: &EngineError) -> u16 {
         | EngineError::MappingTargetElementNotFound { .. } => 400,
         EngineError::UnmappedActiveElement { .. }
         | EngineError::MappedElementTypeChanged { .. }
+        | EngineError::MigratedParallelJoinArityChanged { .. }
         | EngineError::UnsupportedMigration { .. } => 409,
         _ => 500,
     }
