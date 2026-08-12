@@ -1947,15 +1947,13 @@ async fn handle_client_frame(
             target_process_definition_key,
             mapping_instructions,
         } => {
-            let target_key = match target_process_definition_key.parse::<u64>() {
+            let target_key = match parse_migration_target_key(&target_process_definition_key) {
                 Ok(k) => k,
-                Err(_) => {
+                Err((status, message)) => {
                     conn.send(ServerFrame::CommandResult {
                         corr,
-                        status: 404,
-                        body: Some(Value::String(format!(
-                            "Target process definition key '{target_process_definition_key}' is not a valid key."
-                        ))),
+                        status,
+                        body: Some(Value::String(message)),
                     });
                     return;
                 }
@@ -3044,6 +3042,22 @@ pub(crate) fn record_peer_backlog(node: u32, backlog: i64) {
         .insert(node, (backlog.max(0), Instant::now()));
 }
 
+/// Parse a migration target process-definition key from its wire string,
+/// classifying a malformed value as invalid input (HTTP 400) with the canonical
+/// message. This is the single source of truth shared by the public REST handler
+/// (`migrate_process_instance_impl`) and the intra-cluster `MigrateInstance`
+/// frame handler, so the two paths cannot drift on the status code: a malformed
+/// key is 400 INVALID_ARGUMENT (Zeebe parity), and 404 is reserved for
+/// well-formed keys that don't resolve to a live definition.
+pub(crate) fn parse_migration_target_key(raw: &str) -> Result<u64, (u16, String)> {
+    raw.parse::<u64>().map_err(|_| {
+        (
+            400,
+            format!("Target process definition key '{raw}' is not a valid key."),
+        )
+    })
+}
+
 /// Freshness window for a cached peer backlog hint, from
 /// `NANOBPMN_PEER_BACKLOG_FRESH_MS` (default 1000ms). A hint older than this is
 /// considered stale and forces a re-probe of that peer, so a node that was down
@@ -3684,7 +3698,31 @@ mod peer_backlog_freshness_tests {
     }
 }
 
-/// Drift guard: the public falcon protocol is hand-documented in
+#[cfg(test)]
+mod migration_target_key_tests {
+    use super::parse_migration_target_key;
+
+    /// A well-formed key parses through unchanged.
+    #[test]
+    fn well_formed_key_parses() {
+        assert_eq!(parse_migration_target_key("42"), Ok(42));
+    }
+
+    /// A malformed key is classified as 400 INVALID_ARGUMENT (Zeebe parity),
+    /// NOT 404 — this is the single source of truth shared by the REST handler
+    /// and the intra-cluster `MigrateInstance` frame handler, so neither path can
+    /// misreport a malformed key as `NotFound`.
+    #[test]
+    fn malformed_key_is_400_not_404() {
+        let (status, message) = parse_migration_target_key("not-a-key").unwrap_err();
+        assert_eq!(status, 400, "malformed target key must be 400, not 404");
+        assert_eq!(
+            message,
+            "Target process definition key 'not-a-key' is not a valid key."
+        );
+    }
+}
+
 /// `docs/falcon.asyncapi.yaml` (a WebSocket protocol can't be modelled
 /// by OpenAPI, so it is not code-generated). These tests pin the spec to the
 /// `ClientFrame` / `ServerFrame` enums it claims to mirror, so the spec — and

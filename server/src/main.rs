@@ -4284,20 +4284,19 @@ impl ServerImpl {
             }
         };
 
-        let target_process_definition_key: u64 = match body.target_process_definition_key.0.parse()
-        {
+        let target_process_definition_key: u64 = match crate::falcon::parse_migration_target_key(
+            &body.target_process_definition_key.0,
+        ) {
             Ok(k) => k,
-            Err(_) => {
-                // A malformed body field is invalid input, not a missing
-                // resource: Zeebe parity returns 400 INVALID_ARGUMENT here and
-                // reserves 404 for well-formed keys that don't resolve.
+            // A malformed body field is invalid input, not a missing
+            // resource: Zeebe parity returns 400 INVALID_ARGUMENT here and
+            // reserves 404 for well-formed keys that don't resolve. Shared
+            // with the intra-cluster frame handler so the two cannot drift.
+            Err((_status, detail)) => {
                 return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
                     "Invalid migration",
                     400,
-                    format!(
-                        "Target process definition key '{}' is not a valid key.",
-                        body.target_process_definition_key.0
-                    ),
+                    detail,
                 )));
             }
         };
