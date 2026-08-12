@@ -11,6 +11,10 @@ ADR 0051 (`0051-nano-workforce.md`, the crew orchestrator — one of the two wor
 ADR 0046 (`0046-agent-as-worker-vs-agent-in-the-node.md`, **agent-as-worker** — the topology whose
 workers a machine runs),
 ADR 0028 (`0028-urban-app-user-auth-identity-authorization.md`, the identity a machine enrols under),
+ADR 0058 (`0058-openapi-endpoint-surface.md`, the Urban **`api` primitive** — the contract-first
+endpoint surface this ADR's enrol/vocab/registry endpoints are *generated* by, not hand-rolled),
+ADR 0052 (`0052-urban-runtime-decoupled-manifest-interpreter.md`, the Urban runtime whose primitives
+— pages, workers, connectors, `api` — this ADR joins with a generic **enrolment capability**),
 ADR 0035 (`0035-observability-config-and-standalone-console.md`, runtime console profiles the
 supervisor already threads through),
 `c8ctl-plugin.js` in the `jwulf/c8ctl-plugin-nano` repo (the `supervisor` daemon and the `nano work`
@@ -85,6 +89,8 @@ Each app is the **hub** for its own work (ADR 0056 §4): it owns a versioned **v
 networks/roles/requirements) and a live **demand** view (its deployed leaves). On enrol it returns the
 leaf tokens this machine both **qualifies for** (capability satisfies the role's `requires`) and the
 app **currently demands** — and pushes an updated set whenever demand, the vocab, or the fleet changes.
+The demand view is **not hand-maintained**: it is *derived from the app's models* by Urban Gen (§9), so
+"what work exists" stays authoritative-from-model.
 
 ```
 supervisor → app:  ENROL   { capability: { family, cognition, weight }, host }
@@ -140,6 +146,31 @@ Each app publishes **demand × supply** (ADR 0056 §11); the **host console aggr
 installed app** into one board — *"`annotate.label.adjudicate` is demanded, no frontier machine
 enrolled"* in red; *"`planning.spar` seats are both `opus` — diversity degraded"* in amber. The
 operator's answer to *"what needs serving, and what can I serve?"* is one screen, spanning all apps.
+
+### 9. The endpoints are generated, not hand-rolled — scaffold + Urban Gen
+
+The enrol/vocab/registry endpoints are a **generic Urban enrolment capability** (ADR 0056 §4 — "the
+way apps get pages and workers"), delivered through the toolchain apps already use, so **no app author
+writes a line of enrolment plumbing:**
+
+- **`create-urban-app` scaffolds the OpenAPI endpoint.** A new Urban app is scaffolded with the
+  enrolment `api: { spec }` fragment (ADR 0058) already wired — the enrol/vocab/registry contract the
+  supervisor points at. Because the endpoint surface is generated from OpenAPI by the existing `api`
+  primitive, this is just one more shipped spec fragment + its capability-provided delegates, not a new
+  runtime HTTP primitive.
+- **Urban Gen generates what backs the endpoint by analyzing the model.** The **demand** view (and the
+  model-derived slice of the vocab — the actual task-type leaves each process demands) is produced by a
+  **deriver in `urban gen`**, extending the same model-scanning pass that already exists: the `worker-io`
+  deriver "scans each process for service tasks and extracts the Zeebe task type" (ADR 0033 §3 / ADR
+  0053). A companion **demand deriver** folds those leaves — across every deployed BPMN *and* code-first
+  `defineFlow` (which compiles to the same BPMN service tasks) — into the demand artifact the enrolment
+  endpoint serves. Re-running `urban gen` after a model change re-derives demand; the endpoint reflects
+  it on next `SERVE` push.
+
+So the split is: **capability (requirements, seats, cognition) is author-declared** in the vocab, but
+**demand (which leaves actually exist) is derived from the models by Urban Gen** — the same authored-
+semantics / generated-DI split the toolkit already draws elsewhere. The supervisor sees one coherent
+endpoint; the app author sees generated plumbing plus a small vocab they own.
 
 ## Worked example — two apps, three machines
 
@@ -200,6 +231,15 @@ should help; its demand appears on the board, and qualifying machines start serv
 
 ## Endpoint contract (app-side)
 
+These endpoints are **not hand-written per app** — they are generated (§9): a **generic Urban enrolment
+capability** ships the endpoints, the registry DataLayer schema, the capability→token resolver, the live
+SERVE stream, and the demand×supply page, so an author supplies **only its vocab artifact** (and its
+models, from which demand is derived). The capability is built on the existing Urban **`api` primitive**
+(ADR 0058): the enrol/vocab/registry contract is a shipped OpenAPI fragment the runtime already mounts +
+validates under a framework-constant prefix, with capability-provided delegates behind each
+`operationId` — **no new bespoke HTTP-routing primitive** in the runtime, just a packaged `api` surface
++ DataLayer migration + resolver + page + Urban Gen deriver, versioned with the capability.
+
 ```
 GET  /apps/<app>/vocab                    → { networks, requirements, version }
 POST /apps/<app>/enrol { capability, host }
@@ -207,9 +247,12 @@ POST /apps/<app>/enrol { capability, host }
 GET  /apps/<app>/registry                 → demand × supply (for the console board)
 ```
 
-`enrol` is idempotent per (app, machine); the stream delivers a fresh `serve` set on any demand/vocab/
-fleet change. The supervisor holds one session per enrolled app, intersects each `serve` with the
-operator's scope (§6), unions across apps, and reconciles.
+Because the mount is a **framework constant** (like `/app/api`), the supervisor points at
+`http://host:8080/apps/<app>/` and hits the well-known enrolment path — no per-app URL scheme to guess,
+which is also what makes an app **directory** (Open questions) a thin add: list installed apps, each
+already exposes the same contract. `enrol` is idempotent per (app, machine); the stream delivers a
+fresh `serve` set on any demand/vocab/fleet change. The supervisor holds one session per enrolled app,
+intersects each `serve` with the operator's scope (§6), unions across apps, and reconciles.
 
 ## Consequences
 
@@ -224,6 +267,9 @@ operator's scope (§6), unions across apps, and reconciles.
 - New app-tier surface: the supervisor's enrolment client + multi-app SERVE merge (small — it reuses the
   existing reconcile loop), and each app's enrol/vocab/registry endpoints (a thin layer over the ADR 0056
   registry it already needs).
+- The enrolment endpoints are **generated, not authored**: `create-urban-app` scaffolds the OpenAPI
+  fragment and Urban Gen's demand deriver analyzes the models — so every Urban app gets a supervisor-
+  pointable endpoint for free, and demand stays authoritative-from-model rather than a hand-kept list.
 - The engine stays a frozen, agent-oblivious C8 router; `nano work` children stay dumb 1:1 pollers.
 
 ## Open questions
@@ -239,6 +285,11 @@ operator's scope (§6), unions across apps, and reconciles.
   every open enrolment?
 - **App discovery.** The examples hard-code app URLs. Should the host expose an **app directory**
   (installed apps + their enrol endpoints) so `supervisor enrol` can offer a pick-list instead of a URL?
+- **How much vocab is derivable vs authored.** Demand (which leaves exist) is derived from the models
+  (§9), but role *requirements* (`requires: frontier`, seats, `seatsDistinctFamily`) are author-declared.
+  Could requirements be partly derived too — e.g. from `zeebe:property` / headers on the task, so a model
+  that tags a task `requires=frontier` needs no separate vocab entry — and where is the authored residue
+  kept so Urban Gen never clobbers it?
 - **Scope expression.** The shape of the operator's allow/deny scope (§6) — prefix globs, per-role cost
   caps, budget ceilings — and where it is persisted (supervisor state vs the app registry).
 - **Cross-supervisor coordination.** Seat placement is global (§7); the supervisor is per-machine. Does
