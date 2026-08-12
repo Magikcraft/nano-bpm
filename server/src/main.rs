@@ -8619,10 +8619,8 @@ impl ServerImpl {
     /// joining each correlation's instance to `process_instances`. Honours the Zeebe
     /// filter, sort and cursor-pagination contract.
     ///
-    /// Limitations: `partitionId` (Integer) and `correlationTime` (DateTime)
-    /// filtering are not yet supported (the values are returned); and only
-    /// instance-scoped correlations are recorded (message-*start* correlations,
-    /// which spawn a new instance, are not).
+    /// Limitation: only instance-scoped correlations are recorded (message-*start*
+    /// correlations, which spawn a new instance, are not).
     async fn search_correlated_message_subscriptions_impl(
         &self,
         body: &Option<models::CorrelatedMessageSubscriptionSearchQuery>,
@@ -8652,15 +8650,20 @@ impl ServerImpl {
 
         let entries: Vec<CorrEntry> = rows
             .into_iter()
-            .map(|row| {
-                let inst = by_instance.get(&row.instance_key);
-                CorrEntry {
+            .filter_map(|row| {
+                // Skip correlations whose owning instance is not yet projected
+                // (eventual consistency / shard ordering). `processDefinitionId`
+                // and `processDefinitionKey` are required, non-nullable fields in
+                // the correlated-subscription result schema, so emitting a row with
+                // an empty definition id / key would be malformed Zeebe-parity
+                // output. Surfacing the correlation only once its instance join
+                // resolves keeps the row atomic.
+                let inst = by_instance.get(&row.instance_key)?;
+                Some(CorrEntry {
                     message_key: row.message_key,
                     subscription_key: row.subscription_key,
-                    process_definition_id: inst
-                        .map(|i| i.process_definition_id.clone())
-                        .unwrap_or_default(),
-                    process_definition_key: inst.map(|i| i.process_definition_key.clone()),
+                    process_definition_id: inst.process_definition_id.clone(),
+                    process_definition_key: Some(inst.process_definition_key.clone()),
                     process_instance_key: row.instance_key,
                     element_id: row.element_id,
                     element_instance_key: row.element_instance_key,
@@ -8668,18 +8671,23 @@ impl ServerImpl {
                     correlation_key: row.correlation_key,
                     correlation_time_ms: row.correlation_time_ms,
                     partition_id: row.partition_id,
-                }
+                })
             })
             .collect();
 
-        // `partitionId` (Integer) and `correlationTime` (DateTime) filters are not
-        // yet supported; all other Zeebe filters are honoured.
+        // Every Zeebe `CorrelatedMessageSubscriptionFilter` field is honoured,
+        // including `partitionId` (Integer) and `correlationTime` (DateTime).
         let mut matched: Vec<CorrEntry> = entries
             .into_iter()
             .filter(|e| match filter {
                 None => true,
                 Some(f) => {
                     query::match_string(&f.correlation_key, &e.correlation_key)
+                        && query::match_integer(&f.partition_id, Some(i64::from(e.partition_id)))
+                        && query::match_date_time_ms(
+                            &f.correlation_time,
+                            Some(e.correlation_time_ms as i64),
+                        )
                         && query::match_string(&f.element_id, &e.element_id)
                         && query::match_element_instance_key(
                             &f.element_instance_key,
@@ -8730,6 +8738,7 @@ impl ServerImpl {
                 ),
                 "processInstanceKey" => query::SortVal::Num(e.process_instance_key as i64),
                 "subscriptionKey" => query::SortVal::Num(e.subscription_key as i64),
+                "tenantId" => query::SortVal::Str("<default>".to_string()),
                 _ => query::SortVal::Num(e.message_key as i64),
             },
             |e| e.message_key,
@@ -21014,6 +21023,76 @@ mod clustered_startup_tests {
             panic!("expected a 200 result");
         };
         assert_eq!(result.items.len(), 1);
+
+        // Zeebe-parity Integer/DateTime filters: partitionId and correlationTime.
+        // partitionId is 1-based; the sole correlation is on partition 1.
+        let by_partition = models::CorrelatedMessageSubscriptionFilter {
+            partition_id: Some(models::IntegerFilterProperty::I32(corr.partition_id)),
+            ..models::CorrelatedMessageSubscriptionFilter::new()
+        };
+        let resp = server
+            .search_correlated_message_subscriptions_impl(&Some(
+                models::CorrelatedMessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(by_partition),
+                },
+            ))
+            .await
+            .expect("partition-filtered search returns");
+        let Resp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert_eq!(result.items.len(), 1, "partitionId filter matches");
+
+        let wrong_partition = models::CorrelatedMessageSubscriptionFilter {
+            partition_id: Some(models::IntegerFilterProperty::I32(corr.partition_id + 1)),
+            ..models::CorrelatedMessageSubscriptionFilter::new()
+        };
+        let resp = server
+            .search_correlated_message_subscriptions_impl(&Some(
+                models::CorrelatedMessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(wrong_partition),
+                },
+            ))
+            .await
+            .expect("partition-filtered search returns");
+        let Resp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert!(
+            result.items.is_empty(),
+            "a non-matching partitionId excludes the row"
+        );
+
+        // correlationTime is a real DateTime filter: an open upper bound matches.
+        let by_time = models::CorrelatedMessageSubscriptionFilter {
+            correlation_time: Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                models::AdvancedDateTimeFilter {
+                    dollar_gt: Some(
+                        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(0).unwrap(),
+                    ),
+                    ..models::AdvancedDateTimeFilter::new()
+                },
+            )),
+            ..models::CorrelatedMessageSubscriptionFilter::new()
+        };
+        let resp = server
+            .search_correlated_message_subscriptions_impl(&Some(
+                models::CorrelatedMessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(by_time),
+                },
+            ))
+            .await
+            .expect("time-filtered search returns");
+        let Resp::Status200_TheCorrelatedMessageSubscriptionsSearchResult(result) = resp else {
+            panic!("expected a 200 result");
+        };
+        assert_eq!(result.items.len(), 1, "correlationTime $gt epoch matches");
 
         let miss = models::CorrelatedMessageSubscriptionFilter {
             message_name: Some(models::StringFilterProperty::String("Nope".to_string())),
