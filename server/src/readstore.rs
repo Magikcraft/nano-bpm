@@ -3723,16 +3723,20 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                      WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
                     params![ik, source_id, t, active_el],
                 )?;
+                // No state filter: the engine applier re-points `element_id` on
+                // *every* job the instance owns (it loops all of `state.jobs`
+                // and never removes terminal rows), so a job that is live-but-
+                // parked (`Failed` with retries=0) or terminal (`Errored`/
+                // `Completed`/`Canceled`) is remapped there too. Filtering to
+                // `Created`/`Activated` here would be a narrower, divergent
+                // notion of "live" than the single source of truth (the engine)
+                // and would silently drift the read model — and adding a new
+                // job state would silently widen that drift. Mirror the applier
+                // exactly and remap by original element id alone.
                 tx.cexecute(
                     "UPDATE jobs SET element_id = ?3 \
-                     WHERE instance_key = ?1 AND element_id = ?2 AND state IN (?4, ?5)",
-                    params![
-                        ik,
-                        source_id,
-                        t,
-                        job_state_code(JobState::Created),
-                        job_state_code(JobState::Activated)
-                    ],
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
                 )?;
                 tx.cexecute(
                     "UPDATE user_tasks SET element_id = ?3 \
@@ -4621,7 +4625,7 @@ mod decision_deletion_tests {
 mod element_instance_tests {
     use std::collections::HashMap;
 
-    use nanobpmn_engine_core::{Event, ProcessBuilder};
+    use nanobpmn_engine_core::{Event, JobState, Key, ProcessBuilder};
 
     use super::{ElementInstanceState, ReadStore};
 
@@ -5025,5 +5029,98 @@ mod element_instance_tests {
         assert_eq!(inst.process_definition_id, "p2");
         assert_eq!(inst.process_definition_key, target_key.to_string());
         assert_eq!(inst.version, 3);
+    }
+
+    #[test]
+    fn migration_remaps_parked_and_terminal_job_element_ids() {
+        // The engine applier re-points `element_id` on *every* job the instance
+        // owns — it loops all of `state.jobs` and never removes terminal rows —
+        // so a parked (`Failed`, retries=0) or terminal (`Errored`) job is
+        // remapped there too. The read model must mirror that, or a job row is
+        // left pointing at the source `element_id` the engine no longer runs
+        // under. This guards the whole defect class (any job state, not just the
+        // two the projection used to allow-list) against silent drift.
+        let store = ReadStore::open(None).unwrap();
+
+        let target = ProcessBuilder::new("p2")
+            .start_event("s2")
+            .service_task("t2", "worker")
+            .with_name("t2", "My Task 2")
+            .end_event("e2")
+            .connect("s2", "t2")
+            .connect("t2", "e2")
+            .build()
+            .unwrap();
+        let target_key: u64 = 600;
+
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::ProcessDeployed {
+                    deployment_key: 2,
+                    process_definition_key: target_key,
+                    version: 3,
+                    process: target,
+                },
+                // A parked job (retries exhausted) on the source element `t`.
+                &Event::JobCreated {
+                    job_key: 7001,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobFailed {
+                    job_key: 7001,
+                    instance_key: INST,
+                    retries: 0,
+                },
+                // A terminal errored job on the same source element.
+                &Event::JobCreated {
+                    job_key: 7002,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobErrorThrown {
+                    job_key: 7002,
+                    instance_key: INST,
+                    error_code: "BOOM".to_string(),
+                },
+            ])
+            .unwrap();
+        let before: HashMap<Key, JobState> =
+            store.jobs().into_iter().map(|j| (j.key, j.state)).collect();
+        assert_eq!(before.get(&7001), Some(&JobState::Failed));
+        assert_eq!(before.get(&7002), Some(&JobState::Errored));
+
+        store
+            .export(&[&Event::ProcessInstanceMigrated {
+                instance_key: INST,
+                target_process_id: "p2".to_string(),
+                target_process_definition_key: target_key,
+                element_mappings: vec![("t".to_string(), "t2".to_string())],
+            }])
+            .unwrap();
+
+        // Both the parked and the terminal job re-home onto the target element
+        // id and pick up the target definition identity — matching the engine.
+        for job in store.jobs() {
+            assert_eq!(
+                job.element_id, "t2",
+                "job {} left pointing at stale source element id",
+                job.key
+            );
+            assert_eq!(job.process_definition_id, "p2");
+            assert_eq!(job.process_definition_key, target_key.to_string());
+        }
     }
 }
