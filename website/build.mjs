@@ -708,6 +708,7 @@ function siteNav() {
   <a class="brand" href="/">nanobpm<span class="dim">.io</span></a>
   <nav>
     <a href="/architecture/">Architecture</a>
+    <a href="/architecture/#landscape">Compare</a>
     <a href="/demo/">Demo</a>
     ${whitepaperPresent ? '<a href="/whitepaper/">Whitepaper</a>' : ""}
     ${docsPresent ? '<a href="/docs/">Docs</a>' : ""}
@@ -831,6 +832,25 @@ function architectureHtml() {
 
   .arch-foot { max-width: 52rem; margin: 2.8rem auto 0; text-align: center; }
   .arch-foot .cta { display: flex; gap: .8rem; justify-content: center; flex-wrap: wrap; margin-top: 1.4rem; }
+
+  .arch-section { max-width: 52rem; margin: 3.6rem auto 0; }
+  .arch-section > h2 { font-size: clamp(1.5rem, 3.4vw, 2rem); text-align: center; margin: 0 0 .5rem; }
+  .arch-section > .lede { text-align: center; margin: 0 auto 1.6rem; }
+  .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); backdrop-filter: blur(6px); }
+  table.landscape { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  table.landscape th, table.landscape td { text-align: left; padding: .7rem .9rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.landscape thead th { color: var(--muted); font-weight: 700; font-size: .82rem; }
+  table.landscape thead th small { display: block; font-weight: 400; color: var(--muted); opacity: .8; font-size: .82em; margin-top: .2rem; }
+  table.landscape thead th.nano { color: var(--emerald); }
+  table.landscape tbody tr:last-child td { border-bottom: none; }
+  table.landscape td.feature { color: var(--muted); white-space: nowrap; }
+  table.landscape td.nano { color: var(--ink); background: rgba(52,211,153,.06); }
+  table.landscape .yes { color: var(--emerald); font-weight: 600; }
+  table.landscape .no { color: #f87171; }
+  table.landscape .partial { color: #fbbf24; }
+  .arch-note { font-size: .84rem; color: var(--muted); opacity: .85; text-align: center; margin-top: .9rem; }
+  blockquote.crib { margin: 1.2rem 0; padding: .5rem 0 .5rem 1.1rem; border-left: 3px solid rgba(52,211,153,.5); color: var(--ink); font-style: italic; }
+  blockquote.crib .src { display: block; font-style: normal; color: var(--muted); font-size: .88rem; margin-top: .4rem; }
 </style>
 
 <section class="arch-hero">
@@ -844,6 +864,103 @@ function architectureHtml() {
   <div class="stack">
 ${layers}
   </div>
+</section>
+
+<section class="arch-section wrap" id="landscape">
+  <h2>Where it sits in the landscape</h2>
+  <p class="lede">Nano Workforce isn&rsquo;t a faster coding agent &mdash; it&rsquo;s a
+  different layer. Here&rsquo;s where it sits relative to the tools you already know.</p>
+  <div class="table-wrap">
+    <table class="landscape">
+      <thead>
+        <tr>
+          <th>Capability</th>
+          <th>Interactive coding agents<small>Copilot CLI, Claude Code, OpenCode, Cursor, Aider</small></th>
+          <th>Autonomous SWE agents<small>Devin &amp; hosted coding agents</small></th>
+          <th class="nano">Nano Workforce</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="feature">Primary role</td>
+          <td>Edit code in a session</td>
+          <td>Complete one task autonomously</td>
+          <td class="nano">Orchestrate many agents into a delivery workflow</td>
+        </tr>
+        <tr>
+          <td class="feature">Interaction model</td>
+          <td>Interactive, human-in-the-loop</td>
+          <td>Fire-and-check, mostly hosted UI</td>
+          <td class="nano">Modelled graph; human only on escalation/approval</td>
+        </tr>
+        <tr>
+          <td class="feature">Unit of work</td>
+          <td>A prompt / a task</td>
+          <td>A task / a ticket</td>
+          <td class="nano">An issue &rarr; a graph of PRs</td>
+        </tr>
+        <tr>
+          <td class="feature">Multi-agent fan-out</td>
+          <td><span class="no">No</span></td>
+          <td><span class="partial">Limited</span></td>
+          <td class="nano"><span class="yes">Yes &mdash; levelized task graph</span></td>
+        </tr>
+        <tr>
+          <td class="feature">Durable across restart / failure</td>
+          <td><span class="no">Ephemeral session</span></td>
+          <td><span class="partial">Vendor-hosted state</span></td>
+          <td class="nano"><span class="yes">Yes &mdash; engine journal</span></td>
+        </tr>
+        <tr>
+          <td class="feature">Review-convergence loop</td>
+          <td><span class="no">Manual</span></td>
+          <td><span class="partial">Varies</span></td>
+          <td class="nano"><span class="yes">Built-in, multi-round, capped</span></td>
+        </tr>
+        <tr>
+          <td class="feature">Merge automation</td>
+          <td><span class="no">You merge</span></td>
+          <td><span class="partial">Opens a PR</span></td>
+          <td class="nano"><span class="yes">CI-aware merge loop</span></td>
+        </tr>
+        <tr>
+          <td class="feature">Model / provider</td>
+          <td>Provider-agnostic (mostly)</td>
+          <td>Proprietary / fixed</td>
+          <td class="nano">Provider-agnostic; agents are pluggable</td>
+        </tr>
+        <tr>
+          <td class="feature">Where it runs</td>
+          <td>Your workstation</td>
+          <td>Vendor cloud</td>
+          <td class="nano">Your machine &mdash; or across an HA fleet</td>
+        </tr>
+        <tr>
+          <td class="feature">Relationship to the others</td>
+          <td colspan="2">Point tools &mdash; the hands that write code</td>
+          <td class="nano"><span class="yes">Hires the tools on the left as workers</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="arch-note">Categories blur and vendors move fast &mdash; this is an indicative
+  positioning map, not a scorecard. The point is the axis: single-agent tools operate one
+  session at a time; Nano Workforce coordinates many of them durably.</p>
+</section>
+
+<section class="arch-section wrap" id="complementary">
+  <h2>Complementary, not competing</h2>
+  <p class="lede">OpenCode, Claude Code and the Copilot CLI are exactly the kind of worker
+  Nano Workforce hires. Adopting Nano doesn&rsquo;t replace your coding agent &mdash; it puts
+  a durable orchestrator around it.</p>
+  <blockquote class="crib">
+    &ldquo;The agents are external workers you <em>hire</em> (any coding-agent CLI harness,
+    e.g. the GitHub Copilot CLI). Nano Workforce owns the orchestration; the agents do the work.&rdquo;
+    <span class="src">&mdash; Nano Workforce README</span>
+  </blockquote>
+  <p class="lede" style="margin-top:1.2rem">So the question isn&rsquo;t &ldquo;Nano <em>or</em>
+  OpenCode?&rdquo; &mdash; it&rsquo;s &ldquo;which agent do I want Nano to drive?&rdquo; Swap the
+  harness without rewriting the workflow; the plan / review / merge graph stays the same.</p>
 </section>
 
 <section class="arch-foot wrap">

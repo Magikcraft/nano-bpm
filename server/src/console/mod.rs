@@ -84,6 +84,11 @@ const FEATURES_HTML: &str = include_str!("features.html");
 /// inline SVG diagrams), served at `/optimization`.
 const OPTIMIZATION_HTML: &str = include_str!("optimization.html");
 
+/// The standalone stack-positioning page (self-contained) explaining where
+/// Nano BPM and Nano Workforce sit relative to coding agents, served at
+/// `/stack`.
+const STACK_HTML: &str = include_str!("stack.html");
+
 /// Result of a console API core handler: a JSON body on success, or an HTTP
 /// status + message on failure. The generated trait layer (`generated_api`)
 /// maps these onto the spec's typed response variants.
@@ -95,6 +100,7 @@ pub fn router(server: ServerImpl) -> Router {
         .route("/", get(landing))
         .route("/features", get(features))
         .route("/optimization", get(optimization))
+        .route("/stack", get(stack))
         .route("/swagger", get(swagger_index))
         .route("/swagger/", get(swagger_index))
         .route("/swagger/{*path}", get(swagger_asset))
@@ -393,6 +399,15 @@ async fn optimization() -> Response {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         OPTIMIZATION_HTML,
+    )
+        .into_response()
+}
+
+/// Serves the standalone stack-positioning page at `/stack`.
+async fn stack() -> Response {
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        STACK_HTML,
     )
         .into_response()
 }
