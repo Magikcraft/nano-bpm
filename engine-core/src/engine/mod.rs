@@ -2577,6 +2577,183 @@ impl Engine {
                 }
             }
 
+            Command::MigrateInstance {
+                instance_key,
+                target_process_definition_key,
+                mapping_instructions,
+            } => {
+                // 1. Only an active instance can be migrated; unknown or finished
+                //    is a clean 404 (mirrors CancelInstance).
+                let source_process_id = match self.state.instances.get(&instance_key) {
+                    Some(i) if i.state == ProcessInstanceState::Active => i.process_id.clone(),
+                    _ => return Err(EngineError::InstanceNotFound { instance_key }),
+                };
+
+                // 2. The target definition must be deployed. `state.processes` is
+                //    keyed by process id and retains only the latest version, so
+                //    the target key must belong to a currently-deployed latest
+                //    version (Phase 1 limitation, matches the model).
+                let target = self
+                    .state
+                    .processes
+                    .values()
+                    .find(|dp| dp.key == target_process_definition_key)
+                    .ok_or(EngineError::TargetProcessDefinitionNotFound {
+                        process_definition_key: target_process_definition_key,
+                    })?;
+                let target_process_id = target.definition.id.clone();
+
+                // The instance's current definition is the source of truth for its
+                // active elements' types (only the latest version is retained).
+                let source_def = self.state.processes.get(&source_process_id).ok_or(
+                    EngineError::ProcessNotFound {
+                        process_id: source_process_id.clone(),
+                    },
+                )?;
+
+                // 3. No duplicate source ids; every mapped source/target element
+                //    exists; each mapped pair keeps the same BPMN type (compared
+                //    by discriminant only, so a service task may map to one with a
+                //    different job type — Zeebe parity).
+                let mut mapped: HashMap<String, String> =
+                    HashMap::with_capacity(mapping_instructions.len());
+                for (src, tgt) in &mapping_instructions {
+                    if mapped.contains_key(src) {
+                        return Err(EngineError::DuplicateMappingSourceElement {
+                            instance_key,
+                            element_id: src.clone(),
+                        });
+                    }
+                    let src_el = source_def.definition.element(src).ok_or_else(|| {
+                        EngineError::MappingSourceElementNotFound {
+                            instance_key,
+                            element_id: src.clone(),
+                        }
+                    })?;
+                    let tgt_el = target.definition.element(tgt).ok_or_else(|| {
+                        EngineError::MappingTargetElementNotFound {
+                            target_process_definition_key,
+                            element_id: tgt.clone(),
+                        }
+                    })?;
+                    if std::mem::discriminant(&src_el.kind) != std::mem::discriminant(&tgt_el.kind)
+                    {
+                        return Err(EngineError::MappedElementTypeChanged {
+                            instance_key,
+                            source_element_id: src.clone(),
+                            target_element_id: tgt.clone(),
+                        });
+                    }
+                    mapped.insert(src.clone(), tgt.clone());
+                }
+
+                // 4. Reject element classes this phase cannot remap safely.
+                //    Two sources of "unsupported":
+                //    (a) an active element instance whose own kind is a
+                //        sub-process, call activity, or event-based gateway (the
+                //        token rests directly on it, so it appears in `active`);
+                //    (b) an armed boundary event — its runtime (timer/subscription)
+                //        is stored against the *host* activity's element id with a
+                //        boundary `kind`, so the boundary element id lives inside
+                //        that kind rather than in `active`.
+                //    Zeebe rejects several of these as "not supported yet";
+                //    reproducing the rejection is parity.
+                let instance = self
+                    .state
+                    .instances
+                    .get(&instance_key)
+                    .expect("instance existence checked above");
+                let mut active_ids: Vec<String> = instance.active.values().cloned().collect();
+                active_ids.sort();
+                active_ids.dedup();
+                for eid in &active_ids {
+                    if let Some(el) = source_def.definition.element(eid) {
+                        if let Some(reason) = unsupported_migration_reason(&el.kind) {
+                            return Err(EngineError::UnsupportedMigration {
+                                instance_key,
+                                element_id: eid.clone(),
+                                reason: reason.to_string(),
+                            });
+                        }
+                    }
+                }
+                let boundary_reason = "boundary events are not migratable yet";
+                let mut armed_boundaries: Vec<String> = Vec::new();
+                for t in self.state.timers.values() {
+                    if t.instance_key == instance_key {
+                        match &t.kind {
+                            state::TimerKind::InterruptingBoundary {
+                                boundary_element_id,
+                            }
+                            | state::TimerKind::NonInterruptingBoundary {
+                                boundary_element_id,
+                            } => armed_boundaries.push(boundary_element_id.clone()),
+                            _ => {}
+                        }
+                    }
+                }
+                let boundary_kind = |kind: &state::MessageSubscriptionKind| match kind {
+                    state::MessageSubscriptionKind::InterruptingBoundary {
+                        boundary_element_id,
+                    }
+                    | state::MessageSubscriptionKind::NonInterruptingBoundary {
+                        boundary_element_id,
+                    } => Some(boundary_element_id.clone()),
+                    _ => None,
+                };
+                for s in self.state.message_subscriptions.values() {
+                    if s.instance_key == instance_key {
+                        if let Some(id) = boundary_kind(&s.kind) {
+                            armed_boundaries.push(id);
+                        }
+                    }
+                }
+                for s in self.state.signal_subscriptions.values() {
+                    if s.instance_key == instance_key {
+                        if let Some(id) = boundary_kind(&s.kind) {
+                            armed_boundaries.push(id);
+                        }
+                    }
+                }
+                for s in self.state.conditional_subscriptions.values() {
+                    if s.instance_key == instance_key {
+                        if let Some(id) = boundary_kind(&s.kind) {
+                            armed_boundaries.push(id);
+                        }
+                    }
+                }
+                if let Some(boundary_element_id) = armed_boundaries.into_iter().min() {
+                    return Err(EngineError::UnsupportedMigration {
+                        instance_key,
+                        element_id: boundary_element_id,
+                        reason: boundary_reason.to_string(),
+                    });
+                }
+
+                // 5. Every active element instance must have a mapping.
+                for eid in &active_ids {
+                    if !mapped.contains_key(eid) {
+                        return Err(EngineError::UnmappedActiveElement {
+                            instance_key,
+                            element_id: eid.clone(),
+                        });
+                    }
+                }
+
+                // 6. All preconditions hold: emit the migration fact. The applier
+                //    rewrites the instance's process id and re-points every active
+                //    element instance and its attached runtime.
+                self.emit(
+                    &mut log,
+                    Event::ProcessInstanceMigrated {
+                        instance_key,
+                        target_process_id,
+                        target_process_definition_key,
+                        element_mappings: mapping_instructions,
+                    },
+                );
+            }
+
             Command::ModifyInstance {
                 instance_key,
                 activate_instructions,
@@ -7180,6 +7357,76 @@ pub enum EngineError {
     /// container. (The agent-job completion seam, #614 gap 4, still ends a turn
     /// by activating nothing; only this external command forbids it.)
     AdHocNoActivationTargets { ad_hoc_instance_key: Key },
+    /// A `MigrateInstance` named a `target_process_definition_key` that is not
+    /// deployed (or is not the latest retained version of its process id). Maps
+    /// to HTTP 404. Zeebe parity: "expected to migrate ... but the target process
+    /// definition could not be found".
+    TargetProcessDefinitionNotFound { process_definition_key: Key },
+    /// A `MigrateInstance` mapping list contained the same `source_element_id`
+    /// twice. Maps to HTTP 400. Zeebe parity: "the mapping instructions ... target
+    /// the same source element more than once".
+    DuplicateMappingSourceElement {
+        instance_key: Key,
+        element_id: String,
+    },
+    /// A `MigrateInstance` mapping referenced a `source_element_id` absent from
+    /// the instance's (current) process definition. Maps to HTTP 400.
+    MappingSourceElementNotFound {
+        instance_key: Key,
+        element_id: String,
+    },
+    /// A `MigrateInstance` mapping referenced a `target_element_id` absent from
+    /// the target process definition. Maps to HTTP 400.
+    MappingTargetElementNotFound {
+        target_process_definition_key: Key,
+        element_id: String,
+    },
+    /// A `MigrateInstance` left an active element instance without a mapping
+    /// instruction. Maps to HTTP 409. Zeebe parity: "no mapping instruction
+    /// defined for active element with id".
+    UnmappedActiveElement {
+        instance_key: Key,
+        element_id: String,
+    },
+    /// A `MigrateInstance` mapped a source element to a target element of a
+    /// different BPMN type. Maps to HTTP 409. Zeebe parity: "active element ...
+    /// is mapped to an element with id ... and different type".
+    MappedElementTypeChanged {
+        instance_key: Key,
+        source_element_id: String,
+        target_element_id: String,
+    },
+    /// A `MigrateInstance` targeted an instance that contains an active element
+    /// class this phase does not yet support migrating (boundary events, event
+    /// subprocesses, multi-instance bodies, call activities, event-based-gateway
+    /// catch events). Maps to HTTP 409. Zeebe itself rejects several of these as
+    /// "not supported yet"; reproducing the rejection is parity.
+    UnsupportedMigration {
+        instance_key: Key,
+        element_id: String,
+        reason: String,
+    },
+}
+
+/// Element classes this migration phase does not remap yet, mirroring Zeebe's
+/// "not supported yet" migration rejections. Returns `Some(reason)` when a
+/// migration touching an active element (or armed boundary runtime) of this kind
+/// must be rejected with [`EngineError::UnsupportedMigration`].
+fn unsupported_migration_reason(kind: &crate::model::ElementKind) -> Option<&'static str> {
+    use crate::model::ElementKind;
+    match kind {
+        ElementKind::ErrorBoundaryEvent { .. }
+        | ElementKind::TimerBoundaryEvent { .. }
+        | ElementKind::MessageBoundaryEvent { .. }
+        | ElementKind::SignalBoundaryEvent { .. }
+        | ElementKind::ConditionalBoundaryEvent { .. } => {
+            Some("boundary events are not migratable yet")
+        }
+        ElementKind::CallActivity { .. } => Some("call activities are not migratable yet"),
+        ElementKind::SubProcess { .. } => Some("embedded sub-processes are not migratable yet"),
+        ElementKind::EventBasedGateway => Some("event-based gateways are not migratable yet"),
+        _ => None,
+    }
 }
 
 impl std::fmt::Display for EngineError {
@@ -7305,6 +7552,70 @@ impl std::fmt::Display for EngineError {
                 write!(
                     f,
                     "ad-hoc sub-process activation for container {ad_hoc_instance_key} named no elements and did not cancel remaining instances"
+                )
+            }
+            EngineError::TargetProcessDefinitionNotFound {
+                process_definition_key,
+            } => {
+                write!(
+                    f,
+                    "no deployed process definition with key {process_definition_key} to migrate to"
+                )
+            }
+            EngineError::DuplicateMappingSourceElement {
+                instance_key,
+                element_id,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} maps source element {element_id} more than once"
+                )
+            }
+            EngineError::MappingSourceElementNotFound {
+                instance_key,
+                element_id,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} maps source element {element_id}, which its process definition does not contain"
+                )
+            }
+            EngineError::MappingTargetElementNotFound {
+                target_process_definition_key,
+                element_id,
+            } => {
+                write!(
+                    f,
+                    "migration target process definition {target_process_definition_key} has no element with id {element_id}"
+                )
+            }
+            EngineError::UnmappedActiveElement {
+                instance_key,
+                element_id,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} leaves active element {element_id} unmapped"
+                )
+            }
+            EngineError::MappedElementTypeChanged {
+                instance_key,
+                source_element_id,
+                target_element_id,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} maps element {source_element_id} to {target_element_id} of a different type"
+                )
+            }
+            EngineError::UnsupportedMigration {
+                instance_key,
+                element_id,
+                reason,
+            } => {
+                write!(
+                    f,
+                    "migration of instance {instance_key} is not supported yet: active element {element_id} ({reason})"
                 )
             }
         }

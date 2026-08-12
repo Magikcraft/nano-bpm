@@ -4263,6 +4263,90 @@ impl ServerImpl {
         })
     }
 
+    async fn migrate_process_instance_impl(
+        &self,
+        path_params: &models::MigrateProcessInstancePathParams,
+        body: &models::ProcessInstanceMigrationInstruction,
+    ) -> Result<apis::process_instance::MigrateProcessInstanceResponse, ()> {
+        use apis::process_instance::MigrateProcessInstanceResponse as Resp;
+
+        let instance_key: u64 = match path_params.process_instance_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                    "Process instance not found",
+                    404,
+                    format!(
+                        "Process instance key '{}' is not a valid key.",
+                        path_params.process_instance_key
+                    ),
+                )));
+            }
+        };
+
+        let target_process_definition_key: u64 = match body.target_process_definition_key.0.parse()
+        {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                    "Target process definition not found",
+                    404,
+                    format!(
+                        "Target process definition key '{}' is not a valid key.",
+                        body.target_process_definition_key.0
+                    ),
+                )));
+            }
+        };
+
+        let mapping_instructions: Vec<(String, String)> = body
+            .mapping_instructions
+            .iter()
+            .map(|m| (m.source_element_id.clone(), m.target_element_id.clone()))
+            .collect();
+
+        Ok(
+            match self
+                .migrate_instance_core(
+                    instance_key,
+                    target_process_definition_key,
+                    mapping_instructions,
+                )
+                .await
+            {
+                MigrateInstanceOutcome::Migrated => Resp::Status204_TheProcessInstanceIsMigrated,
+                MigrateInstanceOutcome::BadRequest(detail) => {
+                    Resp::Status400_TheProvidedDataIsNotValid(problem(
+                        "Invalid migration",
+                        400,
+                        detail,
+                    ))
+                }
+                MigrateInstanceOutcome::NotFound(detail) => {
+                    Resp::Status404_TheProcessInstanceIsNotFound(problem(
+                        "Process instance not found",
+                        404,
+                        detail,
+                    ))
+                }
+                MigrateInstanceOutcome::Conflict(detail) => {
+                    Resp::Status409_TheProcessInstanceMigrationFailed(problem(
+                        "Migration failed",
+                        409,
+                        detail,
+                    ))
+                }
+                MigrateInstanceOutcome::Internal(detail) => {
+                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(problem(
+                        "Internal error",
+                        500,
+                        detail,
+                    ))
+                }
+            },
+        )
+    }
+
     async fn complete_job_impl(
         &self,
         path_params: &models::CompleteJobPathParams,
@@ -4753,7 +4837,86 @@ impl ServerImpl {
         }
     }
 
-    /// Surface-independent core of "resolve an incident": leader-forward when
+    /// Surface-independent core of "migrate a process instance": leader-forward
+    /// when this node is not the instance's leader, else apply
+    /// [`Command::MigrateInstance`] and wait for commit. Mirrors
+    /// [`Self::cancel_instance_core`] so the v2 REST handler maps a single
+    /// source of truth for the engine-command + clustering semantics.
+    pub(crate) async fn migrate_instance_core(
+        &self,
+        instance_key: u64,
+        target_process_definition_key: u64,
+        mapping_instructions: Vec<(String, String)>,
+    ) -> MigrateInstanceOutcome {
+        use MigrateInstanceOutcome as Out;
+
+        if let Some(node) = self.route_by_leader(instance_key) {
+            return match self.peer_link(node).await {
+                Ok(link) => match link
+                    .migrate_instance(
+                        instance_key.to_string(),
+                        target_process_definition_key.to_string(),
+                        mapping_instructions,
+                    )
+                    .await
+                {
+                    Ok(r) if is_ok_status(r.status) => Out::Migrated,
+                    Ok(r) if r.status == 400 => Out::BadRequest(peer_detail(&r)),
+                    Ok(r) if r.status == 404 => Out::NotFound(peer_detail(&r)),
+                    Ok(r) if r.status == 409 => Out::Conflict(peer_detail(&r)),
+                    Ok(r) => Out::Internal(peer_detail(&r)),
+                    Err(e) => Out::Internal(e.to_string()),
+                },
+                Err((s, m)) => Out::Internal(format!("peer error ({s}): {m}")),
+            };
+        }
+
+        match self
+            .migrate_instance_local(
+                instance_key,
+                target_process_definition_key,
+                mapping_instructions,
+            )
+            .await
+        {
+            Ok(()) => Out::Migrated,
+            Err((400, detail)) => Out::BadRequest(detail),
+            Err((404, detail)) => Out::NotFound(detail),
+            Err((409, detail)) => Out::Conflict(detail),
+            Err((_, detail)) => Out::Internal(detail),
+        }
+    }
+
+    /// Applies a migration on this node's owning partition. Returns
+    /// `Ok(())` on success, else `(status, detail)` where `status` is the
+    /// HTTP code the migration [`EngineError`] maps to (400 invalid mapping,
+    /// 404 unknown instance/target, 409 rejected migration, 500 otherwise).
+    pub(crate) async fn migrate_instance_local(
+        &self,
+        instance_key: u64,
+        target_process_definition_key: u64,
+        mapping_instructions: Vec<(String, String)>,
+    ) -> Result<(), (u16, String)> {
+        let command = Command::migrate_instance(
+            instance_key,
+            target_process_definition_key,
+            mapping_instructions,
+        );
+        match self
+            .engine
+            .by_key(instance_key)
+            .with(move |engine| engine.apply_command_at(command, now_millis()))
+            .await
+        {
+            Ok((events, commit)) => {
+                commit.wait().await;
+                self.spawn_routing_if_needed(&events);
+                self.signal_jobs_available();
+                Ok(())
+            }
+            Err(e) => Err((migration_error_status(&e), e.to_string())),
+        }
+    }
     /// this node is not the leader, else apply [`Command::ResolveIncident`] and
     /// wait for commit. Returns a neutral outcome so every API surface (the v2
     /// REST handler and the console Process-Explorer handler) maps a single
@@ -15669,6 +15832,42 @@ pub(crate) enum CancelInstanceOutcome {
     Internal(String),
 }
 
+/// Surface-independent outcome of [`ServerImpl::migrate_instance_core`].
+pub(crate) enum MigrateInstanceOutcome {
+    /// The instance was migrated onto the target process definition.
+    Migrated,
+    /// The migration request is invalid — a mapping references an unknown
+    /// element or duplicates a source (400).
+    BadRequest(String),
+    /// No active process instance, or no target process definition, with the
+    /// given key exists (404).
+    NotFound(String),
+    /// The migration is rejected by the engine — an active element is unmapped,
+    /// a mapped element changes type, or the instance uses a construct not yet
+    /// supported by migration (409).
+    Conflict(String),
+    /// An unexpected engine/peer error occurred (500).
+    Internal(String),
+}
+
+/// Maps a migration [`EngineError`] to the HTTP status the v2 REST surface
+/// returns. Invalid mappings are 400; unknown instance/target are 404;
+/// engine-rejected migrations (unmapped element, type change, unsupported
+/// construct) are 409; anything else is a 500.
+fn migration_error_status(e: &EngineError) -> u16 {
+    match e {
+        EngineError::InstanceNotFound { .. }
+        | EngineError::TargetProcessDefinitionNotFound { .. } => 404,
+        EngineError::DuplicateMappingSourceElement { .. }
+        | EngineError::MappingSourceElementNotFound { .. }
+        | EngineError::MappingTargetElementNotFound { .. } => 400,
+        EngineError::UnmappedActiveElement { .. }
+        | EngineError::MappedElementTypeChanged { .. }
+        | EngineError::UnsupportedMigration { .. } => 409,
+        _ => 500,
+    }
+}
+
 /// Surface-independent outcome of [`ServerImpl::set_variables_core`].
 pub(crate) enum SetVariablesOutcome {
     /// The variables were merged into the scope.
@@ -21215,6 +21414,165 @@ mod clustered_startup_tests {
         assert!(matches!(
             server.cancel_instance_core(instance_key).await,
             CancelInstanceOutcome::NotFound(_)
+        ));
+    }
+
+    /// Exercises [`ServerImpl::migrate_instance_core`] — the surface-independent
+    /// core the v2 REST API shares — end to end: a service-task instance waiting
+    /// on a job is migrated onto a second definition, the read model re-homes
+    /// onto the target (definition id + active element id), and the not-found /
+    /// re-migrate outcomes are reported rather than swallowed.
+    #[tokio::test]
+    async fn migrate_instance_via_shared_core() {
+        let server = ServerImpl::default();
+
+        // Source + target: same shape, but the waiting service task carries a
+        // different element id (`work` → `fulfil`) and job type, so a successful
+        // migration must remap the active element and its job.
+        let source = ProcessBuilder::new("order-v1")
+            .start_event("s")
+            .service_task("work", "src-work")
+            .end_event("e")
+            .connect("s", "work")
+            .connect("work", "e")
+            .build()
+            .expect("valid source definition");
+        let target = ProcessBuilder::new("order-v2")
+            .start_event("s2")
+            .service_task("fulfil", "tgt-work")
+            .end_event("e2")
+            .connect("s2", "fulfil")
+            .connect("fulfil", "e2")
+            .build()
+            .expect("valid target definition");
+
+        let mut src_names = std::collections::HashMap::new();
+        src_names.insert("order-v1".to_string(), "order-v1.bpmn".to_string());
+        server
+            .deploy_resources_locally(
+                vec![source],
+                &src_names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy source");
+
+        let mut tgt_names = std::collections::HashMap::new();
+        tgt_names.insert("order-v2".to_string(), "order-v2.bpmn".to_string());
+        let (deploy, _) = server
+            .deploy_resources_locally(
+                vec![target],
+                &tgt_names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy target");
+
+        // The target's process-definition key comes back on its deployment.
+        let target_key: u64 = deploy
+            .deployments
+            .iter()
+            .find_map(|d| match &d.process_definition {
+                types::Nullable::Present(p) => Some(p.process_definition_key.0.clone()),
+                _ => None,
+            })
+            .expect("target deployment carries a process definition")
+            .parse()
+            .expect("numeric process-definition key");
+
+        let (instance_key, _) = server
+            .create_for_stream(
+                Some("order-v1".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("create the instance");
+
+        // Wait until the source instance projects as Active on `order-v1`.
+        let mut active = false;
+        for _ in 0..200 {
+            if server
+                .store
+                .process_instance(instance_key)
+                .is_some_and(|r| {
+                    r.state == ProcessInstanceState::Active && r.process_definition_id == "order-v1"
+                })
+            {
+                active = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(active, "the instance projects as Active on order-v1");
+
+        // A bogus instance key is a not-found, not a silent no-op.
+        assert!(matches!(
+            server
+                .migrate_instance_core(
+                    999_999_999,
+                    target_key,
+                    vec![("work".into(), "fulfil".into())],
+                )
+                .await,
+            MigrateInstanceOutcome::NotFound(_)
+        ));
+
+        // Migrate `work` → `fulfil` onto order-v2.
+        assert!(matches!(
+            server
+                .migrate_instance_core(
+                    instance_key,
+                    target_key,
+                    vec![("work".into(), "fulfil".into())],
+                )
+                .await,
+            MigrateInstanceOutcome::Migrated
+        ));
+
+        // The read model re-homes onto the target definition and its active
+        // element id.
+        let mut rehomed = false;
+        for _ in 0..200 {
+            let on_target = server
+                .store
+                .process_instance(instance_key)
+                .is_some_and(|r| {
+                    r.process_definition_id == "order-v2"
+                        && r.process_definition_key == target_key.to_string()
+                });
+            let element_remapped = server.store.element_instances().iter().any(|e| {
+                e.instance_key == instance_key
+                    && e.element_id == "fulfil"
+                    && e.state == crate::readstore::ElementInstanceState::Active
+            });
+            if on_target && element_remapped {
+                rehomed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            rehomed,
+            "migration re-homes the instance + its active element onto order-v2"
+        );
+
+        // The instance is now on order-v2, whose elements are `s2`/`fulfil`/`e2`.
+        // Re-migrating with the stale source id `work` (absent from the current
+        // definition) is rejected as an invalid mapping (400), not swallowed.
+        assert!(matches!(
+            server
+                .migrate_instance_core(
+                    instance_key,
+                    target_key,
+                    vec![("work".into(), "fulfil".into())],
+                )
+                .await,
+            MigrateInstanceOutcome::BadRequest(_)
         ));
     }
 

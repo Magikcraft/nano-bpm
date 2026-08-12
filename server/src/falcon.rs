@@ -253,6 +253,17 @@ pub enum ClientFrame {
         corr: u64,
         instance_key: String,
     },
+    /// **Intra-cluster only.** A gateway forwards a by-key process-instance
+    /// migration to the peer that owns the instance's partition. Answered by a
+    /// `CommandResult` (204 on success, 400 invalid mapping, 404 unknown
+    /// instance/target, 409 rejected migration, 5xx otherwise).
+    #[serde(rename_all = "camelCase")]
+    MigrateInstance {
+        corr: u64,
+        instance_key: String,
+        target_process_definition_key: String,
+        mapping_instructions: Vec<(String, String)>,
+    },
     /// **Intra-cluster only.** Routes a cross-partition subscription follow-up
     /// (a `MessageSubscriptionOpening` opening a canonical subscription on its
     /// `hash(correlationKey)` partition, or a `RemoteMessageCorrelation` advancing
@@ -1391,6 +1402,7 @@ async fn handle_client_frame(
         ClientFrame::InstallDeployment { .. } => "install_deployment",
         ClientFrame::PublishMessage { .. } => "publish_message",
         ClientFrame::CancelInstance { .. } => "cancel_instance",
+        ClientFrame::MigrateInstance { .. } => "migrate_instance",
         ClientFrame::RouteSubscription { .. } => "route_subscription",
         ClientFrame::UpdateJobRetries { .. } => "update_job_retries",
         ClientFrame::UpdateJobTimeout { .. } => "update_job_timeout",
@@ -1926,6 +1938,32 @@ async fn handle_client_frame(
         ClientFrame::CancelInstance { corr, instance_key } => {
             forward_by_key_reply(conn, corr, &instance_key, |key| async move {
                 server.cancel_instance_local(key).await
+            })
+            .await;
+        }
+        ClientFrame::MigrateInstance {
+            corr,
+            instance_key,
+            target_process_definition_key,
+            mapping_instructions,
+        } => {
+            let target_key = match target_process_definition_key.parse::<u64>() {
+                Ok(k) => k,
+                Err(_) => {
+                    conn.send(ServerFrame::CommandResult {
+                        corr,
+                        status: 404,
+                        body: Some(Value::String(format!(
+                            "Target process definition key '{target_process_definition_key}' is not a valid key."
+                        ))),
+                    });
+                    return;
+                }
+            };
+            forward_by_key_reply(conn, corr, &instance_key, |key| async move {
+                server
+                    .migrate_instance_local(key, target_key, mapping_instructions)
+                    .await
             })
             .await;
         }

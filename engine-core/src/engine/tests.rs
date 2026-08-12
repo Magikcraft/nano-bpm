@@ -12245,6 +12245,37 @@ fn process_with_concat_correlation_key() -> ProcessDefinition {
         .unwrap()
 }
 
+// --- Process-instance migration (Zeebe-behaviour parity) --------------------
+
+/// Deploys `def` and returns the process definition key the engine assigned it.
+fn deploy_for_migration(engine: &mut Engine, def: ProcessDefinition) -> Key {
+    engine
+        .apply_command(Command::DeployProcess(def))
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                ..
+            } => Some(*process_definition_key),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// A linear process `id` whose single service task `task_id` emits `job_type`
+/// jobs, parked while a worker is expected to pick them up.
+fn migratable_task_process(id: &str, task_id: &str, job_type: &str) -> ProcessDefinition {
+    ProcessBuilder::new(id)
+        .start_event("start")
+        .service_task(task_id, job_type)
+        .end_event("end")
+        .connect("start", task_id)
+        .connect(task_id, "end")
+        .build()
+        .unwrap()
+}
+
 #[test]
 fn errored_correlation_key_raises_incident_and_reopens_on_resolve() {
     let mut engine = Engine::new();
@@ -12309,4 +12340,299 @@ fn errored_correlation_key_raises_incident_and_reopens_on_resolve() {
         .apply_command(Command::correlate_message("answered", "plan#1:w1"))
         .unwrap();
     assert!(engine.is_completed(instance_key));
+}
+
+fn pending_job_element(engine: &Engine, instance_key: Key) -> String {
+    engine
+        .state()
+        .jobs
+        .values()
+        .find(|j| j.instance_key == instance_key)
+        .map(|j| j.element_id.clone())
+        .expect("instance has a pending job")
+}
+
+#[test]
+fn migration_remaps_active_service_task_and_its_job() {
+    // A token parked on service task `a` of `source` is migrated to `b` of
+    // `target`: the instance now belongs to `target`, its active element and its
+    // pending job are re-pointed at `b`, and the job keeps its type.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+
+    let inst = create_instance_key(&mut engine, "source");
+    assert_eq!(pending_job_element(&engine, inst), "a");
+
+    let events = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, Event::ProcessInstanceMigrated { .. })),
+        "a ProcessInstanceMigrated fact is emitted"
+    );
+
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(
+        instance.process_id, "target",
+        "instance re-homed to target id"
+    );
+    assert!(
+        instance.active.values().any(|e| e == "b"),
+        "active token re-pointed at target element b"
+    );
+    assert!(
+        !instance.active.values().any(|e| e == "a"),
+        "no active token still points at source element a"
+    );
+    assert_eq!(
+        pending_job_element(&engine, inst),
+        "b",
+        "the pending job is re-pointed at b"
+    );
+
+    // The in-flight count moved from source to target.
+    assert_eq!(
+        engine.state().inflight_by_process.get("source").copied(),
+        None,
+        "source has no live instances"
+    );
+    assert_eq!(
+        engine.state().inflight_by_process.get("target").copied(),
+        Some(1),
+        "target has one live instance"
+    );
+}
+
+#[test]
+fn migration_completes_via_remapped_job() {
+    // After migrating, completing the (re-pointed) job drives the token to the
+    // TARGET's end event, so the instance completes cleanly under its new
+    // definition — proving the remap is executable, not cosmetic.
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap();
+
+    let job = engine
+        .activate_jobs("work", "W", 10, 1_000, 0)
+        .into_iter()
+        .find(|j| j.instance_key == inst)
+        .unwrap();
+    assert_eq!(job.element_id, "b");
+    engine
+        .apply_command(Command::complete_job(job.key))
+        .unwrap();
+
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(
+        instance.state,
+        crate::state::ProcessInstanceState::Completed,
+        "instance completed through the target's end event"
+    );
+}
+
+#[test]
+fn migration_rejects_unknown_instance() {
+    let mut engine = Engine::new();
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            999,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::InstanceNotFound { instance_key: 999 }
+    ));
+}
+
+#[test]
+fn migration_rejects_unknown_target_definition() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            424_242,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::TargetProcessDefinitionNotFound {
+            process_definition_key: 424_242
+        }
+    ));
+}
+
+#[test]
+fn migration_rejects_duplicate_source_mapping() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("a".to_string(), "b".to_string()),
+                ("a".to_string(), "b".to_string()),
+            ],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::DuplicateMappingSourceElement { element_id, .. } if element_id == "a"
+    ));
+}
+
+#[test]
+fn migration_rejects_unknown_source_element() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("nope".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::MappingSourceElementNotFound { element_id, .. } if element_id == "nope"
+    ));
+}
+
+#[test]
+fn migration_rejects_unknown_target_element() {
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "nope".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::MappingTargetElementNotFound { element_id, .. } if element_id == "nope"
+    ));
+}
+
+#[test]
+fn migration_rejects_unmapped_active_element() {
+    // No mapping for the active service task `a` → the active token would be
+    // orphaned, so migration is rejected (Zeebe 409 parity).
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(inst, target_key, vec![]))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::UnmappedActiveElement { element_id, .. } if element_id == "a"
+    ));
+}
+
+#[test]
+fn migration_rejects_type_change() {
+    // Mapping the active service task to a user task changes the element type →
+    // rejected (Zeebe 409 parity).
+    let mut engine = Engine::new();
+    deploy_for_migration(&mut engine, migratable_task_process("source", "a", "work"));
+    let target_key = deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("target")
+            .start_event("start")
+            .user_task("b")
+            .end_event("end")
+            .connect("start", "b")
+            .connect("b", "end")
+            .build()
+            .unwrap(),
+    );
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::MappedElementTypeChanged {
+            source_element_id,
+            target_element_id,
+            ..
+        } if source_element_id == "a" && target_element_id == "b"
+    ));
+}
+
+#[test]
+fn migration_rejects_unsupported_boundary_event() {
+    // The active service task carries an armed interrupting timer boundary event.
+    // Boundary events are not migratable in this phase (Zeebe rejects several
+    // such cases as "not supported yet") → rejected.
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        ProcessBuilder::new("source")
+            .start_event("start")
+            .service_task("a", "work")
+            .timer_boundary_event("boundary", "a", 60_000)
+            .end_event("end")
+            .end_event("caught")
+            .connect("start", "a")
+            .connect("a", "end")
+            .connect("boundary", "caught")
+            .build()
+            .unwrap(),
+    );
+    let target_key =
+        deploy_for_migration(&mut engine, migratable_task_process("target", "b", "work"));
+    let inst = create_instance_key(&mut engine, "source");
+    let err = engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![("a".to_string(), "b".to_string())],
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        EngineError::UnsupportedMigration { element_id, .. } if element_id == "boundary"
+    ));
 }

@@ -1801,6 +1801,93 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
+        Event::ProcessInstanceMigrated {
+            instance_key,
+            target_process_id,
+            element_mappings,
+            ..
+        } => {
+            let remap: HashMap<&str, &str> = element_mappings
+                .iter()
+                .map(|(s, t)| (s.as_str(), t.as_str()))
+                .collect();
+            let remap_id = |id: &mut ElementId| {
+                if let Some(target) = remap.get(id.as_str()) {
+                    *id = (*target).to_string();
+                }
+            };
+
+            // Move the live-instance count from the source process id to the
+            // target's, and re-point the instance itself.
+            let source_process_id = state
+                .instances
+                .get(instance_key)
+                .map(|i| i.process_id.clone());
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.process_id = target_process_id.clone();
+                for element_id in instance.active.values_mut() {
+                    remap_id(element_id);
+                }
+                if !instance.join_counts.is_empty() {
+                    let remapped: HashMap<ElementId, usize> = instance
+                        .join_counts
+                        .drain()
+                        .map(|(mut eid, count)| {
+                            remap_id(&mut eid);
+                            (eid, count)
+                        })
+                        .collect();
+                    instance.join_counts = remapped;
+                }
+            }
+            if source_process_id.as_deref() != Some(target_process_id.as_str()) {
+                decrement_inflight_by_process(state, source_process_id);
+                *state
+                    .inflight_by_process
+                    .entry(target_process_id.clone())
+                    .or_insert(0) += 1;
+            }
+
+            // Re-point every element instance's attached runtime. Active jobs keep
+            // their type (a worker already holds the lease) — only the element id
+            // moves, mirroring Zeebe.
+            for job in state.jobs.values_mut() {
+                if job.instance_key == *instance_key {
+                    remap_id(&mut job.element_id);
+                }
+            }
+            for user_task in state.user_tasks.values_mut() {
+                if user_task.instance_key == *instance_key {
+                    remap_id(&mut user_task.element_id);
+                }
+            }
+            for timer in state.timers.values_mut() {
+                if timer.instance_key == *instance_key {
+                    remap_id(&mut timer.element_id);
+                }
+            }
+            for sub in state.message_subscriptions.values_mut() {
+                if sub.instance_key == *instance_key {
+                    remap_id(&mut sub.element_id);
+                }
+            }
+            for sub in state.signal_subscriptions.values_mut() {
+                if sub.instance_key == *instance_key {
+                    remap_id(&mut sub.element_id);
+                }
+            }
+            for sub in state.conditional_subscriptions.values_mut() {
+                if sub.instance_key == *instance_key {
+                    remap_id(&mut sub.element_id);
+                }
+            }
+            for incident in state.incidents.values_mut() {
+                if incident.instance_key == *instance_key {
+                    remap_id(&mut incident.element_id);
+                }
+            }
+        }
+
         Event::ProcessInstanceTerminated { instance_key } => {
             let terminal_pid = non_terminal_process_id(state, instance_key);
             // Close any incident still active on the instance: with the instance

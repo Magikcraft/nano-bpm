@@ -3663,6 +3663,137 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
+        Event::ProcessInstanceMigrated {
+            instance_key,
+            target_process_id,
+            target_process_definition_key,
+            element_mappings,
+        } => {
+            // Re-home the read model onto the target definition, mirroring the
+            // engine applier (`state::apply`): the instance's definition
+            // identity moves, and every LIVE runtime row's `element_id` is
+            // remapped by its ORIGINAL id (never chained). Completed/terminal
+            // history rows keep the definition + element id they ran under.
+            let ik = *instance_key as i64;
+            let target_key_str = target_process_definition_key.to_string();
+            let target_key_i = *target_process_definition_key as i64;
+            let target_version: i32 = tx
+                .query_row(
+                    "SELECT version FROM process_definitions WHERE key = ?1",
+                    params![target_key_i],
+                    |r| r.get::<_, i32>(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+
+            // 1) Re-point the instance row itself.
+            tx.cexecute(
+                "UPDATE process_instances SET process_id = ?2, process_definition_id = ?2, \
+                 process_definition_key = ?3, version = ?4 WHERE key = ?1",
+                params![ik, target_process_id, target_key_str, target_version],
+            )?;
+
+            // 2) Remap live runtime element ids in a single logical pass. A
+            //    control-char (`SOH`) temp namespace — illegal in a BPMN NCName
+            //    id — makes the two SQL passes equivalent to the engine's
+            //    remap-by-original-id map even when a target id equals another
+            //    mapping's source (loops / swaps). Job types are preserved (the
+            //    worker keeps its lease), matching the applier.
+            let active_el = element_instance_state_code(ElementInstanceState::Active);
+            let live_ut = user_task_state_code(UserTaskState::Created);
+            let active_inc = incident_state_code(IncidentState::Active);
+            let tmp = |target: &str| format!("\u{1}mig:{target}");
+
+            // Phase A — stamp matched live rows with a collision-free temp id.
+            for (source_id, target_id) in element_mappings {
+                let t = tmp(target_id);
+                tx.cexecute(
+                    "UPDATE element_instances SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
+                    params![ik, source_id, t, active_el],
+                )?;
+                tx.cexecute(
+                    "UPDATE jobs SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2 AND state IN (0, 1)",
+                    params![ik, source_id, t],
+                )?;
+                tx.cexecute(
+                    "UPDATE user_tasks SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
+                    params![ik, source_id, t, live_ut],
+                )?;
+                tx.cexecute(
+                    "UPDATE incidents SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
+                    params![ik, source_id, t, active_inc],
+                )?;
+            }
+
+            // Phase B — resolve temp ids to the target id + re-home the
+            //    definition identity (once per distinct target).
+            let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (_source_id, target_id) in element_mappings {
+                if !resolved.insert(target_id.as_str()) {
+                    continue;
+                }
+                let t = tmp(target_id);
+                let (t_name, t_type): (Option<String>, String) = tx
+                    .query_row(
+                        "SELECT element_name, element_type FROM definition_elements \
+                         WHERE process_definition_key = ?1 AND element_id = ?2",
+                        params![target_key_i, target_id],
+                        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .optional()?
+                    .unwrap_or((None, String::new()));
+                tx.cexecute(
+                    "UPDATE element_instances SET element_id = ?2, element_name = ?3, \
+                     element_type = ?4, process_definition_id = ?5, process_definition_key = ?6 \
+                     WHERE instance_key = ?1 AND element_id = ?7",
+                    params![
+                        ik,
+                        target_id,
+                        t_name,
+                        t_type,
+                        target_process_id,
+                        target_key_str,
+                        t
+                    ],
+                )?;
+                tx.cexecute(
+                    "UPDATE jobs SET element_id = ?2, process_definition_id = ?3, \
+                     process_definition_key = ?4 WHERE instance_key = ?1 AND element_id = ?5",
+                    params![ik, target_id, target_process_id, target_key_str, t],
+                )?;
+                tx.cexecute(
+                    "UPDATE user_tasks SET element_id = ?2, process_definition_id = ?3, \
+                     process_definition_key = ?4, process_definition_version = ?5 \
+                     WHERE instance_key = ?1 AND element_id = ?6",
+                    params![
+                        ik,
+                        target_id,
+                        target_process_id,
+                        target_key_str,
+                        target_version,
+                        t
+                    ],
+                )?;
+                tx.cexecute(
+                    "UPDATE incidents SET element_id = ?2, process_definition_id = ?3, \
+                     process_definition_key = ?4 WHERE instance_key = ?1 AND element_id = ?5",
+                    params![ik, target_id, target_process_id, target_key_str, t],
+                )?;
+            }
+
+            // Variables carry the definition identity but no element id, so
+            // re-home them wholesale for the instance.
+            tx.cexecute(
+                "UPDATE variables SET process_definition_id = ?2, process_definition_key = ?3 \
+                 WHERE instance_key = ?1",
+                params![ik, target_process_id, target_key_str],
+            )?;
+        }
+
         // Events with no queryable read-model projection.
         _ => {}
     }

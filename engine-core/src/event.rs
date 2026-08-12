@@ -486,6 +486,22 @@ pub enum Event {
     /// [`Event::ProcessInstanceTerminated`] once the last canceling chain drains.
     ProcessInstanceTerminating { instance_key: Key },
 
+    /// A process instance was migrated to a target process definition (Zeebe
+    /// process-instance migration). Carries the full remapping the applier needs
+    /// to rewrite state deterministically on replay: `target_process_id` is the
+    /// BPMN process id the instance now belongs to, `target_process_definition_key`
+    /// its deployment key, and `element_mappings` the accepted
+    /// `(source_element_id, target_element_id)` pairs. [`crate::state::apply`]
+    /// re-points every active element instance carrying a mapped `source` id (and
+    /// its attached jobs, user tasks, timers, subscriptions and incidents) at the
+    /// corresponding `target`, and sets the instance's `process_id`.
+    ProcessInstanceMigrated {
+        instance_key: Key,
+        target_process_id: String,
+        target_process_definition_key: Key,
+        element_mappings: Vec<(ElementId, ElementId)>,
+    },
+
     /// A timer was armed: either on a timer intermediate catch event (the token
     /// rests on it) or as an interrupting boundary timer on an activity (the
     /// activity runs as normal until the timer fires). `due_at` is the logical
@@ -944,6 +960,7 @@ impl Event {
             | Event::DecisionInstanceDeleted { instance_key, .. }
             | Event::ProcessInstanceTerminated { instance_key } => Some(*instance_key),
             Event::ProcessInstanceTerminating { instance_key } => Some(*instance_key),
+            Event::ProcessInstanceMigrated { instance_key, .. } => Some(*instance_key),
             Event::ProcessDeployed { .. }
             | Event::DecisionRequirementsDeployed { .. }
             | Event::DecisionDeployed { .. }
