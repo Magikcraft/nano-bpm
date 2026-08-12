@@ -73,6 +73,67 @@ impl Ops {
     }
 }
 
+/// The numeric advanced-filter operators (integer and date-time), normalised to
+/// `i64` comparisons. Date-times are projected to epoch milliseconds so integer
+/// and timestamp filters share one comparator. `None` fields are unconstrained.
+#[derive(Default)]
+struct NumOps {
+    eq: Option<i64>,
+    neq: Option<i64>,
+    exists: Option<bool>,
+    gt: Option<i64>,
+    gte: Option<i64>,
+    lt: Option<i64>,
+    lte: Option<i64>,
+    in_: Option<Vec<i64>>,
+}
+
+impl NumOps {
+    /// Whether `value` (the engine value's `i64` projection, or `None` when the
+    /// property is absent) satisfies every operator present on this filter.
+    fn matches(&self, value: Option<i64>) -> bool {
+        if matches!(self.exists, Some(e) if e != value.is_some()) {
+            return false;
+        }
+        let v = match value {
+            Some(v) => v,
+            None => {
+                // An absent value can only satisfy an `$exists: false` (handled
+                // above); any value-based operator fails to match.
+                return self.eq.is_none()
+                    && self.neq.is_none()
+                    && self.gt.is_none()
+                    && self.gte.is_none()
+                    && self.lt.is_none()
+                    && self.lte.is_none()
+                    && self.in_.is_none();
+            }
+        };
+        if self.eq.is_some_and(|eq| v != eq) {
+            return false;
+        }
+        if self.neq.is_some_and(|neq| v == neq) {
+            return false;
+        }
+        if self.gt.is_some_and(|gt| v <= gt) {
+            return false;
+        }
+        if self.gte.is_some_and(|gte| v < gte) {
+            return false;
+        }
+        if self.lt.is_some_and(|lt| v >= lt) {
+            return false;
+        }
+        if self.lte.is_some_and(|lte| v > lte) {
+            return false;
+        }
+        if self.in_.as_ref().is_some_and(|in_| !in_.contains(&v)) {
+            return false;
+        }
+        true
+    }
+}
+
 /// Matches a `$like` pattern against a value. `*` matches any run of characters,
 /// `?` matches a single character, and `\` escapes the next metacharacter. The
 /// match is anchored to the whole string.
@@ -166,12 +227,78 @@ macro_rules! ops {
 
 /// Matches a `StringFilterProperty` (bare string or advanced) against a value.
 pub fn match_string(filter: &Option<models::StringFilterProperty>, value: &str) -> bool {
+    match_string_opt(filter, Some(value))
+}
+
+/// Matches a `StringFilterProperty` against a possibly-absent string value.
+/// Passing `None` models a schema field Nano does not yet project: an equality/
+/// `$like`/`$in` filter then correctly yields no match (so the field is not
+/// silently ignored), while `$exists: false` still matches. This keeps declared
+/// filters honest instead of returning rows a client asked to exclude.
+pub fn match_string_opt(
+    filter: &Option<models::StringFilterProperty>,
+    value: Option<&str>,
+) -> bool {
     match filter {
         None => true,
-        Some(models::StringFilterProperty::String(s)) => s == value,
+        Some(models::StringFilterProperty::String(s)) => value == Some(s.as_str()),
         Some(models::StringFilterProperty::AdvancedStringFilter(a)) => {
-            ops!(a, |s: &String| s.clone(), like).matches(Some(value))
+            ops!(a, |s: &String| s.clone(), like).matches(value)
         }
+    }
+}
+
+/// Matches an `IntegerFilterProperty` (bare int or advanced `$eq`/`$neq`/
+/// `$exists`/`$gt`/`$gte`/`$lt`/`$lte`/`$in`) against a possibly-absent integer.
+pub fn match_integer(filter: &Option<models::IntegerFilterProperty>, value: Option<i64>) -> bool {
+    match filter {
+        None => true,
+        Some(models::IntegerFilterProperty::I32(n)) => value == Some(*n as i64),
+        Some(models::IntegerFilterProperty::AdvancedIntegerFilter(a)) => NumOps {
+            eq: a.dollar_eq.map(i64::from),
+            neq: a.dollar_neq.map(i64::from),
+            exists: a.dollar_exists,
+            gt: a.dollar_gt.map(i64::from),
+            gte: a.dollar_gte.map(i64::from),
+            lt: a.dollar_lt.map(i64::from),
+            lte: a.dollar_lte.map(i64::from),
+            in_: a
+                .dollar_in
+                .as_ref()
+                .map(|v| v.iter().map(|&n| i64::from(n)).collect()),
+        }
+        .matches(value),
+    }
+}
+
+/// Matches a `DateTimeFilterProperty` (bare date-time or advanced range filter)
+/// against a possibly-absent value expressed as epoch milliseconds. Comparisons
+/// are performed in millisecond space so `$gt`/`$lt` behave as calendar
+/// comparisons; passing `None` correctly yields no match for value operators
+/// while satisfying `$exists: false`.
+pub fn match_date_time_ms(
+    filter: &Option<models::DateTimeFilterProperty>,
+    value_ms: Option<i64>,
+) -> bool {
+    match filter {
+        None => true,
+        Some(models::DateTimeFilterProperty::DateTimeUtc(dt)) => {
+            value_ms == Some(dt.timestamp_millis())
+        }
+        Some(models::DateTimeFilterProperty::AdvancedDateTimeFilter(a)) => NumOps {
+            eq: a.dollar_eq.map(|d| d.timestamp_millis()),
+            neq: a.dollar_neq.map(|d| d.timestamp_millis()),
+            exists: a.dollar_exists,
+            gt: a.dollar_gt.map(|d| d.timestamp_millis()),
+            gte: a.dollar_gte.map(|d| d.timestamp_millis()),
+            lt: a.dollar_lt.map(|d| d.timestamp_millis()),
+            lte: a.dollar_lte.map(|d| d.timestamp_millis()),
+            in_: a
+                .dollar_in
+                .as_ref()
+                .map(|v| v.iter().map(|d| d.timestamp_millis()).collect()),
+        }
+        .matches(value_ms),
     }
 }
 

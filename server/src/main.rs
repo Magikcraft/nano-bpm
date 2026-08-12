@@ -8311,8 +8311,11 @@ impl ServerImpl {
             })
             .collect();
 
-        // `processDefinitionVersion` (Integer) and `lastUpdatedDate` (DateTime)
-        // filters are not yet supported; all other Zeebe filters are honoured.
+        // All Zeebe `MessageSubscriptionFilter` fields are honoured. Fields Nano
+        // does not yet project (`processDefinitionName`, `toolName`,
+        // `inboundConnectorType`) are matched against an absent value, so an
+        // equality/`$like` filter on them correctly yields no rows (rather than
+        // being silently ignored) while `$exists: false` still matches.
         let mut matched: Vec<MsgSubEntry> = entries
             .into_iter()
             .filter(|e| match filter {
@@ -8345,6 +8348,17 @@ impl ServerImpl {
                             &type_str,
                         )
                         && query::match_string(&f.tenant_id, "<default>")
+                        && query::match_integer(
+                            &f.process_definition_version,
+                            e.process_definition_version.map(i64::from),
+                        )
+                        && query::match_date_time_ms(
+                            &f.last_updated_date,
+                            Some(e.last_updated_ms as i64),
+                        )
+                        && query::match_string_opt(&f.process_definition_name, None)
+                        && query::match_string_opt(&f.tool_name, None)
+                        && query::match_string_opt(&f.inbound_connector_type, None)
                 }
             })
             .collect();
@@ -20396,6 +20410,150 @@ mod clustered_startup_tests {
             panic!("expected a 200 result");
         };
         assert!(result.items.is_empty());
+
+        // Helper: run one filter and return how many rows it matches.
+        async fn count(server: &ServerImpl, filter: models::MessageSubscriptionFilter) -> usize {
+            let resp = server
+                .search_message_subscriptions_impl(&Some(models::MessageSubscriptionSearchQuery {
+                    page: None,
+                    sort: None,
+                    filter: Some(filter),
+                }))
+                .await
+                .expect("filtered search returns");
+            let Resp::Status200_TheMessageSubscriptionSearchResult(result) = resp else {
+                panic!("expected a 200 result");
+            };
+            result.items.len()
+        }
+
+        // processDefinitionVersion (Integer) is now honoured, not ignored.
+        assert_eq!(
+            count(
+                &server,
+                models::MessageSubscriptionFilter {
+                    process_definition_version: Some(models::IntegerFilterProperty::I32(1)),
+                    ..models::MessageSubscriptionFilter::new()
+                }
+            )
+            .await,
+            1,
+            "version == 1 matches"
+        );
+        assert_eq!(
+            count(
+                &server,
+                models::MessageSubscriptionFilter {
+                    process_definition_version: Some(models::IntegerFilterProperty::I32(2)),
+                    ..models::MessageSubscriptionFilter::new()
+                }
+            )
+            .await,
+            0,
+            "version == 2 excludes"
+        );
+        assert_eq!(
+            count(
+                &server,
+                models::MessageSubscriptionFilter {
+                    process_definition_version: Some(
+                        models::IntegerFilterProperty::AdvancedIntegerFilter(
+                            models::AdvancedIntegerFilter {
+                                dollar_gte: Some(1),
+                                dollar_lt: Some(5),
+                                ..models::AdvancedIntegerFilter::new()
+                            }
+                        )
+                    ),
+                    ..models::MessageSubscriptionFilter::new()
+                }
+            )
+            .await,
+            1,
+            "version range 1..5 matches"
+        );
+
+        // lastUpdatedDate (DateTime) is now honoured: the row has a timestamp, so
+        // `$exists: true` matches and a far-future `$gt` excludes.
+        assert_eq!(
+            count(
+                &server,
+                models::MessageSubscriptionFilter {
+                    last_updated_date: Some(
+                        models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                            models::AdvancedDateTimeFilter {
+                                dollar_exists: Some(true),
+                                ..models::AdvancedDateTimeFilter::new()
+                            }
+                        )
+                    ),
+                    ..models::MessageSubscriptionFilter::new()
+                }
+            )
+            .await,
+            1,
+            "lastUpdatedDate exists"
+        );
+        let far_future = chrono::DateTime::<chrono::Utc>::from_timestamp(4_102_444_800, 0).unwrap();
+        assert_eq!(
+            count(
+                &server,
+                models::MessageSubscriptionFilter {
+                    last_updated_date: Some(
+                        models::DateTimeFilterProperty::AdvancedDateTimeFilter(
+                            models::AdvancedDateTimeFilter {
+                                dollar_gt: Some(far_future),
+                                ..models::AdvancedDateTimeFilter::new()
+                            }
+                        )
+                    ),
+                    ..models::MessageSubscriptionFilter::new()
+                }
+            )
+            .await,
+            0,
+            "lastUpdatedDate after 2100 excludes"
+        );
+
+        // Fields Nano does not project (processDefinitionName / toolName /
+        // inboundConnectorType) are treated as absent: an equality filter yields
+        // no rows (not silently ignored) while `$exists: false` matches.
+        for field_setter in [
+            |f: &mut models::MessageSubscriptionFilter, v: models::StringFilterProperty| {
+                f.process_definition_name = Some(v)
+            },
+            |f: &mut models::MessageSubscriptionFilter, v: models::StringFilterProperty| {
+                f.tool_name = Some(v)
+            },
+            |f: &mut models::MessageSubscriptionFilter, v: models::StringFilterProperty| {
+                f.inbound_connector_type = Some(v)
+            },
+        ] {
+            let mut eq = models::MessageSubscriptionFilter::new();
+            field_setter(
+                &mut eq,
+                models::StringFilterProperty::String("x".to_string()),
+            );
+            assert_eq!(
+                count(&server, eq).await,
+                0,
+                "equality on an unprojected field is not silently ignored"
+            );
+
+            let mut absent = models::MessageSubscriptionFilter::new();
+            field_setter(
+                &mut absent,
+                models::StringFilterProperty::AdvancedStringFilter(models::AdvancedStringFilter {
+                    dollar_exists: Some(false),
+                    ..models::AdvancedStringFilter::new()
+                }),
+            );
+            assert_eq!(
+                count(&server, absent).await,
+                1,
+                "$exists:false matches an unprojected field"
+            );
+        }
     }
 
     #[tokio::test]
