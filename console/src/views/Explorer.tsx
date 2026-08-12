@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { listInstances, type Instance } from "../gen";
+import { getInstance, listInstances, type Instance } from "../gen";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
 import InstanceDetail from "./InstanceDetail";
 import { Badge, Button } from "../components/ui";
@@ -30,6 +30,55 @@ function stateTone(
     default:
       return "neutral";
   }
+}
+
+/**
+ * One instance row in the left list. `rowRef` is forwarded only for the selected
+ * row so the list can scroll it into view (e.g. after a deep-link preselects an
+ * instance that would otherwise be below the fold). `pinnedLabel` renders the
+ * small "Linked" tag on the pinned deep-link row that sits above the page when
+ * the selected instance isn't on the current page.
+ */
+function InstanceRow({
+  inst,
+  selected,
+  onSelect,
+  rowRef,
+  pinnedLabel,
+}: {
+  inst: Instance;
+  selected: boolean;
+  onSelect: (key: string) => void;
+  rowRef?: (node: HTMLButtonElement | null) => void;
+  pinnedLabel?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      ref={rowRef}
+      onClick={() => onSelect(inst.key)}
+      className={`flex w-full flex-col gap-1 border-b border-edge px-5 py-3 text-left hover:bg-hover ${
+        selected ? "bg-accent/10" : ""
+      }`}
+    >
+      <div className="flex items-center justify-between">
+        <span className="flex items-center gap-2 font-medium text-fg">
+          {inst.process_id}
+          {pinnedLabel && (
+            <span className="rounded bg-accent/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-accent-strong">
+              Linked
+            </span>
+          )}
+        </span>
+        <Badge tone={stateTone(inst.state, inst.has_incident)}>
+          {inst.has_incident ? "Incident" : inst.state}
+        </Badge>
+      </div>
+      <div className="font-mono text-xs text-fg-faint">
+        {inst.key} · v{inst.version}
+      </div>
+    </button>
+  );
 }
 
 export default function Explorer() {
@@ -61,7 +110,7 @@ export default function Explorer() {
     markExplorerReached();
   }, []);
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, isPlaceholderData } = useQuery({
     queryKey: ["instances", page],
     queryFn: async () =>
       (
@@ -82,6 +131,48 @@ export default function Explorer() {
     total,
     page * PAGE_SIZE + (data?.items.length ?? 0),
   );
+
+  // Is the selected instance present on the page currently in view? A deep-link
+  // (or a selection made before paging) can point at an instance that lives on
+  // another page — the list is paged server-side with no key filter, so we can't
+  // page to it. Instead we fetch just that instance and pin a highlighted row
+  // above the list so the selection is always visible, not silently off-screen.
+  const items = data?.items ?? [];
+  const selectedOnPage =
+    selected != null && items.some((i: Instance) => i.key === selected);
+  const pinnedQuery = useQuery({
+    // Same key + fetch as InstanceDetail's, so React Query dedupes to one request.
+    queryKey: ["instance", selected],
+    queryFn: async () =>
+      (await getInstance({ path: { key: selected! }, throwOnError: true }))
+        .data,
+    enabled: selected != null && !selectedOnPage,
+  });
+  const pinned =
+    selected != null && !selectedOnPage
+      ? pinnedQuery.data?.instance
+      : undefined;
+
+  // Scroll the selected row into view whenever the selection (or the loaded
+  // page) changes, so a preselected instance below the fold is revealed rather
+  // than merely highlighted off-screen. `block: "nearest"` avoids jumping the
+  // whole page when the row is already visible.
+  //
+  // Deliberately NOT depending on the `data` object: this view uses
+  // `useLiveInvalidation(["instances"])`, so every SSE-driven read-model advance
+  // refetches and hands back a fresh `data` reference. Keying the effect on
+  // identity (`selected`, `page`, `pinned?.key`) plus `isPlaceholderData` means
+  // we scroll only when the selection/page/pinned row actually changes or when a
+  // freshly-requested page's data settles (placeholder → real) — never on a
+  // same-page background refetch, which would otherwise snap the list back to
+  // the selected row while the user is scrolling. `firstPageLoaded` covers the
+  // initial mount, where `isPlaceholderData` stays false and never toggles.
+  const selectedRowRef = useRef<HTMLButtonElement | null>(null);
+  const firstPageLoaded = data != null;
+  useEffect(() => {
+    if (isPlaceholderData) return;
+    selectedRowRef.current?.scrollIntoView({ block: "nearest" });
+  }, [selected, page, pinned?.key, isPlaceholderData, firstPageLoaded]);
 
   // Clamp the page if the dataset shrinks (e.g. retention prune) below it.
   useEffect(() => {
@@ -116,26 +207,29 @@ export default function Explorer() {
             </p>
           )}
           <ul>
-            {data?.items.map((inst: Instance) => (
+            {pinned && (
+              <li key={`pinned-${pinned.key}`}>
+                <InstanceRow
+                  inst={pinned}
+                  selected
+                  onSelect={setSelected}
+                  rowRef={(node) => (selectedRowRef.current = node)}
+                  pinnedLabel
+                />
+              </li>
+            )}
+            {items.map((inst: Instance) => (
               <li key={inst.key}>
-                <button
-                  onClick={() => setSelected(inst.key)}
-                  className={`flex w-full flex-col gap-1 border-b border-edge px-5 py-3 text-left hover:bg-hover ${
-                    selected === inst.key ? "bg-accent/10" : ""
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <span className="font-medium text-fg">
-                      {inst.process_id}
-                    </span>
-                    <Badge tone={stateTone(inst.state, inst.has_incident)}>
-                      {inst.has_incident ? "Incident" : inst.state}
-                    </Badge>
-                  </div>
-                  <div className="font-mono text-xs text-fg-faint">
-                    {inst.key} · v{inst.version}
-                  </div>
-                </button>
+                <InstanceRow
+                  inst={inst}
+                  selected={selected === inst.key}
+                  onSelect={setSelected}
+                  rowRef={
+                    selected === inst.key
+                      ? (node) => (selectedRowRef.current = node)
+                      : undefined
+                  }
+                />
               </li>
             ))}
           </ul>
