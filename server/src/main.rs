@@ -3675,6 +3675,49 @@ mod successor_balance_tests {
     }
 }
 
+/// Resolves a create request's `(by_id, by_key, by_version)` selector against
+/// the engine state to `(process_id, selector_key, selector_version)` for a
+/// [`Command::create_instance_versioned`]:
+///
+/// * **by-key** — the key identifies the exact version, so it is looked up
+///   across *all retained versions* (`process_versions`, not the latest-by-id
+///   index) and passed through as `selector_key`; the version number is left
+///   `None` (the key already pins it). An unknown key is a 400 (the create
+///   endpoint has no 404 variant).
+/// * **by-id** — the (already-positive-filtered) `by_version` becomes
+///   `selector_version`; the engine resolves it to that version of `process_id`,
+///   or the latest when `None`.
+///
+/// Returns `(u16, String)` errors for the raft/stream paths; the `with_low`
+/// closure maps them to a `Resp`.
+/// The resolved create selector: `(process_id, selector_key, selector_version)`.
+/// `selector_key` pins an exact deployed version (by-key create); `selector_version`
+/// requests a version of `process_id` (by-id create); both `None` means latest.
+type ResolvedCreateSelector = (String, Option<nanobpmn_engine_core::Key>, Option<i32>);
+
+fn resolve_create_selector(
+    state: &nanobpmn_engine_core::State,
+    by_id: Option<String>,
+    by_key: Option<String>,
+    by_version: Option<i32>,
+) -> Result<ResolvedCreateSelector, (u16, String)> {
+    match (by_id, by_key) {
+        (Some(id), _) => Ok((id, None, by_version.filter(|v| *v > 0))),
+        (None, Some(requested)) => match state
+            .process_versions
+            .values()
+            .find(|d| d.key.to_string() == requested)
+        {
+            Some(d) => Ok((d.definition.id.clone(), Some(d.key), None)),
+            None => Err((400, format!("No deployed process with key '{requested}'."))),
+        },
+        (None, None) => Err((
+            400,
+            "A processDefinitionId or processDefinitionKey is required.".to_string(),
+        )),
+    }
+}
+
 /// Engine-backed implementations of selected operations. The stub generator
 /// (scripts/gen-stub-server.py) emits trait methods that delegate here.
 impl ServerImpl {
@@ -3787,14 +3830,21 @@ impl ServerImpl {
         let business_id_str = business_id;
 
         // Only the by-key variant needs the engine (to resolve a deployed key to a
-        // process id); capture the lookup inputs the engine thread will need.
-        let (by_id, by_key) = match body {
+        // process id); capture the lookup inputs the engine thread will need. The
+        // by-id variant may pin an explicit `processDefinitionVersion` (Zeebe: the
+        // latest version is used when omitted); by-key already identifies the
+        // version through the key, so its `processDefinitionVersion` is ignored.
+        let (by_id, by_key, by_version) = match body {
             models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionById(
                 b,
-            ) => (Some(b.process_definition_id.clone()), None),
+            ) => (
+                Some(b.process_definition_id.clone()),
+                None,
+                b.process_definition_version.filter(|v| *v > 0),
+            ),
             models::ProcessInstanceCreationInstruction::ProcessInstanceCreationInstructionByKey(
                 b,
-            ) => (None, Some(b.process_definition_key.0.clone())),
+            ) => (None, Some(b.process_definition_key.0.clone()), None),
         };
 
         // ADR-0020 Tier-1: shed if the engine's shared write path (raft-log fsync)
@@ -3892,6 +3942,7 @@ impl ServerImpl {
                 .create_rest_via_raft(
                     by_id,
                     by_key,
+                    by_version,
                     variables,
                     wire_vars,
                     tags_vec,
@@ -3992,40 +4043,28 @@ impl ServerImpl {
             self.engine
                 .for_create()
                 .with_low(move |engine| {
-                    // The engine starts processes by BPMN process id. A creation-by-key
-                    // request is resolved to its process id by looking up the deployed
-                    // definition whose key matches; an unknown key is rejected as
-                    // invalid input (the create endpoint has no 404 variant).
-                    let process_id = match (by_id, by_key) {
-                        (Some(id), _) => id,
-                        (None, Some(requested)) => {
-                            match engine
-                                .state()
-                                .processes
-                                .values()
-                                .find(|d| d.key.to_string() == requested)
-                            {
-                                Some(d) => d.definition.id.clone(),
-                                None => {
-                                    return Err(Box::new(
-                                        Resp::Status400_TheProvidedDataIsNotValid(problem(
-                                            "Process not found",
-                                            400,
-                                            format!("No deployed process with key '{requested}'."),
-                                        )),
-                                    ));
-                                }
+                    // Resolve the version selector to a concrete process id +
+                    // (key | version). A by-key request is matched across all
+                    // retained versions; an unknown key is a 400 (the create
+                    // endpoint has no 404 variant).
+                    let (process_id, sel_key, sel_ver) =
+                        match resolve_create_selector(engine.state(), by_id, by_key, by_version) {
+                            Ok(t) => t,
+                            Err((code, detail)) => {
+                                return Err(Box::new(Resp::Status400_TheProvidedDataIsNotValid(
+                                    problem("Process not found", code, detail),
+                                )));
                             }
-                        }
-                        (None, None) => unreachable!("one creation variant is always set"),
-                    };
+                        };
 
                     match engine.apply_command_at(
-                        Command::create_instance_full(
+                        Command::create_instance_versioned(
                             process_id.clone(),
                             variables,
                             tags_vec,
                             business_id_str,
+                            sel_key,
+                            sel_ver,
                         ),
                         now_millis(),
                     ) {
@@ -4034,13 +4073,14 @@ impl ServerImpl {
                                 .iter()
                                 .find_map(Event::instance_key)
                                 .expect("created instance has a key");
-                            // Project the real deployed key and version now that the
-                            // instance exists, so by-id and by-key requests report the
-                            // same definition identity.
+                            // Project the real deployed key and version of the
+                            // version the instance was pinned to (not the latest),
+                            // so by-id and by-key requests report the same identity.
                             let (definition_key, version) = engine
                                 .state()
-                                .processes
-                                .get(&process_id)
+                                .instances
+                                .get(&instance_key)
+                                .and_then(|i| engine.state().definition_for(i))
                                 .map(|d| (d.key.to_string(), d.version))
                                 .unwrap_or_else(|| (process_id.clone(), 1));
                             // An auto-completing process (no wait states) finishes
@@ -6776,7 +6816,7 @@ impl ServerImpl {
         // shared Raft create core (durability is awaited inside the propose, so
         // the returned commit is already ready).
         let outcome: Result<CreateOk, (u16, String)> = if !self.raft.is_empty() {
-            self.raft_create_core(by_id, by_key, variables, tags, business_id)
+            self.raft_create_core(by_id, by_key, None, variables, tags, business_id)
                 .await
                 .map(
                     |(
@@ -6805,36 +6845,19 @@ impl ServerImpl {
             self.engine
                 .for_create()
                 .with_low(move |engine| {
-                    let process_id = match (by_id, by_key) {
-                        (Some(id), _) => id,
-                        (None, Some(requested)) => match engine
-                            .state()
-                            .processes
-                            .values()
-                            .find(|d| d.key.to_string() == requested)
-                        {
-                            Some(d) => d.definition.id.clone(),
-                            None => {
-                                return Err((
-                                    400,
-                                    format!("No deployed process with key '{requested}'."),
-                                ));
-                            }
-                        },
-                        (None, None) => {
-                            return Err((
-                                400,
-                                "A processDefinitionId or processDefinitionKey is required."
-                                    .to_string(),
-                            ));
-                        }
-                    };
+                    let (process_id, sel_key, sel_ver) =
+                        match resolve_create_selector(engine.state(), by_id, by_key, None) {
+                            Ok(t) => t,
+                            Err(e) => return Err(e),
+                        };
                     match engine.apply_command_at(
-                        Command::create_instance_full(
+                        Command::create_instance_versioned(
                             process_id.clone(),
                             variables,
                             tags,
                             business_id,
+                            sel_key,
+                            sel_ver,
                         ),
                         now_millis(),
                     ) {
@@ -6845,8 +6868,9 @@ impl ServerImpl {
                                 .expect("created instance has a key");
                             let (definition_key, version) = engine
                                 .state()
-                                .processes
-                                .get(&process_id)
+                                .instances
+                                .get(&instance_key)
+                                .and_then(|i| engine.state().definition_for(i))
                                 .map(|d| (d.key.to_string(), d.version))
                                 .unwrap_or_else(|| (process_id.clone(), 1));
                             let sync_completed = engine.engine().is_completed(instance_key);
@@ -13142,32 +13166,20 @@ impl ServerImpl {
             self.engine
                 .for_create()
                 .with_low(move |engine| {
-                    let process_id = match (by_id, by_key) {
-                        (Some(id), _) => id,
-                        (None, Some(requested)) => match engine
-                            .state()
-                            .processes
-                            .values()
-                            .find(|d| d.key.to_string() == requested)
-                        {
-                            Some(d) => d.definition.id.clone(),
-                            None => {
-                                return Err((
-                                    400,
-                                    format!("No deployed process with key '{requested}'."),
-                                ));
-                            }
-                        },
-                        (None, None) => {
-                            return Err((
-                                400,
-                                "A processDefinitionId or processDefinitionKey is required."
-                                    .to_string(),
-                            ));
-                        }
-                    };
+                    let (process_id, sel_key, sel_ver) =
+                        match resolve_create_selector(engine.state(), by_id, by_key, None) {
+                            Ok(t) => t,
+                            Err(e) => return Err(e),
+                        };
                     match engine.apply_command_at(
-                        Command::create_instance_with(process_id.clone(), variables),
+                        Command::create_instance_versioned(
+                            process_id.clone(),
+                            variables,
+                            Vec::new(),
+                            None,
+                            sel_key,
+                            sel_ver,
+                        ),
                         now_millis(),
                     ) {
                         Ok((events, commit)) => {
@@ -13448,6 +13460,7 @@ impl ServerImpl {
             .raft_create_core(
                 by_id.clone(),
                 by_key.clone(),
+                None,
                 variables.clone(),
                 Vec::new(),
                 None,
@@ -13574,6 +13587,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
+        by_version: Option<i32>,
         variables: std::collections::HashMap<String, Value>,
         wire_vars: Option<serde_json::Map<String, serde_json::Value>>,
         tags: Vec<String>,
@@ -13604,6 +13618,7 @@ impl ServerImpl {
             .raft_create_core(
                 by_id.clone(),
                 by_key.clone(),
+                by_version,
                 variables,
                 tags.clone(),
                 business_id.clone(),
@@ -13688,6 +13703,7 @@ impl ServerImpl {
         &self,
         by_id: Option<String>,
         by_key: Option<String>,
+        by_version: Option<i32>,
         variables: std::collections::HashMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
@@ -13718,23 +13734,12 @@ impl ServerImpl {
             return Err((500, format!("no local engine actor for partition {p}")));
         };
 
-        // Resolve the process-definition id (a by-key create needs a read of the
-        // engine's deployed-process table) before proposing — the command carries
-        // a concrete `process_id`.
-        let process_id = handle
-            .with(move |journal| match (by_id, by_key) {
-                (Some(id), _) => Ok(id),
-                (None, Some(requested)) => journal
-                    .state()
-                    .processes
-                    .values()
-                    .find(|d| d.key.to_string() == requested)
-                    .map(|d| d.definition.id.clone())
-                    .ok_or((400, format!("No deployed process with key '{requested}'."))),
-                (None, None) => Err((
-                    400,
-                    "A processDefinitionId or processDefinitionKey is required.".to_string(),
-                )),
+        // Resolve the version selector (a by-key create needs a read of the
+        // engine's retained-versions table) before proposing — the command
+        // carries a concrete `process_id` plus the resolved selector.
+        let (process_id, sel_key, sel_ver) = handle
+            .with(move |journal| {
+                resolve_create_selector(journal.state(), by_id, by_key, by_version)
             })
             .await?;
 
@@ -13743,7 +13748,14 @@ impl ServerImpl {
         };
         let response = part
             .propose_result(
-                Command::create_instance_full(process_id.clone(), variables, tags, business_id),
+                Command::create_instance_versioned(
+                    process_id.clone(),
+                    variables,
+                    tags,
+                    business_id,
+                    sel_key,
+                    sel_ver,
+                ),
                 now_millis(),
             )
             .await
@@ -13760,15 +13772,16 @@ impl ServerImpl {
         let sync_completed = events.iter().any(|e| {
             matches!(e, Event::ProcessInstanceCompleted { instance_key: k } if *k == instance_key)
         });
-        // Project the deployed key + version now the instance exists, so by-id and
-        // by-key creates report the same definition identity.
+        // Project the deployed key + version of the version the instance was
+        // pinned to (not the latest), so by-id and by-key creates agree.
         let pid_for_read = process_id.clone();
         let (definition_key, version) = handle
             .with(move |journal| {
                 journal
                     .state()
-                    .processes
-                    .get(&pid_for_read)
+                    .instances
+                    .get(&instance_key)
+                    .and_then(|i| journal.state().definition_for(i))
                     .map(|d| (d.key.to_string(), d.version))
                     .unwrap_or((pid_for_read, 1))
             })

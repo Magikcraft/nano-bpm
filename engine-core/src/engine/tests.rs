@@ -2954,6 +2954,8 @@ fn should_create_a_user_task_with_resolved_attributes() {
             variables: vars,
             tags: Vec::new(),
             business_id: None,
+            process_definition_key: None,
+            version: None,
         })
         .unwrap();
     let user_task_key = created
@@ -12933,4 +12935,294 @@ fn migration_rejects_active_token_inside_a_nested_flow_scope() {
     );
     // The instance stays on its source definition — nothing was migrated.
     assert_eq!(engine.instance(inst).unwrap().process_id, "sub-scope");
+}
+
+// ===========================================================================
+// Issue #750 — process-definition version support (Zeebe parity).
+//
+// The engine retains *every* deployed version of a process definition (keyed
+// by process-definition key), pins each running instance to the exact version
+// it was created on, and honours the create-time version selector (by explicit
+// definition key, or by process id + version number, defaulting to latest).
+// ===========================================================================
+
+/// A `payment`-emitting "order" definition whose model differs from
+/// `linear_with_task` by adding `extra` service tasks after `charge`, so each
+/// distinct `extra` count deploys as a new, non-idempotent version of "order".
+fn order_with_extra_tasks(extra: usize) -> ProcessDefinition {
+    let mut b = ProcessBuilder::new("order")
+        .start_event("start")
+        .service_task("charge", "payment");
+    let mut prev = "charge".to_string();
+    for i in 0..extra {
+        let id = format!("extra{i}");
+        b = b.service_task(&id, "work");
+        b = b.connect(&prev, &id);
+        prev = id;
+    }
+    b.end_event("end")
+        .connect("start", "charge")
+        .connect(&prev, "end")
+        .build()
+        .unwrap()
+}
+
+/// Deploy `def` and return its `(process_definition_key, version)`.
+fn deploy_returning_key(engine: &mut Engine, def: ProcessDefinition) -> (Key, i32) {
+    engine
+        .apply_command(Command::DeployProcess(def))
+        .unwrap()
+        .iter()
+        .find_map(|e| match e {
+            Event::ProcessDeployed {
+                process_definition_key,
+                version,
+                ..
+            } => Some((*process_definition_key, *version)),
+            _ => None,
+        })
+        .expect("a changed definition emits ProcessDeployed")
+}
+
+#[test]
+fn deploying_multiple_versions_retains_every_version_by_key() {
+    // v1, v2, v3 of the same id must all be retained in `process_versions`
+    // (keyed by definition key), with monotonically increasing versions and a
+    // latest-index that tracks the highest version.
+    let mut engine = Engine::new();
+    let (k1, v1) = deploy_returning_key(&mut engine, order_with_extra_tasks(0));
+    let (k2, v2) = deploy_returning_key(&mut engine, order_with_extra_tasks(1));
+    let (k3, v3) = deploy_returning_key(&mut engine, order_with_extra_tasks(2));
+
+    assert_eq!((v1, v2, v3), (1, 2, 3), "versions increment monotonically");
+    assert!(
+        k1 != k2 && k2 != k3 && k1 != k3,
+        "each version has a distinct definition key"
+    );
+
+    let versions = &engine.state().process_versions;
+    for (k, v) in [(k1, 1), (k2, 2), (k3, 3)] {
+        let d = versions
+            .get(&k)
+            .unwrap_or_else(|| panic!("version {v} (key {k}) is retained"));
+        assert_eq!(d.version, v, "retained definition reports its own version");
+    }
+
+    // The latest-by-id index points at the highest version.
+    let latest = engine.state().processes.get("order").unwrap();
+    assert_eq!(latest.version, 3, "latest index tracks the newest version");
+    assert_eq!(latest.key, k3);
+}
+
+#[test]
+fn create_by_key_pins_instance_to_that_exact_version() {
+    // Creating by the *key* of an older version must pin the instance to that
+    // version even though a newer one is the latest — the key already
+    // identifies the version (Zeebe by-key semantics), so any version selector
+    // is irrelevant.
+    let mut engine = Engine::new();
+    let (k1, _) = deploy_returning_key(&mut engine, order_with_extra_tasks(0));
+    let (_k2, _) = deploy_returning_key(&mut engine, order_with_extra_tasks(1)); // v2 is latest
+
+    let events = engine
+        .apply_command(Command::create_instance_versioned(
+            "order",
+            HashMap::new(),
+            Vec::new(),
+            None,
+            Some(k1),
+            // A version selector is ignored on a by-key create; prove it does
+            // not override the key's own version.
+            Some(2),
+        ))
+        .unwrap();
+    let inst_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let instance = engine.state().instances.get(&inst_key).unwrap();
+    assert_eq!(
+        instance.process_definition_key, k1,
+        "the instance is pinned to the requested (older) version's key"
+    );
+    let def = engine
+        .state()
+        .definition_for(instance)
+        .expect("pinned definition resolves");
+    assert_eq!(
+        def.version, 1,
+        "execution resolves the pinned v1, not latest"
+    );
+
+    // The job it emits reports the pinned version, not the latest.
+    let job = &engine.activate_jobs("payment", "w", 1, 60_000, 0)[0];
+    assert_eq!(job.process_definition_version, 1);
+    assert_eq!(job.process_definition_key, k1);
+}
+
+#[test]
+fn create_by_id_and_version_selects_that_version_else_latest_else_errors() {
+    let mut engine = Engine::new();
+    let (k1, _) = deploy_returning_key(&mut engine, order_with_extra_tasks(0));
+    let (k2, _) = deploy_returning_key(&mut engine, order_with_extra_tasks(1)); // v2 latest
+
+    // Explicit version 1 → v1.
+    let by_v1 = engine
+        .apply_command(Command::create_instance_versioned(
+            "order",
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            Some(1),
+        ))
+        .unwrap();
+    let i1 = by_v1.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        engine
+            .state()
+            .instances
+            .get(&i1)
+            .unwrap()
+            .process_definition_key,
+        k1
+    );
+
+    // No version → latest (v2).
+    let by_latest = engine
+        .apply_command(Command::create_instance_versioned(
+            "order",
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+        ))
+        .unwrap();
+    let i2 = by_latest.iter().find_map(|e| e.instance_key()).unwrap();
+    assert_eq!(
+        engine
+            .state()
+            .instances
+            .get(&i2)
+            .unwrap()
+            .process_definition_key,
+        k2
+    );
+
+    // Unknown version → error, no instance created.
+    let err = engine.apply_command(Command::create_instance_versioned(
+        "order",
+        HashMap::new(),
+        Vec::new(),
+        None,
+        None,
+        Some(99),
+    ));
+    assert!(
+        matches!(err, Err(EngineError::ProcessNotFound { .. })),
+        "an unknown version is rejected, not silently coerced to latest"
+    );
+}
+
+#[test]
+fn instance_without_a_pinned_key_resolves_to_latest() {
+    // Back-compat: an instance materialized from an old snapshot (no
+    // `process_definition_key`, i.e. key 0) must resolve its definition via the
+    // latest-by-id index rather than failing to resolve.
+    let mut engine = Engine::new();
+    deploy_returning_key(&mut engine, order_with_extra_tasks(0));
+    let created = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let inst_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // Simulate an old-format instance by clearing its pinned key.
+    // (Field is `#[serde(default)]` → 0 on legacy snapshots.)
+    let mut state = engine.state().clone();
+    state
+        .instances
+        .get_mut(&inst_key)
+        .unwrap()
+        .process_definition_key = 0;
+    let instance = state.instances.get(&inst_key).unwrap();
+    let def = state
+        .definition_for(instance)
+        .expect("a key-0 instance falls back to the latest-by-id definition");
+    assert_eq!(def.definition.id, "order");
+}
+
+#[test]
+fn every_active_instance_pins_its_own_definition_key() {
+    // Class-scoped guard: no live instance may rely on the latest-by-id index
+    // for execution. Even after a newer version is deployed, previously-created
+    // instances keep their original pinned key and resolve their original
+    // version.
+    let mut engine = Engine::new();
+    let (k1, _) = deploy_returning_key(&mut engine, order_with_extra_tasks(0));
+    let created = engine
+        .apply_command(Command::create_instance("order"))
+        .unwrap();
+    let inst_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    // A newer version lands *after* the instance was created.
+    let (_k2, _) = deploy_returning_key(&mut engine, order_with_extra_tasks(1));
+
+    for (key, instance) in &engine.state().instances {
+        assert_ne!(
+            instance.process_definition_key, 0,
+            "instance {key} must pin a concrete definition key, not fall through to latest"
+        );
+    }
+    let instance = engine.state().instances.get(&inst_key).unwrap();
+    assert_eq!(instance.process_definition_key, k1);
+    let job = &engine.activate_jobs("payment", "w", 1, 60_000, 0)[0];
+    assert_eq!(
+        job.process_definition_version, 1,
+        "the pre-existing instance still executes v1 after v2 is deployed"
+    );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn snapshot_round_trip_retains_all_versions_and_instance_pins() {
+    // A serialized snapshot must preserve every retained version *and* each
+    // instance's pinned definition key, so a node rebuilt from a snapshot
+    // resolves execution against the same versions.
+    let mut engine = Engine::new();
+    let (k1, _) = deploy_returning_key(&mut engine, order_with_extra_tasks(0));
+    let (k2, _) = deploy_returning_key(&mut engine, order_with_extra_tasks(1));
+    let created = engine
+        .apply_command(Command::create_instance_versioned(
+            "order",
+            HashMap::new(),
+            Vec::new(),
+            None,
+            Some(k1),
+            None,
+        ))
+        .unwrap();
+    let inst_key = created.iter().find_map(|e| e.instance_key()).unwrap();
+
+    let snapshot = engine.snapshot();
+    let serialized = serde_json::to_vec(&snapshot).expect("snapshot serializes");
+    let decoded: EngineSnapshot =
+        serde_json::from_slice(&serialized).expect("snapshot deserializes");
+    let restored = Engine::from_snapshot(decoded);
+
+    assert_eq!(
+        restored.state(),
+        engine.state(),
+        "restored state equals the source state, versions and pins included"
+    );
+    assert!(restored.state().process_versions.contains_key(&k1));
+    assert!(restored.state().process_versions.contains_key(&k2));
+    assert_eq!(
+        restored
+            .state()
+            .instances
+            .get(&inst_key)
+            .unwrap()
+            .process_definition_key,
+        k1,
+        "the instance's pinned key survives the round-trip"
+    );
 }

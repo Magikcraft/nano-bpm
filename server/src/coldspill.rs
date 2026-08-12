@@ -269,6 +269,7 @@ mod tests {
         ProcessInstance {
             key,
             process_id: "p".into(),
+            process_definition_key: 0,
             state: ProcessInstanceState::Active,
             created_at: 0,
             tags: Vec::new(),

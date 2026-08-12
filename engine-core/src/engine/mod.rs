@@ -456,19 +456,13 @@ impl Engine {
             if state::partition_of(max_key) == self.partition_id {
                 self.next_local = self.next_local.max(state::local_of(max_key));
             }
-            if let Event::ProcessDeployed {
-                process, version, ..
-            } = event
-            {
-                let newer = self
-                    .state
-                    .processes
-                    .get(&process.id)
-                    .map(|d| *version > d.version)
-                    .unwrap_or(true);
-                if newer {
-                    state::apply(&mut self.state, event);
-                }
+            if let Event::ProcessDeployed { .. } = event {
+                // Always apply: the applier retains every version in
+                // `process_versions` and internally guards the latest-by-id
+                // index so an out-of-order (older) durable copy never regresses
+                // the latest pointer. Skipping older events here would drop
+                // historical versions that pinned instances still resolve.
+                state::apply(&mut self.state, event);
             } else if let Event::DecisionRequirementsDeployed { drg, version, .. } = event {
                 let newer = self
                     .state
@@ -524,8 +518,18 @@ impl Engine {
         variables: HashMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
+        process_definition_key: Key,
     ) -> Key {
         let instance_key = self.mint_key();
+        // Pin to the given version; a `0` key (start-event / dispatch callers)
+        // resolves to the current latest for this process id.
+        let (process_definition_key, version) = self
+            .state
+            .process_versions
+            .get(&process_definition_key)
+            .or_else(|| self.state.processes.get(&process_id))
+            .map(|d| (d.key, d.version))
+            .unwrap_or((process_definition_key, 0));
         self.emit(
             log,
             Event::ProcessInstanceCreated {
@@ -535,6 +539,8 @@ impl Engine {
                 created_at: self.now,
                 tags,
                 business_id,
+                process_definition_key,
+                version,
             },
         );
         queue.push_back(Step::Activate {
@@ -574,6 +580,7 @@ impl Engine {
                 variables,
                 tags,
                 business_id,
+                0,
             );
             return;
         }
@@ -588,6 +595,7 @@ impl Engine {
                 variables,
                 tags,
                 business_id,
+                0,
             );
         } else {
             self.emit(
@@ -997,12 +1005,42 @@ impl Engine {
                 variables,
                 tags,
                 business_id,
+                process_definition_key,
+                version,
             } => {
-                let process = self.state.processes.get(&process_id).ok_or_else(|| {
-                    EngineError::ProcessNotFound {
-                        process_id: process_id.clone(),
+                // Resolve the requested version to a concrete deployed
+                // definition (Zeebe parity):
+                //   * an explicit definition key selects that exact version
+                //     (creation-by-key — the key already identifies the version);
+                //   * else an explicit positive version number selects that
+                //     version of `process_id` (creation-by-id + version);
+                //   * else the latest version of `process_id`.
+                let process = match (
+                    process_definition_key.filter(|k| *k != 0),
+                    version.filter(|v| *v > 0),
+                ) {
+                    (Some(key), _) => self.state.process_versions.get(&key).ok_or_else(|| {
+                        EngineError::ProcessNotFound {
+                            process_id: process_id.clone(),
+                        }
+                    })?,
+                    (None, Some(v)) => {
+                        self.state.process_version(&process_id, v).ok_or_else(|| {
+                            EngineError::ProcessNotFound {
+                                process_id: process_id.clone(),
+                            }
+                        })?
                     }
-                })?;
+                    (None, None) => self.state.processes.get(&process_id).ok_or_else(|| {
+                        EngineError::ProcessNotFound {
+                            process_id: process_id.clone(),
+                        }
+                    })?,
+                };
+                let resolved_key = process.key;
+                // A by-key request may carry an empty `process_id`; use the
+                // resolved definition's id so the event and indices are coherent.
+                let process_id = process.definition.id.clone();
                 let start_event = process.definition.start_event.clone();
                 self.start_instance(
                     &mut log,
@@ -1012,6 +1050,7 @@ impl Engine {
                     variables,
                     tags,
                     business_id,
+                    resolved_key,
                 );
             }
 
@@ -2973,6 +3012,7 @@ impl Engine {
                     variables,
                     tags,
                     business_id,
+                    0,
                 );
             }
 
@@ -3459,7 +3499,7 @@ impl Engine {
             if instance.state != ProcessInstanceState::Active {
                 continue;
             }
-            let Some(process) = self.state.processes.get(&instance.process_id) else {
+            let Some(process) = self.state.definition_for(instance) else {
                 continue;
             };
             for (eik, element_id) in &instance.active {
@@ -7284,10 +7324,7 @@ impl Engine {
 
     fn process_of_instance(&self, instance_key: Key) -> Option<&crate::model::ProcessDefinition> {
         let instance = self.state.instances.get(&instance_key)?;
-        self.state
-            .processes
-            .get(&instance.process_id)
-            .map(|p| &p.definition)
+        self.state.definition_for(instance).map(|p| &p.definition)
     }
 
     fn element_kind(&self, instance_key: Key, element_id: &str) -> Option<ElementKind> {

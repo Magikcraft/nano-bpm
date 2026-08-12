@@ -2332,6 +2332,8 @@ mod tests {
             variables: HashMap::new(),
             tags: vec![],
             business_id: None,
+            process_definition_key: None,
+            version: None,
         }));
         assert!(is_creation_intake(&Command::activate_jobs(
             "t", "w", 1, 1, 0
@@ -2380,6 +2382,8 @@ mod tests {
                     variables: Default::default(),
                     tags: Vec::new(),
                     business_id: None,
+                    process_definition_key: None,
+                    version: None,
                 },
                 2_000,
             )
@@ -2439,6 +2443,8 @@ mod tests {
                         variables: Default::default(),
                         tags: Vec::new(),
                         business_id: None,
+                        process_definition_key: None,
+                        version: None,
                     },
                     3,
                 )
@@ -2454,6 +2460,8 @@ mod tests {
                             variables: Default::default(),
                             tags: Vec::new(),
                             business_id: None,
+                            process_definition_key: None,
+                            version: None,
                         },
                         4,
                     )
@@ -2776,6 +2784,8 @@ mod tests {
                         variables: Default::default(),
                         tags: Vec::new(),
                         business_id: None,
+                        process_definition_key: None,
+                        version: None,
                     },
                     2_000,
                 )
@@ -2951,6 +2961,8 @@ mod tests {
                     variables: Default::default(),
                     tags: Vec::new(),
                     business_id: None,
+                    process_definition_key: None,
+                    version: None,
                 },
                 2_000,
             )

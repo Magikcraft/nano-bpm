@@ -338,6 +338,15 @@ pub struct UserTask {
 pub struct ProcessInstance {
     pub key: Key,
     pub process_id: String,
+    /// The unique key of the process **definition version** this instance was
+    /// created on. Resolves the instance's executable definition through
+    /// [`State::process_versions`], so the instance always runs the version it
+    /// started on even after a newer version is redeployed (Zeebe parity).
+    /// `0` for instances created before version pinning existed (or snapshots
+    /// written before this field); [`State::definition_for`] falls back to the
+    /// latest-by-id index for those. `serde(default)` for snapshot back-compat.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub process_definition_key: Key,
     pub state: ProcessInstanceState,
     /// The logical instant the instance was started (the `created_at` carried on
     /// the creating command), in milliseconds since the Unix epoch. This is the
@@ -825,8 +834,19 @@ pub struct DeployedProcess {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct State {
     /// Latest deployed version of each process, keyed by BPMN process id. New
-    /// instances created by id start the latest version.
+    /// instances created by id (with no explicit version) start the latest
+    /// version. This is a fast latest-by-id index over `process_versions`.
     pub processes: HashMap<String, DeployedProcess>,
+    /// Every deployed process definition ever seen, keyed by its unique
+    /// process-definition key (so historical versions are retained, not
+    /// overwritten by a redeploy). A running instance resolves *its* definition
+    /// through here by its pinned `process_definition_key`, so replaying it
+    /// against a newer redeployed version is impossible (Zeebe parity: an
+    /// instance runs the version it was created on). `serde(default)` so
+    /// snapshots written before version retention deserialize empty and fall
+    /// back to the latest-by-id index via [`State::definition_for`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub process_versions: HashMap<Key, DeployedProcess>,
     pub instances: HashMap<Key, ProcessInstance>,
     pub jobs: HashMap<Key, Job>,
     /// User tasks created for `userTask` elements, keyed by user-task key. A
@@ -1003,6 +1023,29 @@ impl State {
         Self::default()
     }
 
+    /// The executable definition an instance runs against — resolved through the
+    /// instance's pinned `process_definition_key` so it is always the version the
+    /// instance was created on, even after a newer version is redeployed (Zeebe
+    /// parity). Falls back to the latest-by-id index for instances (or snapshots)
+    /// created before version pinning, whose `process_definition_key` is `0`.
+    pub fn definition_for(&self, instance: &ProcessInstance) -> Option<&DeployedProcess> {
+        if instance.process_definition_key != 0 {
+            if let Some(deployed) = self.process_versions.get(&instance.process_definition_key) {
+                return Some(deployed);
+            }
+        }
+        self.processes.get(&instance.process_id)
+    }
+
+    /// The exact deployed version of `process_id` with version number `version`,
+    /// if one is retained. Used to resolve an explicit by-id + version create
+    /// request to a concrete definition.
+    pub fn process_version(&self, process_id: &str, version: i32) -> Option<&DeployedProcess> {
+        self.process_versions
+            .values()
+            .find(|d| d.definition.id == process_id && d.version == version)
+    }
+
     /// Count of jobs that represent *live* runnable congestion — `Created`
     /// (waiting for a worker, in the activatable index) plus `Activated`
     /// (leased, in-flight at a worker, in the activated index). Terminal jobs
@@ -1133,14 +1176,29 @@ pub fn apply(state: &mut State, event: &Event) {
             process,
             ..
         } => {
-            state.processes.insert(
-                process.id.clone(),
-                DeployedProcess {
-                    key: *process_definition_key,
-                    version: *version,
-                    definition: process.clone(),
-                },
-            );
+            let deployed = DeployedProcess {
+                key: *process_definition_key,
+                version: *version,
+                definition: process.clone(),
+            };
+            // Retain every version, keyed by its unique definition key, so a
+            // running instance can always resolve the version it was created on.
+            state
+                .process_versions
+                .insert(*process_definition_key, deployed.clone());
+            // Maintain the latest-by-id index. In sequential replay versions
+            // strictly increase, so the last applied wins; the `>=` guard makes
+            // out-of-order snapshot merge (see `install_deployment_if_newer`)
+            // monotonic — an older surviving durable copy never regresses the
+            // latest pointer.
+            let is_latest = state
+                .processes
+                .get(&process.id)
+                .map(|existing| *version >= existing.version)
+                .unwrap_or(true);
+            if is_latest {
+                state.processes.insert(process.id.clone(), deployed);
+            }
         }
 
         Event::DecisionRequirementsDeployed {
@@ -1225,6 +1283,8 @@ pub fn apply(state: &mut State, event: &Event) {
             created_at,
             tags,
             business_id,
+            process_definition_key,
+            ..
         } => {
             *state
                 .inflight_by_process
@@ -1234,11 +1294,19 @@ pub fn apply(state: &mut State, event: &Event) {
                 .created_by_process
                 .entry(process_id.clone())
                 .or_insert(0) += 1;
+            // Pin to the exact version the event carries; fall back to the
+            // current latest for events written before version pinning (`0`).
+            let pinned_key = if *process_definition_key != 0 {
+                *process_definition_key
+            } else {
+                state.processes.get(process_id).map(|d| d.key).unwrap_or(0)
+            };
             state.instances.insert(
                 *instance_key,
                 ProcessInstance {
                     key: *instance_key,
                     process_id: process_id.clone(),
+                    process_definition_key: pinned_key,
                     state: ProcessInstanceState::Active,
                     created_at: *created_at,
                     tags: tags.clone(),

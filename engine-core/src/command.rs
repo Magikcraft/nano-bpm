@@ -49,6 +49,24 @@ pub enum Command {
         variables: HashMap<String, Value>,
         tags: Vec<String>,
         business_id: Option<String>,
+        /// Selects an exact process **definition version** by its unique key.
+        /// `None` (or `Some(0)`) means "not selected by key" — used by the
+        /// creation-by-key REST variant, where the key already identifies the
+        /// version. Takes precedence over `version` when set. `serde(default)`
+        /// so commands written before version selection deserialize unchanged.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        process_definition_key: Option<Key>,
+        /// Selects a process version by its version *number* under `process_id`.
+        /// `None` (or a non-positive value) means "latest" — the creation-by-id
+        /// REST variant's default. Ignored when `process_definition_key` is set.
+        #[cfg_attr(
+            feature = "serde",
+            serde(default, skip_serializing_if = "Option::is_none")
+        )]
+        version: Option<i32>,
     },
     /// Report that the work for a job has finished, optionally merging variables
     /// into the instance before the token resumes. Completion is by key alone:
@@ -502,6 +520,8 @@ impl Command {
             variables: HashMap::new(),
             tags: Vec::new(),
             business_id: None,
+            process_definition_key: None,
+            version: None,
         }
     }
 
@@ -515,6 +535,8 @@ impl Command {
             variables,
             tags: Vec::new(),
             business_id: None,
+            process_definition_key: None,
+            version: None,
         }
     }
 
@@ -531,6 +553,32 @@ impl Command {
             variables,
             tags,
             business_id,
+            process_definition_key: None,
+            version: None,
+        }
+    }
+
+    /// Convenience constructor for a `CreateInstance` that selects a specific
+    /// process **definition version** — by its unique key (`process_definition_key`,
+    /// the creation-by-key path) or by version *number* under `process_id`
+    /// (`version`, the creation-by-id path). A `None`/`0` key and a `None`/
+    /// non-positive version together mean "latest".
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_instance_versioned(
+        process_id: impl Into<String>,
+        variables: HashMap<String, Value>,
+        tags: Vec<String>,
+        business_id: Option<String>,
+        process_definition_key: Option<Key>,
+        version: Option<i32>,
+    ) -> Self {
+        Command::CreateInstance {
+            process_id: process_id.into(),
+            variables,
+            tags,
+            business_id,
+            process_definition_key,
+            version,
         }
     }
 
