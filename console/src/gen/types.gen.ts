@@ -96,7 +96,7 @@ export type Job = {
      */
     activated_at_ms: number | null;
     /**
-     * The original activation timeout (the worker-requested lock duration), frozen by the engine at activation. May differ from the current deadline_ms − activated_at_ms after an UpdateJobTimeout lock extension. Null unless activated.
+     * The current lock window (deadline_ms − activated_at_ms) the job is held for, derived from the live deadline. Reflects UpdateJobTimeout lock extensions that move the deadline out (or in). Null unless activated.
      *
      */
     timeout_ms: number | null;

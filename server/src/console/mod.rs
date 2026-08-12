@@ -1961,9 +1961,10 @@ struct JobDto {
     /// Logical instant (ms since epoch) the current activation lock was acquired.
     /// Only populated for a job the engine reports as `Activated` (studio overlay).
     activated_at_ms: Option<u64>,
-    /// The lock duration the job was activated with (the worker's job timeout),
-    /// frozen by the engine at activation so it stays correct across later
-    /// `UpdateJobTimeout` lock extensions. `None` unless currently activated.
+    /// The current lock window (`deadline - activated_at`) the job is held for.
+    /// Derived from the *live* deadline, so it moves when an `UpdateJobTimeout`
+    /// extends (or shortens) the lock and the Explorer's "Timeout" reflects the
+    /// modification. `None` unless currently activated.
     timeout_ms: Option<u64>,
 }
 
@@ -2027,7 +2028,6 @@ struct LiveJob {
     worker: Option<String>,
     deadline_ms: Option<u64>,
     activated_at_ms: Option<u64>,
-    timeout_ms: Option<u64>,
 }
 
 /// Overlays live engine job state onto read-model job DTOs (studio-only, nano
@@ -2060,9 +2060,13 @@ fn apply_job_activation_overlay(
             dto.worker = l.worker.clone();
             dto.deadline_ms = l.deadline_ms;
             dto.activated_at_ms = l.activated_at_ms;
-            // The lock window the worker was activated with, frozen by the engine
-            // at activation so it stays correct across UpdateJobTimeout extensions.
-            dto.timeout_ms = l.timeout_ms;
+            // The current lock window (deadline - activated_at), derived from the
+            // *live* deadline so it reflects any UpdateJobTimeout that moved the
+            // deadline out (or in) since activation.
+            dto.timeout_ms = l
+                .deadline_ms
+                .zip(l.activated_at_ms)
+                .map(|(deadline, activated_at)| deadline.saturating_sub(activated_at));
         }
     }
 }
@@ -2130,7 +2134,6 @@ pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<In
                                 worker: job.worker.clone(),
                                 deadline_ms: job.deadline,
                                 activated_at_ms: job.activated_at,
-                                timeout_ms: job.activation_timeout,
                             },
                         );
                     }
@@ -2202,7 +2205,6 @@ mod job_activation_overlay_tests {
             worker: Some(worker.to_string()),
             deadline_ms: Some(deadline_ms),
             activated_at_ms: Some(deadline_ms.saturating_sub(300_000)),
-            timeout_ms: Some(300_000),
         }
     }
 
@@ -2218,12 +2220,12 @@ mod job_activation_overlay_tests {
     }
 
     #[test]
-    fn surfaces_activation_time_and_frozen_timeout() {
+    fn surfaces_activation_time_and_live_lock_window() {
         let mut jobs = vec![job("10", "Created")];
         let mut live = HashMap::new();
-        // Activated at t=1_000 with a 7_200_000ms (2h) lock → deadline 7_201_000.
-        // The engine froze the requested timeout at activation, so the overlay
-        // surfaces it directly (immune to later UpdateJobTimeout deadline moves).
+        // Activated at t=1_000 with a 2h lock → deadline 7_201_000. The overlay
+        // derives the lock window from the *live* deadline (deadline - activated_at),
+        // so it always reflects the current lock, including UpdateJobTimeout moves.
         live.insert(
             10u64,
             LiveJob {
@@ -2231,12 +2233,32 @@ mod job_activation_overlay_tests {
                 worker: Some("fleet".to_string()),
                 deadline_ms: Some(7_201_000),
                 activated_at_ms: Some(1_000),
-                timeout_ms: Some(7_200_000),
             },
         );
         apply_job_activation_overlay(&mut jobs, &live);
         assert_eq!(jobs[0].activated_at_ms, Some(1_000));
         assert_eq!(jobs[0].timeout_ms, Some(7_200_000));
+    }
+
+    #[test]
+    fn timeout_reflects_an_update_job_timeout_deadline_move() {
+        // A job activated at t=1_000 with a 2h lock (deadline 7_201_000) then
+        // extended via UpdateJobTimeout, which moves the deadline out to
+        // 10_801_000 (activated_at unchanged). The Explorer "Timeout" must grow
+        // to the new lock window (10_800_000 = 3h), not stay frozen at 2h.
+        let mut jobs = vec![job("10", "Created")];
+        let mut live = HashMap::new();
+        live.insert(
+            10u64,
+            LiveJob {
+                state: "Activated".to_string(),
+                worker: Some("fleet".to_string()),
+                deadline_ms: Some(10_801_000),
+                activated_at_ms: Some(1_000),
+            },
+        );
+        apply_job_activation_overlay(&mut jobs, &live);
+        assert_eq!(jobs[0].timeout_ms, Some(10_800_000));
     }
 
     #[test]
@@ -2261,7 +2283,6 @@ mod job_activation_overlay_tests {
                 worker: None,
                 deadline_ms: None,
                 activated_at_ms: None,
-                timeout_ms: None,
             },
         );
         apply_job_activation_overlay(&mut jobs, &live);
