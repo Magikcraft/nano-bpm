@@ -484,8 +484,18 @@ impl Inner {
                 created_at,
                 tags,
                 business_id,
+                version: pinned_version,
+                ..
             } => {
-                let version = self.versions.get(process_id).copied();
+                // Prefer the version the instance was pinned to at creation
+                // (a by-key / by-id+version create may target a non-latest
+                // version); fall back to the latest deployed so far for events
+                // written before version pinning (`pinned_version == 0`).
+                let version = if *pinned_version != 0 {
+                    Some(*pinned_version)
+                } else {
+                    self.versions.get(process_id).copied()
+                };
                 let started = if *created_at != 0 { *created_at } else { now };
                 let (creation_variables, current_variables) = if self.capture_vars {
                     (
@@ -1283,6 +1293,8 @@ mod tests {
             created_at: 100,
             tags: vec![],
             business_id: None,
+            process_definition_key: 0,
+            version: 0,
         }
     }
 

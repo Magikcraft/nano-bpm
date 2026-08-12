@@ -80,6 +80,8 @@ pub fn run_instance(
             variables: vars,
             tags: Vec::new(),
             business_id: None,
+            process_definition_key: None,
+            version: None,
         },
         clock,
     );

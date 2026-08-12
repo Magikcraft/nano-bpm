@@ -165,7 +165,7 @@ impl Engine {
         let (tags, business_id) = instance
             .map(|i| (i.tags.clone(), i.business_id.clone()))
             .unwrap_or_default();
-        let deployed = instance.and_then(|i| self.state.processes.get(&i.process_id));
+        let deployed = instance.and_then(|i| self.state.definition_for(i));
         let process_definition_key = deployed.map(|d| d.key).unwrap_or(0);
         let process_definition_version = deployed.map(|d| d.version).unwrap_or(0);
         let custom_headers = if matches!(job.kind, state::JobKind::BpmnElement) {

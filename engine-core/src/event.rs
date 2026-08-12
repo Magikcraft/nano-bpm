@@ -126,6 +126,16 @@ pub enum Event {
         tags: Vec<String>,
         #[cfg_attr(feature = "serde", serde(default))]
         business_id: Option<String>,
+        /// The unique key of the process **definition version** this instance was
+        /// created on. Pins the instance to that version for its whole life
+        /// (Zeebe parity). `0` (the `serde(default)`) for events written before
+        /// version pinning; the applier then resolves the latest version by id.
+        #[cfg_attr(feature = "serde", serde(default))]
+        process_definition_key: Key,
+        /// The version number of that definition, surfaced by the read model.
+        /// `0` (the `serde(default)`) for events written before version pinning.
+        #[cfg_attr(feature = "serde", serde(default))]
+        version: i32,
     },
 
     /// Variables were merged into a process instance.

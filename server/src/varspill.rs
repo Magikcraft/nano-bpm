@@ -643,6 +643,7 @@ mod tests {
             instance: ProcessInstance {
                 key: 42,
                 process_id: "order".to_string(),
+                process_definition_key: 0,
                 state: ProcessInstanceState::Active,
                 created_at: 1,
                 tags: Vec::new(),

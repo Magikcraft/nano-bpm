@@ -2833,15 +2833,20 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             variables,
             tags,
             business_id,
+            process_definition_key,
+            version,
         } => {
-            // Resolve the deployed identity now (defaults mirror
-            // `process_instance_result` when no definition is on record). With
-            // every version retained, pick the latest deployed so far — during an
-            // ordered replay only versions deployed before this create are on
-            // record, so the highest version (ORDER BY version DESC LIMIT 1) is the version the
-            // instance was created on.
-            let (def_key, version): (String, i32) = tx
-                .query_row(
+            // Prefer the definition identity the event carries — it pins the
+            // instance to the exact version it was created on (a by-key or
+            // by-id+version create may target a non-latest version). Fall back to
+            // the latest-deployed-so-far lookup for events written before version
+            // pinning (`process_definition_key == 0`): during an ordered replay
+            // only versions deployed before this create are on record, so the
+            // highest version is the one the instance was created on.
+            let (def_key, version): (String, i32) = if *process_definition_key != 0 {
+                (process_definition_key.to_string(), *version)
+            } else {
+                tx.query_row(
                     "SELECT key, version FROM process_definitions WHERE process_id = ?1 \
                      ORDER BY version DESC LIMIT 1",
                     params![process_id],
@@ -2849,7 +2854,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 )
                 .optional()?
                 .map(|(k, v)| (k.to_string(), v))
-                .unwrap_or_else(|| ("-1".to_string(), 0));
+                .unwrap_or_else(|| ("-1".to_string(), 0))
+            };
             // Serialize tags as comma-separated string for storage
             let tags_str = tags.join(",");
             // `DO NOTHING` (not `DO UPDATE`): a create is the first event for a
@@ -4217,7 +4223,55 @@ mod definition_xml_tests {
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
+            process_definition_key: 0,
+            version: 0,
         }
+    }
+
+    /// A create event that pins the instance to an explicit definition
+    /// (`key`/`version`) — the on-the-wire shape a by-key or by-id+version
+    /// create produces.
+    fn created_event_pinned(
+        instance_key: super::Key,
+        process_id: &str,
+        process_definition_key: super::Key,
+        version: i32,
+    ) -> Event {
+        Event::ProcessInstanceCreated {
+            instance_key,
+            process_id: process_id.to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key,
+            version,
+        }
+    }
+
+    #[test]
+    fn read_model_reports_each_instance_its_pinned_version() {
+        // Two versions of the same process id are deployed; one instance is
+        // created against the *older* version (by-key) and one against the
+        // latest. The read model must report the version each instance was
+        // actually created on — not merely the newest deployed.
+        let store = ReadStore::open(None).unwrap();
+        let v1 = deployed_event_versioned("order", 6, 1, "<xml>v1</xml>");
+        let v2 = deployed_event_versioned("order", 297, 2, "<xml>v2</xml>");
+        store.export(&[&v1, &v2]).unwrap();
+
+        // Instance A pins v1 (key 6); instance B pins v2 (key 297).
+        let a = created_event_pinned(1000, "order", 6, 1);
+        let b = created_event_pinned(1001, "order", 297, 2);
+        store.export(&[&a, &b]).unwrap();
+
+        let row_a = store.process_instance(1000).expect("instance A present");
+        assert_eq!(row_a.version, 1, "A reports the version it was created on");
+        assert_eq!(row_a.process_definition_key, "6");
+
+        let row_b = store.process_instance(1001).expect("instance B present");
+        assert_eq!(row_b.version, 2, "B reports the latest version");
+        assert_eq!(row_b.process_definition_key, "297");
     }
 
     #[test]
@@ -4667,6 +4721,8 @@ mod element_instance_tests {
             created_at: 1,
             tags: Vec::new(),
             business_id: None,
+            process_definition_key: 0,
+            version: 0,
         }
     }
 
@@ -4850,6 +4906,8 @@ mod element_instance_tests {
                     created_at: 1,
                     tags: Vec::new(),
                     business_id: None,
+                    process_definition_key: 0,
+                    version: 0,
                 },
                 &Event::ElementActivated {
                     instance_key: INST + 100,

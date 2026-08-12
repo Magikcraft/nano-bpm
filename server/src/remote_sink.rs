@@ -463,6 +463,8 @@ mod tests {
             created_at: 0,
             tags: Vec::new(),
             business_id: None,
+            process_definition_key: 0,
+            version: 0,
         }
     }
 

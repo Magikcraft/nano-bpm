@@ -128,14 +128,17 @@ impl TestEngine {
     }
 
     /// Start a new instance of `process_id`, seeding it with the given variables
-    /// (a JSON object string; pass `"{}"` or `""` for none). Returns the
-    /// post-run [`Snapshot`] with a top-level `created` field holding the new
-    /// instance key.
+    /// (a JSON object string; pass `"{}"` or `""` for none). `version` selects a
+    /// specific process **version** number (Zeebe by-id semantics); pass
+    /// `undefined`/`null` (or a non-positive value) for the latest version.
+    /// Returns the post-run [`Snapshot`] with a top-level `created` field holding
+    /// the new instance key.
     #[wasm_bindgen(js_name = createInstance)]
     pub fn create_instance(
         &mut self,
         process_id: &str,
         variables_json: &str,
+        version: Option<i32>,
     ) -> Result<String, JsValue> {
         self.guard_paused()?;
         let variables = parse_vars(variables_json)?;
@@ -145,6 +148,8 @@ impl TestEngine {
                 variables,
                 tags: Vec::new(),
                 business_id: None,
+                process_definition_key: None,
+                version,
             })
             .map_err(|e| js_err(&format!("create error: {e}")))?;
         let created = events.iter().find_map(|e| match e {
@@ -193,6 +198,8 @@ impl TestEngine {
                     variables,
                     tags: Vec::new(),
                     business_id: None,
+                    process_definition_key: None,
+                    version: None,
                 },
                 self.now,
                 breakpoints,
@@ -1782,7 +1789,7 @@ mod tests {
     fn user_task_lifecycle_and_snapshot() {
         let mut eng = TestEngine::new();
         eng.deploy(USER_TASK_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
 
         // A Created user task is surfaced, parked on the `review` element.
         let task = &snap["userTasks"][0];
@@ -1847,7 +1854,7 @@ mod tests {
     fn throw_error_without_boundary_raises_incident() {
         let mut eng = TestEngine::new();
         eng.deploy(SERVICE_TASK_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
         let job_key = snap["jobs"][0]["key"].as_str().unwrap().to_string();
 
         // Throwing an uncaught business error consumes the job and raises an
@@ -1867,7 +1874,7 @@ mod tests {
     fn fail_update_retries_resolve_incident_recovers_job() {
         let mut eng = TestEngine::new();
         eng.deploy(SERVICE_TASK_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
         let job_key = snap["jobs"][0]["key"].as_str().unwrap().to_string();
 
         // Fail with no retries left → incident.
@@ -1892,8 +1899,8 @@ mod tests {
         let mut eng = TestEngine::new();
         eng.deploy(SERVICE_TASK_XML).unwrap();
         // Two instances → two `do-work` jobs waiting to be activated.
-        eng.create_instance("p", "{}").unwrap();
-        eng.create_instance("p", "{}").unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
 
         // First activation with the same worker locks exactly one job.
         let first: Vec<J> =
@@ -1929,7 +1936,7 @@ mod tests {
     fn set_variables_merges_into_instance() {
         let mut eng = TestEngine::new();
         eng.deploy(SERVICE_TASK_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", r#"{"a":1}"#).unwrap());
+        let snap = parse(&eng.create_instance("p", r#"{"a":1}"#, None).unwrap());
         let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
 
         let snap = parse(
@@ -1945,7 +1952,7 @@ mod tests {
     fn cancel_instance_terminates() {
         let mut eng = TestEngine::new();
         eng.deploy(USER_TASK_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
         let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
 
         let snap = parse(&eng.cancel_instance(&instance_key).unwrap());
@@ -1991,7 +1998,7 @@ mod tests {
     fn modify_moves_a_token_between_elements() {
         let mut eng = TestEngine::new();
         eng.deploy(TWO_TASK_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
         let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
         let a_eik = active_eik(&snap, "a");
 
@@ -2024,7 +2031,7 @@ mod tests {
     fn modify_terminating_last_token_terminates_instance() {
         let mut eng = TestEngine::new();
         eng.deploy(SERVICE_TASK_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
         let instance_key = snap["instances"][0]["key"].as_str().unwrap().to_string();
         let work_eik = active_eik(&snap, "work");
 
@@ -2084,7 +2091,7 @@ mod tests {
     fn complete_agent_job_activates_tools_loops_and_completes() {
         let mut eng = TestEngine::new();
         eng.deploy(ADHOC_AGENT_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
 
         // The container emitted its agent job; no tools are active yet.
         let agent = job_key(&snap, "agent", "agent-worker");
@@ -2151,7 +2158,7 @@ mod tests {
     fn complete_agent_job_empty_result_completes_container() {
         let mut eng = TestEngine::new();
         eng.deploy(ADHOC_AGENT_XML).unwrap();
-        let snap = parse(&eng.create_instance("p", "{}").unwrap());
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
         let agent = job_key(&snap, "agent", "agent-worker");
 
         let snap = parse(&eng.complete_agent_job(&agent, "{}", "").unwrap());
@@ -2223,7 +2230,7 @@ mod tests {
         let plain = {
             let mut eng = TestEngine::new();
             eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
-            eng.create_instance("p", "{}").unwrap();
+            eng.create_instance("p", "{}", None).unwrap();
             parse(&eng.events().unwrap())
         };
 
@@ -2255,7 +2262,7 @@ mod tests {
         let plain = {
             let mut eng = TestEngine::new();
             eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
-            eng.create_instance("p", "{}").unwrap();
+            eng.create_instance("p", "{}", None).unwrap();
             parse(&eng.events().unwrap())
         };
 
@@ -2292,7 +2299,7 @@ mod tests {
         let plain = {
             let mut eng = TestEngine::new();
             eng.deploy(DEBUG_TWO_TASK_XML).unwrap();
-            eng.create_instance("p", "{}").unwrap();
+            eng.create_instance("p", "{}", None).unwrap();
             parse(&eng.events().unwrap())
         };
 
