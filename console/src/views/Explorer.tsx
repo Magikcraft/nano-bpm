@@ -109,7 +109,7 @@ export default function Explorer() {
     markExplorerReached();
   }, []);
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, isPlaceholderData } = useQuery({
     queryKey: ["instances", page],
     queryFn: async () =>
       (
@@ -156,10 +156,22 @@ export default function Explorer() {
   // page) changes, so a preselected instance below the fold is revealed rather
   // than merely highlighted off-screen. `block: "nearest"` avoids jumping the
   // whole page when the row is already visible.
+  //
+  // Deliberately NOT depending on the `data` object: this view uses
+  // `useLiveInvalidation(["instances"])`, so every SSE-driven read-model advance
+  // refetches and hands back a fresh `data` reference. Keying the effect on
+  // identity (`selected`, `page`, `pinned?.key`) plus `isPlaceholderData` means
+  // we scroll only when the selection/page/pinned row actually changes or when a
+  // freshly-requested page's data settles (placeholder → real) — never on a
+  // same-page background refetch, which would otherwise snap the list back to
+  // the selected row while the user is scrolling. `firstPageLoaded` covers the
+  // initial mount, where `isPlaceholderData` stays false and never toggles.
   const selectedRowRef = useRef<HTMLButtonElement | null>(null);
+  const firstPageLoaded = data != null;
   useEffect(() => {
+    if (isPlaceholderData) return;
     selectedRowRef.current?.scrollIntoView({ block: "nearest" });
-  }, [selected, data, pinned]);
+  }, [selected, page, pinned?.key, isPlaceholderData, firstPageLoaded]);
 
   // Clamp the page if the dataset shrinks (e.g. retention prune) below it.
   useEffect(() => {
