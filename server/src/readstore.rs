@@ -215,9 +215,23 @@ CREATE TABLE message_subscriptions (
     element_id             TEXT NOT NULL,
     message_name           TEXT NOT NULL,
     correlation_key        TEXT NOT NULL,
-    created_at_ms          INTEGER NOT NULL DEFAULT 0
+    created_at_ms          INTEGER NOT NULL DEFAULT 0,
+    non_interrupting       INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX idx_message_subscriptions_instance ON message_subscriptions(instance_key);
+CREATE TABLE correlated_message_subscriptions (
+    message_key            INTEGER NOT NULL,
+    subscription_key       INTEGER NOT NULL,
+    instance_key           INTEGER NOT NULL,
+    element_instance_key   INTEGER NOT NULL,
+    element_id             TEXT NOT NULL,
+    message_name           TEXT NOT NULL,
+    correlation_key        TEXT NOT NULL,
+    correlation_time_ms    INTEGER NOT NULL,
+    partition_id           INTEGER NOT NULL,
+    PRIMARY KEY (message_key, subscription_key)
+);
+CREATE INDEX idx_correlated_message_subscriptions_instance ON correlated_message_subscriptions(instance_key);
 CREATE TABLE forms (
     form_key      INTEGER PRIMARY KEY,
     form_id       TEXT NOT NULL,
@@ -507,8 +521,11 @@ pub struct ElementInstanceRow {
 
 /// A projected open message subscription: a running element instance parked on a
 /// message catch (intermediate catch event, receive task or message boundary),
-/// materialized from `MessageSubscriptionCreated` and dropped on
-/// `MessageCorrelated`/`MessageSubscriptionCanceled` or instance termination.
+/// materialized from `MessageSubscriptionCreated`. Interrupting subscriptions are
+/// dropped on `MessageCorrelated`/`RemoteMessageCorrelation`; a non-interrupting
+/// boundary subscription stays open (it can correlate repeatedly) and is dropped
+/// only on `MessageSubscriptionCanceled` or instance termination. Each correlation
+/// is additionally recorded in `correlated_message_subscriptions`.
 /// Feeds the MESSAGE variant of the element-instance wait-state API.
 pub struct MessageSubscriptionRow {
     pub subscription_key: Key,
@@ -520,6 +537,26 @@ pub struct MessageSubscriptionRow {
     /// Projection-time timestamp (ms since epoch) of when this subscription row
     /// was first materialised; surfaces as `lastUpdatedDate` in the search API.
     pub created_at_ms: u64,
+}
+
+/// A projected *correlated* message subscription: the historical record of a
+/// message that correlated to an instance-scoped subscription, materialized from
+/// `MessageCorrelated`/`RemoteMessageCorrelation` (capturing the message name and
+/// correlation key from the open subscription row before it is dropped). Feeds
+/// the `searchCorrelatedMessageSubscriptions` API. Unlike open subscriptions,
+/// these rows are retained after the subscription settles.
+pub struct CorrelatedMessageSubscriptionRow {
+    pub message_key: Key,
+    pub subscription_key: Key,
+    pub instance_key: Key,
+    pub element_instance_key: Key,
+    pub element_id: String,
+    pub message_name: String,
+    pub correlation_key: String,
+    /// Projection-time timestamp (ms since epoch) of the correlation.
+    pub correlation_time_ms: u64,
+    /// The id of the partition that correlated the message.
+    pub partition_id: i32,
 }
 
 pub struct ProcessDefinitionRow {
@@ -967,6 +1004,7 @@ impl ReadStore {
              DROP TABLE IF EXISTS definition_elements;
              DROP TABLE IF EXISTS element_instances;
              DROP TABLE IF EXISTS message_subscriptions;
+                 DROP TABLE IF EXISTS correlated_message_subscriptions;
              DROP TABLE IF EXISTS meta;",
             )?;
         }
@@ -1542,6 +1580,20 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// All correlated (historical) message subscriptions in this shard.
+    pub fn correlated_message_subscriptions(&self) -> Vec<CorrelatedMessageSubscriptionRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {CORRELATED_MESSAGE_SUBSCRIPTION_COLS} FROM correlated_message_subscriptions"
+            ))
+            .expect("prepare correlated_message_subscriptions");
+        let rows = stmt
+            .query_map([], map_correlated_message_subscription)
+            .expect("query correlated_message_subscriptions");
+        rows.filter_map(Result::ok).collect()
+    }
+
     /// All decision-instance rows in this shard.
     pub fn decision_instances(&self) -> Vec<DecisionInstanceRow> {
         let conn = self.conn.lock().expect("read store poisoned");
@@ -2001,6 +2053,14 @@ impl ReadModel {
             .collect()
     }
 
+    /// Every correlated (historical) message subscription across all shards.
+    pub fn correlated_message_subscriptions(&self) -> Vec<CorrelatedMessageSubscriptionRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.correlated_message_subscriptions())
+            .collect()
+    }
+
     /// Every decision-instance row across all shards. Decision instances live in
     /// the shard of their owning process instance (routed by `max_key`), so a
     /// full listing must concatenate across shards.
@@ -2228,6 +2288,26 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
         message_name: r.get(4)?,
         correlation_key: r.get(5)?,
         created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
+    })
+}
+
+/// Column list for `correlated_message_subscriptions` selects.
+const CORRELATED_MESSAGE_SUBSCRIPTION_COLS: &str = "message_key, subscription_key, instance_key, element_instance_key, element_id, \
+     message_name, correlation_key, correlation_time_ms, partition_id";
+
+fn map_correlated_message_subscription(
+    r: &rusqlite::Row,
+) -> rusqlite::Result<CorrelatedMessageSubscriptionRow> {
+    Ok(CorrelatedMessageSubscriptionRow {
+        message_key: r.get::<_, i64>(0)? as Key,
+        subscription_key: r.get::<_, i64>(1)? as Key,
+        instance_key: r.get::<_, i64>(2)? as Key,
+        element_instance_key: r.get::<_, i64>(3)? as Key,
+        element_id: r.get(4)?,
+        message_name: r.get(5)?,
+        correlation_key: r.get(6)?,
+        correlation_time_ms: r.get::<_, i64>(7)? as u64,
+        partition_id: r.get::<_, i64>(8)? as i32,
     })
 }
 
@@ -2748,15 +2828,21 @@ fn project_engine_state(
                 | nanobpmn_engine_core::MessageSubscriptionState::Opening
         );
         if open && sub.element_instance_key != 0 {
+            let non_interrupting = matches!(
+                sub.kind,
+                nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
+            );
             tx.cexecute(
                 "INSERT INTO message_subscriptions (subscription_key, instance_key, \
-                 element_instance_key, element_id, message_name, correlation_key, created_at_ms) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
+                 non_interrupting) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(subscription_key) DO UPDATE SET \
                  element_instance_key = excluded.element_instance_key, \
                  element_id = excluded.element_id, \
                  message_name = excluded.message_name, \
-                 correlation_key = excluded.correlation_key",
+                 correlation_key = excluded.correlation_key, \
+                 non_interrupting = excluded.non_interrupting",
                 params![
                     sub.key as i64,
                     sub.instance_key as i64,
@@ -2765,6 +2851,7 @@ fn project_engine_state(
                     sub.message_name,
                     sub.correlation_key,
                     now_ms as i64,
+                    non_interrupting as i64,
                 ],
             )?;
         }
@@ -3019,18 +3106,24 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             element_id,
             message_name,
             correlation_key,
-            ..
+            kind,
         } => {
             if *element_instance_key != 0 {
+                let non_interrupting = matches!(
+                    kind,
+                    nanobpmn_engine_core::MessageSubscriptionKind::NonInterruptingBoundary { .. }
+                );
                 tx.cexecute(
                     "INSERT INTO message_subscriptions (subscription_key, instance_key, \
-                     element_instance_key, element_id, message_name, correlation_key, created_at_ms) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                     element_instance_key, element_id, message_name, correlation_key, created_at_ms, \
+                     non_interrupting) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                      ON CONFLICT(subscription_key) DO UPDATE SET \
                      element_instance_key = excluded.element_instance_key, \
                      element_id = excluded.element_id, \
                      message_name = excluded.message_name, \
-                     correlation_key = excluded.correlation_key",
+                     correlation_key = excluded.correlation_key, \
+                     non_interrupting = excluded.non_interrupting",
                     params![
                         *subscription_key as i64,
                         *instance_key as i64,
@@ -3039,23 +3132,93 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                         message_name,
                         correlation_key,
                         now_ms as i64,
+                        non_interrupting as i64,
                     ],
                 )?;
             }
         }
 
-        // A correlated or cancelled subscription is no longer waiting: drop it.
-        // `RemoteMessageCorrelation` is the multi-partition counterpart of
-        // `MessageCorrelated` — when the process instance lives on another
-        // partition, the message partition settles the canonical subscription
-        // with this event instead, so it must clear the row too.
+        // A message correlated to an open subscription: record it in the
+        // correlated (history) table. The open row still holds the message name,
+        // correlation key and interrupting flag at this point (none of which are
+        // carried on the correlation event), so capture them before deciding
+        // whether to drop it. `RemoteMessageCorrelation` is the multi-partition
+        // counterpart of `MessageCorrelated` — when the process instance lives on
+        // another partition, the message partition settles the canonical
+        // subscription with this event instead. In both cases `subscription_key`
+        // is the canonical (message-partition) subscription, so its partition is
+        // the one that correlated the message.
         Event::MessageCorrelated {
-            subscription_key, ..
+            subscription_key,
+            message_key,
+            instance_key,
+            element_instance_key,
+            element_id,
         }
         | Event::RemoteMessageCorrelation {
-            subscription_key, ..
+            subscription_key,
+            message_key,
+            instance_key,
+            element_instance_key,
+            element_id,
+            ..
+        } => {
+            // Instance-scoped correlations (a running element instance parked on a
+            // catch) are the only ones the open read model tracks; mirror that.
+            if *element_instance_key != 0 {
+                // Recover the message name / correlation key / interrupting flag
+                // from the open row. If the open row is absent (out-of-order replay
+                // or partial seeding), skip the history insert entirely rather than
+                // record a row with an empty message name / correlation key that
+                // would silently corrupt `searchCorrelatedMessageSubscriptions`.
+                let captured: Option<(String, String, bool)> = tx
+                    .query_row(
+                        "SELECT message_name, correlation_key, non_interrupting \
+                         FROM message_subscriptions WHERE subscription_key = ?1",
+                        params![*subscription_key as i64],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+                    )
+                    .optional()?;
+                if let Some((message_name, correlation_key, non_interrupting)) = captured {
+                    tx.cexecute(
+                        "INSERT INTO correlated_message_subscriptions (message_key, subscription_key, \
+                         instance_key, element_instance_key, element_id, message_name, correlation_key, \
+                         correlation_time_ms, partition_id) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+                         ON CONFLICT(message_key, subscription_key) DO NOTHING",
+                        params![
+                            *message_key as i64,
+                            *subscription_key as i64,
+                            *instance_key as i64,
+                            *element_instance_key as i64,
+                            element_id,
+                            message_name,
+                            correlation_key,
+                            now_ms as i64,
+                            // 1-based partition id (Camunda/Zeebe convention), to
+                            // match the topology mapping in main.rs.
+                            (partition_of(*subscription_key) + 1) as i64,
+                        ],
+                    )?;
+                    // A non-interrupting boundary subscription stays open in the
+                    // engine so it can correlate again (each correlation spawns a
+                    // parallel token); keep its open read-model row so subsequent
+                    // correlations are still recorded. Interrupting boundaries and
+                    // intermediate catches settle, so their open row is dropped.
+                    if non_interrupting {
+                        return Ok(delta);
+                    }
+                }
+            }
+            tx.cexecute(
+                "DELETE FROM message_subscriptions WHERE subscription_key = ?1",
+                params![*subscription_key as i64],
+            )?;
         }
-        | Event::MessageSubscriptionCanceled {
+
+        // A cancelled subscription is no longer waiting and did not correlate: drop
+        // the open row without recording a correlation.
+        Event::MessageSubscriptionCanceled {
             subscription_key, ..
         } => {
             tx.cexecute(
@@ -4981,6 +5144,16 @@ mod element_instance_tests {
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
+        // Correlation is recorded in the history read model, capturing the message
+        // name and correlation key from the (now-dropped) open subscription row.
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 1);
+        assert_eq!(corr[0].message_key, 9);
+        assert_eq!(corr[0].subscription_key, 3001);
+        assert_eq!(corr[0].instance_key, INST);
+        assert_eq!(corr[0].element_instance_key, TASK_EI);
+        assert_eq!(corr[0].message_name, "OrderPlaced");
+        assert_eq!(corr[0].correlation_key, "A1");
 
         // A subscription still open when the process terminates is cleaned up.
         store
@@ -5186,5 +5359,99 @@ mod element_instance_tests {
             assert_eq!(job.process_definition_id, "p2");
             assert_eq!(job.process_definition_key, target_key.to_string());
         }
+    }
+
+    #[test]
+    fn non_interrupting_boundary_stays_open_and_records_each_correlation() {
+        use nanobpmn_engine_core::MessageSubscriptionKind;
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+
+        // A non-interrupting message boundary subscription: correlating spawns a
+        // parallel token but leaves the subscription open, so it can correlate
+        // again for every matching message.
+        store
+            .export(&[&Event::MessageSubscriptionCreated {
+                subscription_key: 4001,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "task".to_string(),
+                message_name: "Ping".to_string(),
+                correlation_key: "K1".to_string(),
+                kind: MessageSubscriptionKind::NonInterruptingBoundary {
+                    boundary_element_id: "boundary".to_string(),
+                },
+            }])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1);
+
+        // First correlation: history recorded AND the open row is kept.
+        store
+            .export(&[&Event::MessageCorrelated {
+                subscription_key: 4001,
+                message_key: 11,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "task".to_string(),
+            }])
+            .unwrap();
+        assert_eq!(
+            store.message_subscriptions().len(),
+            1,
+            "non-interrupting subscription stays open after correlating"
+        );
+        assert_eq!(store.correlated_message_subscriptions().len(), 1);
+
+        // Second correlation (different message): another history row, still open.
+        store
+            .export(&[&Event::MessageCorrelated {
+                subscription_key: 4001,
+                message_key: 12,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "task".to_string(),
+            }])
+            .unwrap();
+        assert_eq!(store.message_subscriptions().len(), 1);
+        let corr = store.correlated_message_subscriptions();
+        assert_eq!(corr.len(), 2, "each correlation is recorded in history");
+        // partition_id is stored 1-based (Camunda/Zeebe convention).
+        assert!(corr.iter().all(|c| c.partition_id == 1));
+        assert!(corr.iter().all(|c| c.message_name == "Ping"));
+
+        // Cancelling (activity completes / instance ends) finally drops the row.
+        store
+            .export(&[&Event::MessageSubscriptionCanceled {
+                subscription_key: 4001,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "task".to_string(),
+            }])
+            .unwrap();
+        assert!(store.message_subscriptions().is_empty());
+        // History survives the cancel.
+        assert_eq!(store.correlated_message_subscriptions().len(), 2);
+    }
+
+    #[test]
+    fn correlation_without_an_open_row_records_no_history() {
+        // A correlation event whose open subscription row is absent (out-of-order
+        // replay / partial seeding) must not fabricate a history row with an empty
+        // message name / correlation key.
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+        store
+            .export(&[&Event::MessageCorrelated {
+                subscription_key: 5001,
+                message_key: 13,
+                instance_key: INST,
+                element_instance_key: TASK_EI,
+                element_id: "await".to_string(),
+            }])
+            .unwrap();
+        assert!(
+            store.correlated_message_subscriptions().is_empty(),
+            "no history row without a captured open subscription"
+        );
     }
 }

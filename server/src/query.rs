@@ -774,11 +774,11 @@ impl Ord for SortVal {
 /// the order is fully deterministic (and stable for cursor paging). `project`
 /// returns the [`SortVal`] for a given `(item, field)`; `key` returns the
 /// entity key used as the final tiebreaker.
-pub fn sort_items<T>(
+pub fn sort_items<T, K: Ord>(
     items: &mut [T],
     keys: &[SortKey],
     project: impl Fn(&T, &str) -> SortVal,
-    key: impl Fn(&T) -> u64,
+    key: impl Fn(&T) -> K,
 ) {
     items.sort_by(|a, b| {
         for sk in keys {
@@ -798,12 +798,60 @@ pub struct Page<T> {
     pub response: models::SearchQueryPageResponse,
 }
 
+/// An entity key usable as an opaque page cursor: it must round-trip through a
+/// spec-conformant base64 string (no padding, length a multiple of four) and
+/// support equality so a forward/backward cursor can locate its resume point.
+/// Implemented for a single `u64` entity key and for a composite `(u64, u64)`
+/// key (used where no single column is unique, e.g. correlated message
+/// subscriptions keyed by `(message_key, subscription_key)`).
+pub trait CursorKey: Copy + Eq {
+    fn encode(self) -> String;
+    fn decode(cursor: &str) -> Option<Self>;
+}
+
+impl CursorKey for u64 {
+    fn encode(self) -> String {
+        encode_cursor(self)
+    }
+    fn decode(cursor: &str) -> Option<Self> {
+        decode_cursor(cursor)
+    }
+}
+
+impl CursorKey for (u64, u64) {
+    /// Eighteen big-endian bytes — two leading zero bytes then the two `u64`s,
+    /// contiguously — in standard base64 without padding. Eighteen is a multiple
+    /// of three, so the result is exactly 24 characters with no `=` padding, a
+    /// clean multiple of four that satisfies the spec's cursor charset. The two
+    /// fixed leading zero bytes are validated on decode so there is exactly one
+    /// canonical encoding per key.
+    fn encode(self) -> String {
+        let mut bytes = [0u8; 18];
+        bytes[2..10].copy_from_slice(&self.0.to_be_bytes());
+        bytes[10..18].copy_from_slice(&self.1.to_be_bytes());
+        base64_encode(&bytes)
+    }
+    fn decode(cursor: &str) -> Option<Self> {
+        let bytes = base64_decode(cursor)?;
+        if bytes.len() != 18 || bytes[0] != 0 || bytes[1] != 0 {
+            return None;
+        }
+        let mut a = [0u8; 8];
+        let mut b = [0u8; 8];
+        a.copy_from_slice(&bytes[2..10]);
+        b.copy_from_slice(&bytes[10..18]);
+        Some((u64::from_be_bytes(a), u64::from_be_bytes(b)))
+    }
+}
+
 /// Applies pagination (limit + offset/forward-cursor/backward-cursor) to an
 /// already-sorted `sorted` list of `(entity key, item)` pairs. Cursors are
-/// opaque encodings of the entity key (see [`encode_cursor`]); because the sort
-/// always ends in an entity-key tiebreaker, resuming from a key is unambiguous.
-pub fn paginate<T>(
-    sorted: Vec<(u64, T)>,
+/// opaque encodings of the entity key (see [`CursorKey`]); because the sort
+/// always ends in an entity-key tiebreaker, resuming from a key is unambiguous —
+/// so the key MUST be unique per row (use a composite `(u64, u64)` key where no
+/// single column is).
+pub fn paginate<T, K: CursorKey>(
+    sorted: Vec<(K, T)>,
     page: Option<&models::SearchQueryPageRequest>,
 ) -> Page<T> {
     let total = sorted.len() as i64;
@@ -830,20 +878,20 @@ pub fn paginate<T>(
             None,
         ),
         Some(models::SearchQueryPageRequest::CursorForwardPagination(p)) => {
-            let after = p.after.as_deref().and_then(decode_cursor);
+            let after = p.after.as_deref().and_then(K::decode);
             let start = after
                 .and_then(|k| sorted.iter().position(|(key, _)| *key == k).map(|i| i + 1))
                 .unwrap_or(0);
             (start, clamp_limit(p.limit, default_limit), None)
         }
         Some(models::SearchQueryPageRequest::CursorBackwardPagination(p)) => {
-            let before = p.before.as_deref().and_then(decode_cursor);
+            let before = p.before.as_deref().and_then(K::decode);
             (0usize, clamp_limit(p.limit, default_limit), before)
         }
         None => (0usize, default_limit, None),
     };
 
-    let window: Vec<(u64, T)> = if let Some(before_key) = backward_before {
+    let window: Vec<(K, T)> = if let Some(before_key) = backward_before {
         // Backward paging: take the `limit` items immediately preceding the
         // cursor (keeping ascending order within the page).
         let end = sorted
@@ -858,11 +906,11 @@ pub fn paginate<T>(
 
     let start_cursor = window
         .first()
-        .map(|(k, _)| types::Nullable::Present(encode_cursor(*k)))
+        .map(|(k, _)| types::Nullable::Present(k.encode()))
         .unwrap_or(types::Nullable::Null);
     let end_cursor = window
         .last()
-        .map(|(k, _)| types::Nullable::Present(encode_cursor(*k)))
+        .map(|(k, _)| types::Nullable::Present(k.encode()))
         .unwrap_or(types::Nullable::Null);
 
     Page {
@@ -1002,6 +1050,47 @@ mod tests {
         let p = paginate(big, Some(&req));
         assert_eq!(p.items.len(), 10_000);
         assert_eq!(p.response.total_items, 20_000);
+    }
+
+    #[test]
+    fn composite_cursor_round_trips_and_pages_unambiguously() {
+        // A composite (u64, u64) cursor encodes to a spec-conformant 24-char,
+        // padding-free base64 string and round-trips.
+        for key in [(0u64, 0u64), (1, 2), (u64::MAX, 0), (7, u64::MAX), (42, 99)] {
+            let c = <(u64, u64) as CursorKey>::encode(key);
+            assert_eq!(c.len(), 24, "composite cursor must be 24 chars: {c}");
+            assert!(!c.contains('='), "cursor must be padding-free: {c}");
+            assert!(
+                c.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/'),
+                "cursor charset: {c}"
+            );
+            assert_eq!(<(u64, u64) as CursorKey>::decode(&c), Some(key));
+        }
+        assert_eq!(<(u64, u64) as CursorKey>::decode("short"), None);
+        // A well-formed 18-byte cursor whose fixed leading bytes aren't zero is
+        // rejected, so there is exactly one canonical encoding per key.
+        let mut noncanonical = [0u8; 18];
+        noncanonical[0] = 1;
+        assert_eq!(
+            <(u64, u64) as CursorKey>::decode(&base64_encode(&noncanonical)),
+            None
+        );
+
+        // Rows that share a first key component must page without skip/dup: three
+        // rows share message_key 5, distinguished only by the second component.
+        let rows: Vec<((u64, u64), u64)> =
+            vec![((5, 1), 10), ((5, 2), 20), ((5, 3), 30), ((6, 1), 40)];
+        // Resume after the middle duplicate (5, 2): must yield exactly (5,3),(6,1).
+        let after = <(u64, u64) as CursorKey>::encode((5, 2));
+        let req = models::SearchQueryPageRequest::CursorForwardPagination(
+            models::CursorForwardPagination {
+                after: Some(after),
+                limit: Some(10),
+            },
+        );
+        let p = paginate(rows, Some(&req));
+        assert_eq!(p.items, vec![30, 40], "resume must not skip or duplicate");
     }
 
     #[test]
