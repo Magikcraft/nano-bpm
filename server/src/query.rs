@@ -819,24 +819,27 @@ impl CursorKey for u64 {
 }
 
 impl CursorKey for (u64, u64) {
-    /// Eighteen big-endian bytes (a leading zero, the first `u64`, then the
-    /// second `u64`) in standard base64 without padding — exactly 24 characters,
-    /// a clean multiple of four that satisfies the spec's cursor charset.
+    /// Eighteen big-endian bytes — two leading zero bytes then the two `u64`s,
+    /// contiguously — in standard base64 without padding. Eighteen is a multiple
+    /// of three, so the result is exactly 24 characters with no `=` padding, a
+    /// clean multiple of four that satisfies the spec's cursor charset. The two
+    /// fixed leading zero bytes are validated on decode so there is exactly one
+    /// canonical encoding per key.
     fn encode(self) -> String {
         let mut bytes = [0u8; 18];
-        bytes[1..9].copy_from_slice(&self.0.to_be_bytes());
-        bytes[10..].copy_from_slice(&self.1.to_be_bytes());
+        bytes[2..10].copy_from_slice(&self.0.to_be_bytes());
+        bytes[10..18].copy_from_slice(&self.1.to_be_bytes());
         base64_encode(&bytes)
     }
     fn decode(cursor: &str) -> Option<Self> {
         let bytes = base64_decode(cursor)?;
-        if bytes.len() != 18 {
+        if bytes.len() != 18 || bytes[0] != 0 || bytes[1] != 0 {
             return None;
         }
         let mut a = [0u8; 8];
         let mut b = [0u8; 8];
-        a.copy_from_slice(&bytes[1..9]);
-        b.copy_from_slice(&bytes[10..]);
+        a.copy_from_slice(&bytes[2..10]);
+        b.copy_from_slice(&bytes[10..18]);
         Some((u64::from_be_bytes(a), u64::from_be_bytes(b)))
     }
 }
@@ -1065,6 +1068,14 @@ mod tests {
             assert_eq!(<(u64, u64) as CursorKey>::decode(&c), Some(key));
         }
         assert_eq!(<(u64, u64) as CursorKey>::decode("short"), None);
+        // A well-formed 18-byte cursor whose fixed leading bytes aren't zero is
+        // rejected, so there is exactly one canonical encoding per key.
+        let mut noncanonical = [0u8; 18];
+        noncanonical[0] = 1;
+        assert_eq!(
+            <(u64, u64) as CursorKey>::decode(&base64_encode(&noncanonical)),
+            None
+        );
 
         // Rows that share a first key component must page without skip/dup: three
         // rows share message_key 5, distinguished only by the second component.
