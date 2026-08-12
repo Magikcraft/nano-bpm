@@ -95,6 +95,9 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::ModifyInstance { .. } => Surface::Surfaced {
             js_method: "modify",
         },
+        Command::MigrateInstance { .. } => Surface::Surfaced {
+            js_method: "migrate",
+        },
         Command::AssignUserTask { .. } => Surface::Surfaced {
             js_method: "assignUserTask",
         },

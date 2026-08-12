@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    AdHocActivateElement, AdHocJobResult, ProcessDefinition, TaskListenerJobResult, Value,
+    AdHocActivateElement, AdHocJobResult, ElementId, ProcessDefinition, TaskListenerJobResult,
+    Value,
 };
 use crate::state::{Key, MessageSubscriptionKind};
 
@@ -268,6 +269,29 @@ pub enum Command {
     /// `Terminated` (it does *not* complete). Only an active instance can be
     /// cancelled; an unknown or already-finished instance is rejected.
     CancelInstance { instance_key: Key },
+    /// Migrate a running process instance to a target process definition
+    /// (Zeebe process-instance migration). Each active element instance whose
+    /// element id appears as a `source_element_id` in `mapping_instructions` is
+    /// re-pointed at the corresponding `target_element_id` in the target
+    /// definition; the instance's `process_id` is rewritten to the target's id.
+    /// Runtime attached to migrated element instances (jobs, user tasks, timers,
+    /// message/signal/conditional subscriptions, incidents) is remapped in place
+    /// — active jobs keep their type and are not re-created.
+    ///
+    /// Only an active instance can be migrated. The command is rejected (with no
+    /// state change) when: the instance is unknown/finished; the target
+    /// definition is not deployed; a source element id is duplicated; a mapped
+    /// source or target element id does not exist; an active element instance has
+    /// no mapping; a mapped pair changes element type; or the instance contains
+    /// an element class this phase does not yet support migrating (boundary
+    /// events, event subprocesses, multi-instance bodies, call activities,
+    /// event-based-gateway catch events) — mirroring Zeebe's "not supported yet"
+    /// rejections.
+    MigrateInstance {
+        instance_key: Key,
+        target_process_definition_key: Key,
+        mapping_instructions: Vec<(ElementId, ElementId)>,
+    },
     /// Modify a running process instance (Zeebe process-instance modification):
     /// spawn fresh tokens at elements and/or terminate specific active element
     /// instances in one atomic command.
@@ -414,6 +438,7 @@ impl Command {
             Command::CorrelateMessageSubscription { .. } => "correlate_message_subscription",
             Command::CloseMessageSubscription { .. } => "close_message_subscription",
             Command::CancelInstance { .. } => "cancel_instance",
+            Command::MigrateInstance { .. } => "migrate_instance",
             Command::ModifyInstance { .. } => "modify_instance",
             Command::DispatchStartInstance { .. } => "dispatch_start_instance",
             Command::ActivateAdHocActivities { .. } => "activate_ad_hoc_sub_process_activities",
@@ -765,6 +790,19 @@ impl Command {
     /// Convenience constructor for a `CancelInstance`.
     pub fn cancel_instance(instance_key: Key) -> Self {
         Command::CancelInstance { instance_key }
+    }
+
+    /// Convenience constructor for a `MigrateInstance`.
+    pub fn migrate_instance(
+        instance_key: Key,
+        target_process_definition_key: Key,
+        mapping_instructions: Vec<(ElementId, ElementId)>,
+    ) -> Self {
+        Command::MigrateInstance {
+            instance_key,
+            target_process_definition_key,
+            mapping_instructions,
+        }
     }
 
     /// Convenience constructor for a `ModifyInstance`.

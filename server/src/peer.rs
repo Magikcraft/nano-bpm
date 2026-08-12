@@ -730,6 +730,24 @@ impl PeerLink {
         .await
     }
 
+    /// Forwards a `migrateProcessInstance` to the peer that owns the instance.
+    pub async fn migrate_instance(
+        &self,
+        instance_key: String,
+        target_process_definition_key: String,
+        mapping_instructions: Vec<(String, String)>,
+    ) -> Result<PeerResult, PeerError> {
+        self.request_within(fast_forward_timeout(), |corr| {
+            ClientFrame::MigrateInstance {
+                corr,
+                instance_key,
+                target_process_definition_key,
+                mapping_instructions,
+            }
+        })
+        .await
+    }
+
     /// Forwards a cross-partition subscription follow-up event (a
     /// `MessageSubscriptionOpening` or `RemoteMessageCorrelation`) to the peer
     /// that owns the target partition, so it applies the corresponding routed

@@ -1801,6 +1801,121 @@ pub fn apply(state: &mut State, event: &Event) {
             }
         }
 
+        Event::ProcessInstanceMigrated {
+            instance_key,
+            target_process_id,
+            element_mappings,
+            ..
+        } => {
+            let remap: HashMap<&str, &str> = element_mappings
+                .iter()
+                .map(|(s, t)| (s.as_str(), t.as_str()))
+                .collect();
+            let remap_id = |id: &mut ElementId| {
+                if let Some(target) = remap.get(id.as_str()) {
+                    *id = (*target).to_string();
+                }
+            };
+
+            // Move the live-instance count from the source process id to the
+            // target's, and re-point the instance itself.
+            let source_process_id = state
+                .instances
+                .get(instance_key)
+                .map(|i| i.process_id.clone());
+            if let Some(instance) = state.instances.get_mut(instance_key) {
+                instance.process_id = target_process_id.clone();
+                for element_id in instance.active.values_mut() {
+                    remap_id(element_id);
+                }
+                // Both parallel-join maps are keyed by the join gateway's element
+                // id, so they must be remapped together to stay in sync (a stale
+                // `join_instances` key would make `join_eik` miss after migration
+                // and re-open an already-open join). `collect()` would silently
+                // drop entries if two source ids collapse onto one target id, so
+                // merge deterministically instead: sum the arrival counts, and
+                // keep the smallest element-instance key for the open join.
+                if !instance.join_counts.is_empty() {
+                    let mut remapped: HashMap<ElementId, usize> =
+                        HashMap::with_capacity(instance.join_counts.len());
+                    for (mut eid, count) in instance.join_counts.drain() {
+                        remap_id(&mut eid);
+                        *remapped.entry(eid).or_insert(0) += count;
+                    }
+                    instance.join_counts = remapped;
+                }
+                if !instance.join_instances.is_empty() {
+                    let mut remapped: HashMap<ElementId, Key> =
+                        HashMap::with_capacity(instance.join_instances.len());
+                    for (mut eid, eik) in instance.join_instances.drain() {
+                        remap_id(&mut eid);
+                        remapped
+                            .entry(eid)
+                            .and_modify(|existing| {
+                                if eik < *existing {
+                                    *existing = eik;
+                                }
+                            })
+                            .or_insert(eik);
+                    }
+                    instance.join_instances = remapped;
+                }
+            }
+            if source_process_id.as_deref() != Some(target_process_id.as_str()) {
+                decrement_inflight_by_process(state, source_process_id);
+                *state
+                    .inflight_by_process
+                    .entry(target_process_id.clone())
+                    .or_insert(0) += 1;
+            }
+
+            // Re-point every element instance's attached runtime. Active jobs keep
+            // their type (a worker already holds the lease) — only the element id
+            // moves, mirroring Zeebe.
+            for job in state.jobs.values_mut() {
+                if job.instance_key == *instance_key {
+                    remap_id(&mut job.element_id);
+                }
+            }
+            for user_task in state.user_tasks.values_mut() {
+                if user_task.instance_key == *instance_key {
+                    remap_id(&mut user_task.element_id);
+                }
+            }
+            for timer in state.timers.values_mut() {
+                if timer.instance_key == *instance_key {
+                    remap_id(&mut timer.element_id);
+                }
+            }
+            for sub in state.message_subscriptions.values_mut() {
+                if sub.instance_key == *instance_key {
+                    remap_id(&mut sub.element_id);
+                }
+            }
+            for sub in state.signal_subscriptions.values_mut() {
+                if sub.instance_key == *instance_key {
+                    remap_id(&mut sub.element_id);
+                }
+            }
+            for sub in state.conditional_subscriptions.values_mut() {
+                if sub.instance_key == *instance_key {
+                    remap_id(&mut sub.element_id);
+                }
+            }
+            for incident in state.incidents.values_mut() {
+                if incident.instance_key == *instance_key {
+                    remap_id(&mut incident.element_id);
+                }
+            }
+            // The scope tree (`scopes` / `scope_parents` / `scope_variables`) is
+            // intentionally NOT remapped: the command handler rejects any
+            // instance whose active tokens live inside a non-root flow scope
+            // (embedded sub-process, multi-instance, or ad-hoc) as unsupported,
+            // so an instance that reaches this applier is flat (root scope only)
+            // and has nothing to remap. See the "flow scope unchanged"
+            // precondition in `Command::MigrateInstance` validation.
+        }
+
         Event::ProcessInstanceTerminated { instance_key } => {
             let terminal_pid = non_terminal_process_id(state, instance_key);
             // Close any incident still active on the instance: with the instance

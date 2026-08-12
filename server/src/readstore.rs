@@ -3663,6 +3663,193 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             )?;
         }
 
+        Event::ProcessInstanceMigrated {
+            instance_key,
+            target_process_id,
+            target_process_definition_key,
+            element_mappings,
+        } => {
+            // Re-home the read model onto the target definition, mirroring the
+            // engine applier (`state::apply`): the instance's definition
+            // identity moves, and every LIVE runtime row's `element_id` is
+            // remapped by its ORIGINAL id (never chained). Completed/terminal
+            // history rows keep the definition + element id they ran under.
+            let ik = *instance_key as i64;
+            let target_key_str = target_process_definition_key.to_string();
+            let target_key_i = *target_process_definition_key as i64;
+            let target_version: i32 = tx
+                .query_row(
+                    "SELECT version FROM process_definitions WHERE key = ?1",
+                    params![target_key_i],
+                    |r| r.get::<_, i32>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    // The engine validated the target definition is deployed
+                    // before emitting this event, so a missing row is read-model
+                    // corruption — fail loudly rather than writing version=0.
+                    rusqlite::Error::SqliteFailure(
+                        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                        Some(format!(
+                            "migration projection: target process definition key {target_key_i} \
+                             missing from process_definitions"
+                        )),
+                    )
+                })?;
+
+            // 1) Re-point the instance row itself.
+            tx.cexecute(
+                "UPDATE process_instances SET process_id = ?2, process_definition_id = ?2, \
+                 process_definition_key = ?3, version = ?4 WHERE key = ?1",
+                params![ik, target_process_id, target_key_str, target_version],
+            )?;
+
+            // 2) Remap live runtime element ids in a single logical pass. A
+            //    control-char (`SOH`) temp namespace — illegal in a BPMN NCName
+            //    id — makes the two SQL passes equivalent to the engine's
+            //    remap-by-original-id map even when a target id equals another
+            //    mapping's source (loops / swaps). Job types are preserved (the
+            //    worker keeps its lease), matching the applier.
+            let active_el = element_instance_state_code(ElementInstanceState::Active);
+            let tmp = |target: &str| format!("\u{1}mig:{target}");
+
+            // Phase A — stamp matched live rows with a collision-free temp id.
+            for (source_id, target_id) in element_mappings {
+                let t = tmp(target_id);
+                tx.cexecute(
+                    "UPDATE element_instances SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2 AND state = ?4",
+                    params![ik, source_id, t, active_el],
+                )?;
+                // No state filter on jobs / user_tasks / incidents: the engine
+                // applier re-points `element_id` on *every* such row the instance
+                // owns — it loops all of `state.jobs`, `state.user_tasks` and
+                // `state.incidents` filtering only by `instance_key`, and never
+                // removes terminal rows — so a job that is live-but-parked
+                // (`Failed` with retries=0) or terminal (`Errored`/`Completed`/
+                // `Canceled`), a user task that is `Completed`/`Canceled`, and a
+                // `Resolved` incident are all remapped there too. Filtering to a
+                // "live" state here (`Created` user tasks / `Active` incidents)
+                // would be a narrower, divergent notion of "live" than the single
+                // source of truth (the engine) and would silently leave terminal
+                // rows pointing at stale source element ids (and, for those tables
+                // re-homed in Phase B, stale definition identity) — and adding a
+                // new state would silently widen that drift. Mirror the applier
+                // exactly and remap by original element id alone. (Only the
+                // `element_instances` remap keeps a state filter, because the
+                // applier likewise remaps only *active* element instances — the
+                // ids in `instance.active`.)
+                tx.cexecute(
+                    "UPDATE jobs SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
+                )?;
+                tx.cexecute(
+                    "UPDATE user_tasks SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
+                )?;
+                tx.cexecute(
+                    "UPDATE incidents SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
+                )?;
+                // Message subscriptions in the read model are all live (rows are
+                // dropped on correlation/cancel/termination), and carry no
+                // definition-identity columns, so remap by original element id
+                // with no state filter. A migrated instance waiting on a message
+                // catch event must re-home its subscription alongside the token.
+                tx.cexecute(
+                    "UPDATE message_subscriptions SET element_id = ?3 \
+                     WHERE instance_key = ?1 AND element_id = ?2",
+                    params![ik, source_id, t],
+                )?;
+            }
+
+            // Phase B — resolve temp ids to the target id + re-home the
+            //    definition identity (once per distinct target).
+            let mut resolved: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (_source_id, target_id) in element_mappings {
+                if !resolved.insert(target_id.as_str()) {
+                    continue;
+                }
+                let t = tmp(target_id);
+                let (t_name, t_type): (Option<String>, String) = tx
+                    .query_row(
+                        "SELECT element_name, element_type FROM definition_elements \
+                         WHERE process_definition_key = ?1 AND element_id = ?2",
+                        params![target_key_i, target_id],
+                        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| {
+                        // The engine validated every mapped target element exists
+                        // before emitting this event, so missing metadata is read
+                        // model corruption — fail loudly rather than overwriting
+                        // `element_type` with an empty string.
+                        rusqlite::Error::SqliteFailure(
+                            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                            Some(format!(
+                                "migration projection: target element '{target_id}' missing from \
+                                 definition_elements for process definition key {target_key_i}"
+                            )),
+                        )
+                    })?;
+                tx.cexecute(
+                    "UPDATE element_instances SET element_id = ?2, element_name = ?3, \
+                     element_type = ?4, process_definition_id = ?5, process_definition_key = ?6 \
+                     WHERE instance_key = ?1 AND element_id = ?7",
+                    params![
+                        ik,
+                        target_id,
+                        t_name,
+                        t_type,
+                        target_process_id,
+                        target_key_str,
+                        t
+                    ],
+                )?;
+                tx.cexecute(
+                    "UPDATE jobs SET element_id = ?2, process_definition_id = ?3, \
+                     process_definition_key = ?4 WHERE instance_key = ?1 AND element_id = ?5",
+                    params![ik, target_id, target_process_id, target_key_str, t],
+                )?;
+                tx.cexecute(
+                    "UPDATE user_tasks SET element_id = ?2, process_definition_id = ?3, \
+                     process_definition_key = ?4, process_definition_version = ?5 \
+                     WHERE instance_key = ?1 AND element_id = ?6",
+                    params![
+                        ik,
+                        target_id,
+                        target_process_id,
+                        target_key_str,
+                        target_version,
+                        t
+                    ],
+                )?;
+                tx.cexecute(
+                    "UPDATE incidents SET element_id = ?2, process_definition_id = ?3, \
+                     process_definition_key = ?4 WHERE instance_key = ?1 AND element_id = ?5",
+                    params![ik, target_id, target_process_id, target_key_str, t],
+                )?;
+                // Resolve the temp-stamped message subscriptions (they carry no
+                // definition identity, so only the element id moves).
+                tx.cexecute(
+                    "UPDATE message_subscriptions SET element_id = ?2 \
+                     WHERE instance_key = ?1 AND element_id = ?3",
+                    params![ik, target_id, t],
+                )?;
+            }
+
+            // Variables carry the definition identity but no element id, so
+            // re-home them wholesale for the instance.
+            tx.cexecute(
+                "UPDATE variables SET process_definition_id = ?2, process_definition_key = ?3 \
+                 WHERE instance_key = ?1",
+                params![ik, target_process_id, target_key_str],
+            )?;
+        }
+
         // Events with no queryable read-model projection.
         _ => {}
     }
@@ -4444,7 +4631,7 @@ mod decision_deletion_tests {
 mod element_instance_tests {
     use std::collections::HashMap;
 
-    use nanobpmn_engine_core::{Event, ProcessBuilder};
+    use nanobpmn_engine_core::{Event, JobState, Key, ProcessBuilder};
 
     use super::{ElementInstanceState, ReadStore};
 
@@ -4782,5 +4969,164 @@ mod element_instance_tests {
             }])
             .unwrap();
         assert!(store.message_subscriptions().is_empty());
+    }
+
+    #[test]
+    fn migration_remaps_live_message_subscription_onto_target_element() {
+        use nanobpmn_engine_core::MessageSubscriptionKind;
+        // An instance waiting on a message catch event carries a live
+        // `message_subscriptions` row. Migrating it must re-home that row's
+        // `element_id` onto the mapped target element, alongside the token —
+        // otherwise the read model points at the source element id the engine no
+        // longer runs under.
+        let store = ReadStore::open(None).unwrap();
+
+        // Target definition `p2` carries the mapped target element `await2` as a
+        // message intermediate catch event (matching the source token's
+        // `IntermediateCatch` subscription kind and the realistic
+        // `definition_elements` metadata/type), so its metadata is resolvable.
+        let target = ProcessBuilder::new("p2")
+            .start_event("s2")
+            .message_intermediate_catch_event("await2", "OrderPlaced", "=orderId")
+            .end_event("e2")
+            .connect("s2", "await2")
+            .connect("await2", "e2")
+            .build()
+            .unwrap();
+        let target_key: u64 = 600;
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::ProcessDeployed {
+                    deployment_key: 2,
+                    process_definition_key: target_key,
+                    version: 3,
+                    process: target,
+                },
+                &Event::MessageSubscriptionCreated {
+                    subscription_key: 4001,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "await".to_string(),
+                    message_name: "OrderPlaced".to_string(),
+                    correlation_key: "A1".to_string(),
+                    kind: MessageSubscriptionKind::IntermediateCatch,
+                },
+            ])
+            .unwrap();
+        assert_eq!(store.message_subscriptions()[0].element_id, "await");
+
+        store
+            .export(&[&Event::ProcessInstanceMigrated {
+                instance_key: INST,
+                target_process_id: "p2".to_string(),
+                target_process_definition_key: target_key,
+                element_mappings: vec![("await".to_string(), "await2".to_string())],
+            }])
+            .unwrap();
+
+        // The subscription re-homes onto the target element id; the instance row
+        // re-homes onto the target definition + its version (looked up loudly).
+        let subs = store.message_subscriptions();
+        assert_eq!(subs.len(), 1);
+        assert_eq!(subs[0].element_id, "await2");
+        let inst = store.process_instance(INST).unwrap();
+        assert_eq!(inst.process_definition_id, "p2");
+        assert_eq!(inst.process_definition_key, target_key.to_string());
+        assert_eq!(inst.version, 3);
+    }
+
+    #[test]
+    fn migration_remaps_parked_and_terminal_job_element_ids() {
+        // The engine applier re-points `element_id` on *every* job the instance
+        // owns — it loops all of `state.jobs` and never removes terminal rows —
+        // so a parked (`Failed`, retries=0) or terminal (`Errored`) job is
+        // remapped there too. The read model must mirror that, or a job row is
+        // left pointing at the source `element_id` the engine no longer runs
+        // under. This guards the whole defect class (any job state, not just the
+        // two the projection used to allow-list) against silent drift.
+        let store = ReadStore::open(None).unwrap();
+
+        let target = ProcessBuilder::new("p2")
+            .start_event("s2")
+            .service_task("t2", "worker")
+            .with_name("t2", "My Task 2")
+            .end_event("e2")
+            .connect("s2", "t2")
+            .connect("t2", "e2")
+            .build()
+            .unwrap();
+        let target_key: u64 = 600;
+
+        store
+            .export(&[
+                &deploy(),
+                &created(),
+                &Event::ProcessDeployed {
+                    deployment_key: 2,
+                    process_definition_key: target_key,
+                    version: 3,
+                    process: target,
+                },
+                // A parked job (retries exhausted) on the source element `t`.
+                &Event::JobCreated {
+                    job_key: 7001,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobFailed {
+                    job_key: 7001,
+                    instance_key: INST,
+                    retries: 0,
+                },
+                // A terminal errored job on the same source element.
+                &Event::JobCreated {
+                    job_key: 7002,
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    job_type: "worker".to_string(),
+                    created_at: 1,
+                    priority: 0,
+                    retries: 1,
+                },
+                &Event::JobErrorThrown {
+                    job_key: 7002,
+                    instance_key: INST,
+                    error_code: "BOOM".to_string(),
+                },
+            ])
+            .unwrap();
+        let before: HashMap<Key, JobState> =
+            store.jobs().into_iter().map(|j| (j.key, j.state)).collect();
+        assert_eq!(before.get(&7001), Some(&JobState::Failed));
+        assert_eq!(before.get(&7002), Some(&JobState::Errored));
+
+        store
+            .export(&[&Event::ProcessInstanceMigrated {
+                instance_key: INST,
+                target_process_id: "p2".to_string(),
+                target_process_definition_key: target_key,
+                element_mappings: vec![("t".to_string(), "t2".to_string())],
+            }])
+            .unwrap();
+
+        // Both the parked and the terminal job re-home onto the target element
+        // id and pick up the target definition identity — matching the engine.
+        for job in store.jobs() {
+            assert_eq!(
+                job.element_id, "t2",
+                "job {} left pointing at stale source element id",
+                job.key
+            );
+            assert_eq!(job.process_definition_id, "p2");
+            assert_eq!(job.process_definition_key, target_key.to_string());
+        }
     }
 }

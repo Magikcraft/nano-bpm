@@ -608,6 +608,32 @@ impl TestEngine {
         to_json(&self.snapshot_value(None))
     }
 
+    /// Migrate a running process instance to a target process definition (Zeebe
+    /// "migrate process instance"): re-point every active element instance at the
+    /// mapped element of `target_process_definition_key` and re-home the instance.
+    /// `mapping_instructions_json` is a JSON array of
+    /// `{ sourceElementId: string, targetElementId: string }`. Returns the
+    /// snapshot.
+    #[wasm_bindgen(js_name = migrate)]
+    pub fn migrate(
+        &mut self,
+        instance_key: &str,
+        target_process_definition_key: &str,
+        mapping_instructions_json: &str,
+    ) -> Result<String, JsValue> {
+        self.guard_paused()?;
+        let key = parse_key(instance_key)?;
+        let target_key = parse_key(target_process_definition_key)?;
+        let mapping_instructions = parse_mapping_instructions(mapping_instructions_json)?;
+        self.apply(Command::MigrateInstance {
+            instance_key: key,
+            target_process_definition_key: target_key,
+            mapping_instructions,
+        })
+        .map_err(|e| js_err(&format!("migrate instance error: {e}")))?;
+        to_json(&self.snapshot_value(None))
+    }
+
     /// Complete a waiting user task by key, merging `variables_json` into the
     /// instance before the parked token resumes. The task must be in the
     /// `Created` state. Returns the snapshot.
@@ -1495,6 +1521,39 @@ fn json_to_element_instance_key(v: &serde_json::Value) -> Result<u64, JsValue> {
             "terminate instruction must be a key string, number or object",
         )),
     }
+}
+
+/// Parse a JSON array of `{ sourceElementId, targetElementId }` objects into the
+/// `(source, target)` element-id pairs a `MigrateInstance` command carries.
+/// Empty/whitespace ⇒ no mappings.
+fn parse_mapping_instructions(s: &str) -> Result<Vec<(String, String)>, JsValue> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(Vec::new());
+    }
+    let json: serde_json::Value = serde_json::from_str(t)
+        .map_err(|e| js_err(&format!("invalid mapping instructions JSON: {e}")))?;
+    let serde_json::Value::Array(items) = json else {
+        return Err(js_err("mapping instructions must be a JSON array"));
+    };
+    items
+        .iter()
+        .map(|v| {
+            let serde_json::Value::Object(map) = v else {
+                return Err(js_err(
+                    "mapping instruction must be a { sourceElementId, targetElementId } object",
+                ));
+            };
+            let source = map.get("sourceElementId").and_then(|x| x.as_str());
+            let target = map.get("targetElementId").and_then(|x| x.as_str());
+            match (source, target) {
+                (Some(source), Some(target)) => Ok((source.to_string(), target.to_string())),
+                _ => Err(js_err(
+                    "mapping instruction requires string sourceElementId and targetElementId",
+                )),
+            }
+        })
+        .collect()
 }
 
 /// Parse a JSON object string into engine variables. Empty/whitespace ⇒ none.
