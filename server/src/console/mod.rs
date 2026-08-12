@@ -102,12 +102,21 @@ const LANDSCAPE_MARKER: &str = "<!--LANDSCAPE_TABLE-->";
 
 /// The fully assembled `/stack` page: [`STACK_HTML`] with the generated
 /// landscape table spliced in at [`LANDSCAPE_MARKER`]. Built once on first use.
+///
+/// Splices via [`str::split_once`] rather than [`str::replace`] so the marker
+/// must appear *exactly once*: `split_once` matches only the first occurrence,
+/// and the `rest.contains(...)` assert makes a duplicated marker a loud panic
+/// instead of silently injecting the table twice. A missing marker is likewise
+/// a panic — the table must never be silently dropped.
 static STACK_PAGE: LazyLock<String> = LazyLock::new(|| {
-    debug_assert!(
-        STACK_HTML.contains(LANDSCAPE_MARKER),
-        "stack.html is missing the {LANDSCAPE_MARKER} landscape-table marker",
+    let (head, rest) = STACK_HTML.split_once(LANDSCAPE_MARKER).unwrap_or_else(|| {
+        panic!("stack.html is missing the {LANDSCAPE_MARKER} landscape-table marker")
+    });
+    assert!(
+        !rest.contains(LANDSCAPE_MARKER),
+        "stack.html contains the {LANDSCAPE_MARKER} landscape-table marker more than once",
     );
-    STACK_HTML.replace(LANDSCAPE_MARKER, LANDSCAPE_TABLE_HTML.trim())
+    format!("{head}{}{rest}", LANDSCAPE_TABLE_HTML.trim())
 });
 
 /// Result of a console API core handler: a JSON body on success, or an HTTP
@@ -444,6 +453,18 @@ mod stack_page_tests {
         assert!(
             STACK_HTML.contains(LANDSCAPE_MARKER),
             "stack.html must contain the {LANDSCAPE_MARKER} landscape-table marker",
+        );
+    }
+
+    #[test]
+    fn stack_html_carries_exactly_one_landscape_marker() {
+        // STACK_PAGE splices via split_once and panics on a duplicate marker, so a
+        // second marker would inject the table twice (loudly). Guard the invariant
+        // here too so the failure is caught at test time, not first request.
+        assert_eq!(
+            STACK_HTML.matches(LANDSCAPE_MARKER).count(),
+            1,
+            "stack.html must contain the {LANDSCAPE_MARKER} landscape-table marker exactly once",
         );
     }
 
