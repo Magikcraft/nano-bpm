@@ -1983,6 +1983,19 @@ pub(super) struct InstanceDetailDto {
     variables: Vec<VariableDto>,
     jobs: Vec<JobDto>,
     incidents: Vec<IncidentDto>,
+    active_elements: Vec<ActiveElementDto>,
+}
+
+/// An element instance currently in the `Active` state — a live token position.
+/// Unlike jobs (service tasks only), this covers wait states with no job
+/// (intermediate catch events, receive tasks, timers, event-based gateways) and
+/// active (sub)process bodies, so the Explorer overlay can highlight a waiting
+/// instance's location.
+#[derive(Serialize)]
+pub(super) struct ActiveElementDto {
+    element_id: String,
+    element_type: String,
+    element_name: Option<String>,
 }
 
 /// `GET /console/api/instances?page=N&pageSize=M` — one page of process
@@ -2143,11 +2156,23 @@ pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<In
         })
         .collect();
 
+    let active_elements: Vec<ActiveElementDto> = server
+        .store
+        .active_element_instances(key)
+        .into_iter()
+        .map(|e| ActiveElementDto {
+            element_id: e.element_id,
+            element_type: e.element_type,
+            element_name: e.element_name,
+        })
+        .collect();
+
     Some(InstanceDetailDto {
         instance: InstanceDto::from(&row),
         variables,
         jobs,
         incidents,
+        active_elements,
     })
 }
 
