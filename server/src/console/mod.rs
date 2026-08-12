@@ -2158,12 +2158,8 @@ pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<In
 
     let active_elements: Vec<ActiveElementDto> = server
         .store
-        .element_instances()
+        .active_element_instances(key)
         .into_iter()
-        .filter(|e| {
-            e.instance_key == key
-                && matches!(e.state, crate::readstore::ElementInstanceState::Active)
-        })
         .map(|e| ActiveElementDto {
             element_id: e.element_id,
             element_type: e.element_type,

@@ -1500,6 +1500,30 @@ impl ReadStore {
         .expect("query element_instance")
     }
 
+    /// The `Active` element instances for one process instance (its live token
+    /// positions). Selects by `instance_key` via `idx_element_instances_instance`
+    /// and filters to the `Active` state code in SQL, so this stays O(rows for
+    /// this instance) rather than scanning every element instance in the shard.
+    pub fn active_element_instances(&self, instance_key: Key) -> Vec<ElementInstanceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {ELEMENT_INSTANCE_COLS} FROM element_instances \
+                 WHERE instance_key = ?1 AND state = ?2"
+            ))
+            .expect("prepare active_element_instances");
+        let rows = stmt
+            .query_map(
+                params![
+                    instance_key as i64,
+                    element_instance_state_code(ElementInstanceState::Active)
+                ],
+                map_element_instance,
+            )
+            .expect("query active_element_instances");
+        rows.filter_map(Result::ok).collect()
+    }
+
     /// All open message subscriptions in this shard (MESSAGE wait states).
     pub fn message_subscriptions(&self) -> Vec<MessageSubscriptionRow> {
         let conn = self.conn.lock().expect("read store poisoned");
@@ -1840,6 +1864,14 @@ impl ReadModel {
     pub fn instance_variables(&self, instance_key: Key) -> Vec<VariableRow> {
         self.shard_for(instance_key)
             .map(|s| s.instance_variables(instance_key))
+            .unwrap_or_default()
+    }
+
+    /// The `Active` element instances for one process instance, routed to the
+    /// instance's owning shard and selected by the `instance_key` index.
+    pub fn active_element_instances(&self, instance_key: Key) -> Vec<ElementInstanceRow> {
+        self.shard_for(instance_key)
+            .map(|s| s.active_element_instances(instance_key))
             .unwrap_or_default()
     }
 
@@ -4580,6 +4612,68 @@ mod element_instance_tests {
         let row = store.element_instance(2003).unwrap();
         assert_eq!(row.element_type, "AD_HOC_SUB_PROCESS_INNER_INSTANCE");
         assert_eq!(row.element_name, None);
+    }
+
+    /// `active_element_instances` returns only the `Active` rows for the given
+    /// instance — the live token positions the explorer overlays. Completed or
+    /// terminated elements, and elements belonging to other instances, are
+    /// excluded.
+    #[test]
+    fn active_element_instances_returns_only_active_rows_for_the_instance() {
+        let store = ReadStore::open(None).unwrap();
+        store.export(&[&deploy(), &created()]).unwrap();
+
+        // Two elements activate on INST; one then completes.
+        store
+            .export(&[
+                &Event::ElementActivated {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI,
+                    element_id: "t".to_string(),
+                    scope: 0,
+                },
+                &Event::ElementActivated {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI + 1,
+                    element_id: "t".to_string(),
+                    scope: 0,
+                },
+                &Event::ElementCompleted {
+                    instance_key: INST,
+                    element_instance_key: TASK_EI + 1,
+                    element_id: "t".to_string(),
+                },
+            ])
+            .unwrap();
+
+        // A different instance's active element must not leak in.
+        store
+            .export(&[
+                &Event::ProcessInstanceCreated {
+                    instance_key: INST + 100,
+                    process_id: "p".to_string(),
+                    variables: HashMap::new(),
+                    created_at: 1,
+                    tags: Vec::new(),
+                    business_id: None,
+                },
+                &Event::ElementActivated {
+                    instance_key: INST + 100,
+                    element_instance_key: TASK_EI + 2,
+                    element_id: "t".to_string(),
+                    scope: 0,
+                },
+            ])
+            .unwrap();
+
+        let active = store.active_element_instances(INST);
+        assert_eq!(active.len(), 1, "only the still-active element on INST");
+        assert_eq!(active[0].element_instance_key, TASK_EI);
+        assert!(
+            active
+                .iter()
+                .all(|e| e.state == ElementInstanceState::Active && e.instance_key == INST)
+        );
     }
 
     #[test]
