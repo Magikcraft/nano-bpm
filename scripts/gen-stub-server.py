@@ -67,6 +67,8 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("element_instance", "search_element_instance_wait_states"): "self.search_element_instance_wait_states_impl(body).await",
     ("message", "publish_message"): "self.publish_message_impl(body).await",
     ("message", "correlate_message"): "self.correlate_message_impl(body).await",
+    ("message_subscription", "search_message_subscriptions"): "self.search_message_subscriptions_impl(body).await",
+    ("message_subscription", "search_correlated_message_subscriptions"): "self.search_correlated_message_subscriptions_impl(body).await",
     ("variable", "search_variables"): "self.search_variables_impl(query_params, body).await",
     ("variable", "get_variable"): "self.get_variable_impl(path_params).await",
     ("cluster", "get_topology"): "self.get_topology_impl().await",
