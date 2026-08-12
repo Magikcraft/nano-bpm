@@ -188,6 +188,17 @@ enum Step {
         element_instance_key: Key,
         element_id: String,
     },
+    /// Re-run the activation body of an already-active message intermediate
+    /// catch event to re-open its subscription. Used to retry a catch whose
+    /// correlation-key expression raised an `ExpressionEvaluation` incident at
+    /// open time: the element instance stays active throughout, so its
+    /// `ElementActivating`/`ElementActivated` are not re-emitted — only the
+    /// subscription is re-derived once the referenced variables are corrected.
+    ReopenCatch {
+        instance_key: Key,
+        element_instance_key: Key,
+        element_id: String,
+    },
     /// Activate one child of a multi-instance body: instantiate `element_id`
     /// again in the body's scope with the `index`-th item's local bindings. The
     /// item and bindings are read from the body's runtime state.
@@ -2032,11 +2043,27 @@ impl Engine {
                     state::IncidentKind::NoMatchingSequenceFlow
                     | state::IncidentKind::ExpressionEvaluation
                     | state::IncidentKind::DecisionEvaluation => {
-                        queue.push_back(Step::Complete {
-                            instance_key,
-                            element_instance_key,
-                            element_id,
-                        });
+                        // A message intermediate catch event whose correlation
+                        // key failed to evaluate parks ACTIVATED with no
+                        // subscription; re-driving `Complete` would advance the
+                        // token past the wait (skipping the message). Instead
+                        // re-open its subscription so the token keeps waiting.
+                        if matches!(
+                            self.element_kind(instance_key, &element_id),
+                            Some(ElementKind::MessageIntermediateCatchEvent { .. })
+                        ) {
+                            queue.push_back(Step::ReopenCatch {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        } else {
+                            queue.push_back(Step::Complete {
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                            });
+                        }
                     }
                     // Uncaught business error: re-create a job for the still-active
                     // service task so a worker can attempt it again.
@@ -3356,6 +3383,18 @@ impl Engine {
                 element_instance_key,
                 element_id,
             } => self.create_job_for(instance_key, element_instance_key, element_id),
+            Step::ReopenCatch {
+                instance_key,
+                element_instance_key,
+                element_id,
+            } => {
+                // The catch element instance is already ACTIVATED (its token is
+                // parked on the resolved incident); reconstruct its enclosing
+                // scope (absent from `scopes` ⇒ root) and re-derive only the
+                // activation body to re-open the subscription.
+                let scope = self.scope_of(instance_key, element_instance_key);
+                self.run_activation_body(instance_key, element_id, element_instance_key, scope)
+            }
             Step::ActivateMiChild {
                 instance_key,
                 element_id,
@@ -3867,34 +3906,55 @@ impl Engine {
                 // The message name may be a FEEL expression evaluated on
                 // activation against the instance variables (Zeebe parity).
                 let message_name = self.resolve_event_name(&element_vars, &message_name);
-                let correlation_value =
-                    self.resolve_correlation_value(&element_vars, &correlation_key);
-                let kind = state::MessageSubscriptionKind::IntermediateCatch;
-                // Zeebe-style placement: the canonical subscription lives on the
-                // partition owning `hash(correlation_key)`. When that is this
-                // partition (always so single-partition), open it locally; else
-                // park the token on an `Opening` record and let the host route an
-                // `OpenMessageSubscription` to the message partition.
-                if self.subscription_partition(&correlation_value) == self.partition_id {
-                    events.push(Event::MessageSubscriptionCreated {
-                        subscription_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        message_name,
-                        correlation_key: correlation_value,
-                        kind,
-                    });
-                } else {
-                    events.push(Event::MessageSubscriptionOpening {
-                        subscription_key,
-                        instance_key,
-                        element_instance_key,
-                        element_id,
-                        message_name,
-                        correlation_key: correlation_value,
-                        kind,
-                    });
+                // A declared correlation-key expression that fails to evaluate
+                // (missing variable, `null`, or a type error like `str + null`)
+                // must NOT silently open a subscription with an empty key — that
+                // key can never be matched by a published message, so the token
+                // would park forever with no error. Raise an ExpressionEvaluation
+                // incident instead (Zeebe parity); resolving it re-opens the
+                // subscription (see the `ResolveIncident` re-drive).
+                match self.resolve_correlation_value_checked(&element_vars, &correlation_key) {
+                    Err(reason) => {
+                        events.push(Event::IncidentRaised {
+                            incident_key: subscription_key,
+                            instance_key,
+                            element_instance_key,
+                            element_id,
+                            kind: state::IncidentKind::ExpressionEvaluation,
+                            reason,
+                            job_key: None,
+                            created_at: self.now,
+                        });
+                    }
+                    Ok(correlation_value) => {
+                        let kind = state::MessageSubscriptionKind::IntermediateCatch;
+                        // Zeebe-style placement: the canonical subscription lives on the
+                        // partition owning `hash(correlation_key)`. When that is this
+                        // partition (always so single-partition), open it locally; else
+                        // park the token on an `Opening` record and let the host route an
+                        // `OpenMessageSubscription` to the message partition.
+                        if self.subscription_partition(&correlation_value) == self.partition_id {
+                            events.push(Event::MessageSubscriptionCreated {
+                                subscription_key,
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                message_name,
+                                correlation_key: correlation_value,
+                                kind,
+                            });
+                        } else {
+                            events.push(Event::MessageSubscriptionOpening {
+                                subscription_key,
+                                instance_key,
+                                element_instance_key,
+                                element_id,
+                                message_name,
+                                correlation_key: correlation_value,
+                                kind,
+                            });
+                        }
+                    }
                 }
             }
             // A signal intermediate catch event opens a signal subscription
