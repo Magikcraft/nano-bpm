@@ -2034,20 +2034,33 @@ struct LiveJob {
 /// enhancement — issue #608).
 ///
 /// Job activation is a *volatile* lease that nano deliberately does not journal
-/// or export (see `console::trace`), so the read model shows a leased job as
-/// `Created` until it completes. The engine, however, holds the authoritative
-/// live state. This upgrades a read-model job still shown as `Created` to the
-/// engine's live `Activated` view (state + worker + deadline) when the engine
-/// reports it activated. Every other case is left exactly as the read model has
-/// it: a terminal/failed row is never regressed, and a job the engine no longer
-/// holds (evicted on completion) keeps its read-model state. Pure, so the merge
-/// is unit-testable without an engine.
+/// or export under leader-local activation (see `console::trace`), so the read
+/// model shows a leased job as `Created` until it completes. The engine, however,
+/// holds the authoritative live state. This upgrades a read-model job still shown
+/// as `Created` to the engine's live `Activated` view (state + worker + deadline)
+/// when the engine reports it activated.
+///
+/// Under fully-replicated activation (`NANOBPMN_REPLICATE_ACTIVATION` resolving to
+/// `Always`) the `JobActivated` event *is* exported, so the read-model row is
+/// already `Activated` — but the projection stores only state/worker/deadline, not
+/// `activated_at`, so `activated_at_ms`/`timeout_ms` stay null. An already-
+/// `Activated` row is therefore enriched here too (its live `activated_at` filled
+/// in and `timeout_ms` recomputed from the live deadline), so the "Timeout" field
+/// reflects `UpdateJobTimeout` moves regardless of activation-replication mode.
+///
+/// Every other case is left exactly as the read model has it: a terminal/failed
+/// row is never regressed, and a job the engine no longer holds (evicted on
+/// completion) keeps its read-model state. Pure, so the merge is unit-testable
+/// without an engine.
 fn apply_job_activation_overlay(
     jobs: &mut [JobDto],
     live: &std::collections::HashMap<u64, LiveJob>,
 ) {
     for dto in jobs.iter_mut() {
-        if dto.state != "Created" {
+        // Only enrich non-terminal, activatable rows: a job still shown as
+        // `Created` (leader-local activation) or already `Activated` (replicated
+        // activation). Terminal/failed states are never regressed.
+        if dto.state != "Created" && dto.state != "Activated" {
             continue;
         }
         let Ok(key) = dto.key.parse::<u64>() else {
@@ -2107,25 +2120,28 @@ pub(super) async fn instance_detail(server: &ServerImpl, key: &str) -> Option<In
         .collect();
 
     // Studio-only enhancement (#608): surface the live `Activated` lease that the
-    // read model can't see. For jobs still shown as `Created`, ask the owning
-    // partition's engine — the authoritative holder of the volatile activation
-    // lease — for their true state and overlay `Activated` + worker + deadline.
-    // On a non-leader node no handle is found (or the job isn't resident) and the
-    // row stays `Created` (still correct). `POST /jobs/search` is intentionally
-    // NOT overlaid, keeping it at Zeebe parity (Zeebe has no queryable Activated
-    // job state either). A few point lookups, off the hot path.
-    let created_keys: Vec<u64> = jobs
+    // read model can't see under leader-local activation. For jobs still shown as
+    // `Created` — and for rows already `Activated` under replicated activation,
+    // which carry no `activated_at`/`timeout_ms` from the projection — ask the
+    // owning partition's engine (the authoritative holder of the volatile
+    // activation lease) for their true state and overlay
+    // `Activated` + worker + deadline + live lock window. On a non-leader node no
+    // handle is found (or the job isn't resident) and the row is left as-is (still
+    // correct). `POST /jobs/search` is intentionally NOT overlaid, keeping it at
+    // Zeebe parity (Zeebe has no queryable Activated job state either). A few point
+    // lookups, off the hot path.
+    let overlay_keys: Vec<u64> = jobs
         .iter()
-        .filter(|d| d.state == "Created")
+        .filter(|d| d.state == "Created" || d.state == "Activated")
         .filter_map(|d| d.key.parse::<u64>().ok())
         .collect();
-    if !created_keys.is_empty()
+    if !overlay_keys.is_empty()
         && let Some(handle) = server.engine_handle_for(nanobpmn_engine_core::partition_of(key))
     {
         let live = handle
             .with(move |journal| {
                 let mut m = std::collections::HashMap::new();
-                for k in created_keys {
+                for k in overlay_keys {
                     if let Some(job) = journal.engine().job(k) {
                         m.insert(
                             k,
@@ -2287,6 +2303,49 @@ mod job_activation_overlay_tests {
         );
         apply_job_activation_overlay(&mut jobs, &live);
         assert_eq!(jobs[0].state, "Created");
+    }
+
+    #[test]
+    fn enriches_an_already_activated_row_from_replicated_activation() {
+        // Under fully-replicated activation the `JobActivated` event is exported,
+        // so the read-model row is already `Activated` with a worker + deadline —
+        // but the projection stores no `activated_at`, leaving `activated_at_ms`
+        // and `timeout_ms` null. The overlay must fill those in from the live
+        // engine (and recompute the lock window from the live deadline) without
+        // regressing the row.
+        let mut jobs = vec![job("10", "Activated")];
+        jobs[0].worker = Some("fleet".to_string());
+        jobs[0].deadline_ms = Some(7_201_000);
+        let mut live = HashMap::new();
+        live.insert(
+            10u64,
+            LiveJob {
+                state: "Activated".to_string(),
+                worker: Some("fleet".to_string()),
+                deadline_ms: Some(7_201_000),
+                activated_at_ms: Some(1_000),
+            },
+        );
+        apply_job_activation_overlay(&mut jobs, &live);
+        assert_eq!(jobs[0].state, "Activated");
+        assert_eq!(jobs[0].activated_at_ms, Some(1_000));
+        assert_eq!(jobs[0].timeout_ms, Some(7_200_000));
+    }
+
+    #[test]
+    fn leaves_activated_untouched_when_engine_has_no_live_entry() {
+        // Engine no longer holds the job (e.g. evicted just after a replicated
+        // activation) — keep the read-model row exactly as projected.
+        let mut jobs = vec![job("10", "Activated")];
+        jobs[0].worker = Some("fleet".to_string());
+        jobs[0].deadline_ms = Some(7_201_000);
+        let live: HashMap<u64, LiveJob> = HashMap::new();
+        apply_job_activation_overlay(&mut jobs, &live);
+        assert_eq!(jobs[0].state, "Activated");
+        assert_eq!(jobs[0].worker.as_deref(), Some("fleet"));
+        assert_eq!(jobs[0].deadline_ms, Some(7_201_000));
+        assert!(jobs[0].activated_at_ms.is_none());
+        assert!(jobs[0].timeout_ms.is_none());
     }
 
     #[test]
