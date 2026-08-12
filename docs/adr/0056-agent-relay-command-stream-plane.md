@@ -16,6 +16,9 @@ ADR 0057 (`0057-console-app-view-embedded-urban-apps.md`, **Console App View** �
 console-embedded app-view this ADR's cockpit rides in; rewritten alongside this ADR),
 ADR 0050 (`0050-urban-connectors-outbound-io-and-project-enablement.md`, the Urban outbound-I/O edge —
 the connector surface these agent workers act through),
+ADR 0059 (`0059-supervisor-enrolment-app-driven-fleet-configuration.md`, **supervisor enrolment** —
+lifts this ADR's per-worker `REGISTER`/`SERVE` (§9) to per-machine, multi-app fleet configuration:
+an operator points a machine's supervisor at an app and the app drives what that machine serves),
 `@nanobpm/urban` (the generic Urban runtime — the home of this capability, not any one app),
 `app/blackboard.ts` in the `nanobpm/nano-workforce` repo (the per-plan advisory blackboard — the seed
 this ADR generalizes into a first-class channel family),
@@ -177,7 +180,9 @@ worker → engine: activateJobs(<each token>)      # dumb 1:1 pollers, one proce
 One `nano work` process multiplexes **many pollers**, so one machine serves a whole department it
 qualifies for. c8ctl stays a dumb bridge: it declares capability and opens whatever tokens the app
 returns. The operator may scope/trim the resolved set (cost control); the supervisor may reconcile it
-live as the vocab or fleet changes.
+live as the vocab or fleet changes. **ADR 0059** lifts this handshake from a single worker to the
+**per-machine supervisor across several apps at once** — an operator enrols a machine against an app
+(*"work on this"*) and the app drives that machine's fleet configuration.
 
 ### 10. Diversity SLO
 
@@ -255,7 +260,8 @@ Swap Kimi for Qwen tomorrow: re-enrol the blue box. **The BPMN does not change; 
   store; retention / eviction policy for long transcripts.
 - **Mirror vs matchmaker** — does the registry stay a read-only mirror, or grow app-tier placement
   policy (auto-fill an unserved role, hold a seat's job until a distinct family is free)? Legitimate at
-  the app tier; deferred to a follow-up.
+  the app tier; deferred to a follow-up. ADR 0059 sharpens this: multi-machine seats force cross-machine
+  placement, and its per-machine supervisor is deliberately *not* the arbiter — the app-hub registry is.
 - **Vocab distribution** — does a worker fetch the vocab over the channel at enrol, or is it bundled
   with the capability version it runs — and how do core/extension versions reconcile across app and
   fleet?
