@@ -3680,10 +3680,11 @@ mod successor_balance_tests {
 /// [`Command::create_instance_versioned`]:
 ///
 /// * **by-key** — the key identifies the exact version, so it is looked up
-///   across *all retained versions* (`process_versions`, not the latest-by-id
-///   index) and passed through as `selector_key`; the version number is left
-///   `None` (the key already pins it). An unknown key is a 400 (the create
-///   endpoint has no 404 variant).
+///   across *all retained versions* (`process_versions`), falling back to the
+///   latest-by-id index for pre-retention snapshots, via
+///   [`State::process_by_key`]; the resolved key is passed through as
+///   `selector_key` and the version number is left `None` (the key already pins
+///   it). An unknown key is a 400 (the create endpoint has no 404 variant).
 /// * **by-id** — the (already-positive-filtered) `by_version` becomes
 ///   `selector_version`; the engine resolves it to that version of `process_id`,
 ///   or the latest when `None`.
@@ -3703,10 +3704,10 @@ fn resolve_create_selector(
 ) -> Result<ResolvedCreateSelector, (u16, String)> {
     match (by_id, by_key) {
         (Some(id), _) => Ok((id, None, by_version.filter(|v| *v > 0))),
-        (None, Some(requested)) => match state
-            .process_versions
-            .values()
-            .find(|d| d.key.to_string() == requested)
+        (None, Some(requested)) => match requested
+            .parse::<nanobpmn_engine_core::Key>()
+            .ok()
+            .and_then(|k| state.process_by_key(k))
         {
             Some(d) => Ok((d.definition.id.clone(), Some(d.key), None)),
             None => Err((400, format!("No deployed process with key '{requested}'."))),

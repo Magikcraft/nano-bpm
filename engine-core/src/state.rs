@@ -1037,13 +1037,39 @@ impl State {
         self.processes.get(&instance.process_id)
     }
 
+    /// The exact deployed definition identified by its process-definition
+    /// `key`, if retained. Checks the full version-retention map first, then
+    /// falls back to the latest-by-id index for engines restored from
+    /// pre-retention snapshots — where `process_versions` deserializes empty
+    /// (`serde(default)`) but `processes` still holds the latest deployed
+    /// definition (including its key). Without the fallback, a valid by-key
+    /// create would spuriously 400 after an upgrade until a redeploy
+    /// repopulated `process_versions`.
+    pub fn process_by_key(&self, key: Key) -> Option<&DeployedProcess> {
+        if let Some(deployed) = self.process_versions.get(&key) {
+            return Some(deployed);
+        }
+        self.processes.values().find(|d| d.key == key)
+    }
+
     /// The exact deployed version of `process_id` with version number `version`,
     /// if one is retained. Used to resolve an explicit by-id + version create
-    /// request to a concrete definition.
+    /// request to a concrete definition. Checks the full version-retention map
+    /// first, then falls back to the latest-by-id index for engines restored
+    /// from pre-retention snapshots (empty `process_versions`), where only the
+    /// latest version per id — the only version legacy snapshots can preserve —
+    /// is still available in `processes`.
     pub fn process_version(&self, process_id: &str, version: i32) -> Option<&DeployedProcess> {
-        self.process_versions
+        if let Some(deployed) = self
+            .process_versions
             .values()
             .find(|d| d.definition.id == process_id && d.version == version)
+        {
+            return Some(deployed);
+        }
+        self.processes
+            .get(process_id)
+            .filter(|d| d.version == version)
     }
 
     /// Count of jobs that represent *live* runnable congestion — `Created`
@@ -2605,5 +2631,80 @@ mod placement_tests {
         for count in seen {
             assert!(count > 150, "uneven placement: {seen:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod version_lookup_tests {
+    use super::{DeployedProcess, State};
+    use crate::model::ProcessBuilder;
+
+    fn deployed(id: &str, key: u64, version: i32) -> DeployedProcess {
+        let definition = ProcessBuilder::new(id)
+            .start_event("start")
+            .build()
+            .expect("valid definition");
+        DeployedProcess {
+            key,
+            version,
+            definition,
+        }
+    }
+
+    /// A pre-retention snapshot deserializes `process_versions` empty (it is
+    /// `serde(default)`), but `processes` still holds the latest deployed
+    /// definition and its key. A by-key create for that key must still resolve.
+    #[test]
+    fn process_by_key_falls_back_to_latest_by_id_index_for_legacy_snapshots() {
+        let mut state = State::default();
+        let latest = deployed("order", 42, 3);
+        state.processes.insert("order".to_string(), latest.clone());
+        // process_versions is intentionally empty (legacy snapshot).
+        assert!(state.process_versions.is_empty());
+
+        let resolved = state
+            .process_by_key(42)
+            .expect("by-key resolves via fallback");
+        assert_eq!(resolved.key, 42);
+        assert_eq!(resolved.version, 3);
+        // An unknown key is still absent.
+        assert!(state.process_by_key(99).is_none());
+    }
+
+    /// By-id + version create for the *latest* version must resolve from the
+    /// latest-by-id index when `process_versions` is empty (legacy snapshot);
+    /// only that version is recoverable from such a snapshot.
+    #[test]
+    fn process_version_falls_back_to_latest_by_id_index_for_legacy_snapshots() {
+        let mut state = State::default();
+        let latest = deployed("order", 42, 3);
+        state.processes.insert("order".to_string(), latest);
+        assert!(state.process_versions.is_empty());
+
+        let resolved = state
+            .process_version("order", 3)
+            .expect("latest version resolves via fallback");
+        assert_eq!(resolved.version, 3);
+        assert_eq!(resolved.key, 42);
+        // A non-latest version is genuinely unrecoverable from a legacy snapshot.
+        assert!(state.process_version("order", 2).is_none());
+        assert!(state.process_version("order", 4).is_none());
+    }
+
+    /// When `process_versions` is populated it takes precedence and retains
+    /// historical versions the latest-by-id index has overwritten.
+    #[test]
+    fn version_retention_map_takes_precedence_and_retains_history() {
+        let mut state = State::default();
+        let v1 = deployed("order", 10, 1);
+        let v2 = deployed("order", 20, 2);
+        state.processes.insert("order".to_string(), v2.clone());
+        state.process_versions.insert(10, v1);
+        state.process_versions.insert(20, v2);
+
+        assert_eq!(state.process_by_key(10).expect("v1 retained").version, 1);
+        assert_eq!(state.process_by_key(20).expect("v2 retained").version, 2);
+        assert_eq!(state.process_version("order", 1).expect("v1").key, 10);
+        assert_eq!(state.process_version("order", 2).expect("v2").key, 20);
     }
 }

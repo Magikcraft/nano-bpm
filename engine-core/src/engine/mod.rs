@@ -1019,7 +1019,7 @@ impl Engine {
                     process_definition_key.filter(|k| *k != 0),
                     version.filter(|v| *v > 0),
                 ) {
-                    (Some(key), _) => self.state.process_versions.get(&key).ok_or_else(|| {
+                    (Some(key), _) => self.state.process_by_key(key).ok_or_else(|| {
                         EngineError::ProcessNotFound {
                             process_id: process_id.clone(),
                         }
