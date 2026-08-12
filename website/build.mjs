@@ -491,8 +491,8 @@ ${compareHtml()}
 
 // A landscape comparison grid, rendered from a single source of truth so the
 // header set and every row stay aligned. Nano Workforce is the first product
-// column and is visually highlighted (`col-nano`) — the row each peer is read
-// against. Cells carry an optional tone (`yes` / `partial` / `no`) that decorates
+// column and is visually highlighted (`col-nano`) — the column each peer is
+// read against. Cells carry an optional tone (`yes` / `partial` / `no`) that decorates
 // them with a ✓ / ~ / — marker; plain cells are descriptive. Every claim traces
 // to the tool's own docs (onorca.dev, herdr.dev, code.claude.com/docs) and is
 // kept deliberately fair — these tools solve overlapping-but-distinct problems.
@@ -653,9 +653,11 @@ function compareHtml() {
           // The ✓/~/— glyphs are CSS `::before` content, which assistive tech
           // often does not announce — prepend visually-hidden text so the
           // yes/partial/no signal reaches screen readers without overriding the
-          // cell's visible descriptive text (as an aria-label would).
+          // cell's visible descriptive text (as an aria-label would). A trailing
+          // ": " (only when the cell has visible text) makes it read as
+          // "Yes: …" with a reliable pause, instead of "YesJournal-backed…".
           const toneLabel = tone
-            ? `<span class="visually-hidden">${TONE_LABELS[tone]}</span>`
+            ? `<span class="visually-hidden">${TONE_LABELS[tone]}${text ? ": " : ""}</span>`
             : "";
           return `      <td class="${colClass(cols[i]).trim()}"><span class="cell${toneCls}">${toneLabel}${text}</span></td>`;
         })
