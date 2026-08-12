@@ -2227,7 +2227,7 @@ fn map_message_subscription(r: &rusqlite::Row) -> rusqlite::Result<MessageSubscr
         element_id: r.get(3)?,
         message_name: r.get(4)?,
         correlation_key: r.get(5)?,
-        created_at_ms: r.get::<_, i64>(6)? as u64,
+        created_at_ms: r.get::<_, i64>(6)?.max(0) as u64,
     })
 }
 

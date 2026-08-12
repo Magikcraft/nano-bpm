@@ -8287,22 +8287,27 @@ impl ServerImpl {
 
         let entries: Vec<MsgSubEntry> = subs
             .into_iter()
-            .map(|sub| {
-                let inst = by_instance.get(&sub.instance_key);
-                MsgSubEntry {
+            .filter_map(|sub| {
+                // Skip subscriptions whose owning instance is not yet projected
+                // (eventual consistency / shard ordering). Emitting a row with an
+                // empty `processDefinitionId` and null definition metadata would be
+                // malformed Zeebe-parity output; surfacing the subscription only
+                // once its instance join resolves keeps definition attributes and
+                // the subscription atomic, so a partially-populated row can never
+                // escape.
+                let inst = by_instance.get(&sub.instance_key)?;
+                Some(MsgSubEntry {
                     subscription_key: sub.subscription_key,
-                    process_definition_id: inst
-                        .map(|i| i.process_definition_id.clone())
-                        .unwrap_or_default(),
-                    process_definition_key: inst.map(|i| i.process_definition_key.clone()),
+                    process_definition_id: inst.process_definition_id.clone(),
+                    process_definition_key: Some(inst.process_definition_key.clone()),
                     process_instance_key: sub.instance_key,
                     element_id: sub.element_id,
                     element_instance_key: sub.element_instance_key,
                     last_updated_ms: sub.created_at_ms,
                     message_name: sub.message_name,
                     correlation_key: sub.correlation_key,
-                    process_definition_version: inst.map(|i| i.version),
-                }
+                    process_definition_version: Some(inst.version),
+                })
             })
             .collect();
 
