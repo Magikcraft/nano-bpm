@@ -28,14 +28,15 @@ impl Engine {
     /// concatenating a string with `null` — returns `Err(reason)` so the caller
     /// can raise an incident instead of silently opening an unmatchable
     /// subscription with an empty key (Zeebe raises a correlation-key incident
-    /// in exactly this case). An absent declaration (empty string) resolves to
-    /// `Ok("")`, matching the REST default `correlationKey` of `""`.
+    /// in exactly this case). An absent declaration (empty or whitespace-only
+    /// string) resolves to `Ok("")`, matching the REST default `correlationKey`
+    /// of `""`.
     pub(crate) fn resolve_correlation_value_checked(
         &self,
         vars: &HashMap<String, Value>,
         correlation_key: &str,
     ) -> Result<String, String> {
-        if correlation_key.is_empty() {
+        if correlation_key.trim().is_empty() {
             return Ok(String::new());
         }
         crate::feel::eval_string(correlation_key, vars).map_err(|e| {
@@ -648,5 +649,38 @@ impl Engine {
             .and_then(|p| p.element(element_id))
             .map(|e| e.io.outputs.clone())
             .unwrap_or_default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checked_correlation_treats_whitespace_only_key_as_absent() {
+        // A whitespace-only declaration is not a real correlation-key
+        // expression; it must resolve to Ok("") (absent) rather than being fed
+        // to the FEEL parser and raising a spurious incident.
+        let engine = Engine::new();
+        let vars = HashMap::new();
+        assert_eq!(
+            engine.resolve_correlation_value_checked(&vars, "   "),
+            Ok(String::new())
+        );
+        assert_eq!(
+            engine.resolve_correlation_value_checked(&vars, ""),
+            Ok(String::new())
+        );
+    }
+
+    #[test]
+    fn checked_correlation_surfaces_unevaluable_declared_key() {
+        // A genuinely declared key that cannot evaluate (missing variable)
+        // must return Err so the caller can raise an incident.
+        let engine = Engine::new();
+        let vars = HashMap::new();
+        assert!(engine
+            .resolve_correlation_value_checked(&vars, "missingVar")
+            .is_err());
     }
 }

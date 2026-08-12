@@ -3392,12 +3392,7 @@ impl Engine {
                 // parked on the resolved incident); reconstruct its enclosing
                 // scope (absent from `scopes` ⇒ root) and re-derive only the
                 // activation body to re-open the subscription.
-                let scope = self
-                    .state
-                    .instances
-                    .get(&instance_key)
-                    .and_then(|i| i.scopes.get(&element_instance_key).copied())
-                    .unwrap_or(0);
+                let scope = self.scope_of(instance_key, element_instance_key);
                 self.run_activation_body(instance_key, element_id, element_instance_key, scope)
             }
             Step::ActivateMiChild {
