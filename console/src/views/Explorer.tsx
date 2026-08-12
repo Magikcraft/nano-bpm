@@ -54,6 +54,7 @@ function InstanceRow({
 }) {
   return (
     <button
+      type="button"
       ref={rowRef}
       onClick={() => onSelect(inst.key)}
       className={`flex w-full flex-col gap-1 border-b border-edge px-5 py-3 text-left hover:bg-hover ${
