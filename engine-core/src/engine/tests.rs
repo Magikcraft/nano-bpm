@@ -12447,6 +12447,97 @@ fn migration_completes_via_remapped_job() {
     );
 }
 
+/// A `par` process `s -> split =< a, b >= join -> e` whose branch `a` has
+/// already reached the join (so the join is half-open) while branch `b` is
+/// still parked, migrated to an identically-shaped `target` with renamed
+/// elements. Both `join_counts` and `join_instances` are keyed by the join
+/// gateway's element id, so the applier must remap them *together*; a regression
+/// that remapped only `join_counts` left `join_instances` pointing at the source
+/// id, desyncing `join_eik` from `join_count` after migration.
+#[test]
+fn migration_remaps_both_parallel_join_maps_together() {
+    fn par_join_process(id: &str, split: &str, a: &str, b: &str, join: &str) -> ProcessDefinition {
+        ProcessBuilder::new(id)
+            .start_event("s")
+            .parallel_gateway(split)
+            .service_task(a, "ja")
+            .service_task(b, "jb")
+            .parallel_gateway(join)
+            .end_event("e")
+            .connect("s", split)
+            .connect(split, a)
+            .connect(split, b)
+            .connect(a, join)
+            .connect(b, join)
+            .connect(join, "e")
+            .build()
+            .unwrap()
+    }
+
+    let mut engine = Engine::new();
+    deploy_for_migration(
+        &mut engine,
+        par_join_process("source", "split", "a", "b", "join"),
+    );
+    let target_key = deploy_for_migration(
+        &mut engine,
+        par_join_process("target", "split2", "a2", "b2", "join2"),
+    );
+
+    let inst = create_instance_key(&mut engine, "source");
+    // Drive branch `a` into the join so it opens and waits for branch `b`.
+    complete_one(&mut engine, "ja");
+
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_instances.contains_key("join"),
+        "the join is half-open on the source id before migration"
+    );
+    assert_eq!(
+        instance.join_counts.get("join").copied(),
+        Some(1),
+        "one branch has arrived at the join before migration"
+    );
+
+    // Active elements at this point: the parked task `b` and the open `join`.
+    engine
+        .apply_command(Command::migrate_instance(
+            inst,
+            target_key,
+            vec![
+                ("b".to_string(), "b2".to_string()),
+                ("join".to_string(), "join2".to_string()),
+            ],
+        ))
+        .unwrap();
+
+    let instance = engine.instance(inst).unwrap();
+    assert!(
+        instance.join_counts.contains_key("join2") && !instance.join_counts.contains_key("join"),
+        "join_counts re-keyed onto the target join id"
+    );
+    assert!(
+        instance.join_instances.contains_key("join2")
+            && !instance.join_instances.contains_key("join"),
+        "join_instances re-keyed onto the target join id (kept in sync with join_counts)"
+    );
+    assert_eq!(
+        instance.join_counts.get("join2").copied(),
+        Some(1),
+        "the arrival count survives the remap"
+    );
+
+    // Executable proof: completing the remaining branch fires the join once and
+    // the instance completes cleanly under the target definition.
+    complete_one(&mut engine, "jb");
+    let instance = engine.instance(inst).unwrap();
+    assert_eq!(
+        instance.state,
+        crate::state::ProcessInstanceState::Completed,
+        "the remapped join fires and the instance completes under the target"
+    );
+}
+
 #[test]
 fn migration_rejects_unknown_instance() {
     let mut engine = Engine::new();

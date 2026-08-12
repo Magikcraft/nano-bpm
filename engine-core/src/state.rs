@@ -1828,16 +1828,37 @@ pub fn apply(state: &mut State, event: &Event) {
                 for element_id in instance.active.values_mut() {
                     remap_id(element_id);
                 }
+                // Both parallel-join maps are keyed by the join gateway's element
+                // id, so they must be remapped together to stay in sync (a stale
+                // `join_instances` key would make `join_eik` miss after migration
+                // and re-open an already-open join). `collect()` would silently
+                // drop entries if two source ids collapse onto one target id, so
+                // merge deterministically instead: sum the arrival counts, and
+                // keep the smallest element-instance key for the open join.
                 if !instance.join_counts.is_empty() {
-                    let remapped: HashMap<ElementId, usize> = instance
-                        .join_counts
-                        .drain()
-                        .map(|(mut eid, count)| {
-                            remap_id(&mut eid);
-                            (eid, count)
-                        })
-                        .collect();
+                    let mut remapped: HashMap<ElementId, usize> =
+                        HashMap::with_capacity(instance.join_counts.len());
+                    for (mut eid, count) in instance.join_counts.drain() {
+                        remap_id(&mut eid);
+                        *remapped.entry(eid).or_insert(0) += count;
+                    }
                     instance.join_counts = remapped;
+                }
+                if !instance.join_instances.is_empty() {
+                    let mut remapped: HashMap<ElementId, Key> =
+                        HashMap::with_capacity(instance.join_instances.len());
+                    for (mut eid, eik) in instance.join_instances.drain() {
+                        remap_id(&mut eid);
+                        remapped
+                            .entry(eid)
+                            .and_modify(|existing| {
+                                if eik < *existing {
+                                    *existing = eik;
+                                }
+                            })
+                            .or_insert(eik);
+                    }
+                    instance.join_instances = remapped;
                 }
             }
             if source_process_id.as_deref() != Some(target_process_id.as_str()) {
