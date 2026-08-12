@@ -787,7 +787,7 @@ function landscapeTableHtml() {
     .map((c) => {
       const cls = c.nano ? ' class="nano"' : "";
       const sub = c.sub ? `<small>${esc(c.sub)}</small>` : "";
-      return `          <th${cls}>${esc(c.label)}${sub}</th>`;
+      return `          <th scope="col"${cls}>${esc(c.label)}${sub}</th>`;
     })
     .join("\n");
   const body = rows
@@ -803,7 +803,7 @@ function landscapeTableHtml() {
           return `          <td${attrs}>${inner}</td>`;
         })
         .join("\n");
-      return `        <tr>\n          <td class="feature">${esc(r.feature)}</td>\n${cells}\n        </tr>`;
+      return `        <tr>\n          <th scope="row" class="feature">${esc(r.feature)}</th>\n${cells}\n        </tr>`;
     })
     .join("\n");
   return `<table class="landscape">
@@ -961,8 +961,8 @@ function architectureHtml() {
   table.landscape thead th { color: var(--muted); font-weight: 700; font-size: .82rem; }
   table.landscape thead th small { display: block; font-weight: 400; color: var(--muted); opacity: .8; font-size: .82em; margin-top: .2rem; }
   table.landscape thead th.nano { color: var(--emerald); }
-  table.landscape tbody tr:last-child td { border-bottom: none; }
-  table.landscape td.feature { color: var(--muted); white-space: nowrap; }
+  table.landscape tbody tr:last-child td, table.landscape tbody tr:last-child th { border-bottom: none; }
+  table.landscape .feature { color: var(--muted); white-space: nowrap; font-weight: inherit; }
   table.landscape td.nano { color: var(--ink); background: rgba(52,211,153,.06); }
   table.landscape .yes { color: var(--emerald); font-weight: 600; }
   table.landscape .no { color: #f87171; }

@@ -286,12 +286,14 @@
         opacity: 0.8;
         margin-top: 0.15rem;
       }
-      tbody tr:last-child td {
+      tbody tr:last-child td,
+      tbody tr:last-child th {
         border-bottom: none;
       }
-      td.feature {
+      .feature {
         color: var(--muted);
         white-space: nowrap;
+        font-weight: inherit;
       }
       td.nano {
         color: var(--ink);
