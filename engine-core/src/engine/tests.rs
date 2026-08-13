@@ -8656,6 +8656,101 @@ fn deploy_forms_mints_a_form_key_versions_per_id_and_is_idempotent() {
 }
 
 #[test]
+fn deploy_generic_resources_mints_a_resource_key_versions_per_id_and_is_idempotent() {
+    use crate::command::GenericResource;
+    let mut engine = Engine::new();
+    let resource = |content: &str| GenericResource {
+        resource_id: "agent-prompt.md".to_string(),
+        resource_name: "agent-prompt.md".to_string(),
+        content: content.to_string(),
+    };
+    let v1 = "# Reviewer\n\nReview the PR.";
+
+    let events = engine
+        .apply_command(Command::DeployGenericResources(vec![resource(v1)]))
+        .unwrap();
+    let deployed = events
+        .iter()
+        .find_map(|e| match e {
+            Event::GenericResourceDeployed {
+                resource_key,
+                version,
+                resource_id,
+                content,
+                ..
+            } => Some((
+                *resource_key,
+                *version,
+                resource_id.clone(),
+                content.clone(),
+            )),
+            _ => None,
+        })
+        .expect("a GenericResourceDeployed event is emitted");
+    assert_eq!(deployed.1, 1, "the first deploy is version 1");
+    assert_eq!(deployed.2, "agent-prompt.md", "resource_id is the filename");
+    assert_eq!(deployed.3, v1, "the raw content is carried on the event");
+    let stored = &engine.state().resources["agent-prompt.md"];
+    assert_eq!(stored.key, deployed.0);
+    assert_eq!(stored.version, 1);
+
+    // Redeploying the identical resource (same name + content) is a no-op.
+    let again = engine
+        .apply_command(Command::DeployGenericResources(vec![resource(v1)]))
+        .unwrap();
+    assert!(
+        !again
+            .iter()
+            .any(|e| matches!(e, Event::GenericResourceDeployed { .. })),
+        "an identical redeploy emits no GenericResourceDeployed"
+    );
+    assert_eq!(engine.state().resources["agent-prompt.md"].version, 1);
+
+    // Changed content under the same filename bumps the version and re-mints a key.
+    let v2 = "# Reviewer\n\nReview the PR carefully and cite lines.";
+    let changed = engine
+        .apply_command(Command::DeployGenericResources(vec![resource(v2)]))
+        .unwrap();
+    let bumped = changed
+        .iter()
+        .find_map(|e| match e {
+            Event::GenericResourceDeployed {
+                resource_key,
+                version,
+                ..
+            } => Some((*resource_key, *version)),
+            _ => None,
+        })
+        .expect("changed content redeploys");
+    assert_eq!(bumped.1, 2, "changed content is version 2");
+    assert_ne!(bumped.0, deployed.0, "a new resource key is minted");
+    assert_eq!(engine.state().resources["agent-prompt.md"].version, 2);
+    assert_eq!(
+        engine.state().resources["agent-prompt.md"].content,
+        v2,
+        "the latest content is stored"
+    );
+
+    // A different filename is an independent resource (its own version 1).
+    let other = engine
+        .apply_command(Command::DeployGenericResources(vec![GenericResource {
+            resource_id: "other-prompt.md".to_string(),
+            resource_name: "other-prompt.md".to_string(),
+            content: "# Other".to_string(),
+        }]))
+        .unwrap();
+    let other_v = other
+        .iter()
+        .find_map(|e| match e {
+            Event::GenericResourceDeployed { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("a new filename deploys");
+    assert_eq!(other_v, 1, "a different resource_id restarts at version 1");
+    assert_eq!(engine.state().resources.len(), 2);
+}
+
+#[test]
 fn business_rule_task_spreads_map_output_without_result_variable() {
     // A two-output decision table yields a map output; with no result variable
     // its entries are spread into the instance scope.

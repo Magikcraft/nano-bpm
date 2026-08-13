@@ -84,7 +84,9 @@ pub mod xml;
 #[cfg(feature = "ffi")]
 pub mod ffi;
 
-pub use command::{ActivateElementInstruction, Command, FormResource, UserTaskChangeset};
+pub use command::{
+    ActivateElementInstruction, Command, FormResource, GenericResource, UserTaskChangeset,
+};
 #[cfg(feature = "serde")]
 pub use engine::EngineSnapshot;
 pub use engine::{adhoc_inner_instance_id, ADHOC_INNER_INSTANCE_ID_POSTFIX};
