@@ -38,6 +38,10 @@ export interface PaneResizeOptions {
 export interface PaneResize {
   /** Current pane size in px (apply as inline `width`/`height`). */
   size: number;
+  /** Minimum size in px (for `aria-valuemin` on the handle). */
+  min: number;
+  /** Current maximum size in px, resolved at read time (for `aria-valuemax`). */
+  max: number;
   /** True while a drag is in progress (for handle styling). */
   dragging: boolean;
   /** Attach to the resize handle's `onPointerDown`. */
@@ -123,6 +127,7 @@ export function usePaneResize(opts: PaneResizeOptions): PaneResize {
   // Re-clamp when the viewport shrinks so a viewport-relative `max` can't leave
   // the pane oversized after a window resize.
   useEffect(() => {
+    if (typeof window === "undefined") return;
     const onResize = () => setSize((s) => clamp(s, min, resolveMax()));
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -154,11 +159,16 @@ export function usePaneResize(opts: PaneResizeOptions): PaneResize {
       setDragging(false);
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", up);
       document.body.style.removeProperty("cursor");
       document.body.style.removeProperty("user-select");
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+    // A pointercancel (touch interruption, OS gesture, tab switch, …) must run
+    // the same cleanup as pointerup, or the drag leaves dangling listeners and
+    // a stuck resize cursor / user-select:none.
+    window.addEventListener("pointercancel", up);
     // Keep the resize cursor and suppress text selection for the whole drag,
     // even when the pointer leaves the thin handle.
     document.body.style.cursor = axis === "x" ? "col-resize" : "row-resize";
@@ -172,5 +182,12 @@ export function usePaneResize(opts: PaneResizeOptions): PaneResize {
     setSize(next);
   };
 
-  return { size, dragging, onPointerDown, onKeyDown };
+  return {
+    size,
+    min,
+    max: resolveMax(),
+    dragging,
+    onPointerDown,
+    onKeyDown,
+  };
 }

@@ -18,8 +18,14 @@ export function ResizeHandle({
   onPointerDown,
   onKeyDown,
   dragging,
+  size,
+  min,
+  max,
   label,
-}: Pick<PaneResize, "onPointerDown" | "onKeyDown" | "dragging"> & {
+}: Pick<
+  PaneResize,
+  "onPointerDown" | "onKeyDown" | "dragging" | "size" | "min" | "max"
+> & {
   axis: "x" | "y";
   label: string;
 }) {
@@ -29,6 +35,9 @@ export function ResizeHandle({
       role="separator"
       aria-orientation={horizontal ? "vertical" : "horizontal"}
       aria-label={label}
+      aria-valuenow={Math.round(size)}
+      aria-valuemin={Math.round(min)}
+      aria-valuemax={Math.round(max)}
       tabIndex={0}
       onPointerDown={onPointerDown}
       onKeyDown={onKeyDown}

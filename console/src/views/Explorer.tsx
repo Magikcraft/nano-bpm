@@ -283,6 +283,9 @@ export default function Explorer() {
         onPointerDown={listResize.onPointerDown}
         onKeyDown={listResize.onKeyDown}
         dragging={listResize.dragging}
+        size={listResize.size}
+        min={listResize.min}
+        max={listResize.max}
       />
 
       <div className="min-w-0 flex-1 overflow-auto">

@@ -164,6 +164,9 @@ export default function InstanceDetail({
         onPointerDown={modelResize.onPointerDown}
         onKeyDown={modelResize.onKeyDown}
         dragging={modelResize.dragging}
+        size={modelResize.size}
+        min={modelResize.min}
+        max={modelResize.max}
       />
 
       <div className="min-h-0 flex-1 overflow-auto p-8">
