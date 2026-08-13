@@ -5,7 +5,45 @@
 // clamping, drag-delta, and keyboard math that decide the actual sizes.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { clampSize, sizeFromDelta, sizeFromKey } from "./usePaneResize.ts";
+import {
+  clampSize,
+  sizeFromDelta,
+  sizeFromKey,
+  beginDragSession,
+} from "./usePaneResize.ts";
+
+function fakeTarget() {
+  const listeners = new Map<string, Set<(ev: any) => void>>();
+  return {
+    addEventListener(type: string, fn: (ev: any) => void) {
+      if (!listeners.has(type)) listeners.set(type, new Set());
+      listeners.get(type)!.add(fn);
+    },
+    removeEventListener(type: string, fn: (ev: any) => void) {
+      listeners.get(type)?.delete(fn);
+    },
+    count(type: string) {
+      return listeners.get(type)?.size ?? 0;
+    },
+    fire(type: string, ev: any) {
+      for (const fn of [...(listeners.get(type) ?? [])]) fn(ev);
+    },
+  };
+}
+
+function fakeBody() {
+  const style: any = {
+    cursor: "",
+    userSelect: "",
+    removeProperty(name: string) {
+      const camel = name.replace(/-([a-z])/g, (_m: string, c: string) =>
+        c.toUpperCase(),
+      );
+      style[camel] = "";
+    },
+  };
+  return { style };
+}
 
 test("clampSize: holds a value within [min, max]", () => {
   assert.equal(clampSize(300, 256, 640), 300);
@@ -65,4 +103,94 @@ test("sizeFromKey: an off-axis or non-arrow key is ignored (returns null)", () =
 test("sizeFromKey: a nudge past a bound is clamped", () => {
   assert.equal(sizeFromKey(636, "ArrowRight", "x", 16, 256, 640), 640);
   assert.equal(sizeFromKey(260, "ArrowLeft", "x", 16, 256, 640), 256);
+});
+
+test("beginDragSession: registers move + end listeners and applies the drag body styles", () => {
+  const target = fakeTarget();
+  const body = fakeBody();
+  beginDragSession(
+    target as any,
+    body as any,
+    "x",
+    () => {},
+    () => {},
+  );
+  assert.equal(target.count("pointermove"), 1);
+  assert.equal(target.count("pointerup"), 1);
+  assert.equal(target.count("pointercancel"), 1);
+  assert.equal(body.style.cursor, "col-resize");
+  assert.equal(body.style.userSelect, "none");
+});
+
+test("beginDragSession: stop() tears down without a pointer event (the unmount-mid-drag path)", () => {
+  const target = fakeTarget();
+  const body = fakeBody();
+  let ended = 0;
+  const stop = beginDragSession(
+    target as any,
+    body as any,
+    "y",
+    () => {},
+    () => {
+      ended++;
+    },
+  );
+  // Simulate an unmount mid-drag: no pointerup/pointercancel fires, we call stop directly.
+  stop();
+  assert.equal(target.count("pointermove"), 0);
+  assert.equal(target.count("pointerup"), 0);
+  assert.equal(target.count("pointercancel"), 0);
+  assert.equal(body.style.cursor, "");
+  assert.equal(body.style.userSelect, "");
+  // A bare stop() is teardown only — it must not fire the onEnd (state) callback.
+  assert.equal(ended, 0);
+  // Idempotent: calling again is a no-op and never fires onEnd.
+  stop();
+  assert.equal(ended, 0);
+});
+
+test("beginDragSession: a pointerup fires onEnd and tears everything down", () => {
+  const target = fakeTarget();
+  const body = fakeBody();
+  let ended = 0;
+  beginDragSession(
+    target as any,
+    body as any,
+    "x",
+    () => {},
+    () => {
+      ended++;
+    },
+  );
+  target.fire("pointerup", {});
+  assert.equal(ended, 1);
+  assert.equal(target.count("pointermove"), 0);
+  assert.equal(body.style.cursor, "");
+  assert.equal(body.style.userSelect, "");
+});
+
+test("beginDragSession: onMove receives the axis-projected coordinate", () => {
+  const xt = fakeTarget();
+  let xc = -1;
+  beginDragSession(
+    xt as any,
+    fakeBody() as any,
+    "x",
+    (c) => (xc = c),
+    () => {},
+  );
+  xt.fire("pointermove", { clientX: 123, clientY: 456 });
+  assert.equal(xc, 123);
+
+  const yt = fakeTarget();
+  let yc = -1;
+  beginDragSession(
+    yt as any,
+    fakeBody() as any,
+    "y",
+    (c) => (yc = c),
+    () => {},
+  );
+  yt.fire("pointermove", { clientX: 123, clientY: 456 });
+  assert.equal(yc, 456);
 });

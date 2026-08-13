@@ -97,6 +97,65 @@ export function sizeFromKey(
   return clamp(size + delta, min, max);
 }
 
+/** Minimal surface of the global target (`window`) and the style host
+ *  (`document.body`) a drag session touches. Narrowed so the session can be
+ *  driven by a fake in unit tests. */
+interface DragEventTarget {
+  addEventListener: (type: string, fn: (ev: PointerEvent) => void) => void;
+  removeEventListener: (type: string, fn: (ev: PointerEvent) => void) => void;
+}
+interface DragStyleHost {
+  style: {
+    cursor: string;
+    userSelect: string;
+    removeProperty: (name: string) => void;
+  };
+}
+
+/** Wire up a pointer-drag session: register the move / end (`pointerup` *and*
+ *  `pointercancel`) listeners on `target` and apply the drag cursor + selection
+ *  suppression to `body`. Returns an **idempotent** `stop()` that removes every
+ *  listener and restores `body`, so the teardown can run from the pointer-end
+ *  events *or* directly (e.g. on component unmount mid-drag) without leaking
+ *  global listeners or a stuck resize cursor. `onMove` receives the axis-projected
+ *  pointer coordinate; `onEnd` runs after teardown on a real pointer end (not on a
+ *  bare `stop()`). Exported for unit testing. */
+export function beginDragSession(
+  target: DragEventTarget,
+  body: DragStyleHost,
+  axis: "x" | "y",
+  onMove: (coord: number) => void,
+  onEnd: () => void,
+): () => void {
+  const move = (ev: PointerEvent) =>
+    onMove(axis === "x" ? ev.clientX : ev.clientY);
+  let stopped = false;
+  const stop = () => {
+    if (stopped) return;
+    stopped = true;
+    target.removeEventListener("pointermove", move);
+    target.removeEventListener("pointerup", end);
+    target.removeEventListener("pointercancel", end);
+    body.style.removeProperty("cursor");
+    body.style.removeProperty("user-select");
+  };
+  const end = () => {
+    stop();
+    onEnd();
+  };
+  target.addEventListener("pointermove", move);
+  target.addEventListener("pointerup", end);
+  // A pointercancel (touch interruption, OS gesture, tab switch, …) must run the
+  // same cleanup as pointerup, or the drag leaves dangling listeners and a stuck
+  // resize cursor / user-select:none.
+  target.addEventListener("pointercancel", end);
+  // Keep the resize cursor and suppress text selection for the whole drag, even
+  // when the pointer leaves the thin handle.
+  body.style.cursor = axis === "x" ? "col-resize" : "row-resize";
+  body.style.userSelect = "none";
+  return stop;
+}
+
 function readStored(key: string, fallback: number): number {
   try {
     const raw = localStorage.getItem(key);
@@ -119,6 +178,10 @@ export function usePaneResize(opts: PaneResizeOptions): PaneResize {
   const [dragging, setDragging] = useState(false);
   const startPos = useRef(0);
   const startSize = useRef(0);
+  // Teardown for an in-flight drag, so an unmount mid-drag (route change, error
+  // boundary, hot reload, …) can run the same cleanup the pointer-end events
+  // would — no dangling window listeners or stuck body cursor / user-select.
+  const dragStop = useRef<(() => void) | null>(null);
 
   // Persist on every change so the layout survives a reload.
   useEffect(() => {
@@ -140,6 +203,9 @@ export function usePaneResize(opts: PaneResizeOptions): PaneResize {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [min]);
 
+  // Run any in-flight drag's teardown if the component unmounts mid-drag.
+  useEffect(() => () => dragStop.current?.(), []);
+
   const onPointerDown = (e: React.PointerEvent) => {
     // Only react to the primary button / a touch or pen contact.
     if (e.button !== 0) return;
@@ -148,36 +214,25 @@ export function usePaneResize(opts: PaneResizeOptions): PaneResize {
     startSize.current = size;
     setDragging(true);
 
-    const move = (ev: PointerEvent) => {
-      const cur = axis === "x" ? ev.clientX : ev.clientY;
-      setSize(
-        sizeFromDelta(
-          startSize.current,
-          cur - startPos.current,
-          invert,
-          min,
-          resolveMax(),
+    dragStop.current = beginDragSession(
+      window,
+      document.body,
+      axis,
+      (coord) =>
+        setSize(
+          sizeFromDelta(
+            startSize.current,
+            coord - startPos.current,
+            invert,
+            min,
+            resolveMax(),
+          ),
         ),
-      );
-    };
-    const up = () => {
-      setDragging(false);
-      window.removeEventListener("pointermove", move);
-      window.removeEventListener("pointerup", up);
-      window.removeEventListener("pointercancel", up);
-      document.body.style.removeProperty("cursor");
-      document.body.style.removeProperty("user-select");
-    };
-    window.addEventListener("pointermove", move);
-    window.addEventListener("pointerup", up);
-    // A pointercancel (touch interruption, OS gesture, tab switch, …) must run
-    // the same cleanup as pointerup, or the drag leaves dangling listeners and
-    // a stuck resize cursor / user-select:none.
-    window.addEventListener("pointercancel", up);
-    // Keep the resize cursor and suppress text selection for the whole drag,
-    // even when the pointer leaves the thin handle.
-    document.body.style.cursor = axis === "x" ? "col-resize" : "row-resize";
-    document.body.style.userSelect = "none";
+      () => {
+        setDragging(false);
+        dragStop.current = null;
+      },
+    );
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
