@@ -1195,6 +1195,7 @@ impl Journal {
                         | Event::DecisionRequirementsDeployed { .. }
                         | Event::DecisionDeployed { .. }
                         | Event::FormDeployed { .. }
+                        | Event::GenericResourceDeployed { .. }
                 )
             })
             .cloned()

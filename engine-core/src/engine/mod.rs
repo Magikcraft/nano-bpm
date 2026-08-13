@@ -432,6 +432,7 @@ impl Engine {
                     | Event::DecisionRequirementsDeployed { .. }
                     | Event::DecisionDeployed { .. }
                     | Event::FormDeployed { .. }
+                    | Event::GenericResourceDeployed { .. }
             ) {
                 state::apply(&mut self.state, event);
             }
@@ -497,6 +498,21 @@ impl Engine {
                     .forms
                     .get(form_id)
                     .map(|f| *version > f.version)
+                    .unwrap_or(true);
+                if newer {
+                    state::apply(&mut self.state, event);
+                }
+            } else if let Event::GenericResourceDeployed {
+                resource_id,
+                version,
+                ..
+            } = event
+            {
+                let newer = self
+                    .state
+                    .resources
+                    .get(resource_id)
+                    .map(|r| *version > r.version)
                     .unwrap_or(true);
                 if newer {
                     state::apply(&mut self.state, event);
@@ -852,6 +868,56 @@ impl Engine {
         Ok(())
     }
 
+    /// Registers one or more generic resources as a deployment, mirroring
+    /// [`Engine::deploy_forms`]: a shared deployment key and one
+    /// [`Event::GenericResourceDeployed`] per resource (versioned per
+    /// `resource_id`). An idempotent redeploy of the identical latest resource
+    /// (same `resource_name` and content — Zeebe's name+checksum duplicate rule)
+    /// is skipped. The engine does not execute generic resources; it stores them
+    /// so `GetResourceByKey` / `searchResources` can serve the content.
+    fn deploy_generic_resources(
+        &mut self,
+        log: &mut Vec<Event>,
+        resources: Vec<crate::command::GenericResource>,
+    ) -> Result<(), EngineError> {
+        let deployment_key = self.mint_key();
+        self.emit(log, Event::DeploymentCreated { deployment_key });
+
+        for resource in resources {
+            if self
+                .state
+                .resources
+                .get(&resource.resource_id)
+                .is_some_and(|existing| {
+                    existing.resource_name == resource.resource_name
+                        && existing.content == resource.content
+                })
+            {
+                // Idempotent redeploy of the identical latest resource: skip.
+                continue;
+            }
+            let version = self
+                .state
+                .resources
+                .get(&resource.resource_id)
+                .map(|r| r.version + 1)
+                .unwrap_or(1);
+            let resource_key = self.mint_key();
+            self.emit(
+                log,
+                Event::GenericResourceDeployed {
+                    deployment_key,
+                    resource_key,
+                    version,
+                    resource_id: resource.resource_id,
+                    resource_name: resource.resource_name,
+                    content: resource.content,
+                },
+            );
+        }
+        Ok(())
+    }
+
     /// Evaluates a deployed decision on demand for the standalone
     /// EvaluateDecision API. Resolves the decision by id (latest version) or, if
     /// `by_id` is `None`, by decision key, evaluates it against `variables`
@@ -982,6 +1048,10 @@ impl Engine {
 
             Command::DeployForms(forms) => {
                 self.deploy_forms(&mut log, forms)?;
+            }
+
+            Command::DeployGenericResources(resources) => {
+                self.deploy_generic_resources(&mut log, resources)?;
             }
 
             Command::DeleteDecisionInstance {

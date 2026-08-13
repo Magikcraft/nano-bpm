@@ -550,6 +550,7 @@ mod tests {
                 job_type: "notify".into(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             },
         );
         assert_eq!(role, Some(Role::Notification));

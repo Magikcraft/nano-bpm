@@ -19,7 +19,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use nanobpmn_engine_core::bpmn::parse_bpmn;
-use nanobpmn_engine_core::{Condition, Element, ElementKind, ProcessDefinition, SequenceFlow};
+use nanobpmn_engine_core::{
+    BindingType, Condition, Element, ElementKind, ProcessDefinition, SequenceFlow,
+};
 use serde_json::{json, Value};
 
 /// Parse `xml` and return its first process definition, or an error message.
@@ -2031,6 +2033,7 @@ fn emit_element(
             job_type,
             priority,
             custom_headers,
+            linked_resources,
         } => {
             out.push_str(&format!("    <bpmn:serviceTask id=\"{eid}\"{na}>\n"));
             out.push_str("      <bpmn:extensionElements>\n");
@@ -2059,6 +2062,30 @@ fn emit_element(
                     ));
                 }
                 out.push_str("        </zeebe:taskHeaders>\n");
+            }
+            if !linked_resources.is_empty() {
+                out.push_str("        <zeebe:linkedResources>\n");
+                for lr in linked_resources {
+                    let binding = match lr.binding_type {
+                        BindingType::Deployment => "deployment",
+                        BindingType::Latest => "latest",
+                        BindingType::VersionTag => "versionTag",
+                    };
+                    let version_tag_attr = lr
+                        .version_tag
+                        .as_deref()
+                        .map(|t| format!(" versionTag=\"{}\"", xml_escape(t)))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "          <zeebe:linkedResource linkName=\"{}\" resourceId=\"{}\" \
+resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
+                        xml_escape(&lr.link_name),
+                        xml_escape(&lr.resource_id),
+                        xml_escape(&lr.resource_type),
+                        binding,
+                    ));
+                }
+                out.push_str("        </zeebe:linkedResources>\n");
             }
             emit_io_mapping(el, out);
             out.push_str("      </bpmn:extensionElements>\n");
@@ -3258,6 +3285,7 @@ fn apply_edit_op(
                         job_type: job_type.to_string(),
                         priority: None,
                         custom_headers: std::collections::BTreeMap::new(),
+                        linked_resources: Vec::new(),
                     },
                     name: None,
                     outgoing: moved,
@@ -4082,6 +4110,67 @@ mod tests {
         assert_eq!(call.retries.as_deref(), Some("=maxRetries"));
         assert_eq!(call.io.inputs.len(), 1);
         assert_eq!(call.io.outputs.len(), 1);
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_linked_resources() {
+        // A serviceTask carrying zeebe:linkedResources must round-trip through the XML
+        // emitter losslessly — otherwise processos silently drops the declarative resource
+        // links when it re-serializes a model that engine-core parsed. Guards the drift
+        // surface flagged in review when ServiceTask gained a `linked_resources` field.
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("Linked")
+            .start_event("Start")
+            .service_task("Call", "agent")
+            .end_event("Done")
+            .connect("Start", "Call")
+            .connect("Call", "Done")
+            .build()
+            .unwrap();
+        if let ElementKind::ServiceTask {
+            linked_resources, ..
+        } = &mut def.elements.get_mut("Call").unwrap().kind
+        {
+            linked_resources.push(nanobpmn_engine_core::LinkedResource {
+                resource_id: "prompt.md".into(),
+                binding_type: BindingType::VersionTag,
+                resource_type: "GenericScript".into(),
+                version_tag: Some("v3".into()),
+                link_name: "agentPrompt".into(),
+            });
+        } else {
+            panic!("Call is a service task");
+        }
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<zeebe:linkedResources>"),
+            "emits the linkedResources container, got:\n{xml}"
+        );
+        assert!(
+            xml.contains(
+                "<zeebe:linkedResource linkName=\"agentPrompt\" resourceId=\"prompt.md\" \
+resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
+            ),
+            "emits the linkedResource with all attributes, got:\n{xml}"
+        );
+        let reparsed = parse_bpmn(&xml).expect("serialized model re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        let ElementKind::ServiceTask {
+            linked_resources, ..
+        } = &reparsed[0].elements["Call"].kind
+        else {
+            panic!("Call re-parses as a service task");
+        };
+        assert_eq!(
+            linked_resources.len(),
+            1,
+            "the link survives the round trip"
+        );
+        let lr = &linked_resources[0];
+        assert_eq!(lr.resource_id, "prompt.md");
+        assert_eq!(lr.resource_type, "GenericScript");
+        assert_eq!(lr.link_name, "agentPrompt");
+        assert_eq!(lr.version_tag.as_deref(), Some("v3"));
+        assert!(matches!(lr.binding_type, BindingType::VersionTag));
     }
 
     #[test]

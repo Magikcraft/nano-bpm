@@ -444,6 +444,17 @@ pub fn match_element_instance_key(
     }
 }
 
+/// Matches a `ResourceKeyFilterProperty` against a key's decimal string.
+pub fn match_resource_key(filter: &Option<models::ResourceKeyFilterProperty>, value: &str) -> bool {
+    match filter {
+        None => true,
+        Some(models::ResourceKeyFilterProperty::ResourceKey(k)) => k.0 == value,
+        Some(models::ResourceKeyFilterProperty::AdvancedResourceKeyFilter(a)) => {
+            ops!(a, |k: &models::ResourceKey| k.0.clone()).matches(Some(value))
+        }
+    }
+}
+
 /// Matches a `JobKeyFilterProperty` against a key's decimal string.
 pub fn match_job_key(filter: &Option<models::JobKeyFilterProperty>, value: &str) -> bool {
     match_job_key_opt(filter, Some(value))

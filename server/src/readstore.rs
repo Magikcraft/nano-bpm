@@ -241,6 +241,16 @@ CREATE TABLE forms (
     tenant_id     TEXT NOT NULL DEFAULT '<default>'
 );
 CREATE INDEX idx_forms_id ON forms(form_id);
+CREATE TABLE resources (
+    resource_key   INTEGER PRIMARY KEY,
+    resource_id    TEXT NOT NULL,
+    resource_name  TEXT NOT NULL,
+    version        INTEGER NOT NULL,
+    version_tag    TEXT,
+    content        TEXT NOT NULL,
+    tenant_id      TEXT NOT NULL DEFAULT '<default>'
+);
+CREATE INDEX idx_resources_id ON resources(resource_id);
 ";
 
 // --- enum <-> integer code mappings (kept beside the engine enums) ---
@@ -649,6 +659,37 @@ pub struct FormRow {
     pub version: i32,
     pub schema: String,
     pub resource_name: String,
+    pub tenant_id: String,
+}
+
+/// A projected generic-resource row, one per deployed resource version (keyed by
+/// `resource_key`). For a generic resource `resource_id` equals `resource_name`
+/// (the filename); versions increment per `resource_id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceRow {
+    pub resource_key: Key,
+    pub resource_id: String,
+    pub resource_name: String,
+    pub version: i32,
+    pub version_tag: Option<String>,
+    pub content: String,
+    pub tenant_id: String,
+}
+
+/// The metadata-only projection of a generic-resource row — every column of
+/// [`ResourceRow`] except the (potentially large) `content` blob. Used by the
+/// list/search path (`searchResources`), whose response returns only metadata,
+/// so it never pays to read `content` for every projected version. Full content
+/// is reserved for the by-key endpoints (`getResource*`), mirroring how process
+/// definitions list only `key/process_id/version` and fetch the BPMN `xml`
+/// separately by key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceMetaRow {
+    pub resource_key: Key,
+    pub resource_id: String,
+    pub resource_name: String,
+    pub version: i32,
+    pub version_tag: Option<String>,
     pub tenant_id: String,
 }
 
@@ -1761,6 +1802,51 @@ impl ReadStore {
         .expect("query form_by_key")
     }
 
+    /// A single deployed generic resource by its per-version numeric key. Each
+    /// deployed version is retained under its own `resource_key`, so a redeploy
+    /// that mints a new key never invalidates an earlier one. `None` when no such
+    /// resource is projected.
+    pub fn resource_by_key(&self, key: Key) -> Option<ResourceRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!("SELECT {RESOURCE_COLS} FROM resources WHERE resource_key = ?1"),
+            params![key as i64],
+            map_resource,
+        )
+        .optional()
+        .expect("query resource_by_key")
+    }
+
+    /// Metadata (no `content`) for a single generic resource by key, for the
+    /// by-key metadata endpoint (`getResource`), which returns no content.
+    pub fn resource_by_key_meta(&self, key: Key) -> Option<ResourceMetaRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!("SELECT {RESOURCE_META_COLS} FROM resources WHERE resource_key = ?1"),
+            params![key as i64],
+            map_resource_meta,
+        )
+        .optional()
+        .expect("query resource_by_key_meta")
+    }
+
+    /// Metadata (no `content`) for every projected generic-resource row, for the
+    /// list/search path. Omits the `content` blob so a search over many/large
+    /// resources does not read every version's full body. Callers apply search
+    /// filters / sort / pagination in the gateway.
+    pub fn resources_meta(&self) -> Vec<ResourceMetaRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {RESOURCE_META_COLS} FROM resources ORDER BY resource_key"
+            ))
+            .expect("prepare resources_meta");
+        stmt.query_map([], map_resource_meta)
+            .expect("query resources_meta")
+            .filter_map(Result::ok)
+            .collect()
+    }
+
     /// when no such definition is projected (only the latest version per process
     /// id is retained, mirroring the engine). Empty-string XML (a definition
     /// built programmatically rather than parsed) is returned as `Some("")`.
@@ -2017,6 +2103,31 @@ impl ReadModel {
             }
         }
         None
+    }
+
+    pub fn resource_by_key(&self, key: Key) -> Option<ResourceRow> {
+        for s in &self.shards {
+            if let Some(row) = s.resource_by_key(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn resource_by_key_meta(&self, key: Key) -> Option<ResourceMetaRow> {
+        for s in &self.shards {
+            if let Some(row) = s.resource_by_key_meta(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn resources_meta(&self) -> Vec<ResourceMetaRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.resources_meta())
+            .collect()
     }
 
     pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
@@ -2386,6 +2497,35 @@ fn map_form(r: &rusqlite::Row) -> rusqlite::Result<FormRow> {
         tenant_id: r.get(5)?,
     })
 }
+
+const RESOURCE_COLS: &str =
+    "resource_key, resource_id, resource_name, version, version_tag, content, tenant_id";
+
+fn map_resource(r: &rusqlite::Row) -> rusqlite::Result<ResourceRow> {
+    Ok(ResourceRow {
+        resource_key: r.get::<_, i64>(0)? as Key,
+        resource_id: r.get(1)?,
+        resource_name: r.get(2)?,
+        version: r.get(3)?,
+        version_tag: r.get(4)?,
+        content: r.get(5)?,
+        tenant_id: r.get(6)?,
+    })
+}
+
+const RESOURCE_META_COLS: &str =
+    "resource_key, resource_id, resource_name, version, version_tag, tenant_id";
+
+fn map_resource_meta(r: &rusqlite::Row) -> rusqlite::Result<ResourceMetaRow> {
+    Ok(ResourceMetaRow {
+        resource_key: r.get::<_, i64>(0)? as Key,
+        resource_id: r.get(1)?,
+        resource_name: r.get(2)?,
+        version: r.get(3)?,
+        version_tag: r.get(4)?,
+        tenant_id: r.get(5)?,
+    })
+}
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
 /// the wire: strings are JSON-quoted (so a string `myValue` becomes `"myValue"`),
 /// numbers and booleans render bare, and lists/objects render as JSON.
@@ -2662,6 +2802,28 @@ fn project_engine_state(
                 dep.version,
                 dep.schema,
                 dep.resource_name,
+                "<default>"
+            ],
+        )?;
+    }
+
+    // 4b) Generic resources.
+    for res in state.resources.values() {
+        tx.cexecute(
+            "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
+             version_tag, content, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
+             ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
+             resource_name = excluded.resource_name, version = excluded.version, \
+             version_tag = excluded.version_tag, content = excluded.content, \
+             tenant_id = excluded.tenant_id",
+            // `tenant_id` is not modeled in engine state; default to '<default>'.
+            params![
+                res.key as i64,
+                res.resource_id,
+                res.resource_name,
+                res.version,
+                res.content,
                 "<default>"
             ],
         )?;
@@ -3697,6 +3859,36 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     version,
                     schema,
                     resource_name,
+                    "<default>",
+                ],
+            )?;
+        }
+
+        Event::GenericResourceDeployed {
+            resource_key,
+            version,
+            resource_id,
+            resource_name,
+            content,
+            ..
+        } => {
+            // One row per deployed generic-resource version, keyed by its unique
+            // resource_key so GetResourceByKey resolves every version. The upsert
+            // is idempotent on a journal replay.
+            tx.cexecute(
+                "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
+                 version_tag, content, tenant_id) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
+                 ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
+                 resource_name = excluded.resource_name, version = excluded.version, \
+                 version_tag = excluded.version_tag, content = excluded.content, \
+                 tenant_id = excluded.tenant_id",
+                params![
+                    *resource_key as i64,
+                    resource_id,
+                    resource_name,
+                    version,
+                    content,
                     "<default>",
                 ],
             )?;
