@@ -184,6 +184,11 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
     // Gates `zeebe:header` reads to a real `zeebe:taskHeaders` container; each
     // header attaches to the innermost open activity on the io_stack.
     let mut in_task_headers = false;
+    // Gates `zeebe:linkedResource` reads to a real `zeebe:linkedResources`
+    // container; each link attaches to the innermost open activity on the
+    // io_stack. Without this a stray `linkedResource` tag elsewhere in
+    // `extensionElements` (or from another namespace) would be treated as a link.
+    let mut in_linked_resources = false;
 
     for token in &tokens {
         match token {
@@ -664,10 +669,19 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             // declarative link from the innermost open job task to a
                             // deployed resource by id. Resolved to a concrete
                             // resourceKey at job activation and delivered in the
-                            // `linkedResources` custom header (Zeebe parity). The
-                            // container element itself carries no attributes, so it
-                            // needs no open/close state — only its children matter.
-                            "linkedResource" => {
+                            // `linkedResources` custom header (Zeebe parity). Gated
+                            // on a real open `zeebe:linkedResources` container so a
+                            // stray `linkedResource` tag elsewhere is not treated as
+                            // a link (mirrors the `zeebe:taskHeaders` gate). A
+                            // self-closing `<zeebe:linkedResources />` carries no
+                            // children and emits no end tag, so only a real open
+                            // element enters the container state.
+                            "linkedResources" => {
+                                if !self_closing {
+                                    in_linked_resources = true;
+                                }
+                            }
+                            "linkedResource" if in_linked_resources => {
                                 // Zeebe requires `resourceId`, `resourceType`
                                 // and `linkName` on every linkedResource; an
                                 // entry missing any of them is malformed, so we
@@ -874,6 +888,7 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 }
                 "ioMapping" => in_io_mapping = false,
                 "taskHeaders" => in_task_headers = false,
+                "linkedResources" => in_linked_resources = false,
                 "executionListeners" => in_execution_listeners = false,
                 "taskListeners" => in_task_listeners = false,
                 "startEvent" => cur_start = None,
@@ -2750,6 +2765,59 @@ mod tests {
                     assert!(
                         custom_headers.is_empty(),
                         "{id} unexpectedly captured headers: {custom_headers:?}"
+                    );
+                }
+                other => panic!("{id} should be a service task, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn stray_linked_resource_outside_a_container_is_not_captured() {
+        // given: a first service task with a self-closing (empty)
+        // `<zeebe:linkedResources />`, then a second service task whose own
+        // `zeebe:linkedResource` sits *outside* any linkedResources container.
+        // The `in_linked_resources` gate must reject the stray link and must
+        // not stay stuck open across elements (a self-closing start tag emits
+        // no matching end tag). Mirrors the `zeebe:taskHeaders` gate.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="first">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="a" />
+                  <zeebe:linkedResources />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:serviceTask id="second">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="b" />
+                  <zeebe:linkedResource resourceId="stray.md" bindingType="latest"
+                                        resourceType="GenericScript" linkName="stray" />
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="first" />
+              <bpmn:sequenceFlow id="f2" sourceRef="first" targetRef="second" />
+              <bpmn:sequenceFlow id="f3" sourceRef="second" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the empty container yields no links, and the stray
+        // linkedResource that follows is *not* captured onto the second task.
+        for id in ["first", "second"] {
+            match &def.element(id).unwrap().kind {
+                ElementKind::ServiceTask {
+                    linked_resources, ..
+                } => {
+                    assert!(
+                        linked_resources.is_empty(),
+                        "{id} unexpectedly captured linked resources: {linked_resources:?}"
                     );
                 }
                 other => panic!("{id} should be a service task, got {other:?}"),
