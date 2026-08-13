@@ -129,6 +129,10 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeployForms(..) => Surface::NotSurfaced {
             reason: "form storage; the in-browser test engine exercises BPMN execution only",
         },
+        Command::DeployGenericResources(..) => Surface::NotSurfaced {
+            reason: "verbatim generic-resource storage (e.g. Markdown agent prompts); the \
+                     in-browser test engine exercises BPMN execution only",
+        },
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
         },
