@@ -181,6 +181,10 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             job_type,
             priority,
             custom_headers,
+            // Linked resources (zeebe:linkedResources) are not carried by the
+            // compact IR text format; only the lossless BPMN XML emitter
+            // round-trips them. Ignore here so the IR stays stable.
+            linked_resources: _,
         } => {
             attrs.push(format!("jobType {}", quote(job_type)));
             if let Some(p) = priority {
@@ -1088,6 +1092,7 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             job_type: attrs.require("jobType", id)?,
             priority: attrs.take("priority"),
             custom_headers: std::mem::take(&mut attrs.headers),
+            linked_resources: Vec::new(),
         },
         "businessRuleTask" => ElementKind::BusinessRuleTask {
             decision_id: attrs.require("decisionId", id)?,

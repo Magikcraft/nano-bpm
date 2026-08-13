@@ -97,10 +97,10 @@ pub use event::Event;
 pub use feel::FeelError;
 pub use model::{
     AdHocActivateElement, AdHocImplementationType, AdHocJobResult, AdHocSubProcessDef, AdHocTool,
-    AdHocToolKind, BuildError, Condition, Element, ElementId, ElementKind, ExecutionListener,
-    IoMapping, ListenerEventType, Mapping, MultiInstance, ProcessBuilder, ProcessDefinition,
-    SequenceFlow, TaskListener, TaskListenerEventType, TaskListenerJobResult, TimerDef,
-    TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
+    AdHocToolKind, BindingType, BuildError, Condition, Element, ElementId, ElementKind,
+    ExecutionListener, IoMapping, LinkedResource, ListenerEventType, Mapping, MultiInstance,
+    ProcessBuilder, ProcessDefinition, SequenceFlow, TaskListener, TaskListenerEventType,
+    TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
 };
 pub use state::{
     compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,
