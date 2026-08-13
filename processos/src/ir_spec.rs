@@ -816,6 +816,7 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
                 job_type: "worker".into(),
                 priority: Some("50".into()),
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             },
         ),
         (
@@ -1063,6 +1064,7 @@ mod tests {
                 job_type: "worker".into(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             },
             name: None,
             outgoing: Vec::new(),
