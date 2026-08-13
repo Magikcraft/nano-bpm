@@ -77,7 +77,10 @@ export function sizeFromDelta(
 
 /** The pane size after an arrow-key press on the handle, or `null` when the key
  *  is not an axis-relevant arrow. For `axis:"x"` Left/Right shrink/grow; for
- *  `axis:"y"` Up/Down shrink/grow. Pure. */
+ *  `axis:"y"` Up/Down shrink/grow. `invert` flips that mapping the same way it
+ *  flips the drag delta, so on a leading-edge handle the arrow that physically
+ *  moves the separator toward the pane grows it — keeping keyboard and drag
+ *  consistent. Pure. */
 export function sizeFromKey(
   size: number,
   key: string,
@@ -85,11 +88,13 @@ export function sizeFromKey(
   step: number,
   min: number,
   max: number,
+  invert = false,
 ): number | null {
   const dec = axis === "x" ? "ArrowLeft" : "ArrowUp";
   const inc = axis === "x" ? "ArrowRight" : "ArrowDown";
   if (key !== dec && key !== inc) return null;
-  return clamp(size + (key === inc ? step : -step), min, max);
+  const delta = (key === inc ? step : -step) * (invert ? -1 : 1);
+  return clamp(size + delta, min, max);
 }
 
 function readStored(key: string, fallback: number): number {
@@ -176,7 +181,15 @@ export function usePaneResize(opts: PaneResizeOptions): PaneResize {
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
-    const next = sizeFromKey(size, e.key, axis, step, min, resolveMax());
+    const next = sizeFromKey(
+      size,
+      e.key,
+      axis,
+      step,
+      min,
+      resolveMax(),
+      invert,
+    );
     if (next == null) return;
     e.preventDefault();
     setSize(next);

@@ -46,6 +46,15 @@ test("sizeFromKey (y axis): ArrowDown grows the model space, ArrowUp shrinks it"
   assert.equal(sizeFromKey(288, "ArrowUp", "y", 16, 144, 640), 272);
 });
 
+test("sizeFromKey: an inverted (leading-edge) handle reverses the arrow mapping, matching sizeFromDelta", () => {
+  // On an inverted handle the arrow that physically moves the separator toward
+  // the pane grows it, so the grow/shrink keys swap relative to the default.
+  assert.equal(sizeFromKey(448, "ArrowRight", "x", 16, 256, 640, true), 432);
+  assert.equal(sizeFromKey(448, "ArrowLeft", "x", 16, 256, 640, true), 464);
+  assert.equal(sizeFromKey(288, "ArrowDown", "y", 16, 144, 640, true), 272);
+  assert.equal(sizeFromKey(288, "ArrowUp", "y", 16, 144, 640, true), 304);
+});
+
 test("sizeFromKey: an off-axis or non-arrow key is ignored (returns null)", () => {
   // Vertical handle ignores horizontal arrows and vice-versa.
   assert.equal(sizeFromKey(288, "ArrowLeft", "y", 16, 144, 640), null);
