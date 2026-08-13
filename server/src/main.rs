@@ -8561,6 +8561,10 @@ impl ServerImpl {
                 "resourceId" => query::SortVal::Str(row.resource_id.clone()),
                 "resourceName" => query::SortVal::Str(row.resource_name.clone()),
                 "version" => query::SortVal::Num(row.version as i64),
+                // `versionTag` is nullable; a null tag sorts as the empty string
+                // (before any present tag ascending), matching how the read model
+                // projects `versionTag: null`.
+                "versionTag" => query::SortVal::Str(row.version_tag.clone().unwrap_or_default()),
                 "resourceKey" => query::SortVal::Num(row.resource_key as i64),
                 "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
                 _ => query::SortVal::Num(row.resource_key as i64),
@@ -22488,6 +22492,35 @@ mod clustered_startup_tests {
         let items = latest.expect("both resource versions are projected");
         assert_eq!(items[0].version, 2, "search sorts latest version first");
         assert_eq!(items[0].resource_id, "agent-prompt.md");
+
+        // The `versionTag` sort field (per the OpenAPI enum) is honored rather than
+        // silently falling through to the default ordering: with both versions
+        // carrying a null tag it sorts as equal and the resource_key tiebreak keeps
+        // the result stable, but the request is accepted and returns both rows.
+        let resp = server
+            .search_resources_impl(&Some(models::ResourceSearchQuery {
+                page: None,
+                sort: Some(vec![models::ResourceSearchQuerySortRequest {
+                    field: "versionTag".to_string(),
+                    order: Some(models::SortOrderEnum::Asc),
+                }]),
+                filter: Some(models::ResourceFilter {
+                    resource_id: Some(models::StringFilterProperty::String(
+                        "agent-prompt.md".to_string(),
+                    )),
+                    ..models::ResourceFilter::new()
+                }),
+            }))
+            .await
+            .expect("versionTag-sorted search returns a response");
+        let ResSearch::Status200_TheResourceSearchResult(tagged) = resp else {
+            panic!("expected a 200 resource search result for versionTag sort");
+        };
+        assert_eq!(
+            tagged.items.len(),
+            2,
+            "versionTag sort returns both projected versions"
+        );
 
         // Get the latest version by key returns the v2 metadata.
         let resp = server
