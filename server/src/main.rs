@@ -8501,8 +8501,10 @@ impl ServerImpl {
 
         // This endpoint deserialises RPA (JSON) resource content into a map.
         // Generic resources (e.g. Markdown) are not RPA, so — matching Camunda —
-        // clients must use the binary content endpoint instead.
-        match self.store.resource_by_key(key) {
+        // clients must use the binary content endpoint instead. Only existence
+        // matters here (the response is always 406/404), so use the metadata-only
+        // lookup and avoid loading the `content` blob.
+        match self.store.resource_by_key_meta(key) {
             Some(_) => Ok(Resp::Status406_TheResourceExistsButIsNotAnRPAResource(
                 problem(
                     "Resource is not an RPA resource",
