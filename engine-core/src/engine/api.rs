@@ -2,6 +2,34 @@
 
 use super::*;
 
+/// The custom-header key under which resolved [`crate::model::LinkedResource`]s are delivered
+/// to the worker (Zeebe `linkedResources`). The value is a JSON array of
+/// `{ resourceKey, resourceType, linkName }` objects.
+const LINKED_RESOURCES_HEADER: &str = "linkedResources";
+
+/// Appends `s` to `out` as a quoted, escaped JSON string. Kept local so
+/// engine-core stays dependency-free (the `ffi` module's copy is feature-gated).
+fn write_json_string(out: &mut String, s: &str) {
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                use core::fmt::Write as _;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
 impl Engine {
     /// Looks up a process instance.
     pub fn instance(&self, key: Key) -> Option<&state::ProcessInstance> {
@@ -174,7 +202,27 @@ impl Engine {
                 .and_then(|p| p.element(&job.element_id))
                 .map(|e| &e.kind)
             {
-                Some(ElementKind::ServiceTask { custom_headers, .. }) => custom_headers.clone(),
+                Some(ElementKind::ServiceTask {
+                    custom_headers,
+                    linked_resources,
+                    ..
+                }) => {
+                    let mut headers = custom_headers.clone();
+                    // Resolve each `zeebe:linkedResource` id to a concrete
+                    // deployed resource key and deliver the resolved set to the
+                    // worker in the `linkedResources` custom header (Zeebe
+                    // parity). Resolution happens at activation, so a `latest`
+                    // binding always reflects the newest deployed version at the
+                    // moment the job is handed out. Unresolvable ids are omitted
+                    // (the id has no deployed resource yet).
+                    if !linked_resources.is_empty() {
+                        headers.insert(
+                            LINKED_RESOURCES_HEADER.to_string(),
+                            self.resolve_linked_resources(linked_resources),
+                        );
+                    }
+                    headers
+                }
                 _ => std::collections::BTreeMap::new(),
             }
         } else {
@@ -200,6 +248,46 @@ impl Engine {
             kind: job.kind,
         }
     }
+
+    /// Resolves a service task's declared [`crate::model::LinkedResource`]s to the JSON value
+    /// of the `linkedResources` custom header: an array of
+    /// `{ resourceKey, resourceType, linkName }`, one per resolvable entry.
+    ///
+    /// Each entry's `resource_id` is looked up against the deployed generic
+    /// resources. Nano's read model retains the latest version per `resource_id`,
+    /// so every binding type currently resolves to that latest version;
+    /// deployment-pinned and version-tag bindings degrade to `latest` until the
+    /// engine tracks per-deployment/per-tag resource membership. An id with no
+    /// deployed resource is skipped (the resulting header simply omits it),
+    /// mirroring a worker that finds no key for that link. JSON is written by
+    /// hand to keep engine-core dependency-free and its output deterministic.
+    fn resolve_linked_resources(&self, linked: &[crate::model::LinkedResource]) -> String {
+        let mut json = String::from("[");
+        let mut first = true;
+        for link in linked {
+            let Some(resource) = self.state.resources.get(&link.resource_id) else {
+                continue;
+            };
+            let _ = &link.binding_type; // All bindings resolve to the latest (see doc).
+            if !first {
+                json.push(',');
+            }
+            first = false;
+            json.push_str("{\"resourceKey\":\"");
+            {
+                use core::fmt::Write as _;
+                let _ = write!(json, "{}", resource.key);
+            }
+            json.push_str("\",\"resourceType\":");
+            write_json_string(&mut json, &link.resource_type);
+            json.push_str(",\"linkName\":");
+            write_json_string(&mut json, &link.link_name);
+            json.push('}');
+        }
+        json.push(']');
+        json
+    }
+
     /// making it activatable again. Like [`Engine::trigger_timers`], the host
     /// drives this periodically; the engine never reads a clock. Returns the
     /// [`Event::JobLockExpired`] events produced (empty when nothing was due), so

@@ -660,6 +660,40 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                     acc.nodes[idx].task_headers.insert(key.to_string(), value);
                                 }
                             }
+                            // zeebe:linkedResource inside zeebe:linkedResources: a
+                            // declarative link from the innermost open job task to a
+                            // deployed resource by id. Resolved to a concrete
+                            // resourceKey at job activation and delivered in the
+                            // `linkedResources` custom header (Zeebe parity). The
+                            // container element itself carries no attributes, so it
+                            // needs no open/close state — only its children matter.
+                            "linkedResource" => {
+                                if let (Some(&idx), Some(resource_id)) =
+                                    (io_stack.last(), attr(attrs, "resourceId"))
+                                {
+                                    let binding_type = match attr(attrs, "bindingType") {
+                                        Some("deployment") => crate::model::BindingType::Deployment,
+                                        Some("versionTag") => crate::model::BindingType::VersionTag,
+                                        // `latest` and any unknown/omitted value
+                                        // default to latest (Zeebe's default).
+                                        _ => crate::model::BindingType::Latest,
+                                    };
+                                    acc.nodes[idx].linked_resources.push(
+                                        crate::model::LinkedResource {
+                                            resource_id: resource_id.to_string(),
+                                            binding_type,
+                                            resource_type: attr(attrs, "resourceType")
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            version_tag: attr(attrs, "versionTag")
+                                                .map(str::to_string),
+                                            link_name: attr(attrs, "linkName")
+                                                .unwrap_or("")
+                                                .to_string(),
+                                        },
+                                    );
+                                }
+                            }
                             "input" | "output" if in_io_mapping => {
                                 if let (Some(&idx), Some(source), Some(target)) = (
                                     io_stack.last(),
@@ -1112,6 +1146,10 @@ struct NodeAcc {
     /// job-based task, in a deterministic map. Surfaced verbatim on the
     /// activated job (Zeebe `ActivatedJob.customHeaders`). Empty when none.
     task_headers: std::collections::BTreeMap<String, String>,
+    /// `zeebe:linkedResource`s declared on a job-based task, in declaration
+    /// order. Resolved to concrete resource keys at job activation and delivered
+    /// in the `linkedResources` custom header. Empty when none.
+    linked_resources: Vec<crate::model::LinkedResource>,
 }
 
 #[derive(Clone, Copy)]
@@ -1227,6 +1265,7 @@ impl ProcessAcc {
             end_listeners: Vec::new(),
             task_listeners: Vec::new(),
             task_headers: std::collections::BTreeMap::new(),
+            linked_resources: Vec::new(),
         });
         Some(self.nodes.len() - 1)
     }
@@ -1604,11 +1643,12 @@ impl ProcessAcc {
                         )
                     } else {
                         let job_type = node.job_type.unwrap_or_else(|| node.id.clone());
-                        builder.service_task_with(
+                        builder.service_task_with_links(
                             node.id,
                             job_type,
                             node.job_priority,
                             node.task_headers,
+                            node.linked_resources,
                         )
                     }
                 }
@@ -2020,6 +2060,7 @@ mod tests {
                 job_type: "payment".to_string(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             }
         );
         assert_eq!(def.element("start").unwrap().outgoing[0].to, "charge");
@@ -2087,6 +2128,7 @@ mod tests {
                 job_type: "do-work".to_string(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             }
         );
     }
@@ -2147,6 +2189,7 @@ mod tests {
                 job_type: "ruler".to_string(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             }
         );
     }
@@ -2208,6 +2251,7 @@ mod tests {
                 job_type: "run-script".to_string(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             }
         );
     }
@@ -2254,6 +2298,7 @@ mod tests {
                 job_type: "io.camunda.agenticai:aiagent-job-worker:1".to_string(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             }
         );
         assert_eq!(def.element("s").unwrap().outgoing[0].to, "agent");
@@ -2645,6 +2690,7 @@ mod tests {
                 job_type: "payment".to_string(),
                 priority: None,
                 custom_headers: expected,
+                linked_resources: Vec::new(),
             }
         );
     }
@@ -2729,6 +2775,7 @@ mod tests {
                 job_type: "payment".to_string(),
                 priority: Some("=urgency".to_string()),
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             }
         );
     }
@@ -2757,6 +2804,7 @@ mod tests {
                 job_type: "payment".to_string(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             }
         );
     }
@@ -2785,6 +2833,7 @@ mod tests {
                 job_type: "work".to_string(),
                 priority: None,
                 custom_headers: std::collections::BTreeMap::new(),
+                linked_resources: Vec::new(),
             }
         );
     }

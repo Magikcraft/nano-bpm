@@ -196,6 +196,46 @@ impl IoMapping {
     }
 }
 
+/// How a [`LinkedResource`]'s `resource_id` is resolved to a concrete deployed
+/// resource version at job activation (Zeebe `bindingType`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum BindingType {
+    /// Bind to the version deployed alongside the process definition. Nano does
+    /// not yet track per-resource deployment membership, so this currently
+    /// resolves to the latest version (documented simplification).
+    Deployment,
+    /// Bind to the latest deployed version of the resource id (the default).
+    #[default]
+    Latest,
+    /// Bind to the version carrying a matching `version_tag`, falling back to
+    /// the latest when no resource carries the tag.
+    VersionTag,
+}
+
+/// A `zeebe:linkedResource`: a service task's declarative link to a deployed
+/// resource (e.g. a generic Markdown agent prompt) by its `resource_id`. At job
+/// activation the engine resolves the id to a concrete `resourceKey` per
+/// `binding_type` and delivers the resolved set to the worker in the
+/// `linkedResources` custom header, so the worker can fetch the content via the
+/// resource API. Mirrors Zeebe's linked-resource extension element.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct LinkedResource {
+    /// The linked resource's id (its filename, for a generic resource).
+    pub resource_id: String,
+    /// How `resource_id` is resolved to a version at activation.
+    pub binding_type: BindingType,
+    /// The worker-facing resource type label (opaque to the engine, e.g. `RPA`
+    /// or a custom `GenericScript`). Echoed verbatim into the resolved header.
+    pub resource_type: String,
+    /// The version tag matched when `binding_type` is [`BindingType::VersionTag`].
+    pub version_tag: Option<String>,
+    /// The key under which the worker looks up the resolved resource in the
+    /// `linkedResources` header (Zeebe `linkName`).
+    pub link_name: String,
+}
+
 /// The lifecycle transition an execution listener fires on (Zeebe
 /// `zeebe:executionListener eventType`). `Start` listeners run between an
 /// element's `ACTIVATING` and `ACTIVATED` events; `End` listeners run between
@@ -403,6 +443,17 @@ pub enum ElementKind {
         /// before headers were parsed.
         #[cfg_attr(feature = "serde", serde(default))]
         custom_headers: BTreeMap<String, String>,
+        /// Linked resources declared via `zeebe:linkedResources`
+        /// (`<zeebe:linkedResource resourceId=… bindingType=… resourceType=…
+        /// linkName=… versionTag=…/>`). Each links the task to a deployed
+        /// resource (e.g. a generic Markdown agent prompt) by id; at job
+        /// activation the engine resolves each entry's id to a concrete
+        /// `resourceKey` (per `binding_type`) and delivers the resolved set to
+        /// the worker in the `linkedResources` custom header (Zeebe parity).
+        /// Empty when the task declares none, and when deserializing definitions
+        /// written before linked resources were parsed.
+        #[cfg_attr(feature = "serde", serde(default))]
+        linked_resources: Vec<LinkedResource>,
     },
     /// A business rule task bound to a DMN decision via `zeebe:calledDecision`.
     /// On activation the engine evaluates the referenced decision natively
@@ -1411,6 +1462,7 @@ impl ProcessBuilder {
                 job_type: job_type.into(),
                 priority: None,
                 custom_headers: BTreeMap::new(),
+                linked_resources: Vec::new(),
             },
         )
     }
@@ -1438,12 +1490,28 @@ impl ProcessBuilder {
         priority: Option<String>,
         custom_headers: BTreeMap<String, String>,
     ) -> Self {
+        self.service_task_with_links(id, job_type, priority, custom_headers, Vec::new())
+    }
+
+    /// Adds a service task with static headers plus `zeebe:linkedResources`. At
+    /// job activation each linked resource's id is resolved to a concrete
+    /// `resourceKey` and the resolved set is delivered in the `linkedResources`
+    /// custom header (Zeebe parity).
+    pub fn service_task_with_links(
+        self,
+        id: impl Into<String>,
+        job_type: impl Into<String>,
+        priority: Option<String>,
+        custom_headers: BTreeMap<String, String>,
+        linked_resources: Vec<LinkedResource>,
+    ) -> Self {
         self.add(
             id,
             ElementKind::ServiceTask {
                 job_type: job_type.into(),
                 priority,
                 custom_headers,
+                linked_resources,
             },
         )
     }
