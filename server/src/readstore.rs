@@ -2815,7 +2815,8 @@ fn project_engine_state(
              VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
              ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
              resource_name = excluded.resource_name, version = excluded.version, \
-             content = excluded.content, tenant_id = excluded.tenant_id",
+             version_tag = excluded.version_tag, content = excluded.content, \
+             tenant_id = excluded.tenant_id",
             // `tenant_id` is not modeled in engine state; default to '<default>'.
             params![
                 res.key as i64,
@@ -3880,7 +3881,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                  VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
                  ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
                  resource_name = excluded.resource_name, version = excluded.version, \
-                 content = excluded.content, tenant_id = excluded.tenant_id",
+                 version_tag = excluded.version_tag, content = excluded.content, \
+                 tenant_id = excluded.tenant_id",
                 params![
                     *resource_key as i64,
                     resource_id,
