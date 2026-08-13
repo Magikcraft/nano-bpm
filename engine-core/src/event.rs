@@ -79,6 +79,24 @@ pub enum Event {
         schema: String,
     },
 
+    /// A generic resource (any deployed file that is not a BPMN/DMN/form — e.g. a
+    /// Markdown agent prompt) was registered as part of a deployment. The engine
+    /// assigns a unique `resource_key` and a `version` that increments per
+    /// `resource_id` across deployments. The engine does not execute generic
+    /// resources; it stores them so they can be served by `GetResourceByKey` and
+    /// searched by `resourceId` (Zeebe parity).
+    GenericResourceDeployed {
+        deployment_key: Key,
+        resource_key: Key,
+        version: i32,
+        /// The resource identifier (its filename, for a generic resource).
+        resource_id: String,
+        /// The deploy resource name (the filename).
+        resource_name: String,
+        /// The verbatim resource content.
+        content: String,
+    },
+
     /// A decision was evaluated — by a `businessRuleTask` (with `instance_key` /
     /// `element_id` set) or by the standalone EvaluateDecision API (both `0` /
     /// empty). Carries the root output and the per-decision audit trail for
@@ -975,6 +993,7 @@ impl Event {
             | Event::DecisionRequirementsDeployed { .. }
             | Event::DecisionDeployed { .. }
             | Event::FormDeployed { .. }
+            | Event::GenericResourceDeployed { .. }
             | Event::DeploymentCreated { .. }
             | Event::MessagePublished { .. }
             | Event::SignalBroadcast { .. }
@@ -1022,6 +1041,11 @@ impl Event {
                 form_key,
                 ..
             } => m = m.max(*deployment_key).max(*form_key),
+            Event::GenericResourceDeployed {
+                deployment_key,
+                resource_key,
+                ..
+            } => m = m.max(*deployment_key).max(*resource_key),
             Event::DecisionEvaluated {
                 element_instance_key,
                 decision_key,

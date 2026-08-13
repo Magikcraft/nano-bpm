@@ -1713,6 +1713,199 @@ fn activated_job_has_empty_custom_headers_when_task_declares_none() {
 }
 
 #[test]
+fn bpmn_parses_zeebe_linked_resources_onto_the_service_task() {
+    // A service task's zeebe:linkedResources are parsed into the model, in
+    // declaration order, with binding type / ids / link names preserved.
+    use crate::model::{BindingType, ElementKind};
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="run-agent" />
+              <zeebe:linkedResources>
+                <zeebe:linkedResource resourceId="agent-prompt.md" bindingType="latest"
+                                      resourceType="GenericScript" linkName="prompt" />
+                <zeebe:linkedResource resourceId="policy.md" bindingType="deployment"
+                                      resourceType="GenericScript" linkName="policy" />
+              </zeebe:linkedResources>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let task = def.element("agent").expect("the service task is parsed");
+    let ElementKind::ServiceTask {
+        linked_resources, ..
+    } = &task.kind
+    else {
+        panic!("expected a service task, got {:?}", task.kind);
+    };
+    assert_eq!(linked_resources.len(), 2);
+    assert_eq!(linked_resources[0].resource_id, "agent-prompt.md");
+    assert_eq!(linked_resources[0].binding_type, BindingType::Latest);
+    assert_eq!(linked_resources[0].resource_type, "GenericScript");
+    assert_eq!(linked_resources[0].link_name, "prompt");
+    assert_eq!(linked_resources[1].resource_id, "policy.md");
+    assert_eq!(linked_resources[1].binding_type, BindingType::Deployment);
+    assert_eq!(linked_resources[1].link_name, "policy");
+}
+
+#[test]
+fn activated_job_resolves_linked_resource_latest_binding_into_a_header() {
+    // A serviceTask linking a generic resource by id (bindingType=latest) must,
+    // at activation, resolve that id to the LATEST deployed resource key and
+    // deliver it to the worker in the `linkedResources` custom header. An
+    // undeployed link id is simply omitted.
+    use crate::command::GenericResource;
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="run-agent" />
+              <zeebe:linkedResources>
+                <zeebe:linkedResource resourceId="agent-prompt.md" bindingType="latest"
+                                      resourceType="GenericScript" linkName="prompt" />
+                <zeebe:linkedResource resourceId="missing.md" bindingType="latest"
+                                      resourceType="GenericScript" linkName="gone" />
+              </zeebe:linkedResources>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    // Deploy two versions of the linked resource; `latest` must pick version 2.
+    let resource = |content: &str| GenericResource {
+        resource_id: "agent-prompt.md".to_string(),
+        resource_name: "agent-prompt.md".to_string(),
+        content: content.to_string(),
+    };
+    engine
+        .apply_command(Command::DeployGenericResources(vec![resource("# v1")]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployGenericResources(vec![resource("# v2")]))
+        .unwrap();
+    let latest_key = engine.state().resources["agent-prompt.md"].key;
+    assert_eq!(engine.state().resources["agent-prompt.md"].version, 2);
+
+    engine.apply_command(Command::create_instance("p")).unwrap();
+    let activated = engine.activate_jobs("run-agent", "w1", 10, 60_000, 0);
+    assert_eq!(activated.len(), 1);
+    let header = activated[0]
+        .custom_headers
+        .get("linkedResources")
+        .expect("the linkedResources header is present");
+
+    // The resolved header points at the LATEST resource key; the undeployed
+    // `missing.md` link is omitted (so exactly one entry, keyed by its link).
+    let expected = format!(
+        "[{{\"resourceKey\":\"{latest_key}\",\"resourceType\":\"GenericScript\",\"linkName\":\"prompt\"}}]"
+    );
+    assert_eq!(header, &expected);
+
+    // The read-back projection agrees with activate_jobs.
+    let projected = engine.activated_job(activated[0].key).unwrap();
+    assert_eq!(
+        projected.custom_headers.get("linkedResources"),
+        Some(header)
+    );
+}
+
+#[test]
+fn activated_job_omits_linked_resources_header_when_nothing_resolves() {
+    // When a service task declares linkedResources but NONE of the ids are
+    // deployed, the engine must emit no `linkedResources` header at all — not a
+    // surprising empty `[]` — and must not clobber any author-supplied header.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="run-agent" />
+              <zeebe:linkedResources>
+                <zeebe:linkedResource resourceId="missing.md" bindingType="latest"
+                                      resourceType="GenericScript" linkName="gone" />
+              </zeebe:linkedResources>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine.apply_command(Command::create_instance("p")).unwrap();
+    let activated = engine.activate_jobs("run-agent", "w1", 10, 60_000, 0);
+    assert_eq!(activated.len(), 1);
+    assert!(
+        !activated[0].custom_headers.contains_key("linkedResources"),
+        "no header when nothing resolves (not an empty array)"
+    );
+}
+
+#[test]
+fn bpmn_skips_linked_resource_missing_required_attributes() {
+    // resourceType and linkName are required by Zeebe; a linkedResource missing
+    // either is malformed and must be dropped at parse rather than fabricated
+    // with empty-string attributes that would surface as ambiguous entries.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="run-agent" />
+              <zeebe:linkedResources>
+                <zeebe:linkedResource resourceId="ok.md" resourceType="GenericScript"
+                                      linkName="prompt" />
+                <zeebe:linkedResource resourceId="no-type.md" linkName="x" />
+                <zeebe:linkedResource resourceId="no-name.md" resourceType="GenericScript" />
+              </zeebe:linkedResources>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let ElementKind::ServiceTask {
+        linked_resources, ..
+    } = &def.element("agent").unwrap().kind
+    else {
+        panic!("agent is a service task");
+    };
+    assert_eq!(
+        linked_resources.len(),
+        1,
+        "only the well-formed entry survives"
+    );
+    assert_eq!(linked_resources[0].resource_id, "ok.md");
+    assert_eq!(linked_resources[0].resource_type, "GenericScript");
+    assert_eq!(linked_resources[0].link_name, "prompt");
+}
+
+#[test]
 fn inline_script_task_evaluates_feel_and_writes_result_variable() {
     // A zeebe:script script task evaluates its FEEL expression on activation,
     // stores the result under resultVariable, and passes straight through with
@@ -8653,6 +8846,101 @@ fn deploy_forms_mints_a_form_key_versions_per_id_and_is_idempotent() {
     assert_eq!(bumped.1, 2, "a changed schema is version 2");
     assert_ne!(bumped.0, deployed.0, "a new form key is minted");
     assert_eq!(engine.state().forms["greeting-form"].version, 2);
+}
+
+#[test]
+fn deploy_generic_resources_mints_a_resource_key_versions_per_id_and_is_idempotent() {
+    use crate::command::GenericResource;
+    let mut engine = Engine::new();
+    let resource = |content: &str| GenericResource {
+        resource_id: "agent-prompt.md".to_string(),
+        resource_name: "agent-prompt.md".to_string(),
+        content: content.to_string(),
+    };
+    let v1 = "# Reviewer\n\nReview the PR.";
+
+    let events = engine
+        .apply_command(Command::DeployGenericResources(vec![resource(v1)]))
+        .unwrap();
+    let deployed = events
+        .iter()
+        .find_map(|e| match e {
+            Event::GenericResourceDeployed {
+                resource_key,
+                version,
+                resource_id,
+                content,
+                ..
+            } => Some((
+                *resource_key,
+                *version,
+                resource_id.clone(),
+                content.clone(),
+            )),
+            _ => None,
+        })
+        .expect("a GenericResourceDeployed event is emitted");
+    assert_eq!(deployed.1, 1, "the first deploy is version 1");
+    assert_eq!(deployed.2, "agent-prompt.md", "resource_id is the filename");
+    assert_eq!(deployed.3, v1, "the raw content is carried on the event");
+    let stored = &engine.state().resources["agent-prompt.md"];
+    assert_eq!(stored.key, deployed.0);
+    assert_eq!(stored.version, 1);
+
+    // Redeploying the identical resource (same name + content) is a no-op.
+    let again = engine
+        .apply_command(Command::DeployGenericResources(vec![resource(v1)]))
+        .unwrap();
+    assert!(
+        !again
+            .iter()
+            .any(|e| matches!(e, Event::GenericResourceDeployed { .. })),
+        "an identical redeploy emits no GenericResourceDeployed"
+    );
+    assert_eq!(engine.state().resources["agent-prompt.md"].version, 1);
+
+    // Changed content under the same filename bumps the version and re-mints a key.
+    let v2 = "# Reviewer\n\nReview the PR carefully and cite lines.";
+    let changed = engine
+        .apply_command(Command::DeployGenericResources(vec![resource(v2)]))
+        .unwrap();
+    let bumped = changed
+        .iter()
+        .find_map(|e| match e {
+            Event::GenericResourceDeployed {
+                resource_key,
+                version,
+                ..
+            } => Some((*resource_key, *version)),
+            _ => None,
+        })
+        .expect("changed content redeploys");
+    assert_eq!(bumped.1, 2, "changed content is version 2");
+    assert_ne!(bumped.0, deployed.0, "a new resource key is minted");
+    assert_eq!(engine.state().resources["agent-prompt.md"].version, 2);
+    assert_eq!(
+        engine.state().resources["agent-prompt.md"].content,
+        v2,
+        "the latest content is stored"
+    );
+
+    // A different filename is an independent resource (its own version 1).
+    let other = engine
+        .apply_command(Command::DeployGenericResources(vec![GenericResource {
+            resource_id: "other-prompt.md".to_string(),
+            resource_name: "other-prompt.md".to_string(),
+            content: "# Other".to_string(),
+        }]))
+        .unwrap();
+    let other_v = other
+        .iter()
+        .find_map(|e| match e {
+            Event::GenericResourceDeployed { version, .. } => Some(*version),
+            _ => None,
+        })
+        .expect("a new filename deploys");
+    assert_eq!(other_v, 1, "a different resource_id restarts at version 1");
+    assert_eq!(engine.state().resources.len(), 2);
 }
 
 #[test]

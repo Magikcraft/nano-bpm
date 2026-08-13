@@ -935,6 +935,13 @@ pub struct State {
     /// forms; it retains them so `GetFormByKey` can serve the stored schema.
     #[cfg_attr(feature = "serde", serde(default))]
     pub forms: HashMap<String, DeployedForm>,
+    /// Latest deployed generic resource (any non-BPMN/DMN/form file, e.g. a
+    /// Markdown agent prompt), keyed by `resource_id` (the filename). Versioned
+    /// per `resource_id` across deployments, like forms. The engine does not
+    /// execute generic resources; it retains them so `GetResourceByKey` and
+    /// `searchResources` can serve the stored content.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub resources: HashMap<String, DeployedResource>,
 }
 
 /// A deployed decision requirements graph together with the identity the engine
@@ -985,6 +992,24 @@ pub struct DeployedForm {
     pub resource_name: String,
     /// The verbatim form-js JSON document.
     pub schema: String,
+}
+
+/// A deployed generic resource together with the identity the engine assigned it
+/// at deploy time. The engine stores generic resources but does not execute
+/// them — they are served verbatim by `GetResourceByKey` / `searchResources`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DeployedResource {
+    /// Unique key for this specific resource (and version).
+    pub key: Key,
+    /// Version, incremented per `resource_id` across deployments (starts 1).
+    pub version: i32,
+    /// The resource identifier (its filename, for a generic resource).
+    pub resource_id: String,
+    /// The deploy resource name (the filename).
+    pub resource_name: String,
+    /// The verbatim resource content.
+    pub content: String,
 }
 
 /// A self-contained snapshot of one process instance and every entity it owns
@@ -1289,6 +1314,26 @@ pub fn apply(state: &mut State, event: &Event) {
                     form_id: form_id.clone(),
                     resource_name: resource_name.clone(),
                     schema: schema.clone(),
+                },
+            );
+        }
+
+        Event::GenericResourceDeployed {
+            resource_key,
+            version,
+            resource_id,
+            resource_name,
+            content,
+            ..
+        } => {
+            state.resources.insert(
+                resource_id.clone(),
+                DeployedResource {
+                    key: *resource_key,
+                    version: *version,
+                    resource_id: resource_id.clone(),
+                    resource_name: resource_name.clone(),
+                    content: content.clone(),
                 },
             );
         }

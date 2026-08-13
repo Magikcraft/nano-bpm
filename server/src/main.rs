@@ -1086,6 +1086,11 @@ struct ParsedDeploy {
     /// Forms (`form-js` `.form` resources) to register. The engine stores them
     /// so `GetFormByKey` can serve the schema; it does not execute forms.
     forms: Vec<nanobpmn_engine_core::FormResource>,
+    /// Generic resources (any deployed file that is not a BPMN/DMN/form — e.g. a
+    /// Markdown agent prompt). The engine stores them so `GetResourceByKey` /
+    /// `searchResources` can serve the content; it does not execute them. For a
+    /// generic resource the `resource_id` is its filename (Zeebe parity).
+    generic_resources: Vec<nanobpmn_engine_core::GenericResource>,
 }
 
 /// Parses every deployment resource up front so a deploy is all-or-nothing.
@@ -1109,6 +1114,7 @@ fn parse_deploy_resources(
     let mut drg_resource_names: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut forms = Vec::new();
+    let mut generic_resources = Vec::new();
     for (resource_name, xml) in resources {
         let lower = resource_name.to_ascii_lowercase();
         if lower.ends_with(".dmn") {
@@ -1148,20 +1154,47 @@ fn parse_deploy_resources(
             }
             continue;
         }
-        match parse_bpmn(xml) {
-            Ok(defs) => {
-                for def in defs {
-                    process_resource_names.insert(def.id.clone(), resource_name.clone());
-                    processes.push(def);
+        // Resource-type dispatch mirrors Zeebe's transformer order (see
+        // `DeploymentTransformer`):
+        //   * `.bpmn`  → always BPMN (a parse failure is a client error);
+        //   * `.xml`   → BPMN iff it parses as valid BPMN, else a generic resource;
+        //   * anything else → a generic resource, whose `resource_id` is its
+        //     filename (Zeebe's default resource transformer). The engine stores
+        //     generic resources verbatim and serves them by key / `resourceId`.
+        if lower.ends_with(".bpmn") {
+            match parse_bpmn(xml) {
+                Ok(defs) => {
+                    for def in defs {
+                        process_resource_names.insert(def.id.clone(), resource_name.clone());
+                        processes.push(def);
+                    }
+                }
+                Err(e) => {
+                    return Err((
+                        "Invalid BPMN",
+                        format!("Failed to parse '{resource_name}': {e}."),
+                    ));
                 }
             }
-            Err(e) => {
-                return Err((
-                    "Invalid BPMN",
-                    format!("Failed to parse '{resource_name}': {e}."),
-                ));
-            }
+            continue;
         }
+        // `.xml` is BPMN iff it parses as valid BPMN; otherwise it falls through
+        // to generic-resource handling below.
+        if lower.ends_with(".xml")
+            && let Ok(defs) = parse_bpmn(xml)
+        {
+            for def in defs {
+                process_resource_names.insert(def.id.clone(), resource_name.clone());
+                processes.push(def);
+            }
+            continue;
+        }
+        // Generic resource: the filename is the resource id (Zeebe parity).
+        generic_resources.push(nanobpmn_engine_core::GenericResource {
+            resource_id: resource_name.clone(),
+            resource_name: resource_name.clone(),
+            content: xml.clone(),
+        });
     }
     Ok(ParsedDeploy {
         processes,
@@ -1169,6 +1202,7 @@ fn parse_deploy_resources(
         decisions,
         drg_resource_names,
         forms,
+        generic_resources,
     })
 }
 
@@ -1293,6 +1327,7 @@ fn rebuild_read_model_legacy(
                 | Event::DecisionRequirementsDeployed { .. }
                 | Event::DecisionDeployed { .. }
                 | Event::FormDeployed { .. }
+                | Event::GenericResourceDeployed { .. }
         ) {
             for bucket in per_shard.values_mut() {
                 bucket.push(e);
@@ -8376,6 +8411,180 @@ impl ServerImpl {
         ))
     }
 
+    async fn get_resource_impl(
+        &self,
+        path_params: &models::GetResourcePathParams,
+    ) -> Result<apis::resource::GetResourceResponse, ()> {
+        use apis::resource::GetResourceResponse as Resp;
+
+        let raw = &path_params.resource_key;
+        let key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_AResourceWithTheGivenKeyWasNotFound(
+                    problem(
+                        "Resource not found",
+                        404,
+                        format!("Resource key '{raw}' is not a valid key."),
+                    ),
+                ));
+            }
+        };
+
+        match self.store.resource_by_key_meta(key) {
+            Some(row) => Ok(Resp::Status200_TheResourceIsSuccessfullyReturned(
+                resource_result(&row),
+            )),
+            None => Ok(Resp::Status404_AResourceWithTheGivenKeyWasNotFound(
+                problem(
+                    "Resource not found",
+                    404,
+                    format!("No resource with key {key}."),
+                ),
+            )),
+        }
+    }
+
+    async fn get_resource_content_binary_impl(
+        &self,
+        path_params: &models::GetResourceContentBinaryPathParams,
+    ) -> Result<apis::resource::GetResourceContentBinaryResponse, ()> {
+        use apis::resource::GetResourceContentBinaryResponse as Resp;
+
+        let raw = &path_params.resource_key;
+        let key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_AResourceWithTheGivenKeyWasNotFound(
+                    problem(
+                        "Resource not found",
+                        404,
+                        format!("Resource key '{raw}' is not a valid key."),
+                    ),
+                ));
+            }
+        };
+
+        match self.store.resource_by_key(key) {
+            Some(row) => Ok(Resp::Status200_TheResourceContentIsSuccessfullyReturned(
+                types::ByteArray(row.content.into_bytes()),
+            )),
+            None => Ok(Resp::Status404_AResourceWithTheGivenKeyWasNotFound(
+                problem(
+                    "Resource not found",
+                    404,
+                    format!("No resource with key {key}."),
+                ),
+            )),
+        }
+    }
+
+    async fn get_resource_content_impl(
+        &self,
+        path_params: &models::GetResourceContentPathParams,
+    ) -> Result<apis::resource::GetResourceContentResponse, ()> {
+        use apis::resource::GetResourceContentResponse as Resp;
+
+        let raw = &path_params.resource_key;
+        let key: u64 = match raw.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_AResourceWithTheGivenKeyWasNotFound(
+                    problem(
+                        "Resource not found",
+                        404,
+                        format!("Resource key '{raw}' is not a valid key."),
+                    ),
+                ));
+            }
+        };
+
+        // This endpoint deserialises RPA (JSON) resource content into a map.
+        // Generic resources (e.g. Markdown) are not RPA, so — matching Camunda —
+        // clients must use the binary content endpoint instead. Only existence
+        // matters here (the response is always 406/404), so use the metadata-only
+        // lookup and avoid loading the `content` blob.
+        match self.store.resource_by_key_meta(key) {
+            Some(_) => Ok(Resp::Status406_TheResourceExistsButIsNotAnRPAResource(
+                problem(
+                    "Resource is not an RPA resource",
+                    406,
+                    format!(
+                        "Resource {key} is a generic resource; use the binary content endpoint."
+                    ),
+                ),
+            )),
+            None => Ok(Resp::Status404_AResourceWithTheGivenKeyWasNotFound(
+                problem(
+                    "Resource not found",
+                    404,
+                    format!("No resource with key {key}."),
+                ),
+            )),
+        }
+    }
+
+    async fn search_resources_impl(
+        &self,
+        body: &Option<models::ResourceSearchQuery>,
+    ) -> Result<apis::resource::SearchResourcesResponse, ()> {
+        use apis::resource::SearchResourcesResponse as Resp;
+
+        let filter = body.as_ref().and_then(|q| q.filter.as_ref());
+        let rows = self.store.resources_meta();
+
+        let mut matched: Vec<&readstore::ResourceMetaRow> = rows
+            .iter()
+            .filter(|row| match filter {
+                None => true,
+                Some(f) => {
+                    query::match_resource_key(&f.resource_key, &row.resource_key.to_string())
+                        && query::match_string(&f.resource_name, &row.resource_name)
+                        && query::match_string(&f.resource_id, &row.resource_id)
+                        && query::match_integer(&f.version, Some(row.version as i64))
+                        && query::match_string_opt(&f.version_tag, row.version_tag.as_deref())
+                        && f.tenant_id
+                            .as_ref()
+                            .is_none_or(|want| want == &row.tenant_id)
+                }
+            })
+            .collect();
+
+        let sort = query::sort_keys(
+            body.as_ref().and_then(|q| q.sort.as_ref()),
+            |r: &models::ResourceSearchQuerySortRequest| (r.field.clone(), r.order),
+        );
+        query::sort_items(
+            &mut matched,
+            &sort,
+            |row, field| match field {
+                "resourceId" => query::SortVal::Str(row.resource_id.clone()),
+                "resourceName" => query::SortVal::Str(row.resource_name.clone()),
+                "version" => query::SortVal::Num(row.version as i64),
+                // `versionTag` is nullable; a null tag sorts as the empty string
+                // (before any present tag ascending), matching how the read model
+                // projects `versionTag: null`.
+                "versionTag" => query::SortVal::Str(row.version_tag.clone().unwrap_or_default()),
+                "resourceKey" => query::SortVal::Num(row.resource_key as i64),
+                "tenantId" => query::SortVal::Str(row.tenant_id.clone()),
+                _ => query::SortVal::Num(row.resource_key as i64),
+            },
+            |row| row.resource_key,
+        );
+
+        let sorted: Vec<(u64, &readstore::ResourceMetaRow)> = matched
+            .into_iter()
+            .map(|row| (row.resource_key, row))
+            .collect();
+        let page = query::paginate(sorted, body.as_ref().and_then(|q| q.page.as_ref()));
+        let items: Vec<models::ResourceResult> =
+            page.items.into_iter().map(resource_result).collect();
+
+        Ok(Resp::Status200_TheResourceSearchResult(
+            models::ResourceSearchQueryResult::new(page.response, items),
+        ))
+    }
+
     async fn search_process_instances_impl(
         &self,
         body: &Option<models::ProcessInstanceSearchQuery>,
@@ -9864,6 +10073,7 @@ impl ServerImpl {
                     parsed.decisions,
                     &parsed.drg_resource_names,
                     parsed.forms,
+                    parsed.generic_resources,
                     &tenant_id,
                 )
                 .await
@@ -10102,6 +10312,7 @@ impl ServerImpl {
             decisions,
             drg_resource_names,
             Vec::new(),
+            Vec::new(),
             tenant_id,
         )
         .await
@@ -10115,11 +10326,16 @@ impl ServerImpl {
         decisions: Vec<nanobpmn_engine_core::dmn::DecisionRequirementsGraph>,
         drg_resource_names: &std::collections::HashMap<String, String>,
         forms: Vec<nanobpmn_engine_core::FormResource>,
+        generic_resources: Vec<nanobpmn_engine_core::GenericResource>,
         tenant_id: &str,
     ) -> Result<(models::DeploymentResult, Arc<Vec<Event>>), (&'static str, String)> {
         let requested_ids: Vec<String> = processes.iter().map(|p| p.id.clone()).collect();
         let requested_drg_ids: Vec<String> = decisions.iter().map(|d| d.id.clone()).collect();
         let requested_form_ids: Vec<String> = forms.iter().map(|f| f.id.clone()).collect();
+        let requested_resource_ids: Vec<String> = generic_resources
+            .iter()
+            .map(|r| r.resource_id.clone())
+            .collect();
         // The closure returns, besides the emitted events and commit, the
         // resolved (key, version) for every *requested* process id read back from
         // post-apply state. An idempotent redeploy emits no event but must still
@@ -10132,6 +10348,8 @@ impl ServerImpl {
         type ResolvedDrgs = Vec<(String, String, u64, i32)>;
         // Resolved forms: (form_id, key, version, resource_name).
         type ResolvedForms = Vec<(String, u64, i32, String)>;
+        // Resolved generic resources: (resource_id, key, version, resource_name).
+        type ResolvedResources = Vec<(String, u64, i32, String)>;
         #[allow(clippy::type_complexity)]
         let deploy_result: Result<
             (
@@ -10141,6 +10359,7 @@ impl ServerImpl {
                 ResolvedDrgs,
                 ResolvedDecisions,
                 ResolvedForms,
+                ResolvedResources,
             ),
             String,
         > =
@@ -10169,6 +10388,14 @@ impl ServerImpl {
                             .map_err(|e| e.to_string())?;
                         all_events.extend((*form_events).iter().cloned());
                         commit = form_commit;
+                    }
+                    // Deploy any generic resources in the same durable batch.
+                    if !generic_resources.is_empty() {
+                        let (res_events, res_commit) = engine
+                            .apply_command(Command::DeployGenericResources(generic_resources))
+                            .map_err(|e| e.to_string())?;
+                        all_events.extend((*res_events).iter().cloned());
+                        commit = res_commit;
                     }
                     let events = Arc::new(all_events);
                     let resolved: Resolved = requested_ids
@@ -10222,6 +10449,15 @@ impl ServerImpl {
                                 })
                             })
                             .collect();
+                    let resolved_resources: ResolvedResources =
+                        requested_resource_ids
+                            .iter()
+                            .filter_map(|id| {
+                                engine.state().resources.get(id).map(|r| {
+                                    (id.clone(), r.key, r.version, r.resource_name.clone())
+                                })
+                            })
+                            .collect();
                     Ok((
                         events,
                         commit,
@@ -10229,14 +10465,22 @@ impl ServerImpl {
                         resolved_drgs,
                         resolved_decisions,
                         resolved_forms,
+                        resolved_resources,
                     ))
                 })
                 .await;
-        let (events, commit, resolved, resolved_drgs, resolved_decisions, resolved_forms) =
-            match deploy_result {
-                Ok(t) => t,
-                Err(e) => return Err(("Invalid deployment", e)),
-            };
+        let (
+            events,
+            commit,
+            resolved,
+            resolved_drgs,
+            resolved_decisions,
+            resolved_forms,
+            resolved_resources,
+        ) = match deploy_result {
+            Ok(t) => t,
+            Err(e) => return Err(("Invalid deployment", e)),
+        };
         // Replicate the new definition(s) to the other local partitions so any of
         // them can instantiate the process (the deployment itself is journaled
         // only on partition 0; replication is in-memory and re-derived on restart).
@@ -10332,6 +10576,23 @@ impl ServerImpl {
                 nanobpm_gateway_rest::types::Nullable::Null,
             ));
         }
+        // One metadata entry per deployed generic resource (`resource` slot).
+        for (resource_id, resource_key, version, resource_name) in resolved_resources {
+            let resource_result = models::DeploymentResourceResult::new(
+                resource_id,
+                resource_name,
+                version,
+                tenant_id.to_string(),
+                models::ResourceKey(resource_key.to_string()),
+            );
+            deployments.push(models::DeploymentMetadataResult::new(
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Null,
+                nanobpm_gateway_rest::types::Nullable::Present(resource_result),
+            ));
+        }
 
         let result = models::DeploymentResult::new(
             models::DeploymentKey(deployment_key),
@@ -10360,6 +10621,7 @@ impl ServerImpl {
                 parsed.decisions,
                 &parsed.drg_resource_names,
                 parsed.forms,
+                parsed.generic_resources,
                 &tenant_id,
             )
             .await
@@ -10445,6 +10707,7 @@ impl ServerImpl {
                         | Event::DecisionRequirementsDeployed { .. }
                         | Event::DecisionDeployed { .. }
                         | Event::FormDeployed { .. }
+                        | Event::GenericResourceDeployed { .. }
                 )
             })
             .cloned()
@@ -15101,6 +15364,21 @@ fn decision_requirements_result(
     )
 }
 
+fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
+    let version_tag = match &row.version_tag {
+        Some(t) => types::Nullable::Present(t.clone()),
+        None => types::Nullable::Null,
+    };
+    models::ResourceResult::new(
+        row.resource_name.clone(),
+        row.version,
+        version_tag,
+        row.resource_id.clone(),
+        row.tenant_id.clone(),
+        models::ResourceKey(row.resource_key.to_string()),
+    )
+}
+
 fn decision_instance_result(
     row: &readstore::DecisionInstanceRow,
 ) -> models::DecisionInstanceResult {
@@ -17388,6 +17666,7 @@ async fn main() {
                                 | Event::DecisionRequirementsDeployed { .. }
                                 | Event::DecisionDeployed { .. }
                                 | Event::FormDeployed { .. }
+                                | Event::GenericResourceDeployed { .. }
                         ) {
                             for bucket in per_owned.values_mut() {
                                 bucket.push(event.clone());
@@ -22101,6 +22380,207 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test]
+    async fn a_generic_resource_versions_by_filename_and_is_retrievable() {
+        // Deploying a non-BPMN/DMN/form file (e.g. a Markdown agent prompt) is a
+        // generic resource: its `resourceId` is its filename, redeploying identical
+        // bytes is a no-op, changed bytes bump the version, and it is retrievable
+        // by key + `resourceId` search and its content served verbatim.
+        use apis::resource::GetResourceContentBinaryResponse as ContentGet;
+        use apis::resource::GetResourceContentResponse as RpaGet;
+        use apis::resource::GetResourceResponse as ResGet;
+        use apis::resource::SearchResourcesResponse as ResSearch;
+        let server = ServerImpl::default();
+
+        let deploy = |content: &'static str| {
+            let server = &server;
+            async move {
+                server
+                    .deploy_resources_locally_with_forms(
+                        Vec::new(),
+                        &std::collections::HashMap::new(),
+                        Vec::new(),
+                        &std::collections::HashMap::new(),
+                        Vec::new(),
+                        vec![nanobpmn_engine_core::GenericResource {
+                            resource_id: "agent-prompt.md".to_string(),
+                            resource_name: "agent-prompt.md".to_string(),
+                            content: content.to_string(),
+                        }],
+                        "<default>",
+                    )
+                    .await
+                    .expect("generic-resource deploy succeeds")
+            }
+        };
+
+        // First deploy → version 1 with a resource key on the `resource` slot.
+        let (result, _) = deploy("# v1\nDo the thing.").await;
+        let res = result
+            .deployments
+            .iter()
+            .find_map(|d| match &d.resource {
+                types::Nullable::Present(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("the deployment carries a generic resource");
+        assert_eq!(res.resource_id, "agent-prompt.md");
+        assert_eq!(res.resource_name, "agent-prompt.md");
+        assert_eq!(res.version, 1);
+        let key_v1 = res.resource_key.0.clone();
+
+        // Redeploying byte-identical content is idempotent: same key, no bump.
+        let (result, _) = deploy("# v1\nDo the thing.").await;
+        let res = result
+            .deployments
+            .iter()
+            .find_map(|d| match &d.resource {
+                types::Nullable::Present(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("idempotent redeploy still reports the resource");
+        assert_eq!(
+            res.version, 1,
+            "identical content does not bump the version"
+        );
+        assert_eq!(
+            res.resource_key.0, key_v1,
+            "identical content reuses the key"
+        );
+
+        // Changed content under the same filename bumps to version 2.
+        let (result, _) = deploy("# v2\nDo the thing differently.").await;
+        let res = result
+            .deployments
+            .iter()
+            .find_map(|d| match &d.resource {
+                types::Nullable::Present(r) => Some(r.clone()),
+                _ => None,
+            })
+            .expect("changed redeploy reports the resource");
+        assert_eq!(res.version, 2, "changed content bumps the version");
+        let key_v2 = res.resource_key.0.clone();
+        assert_ne!(key_v2, key_v1, "a new version mints a new key");
+
+        // Poll search until the async exporter projects both versions.
+        let mut latest = None;
+        for _ in 0..200 {
+            let resp = server
+                .search_resources_impl(&Some(models::ResourceSearchQuery {
+                    page: None,
+                    sort: Some(vec![models::ResourceSearchQuerySortRequest {
+                        field: "version".to_string(),
+                        order: Some(models::SortOrderEnum::Desc),
+                    }]),
+                    filter: Some(models::ResourceFilter {
+                        resource_id: Some(models::StringFilterProperty::String(
+                            "agent-prompt.md".to_string(),
+                        )),
+                        ..models::ResourceFilter::new()
+                    }),
+                }))
+                .await
+                .expect("search returns a response");
+            let ResSearch::Status200_TheResourceSearchResult(result) = resp else {
+                panic!("expected a 200 resource search result");
+            };
+            if result.items.len() >= 2 {
+                latest = Some(result.items);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let items = latest.expect("both resource versions are projected");
+        assert_eq!(items[0].version, 2, "search sorts latest version first");
+        assert_eq!(items[0].resource_id, "agent-prompt.md");
+
+        // The `versionTag` sort field (per the OpenAPI enum) is honored rather than
+        // silently falling through to the default ordering: with both versions
+        // carrying a null tag it sorts as equal and the resource_key tiebreak keeps
+        // the result stable, but the request is accepted and returns both rows.
+        let resp = server
+            .search_resources_impl(&Some(models::ResourceSearchQuery {
+                page: None,
+                sort: Some(vec![models::ResourceSearchQuerySortRequest {
+                    field: "versionTag".to_string(),
+                    order: Some(models::SortOrderEnum::Asc),
+                }]),
+                filter: Some(models::ResourceFilter {
+                    resource_id: Some(models::StringFilterProperty::String(
+                        "agent-prompt.md".to_string(),
+                    )),
+                    ..models::ResourceFilter::new()
+                }),
+            }))
+            .await
+            .expect("versionTag-sorted search returns a response");
+        let ResSearch::Status200_TheResourceSearchResult(tagged) = resp else {
+            panic!("expected a 200 resource search result for versionTag sort");
+        };
+        assert_eq!(
+            tagged.items.len(),
+            2,
+            "versionTag sort returns both projected versions"
+        );
+
+        // Get the latest version by key returns the v2 metadata.
+        let resp = server
+            .get_resource_impl(&models::GetResourcePathParams {
+                resource_key: key_v2.clone(),
+            })
+            .await
+            .expect("get returns a response");
+        let ResGet::Status200_TheResourceIsSuccessfullyReturned(got) = resp else {
+            panic!("expected a 200 resource get");
+        };
+        assert_eq!(got.version, 2);
+        assert_eq!(got.resource_id, "agent-prompt.md");
+
+        // The binary content endpoint serves the exact bytes of that version.
+        let resp = server
+            .get_resource_content_binary_impl(&models::GetResourceContentBinaryPathParams {
+                resource_key: key_v2.clone(),
+            })
+            .await
+            .expect("content returns a response");
+        let ContentGet::Status200_TheResourceContentIsSuccessfullyReturned(bytes) = resp else {
+            panic!("expected a 200 resource content");
+        };
+        assert_eq!(bytes.0, b"# v2\nDo the thing differently.".to_vec());
+
+        // The RPA (JSON) content endpoint rejects a generic resource with 406.
+        let resp = server
+            .get_resource_content_impl(&models::GetResourceContentPathParams {
+                resource_key: key_v2.clone(),
+            })
+            .await
+            .expect("content returns a response");
+        assert!(matches!(
+            resp,
+            RpaGet::Status406_TheResourceExistsButIsNotAnRPAResource(_)
+        ));
+
+        // Unknown / invalid keys are 404s.
+        assert!(matches!(
+            server
+                .get_resource_impl(&models::GetResourcePathParams {
+                    resource_key: "999999".to_string(),
+                })
+                .await
+                .unwrap(),
+            ResGet::Status404_AResourceWithTheGivenKeyWasNotFound(_)
+        ));
+        assert!(matches!(
+            server
+                .get_resource_impl(&models::GetResourcePathParams {
+                    resource_key: "not-a-key".to_string(),
+                })
+                .await
+                .unwrap(),
+            ResGet::Status404_AResourceWithTheGivenKeyWasNotFound(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn a_deployed_form_is_retrievable_via_get_form_by_key() {
         // Deploying a `.form` stores the raw form-js schema; the deploy result
         // carries the minted form metadata, and GetFormByKey serves the schema.
@@ -22120,6 +22600,7 @@ mod clustered_startup_tests {
                 Vec::new(),
                 &std::collections::HashMap::new(),
                 vec![form],
+                Vec::new(),
                 "<default>",
             )
             .await
@@ -22175,6 +22656,7 @@ mod clustered_startup_tests {
                     resource_name: "greeting.form".to_string(),
                     schema: schema_v2.to_string(),
                 }],
+                Vec::new(),
                 "<default>",
             )
             .await

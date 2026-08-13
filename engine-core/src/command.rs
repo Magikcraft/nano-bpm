@@ -32,6 +32,14 @@ pub enum Command {
     /// engine does not execute forms; it stores them so they can be served by
     /// `GetFormByKey`.
     DeployForms(Vec<FormResource>),
+    /// Atomically register one or more generic resources (any file that is not a
+    /// BPMN/DMN/form — e.g. a Markdown agent prompt) as a deployment. Each
+    /// resource is assigned a resource key and a per-`resource_id` version. For a
+    /// generic resource the `resource_id` is its filename (Zeebe parity: the
+    /// default resource transformer uses the resource name as the id). The engine
+    /// does not execute generic resources; it stores them verbatim so they can be
+    /// served by `GetResourceByKey` / searched by `resourceId`.
+    DeployGenericResources(Vec<GenericResource>),
     /// Mark a decision instance (all rows sharing a `decision_evaluation_key`) for
     /// deletion in the read model. `instance_key` is the owning process instance,
     /// carried so the emitted [`Event::DecisionInstanceDeleted`] is journaled and
@@ -378,6 +386,27 @@ pub struct FormResource {
     pub schema: String,
 }
 
+/// A generic resource (any deployed file that is not a BPMN process, DMN, or
+/// form — e.g. a Markdown agent prompt) to register in a
+/// [`Command::DeployGenericResources`]. The engine stores it verbatim; it does
+/// not parse or execute it beyond carrying its identity.
+///
+/// For a plain generic resource the `resource_id` equals `resource_name` (the
+/// filename), matching Zeebe's default resource transformer. A structured type
+/// could in principle parse a distinct id from the content, so the id is carried
+/// explicitly rather than re-derived here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct GenericResource {
+    /// The resource identifier used for versioning and lookup. For a generic
+    /// resource this is the filename (`resource_name`).
+    pub resource_id: String,
+    /// The deploy resource name (the filename, e.g. `agent-prompt.md`).
+    pub resource_name: String,
+    /// The verbatim resource content.
+    pub content: String,
+}
+
 /// One activation instruction of a [`Command::ModifyInstance`]: place a new
 /// token at `element_id`, first merging `variables` into the instance's root
 /// scope. (Zeebe's activate instruction also carries an ancestor-scope selector
@@ -434,6 +463,7 @@ impl Command {
             Command::DeployResources(_) => "deploy_resources",
             Command::DeployDecisionRequirements(_) => "deploy_decision_requirements",
             Command::DeployForms(_) => "deploy_forms",
+            Command::DeployGenericResources(_) => "deploy_generic_resources",
             Command::DeleteDecisionInstance { .. } => "delete_decision_instance",
             Command::CreateInstance { .. } => "create_instance",
             Command::CompleteJob { .. } => "complete_job",
