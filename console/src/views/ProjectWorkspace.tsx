@@ -2921,13 +2921,13 @@ function ConfigModal({
                 value={row.key}
                 onChange={(e) => setEnvRow(i, { key: e.target.value })}
                 placeholder="KEY"
-                className={`${inputCls} font-mono w-2/5`}
+                className={`${inputClass} font-mono w-2/5`}
               />
               <input
                 value={row.value}
                 onChange={(e) => setEnvRow(i, { value: e.target.value })}
                 placeholder="value"
-                className={`${inputCls} font-mono flex-1`}
+                className={`${inputClass} font-mono min-w-0 flex-1`}
               />
               <button
                 type="button"
