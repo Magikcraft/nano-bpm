@@ -922,26 +922,54 @@ pub struct State {
     #[cfg_attr(feature = "serde", serde(default))]
     pub created_by_process: HashMap<String, u64>,
     /// Latest deployed decision requirements graph (parsed `.dmn`), keyed by DRG
-    /// id. Versioned per DRG id across deployments, like processes.
+    /// id. Versioned per DRG id across deployments, like processes. A fast
+    /// latest-by-id index over [`State::decision_requirements_versions`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub decision_requirements: HashMap<String, DeployedDrg>,
+    /// Every deployed DRG version ever seen, keyed by its unique
+    /// decision-requirements key (so historical versions are retained, not
+    /// overwritten by a redeploy). A `businessRuleTask` binding pinned to a
+    /// specific version, or an EvaluateDecision by an older decision key,
+    /// resolves through here. `serde(default)` so pre-retention snapshots
+    /// deserialize empty and fall back to the latest-by-id index.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub decision_requirements_versions: HashMap<Key, DeployedDrg>,
     /// Latest deployed decision, keyed by decision id, for
     /// `businessRuleTask`/EvaluateDecision lookup. Points at the DRG it belongs
-    /// to so required-decision chains resolve.
+    /// to so required-decision chains resolve. A fast latest-by-id index over
+    /// [`State::decision_versions`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub decisions: HashMap<String, DeployedDecision>,
+    /// Every deployed decision version ever seen, keyed by its unique decision
+    /// key, so an EvaluateDecision request pinned to an older decision key can
+    /// still resolve the exact version. `serde(default)` for legacy snapshots.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub decision_versions: HashMap<Key, DeployedDecision>,
     /// Latest deployed form (`form-js` `.form` JSON), keyed by form id. Versioned
     /// per form id across deployments, like processes. The engine does not execute
-    /// forms; it retains them so `GetFormByKey` can serve the stored schema.
+    /// forms; it retains them so `GetFormByKey` can serve the stored schema. A
+    /// fast latest-by-id index over [`State::form_versions`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub forms: HashMap<String, DeployedForm>,
+    /// Every deployed form version ever seen, keyed by its unique form key, so a
+    /// `userTask` form binding pinned to a specific version resolves the exact
+    /// schema. `serde(default)` for legacy snapshots.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub form_versions: HashMap<Key, DeployedForm>,
     /// Latest deployed generic resource (any non-BPMN/DMN/form file, e.g. a
     /// Markdown agent prompt), keyed by `resource_id` (the filename). Versioned
     /// per `resource_id` across deployments, like forms. The engine does not
     /// execute generic resources; it retains them so `GetResourceByKey` and
-    /// `searchResources` can serve the stored content.
+    /// `searchResources` can serve the stored content. A fast latest-by-id index
+    /// over [`State::resource_versions`].
     #[cfg_attr(feature = "serde", serde(default))]
     pub resources: HashMap<String, DeployedResource>,
+    /// Every deployed generic-resource version ever seen, keyed by its unique
+    /// resource key, so a `zeebe:linkedResource` binding pinned to a specific
+    /// version (or an older key) resolves the exact content. `serde(default)`
+    /// for legacy snapshots.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub resource_versions: HashMap<Key, DeployedResource>,
 }
 
 /// A deployed decision requirements graph together with the identity the engine
@@ -1095,6 +1123,109 @@ impl State {
         self.processes
             .get(process_id)
             .filter(|d| d.version == version)
+    }
+
+    /// The exact deployed DRG identified by its unique `key`, if retained.
+    /// Checks the version-retention map first, then falls back to the
+    /// latest-by-id index for engines restored from pre-retention snapshots
+    /// (where `decision_requirements_versions` deserializes empty).
+    pub fn drg_by_key(&self, key: Key) -> Option<&DeployedDrg> {
+        if let Some(deployed) = self.decision_requirements_versions.get(&key) {
+            return Some(deployed);
+        }
+        self.decision_requirements.values().find(|d| d.key == key)
+    }
+
+    /// The exact deployed version of DRG `drg_id` with version number `version`,
+    /// if retained. Falls back to the latest-by-id index for pre-retention
+    /// snapshots (only the latest version is available there).
+    pub fn drg_version(&self, drg_id: &str, version: i32) -> Option<&DeployedDrg> {
+        if let Some(deployed) = self
+            .decision_requirements_versions
+            .values()
+            .find(|d| d.drg.id == drg_id && d.version == version)
+        {
+            return Some(deployed);
+        }
+        self.decision_requirements
+            .get(drg_id)
+            .filter(|d| d.version == version)
+    }
+
+    /// The exact deployed decision identified by its unique `key`, if retained.
+    /// Checks the version-retention map first, then falls back to the
+    /// latest-by-id index for pre-retention snapshots.
+    pub fn decision_by_key(&self, key: Key) -> Option<&DeployedDecision> {
+        if let Some(deployed) = self.decision_versions.get(&key) {
+            return Some(deployed);
+        }
+        self.decisions.values().find(|d| d.key == key)
+    }
+
+    /// The exact deployed version of decision `decision_id` with version number
+    /// `version`, if retained. Falls back to the latest-by-id index for
+    /// pre-retention snapshots.
+    pub fn decision_version(&self, decision_id: &str, version: i32) -> Option<&DeployedDecision> {
+        if let Some(deployed) = self
+            .decision_versions
+            .values()
+            .find(|d| d.decision_id == decision_id && d.version == version)
+        {
+            return Some(deployed);
+        }
+        self.decisions
+            .get(decision_id)
+            .filter(|d| d.version == version)
+    }
+
+    /// The exact deployed form identified by its unique `key`, if retained.
+    /// Checks the version-retention map first, then falls back to the
+    /// latest-by-id index for pre-retention snapshots.
+    pub fn form_by_key(&self, key: Key) -> Option<&DeployedForm> {
+        if let Some(deployed) = self.form_versions.get(&key) {
+            return Some(deployed);
+        }
+        self.forms.values().find(|f| f.key == key)
+    }
+
+    /// The exact deployed version of form `form_id` with version number
+    /// `version`, if retained. Falls back to the latest-by-id index for
+    /// pre-retention snapshots.
+    pub fn form_version(&self, form_id: &str, version: i32) -> Option<&DeployedForm> {
+        if let Some(deployed) = self
+            .form_versions
+            .values()
+            .find(|f| f.form_id == form_id && f.version == version)
+        {
+            return Some(deployed);
+        }
+        self.forms.get(form_id).filter(|f| f.version == version)
+    }
+
+    /// The exact deployed generic resource identified by its unique `key`, if
+    /// retained. Checks the version-retention map first, then falls back to the
+    /// latest-by-id index for pre-retention snapshots.
+    pub fn resource_by_key(&self, key: Key) -> Option<&DeployedResource> {
+        if let Some(deployed) = self.resource_versions.get(&key) {
+            return Some(deployed);
+        }
+        self.resources.values().find(|r| r.key == key)
+    }
+
+    /// The exact deployed version of resource `resource_id` with version number
+    /// `version`, if retained. Falls back to the latest-by-id index for
+    /// pre-retention snapshots.
+    pub fn resource_version(&self, resource_id: &str, version: i32) -> Option<&DeployedResource> {
+        if let Some(deployed) = self
+            .resource_versions
+            .values()
+            .find(|r| r.resource_id == resource_id && r.version == version)
+        {
+            return Some(deployed);
+        }
+        self.resources
+            .get(resource_id)
+            .filter(|r| r.version == version)
     }
 
     /// Count of jobs that represent *live* runnable congestion — `Created`
@@ -1258,14 +1389,26 @@ pub fn apply(state: &mut State, event: &Event) {
             drg,
             ..
         } => {
-            state.decision_requirements.insert(
-                drg.id.clone(),
-                DeployedDrg {
-                    key: *decision_requirements_key,
-                    version: *version,
-                    drg: drg.clone(),
-                },
-            );
+            let deployed = DeployedDrg {
+                key: *decision_requirements_key,
+                version: *version,
+                drg: drg.clone(),
+            };
+            // Retain every version by its unique key so a decision that
+            // references an older DRG (see the DecisionDeployed arm) resolves.
+            state
+                .decision_requirements_versions
+                .insert(*decision_requirements_key, deployed.clone());
+            // Maintain the latest-by-id index; the `>=` guard keeps an
+            // out-of-order durable copy from regressing the latest pointer.
+            let is_latest = state
+                .decision_requirements
+                .get(&drg.id)
+                .map(|existing| *version >= existing.version)
+                .unwrap_or(true);
+            if is_latest {
+                state.decision_requirements.insert(drg.id.clone(), deployed);
+            }
         }
 
         Event::DecisionDeployed {
@@ -1277,24 +1420,35 @@ pub fn apply(state: &mut State, event: &Event) {
             ..
         } => {
             // The DRG carrying this decision was applied by the preceding
-            // DecisionRequirementsDeployed event; look it up to bind for eval.
+            // DecisionRequirementsDeployed event; look it up by its exact key in
+            // the version-retention map (the latest-by-id index may already point
+            // at a newer DRG) to bind for eval.
             if let Some(drg) = state
-                .decision_requirements
-                .values()
-                .find(|d| d.key == *decision_requirements_key)
+                .decision_requirements_versions
+                .get(decision_requirements_key)
                 .map(|d| d.drg.clone())
             {
-                state.decisions.insert(
-                    decision_id.clone(),
-                    DeployedDecision {
-                        key: *decision_key,
-                        version: *version,
-                        decision_requirements_key: *decision_requirements_key,
-                        decision_id: decision_id.clone(),
-                        decision_name: decision_name.clone(),
-                        drg,
-                    },
-                );
+                let deployed = DeployedDecision {
+                    key: *decision_key,
+                    version: *version,
+                    decision_requirements_key: *decision_requirements_key,
+                    decision_id: decision_id.clone(),
+                    decision_name: decision_name.clone(),
+                    drg,
+                };
+                // Retain every version by its unique key so an EvaluateDecision
+                // pinned to an older decision key still resolves.
+                state
+                    .decision_versions
+                    .insert(*decision_key, deployed.clone());
+                let is_latest = state
+                    .decisions
+                    .get(decision_id)
+                    .map(|existing| *version >= existing.version)
+                    .unwrap_or(true);
+                if is_latest {
+                    state.decisions.insert(decision_id.clone(), deployed);
+                }
             }
         }
 
@@ -1306,16 +1460,24 @@ pub fn apply(state: &mut State, event: &Event) {
             schema,
             ..
         } => {
-            state.forms.insert(
-                form_id.clone(),
-                DeployedForm {
-                    key: *form_key,
-                    version: *version,
-                    form_id: form_id.clone(),
-                    resource_name: resource_name.clone(),
-                    schema: schema.clone(),
-                },
-            );
+            let deployed = DeployedForm {
+                key: *form_key,
+                version: *version,
+                form_id: form_id.clone(),
+                resource_name: resource_name.clone(),
+                schema: schema.clone(),
+            };
+            // Retain every version by its unique key so a form binding pinned to
+            // a specific version resolves.
+            state.form_versions.insert(*form_key, deployed.clone());
+            let is_latest = state
+                .forms
+                .get(form_id)
+                .map(|existing| *version >= existing.version)
+                .unwrap_or(true);
+            if is_latest {
+                state.forms.insert(form_id.clone(), deployed);
+            }
         }
 
         Event::GenericResourceDeployed {
@@ -1326,16 +1488,26 @@ pub fn apply(state: &mut State, event: &Event) {
             content,
             ..
         } => {
-            state.resources.insert(
-                resource_id.clone(),
-                DeployedResource {
-                    key: *resource_key,
-                    version: *version,
-                    resource_id: resource_id.clone(),
-                    resource_name: resource_name.clone(),
-                    content: content.clone(),
-                },
-            );
+            let deployed = DeployedResource {
+                key: *resource_key,
+                version: *version,
+                resource_id: resource_id.clone(),
+                resource_name: resource_name.clone(),
+                content: content.clone(),
+            };
+            // Retain every version by its unique key so a linked-resource binding
+            // pinned to a specific version (or an older key) resolves.
+            state
+                .resource_versions
+                .insert(*resource_key, deployed.clone());
+            let is_latest = state
+                .resources
+                .get(resource_id)
+                .map(|existing| *version >= existing.version)
+                .unwrap_or(true);
+            if is_latest {
+                state.resources.insert(resource_id.clone(), deployed);
+            }
         }
 
         Event::DecisionEvaluated { .. } => {

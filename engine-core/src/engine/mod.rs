@@ -457,66 +457,22 @@ impl Engine {
             if state::partition_of(max_key) == self.partition_id {
                 self.next_local = self.next_local.max(state::local_of(max_key));
             }
-            if let Event::ProcessDeployed { .. } = event {
-                // Always apply: the applier retains every version in
-                // `process_versions` and internally guards the latest-by-id
-                // index so an out-of-order (older) durable copy never regresses
-                // the latest pointer. Skipping older events here would drop
-                // historical versions that pinned instances still resolve.
+            if matches!(
+                event,
+                Event::ProcessDeployed { .. }
+                    | Event::DecisionRequirementsDeployed { .. }
+                    | Event::DecisionDeployed { .. }
+                    | Event::FormDeployed { .. }
+                    | Event::GenericResourceDeployed { .. }
+            ) {
+                // Always apply every deployment event: each applier retains every
+                // version in its `*_versions` map and internally guards the
+                // latest-by-id index with a `>=` check, so an out-of-order/older
+                // durable copy never regresses the latest pointer. The previous
+                // skip-older guard would drop historical versions that a
+                // version-pinned binding, a running instance, or an
+                // EvaluateDecision by an older key must still resolve.
                 state::apply(&mut self.state, event);
-            } else if let Event::DecisionRequirementsDeployed { drg, version, .. } = event {
-                let newer = self
-                    .state
-                    .decision_requirements
-                    .get(&drg.id)
-                    .map(|d| *version > d.version)
-                    .unwrap_or(true);
-                if newer {
-                    state::apply(&mut self.state, event);
-                }
-            } else if let Event::DecisionDeployed {
-                decision_id,
-                version,
-                ..
-            } = event
-            {
-                let newer = self
-                    .state
-                    .decisions
-                    .get(decision_id)
-                    .map(|d| *version > d.version)
-                    .unwrap_or(true);
-                if newer {
-                    state::apply(&mut self.state, event);
-                }
-            } else if let Event::FormDeployed {
-                form_id, version, ..
-            } = event
-            {
-                let newer = self
-                    .state
-                    .forms
-                    .get(form_id)
-                    .map(|f| *version > f.version)
-                    .unwrap_or(true);
-                if newer {
-                    state::apply(&mut self.state, event);
-                }
-            } else if let Event::GenericResourceDeployed {
-                resource_id,
-                version,
-                ..
-            } = event
-            {
-                let newer = self
-                    .state
-                    .resources
-                    .get(resource_id)
-                    .map(|r| *version > r.version)
-                    .unwrap_or(true);
-                if newer {
-                    state::apply(&mut self.state, event);
-                }
             }
         }
     }
@@ -933,12 +889,7 @@ impl Engine {
     ) -> Option<DecisionEvaluation> {
         let deployed = match (by_id, by_key) {
             (Some(id), _) => self.state.decisions.get(id)?.clone(),
-            (None, Some(key)) => self
-                .state
-                .decisions
-                .values()
-                .find(|d| d.key == key)?
-                .clone(),
+            (None, Some(key)) => self.state.decision_by_key(key)?.clone(),
             (None, None) => return None,
         };
         let result = crate::dmn::evaluate(&deployed.drg, &deployed.decision_id, variables);
