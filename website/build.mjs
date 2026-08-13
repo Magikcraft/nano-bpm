@@ -690,7 +690,7 @@ function compareHtml() {
     })
     .join("\n");
 
-  return `<section class="band compare wrap">
+  return `<section class="band compare wrap" id="compare">
   <h2>How Nano compares.</h2>
   <p class="compare-sub">The agent-tooling landscape spans desktop IDEs, terminal runtimes, and in-model
   scripting. Nano Workforce is the durable engine underneath — the one that keeps running when the
@@ -994,7 +994,8 @@ ${layers}
   </div>
   <p class="arch-note">Categories blur and vendors move fast &mdash; this is an indicative
   positioning map, not a scorecard. The point is the axis: single-agent tools operate one
-  session at a time; Nano Workforce coordinates many of them durably.</p>
+  session at a time; Nano Workforce coordinates many of them durably. For a head-to-head against
+  named orchestrators, see the <a href="/#compare">comparison on the home page</a>.</p>
 </section>
 
 <section class="arch-section wrap" id="complementary">
