@@ -8944,6 +8944,222 @@ fn deploy_generic_resources_mints_a_resource_key_versions_per_id_and_is_idempote
 }
 
 #[test]
+fn deploying_multiple_form_versions_retains_every_version_by_key() {
+    // Every deployed form version is retained under its own key in
+    // `form_versions`; the latest-by-id index tracks the highest version, and
+    // `form_by_key` / `form_version` resolve an OLD version.
+    use crate::command::FormResource;
+    let mut engine = Engine::new();
+    let form = |schema: &str| FormResource {
+        id: "f".to_string(),
+        resource_name: "f.form".to_string(),
+        schema: schema.to_string(),
+    };
+    let deploy = |engine: &mut Engine, schema: &str| -> (Key, i32) {
+        engine
+            .apply_command(Command::DeployForms(vec![form(schema)]))
+            .unwrap()
+            .iter()
+            .find_map(|e| match e {
+                Event::FormDeployed {
+                    form_key, version, ..
+                } => Some((*form_key, *version)),
+                _ => None,
+            })
+            .expect("a changed form emits FormDeployed")
+    };
+    let (k1, v1) = deploy(&mut engine, r#"{"id":"f","components":[]}"#);
+    let (k2, v2) = deploy(&mut engine, r#"{"id":"f","components":[{"key":"a"}]}"#);
+    let (k3, v3) = deploy(&mut engine, r#"{"id":"f","components":[{"key":"b"}]}"#);
+    assert_eq!((v1, v2, v3), (1, 2, 3));
+
+    let st = engine.state();
+    assert_eq!(st.form_versions.len(), 3, "all three versions are retained");
+    assert_eq!(st.form_by_key(k1).unwrap().version, 1, "old version by key");
+    assert_eq!(st.form_by_key(k2).unwrap().version, 2);
+    assert_eq!(
+        st.form_version("f", 1).unwrap().key,
+        k1,
+        "old by id+version"
+    );
+    assert_eq!(st.forms["f"].version, 3, "latest index tracks the newest");
+    assert_eq!(st.forms["f"].key, k3);
+}
+
+#[test]
+fn deploying_multiple_resource_versions_retains_every_version_by_key() {
+    // Every deployed generic-resource version is retained under its own key in
+    // `resource_versions`, resolvable via `resource_by_key` / `resource_version`
+    // even though the latest-by-id index only holds the newest.
+    use crate::command::GenericResource;
+    let mut engine = Engine::new();
+    let deploy = |engine: &mut Engine, content: &str| -> (Key, i32) {
+        engine
+            .apply_command(Command::DeployGenericResources(vec![GenericResource {
+                resource_id: "p.md".to_string(),
+                resource_name: "p.md".to_string(),
+                content: content.to_string(),
+            }]))
+            .unwrap()
+            .iter()
+            .find_map(|e| match e {
+                Event::GenericResourceDeployed {
+                    resource_key,
+                    version,
+                    ..
+                } => Some((*resource_key, *version)),
+                _ => None,
+            })
+            .expect("changed content emits GenericResourceDeployed")
+    };
+    let (k1, _) = deploy(&mut engine, "v1");
+    let (k2, _) = deploy(&mut engine, "v2");
+    let (k3, _) = deploy(&mut engine, "v3");
+
+    let st = engine.state();
+    assert_eq!(st.resource_versions.len(), 3);
+    assert_eq!(st.resource_by_key(k1).unwrap().content, "v1", "old by key");
+    assert_eq!(st.resource_by_key(k2).unwrap().content, "v2");
+    assert_eq!(st.resource_version("p.md", 1).unwrap().key, k1);
+    assert_eq!(st.resources["p.md"].version, 3, "latest tracks the newest");
+    assert_eq!(st.resources["p.md"].key, k3);
+}
+
+#[test]
+fn deploying_multiple_drg_versions_retains_every_version_and_evaluates_old_by_key() {
+    // Every DRG/decision version is retained by key; an EvaluateDecision pinned
+    // to an OLD decision key resolves and evaluates that exact version — the
+    // concrete regression the latest-only index could not serve.
+    let mut engine = Engine::new();
+    let deploy = |engine: &mut Engine| -> (Key, Key, i32) {
+        // (decision_requirements_key, decision_key, version)
+        let events = engine
+            .apply_command(Command::DeployDecisionRequirements(vec![greeting_dmn()]))
+            .unwrap();
+        let drg_key = events
+            .iter()
+            .find_map(|e| match e {
+                Event::DecisionRequirementsDeployed {
+                    decision_requirements_key,
+                    ..
+                } => Some(*decision_requirements_key),
+                _ => None,
+            })
+            .expect("DRG deployed");
+        let (dkey, ver) = events
+            .iter()
+            .find_map(|e| match e {
+                Event::DecisionDeployed {
+                    decision_key,
+                    version,
+                    ..
+                } => Some((*decision_key, *version)),
+                _ => None,
+            })
+            .expect("decision deployed");
+        (drg_key, dkey, ver)
+    };
+    // Deploy v1, then force a v2 by deploying a *changed* DRG (same id).
+    let (_drg1, decision_k1, v1) = deploy(&mut engine);
+    assert_eq!(v1, 1);
+    // A changed DRG: swap an output value so the content differs and versions.
+    let changed_xml = r##"<definitions xmlns="https://www.omg.org/spec/DMN/20191111/MODEL/" id="drg" name="drg">
+      <decision id="greeting" name="Greeting">
+        <decisionTable hitPolicy="UNIQUE">
+          <input id="i1"><inputExpression id="e1" typeRef="string"><text>lang</text></inputExpression></input>
+          <output id="o1" name="result" typeRef="string" />
+          <rule id="r1"><inputEntry id="ie1"><text>"en"</text></inputEntry>
+            <outputEntry id="oe1"><text>"hi"</text></outputEntry></rule>
+        </decisionTable>
+      </decision>
+    </definitions>"##;
+    let changed = engine
+        .apply_command(Command::DeployDecisionRequirements(vec![
+            crate::dmn::parse_dmn(changed_xml).unwrap(),
+        ]))
+        .unwrap();
+    let (decision_k2, v2) = changed
+        .iter()
+        .find_map(|e| match e {
+            Event::DecisionDeployed {
+                decision_key,
+                version,
+                ..
+            } => Some((*decision_key, *version)),
+            _ => None,
+        })
+        .expect("changed DRG redeploys the decision");
+    assert_eq!(v2, 2);
+    assert_ne!(decision_k1, decision_k2);
+
+    let st = engine.state();
+    assert_eq!(st.decision_versions.len(), 2, "both versions retained");
+    assert_eq!(st.decision_requirements_versions.len(), 2);
+    assert_eq!(st.decision_by_key(decision_k1).unwrap().version, 1);
+    assert_eq!(st.decisions["greeting"].version, 2, "latest tracks newest");
+
+    // Evaluate the OLD version by its key: it returns "hello" (v1), whereas the
+    // latest (v2) would return "hi". This is impossible without retention.
+    let inputs = vars(&[("lang", Value::Str("en".to_string()))]);
+    let old = engine
+        .evaluate_deployed_decision(None, Some(decision_k1), &inputs)
+        .expect("old decision resolves by key");
+    assert_eq!(old.version, 1);
+    assert_eq!(old.result.decision_output, Value::Str("hello".to_string()));
+
+    let latest = engine
+        .evaluate_deployed_decision(Some("greeting"), None, &inputs)
+        .expect("latest decision resolves by id");
+    assert_eq!(latest.version, 2);
+    assert_eq!(latest.result.decision_output, Value::Str("hi".to_string()));
+}
+
+#[test]
+#[cfg(feature = "serde")]
+fn version_retention_survives_a_snapshot_round_trip() {
+    // The `*_versions` maps are part of State, so a serde snapshot round-trip
+    // preserves every retained version.
+    use crate::command::{FormResource, GenericResource};
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployForms(vec![FormResource {
+            id: "f".to_string(),
+            resource_name: "f.form".to_string(),
+            schema: r#"{"id":"f","components":[]}"#.to_string(),
+        }]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployForms(vec![FormResource {
+            id: "f".to_string(),
+            resource_name: "f.form".to_string(),
+            schema: r#"{"id":"f","components":[{"key":"a"}]}"#.to_string(),
+        }]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployGenericResources(vec![GenericResource {
+            resource_id: "p.md".to_string(),
+            resource_name: "p.md".to_string(),
+            content: "v1".to_string(),
+        }]))
+        .unwrap();
+    engine
+        .apply_command(Command::DeployGenericResources(vec![GenericResource {
+            resource_id: "p.md".to_string(),
+            resource_name: "p.md".to_string(),
+            content: "v2".to_string(),
+        }]))
+        .unwrap();
+
+    let serialized = serde_json::to_vec(&engine.snapshot()).unwrap();
+    let restored = Engine::from_snapshot(serde_json::from_slice(&serialized).unwrap());
+    let restored = restored.state();
+    assert_eq!(restored.form_versions.len(), 2, "form versions round-trip");
+    assert_eq!(restored.resource_versions.len(), 2, "resource versions too");
+    assert_eq!(restored.forms["f"].version, 2);
+    assert_eq!(restored.resources["p.md"].version, 2);
+}
+
+#[test]
 fn business_rule_task_spreads_map_output_without_result_variable() {
     // A two-output decision table yields a map output; with no result variable
     // its entries are spread into the instance scope.
