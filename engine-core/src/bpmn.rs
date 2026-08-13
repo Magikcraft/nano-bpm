@@ -668,9 +668,26 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             // container element itself carries no attributes, so it
                             // needs no open/close state — only its children matter.
                             "linkedResource" => {
-                                if let (Some(&idx), Some(resource_id)) =
-                                    (io_stack.last(), attr(attrs, "resourceId"))
-                                {
+                                // Zeebe requires `resourceId`, `resourceType`
+                                // and `linkName` on every linkedResource; an
+                                // entry missing any of them is malformed, so we
+                                // skip it rather than fabricate empty-string
+                                // attributes that would surface as ambiguous
+                                // header entries at activation. Like the other
+                                // zeebe extension elements it attaches to the
+                                // innermost open activity and is retained only
+                                // where the built model keeps it (service tasks).
+                                if let (
+                                    Some(&idx),
+                                    Some(resource_id),
+                                    Some(resource_type),
+                                    Some(link_name),
+                                ) = (
+                                    io_stack.last(),
+                                    attr(attrs, "resourceId"),
+                                    attr(attrs, "resourceType"),
+                                    attr(attrs, "linkName"),
+                                ) {
                                     let binding_type = match attr(attrs, "bindingType") {
                                         Some("deployment") => crate::model::BindingType::Deployment,
                                         Some("versionTag") => crate::model::BindingType::VersionTag,
@@ -682,14 +699,10 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                         crate::model::LinkedResource {
                                             resource_id: resource_id.to_string(),
                                             binding_type,
-                                            resource_type: attr(attrs, "resourceType")
-                                                .unwrap_or("")
-                                                .to_string(),
+                                            resource_type: resource_type.to_string(),
                                             version_tag: attr(attrs, "versionTag")
                                                 .map(str::to_string),
-                                            link_name: attr(attrs, "linkName")
-                                                .unwrap_or("")
-                                                .to_string(),
+                                            link_name: link_name.to_string(),
                                         },
                                     );
                                 }

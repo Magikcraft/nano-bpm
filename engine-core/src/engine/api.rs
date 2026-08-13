@@ -1,34 +1,12 @@
 //! `impl Engine` methods: api concern (extracted from the monolithic engine module).
 
 use super::*;
+use crate::json::write_json_string;
 
 /// The custom-header key under which resolved [`crate::model::LinkedResource`]s are delivered
 /// to the worker (Zeebe `linkedResources`). The value is a JSON array of
 /// `{ resourceKey, resourceType, linkName }` objects.
 const LINKED_RESOURCES_HEADER: &str = "linkedResources";
-
-/// Appends `s` to `out` as a quoted, escaped JSON string. Kept local so
-/// engine-core stays dependency-free (the `ffi` module's copy is feature-gated).
-fn write_json_string(out: &mut String, s: &str) {
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\x08' => out.push_str("\\b"),
-            '\x0c' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                use core::fmt::Write as _;
-                let _ = write!(out, "\\u{:04x}", c as u32);
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-}
 
 impl Engine {
     /// Looks up a process instance.
@@ -214,12 +192,14 @@ impl Engine {
                     // parity). Resolution happens at activation, so a `latest`
                     // binding always reflects the newest deployed version at the
                     // moment the job is handed out. Unresolvable ids are omitted
-                    // (the id has no deployed resource yet).
-                    if !linked_resources.is_empty() {
-                        headers.insert(
-                            LINKED_RESOURCES_HEADER.to_string(),
-                            self.resolve_linked_resources(linked_resources),
-                        );
+                    // (the id has no deployed resource yet). The header is a
+                    // reserved, engine-computed key: when at least one id
+                    // resolves, the computed value deliberately wins over any
+                    // author-supplied `linkedResources` header. If nothing
+                    // resolves we insert nothing, so we neither emit a
+                    // surprising empty `[]` nor clobber the author's value.
+                    if let Some(resolved) = self.resolve_linked_resources(linked_resources) {
+                        headers.insert(LINKED_RESOURCES_HEADER.to_string(), resolved);
                     }
                     headers
                 }
@@ -261,7 +241,10 @@ impl Engine {
     /// deployed resource is skipped (the resulting header simply omits it),
     /// mirroring a worker that finds no key for that link. JSON is written by
     /// hand to keep engine-core dependency-free and its output deterministic.
-    fn resolve_linked_resources(&self, linked: &[crate::model::LinkedResource]) -> String {
+    ///
+    /// Returns `None` when nothing resolves so the caller emits no header at all
+    /// rather than a surprising empty `[]`.
+    fn resolve_linked_resources(&self, linked: &[crate::model::LinkedResource]) -> Option<String> {
         let mut json = String::from("[");
         let mut first = true;
         for link in linked {
@@ -284,8 +267,11 @@ impl Engine {
             write_json_string(&mut json, &link.link_name);
             json.push('}');
         }
+        if first {
+            return None;
+        }
         json.push(']');
-        json
+        Some(json)
     }
 
     /// making it activatable again. Like [`Engine::trigger_timers`], the host

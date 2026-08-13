@@ -1827,6 +1827,85 @@ fn activated_job_resolves_linked_resource_latest_binding_into_a_header() {
 }
 
 #[test]
+fn activated_job_omits_linked_resources_header_when_nothing_resolves() {
+    // When a service task declares linkedResources but NONE of the ids are
+    // deployed, the engine must emit no `linkedResources` header at all — not a
+    // surprising empty `[]` — and must not clobber any author-supplied header.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="run-agent" />
+              <zeebe:linkedResources>
+                <zeebe:linkedResource resourceId="missing.md" bindingType="latest"
+                                      resourceType="GenericScript" linkName="gone" />
+              </zeebe:linkedResources>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine.apply_command(Command::create_instance("p")).unwrap();
+    let activated = engine.activate_jobs("run-agent", "w1", 10, 60_000, 0);
+    assert_eq!(activated.len(), 1);
+    assert!(
+        !activated[0].custom_headers.contains_key("linkedResources"),
+        "no header when nothing resolves (not an empty array)"
+    );
+}
+
+#[test]
+fn bpmn_skips_linked_resource_missing_required_attributes() {
+    // resourceType and linkName are required by Zeebe; a linkedResource missing
+    // either is malformed and must be dropped at parse rather than fabricated
+    // with empty-string attributes that would surface as ambiguous entries.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:serviceTask id="agent">
+            <bpmn:extensionElements>
+              <zeebe:taskDefinition type="run-agent" />
+              <zeebe:linkedResources>
+                <zeebe:linkedResource resourceId="ok.md" resourceType="GenericScript"
+                                      linkName="prompt" />
+                <zeebe:linkedResource resourceId="no-type.md" linkName="x" />
+                <zeebe:linkedResource resourceId="no-name.md" resourceType="GenericScript" />
+              </zeebe:linkedResources>
+            </bpmn:extensionElements>
+          </bpmn:serviceTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
+          <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let ElementKind::ServiceTask {
+        linked_resources, ..
+    } = &def.element("agent").unwrap().kind
+    else {
+        panic!("agent is a service task");
+    };
+    assert_eq!(
+        linked_resources.len(),
+        1,
+        "only the well-formed entry survives"
+    );
+    assert_eq!(linked_resources[0].resource_id, "ok.md");
+    assert_eq!(linked_resources[0].resource_type, "GenericScript");
+    assert_eq!(linked_resources[0].link_name, "prompt");
+}
+
+#[test]
 fn inline_script_task_evaluates_feel_and_writes_result_variable() {
     // A zeebe:script script task evaluates its FEEL expression on activation,
     // stores the result under resultVariable, and passes straight through with

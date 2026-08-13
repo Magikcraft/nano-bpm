@@ -72,6 +72,7 @@
 mod command;
 mod engine;
 mod event;
+mod json;
 mod model;
 mod state;
 
