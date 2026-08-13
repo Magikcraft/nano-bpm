@@ -248,7 +248,6 @@ CREATE TABLE resources (
     version        INTEGER NOT NULL,
     version_tag    TEXT,
     content        TEXT NOT NULL,
-    deployment_key INTEGER NOT NULL DEFAULT 0,
     tenant_id      TEXT NOT NULL DEFAULT '<default>'
 );
 CREATE INDEX idx_resources_id ON resources(resource_id);
@@ -2754,12 +2753,12 @@ fn project_engine_state(
     for res in state.resources.values() {
         tx.cexecute(
             "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
-             version_tag, content, deployment_key, tenant_id) \
-             VALUES (?1, ?2, ?3, ?4, NULL, ?5, 0, ?6) \
+             version_tag, content, tenant_id) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
              ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
              resource_name = excluded.resource_name, version = excluded.version, \
              content = excluded.content, tenant_id = excluded.tenant_id",
-            // `tenant_id`/`deployment_key` are not modeled in engine state.
+            // `tenant_id` is not modeled in engine state; default to '<default>'.
             params![
                 res.key as i64,
                 res.resource_id,
@@ -3807,31 +3806,29 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
         }
 
         Event::GenericResourceDeployed {
-            deployment_key,
             resource_key,
             version,
             resource_id,
             resource_name,
             content,
+            ..
         } => {
             // One row per deployed generic-resource version, keyed by its unique
             // resource_key so GetResourceByKey resolves every version. The upsert
             // is idempotent on a journal replay.
             tx.cexecute(
                 "INSERT INTO resources (resource_key, resource_id, resource_name, version, \
-                 version_tag, content, deployment_key, tenant_id) \
-                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7) \
+                 version_tag, content, tenant_id) \
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6) \
                  ON CONFLICT(resource_key) DO UPDATE SET resource_id = excluded.resource_id, \
                  resource_name = excluded.resource_name, version = excluded.version, \
-                 content = excluded.content, deployment_key = excluded.deployment_key, \
-                 tenant_id = excluded.tenant_id",
+                 content = excluded.content, tenant_id = excluded.tenant_id",
                 params![
                     *resource_key as i64,
                     resource_id,
                     resource_name,
                     version,
                     content,
-                    *deployment_key as i64,
                     "<default>",
                 ],
             )?;
