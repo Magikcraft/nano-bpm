@@ -8431,7 +8431,7 @@ impl ServerImpl {
             }
         };
 
-        match self.store.resource_by_key(key) {
+        match self.store.resource_by_key_meta(key) {
             Some(row) => Ok(Resp::Status200_TheResourceIsSuccessfullyReturned(
                 resource_result(&row),
             )),
@@ -8529,9 +8529,9 @@ impl ServerImpl {
         use apis::resource::SearchResourcesResponse as Resp;
 
         let filter = body.as_ref().and_then(|q| q.filter.as_ref());
-        let rows = self.store.resources();
+        let rows = self.store.resources_meta();
 
-        let mut matched: Vec<&readstore::ResourceRow> = rows
+        let mut matched: Vec<&readstore::ResourceMetaRow> = rows
             .iter()
             .filter(|row| match filter {
                 None => true,
@@ -8566,7 +8566,7 @@ impl ServerImpl {
             |row| row.resource_key,
         );
 
-        let sorted: Vec<(u64, &readstore::ResourceRow)> = matched
+        let sorted: Vec<(u64, &readstore::ResourceMetaRow)> = matched
             .into_iter()
             .map(|row| (row.resource_key, row))
             .collect();
@@ -15358,7 +15358,7 @@ fn decision_requirements_result(
     )
 }
 
-fn resource_result(row: &readstore::ResourceRow) -> models::ResourceResult {
+fn resource_result(row: &readstore::ResourceMetaRow) -> models::ResourceResult {
     let version_tag = match &row.version_tag {
         Some(t) => types::Nullable::Present(t.clone()),
         None => types::Nullable::Null,

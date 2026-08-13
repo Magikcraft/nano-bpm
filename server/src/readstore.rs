@@ -676,6 +676,23 @@ pub struct ResourceRow {
     pub tenant_id: String,
 }
 
+/// The metadata-only projection of a generic-resource row — every column of
+/// [`ResourceRow`] except the (potentially large) `content` blob. Used by the
+/// list/search path (`searchResources`), whose response returns only metadata,
+/// so it never pays to read `content` for every projected version. Full content
+/// is reserved for the by-key endpoints (`getResource*`), mirroring how process
+/// definitions list only `key/process_id/version` and fetch the BPMN `xml`
+/// separately by key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResourceMetaRow {
+    pub resource_key: Key,
+    pub resource_id: String,
+    pub resource_name: String,
+    pub version: i32,
+    pub version_tag: Option<String>,
+    pub tenant_id: String,
+}
+
 /// WAL autocheckpoint threshold in pages for the read-model store. Default 12288
 /// (~48 MiB at the 4 KiB page size), 12x SQLite's built-in 1000, chosen to
 /// coalesce repeated dirties of hot pages before they are copied back into the
@@ -1800,17 +1817,32 @@ impl ReadStore {
         .expect("query resource_by_key")
     }
 
-    /// Every projected generic-resource row (one per deployed version). Callers
-    /// apply search filters / sort / pagination in the gateway.
-    pub fn resources(&self) -> Vec<ResourceRow> {
+    /// Metadata (no `content`) for a single generic resource by key, for the
+    /// by-key metadata endpoint (`getResource`), which returns no content.
+    pub fn resource_by_key_meta(&self, key: Key) -> Option<ResourceMetaRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!("SELECT {RESOURCE_META_COLS} FROM resources WHERE resource_key = ?1"),
+            params![key as i64],
+            map_resource_meta,
+        )
+        .optional()
+        .expect("query resource_by_key_meta")
+    }
+
+    /// Metadata (no `content`) for every projected generic-resource row, for the
+    /// list/search path. Omits the `content` blob so a search over many/large
+    /// resources does not read every version's full body. Callers apply search
+    /// filters / sort / pagination in the gateway.
+    pub fn resources_meta(&self) -> Vec<ResourceMetaRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {RESOURCE_COLS} FROM resources ORDER BY resource_key"
+                "SELECT {RESOURCE_META_COLS} FROM resources ORDER BY resource_key"
             ))
-            .expect("prepare resources");
-        stmt.query_map([], map_resource)
-            .expect("query resources")
+            .expect("prepare resources_meta");
+        stmt.query_map([], map_resource_meta)
+            .expect("query resources_meta")
             .filter_map(Result::ok)
             .collect()
     }
@@ -2082,8 +2114,20 @@ impl ReadModel {
         None
     }
 
-    pub fn resources(&self) -> Vec<ResourceRow> {
-        self.shards.iter().flat_map(|s| s.resources()).collect()
+    pub fn resource_by_key_meta(&self, key: Key) -> Option<ResourceMetaRow> {
+        for s in &self.shards {
+            if let Some(row) = s.resource_by_key_meta(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    pub fn resources_meta(&self) -> Vec<ResourceMetaRow> {
+        self.shards
+            .iter()
+            .flat_map(|s| s.resources_meta())
+            .collect()
     }
 
     pub fn process_instances(&self) -> Vec<ProcessInstanceRow> {
@@ -2466,6 +2510,20 @@ fn map_resource(r: &rusqlite::Row) -> rusqlite::Result<ResourceRow> {
         version_tag: r.get(4)?,
         content: r.get(5)?,
         tenant_id: r.get(6)?,
+    })
+}
+
+const RESOURCE_META_COLS: &str =
+    "resource_key, resource_id, resource_name, version, version_tag, tenant_id";
+
+fn map_resource_meta(r: &rusqlite::Row) -> rusqlite::Result<ResourceMetaRow> {
+    Ok(ResourceMetaRow {
+        resource_key: r.get::<_, i64>(0)? as Key,
+        resource_id: r.get(1)?,
+        resource_name: r.get(2)?,
+        version: r.get(3)?,
+        version_tag: r.get(4)?,
+        tenant_id: r.get(5)?,
     })
 }
 /// Serializes an engine [`Value`] to the serialized-JSON string Camunda uses on
