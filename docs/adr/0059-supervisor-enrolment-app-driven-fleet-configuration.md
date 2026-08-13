@@ -1,7 +1,29 @@
 # ADR 0059 — Supervisor enrolment: app-driven fleet configuration
 
-Status: **Proposed.**
+Status: **Proposed** (revised 2026-08-14 — enrolment is **per-worker**, not per-machine; see Revision).
 Date: 2026-08-13.
+
+## Revision (2026-08-14): enrolment is per-worker, not per-machine
+
+The first draft of this ADR (below) made **capability per-machine**: one capability per box, with the
+**supervisor** as the single enrolment principal. **That is reversed.** An operator must be able to run
+**several workers of differing capability on the same machine** — e.g. a heavy `opus` worker *and* a
+local `qwen` worker side by side. So:
+
+- **Capability and enrolment are per-worker** (per `nano work` / per hire profile), preserving ADR 0056
+  §9's per-worker `REGISTER`/`SERVE` granularity. A machine is **not** limited to one capability.
+- The **supervisor is a fleet runner** — it spawns/restarts/reports N workers of possibly-differing
+  capability; it is **not** the single-capability enrolment identity. Each worker enrols itself.
+- Everything else this ADR adds is **kept**, just re-grained to per-worker: the **app owns vocab +
+  demand** and resolves capability × demand → SERVE; the **endpoint contract** (`/vocab`, `/enrol`+
+  stream, `/registry`); the **demand × supply board**; the operator's **scope/trim** and **concurrency**
+  authority. "Point a supervisor at an app and the app drives what gets served" still holds — the unit
+  driven is the **worker**, and a machine may run many.
+
+Read the Decision below with capability/enrolment scoped to the **worker**, and "the supervisor enrols on
+the machine's behalf / one capability per machine" replaced by "each worker enrols itself; the supervisor
+runs many." The producer/consumer split lives in the epics: **agent visibility** (jwulf/c8ctl-plugin-nano#38,
+ADR 0056) is separate from **networks enrolment** (jwulf/c8ctl-plugin-nano#58, this ADR).
 
 Relates to:
 ADR 0056 (`0056-agent-relay-command-stream-plane.md`, the Nano agentic protocol — this ADR **lifts**
@@ -51,11 +73,12 @@ the right work by hand. Discoverability ("what can I serve, and what needs servi
 
 ## Decision
 
-Add **supervisor enrolment**: an operator points a machine's supervisor at an **Urban app's enrolment
-endpoint** — *"work on this"* — and the **app drives that machine's fleet configuration.** The
-supervisor declares the machine's capability once, subscribes to one or more apps' demand, and
-reconciles its `nano work` children to exactly the tokens those apps resolve for this machine. This is
-0056's `REGISTER`/`SERVE`, **lifted from per-worker to per-machine and made multi-app.**
+Add **app-driven enrolment**: an operator points a **worker** at an **Urban app's enrolment endpoint**
+— *"work on this"* — and the **app drives what that worker serves.** The worker declares its capability,
+subscribes to one or more apps' demand, and reconciles its `nano work` pollers to exactly the tokens
+those apps resolve for it. This is 0056's per-worker `REGISTER`/`SERVE` **made app-driven and multi-app.**
+A machine runs **many such workers** (of possibly-differing capability) via the supervisor, which is a
+**fleet runner**, not a single-capability enrolment principal.
 
 The engine and its transport are untouched — this is entirely app-tier, above the frozen C8 core, and
 the `nano work` children remain dumb 1:1 engine pollers.
@@ -72,12 +95,14 @@ c8ctl nano supervisor unenrol http://host:8080/apps/annotate   # drain
 `unenrol` gracefully drains the pollers that only that app demanded. Enrolment is **per machine**, held
 by the supervisor daemon — not per `nano work` child.
 
-### 2. Declare the machine's capability once
+### 2. Declare each worker's capability
 
-The machine has **one capability**, not a per-role profile: `{ family, cognition, weight, host }`
-(e.g. `{ family: opus, cognition: frontier, weight: heavy, host: mac-studio }`). A pre-existing hire's
-`rank`/`capabilities` may *become* the machine capability, so the two models coexist during migration.
-Capability is declared to the app at enrol and **never appears in a routing token** (ADR 0056 §7).
+**Each worker** declares **its own** capability: `{ family, cognition, weight, host }`
+(e.g. `{ family: opus, cognition: frontier, weight: heavy, host: mac-studio }`). A machine may run
+**several workers with different capabilities** at once (the supervisor spawns them); `host` is shared,
+the rest is per-worker. A pre-existing hire's `rank`/`capabilities` may *become* a worker's capability,
+so the two models coexist during migration. Capability is declared to the app at enrol and **never
+appears in a routing token** (ADR 0056 §7).
 
 ### 3. The app resolves demand × capability → served tokens
 
@@ -92,17 +117,18 @@ app        → supervisor: SERVE  [ resolved leaf tokens for THIS machine ]   (+
 supervisor → engine (per token): activateJobs(<token>)   # unchanged dumb pollers
 ```
 
-### 4. The supervisor merges apps and reconciles its fleet
+### 4. Each worker enrols itself; the supervisor runs the fleet
 
-A machine may be enrolled against **several apps at once.** The supervisor **merges** every app's SERVE
-list into a single deduped desired-token set and reconciles its `nano work` children to it — spawning
-pollers for added tokens, draining pollers for removed tokens — reusing the **existing profile-watch
-reconcile loop** (`diffJobTypes` + `reconcile`), lifted from "one profile's matrix" to "the union of my
-enrolled apps' SERVE lists." A SERVE push from **any** enrolled app re-triggers the same reconcile that
-a local profile edit triggers today.
+**Each worker** opens its own enrolment session(s) and reconciles **its own** pollers to the SERVE set(s)
+it receives, reusing the **existing profile-watch reconcile loop** (`diffJobTypes` + `reconcile`) per
+worker. A worker may enrol against **several apps at once** and merge their SERVE lists into its deduped
+desired-token set; a SERVE push from any enrolled app re-triggers the same reconcile a local profile edit
+triggers today.
 
-This keeps hub connections at **machines × apps**, not workers × apps: the supervisor enrols on the
-machine's behalf and owns the children; the children never talk to a hub.
+The **supervisor** is the **fleet runner**: it spawns/restarts/reports the machine's workers — possibly
+of differing capability — but does not itself hold a single machine capability or enrol on the workers'
+behalf. Hub connections are therefore at **workers × apps** (ADR 0056 §9), which is what lets one machine
+present multiple distinct capabilities to the same or different apps.
 
 ### 5. Concurrency is the operator's call, via the supervisor
 
@@ -142,6 +168,11 @@ enrolled"* in red; *"`planning.spar` seats are both `opus` — diversity degrade
 operator's answer to *"what needs serving, and what can I serve?"* is one screen, spanning all apps.
 
 ## Worked example — two apps, three machines
+
+> **Per the Revision:** capability is per **worker**. Below, each machine's single line is the common
+> case of one worker per machine, but a machine may run **several workers of differing capability** (e.g.
+> `mac-studio` could also run a local `qwen` **standard** worker alongside its `opus` **frontier** one);
+> each worker enrols itself and the supervisor runs them all.
 
 **App A — `nano-workforce`** (the coding crew, ADR 0051). Vocab (excerpt):
 
@@ -207,7 +238,7 @@ POST /apps/<app>/enrol { capability, host }
 GET  /apps/<app>/registry                 → demand × supply (for the console board)
 ```
 
-`enrol` is idempotent per (app, machine); the stream delivers a fresh `serve` set on any demand/vocab/
+`enrol` is idempotent per (app, worker); the stream delivers a fresh `serve` set on any demand/vocab/
 fleet change. The supervisor holds one session per enrolled app, intersects each `serve` with the
 operator's scope (§6), unions across apps, and reconciles.
 
