@@ -3,6 +3,8 @@ import { useSearchParams } from "react-router-dom";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { getInstance, listInstances, type Instance } from "../gen";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
+import { usePaneResize } from "../lib/usePaneResize";
+import { ResizeHandle } from "../components/ResizeHandle";
 import InstanceDetail from "./InstanceDetail";
 import { Badge, Button } from "../components/ui";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
@@ -85,6 +87,21 @@ export default function Explorer() {
   const [selected, setSelected] = useState<string | null>(null);
   const [page, setPage] = useState(0);
   const [searchParams, setSearchParams] = useSearchParams();
+
+  // Resizable, reload-persistent process list (the left column). The user can
+  // drag it narrower to give the model/detail pane more room; the width is
+  // stored under `nano.explorer.listWidth` and re-clamped so the right pane
+  // always keeps a usable minimum.
+  const listResize = usePaneResize({
+    storageKey: "nano.explorer.listWidth",
+    axis: "x",
+    initial: 448, // matches the previous fixed w-[28rem]
+    min: 256,
+    max: () =>
+      typeof window === "undefined"
+        ? 640
+        : Math.max(320, window.innerWidth - 480),
+  });
 
   // Allow deep-linking to a specific instance (e.g. from the modeler's "Start
   // instance" success link): ?instance=<key> preselects it, then the param is
@@ -181,7 +198,10 @@ export default function Explorer() {
 
   return (
     <div className="flex h-full">
-      <div className="flex w-[28rem] shrink-0 flex-col border-r border-edge">
+      <div
+        style={{ width: listResize.size }}
+        className="flex shrink-0 flex-col"
+      >
         <header
           data-tour={TOUR_ANCHOR.explorerInspect}
           className="border-b border-edge px-5 py-4"
@@ -256,6 +276,17 @@ export default function Explorer() {
           </footer>
         )}
       </div>
+
+      <ResizeHandle
+        axis="x"
+        label="Resize the process list"
+        onPointerDown={listResize.onPointerDown}
+        onKeyDown={listResize.onKeyDown}
+        dragging={listResize.dragging}
+        size={listResize.size}
+        min={listResize.min}
+        max={listResize.max}
+      />
 
       <div className="min-w-0 flex-1 overflow-auto">
         {selected ? (

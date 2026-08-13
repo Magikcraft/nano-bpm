@@ -9,6 +9,8 @@ import {
 import { fetchProcessXml } from "../lib/api";
 import { isCancellable, cancelConfirmMessage } from "../lib/instanceActions";
 import { useLiveInvalidation } from "../lib/useLiveInvalidation";
+import { usePaneResize } from "../lib/usePaneResize";
+import { ResizeHandle } from "../components/ResizeHandle";
 import BpmnViewer from "../components/BpmnViewer";
 import { fmtClock, fmtDuration } from "../components/TraceTimeline";
 import { Badge, Button, Input, SectionLabel } from "../components/ui";
@@ -23,6 +25,20 @@ export default function InstanceDetail({
   const qc = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+
+  // Resizable, reload-persistent model space. Dragging the divider below the
+  // BPMN diagram taller gives the model more room and shrinks the variables/
+  // detail area beneath it; the height is stored under `nano.explorer.modelHeight`.
+  const modelResize = usePaneResize({
+    storageKey: "nano.explorer.modelHeight",
+    axis: "y",
+    initial: 288, // matches the previous fixed h-72
+    min: 144,
+    max: () =>
+      typeof window === "undefined"
+        ? 640
+        : Math.max(200, window.innerHeight - 280),
+  });
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["instance", instanceKey],
@@ -134,13 +150,24 @@ export default function InstanceDetail({
 
       {/* bg-white is intentional: the BPMN diagram canvas is a physical white
           "sheet" regardless of theme. */}
-      <div className="h-72 shrink-0 border-b border-edge bg-white">
+      <div style={{ height: modelResize.size }} className="shrink-0 bg-white">
         <BpmnViewer
           xml={xml ?? null}
           activeElementIds={activeEls}
           incidentElementIds={incidentEls}
         />
       </div>
+
+      <ResizeHandle
+        axis="y"
+        label="Resize the model space"
+        onPointerDown={modelResize.onPointerDown}
+        onKeyDown={modelResize.onKeyDown}
+        dragging={modelResize.dragging}
+        size={modelResize.size}
+        min={modelResize.min}
+        max={modelResize.max}
+      />
 
       <div className="min-h-0 flex-1 overflow-auto p-8">
         {actionError && (
