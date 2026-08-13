@@ -267,9 +267,10 @@ impl Settings {
 /// The seeded default when no settings file exists. Ships ready-to-run **local llama.cpp
 /// sidecar** profiles spanning a size spread for two model families — **Gemma 4** (E2B / E4B /
 /// 12B / 26B-A4B / 31B) and **Qwen** (Qwen3 4B / 8B / 32B / Coder 30B-A3B and Qwen 3.6 35B-A3B) —
-/// plus **Ornith 1.0** (9B / 35B, coding-specialised) — from a ~4 GB monitor up to a ~64 GB
+/// plus **Ornith 1.0** (9B / 35B, coding-specialised) and **Nemotron 3.5 Lightning** (30B-A3B,
+/// tool-heavy agent execution) — from a ~4 GB monitor up to a ~64 GB
 /// flagship, plus a coding-tuned variant (a RAM hint is in
-/// each name). Each is given its **own port** (8888–8899) so two can run side by side — a primary
+/// each name). Each is given its **own port** (8888–8900) so two can run side by side — a primary
 /// plus a sparring-partner / monitor.
 /// The operator picks one as active and presses Start. Models download/cache to the shared models
 /// directory ([`default_models_dir`]).
@@ -389,6 +390,20 @@ fn seeded() -> Settings {
                 8899,
                 32768,
             ),
+            // Nemotron 3.5 Lightning — NVIDIA's 30B-A3B hybrid-reasoning MoE built for
+            // high-volume, tool-heavy agent execution (~20GB at UD-Q4). Ships MTP
+            // prediction heads, so it runs with `--mtp` self-speculative decoding for
+            // the fast repeated calls it is designed for.
+            LlmProfile {
+                mtp: true,
+                ..local(
+                    "nemotron-35-lightning-local",
+                    "Nemotron 3.5 Lightning 30B-A3B · local (needs 24GB)",
+                    "unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF:UD-Q4_K_XL",
+                    8900,
+                    32768,
+                )
+            },
         ],
         active_profile: Some("gemma-4-local".to_string()),
         python_bin: None,
@@ -813,7 +828,7 @@ mod tests {
         let store = store_in(&tmp);
         let v = store.view();
         // Ships ready-to-run local sidecar models across a size spread, with RAM hints in the name.
-        assert_eq!(v.profiles.len(), 12);
+        assert_eq!(v.profiles.len(), 13);
         assert_eq!(v.active_profile.as_deref(), Some("gemma-4-local"));
         assert!(v.profiles.iter().all(|p| p.sidecar));
         // Every sidecar gets its own port so several can run side by side.
@@ -828,6 +843,18 @@ mod tests {
         assert_eq!(gemma.base_url.as_deref(), Some("http://127.0.0.1:8888/v1"));
         assert!(gemma.model_file.as_deref().unwrap().contains("gemma-4"));
         assert!(v.profiles.iter().any(|p| p.name.contains("64GB")));
+        // Nemotron 3.5 Lightning ships with MTP heads, so its sidecar enables `--mtp`.
+        let nemotron = v
+            .profiles
+            .iter()
+            .find(|p| p.id == "nemotron-35-lightning-local")
+            .unwrap();
+        assert!(nemotron.mtp);
+        assert!(nemotron
+            .model_file
+            .as_deref()
+            .unwrap()
+            .contains("NVIDIA-Nemotron-3.5-Lightning-30B-A3B"));
         // A non-empty default models dir is surfaced for the UI to prefill.
         assert!(!v.default_models_dir.is_empty());
         let _ = std::fs::remove_dir_all(&tmp);
