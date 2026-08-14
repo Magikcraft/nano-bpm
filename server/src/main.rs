@@ -27474,6 +27474,48 @@ mod subscription_placement_tests {
     }
 
     #[tokio::test]
+    async fn rest_deploy_rejects_linked_resource_missing_resource_type_with_400() {
+        // Magikcraft/nano-bpm#767: a `zeebe:linkedResource` omitting the
+        // Zeebe-required `resourceType` was silently dropped (deploy 200, empty
+        // `linkedResources` header at activation). Real Zeebe rejects the
+        // deployment with INVALID_ARGUMENT -> HTTP 400; Nano must match. The
+        // deploy path turns the parser's validation error into a 400 with an
+        // actionable problem detail, not a 200 that discards the link.
+        const BPMN_MISSING_RESOURCE_TYPE: &str = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="agent-proc">
+              <bpmn:startEvent id="s" />
+              <bpmn:serviceTask id="run-agent">
+                <bpmn:extensionElements>
+                  <zeebe:taskDefinition type="run-agent" />
+                  <zeebe:linkedResources>
+                    <zeebe:linkedResource resourceId="x.md" bindingType="latest" linkName="prompt" />
+                  </zeebe:linkedResources>
+                </bpmn:extensionElements>
+              </bpmn:serviceTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="run-agent" />
+              <bpmn:sequenceFlow id="b" sourceRef="run-agent" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let server = single_node_multi_partition();
+        let (status, detail) = server
+            .deploy_centralized(
+                vec![("agent.bpmn".into(), BPMN_MISSING_RESOURCE_TYPE.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect_err("a linkedResource missing resourceType must be rejected, not silently dropped");
+        assert_eq!(status, 400, "Zeebe maps INVALID_ARGUMENT to HTTP 400");
+        assert!(
+            detail.contains("run-agent") && detail.contains("resourceType"),
+            "the problem detail names the offending task and attribute, got: {detail}"
+        );
+    }
+
+    #[tokio::test]
     async fn cross_partition_message_catch_completes_via_the_pump() {
         let server = single_node_multi_partition();
         assert_eq!(server.engine.all().len(), 4, "node owns all 4 partitions");

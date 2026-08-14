@@ -74,6 +74,14 @@ pub enum ParseError {
     /// `messageEventDefinition`) referenced a `message` that was not declared, or
     /// the declared message had no `zeebe:subscription correlationKey`.
     InvalidMessageEvent { process_id: String, reason: String },
+    /// A `zeebe:linkedResource` omitted a Zeebe-required attribute
+    /// (`resourceId`, `bindingType` or `resourceType`). Zeebe rejects such a
+    /// deployment (`INVALID_ARGUMENT` → HTTP 400) rather than silently dropping
+    /// the link, so Nano surfaces it as a hard parse error for parity.
+    InvalidLinkedResource {
+        task_id: String,
+        attribute: String,
+    },
 }
 
 impl std::fmt::Display for ParseError {
@@ -97,6 +105,12 @@ impl std::fmt::Display for ParseError {
             }
             ParseError::InvalidMessageEvent { process_id, reason } => {
                 write!(f, "invalid message event in process {process_id}: {reason}")
+            }
+            ParseError::InvalidLinkedResource { task_id, attribute } => {
+                write!(
+                    f,
+                    "linkedResource on '{task_id}' is missing required attribute '{attribute}'"
+                )
             }
         }
     }
@@ -682,30 +696,38 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "linkedResource" if in_linked_resources => {
-                                // Zeebe requires `resourceId`, `resourceType`
-                                // and `linkName` on every linkedResource; an
-                                // entry missing any of them is malformed, so we
-                                // skip it rather than fabricate empty-string
-                                // attributes that would surface as ambiguous
-                                // header entries at activation. Like the other
+                                // Zeebe's design-time validator requires
+                                // `resourceId`, `bindingType` and `resourceType`
+                                // (each non-empty) on every linkedResource. A
+                                // link missing any of them is a hard deploy
+                                // error: Zeebe rejects it with
+                                // `INVALID_ARGUMENT` (HTTP 400) rather than
+                                // silently dropping the link and leaving the
+                                // task's `linkedResources` header empty at
+                                // activation. Nano matches that parity here.
+                                // `linkName` is intentionally *not* required
+                                // (Zeebe's required set omits it); when absent it
+                                // resolves to an empty link name. Like the other
                                 // zeebe extension elements it attaches to the
                                 // innermost open activity and is retained only
                                 // where the built model keeps it (service tasks).
-                                if let (
-                                    Some(&idx),
-                                    Some(resource_id),
-                                    Some(resource_type),
-                                    Some(link_name),
-                                ) = (
-                                    io_stack.last(),
-                                    attr(attrs, "resourceId"),
-                                    attr(attrs, "resourceType"),
-                                    attr(attrs, "linkName"),
-                                ) {
-                                    let binding_type = match attr(attrs, "bindingType") {
+                                if let Some(&idx) = io_stack.last() {
+                                    let nonempty =
+                                        |a: &str| attr(attrs, a).filter(|v| !v.is_empty());
+                                    for required in ["resourceId", "bindingType", "resourceType"] {
+                                        if nonempty(required).is_none() {
+                                            return Err(ParseError::InvalidLinkedResource {
+                                                task_id: acc.nodes[idx].id.clone(),
+                                                attribute: required.to_string(),
+                                            });
+                                        }
+                                    }
+                                    let resource_id = nonempty("resourceId").unwrap_or("");
+                                    let resource_type = nonempty("resourceType").unwrap_or("");
+                                    let binding_type = match nonempty("bindingType") {
                                         Some("deployment") => crate::model::BindingType::Deployment,
                                         Some("versionTag") => crate::model::BindingType::VersionTag,
-                                        // `latest` and any unknown/omitted value
+                                        // `latest` and any other non-empty value
                                         // default to latest (Zeebe's default).
                                         _ => crate::model::BindingType::Latest,
                                     };
@@ -716,7 +738,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                             resource_type: resource_type.to_string(),
                                             version_tag: attr(attrs, "versionTag")
                                                 .map(str::to_string),
-                                            link_name: link_name.to_string(),
+                                            link_name: attr(attrs, "linkName")
+                                                .unwrap_or("")
+                                                .to_string(),
                                         },
                                     );
                                 }
