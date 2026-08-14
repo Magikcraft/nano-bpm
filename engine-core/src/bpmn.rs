@@ -722,11 +722,20 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                             });
                                         }
                                     }
-                                    let resource_id = nonempty("resourceId").unwrap_or("");
-                                    let resource_type = nonempty("resourceType").unwrap_or("");
-                                    let binding_type = match nonempty("bindingType") {
-                                        Some("deployment") => crate::model::BindingType::Deployment,
-                                        Some("versionTag") => crate::model::BindingType::VersionTag,
+                                    // The required-attribute loop above already
+                                    // guaranteed each of these is present and
+                                    // non-empty, so unwrap the invariant rather
+                                    // than falling back to "" (a dead branch that
+                                    // would only mask a future validation bug).
+                                    let resource_id = nonempty("resourceId")
+                                        .expect("resourceId validated non-empty above");
+                                    let resource_type = nonempty("resourceType")
+                                        .expect("resourceType validated non-empty above");
+                                    let binding_type = match nonempty("bindingType")
+                                        .expect("bindingType validated non-empty above")
+                                    {
+                                        "deployment" => crate::model::BindingType::Deployment,
+                                        "versionTag" => crate::model::BindingType::VersionTag,
                                         // `latest` and any other non-empty value
                                         // default to latest (Zeebe's default).
                                         _ => crate::model::BindingType::Latest,
