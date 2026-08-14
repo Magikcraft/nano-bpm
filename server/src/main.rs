@@ -27474,7 +27474,7 @@ mod subscription_placement_tests {
     }
 
     #[tokio::test]
-    async fn rest_deploy_rejects_linked_resource_missing_resource_type_with_400() {
+    async fn deploy_rejects_linked_resource_missing_resource_type_with_400() {
         // Magikcraft/nano-bpm#767: a `zeebe:linkedResource` omitting the
         // Zeebe-required `resourceType` was silently dropped (deploy 200, empty
         // `linkedResources` header at activation). Real Zeebe rejects the
