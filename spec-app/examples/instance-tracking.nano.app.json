@@ -29,6 +29,19 @@
         }
       },
       "pollMs": 15000
+    },
+    {
+      "table": "feature_runs",
+      "keyField": "process_key",
+      "statusField": "status",
+      "terminalStatuses": ["done", "abandoned", "failed"],
+      "onTerminated": {
+        "set": {
+          "status": "abandoned",
+          "open_task_id": null
+        }
+      },
+      "pollMs": 15000
     }
   ]
 }

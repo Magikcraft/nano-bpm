@@ -115,6 +115,59 @@ test("instanceTracking with statusField + activeStatuses is coherent", () => {
   assert.deepEqual(codesFor(result, "/instanceTracking/0/activeStatuses"), []);
 });
 
+test("instanceTracking terminalStatuses without statusField is incoherent", () => {
+  const m = manifest();
+  m.instanceTracking = [
+    {
+      table: "feature_runs",
+      keyField: "process_key",
+      terminalStatuses: ["done"], // no statusField to read them from
+      onTerminated: { set: { status: "abandoned" } },
+    },
+  ];
+  const result = validateManifest(m);
+  assert.equal(result.ok, false);
+  assert.deepEqual(
+    codesFor(result, "/instanceTracking/0/terminalStatuses"),
+    ["instance-tracking-incoherent"],
+  );
+});
+
+test("instanceTracking with statusField + terminalStatuses is coherent (fail-open)", () => {
+  const m = manifest();
+  m.instanceTracking = [
+    {
+      table: "feature_runs",
+      keyField: "process_key",
+      statusField: "status",
+      terminalStatuses: ["done", "abandoned", "failed"],
+      onTerminated: { set: { status: "abandoned" } },
+    },
+  ];
+  const result = validateManifest(m);
+  assert.equal(result.ok, true);
+  assert.deepEqual(codesFor(result, "/instanceTracking/0/terminalStatuses"), []);
+});
+
+test("instanceTracking activeStatuses and terminalStatuses are mutually exclusive", () => {
+  const m = manifest();
+  m.instanceTracking = [
+    {
+      table: "feature_runs",
+      keyField: "process_key",
+      statusField: "status",
+      activeStatuses: ["running"],
+      terminalStatuses: ["done"],
+      onTerminated: { set: { status: "abandoned" } },
+    },
+  ];
+  const result = validateManifest(m);
+  assert.equal(result.ok, false);
+  // The JSON-Schema `not` guard rejects the combination first (fails closed on
+  // schema before intra-manifest rules run).
+  assert.ok(result.diagnostics.some((d) => d.code === "schema"));
+});
+
 // ── Domain type registry (ADR 0029 §4 / ADR 0031) ─────────────────────────────
 import { resolveDomainTypes } from "../src/domain-types.ts";
 

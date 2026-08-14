@@ -247,16 +247,32 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
     }
   }
 
-  // instanceTracking[]: `activeStatuses` selects rows by their `statusField`, so
-  // declaring statuses without the column to read them against is incoherent —
-  // the runtime would have no field to filter on and would poll every row. Flag
-  // it here rather than let the mismatch surface as a silent full-table scan.
+  // instanceTracking[]: `activeStatuses`/`terminalStatuses` select rows by their
+  // `statusField`, so declaring statuses without the column to read them against
+  // is incoherent — the runtime would have no field to filter on and would poll
+  // every row. Flag it here rather than let the mismatch surface as a silent
+  // full-table scan. The two selectors are also mutually exclusive: one is an
+  // allow-list (fail-closed), the other an exclusion-list (fail-open).
   const tracking: any[] = manifest.instanceTracking ?? [];
   tracking.forEach((t, i) => {
     if (t?.activeStatuses != null && t?.statusField == null) {
       push(
         `/instanceTracking/${i}/activeStatuses`,
         "activeStatuses requires statusField (the column those statuses are read from)",
+        "instance-tracking-incoherent",
+      );
+    }
+    if (t?.terminalStatuses != null && t?.statusField == null) {
+      push(
+        `/instanceTracking/${i}/terminalStatuses`,
+        "terminalStatuses requires statusField (the column those statuses are read from)",
+        "instance-tracking-incoherent",
+      );
+    }
+    if (t?.activeStatuses != null && t?.terminalStatuses != null) {
+      push(
+        `/instanceTracking/${i}/terminalStatuses`,
+        "activeStatuses and terminalStatuses are mutually exclusive (allow-list vs. exclusion-list); set only one",
         "instance-tracking-incoherent",
       );
     }
