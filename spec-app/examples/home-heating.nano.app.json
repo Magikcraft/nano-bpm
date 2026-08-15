@@ -9,8 +9,7 @@
   "models": {
     "processes": ["processes/*.bpmn"],
     "decisions": ["decisions/*.dmn"],
-    "forms": ["forms/*.form"],
-    "templates": ["prompts/*.md"]
+    "forms": ["forms/*.form"]
   },
 
   "data": {

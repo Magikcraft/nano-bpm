@@ -203,12 +203,11 @@
     "models": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Glob references to the models the editors produce (ADR 0027 §2). Each glob must resolve to at least one file (cross-reference rule, ADR 0027 §4).",
+      "description": "OPTIONAL override of the deploy-by-convention layout (ADR 0062). By convention an app keeps its deployables under `resources/` (the deploy root): Urban walks `resources/` and infers content-types by extension, and codegen defaults its BPMN scan to `resources/**/*.bpmn` (and `.dmn`). Docs live outside `resources/`; the tree is one level deep by convention. Declare `models` only for advanced/non-standard layouts where the convention does not fit — each subkey then overrides the corresponding convention default. Each glob must resolve to at least one file (cross-reference rule, ADR 0027 §4).",
       "properties": {
-        "processes": { "$ref": "#/$defs/globList", "description": "BPMN process globs." },
-        "decisions": { "$ref": "#/$defs/globList", "description": "DMN decision globs." },
-        "forms": { "$ref": "#/$defs/globList", "description": "form-js form globs." },
-        "templates": { "$ref": "#/$defs/globList", "description": "`{{name}}` template sources substituted into model resources at deploy time (e.g. `prompts/*.md`). A template's name is its file stem (`prompts/review-round.md` → `{{review-round}}`)." }
+        "processes": { "$ref": "#/$defs/globList", "description": "BPMN process globs. Overrides the convention default (`resources/**/*.bpmn`)." },
+        "decisions": { "$ref": "#/$defs/globList", "description": "DMN decision globs. Overrides the convention default (`resources/**/*.dmn`)." },
+        "forms": { "$ref": "#/$defs/globList", "description": "form-js form globs. Overrides the convention default (form files under `resources/`)." }
       }
     },
     "globList": {

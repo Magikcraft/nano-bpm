@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "id": "models-templates-removed",
+  "name": "models.templates removed by ADR 0062",
+  "models": {
+    "processes": ["processes/*.bpmn"],
+    "templates": ["prompts/*.md"]
+  }
+}

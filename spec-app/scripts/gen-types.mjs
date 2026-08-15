@@ -9,7 +9,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { compileFromFile } from "json-schema-to-typescript";
+import { compile } from "json-schema-to-typescript";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const specDir = join(here, "..");
@@ -26,12 +26,40 @@ const banner = `/**
  */
 `;
 
+// json-schema-to-typescript escapes the block-comment terminator `*/` inside
+// JSDoc by inserting a space (`*/` -> `* /`), which mangles glob defaults such
+// as `resources/**/*.bpmn` into the misleading `resources/** /*.bpmn`. Pre-escape
+// `*/` in every `description` as `*\/` instead: that sequence contains no `*/`
+// (so it never terminates the comment and the library leaves it untouched), and
+// the emitted JSDoc reads `resources/**\/*.bpmn` — a backslash before the slash
+// rather than a glob-breaking space. That keeps the `**/` and `*.bpmn` segments
+// visually contiguous so the glob stays unambiguous for TS consumers.
+function escapeGlobsInDescriptions(node) {
+  if (Array.isArray(node)) {
+    for (const item of node) escapeGlobsInDescriptions(item);
+    return;
+  }
+  if (node && typeof node === "object") {
+    for (const [key, value] of Object.entries(node)) {
+      if (key === "description" && typeof value === "string") {
+        node[key] = value.replace(/\*\//g, "*\\/");
+      } else {
+        escapeGlobsInDescriptions(value);
+      }
+    }
+  }
+}
+
+const schema = JSON.parse(readFileSync(schemaPath, "utf8"));
+escapeGlobsInDescriptions(schema);
+
 const ts =
   banner +
-  (await compileFromFile(schemaPath, {
+  (await compile(schema, schema.title, {
     bannerComment: "",
     additionalProperties: false,
     style: { singleQuote: false },
+    cwd: specDir,
   }));
 
 const check = process.argv.includes("--check");

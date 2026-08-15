@@ -64,6 +64,37 @@ test("network block rejects unknown keys (additionalProperties: false)", () => {
   assert.ok(result.diagnostics.every((d) => d.code === "schema"));
 });
 
+test("a manifest with no `models` key validates (deploy-by-convention, ADR 0062)", async () => {
+  const index = await buildSymbolIndex(models);
+  const m = manifest();
+  delete m.models;
+  const result = validateManifest(m, index);
+  assert.deepEqual(result.diagnostics, []);
+  assert.equal(result.ok, true);
+});
+
+test("`models.templates` is rejected (removed by ADR 0062)", () => {
+  const m = manifest();
+  m.models = { ...m.models, templates: ["prompts/*.md"] };
+  const result = validateManifest(m);
+  assert.equal(result.ok, false);
+  assert.ok(result.diagnostics.every((d) => d.code === "schema"));
+  assert.ok(result.diagnostics.some((d) => d.pointer.startsWith("/models")));
+});
+
+test("`models.processes|decisions|forms` overrides still validate", async () => {
+  const index = await buildSymbolIndex(models);
+  const m = manifest();
+  m.models = {
+    processes: ["processes/*.bpmn"],
+    decisions: ["decisions/*.dmn"],
+    forms: ["forms/*.form"],
+  };
+  const result = validateManifest(m, index);
+  assert.deepEqual(result.diagnostics, []);
+  assert.equal(result.ok, true);
+});
+
 test("unknown process / message / decision are rejected with pointers", async () => {
   const index = await buildSymbolIndex(models);
   const m = manifest();
