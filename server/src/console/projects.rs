@@ -3339,27 +3339,32 @@ async fn gen_with_urban(name: &str, urban: &Path, no_models: bool) -> Result<(),
 /// shape and toolkit availability so the routing invariant is unit-testable in
 /// isolation (mirrors [`super::RegenPath`] for `urban gen`).
 #[cfg_attr(test, derive(Debug, PartialEq, Eq))]
-pub enum DataGatewayPath {
-    /// Urban-shaped app with a resolvable toolkit: the shared, read-only
-    /// `urban data` op gateway — the ADR-0053 target seam.
+enum DataGatewayPath {
+    /// Urban-shaped app with a resolvable, `data`-capable toolkit: the shared
+    /// `urban data` op gateway — the ADR-0053 target seam. Serves the
+    /// datasource's full read *and* write ops (the panel's every read/write);
+    /// only persisting derivation is withheld (that stays with `urban gen`).
     UrbanData,
     /// The console's embedded `data-cli.ts`, materialised and spawned locally.
     /// Taken by legacy-shaped apps (no `nano.app.json`) and — *transitionally*
-    /// (#522 slice b) — by an Urban app whose toolkit doesn't yet resolve, so the
-    /// Data panel keeps working before the marketplace pack ships a `urban`
-    /// carrying the `data` op. Slice c retires this fallback (and deletes the
-    /// vendored `data-cli.ts`) once the pack guarantees the toolkit.
+    /// (#522 slice b) — by an Urban app whose toolkit doesn't yet resolve *or is
+    /// too old to carry the `data` op*, so the Data panel keeps working before the
+    /// marketplace pack ships a `urban` carrying `data`. Slice c retires this
+    /// fallback (and deletes the vendored `data-cli.ts`) once the pack guarantees
+    /// the toolkit.
     Embedded,
 }
 
 /// The #522 dry-out routing rule for datasource ops, factored out as a pure
 /// function so the invariant is unit-testable in isolation (mirrors
 /// [`super::RegenPath`] for `urban gen`): an Urban-shaped app runs through the
-/// shared `urban data` gateway **when the toolkit resolves**, and otherwise
-/// falls back to the embedded `data-cli.ts` during the transition; a legacy app
-/// always keeps the embedded gateway.
-pub fn data_gateway_path(is_urban: bool, urban_available: bool) -> DataGatewayPath {
-    match (is_urban, urban_available) {
+/// shared `urban data` gateway **when a `data`-capable toolkit resolves**, and
+/// otherwise falls back to the embedded `data-cli.ts` during the transition; a
+/// legacy app always keeps the embedded gateway. `urban_data_available` folds
+/// both "an `urban` resolves" and "it carries the `data` op" (probed at the call
+/// site via [`super::urban::urban_supports_data`]).
+fn data_gateway_path(is_urban: bool, urban_data_available: bool) -> DataGatewayPath {
+    match (is_urban, urban_data_available) {
         (true, true) => DataGatewayPath::UrbanData,
         _ => DataGatewayPath::Embedded,
     }
@@ -3427,7 +3432,7 @@ async fn pipe_data_gateway(
 
 /// Run one datasource operation for `project`. The seam depends on the project
 /// shape (#522 dry-out slice b, ADR 0052/0053): an **Urban-shaped app**
-/// (`nano.app.json`) routes every op to the shared, read-only `urban data`
+/// (`nano.app.json`) routes every op to the shared `urban data`
 /// gateway — the host never materialises or spawns the vendored
 /// `nano-generated/data-cli.ts` for it, and persisting derivation stays with
 /// `urban gen` (the one deriver). A **legacy** project keeps the embedded
@@ -3510,21 +3515,32 @@ pub async fn run_data_op(
     let dir = dunce::canonicalize(&dir).unwrap_or(dir);
 
     // #522 dry-out slice (b): an Urban-shaped app's data seam is the shared
-    // toolkit's read-only `urban data` op gateway — not the console's embedded,
-    // vendored `data-cli.ts`. When the app's own `@nanobpm/urban` (project-local,
-    // pack, or PATH — #776 `find_urban_for`) resolves, every op runs through it.
-    // Persisting derivation is deliberately NOT done here: it stays with `urban
-    // gen` (the one deriver, ADR 0053) via `regenerate_domain_types`, so this path
-    // carries only read-only DB ops + the `write:false` composer preview. During
-    // the transition — before the marketplace pack ships a `urban` carrying the
-    // `data` op — an Urban app whose toolkit doesn't yet resolve keeps working via
-    // the embedded fallback; slice c retires that fallback (and deletes
-    // `data-cli.ts`) once the pack guarantees the toolkit.
+    // toolkit's `urban data` op gateway — not the console's embedded, vendored
+    // `data-cli.ts`. When the app's own `@nanobpm/urban` (project-local, pack, or
+    // PATH — #776 `find_urban_for`) resolves *and* carries the `data` op, every op
+    // runs through it. Persisting derivation is deliberately NOT done here: it
+    // stays with `urban gen` (the one deriver, ADR 0053) via
+    // `regenerate_domain_types`, so this path carries the datasource's own read
+    // *and* write DB ops + the `write:false` composer preview, but never
+    // re-derives/persists types. During the transition — before the marketplace
+    // pack ships a `urban` carrying the `data` op — an Urban app whose toolkit
+    // doesn't yet resolve (or is too old for `data`) keeps working via the
+    // embedded fallback; slice c retires that fallback (and deletes `data-cli.ts`)
+    // once the pack guarantees the toolkit.
     let is_urban = dir.join("nano.app.json").is_file();
     let urban = if is_urban {
         super::urban::find_urban_for(&dir)
     } else {
         None
+    };
+    // Gate the `urban data` route on the toolkit actually carrying the `data` op
+    // (not merely resolving): an older `urban` found via PATH/project-local
+    // install that predates the gateway must fall back to the embedded
+    // `data-cli.ts` rather than fail — additive + non-regressing, mirroring the
+    // `urban_supports_derive` gate for `gen`/`derive`.
+    let urban = match urban {
+        Some(u) if super::urban::urban_supports_data(&u).await => Some(u),
+        _ => None,
     };
     match data_gateway_path(is_urban, urban.is_some()) {
         DataGatewayPath::UrbanData => {
@@ -10941,11 +10957,13 @@ mod tests {
         assert_eq!(data_gateway_path(false, true), DataGatewayPath::Embedded);
     }
 
-    /// #522 slice (b) end-to-end: an Urban-shaped app whose toolkit resolves runs
-    /// its data ops through `urban data` (spawned in the project dir) — the host
-    /// never materialises or spawns the vendored `data-cli.ts`. A stub `urban`
-    /// (via `NANOBPMN_URBAN_BIN`) that drains stdin and replies `{ok:true,…}`
-    /// stands in for the pack's toolkit so this needs no real `@nanobpm/urban`.
+    /// #522 slice (b) end-to-end: an Urban-shaped app whose toolkit resolves *and*
+    /// carries the `data` op runs its data ops through `urban data` (spawned in the
+    /// project dir) — the host never materialises or spawns the vendored
+    /// `data-cli.ts`. A stub `urban` (via `NANOBPMN_URBAN_BIN`) advertises `urban
+    /// data` in `--help` (so the capability probe passes), drains stdin and replies
+    /// `{ok:true,…}`, standing in for the pack's toolkit so this needs no real
+    /// `@nanobpm/urban`.
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
@@ -10961,12 +10979,13 @@ mod tests {
         )
         .unwrap();
 
-        // The stub records its subcommand (`data`) + CWD, drains the request on
-        // stdin, and emits the gateway's `{ok:true,…}` reply with a routing marker.
+        // The stub advertises the `urban data` op in `--help` (so the capability
+        // probe routes here), records its subcommand (`data`) + CWD, drains the
+        // request on stdin, and emits the gateway's `{ok:true,…}` reply.
         let stub = root.join("urban-data-stub.sh");
         write_urban_stub(
             &stub,
-            "cat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"urban-data\"}\\n'\n",
+            "case \"$*\" in *--help*) printf 'urban data — datasource op gateway\\n'; exit 0;; esac\ncat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"urban-data\"}\\n'\n",
         );
         unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
 
@@ -10992,6 +11011,61 @@ mod tests {
             !dir.join(GEN_DIR).join("data-cli.ts").exists(),
             "embedded data-cli.ts must not be materialised for an Urban app"
         );
+    }
+
+    /// #522 slice (b): an Urban-shaped app whose resolved `urban` *predates* the
+    /// `data` op (its `--help` advertises only `gen`/`run`) must fall back to the
+    /// embedded gateway rather than be routed to a `urban data` it can't serve —
+    /// additive + non-regressing, mirroring the `urban_supports_derive` gate. The
+    /// capability probe is what makes this fallback happen, so the stub is never
+    /// spawned as `data` in the project dir.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn run_data_op_falls_back_to_embedded_when_urban_lacks_data_op() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "urban-old-toolkit-app";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"urban-old-toolkit-app"}"#,
+        )
+        .unwrap();
+
+        // A pre-`data` toolkit: `--help` lists only `gen`/`run`. Were it ever
+        // (wrongly) routed to as `urban data`, it would write the `data` sentinel
+        // in the project dir + reply with the urban marker — both asserted absent.
+        let stub = root.join("urban-old-stub.sh");
+        write_urban_stub(
+            &stub,
+            "case \"$*\" in *--help*) printf 'urban gen [--check]\\nurban run\\n'; exit 0;; esac\ncat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"urban-data\"}\\n'\n",
+        );
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+
+        let res = run_data_op(name, serde_json::json!({ "op": "schema" })).await;
+
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+
+        // The capability probe saw no `urban data` in `--help`, so routing fell
+        // back to the embedded gateway: the stub was never spawned as `data` in
+        // the project dir (a `data` invocation sets `current_dir(&dir)` and would
+        // have written the sentinel there — the `--help` probe writes elsewhere).
+        assert!(
+            !dir.join("urban-ran.txt").exists(),
+            "urban stub must not be invoked as `data` when it lacks the data op"
+        );
+        // The response is therefore never the urban stub's marker reply (whether
+        // the embedded path then succeeds or errors depends on the host runtime,
+        // which is irrelevant to the routing decision under test).
+        if let Ok(val) = &res {
+            assert_ne!(
+                val.get("routed").and_then(|v| v.as_str()),
+                Some("urban-data"),
+                "op must not be served by the urban stub when it lacks the data op"
+            );
+        }
     }
 
     #[tokio::test]

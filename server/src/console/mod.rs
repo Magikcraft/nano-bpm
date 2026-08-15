@@ -4429,10 +4429,11 @@ pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiRes
         // Persist via the one deriver. This branch is already gated on
         // `urban_available_for(&d)`, so the toolkit *is* present — a failure here
         // is a real `urban gen` error (invalid manifest/models, toolkit error
-        // output), not a dependency outage. Map it to `500 INTERNAL_SERVER_ERROR`
-        // and reserve `503 SERVICE_UNAVAILABLE` for the pre-check/routing decision
-        // (the `urban_ready == false` path), so clients don't retry a genuine
-        // failure as if the toolkit were merely unreachable.
+        // output), not a dependency outage, so map it to `500 INTERNAL_SERVER_ERROR`
+        // rather than `503`. There is no `503 SERVICE_UNAVAILABLE` path here: an
+        // unresolved toolkit doesn't error out — the `urban_ready == false` branch
+        // falls back to the embedded write path above — so clients never see a
+        // transient-outage status for a genuine gen failure.
         projects::gen_via_urban(name)
             .await
             .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, m))?;

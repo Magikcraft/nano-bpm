@@ -198,12 +198,48 @@ pub(crate) fn urban_available_for(project_dir: &Path) -> bool {
 /// `urban derive --stdout`; `regenerate_domain_types` → `urban gen --no-models`)
 /// gate on this so an older toolkit that predates derivation falls back to the
 /// console's embedded Deno driver / bare `urban gen` — additive + non-regressing,
-/// exactly like #530. The result is memoised per binary path since a given
-/// binary's help output is stable for the process lifetime (a pack upgrade
-/// installs a new path, or the server restarts).
+/// exactly like #530. Derived from the memoised [`urban_help_text`] read, so the
+/// binary is spawned at most once regardless of how many capabilities we gate on.
 pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
+    urban_help_text(urban)
+        .await
+        .as_deref()
+        .map(help_indicates_derive)
+        .unwrap_or(false)
+}
+
+/// Whether a resolved `urban` binary carries the **`urban data` op gateway** —
+/// the ADR-0053 shared datasource seam (#522 slice b). A **capability probe, not
+/// a version check** (same rationale as [`urban_supports_derive`]): probing
+/// `urban --help` survives forks, backports and out-of-band installs.
+///
+/// The `run_data_op` seam gates on this so an Urban app whose resolved toolkit
+/// predates the `data` op falls back to the console's embedded `data-cli.ts`
+/// instead of failing — additive + non-regressing, exactly like the derive gate.
+/// Without it, an older `urban` found via `PATH`/project-local install would be
+/// routed to `urban data`, fail, and never reach the still-working embedded
+/// fallback. Derived from the memoised [`urban_help_text`] read.
+pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
+    urban_help_text(urban)
+        .await
+        .as_deref()
+        .map(help_indicates_data)
+        .unwrap_or(false)
+}
+
+/// The `urban --help` text for a resolved binary (stdout + stderr concatenated,
+/// `NO_COLOR`), memoised per binary path. This is the **single** place a toolkit
+/// is spawned to probe its capabilities: every `urban_supports_*` gate derives
+/// its answer from this one cached read via a pure `help_indicates_*` predicate,
+/// so a given binary is probed at most once no matter how many capabilities we
+/// front — no per-capability cache to drift out of sync. Memoisation is safe
+/// because a binary's help output is stable for the process lifetime (a pack
+/// upgrade installs a new path, or the server restarts). `None` means the binary
+/// could not be run.
+async fn urban_help_text(urban: &Path) -> Option<String> {
     use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, bool>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<String>>>> =
+        OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     // Recover from a poisoned mutex rather than propagating the panic: the lock
     // only guards a tiny insert/get (no user code runs under it), so a poisoned
@@ -213,11 +249,11 @@ pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(urban)
-        .copied()
+        .cloned()
     {
         return hit;
     }
-    let supported = tokio::process::Command::new(urban)
+    let help = tokio::process::Command::new(urban)
         .arg("--help")
         .env("NO_COLOR", "1")
         .kill_on_drop(true)
@@ -227,14 +263,13 @@ pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
         .map(|o| {
             let mut help = String::from_utf8_lossy(&o.stdout).into_owned();
             help.push_str(&String::from_utf8_lossy(&o.stderr));
-            help_indicates_derive(&help)
-        })
-        .unwrap_or(false);
+            help
+        });
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(urban.to_path_buf(), supported);
-    supported
+        .insert(urban.to_path_buf(), help.clone());
+    help
 }
 
 /// Pure predicate over `urban --help` text: does this toolkit expose model
@@ -249,6 +284,16 @@ pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
 /// toolkit.
 fn help_indicates_derive(help: &str) -> bool {
     help.contains("--no-models") && (help.contains("--stdout") || help.contains("urban derive"))
+}
+
+/// Pure predicate over `urban --help` text: does this toolkit expose the shared
+/// `urban data` op gateway (#522 slice b, ADR 0053)? Matches the `urban data`
+/// usage/subcommand marker — the same "subcommand appears in help" shape as the
+/// `urban derive` half of [`help_indicates_derive`]. A pre-`data` toolkit lists
+/// only `gen`/`run`, so this stays false and routing falls back to the embedded
+/// gateway.
+fn help_indicates_data(help: &str) -> bool {
+    help.contains("urban data")
 }
 
 #[cfg(test)]
@@ -432,5 +477,27 @@ urban — build and run Urban apps (nano.app.json)
         assert!(help_indicates_derive(
             "gen [--no-models]\nurban derive [--stdout]"
         ));
+    }
+
+    #[test]
+    fn help_indicates_data_discriminates_new_from_old_toolkit() {
+        // A pre-`data` toolkit lists only `gen`/`run` — no `urban data` gateway,
+        // so routing must fall back to the embedded `data-cli.ts`.
+        let old_help = "\
+urban — build and run Urban apps (nano.app.json)
+  urban gen [--check]               derive artifacts (migrations, worker-io)
+  urban run                         materialize + serve the app";
+        assert!(
+            !help_indicates_data(old_help),
+            "old help must not be read as data-op-capable"
+        );
+
+        // The `data`-capable toolkit (#522 slice b) lists the `urban data` op
+        // gateway subcommand.
+        let new_help = "\
+urban — build and run Urban apps (nano.app.json)
+  urban gen [--check]               derive artifacts (migrations, worker-io)
+  urban data                        run a datasource op through the gateway";
+        assert!(help_indicates_data(new_help));
     }
 }
