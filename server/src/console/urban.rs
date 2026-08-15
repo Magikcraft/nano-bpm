@@ -198,8 +198,10 @@ pub(crate) fn urban_available_for(project_dir: &Path) -> bool {
 /// `urban derive --stdout`; `regenerate_domain_types` → `urban gen --no-models`)
 /// gate on this so an older toolkit that predates derivation falls back to the
 /// console's embedded Deno driver / bare `urban gen` — additive + non-regressing,
-/// exactly like #530. Derived from the memoised [`urban_help_text`] read, so the
-/// binary is spawned at most once regardless of how many capabilities we gate on.
+/// exactly like #530. Derived from the memoised [`urban_help_text`] read, so we
+/// never re-spawn the binary per capability we gate on (see its doc for the
+/// bounded, benign duplication when several *concurrent first* calls race before
+/// the cache warms).
 pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
     urban_help_text(urban)
         .await

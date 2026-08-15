@@ -3417,10 +3417,12 @@ async fn pipe_data_gateway(
             (true, false) => stdout.to_string(),
             (true, true) => String::new(),
         };
-        return Err(DataError::Gateway(format!(
-            "data gateway exited {}: {}",
-            out.status, detail
-        )));
+        let base = format!("data gateway exited {}", out.status);
+        return Err(DataError::Gateway(if detail.is_empty() {
+            base
+        } else {
+            format!("{base}: {detail}")
+        }));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut val: serde_json::Value = serde_json::from_str(text.trim())
@@ -11078,6 +11080,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pipe_data_gateway_surfaces_stdout_when_stderr_is_empty() {
         // A gateway that fails but writes its failure detail to stdout (not
@@ -11099,6 +11102,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn pipe_data_gateway_includes_both_streams_when_stderr_is_present() {
         // When both streams carry text, stderr leads and stdout is appended so
