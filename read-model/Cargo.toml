@@ -44,6 +44,15 @@ sqlite-wasm-rs = { version = "0.5", optional = true }
 # (and the host type-check of `--features wasm`) never sees it.
 js-sys = "0.3"
 
+# Build-time only. `build.rs` uses `cc` to compile the trimmed, core-SQL-only
+# `libwsqlite3.a` for the `wasm` backend (see the size follow-up in `build.rs`).
+# It is a host build-dependency compiled unconditionally, but only *invoked* for
+# the `wasm` feature on a `wasm32` target — the `native`/server build never runs
+# the C compile. `cc` is already in the native dependency tree via
+# `rusqlite/bundled`, so this adds no new transitive footprint to the server.
+[build-dependencies]
+cc = "1"
+
 [features]
 default = ["native"]
 # Real C SQLite via rusqlite's `bundled` build — byte-for-byte the server's
