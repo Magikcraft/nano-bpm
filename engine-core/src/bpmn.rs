@@ -43,6 +43,9 @@
 //!   `candidateUsers`), `zeebe:taskSchedule` (`dueDate`, `followUpDate`) and
 //!   `zeebe:priorityDefinition` (`priority`). Each may be a literal or a FEEL
 //!   expression resolved against the instance variables when the task is created.
+//!   Its form linkage comes from nested `zeebe:formDefinition` (`formId` for an
+//!   embedded/deployment form, resolved to a numeric form key at task creation;
+//!   `externalReference` for an external form).
 //! * `sequenceFlow` with `sourceRef`/`targetRef`, and an optional
 //!   `conditionExpression` whose FEEL body is stored verbatim and evaluated by
 //!   [`crate::feel`] at the exclusive gateway (comparisons, arithmetic, boolean
@@ -523,6 +526,21 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 } else if let Some(idx) = cur_service_task {
                                     acc.nodes[idx].job_priority =
                                         attr(attrs, "priority").map(str::to_string);
+                                }
+                            }
+                            "formDefinition" => {
+                                // zeebe:formDefinition inside a user task: the
+                                // form linkage. `formId` names an embedded /
+                                // deployment form (resolved to a numeric form_key
+                                // against the deployed forms at task creation);
+                                // `externalReference` names an external form
+                                // (surfaced verbatim). Zeebe declares exactly one
+                                // of the two.
+                                if let Some(idx) = cur_user_task {
+                                    let props = &mut acc.nodes[idx].user_task;
+                                    props.form_id = attr(attrs, "formId").map(str::to_string);
+                                    props.external_form_reference =
+                                        attr(attrs, "externalReference").map(str::to_string);
                                 }
                             }
                             "adHoc" => {
@@ -2765,6 +2783,54 @@ mod tests {
         assert_eq!(props.due_date.as_deref(), Some("2025-01-01T00:00:00Z"));
         assert_eq!(props.follow_up_date.as_deref(), Some("=followUp"));
         assert_eq!(props.priority.as_deref(), Some("80"));
+    }
+
+    #[test]
+    fn should_parse_user_task_form_definition() {
+        // given: user tasks carrying a zeebe:formDefinition — one an embedded
+        // form (formId), one an external form (externalReference), as the
+        // Camunda modeler emits them.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="embedded">
+                <bpmn:extensionElements>
+                  <zeebe:formDefinition formId="feature-escalation" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:userTask id="external">
+                <bpmn:extensionElements>
+                  <zeebe:formDefinition externalReference="https://forms.example/x" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="embedded" />
+              <bpmn:sequenceFlow id="b" sourceRef="embedded" targetRef="external" />
+              <bpmn:sequenceFlow id="c" sourceRef="external" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the embedded task carries the form id (no external reference).
+        let ElementKind::UserTask(embedded) = &def.element("embedded").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(embedded.form_id.as_deref(), Some("feature-escalation"));
+        assert_eq!(embedded.external_form_reference, None);
+
+        // and: the external task carries the external reference (no form id).
+        let ElementKind::UserTask(external) = &def.element("external").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(external.form_id, None);
+        assert_eq!(
+            external.external_form_reference.as_deref(),
+            Some("https://forms.example/x")
+        );
     }
 
     #[test]

@@ -387,6 +387,19 @@ pub enum Event {
         due_date: Option<String>,
         follow_up_date: Option<String>,
         priority: i32,
+        /// The resolved numeric form key, if the task's `zeebe:formDefinition`
+        /// declared a `formId` that resolved against a currently-deployed form
+        /// (latest version) at creation time. `None` when the task declares no
+        /// embedded form, or its `formId` matched no deployed form. Serialized
+        /// records written before form linkage load as `None`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        form_key: Option<Key>,
+        /// The external form reference declared via `zeebe:formDefinition
+        /// externalReference`, surfaced verbatim. `None` when the task declares
+        /// no external form. Serialized records written before form linkage load
+        /// as `None`.
+        #[cfg_attr(feature = "serde", serde(default))]
+        external_form_reference: Option<String>,
     },
     /// A user task's assignee was set (or cleared, when `assignee` is `None`).
     UserTaskAssigned {

@@ -15899,7 +15899,10 @@ fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
         parse_date(&task.follow_up_date),
         parse_date(&task.due_date),
         "<default>".to_string(),
-        types::Nullable::Null,
+        match &task.external_form_reference {
+            Some(r) => types::Nullable::Present(r.clone()),
+            None => types::Nullable::Null,
+        },
         task.process_definition_version,
         std::collections::HashMap::new(),
         models::UserTaskKey(task.key.to_string()),
@@ -15908,7 +15911,10 @@ fn user_task_result(task: &readstore::UserTaskRow) -> models::UserTaskResult {
         models::ProcessDefinitionKey(task.process_definition_key.clone()),
         models::ProcessInstanceKey(task.instance_key.to_string()),
         types::Nullable::Null,
-        types::Nullable::Null,
+        match task.form_key {
+            Some(k) => types::Nullable::Present(models::FormKey(k.to_string())),
+            None => types::Nullable::Null,
+        },
         Vec::new(),
     );
     result.priority = task.priority.clamp(0, 100) as u8;
@@ -22727,6 +22733,171 @@ mod clustered_startup_tests {
                 .unwrap(),
             FormGet::Status404_TheFormWithTheGivenKeyWasNotFound(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_user_task_form_definition_surfaces_form_key_and_external_reference_in_v2_search() {
+        // End-to-end form linkage (issue #795): a `userTask` declaring a
+        // `<zeebe:formDefinition formId="…"/>` must resolve that id to the
+        // deployed form's numeric key at task creation and surface it as the v2
+        // search `formKey`; an `externalReference` surfaces verbatim as
+        // `externalFormReference`. Downstream `GetFormByKey` then serves the
+        // schema.
+        use apis::user_task::SearchUserTasksResponse as Search;
+        let server = ServerImpl::default();
+
+        let schema = r#"{"id":"feature-escalation","type":"default","schemaVersion":16,"components":[{"label":"Why","type":"textfield","key":"why"}]}"#;
+        let form = nanobpmn_engine_core::FormResource {
+            id: "feature-escalation".to_string(),
+            resource_name: "feature-escalation.form".to_string(),
+            schema: schema.to_string(),
+        };
+
+        // A process with two user tasks: one bound to the embedded form by id,
+        // one carrying an external form reference. Parsed from XML so the whole
+        // formDefinition parse → resolve → project pipeline is exercised.
+        let bpmn = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="feature" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="escalation">
+                <bpmn:extensionElements>
+                  <zeebe:formDefinition formId="feature-escalation" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:userTask id="external">
+                <bpmn:extensionElements>
+                  <zeebe:formDefinition externalReference="https://forms.example/x" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="escalation" />
+              <bpmn:sequenceFlow id="b" sourceRef="escalation" targetRef="external" />
+              <bpmn:sequenceFlow id="c" sourceRef="external" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let proc = parse_bpmn(bpmn).expect("valid BPMN").remove(0);
+        let mut proc_names = std::collections::HashMap::new();
+        proc_names.insert("feature".to_string(), "feature.bpmn".to_string());
+
+        // Deploy the form and the process together, so the form is available for
+        // resolution when the user task is created.
+        let (result, _events) = server
+            .deploy_resources_locally_with_forms(
+                vec![proc],
+                &proc_names,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![form],
+                Vec::new(),
+                "<default>",
+            )
+            .await
+            .expect("process + form deploy succeeds");
+
+        // The deployed form's numeric key, read back from the deploy result.
+        let expected_form_key = result
+            .deployments
+            .iter()
+            .find_map(|d| match &d.form {
+                types::Nullable::Present(f) => Some(f.form_key.0.clone()),
+                types::Nullable::Null => None,
+            })
+            .expect("the deploy result includes the form metadata");
+
+        // Create an instance; it parks on the first user task (escalation).
+        let (_instance_key, _completed) = server
+            .create_for_stream(Some("feature".into()), None, std::collections::HashMap::new())
+            .await
+            .expect("create the feature instance");
+
+        // Poll the v2 user-task search until the async exporter projects the
+        // escalation task, then assert its formKey resolves to the deployed form.
+        let mut escalation = None;
+        for _ in 0..200 {
+            let resp = server
+                .search_user_tasks_impl(&None)
+                .await
+                .expect("search returns a response");
+            if let Search::Status200_TheUserTaskSearchResult(page) = resp
+                && let Some(item) = page.items.iter().find(|t| t.element_id == "escalation")
+            {
+                escalation = Some(item.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let escalation = escalation.expect("the escalation task is projected");
+        match &escalation.form_key {
+            types::Nullable::Present(k) => {
+                assert_eq!(k.0, expected_form_key, "formKey resolves to the deployed form")
+            }
+            types::Nullable::Null => panic!("the escalation task must carry a resolved formKey"),
+        }
+        assert!(
+            matches!(escalation.external_form_reference, types::Nullable::Null),
+            "the embedded-form task carries no external reference"
+        );
+
+        // GetFormByKey serves the resolved form's schema.
+        use apis::form::GetFormByKeyResponse as FormGet;
+        let form_resp = server
+            .get_form_by_key_impl(&models::GetFormByKeyPathParams {
+                form_key: expected_form_key.clone(),
+            })
+            .await
+            .expect("get form by the resolved key");
+        assert!(
+            matches!(form_resp, FormGet::Status200_TheFormIsSuccessfullyReturned(_)),
+            "the resolved formKey is retrievable via GetFormByKey"
+        );
+
+        // Complete the escalation task so the instance advances to the external
+        // form task, then assert its externalFormReference surfaces (no formKey).
+        let escalation_key: u64 = escalation.user_task_key.0.parse().expect("numeric key");
+        let complete_resp = server
+            .complete_user_task_impl(
+                &models::CompleteUserTaskPathParams {
+                    user_task_key: escalation_key.to_string(),
+                },
+                &None,
+            )
+            .await
+            .expect("complete the escalation task");
+        assert!(
+            matches!(
+                complete_resp,
+                apis::user_task::CompleteUserTaskResponse::Status204_TheUserTaskWasCompletedSuccessfully
+            ),
+            "completing the escalation task succeeds"
+        );
+
+        let mut external = None;
+        for _ in 0..200 {
+            let resp = server
+                .search_user_tasks_impl(&None)
+                .await
+                .expect("search returns a response");
+            if let Search::Status200_TheUserTaskSearchResult(page) = resp
+                && let Some(item) = page.items.iter().find(|t| t.element_id == "external")
+            {
+                external = Some(item.clone());
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let external = external.expect("the external task is projected");
+        match &external.external_form_reference {
+            types::Nullable::Present(r) => {
+                assert_eq!(r, "https://forms.example/x", "externalFormReference surfaces verbatim")
+            }
+            types::Nullable::Null => panic!("the external task must carry an externalFormReference"),
+        }
+        assert!(
+            matches!(external.form_key, types::Nullable::Null),
+            "an external-form task carries no numeric formKey"
+        );
     }
 
     #[tokio::test]

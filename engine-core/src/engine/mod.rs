@@ -4129,6 +4129,17 @@ impl Engine {
                     .resolve_user_task_string(&element_vars, props.follow_up_date.as_deref())
                     .filter(|s| !s.is_empty());
                 let priority = self.resolve_priority(&element_vars, props.priority.as_deref());
+                // Resolve the form linkage. `formId` binds to the latest
+                // deployed form version (Zeebe `latest` binding), stamped as a
+                // numeric `form_key` so the v2 search can surface it and
+                // `GetFormByKey` can serve the schema; an unmatched `formId`
+                // leaves the key unset. `externalReference` is surfaced verbatim.
+                let form_key = props
+                    .form_id
+                    .as_deref()
+                    .and_then(|id| self.state.forms.get(id))
+                    .map(|f| f.key);
+                let external_form_reference = props.external_form_reference.clone();
                 // An initial assignee (zeebe:assignmentDefinition) must fire the
                 // `assigning` listeners exactly as a runtime assign does (Zeebe
                 // parity: the assignee is stripped off the CREATED record and
@@ -4161,6 +4172,8 @@ impl Engine {
                     due_date,
                     follow_up_date,
                     priority,
+                    form_key,
+                    external_form_reference,
                 });
                 // Creating task listeners (ADR 0037 §6): the task record exists
                 // but is not yet available for work until the creating chain
@@ -5376,6 +5389,12 @@ impl Engine {
                     .resolve_user_task_string(&child_vars, props.follow_up_date.as_deref())
                     .filter(|s| !s.is_empty());
                 let priority = self.resolve_priority(&child_vars, props.priority.as_deref());
+                let form_key = props
+                    .form_id
+                    .as_deref()
+                    .and_then(|id| self.state.forms.get(id))
+                    .map(|f| f.key);
+                let external_form_reference = props.external_form_reference.clone();
                 events.push(Event::UserTaskCreated {
                     user_task_key,
                     instance_key,
@@ -5388,6 +5407,8 @@ impl Engine {
                     due_date,
                     follow_up_date,
                     priority,
+                    form_key,
+                    external_form_reference,
                 });
             }
             // CallActivity / Other / an unlisted id: no job or task to run, so the

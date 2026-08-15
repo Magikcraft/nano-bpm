@@ -2168,6 +2168,16 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                     xml_escape(p)
                 ));
             }
+            if props.form_id.is_some() || props.external_form_reference.is_some() {
+                out.push_str("        <zeebe:formDefinition");
+                if let Some(f) = &props.form_id {
+                    out.push_str(&format!(" formId=\"{}\"", xml_escape(f)));
+                }
+                if let Some(r) = &props.external_form_reference {
+                    out.push_str(&format!(" externalReference=\"{}\"", xml_escape(r)));
+                }
+                out.push_str("/>\n");
+            }
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:userTask>\n");
         }
