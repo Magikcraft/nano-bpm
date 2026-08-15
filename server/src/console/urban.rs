@@ -231,11 +231,17 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
 /// `NO_COLOR`), memoised per binary path. This is the **single** place a toolkit
 /// is spawned to probe its capabilities: every `urban_supports_*` gate derives
 /// its answer from this one cached read via a pure `help_indicates_*` predicate,
-/// so a given binary is probed at most once no matter how many capabilities we
-/// front — no per-capability cache to drift out of sync. Memoisation is safe
-/// because a binary's help output is stable for the process lifetime (a pack
-/// upgrade installs a new path, or the server restarts). `None` means the binary
-/// could not be run.
+/// so a given binary's help is read once and shared across every capability gate
+/// — one cached read, no per-capability cache to drift out of sync.
+///
+/// The cache is populated by a check-then-insert, **not** single-flight: several
+/// *concurrent first* calls for the same path can each spawn `urban --help` once
+/// before the entry lands (a bounded, benign duplication — help output is
+/// deterministic, so every racer computes the same text and the last insert
+/// wins). Every call after the cache is warm reuses the stored text without
+/// spawning. Memoisation is safe because a binary's help output is stable for the
+/// process lifetime (a pack upgrade installs a new path, or the server restarts).
+/// `None` means the binary could not be run.
 async fn urban_help_text(urban: &Path) -> Option<String> {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<String>>>> =

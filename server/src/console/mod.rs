@@ -4418,22 +4418,38 @@ pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult 
 /// client-side either way.
 pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiResult {
     // Route to the one deriver (`urban gen`) only when the app is Urban-shaped
-    // *and* its toolkit resolves. During the transition — before the marketplace
-    // pack ships a `urban` carrying the `data`/`gen` ops — an Urban app whose
-    // toolkit is unresolved keeps the embedded write path so "Regenerate types"
+    // *and* its toolkit resolves *and* that toolkit actually carries the `data`
+    // op. During the transition — before the marketplace pack ships a `urban`
+    // carrying the `data`/`gen` ops — an Urban app whose toolkit is unresolved
+    // (or too old for `data`) keeps the embedded write path so "Regenerate types"
     // still works; slice c removes this fallback once the pack guarantees urban.
-    let urban_ready = projects::project_dir(name)
-        .map(|d| d.join("nano.app.json").is_file() && urban::urban_available_for(&d))
-        .unwrap_or(false);
+    //
+    // The `data`-capability gate matters here, not just `urban_available_for`:
+    // the branch runs `urban gen` (persist) and then reads back through
+    // `urban data` introspection. An `urban` that has `gen` but predates `data`
+    // would otherwise persist via `urban gen` yet fall back to the *embedded*
+    // introspection inside `run_data_op` — re-introducing a Node/Deno dependency
+    // and contradicting this doc comment. Gating the whole branch on
+    // `urban_supports_data` keeps it atomic (all-urban or all-embedded), mirroring
+    // the capability gate in `run_data_op`.
+    let urban_ready = match projects::project_dir(name) {
+        Some(d) if d.join("nano.app.json").is_file() => match urban::find_urban_for(&d) {
+            Some(u) => urban::urban_supports_data(&u).await,
+            None => false,
+        },
+        _ => false,
+    };
     if urban_ready {
-        // Persist via the one deriver. This branch is already gated on
-        // `urban_available_for(&d)`, so the toolkit *is* present — a failure here
-        // is a real `urban gen` error (invalid manifest/models, toolkit error
-        // output), not a dependency outage, so map it to `500 INTERNAL_SERVER_ERROR`
+        // Persist via the one deriver. This branch is gated on the toolkit
+        // resolving *and* carrying the `data` op, so the toolkit *is* present — a
+        // failure here is a real `urban gen` error (invalid manifest/models,
+        // toolkit error output), not a dependency outage, so map it to
+        // `500 INTERNAL_SERVER_ERROR`
         // rather than `503`. There is no `503 SERVICE_UNAVAILABLE` path here: an
-        // unresolved toolkit doesn't error out — the `urban_ready == false` branch
-        // falls back to the embedded write path above — so clients never see a
-        // transient-outage status for a genuine gen failure.
+        // unresolved (or too-old-for-`data`) toolkit doesn't error out — the
+        // `urban_ready == false` branch falls back to the embedded write path
+        // above — so clients never see a transient-outage status for a genuine
+        // gen failure.
         projects::gen_via_urban(name)
             .await
             .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, m))?;
