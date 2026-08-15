@@ -30,9 +30,10 @@ const banner = `/**
 // JSDoc by inserting a space (`*/` -> `* /`), which mangles glob defaults such
 // as `resources/**/*.bpmn` into the misleading `resources/** /*.bpmn`. Pre-escape
 // `*/` in every `description` as `*\/` instead: that sequence contains no `*/`
-// (so it never terminates the comment and the library leaves it untouched) and
-// renders back to a literal `/` in JSDoc/markdown, preserving the glob for TS
-// consumers.
+// (so it never terminates the comment and the library leaves it untouched), and
+// the emitted JSDoc reads `resources/**\/*.bpmn` — a backslash before the slash
+// rather than a glob-breaking space. That keeps the `**/` and `*.bpmn` segments
+// visually contiguous so the glob stays unambiguous for TS consumers.
 function escapeGlobsInDescriptions(node) {
   if (Array.isArray(node)) {
     for (const item of node) escapeGlobsInDescriptions(item);
