@@ -816,13 +816,21 @@ impl TestEngine {
     /// not hardcoded. Mirrors `POST /user-tasks/search`.
     #[wasm_bindgen(js_name = searchUserTasks)]
     pub fn search_user_tasks(&self, filter_json: &str) -> Result<String, JsValue> {
-        let state = parse_state_filter(filter_json, "state")?;
+        let want = match parse_state_filter(filter_json, "state")? {
+            Some(s) => Some(user_task_state_from_rest(&s).ok_or_else(|| {
+                js_err(&format!(
+                    "filter `state` must be one of {}; got {s:?}",
+                    user_task_state_spellings()
+                ))
+            })?),
+            None => None,
+        };
         let items: Vec<serde_json::Value> = self
             .read_model
             .user_tasks()
             .iter()
-            .filter(|row| match &state {
-                Some(want) => user_task_state_rest(row.state) == want.as_str(),
+            .filter(|row| match want {
+                Some(w) => row.state == w,
                 None => true,
             })
             .map(user_task_result)
@@ -905,6 +913,40 @@ fn user_task_state_rest(state: UserTaskState) -> &'static str {
         UserTaskState::Completed => "COMPLETED",
         UserTaskState::Canceled => "CANCELED",
     }
+}
+
+/// Every [`UserTaskState`] variant, in enum order. Single source of truth for the
+/// set of valid REST `state` filter spellings — each spelling is derived from
+/// [`user_task_state_rest`], so the two never drift. A variant added to the enum
+/// makes `user_task_state_rest`'s match fail to compile; the
+/// `all_user_task_states_is_exhaustive` test additionally asserts this list keeps
+/// enumerating them all.
+#[cfg(feature = "read-model")]
+const ALL_USER_TASK_STATES: [UserTaskState; 3] = [
+    UserTaskState::Created,
+    UserTaskState::Completed,
+    UserTaskState::Canceled,
+];
+
+/// Parse a REST `state` filter spelling (e.g. `"CREATED"`) back into a
+/// [`UserTaskState`], or `None` when it is not a valid enum spelling. The gateway
+/// rejects unknown `UserTaskStateEnum` spellings during request deserialization,
+/// so `searchUserTasks` does too rather than silently returning an empty set.
+#[cfg(feature = "read-model")]
+fn user_task_state_from_rest(s: &str) -> Option<UserTaskState> {
+    ALL_USER_TASK_STATES
+        .into_iter()
+        .find(|st| user_task_state_rest(*st) == s)
+}
+
+/// The comma-separated list of valid REST `state` spellings, for error messages.
+#[cfg(feature = "read-model")]
+fn user_task_state_spellings() -> String {
+    ALL_USER_TASK_STATES
+        .iter()
+        .map(|st| user_task_state_rest(*st))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Extract an optional string field (e.g. `state`) from a search filter argument.
@@ -2939,6 +2981,39 @@ mod read_channel_tests {
         assert!(parse_state_filter_inner(r#"{"state":42}"#, "state").is_err());
         // Malformed JSON is rejected too.
         assert!(parse_state_filter_inner(r#"{"state":"#, "state").is_err());
+    }
+
+    #[test]
+    fn search_user_tasks_rejects_an_unknown_state_spelling() {
+        // The gateway rejects unknown `UserTaskStateEnum` spellings during request
+        // deserialization; `searchUserTasks` mirrors that instead of silently
+        // returning an empty set. The rejection is triggered by
+        // `user_task_state_from_rest` returning `None`, and the error message lists
+        // the valid spellings — tested at the pure layer because the wrapper's
+        // `JsValue` error cannot be inspected on the host target.
+        assert_eq!(user_task_state_from_rest("FOO"), None);
+        assert_eq!(user_task_state_from_rest("created"), None, "spelling is case-sensitive");
+        assert_eq!(user_task_state_from_rest(""), None);
+        let spellings = user_task_state_spellings();
+        assert!(
+            spellings.contains("CREATED")
+                && spellings.contains("COMPLETED")
+                && spellings.contains("CANCELED"),
+            "the rejection message must list every valid spelling, got {spellings:?}"
+        );
+    }
+
+    #[test]
+    fn all_user_task_states_is_exhaustive() {
+        // `user_task_state_rest`'s match is compiler-forced exhaustive; this guards
+        // that `ALL_USER_TASK_STATES` keeps enumerating every variant so the derived
+        // set of valid REST spellings stays complete.
+        assert_eq!(ALL_USER_TASK_STATES.len(), 3);
+        for st in ALL_USER_TASK_STATES {
+            // Every listed variant round-trips through its REST spelling.
+            assert_eq!(user_task_state_from_rest(user_task_state_rest(st)), Some(st));
+        }
+        assert_eq!(user_task_state_from_rest("nope"), None);
     }
 
     #[test]
