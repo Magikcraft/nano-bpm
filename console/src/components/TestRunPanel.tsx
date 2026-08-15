@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import { useBojtos, BpmnRuntimeView } from "@nanobpm/bojtos-react";
@@ -54,11 +54,12 @@ export default function TestRunPanel({
   // typed start/completion payloads instead of leaving the maker to guess fields.
   const model = useMemo(() => parseModelEnvelopes(xml), [xml]);
 
-  // Each (re)deployment produces a fresh `processIds` array; when it changes,
-  // default the process selection and clear the per-run UI state — matching the
-  // original panel's `deployInto` reset.
-  useEffect(() => {
-    setProcess(processIds[0] ?? "");
+  // Clears the per-run draft/UI state — job/message/signal payload edits, the
+  // free-form message/signal inputs, and the pinned trace — so a fresh run never
+  // inherits a previous run's edits. Shared by the (re)deploy effect (below) and
+  // the manual "Reset" button, which resets the engine without changing
+  // `processIds`, so the effect alone would miss it.
+  const clearRunDraftState = useCallback(() => {
     setJobVars({});
     setMsgVars({});
     setSigVars({});
@@ -68,7 +69,22 @@ export default function TestRunPanel({
     setFreeSigName("");
     setFreeSigVars("{}");
     setTraceKey(null);
-  }, [processIds]);
+  }, []);
+
+  // Each (re)deployment produces a fresh `processIds` array; when it changes,
+  // default the process selection and clear the per-run UI state — matching the
+  // original panel's `deployInto` reset.
+  useEffect(() => {
+    setProcess(processIds[0] ?? "");
+    clearRunDraftState();
+  }, [processIds, clearRunDraftState]);
+
+  // "Reset" restarts the engine on the same deployment; `processIds` is
+  // unchanged, so we clear the per-run drafts explicitly here too.
+  const handleReset = useCallback(() => {
+    resetEngine();
+    clearRunDraftState();
+  }, [resetEngine, clearRunDraftState]);
 
   // Start variables are (re)seeded from the selected process's entry-task input
   // envelope whenever the model or the selected process changes, so switching
@@ -264,7 +280,7 @@ export default function TestRunPanel({
               </h3>
               {started && (
                 <button
-                  onClick={resetEngine}
+                  onClick={handleReset}
                   className="text-xs text-fg-muted hover:text-fg"
                 >
                   Reset
