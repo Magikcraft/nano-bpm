@@ -9670,7 +9670,27 @@ impl ServerImpl {
                         (200, Some(b)) => match serde_json::from_value::<models::UserTaskResult>(b)
                         {
                             Ok(r) => match r.form_key {
-                                types::Nullable::Present(fk) => fk.0.parse().ok(),
+                                types::Nullable::Present(fk) => match fk.0.parse::<u64>() {
+                                    Ok(k) => Some(k),
+                                    // A peer that reports a non-numeric form key
+                                    // is corrupted or schema-incompatible;
+                                    // surface it as a 500 rather than silently
+                                    // masking it as "found, no form" (204).
+                                    Err(_) => {
+                                        return Ok(
+                                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                                problem(
+                                                    "Peer error",
+                                                    500,
+                                                    format!(
+                                                        "peer node {node} returned a non-numeric form key '{}'",
+                                                        fk.0
+                                                    ),
+                                                ),
+                                            ),
+                                        );
+                                    }
+                                },
                                 types::Nullable::Null => None,
                             },
                             Err(e) => {
