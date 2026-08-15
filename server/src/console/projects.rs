@@ -3248,16 +3248,13 @@ pub fn is_urban_app(name: &str) -> bool {
 pub async fn gen_via_urban(name: &str) -> Result<(), String> {
     // Belt-and-suspenders shape gate: this is a public entrypoint, so guard the
     // `nano.app.json` shape here too (not only at the `regenerate_domain_types`
-    // call site). Validate the name up front so an invalid/unsafe name reports
-    // "invalid project name" rather than the less accurate shape error, then
-    // reject a legacy-shaped project before any `urban gen` spawn — spawning it
-    // would clobber the project's `nano-generated/` with Urban outputs it
-    // doesn't expect.
-    // Resolve the project directory once and reuse it for the shape gate and the
-    // urban lookup below, so we don't repeat `project_dir`/`read_project_ref` I/O
-    // (and can't drift if the ref changes between calls). Validate the name up
-    // front so an invalid/unsafe name reports "invalid project name" rather than
-    // the less accurate shape error.
+    // call site), rejecting a legacy-shaped project before any `urban gen` spawn
+    // — spawning it would clobber the project's `nano-generated/` with Urban
+    // outputs it doesn't expect. Resolve the project directory once up front and
+    // reuse it for the shape gate and the urban lookup below: an invalid/unsafe
+    // name then reports "invalid project name" rather than the less accurate
+    // shape error, and we don't repeat `project_dir`/`read_project_ref` I/O (or
+    // risk drift if the ref changes between calls).
     let dir = project_dir(name).ok_or("invalid project name")?;
     if !dir.join("nano.app.json").is_file() {
         return Err("not an Urban-shaped app (no nano.app.json)".into());
