@@ -41,6 +41,12 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SQLITE_WASM_RS_SRC_DIR");
+    // Dependency resolution feeds `locate_sqlite_wasm_rs_src` (it reads the locked
+    // `sqlite-wasm-rs` version from `Cargo.lock`), so a change to either manifest
+    // must re-run this script — otherwise Cargo reuses a stale build-script output
+    // and keeps linking a `libwsqlite3.a` compiled against the previous checkout.
+    println!("cargo:rerun-if-changed=Cargo.lock");
+    println!("cargo:rerun-if-changed=Cargo.toml");
 
     let wasm_feature = std::env::var_os("CARGO_FEATURE_WASM").is_some();
     let native_feature = std::env::var_os("CARGO_FEATURE_NATIVE").is_some();
@@ -179,7 +185,20 @@ fn compile_minimal_wsqlite3(out_dir: &Path) {
             required.display()
         );
     }
-    println!("cargo:rerun-if-changed={}", sqlite3_c.display());
+
+    // Every compiled input (not just the amalgamation) must trigger a rebuild —
+    // otherwise an edit to the header/printf/musl shim under a
+    // `SQLITE_WASM_RS_SRC_DIR` override leaves a stale `libwsqlite3.a` linked.
+    let musl_sources: Vec<PathBuf> = MUSL_SHIM_SOURCES
+        .iter()
+        .map(|s| shim.join("musl").join(s))
+        .collect();
+    for input in [&wasm_shim_h, &printf_c, &sqlite3_c]
+        .into_iter()
+        .chain(musl_sources.iter())
+    {
+        println!("cargo:rerun-if-changed={}", input.display());
+    }
 
     let mut cc = cc::Build::new();
     cc.warnings(false)
@@ -189,7 +208,7 @@ fn compile_minimal_wsqlite3(out_dir: &Path) {
         .include(shim.join("musl/include"))
         .file(&printf_c)
         .file(&sqlite3_c)
-        .files(MUSL_SHIM_SOURCES.map(|s| shim.join("musl").join(s)))
+        .files(&musl_sources)
         .flag("-DPRINTF_ALIAS_STANDARD_FUNCTION_NAMES_HARD")
         .flag("-include")
         .flag(wasm_shim_h.to_str().expect("shim path is valid UTF-8"));
@@ -243,20 +262,31 @@ fn locate_sqlite_wasm_rs_src() -> PathBuf {
         }
     }
 
-    // No exact match (or lockfile unreadable): take the highest version present.
-    candidates.sort();
-    candidates.pop().unwrap_or_else(|| {
-        panic!(
+    // No exact match. Do NOT guess by lexicographic "highest": `candidates.sort()`
+    // orders paths as strings, so `sqlite-wasm-rs-0.5.9` sorts *after* `0.5.10` and
+    // we would silently compile against a mismatched amalgamation/shim. Fail closed
+    // instead — fall back only when there is exactly one checkout (no ambiguity).
+    match candidates.len() {
+        1 => candidates.pop().expect("len checked to be 1"),
+        0 => panic!(
             "could not find a sqlite-wasm-rs source checkout under {} — run the build with \
              the wasm32 target (which fetches it) or set SQLITE_WASM_RS_SRC_DIR",
             registry_src.display()
-        )
-    })
+        ),
+        n => panic!(
+            "found {n} sqlite-wasm-rs checkouts under {} but none match the locked version {:?}; \
+             refusing to guess which to compile — set SQLITE_WASM_RS_SRC_DIR to the intended \
+             crate root",
+            registry_src.display(),
+            want_version,
+        ),
+    }
 }
 
 /// Best-effort read of the `sqlite-wasm-rs` version pinned in this crate's
 /// `Cargo.lock`, used only to disambiguate multiple registry checkouts. A miss is
-/// non-fatal: the caller falls back to the newest checkout present.
+/// non-fatal only when a single checkout is present: with more than one, the
+/// caller fails closed rather than guess (see `locate_sqlite_wasm_rs_src`).
 fn locked_sqlite_wasm_rs_version() -> Option<String> {
     let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")?;
     let lock = PathBuf::from(manifest_dir).join("Cargo.lock");
