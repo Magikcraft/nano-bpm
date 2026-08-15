@@ -254,7 +254,11 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
 /// fallback (never to a broken `urban <op>`), so the worst case is a newly-gained
 /// capability going unused until the next restart, not an outage. A long-lived
 /// server outliving an in-place toolkit upgrade is the rare case, and the price is
-/// a restart. `None` means the binary could not be run.
+/// a restart. `None` means the binary could not be run **or** `urban --help`
+/// exited non-zero: we only accept and cache help text on a successful exit, so a
+/// binary that errors out (or whose error message happens to contain a capability
+/// marker) cannot false-positive the gate into routing to a broken `urban <op>` —
+/// it falls back to the embedded path exactly like an absent binary.
 async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
     use std::sync::{Arc, Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<Arc<str>>>>> =
@@ -279,6 +283,7 @@ async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
         .output()
         .await
         .ok()
+        .filter(|o| o.status.success())
         .map(|o| {
             let mut help = String::from_utf8_lossy(&o.stdout).into_owned();
             help.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -518,5 +523,43 @@ urban — build and run Urban apps (nano.app.json)
   urban gen [--check]               derive artifacts (migrations, worker-io)
   urban data                        run a datasource op through the gateway";
         assert!(help_indicates_data(new_help));
+    }
+
+    /// Guards the failure mode where a *failed* `urban --help` (non-zero exit)
+    /// gets cached and its error text mis-detected as a capability, routing to a
+    /// broken `urban <op>` instead of the embedded fallback. A binary that exits
+    /// non-zero — even one whose output contains a capability marker — must be
+    /// treated exactly like an absent binary: `urban_supports_data` stays `false`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_ignores_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("nbpm-urban-help-nz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A binary that prints a capability marker to stdout but exits non-zero.
+        let failing = dir.join("urban-failing");
+        std::fs::write(&failing, b"#!/bin/sh\necho 'urban data'\nexit 1\n").unwrap();
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            urban_help_text(&failing).await.is_none(),
+            "non-zero --help exit must not be cached as valid help"
+        );
+        assert!(
+            !urban_supports_data(&failing).await,
+            "a failing binary must not be read as data-op-capable"
+        );
+
+        // The same marker on a *successful* exit is honoured.
+        let ok = dir.join("urban-ok");
+        std::fs::write(&ok, b"#!/bin/sh\necho 'urban data'\nexit 0\n").unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            urban_supports_data(&ok).await,
+            "a successful --help exposing the marker must be read as capable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
