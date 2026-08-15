@@ -3394,10 +3394,18 @@ async fn pipe_data_gateway(
     let body = serde_json::to_vec(request)
         .map_err(|e| DataError::Gateway(format!("serialize request: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&body)
-            .await
-            .map_err(|e| DataError::Gateway(format!("write request: {e}")))?;
+        // A gateway that fails fast can exit before (or while) reading its
+        // request, closing the read end of the pipe. The write then fails with
+        // `BrokenPipe` (EPIPE) — that is not the real error, it is a symptom of
+        // the child having already exited. Swallow it and fall through to
+        // `wait_with_output` so the child's actual stdout/stderr and exit status
+        // surface the true cause instead of being masked by "write request:
+        // Broken pipe".
+        match stdin.write_all(&body).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(DataError::Gateway(format!("write request: {e}"))),
+        }
         // Drop stdin (via scope) so the gateway's stdin reader sees EOF.
     }
     let out = child
