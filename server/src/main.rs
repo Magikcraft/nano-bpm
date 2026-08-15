@@ -2036,6 +2036,29 @@ fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
     models::ProblemDetail::new(title.to_string(), status, detail, String::new())
 }
 
+/// Builds the `ProblemDetail` for a **deployment** rejection with Zeebe/C8
+/// parity (Magikcraft/nano-bpm#793).
+///
+/// Real Zeebe/Camunda 8 maps every client-side deploy rejection to the gRPC
+/// `INVALID_ARGUMENT` status and, on the REST `/v2/deployments` endpoint,
+/// surfaces that status **name** as the `ProblemDetail.title` (with the
+/// actionable message in `detail`). Clients — notably `c8ctl watch` — key on the
+/// `INVALID_ARGUMENT` title to recognise and render a deployment error; a
+/// non-parity title (e.g. "Invalid BPMN") is unrecognised, so the rejection is
+/// silently swallowed and the watch hangs to its timeout.
+///
+/// A 400 is a client-side rejection → `INVALID_ARGUMENT`. Any other status
+/// (e.g. 502 owner-unreachable, 500) is an infrastructure failure, not a bad
+/// argument, so it keeps a generic deploy title.
+fn deploy_problem(status: u16, detail: String) -> models::ProblemDetail {
+    let title = if status == 400 {
+        "INVALID_ARGUMENT"
+    } else {
+        "Deployment failed"
+    };
+    problem(title, status, detail)
+}
+
 /// Parses `host` and `port` from a peer base URL like `http://10.0.0.1:8080` (or
 /// bare `10.0.0.1:8080`). Returns `None` when no host/port can be extracted (e.g.
 /// the empty self-address of a single-node topology), so the caller can fall back.
@@ -10013,8 +10036,7 @@ impl ServerImpl {
                                     }
                                     Err(_) => {
                                         return Ok(Resp::Status400_TheProvidedDataIsNotValid(
-                                            problem(
-                                                "Invalid resource",
+                                            deploy_problem(
                                                 400,
                                                 "A deployment resource was not valid UTF-8 BPMN XML.".to_string(),
                                             ),
@@ -10024,8 +10046,7 @@ impl ServerImpl {
                             }
                         }
                         Err(e) => {
-                            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                                "Invalid request",
+                            return Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
                                 400,
                                 format!("Could not read a deployment resource: {e}."),
                             )));
@@ -10034,8 +10055,7 @@ impl ServerImpl {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid request",
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
                         400,
                         format!("Malformed multipart request: {e}."),
                     )));
@@ -10044,8 +10064,7 @@ impl ServerImpl {
         }
 
         if resources.is_empty() {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                "No resources",
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
                 400,
                 "At least one deployment resource is required.".to_string(),
             )));
@@ -10060,9 +10079,9 @@ impl ServerImpl {
         if self.engine.topology().is_local(0) {
             let parsed = match parse_deploy_resources(&resources) {
                 Ok(parsed) => parsed,
-                Err((title, detail)) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        title, 400, detail,
+                Err((_, detail)) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
+                        400, detail,
                     )));
                 }
             };
@@ -10082,18 +10101,16 @@ impl ServerImpl {
                     self.broadcast_deployment(&events).await;
                     Ok(Resp::Status200_TheResourcesAreDeployed(result))
                 }
-                Err((title, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    title, 400, detail,
-                ))),
+                Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(
+                    deploy_problem(400, detail),
+                )),
             }
         } else {
             match self.forward_deploy(resources, tenant_id).await {
                 Ok(result) => Ok(Resp::Status200_TheResourcesAreDeployed(result)),
-                Err((status, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Deployment failed",
-                    status,
-                    detail,
-                ))),
+                Err((status, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(
+                    deploy_problem(status, detail),
+                )),
             }
         }
     }
@@ -27700,6 +27717,71 @@ mod subscription_placement_tests {
         assert!(
             detail.contains("run-agent") && detail.contains("resourceType"),
             "the problem detail names the offending task and attribute, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn deploy_rejection_problem_detail_matches_zeebe_invalid_argument_shape() {
+        // Magikcraft/nano-bpm#793: deploying invalid BPMN must surface a
+        // structured rejection whose `ProblemDetail.title` is Zeebe/C8's
+        // `INVALID_ARGUMENT` (with the actionable message in `detail`). Clients
+        // such as `c8ctl watch` key on that title to render the deployment error;
+        // a non-parity title (the old "Invalid BPMN") is unrecognised, so the
+        // rejection is swallowed and the watch hangs to its timeout. A
+        // client-side rejection is HTTP 400 → `INVALID_ARGUMENT`; an
+        // infrastructure failure (e.g. 502 owner-unreachable) is not a bad
+        // argument and keeps a generic title.
+        let bad = deploy_problem(400, "Failed to parse 'bad.bpmn': no process.".to_string());
+        assert_eq!(
+            bad.title, "INVALID_ARGUMENT",
+            "a 400 deploy rejection uses Zeebe's INVALID_ARGUMENT title"
+        );
+        assert_eq!(bad.status, 400, "Zeebe maps INVALID_ARGUMENT to HTTP 400");
+        assert!(
+            bad.detail.contains("bad.bpmn"),
+            "the actionable message is preserved in `detail`, got: {}",
+            bad.detail
+        );
+
+        let unreachable =
+            deploy_problem(502, "deploy-partition owner unreachable".to_string());
+        assert_ne!(
+            unreachable.title, "INVALID_ARGUMENT",
+            "an infrastructure failure is not a client INVALID_ARGUMENT"
+        );
+        assert_eq!(unreachable.status, 502);
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_invalid_bpmn_with_invalid_argument_parity() {
+        // Magikcraft/nano-bpm#793 (end-to-end over the centralized deploy path):
+        // genuinely invalid BPMN is rejected as HTTP 400 with an actionable
+        // detail, and the REST handler surfaces that rejection with Zeebe's
+        // `INVALID_ARGUMENT` title so a watching client can render it.
+        const NOT_BPMN: &str = "<not-bpmn>this is not a BPMN document</not-bpmn>";
+
+        let server = single_node_multi_partition();
+        let (status, detail) = server
+            .deploy_centralized(
+                vec![("bad.bpmn".into(), NOT_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect_err("a resource that is not a BPMN process must be rejected");
+        assert_eq!(status, 400, "Zeebe maps INVALID_ARGUMENT to HTTP 400");
+
+        // The REST handler wraps the `(status, detail)` from the deploy path into
+        // the client-facing ProblemDetail via `deploy_problem` — assert that same
+        // mapping here so the parity title is guaranteed on the wire.
+        let pd = deploy_problem(status, detail);
+        assert_eq!(
+            pd.title, "INVALID_ARGUMENT",
+            "invalid BPMN surfaces as INVALID_ARGUMENT for c8ctl-watch parity"
+        );
+        assert!(
+            pd.detail.contains("bad.bpmn"),
+            "the rejection names the offending resource, got: {}",
+            pd.detail
         );
     }
 
