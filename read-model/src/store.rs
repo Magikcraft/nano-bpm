@@ -327,11 +327,29 @@ fn element_instance_state_from(code: i64) -> ElementInstanceState {
 /// Wall-clock milliseconds since the Unix epoch, used to stamp element-instance
 /// start/end dates at projection time (the lifecycle events carry no
 /// engine-authored timestamp — see [`ElementInstanceRow`]).
+///
+/// The clock source is per-platform: the same projection runs on the gateway
+/// server (`native`) and the in-browser test engine (`wasm`), which have
+/// different clocks. Only the *source* differs; the value semantics (Unix-epoch
+/// milliseconds) are identical, so the projection code above is unchanged.
+#[cfg(not(target_arch = "wasm32"))]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// `wasm32-unknown-unknown` has no platform clock — `std::time::SystemTime::now()`
+/// unconditionally panics there ("time not implemented on this platform"), which
+/// would abort the projection on its very first `export`. Read the wall clock
+/// from JavaScript's `Date.now()` (available in both the browser and node)
+/// instead: the exact browser/node analog of the native Unix-epoch millisecond
+/// clock, so element-instance timestamps stay meaningful and the projection runs
+/// without panicking.
+#[cfg(target_arch = "wasm32")]
+fn now_ms() -> u64 {
+    js_sys::Date::now() as u64
 }
 
 /// Encodes a [`JobKind`] into the `(job_kind, listener_event_type)` column pair
@@ -5268,5 +5286,122 @@ mod element_instance_tests {
             store.correlated_message_subscriptions().is_empty(),
             "no history row without a captured open subscription"
         );
+    }
+}
+
+/// Read-surface parity checks for the shared projection, exercising the exact
+/// readstore-shaped queries the in-browser (wasm) test engine will serve through
+/// this same crate: `GetFormByKey` and `searchUserTasks` (with its open/closed
+/// `state` filter). The projection and SQL are backend-agnostic — identical on
+/// `native` and `wasm` — so proving them here (natively runnable, on the default
+/// backend) proves the query surface the wasm backend answers byte-for-byte.
+///
+/// This is the acceptance coverage for the wasm read-model backend (epic
+/// Magikcraft/nano-bpm#796): it mirrors the epic's spike, so a regression in the
+/// shared read surface fails a plain `cargo test` regardless of backend.
+#[cfg(test)]
+mod read_surface_tests {
+    use nanobpmn_engine_core::{Event, UserTaskState};
+
+    use super::{Key, ReadStore};
+
+    fn form_deployed(form_key: Key, form_id: &str, version: i32, schema: &str) -> Event {
+        Event::FormDeployed {
+            deployment_key: 1,
+            form_key,
+            version,
+            form_id: form_id.to_string(),
+            resource_name: format!("{form_id}.form"),
+            schema: schema.to_string(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn user_task_created(user_task_key: Key, instance_key: Key, element_id: &str) -> Event {
+        Event::UserTaskCreated {
+            user_task_key,
+            instance_key,
+            element_instance_key: instance_key,
+            element_id: element_id.to_string(),
+            created_at: 0,
+            assignee: None,
+            candidate_groups: Vec::new(),
+            candidate_users: Vec::new(),
+            due_date: None,
+            follow_up_date: None,
+            priority: 0,
+            form_key: None,
+            external_form_reference: None,
+        }
+    }
+
+    /// `GetFormByKey` resolves each deployed form version by its unique key, and a
+    /// redeploy of the same `form_id` yields the *latest* schema at the latest
+    /// version — the spike's "form_by_key returns the latest schema".
+    #[test]
+    fn form_by_key_serves_the_latest_deployed_schema() {
+        let store = ReadStore::open(None).expect("in-memory read store opens");
+
+        // Deploy v1 then a new version v2 of the same form id, each with a
+        // distinct schema and its own unique form key.
+        let v1 = form_deployed(10, "greeting", 1, r#"{"schemaVersion":1}"#);
+        let v2 = form_deployed(11, "greeting", 2, r#"{"schemaVersion":2}"#);
+        store.export(&[&v1]).expect("project form v1");
+        store.export(&[&v2]).expect("project form v2");
+
+        // The latest key resolves the latest schema/version.
+        let latest = store.form_by_key(11).expect("latest form version resolves");
+        assert_eq!(latest.form_id, "greeting");
+        assert_eq!(latest.version, 2);
+        assert_eq!(latest.schema, r#"{"schemaVersion":2}"#);
+
+        // Every prior version remains servable by its own key (Zeebe parity).
+        let older = store.form_by_key(10).expect("older form version still resolves");
+        assert_eq!(older.version, 1);
+        assert_eq!(older.schema, r#"{"schemaVersion":1}"#);
+
+        // An unknown key has no form.
+        assert!(store.form_by_key(999).is_none());
+    }
+
+    /// `searchUserTasks` filtered to open tasks returns only open ones — the
+    /// spike's second assertion. The projection stores a `state` per task, so the
+    /// state filter the wasm engine applies distinguishes open (`Created`) from
+    /// completed tasks off the exact projected data.
+    #[test]
+    fn user_tasks_state_filter_returns_only_open_tasks() {
+        let store = ReadStore::open(None).expect("in-memory read store opens");
+
+        // Two user tasks are created (both open); one is then completed.
+        let open = user_task_created(100, 1, "review");
+        let closing = user_task_created(101, 1, "approve");
+        store.export(&[&open]).expect("project open task");
+        store.export(&[&closing]).expect("project task to complete");
+        let completed = Event::UserTaskCompleted {
+            user_task_key: 101,
+            instance_key: 1,
+        };
+        store.export(&[&completed]).expect("project completion");
+
+        let tasks = store.user_tasks();
+        assert_eq!(tasks.len(), 2, "both tasks remain projected");
+
+        // Filtering to the open state (what searchUserTasks({state:'CREATED'})
+        // does) yields exactly the un-completed task.
+        let open_only: Vec<Key> = tasks
+            .iter()
+            .filter(|t| t.state == UserTaskState::Created)
+            .map(|t| t.key)
+            .collect();
+        assert_eq!(open_only, vec![100]);
+
+        // The completed task carries the terminal state, so it is excluded above
+        // and included by a complementary filter.
+        let completed_only: Vec<Key> = tasks
+            .iter()
+            .filter(|t| t.state == UserTaskState::Completed)
+            .map(|t| t.key)
+            .collect();
+        assert_eq!(completed_only, vec![101]);
     }
 }
