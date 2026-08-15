@@ -4,11 +4,44 @@
 //! `Cargo.toml`. A leading `v` is stripped so `v1.2.3` -> `1.2.3`.
 
 use std::env;
+use std::path::Path;
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=NANOBPM_VERSION");
+    // Emitting *any* `rerun-if-*` opts this build script out of Cargo's default
+    // "rerun when any package file changes" heuristic, so unless we say otherwise
+    // Cargo caches the stamped version across `git pull`/`checkout`. That is how a
+    // binary built from fresh `main` can still report an old commit (observed on a
+    // cross-build whose reported gateway version lagged the code by weeks). Watch
+    // the git state that `git describe` reads so the stamp re-derives on every HEAD
+    // movement: `logs/HEAD` is appended on each commit/checkout/reset, and `HEAD`
+    // itself changes on branch switch. `git rev-parse --git-path` resolves these to
+    // the real files even with packed refs or a linked worktree (where `.git` is a
+    // file). When git is unavailable (release tarball), no paths are emitted and the
+    // explicit `NANOBPM_VERSION` env — already watched above — governs.
+    for git_ref in ["logs/HEAD", "HEAD"] {
+        if let Some(path) = git_path(git_ref).filter(|p| Path::new(p).exists()) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
     let version = resolve_version();
     println!("cargo:rustc-env=NANOBPM_VERSION={version}");
+}
+
+/// Absolute path to a file inside the git dir (e.g. `HEAD`, `logs/HEAD`), resolved
+/// via `git rev-parse --git-path` so it is correct for packed refs and linked
+/// worktrees. `None` when git is absent or the command fails.
+fn git_path(rel: &str) -> Option<String> {
+    let manifest = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
+    let out = Command::new("git")
+        .args(["rev-parse", "--git-path", rel])
+        .current_dir(&manifest)
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then_some(path)
 }
 
 fn resolve_version() -> String {
@@ -19,7 +52,7 @@ fn resolve_version() -> String {
         }
     }
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap_or_default();
-    let git = std::process::Command::new("git")
+    let git = Command::new("git")
         .args(["describe", "--tags", "--always", "--dirty"])
         .current_dir(&manifest)
         .output()
