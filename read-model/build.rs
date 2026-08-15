@@ -50,12 +50,20 @@ fn main() {
 
     let wasm_feature = std::env::var_os("CARGO_FEATURE_WASM").is_some();
     let native_feature = std::env::var_os("CARGO_FEATURE_NATIVE").is_some();
-    let target_arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    // Match the EXACT target triple, not just `target_arch == "wasm32"`. The
+    // `wsqlite3` build-script override in `.cargo/config.toml` is scoped to
+    // `[target.wasm32-unknown-unknown.wsqlite3]`, so on any other wasm32 triple
+    // (e.g. `wasm32-wasip1`) that override would NOT apply: `sqlite-wasm-rs`'s own
+    // build script would compile its full `wsqlite3` while this script also
+    // compiled a minimal one, colliding with duplicate link directives/symbols.
+    // Gating on the full triple keeps this script and the override in lockstep.
+    let target = std::env::var("TARGET").unwrap_or_default();
 
-    // Only the wasm-backend-on-wasm32 configuration needs any of this. When
-    // `native` is also enabled the backend seam selects `native` (real bundled
-    // SQLite), so neither the `-lsqlite3` stub nor the `wsqlite3` override apply.
-    if !(wasm_feature && !native_feature && target_arch == "wasm32") {
+    // Only the wasm-backend-on-`wasm32-unknown-unknown` configuration needs any of
+    // this. When `native` is also enabled the backend seam selects `native` (real
+    // bundled SQLite), so neither the `-lsqlite3` stub nor the `wsqlite3` override
+    // apply.
+    if !(wasm_feature && !native_feature && target == "wasm32-unknown-unknown") {
         return;
     }
 
@@ -211,7 +219,10 @@ fn compile_minimal_wsqlite3(out_dir: &Path) {
         .files(&musl_sources)
         .flag("-DPRINTF_ALIAS_STANDARD_FUNCTION_NAMES_HARD")
         .flag("-include")
-        .flag(wasm_shim_h.to_str().expect("shim path is valid UTF-8"));
+        // Pass the shim header as an `OsStr` (cc's `flag` accepts `AsRef<OsStr>`)
+        // rather than `.to_str().expect(...)`, so a non-UTF-8 registry path can't
+        // panic the build script.
+        .flag(&wasm_shim_h);
 
     for flag in MINIMAL_FEATURED {
         cc.flag(flag);
