@@ -22808,7 +22808,11 @@ mod clustered_startup_tests {
 
         // Create an instance; it parks on the first user task (escalation).
         let (_instance_key, _completed) = server
-            .create_for_stream(Some("feature".into()), None, std::collections::HashMap::new())
+            .create_for_stream(
+                Some("feature".into()),
+                None,
+                std::collections::HashMap::new(),
+            )
             .await
             .expect("create the feature instance");
 
@@ -22831,7 +22835,10 @@ mod clustered_startup_tests {
         let escalation = escalation.expect("the escalation task is projected");
         match &escalation.form_key {
             types::Nullable::Present(k) => {
-                assert_eq!(k.0, expected_form_key, "formKey resolves to the deployed form")
+                assert_eq!(
+                    k.0, expected_form_key,
+                    "formKey resolves to the deployed form"
+                )
             }
             types::Nullable::Null => panic!("the escalation task must carry a resolved formKey"),
         }
@@ -22849,7 +22856,10 @@ mod clustered_startup_tests {
             .await
             .expect("get form by the resolved key");
         assert!(
-            matches!(form_resp, FormGet::Status200_TheFormIsSuccessfullyReturned(_)),
+            matches!(
+                form_resp,
+                FormGet::Status200_TheFormIsSuccessfullyReturned(_)
+            ),
             "the resolved formKey is retrievable via GetFormByKey"
         );
 
@@ -22890,9 +22900,14 @@ mod clustered_startup_tests {
         let external = external.expect("the external task is projected");
         match &external.external_form_reference {
             types::Nullable::Present(r) => {
-                assert_eq!(r, "https://forms.example/x", "externalFormReference surfaces verbatim")
+                assert_eq!(
+                    r, "https://forms.example/x",
+                    "externalFormReference surfaces verbatim"
+                )
             }
-            types::Nullable::Null => panic!("the external task must carry an externalFormReference"),
+            types::Nullable::Null => {
+                panic!("the external task must carry an externalFormReference")
+            }
         }
         assert!(
             matches!(external.form_key, types::Nullable::Null),

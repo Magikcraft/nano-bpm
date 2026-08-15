@@ -9042,8 +9042,7 @@ fn user_task_resolves_form_id_to_the_latest_form_key_and_carries_external_refere
 
     // Latest binding: redeploy a newer form version, then a fresh instance's
     // task resolves to the new key while the already-bound task keeps its key.
-    let v2 =
-        r#"{"id":"feature-escalation","type":"default","components":[{"type":"textfield","key":"why"}]}"#;
+    let v2 = r#"{"id":"feature-escalation","type":"default","components":[{"type":"textfield","key":"why"}]}"#;
     let redeployed = engine
         .apply_command(Command::DeployForms(vec![form(v2)]))
         .unwrap();
@@ -9068,7 +9067,10 @@ fn user_task_resolves_form_id_to_the_latest_form_key_and_carries_external_refere
             _ => None,
         })
         .expect("the new instance's escalation task resolves a form key");
-    assert_eq!(escalation2, form_key_v2, "new tasks bind to the latest form");
+    assert_eq!(
+        escalation2, form_key_v2,
+        "new tasks bind to the latest form"
+    );
     // The first task's binding is unchanged (it kept its v1 key).
     assert_eq!(
         engine.state().user_tasks[&escalation_key.0].form_key,
@@ -9122,7 +9124,10 @@ fn user_task_with_external_reference_never_resolves_a_form_key_even_if_form_id_i
         .values()
         .find(|t| t.element_id == "both")
         .expect("the task exists");
-    assert_eq!(task.form_key, None, "external reference suppresses form_key");
+    assert_eq!(
+        task.form_key, None,
+        "external reference suppresses form_key"
+    );
     assert_eq!(
         task.external_form_reference.as_deref(),
         Some("https://forms.example/x")
