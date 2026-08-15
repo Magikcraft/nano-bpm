@@ -14,8 +14,9 @@
 //! ## Supported subset
 //!
 //! * `process` (one or more per file) with its `id`.
-//! * Flow nodes: `startEvent`, `endEvent`, `serviceTask`, `userTask`,
-//!   `exclusiveGateway`, `parallelGateway`, `eventBasedGateway`.
+//! * Flow nodes: `startEvent`, `endEvent`, `task`/`manualTask` (abstract
+//!   pass-through), `serviceTask`, `userTask`, `exclusiveGateway`,
+//!   `parallelGateway`, `eventBasedGateway`.
 //! * `subProcess` (embedded): its nested flow nodes/flows are scoped to it, and
 //!   a `boundaryEvent` with an `errorEventDefinition` attached to it becomes an
 //!   interrupting error boundary on the sub-process.
@@ -569,6 +570,21 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                             "intermediateThrowEvent" => {
                                 acc.add_node(attrs, NodeKind::IntermediateThrow);
                             }
+                            // An abstract `task` (or `manualTask`) has no
+                            // execution semantics — Zeebe/C8 accept it and treat
+                            // it as a pass-through. Model it as such (token
+                            // completes on activation and takes its outgoing
+                            // flow). Push it onto the io_stack so any
+                            // `zeebe:ioMapping` on it still applies, mirroring the
+                            // typed tasks.
+                            "task" | "manualTask" => {
+                                let idx = acc.add_node(attrs, NodeKind::Task);
+                                if !self_closing {
+                                    if let Some(i) = idx {
+                                        io_stack.push(i);
+                                    }
+                                }
+                            }
                             // A receive task waits for a message. Nano's trace
                             // generator has no inbound correlation, so model it as
                             // a pass-through (the awaited event is assumed to
@@ -899,6 +915,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                     cur_user_task = None;
                     io_stack.pop();
                 }
+                "task" | "manualTask" => {
+                    io_stack.pop();
+                }
                 "callActivity" => {
                     cur_call = None;
                     io_stack.pop();
@@ -1221,6 +1240,8 @@ enum NodeKind {
     EventBased,
     IntermediateCatch,
     IntermediateThrow,
+    /// An abstract `task`/`manualTask` — a pass-through (see [`ElementKind::Task`]).
+    Task,
     SubProcess,
     /// A call activity (callee in `NodeAcc::called_process_id`); expanded inline.
     Call,
@@ -1678,6 +1699,7 @@ impl ProcessAcc {
                 }
                 NodeKind::End => builder.end_event(node.id),
                 NodeKind::IntermediateThrow => builder.intermediate_throw_event(node.id),
+                NodeKind::Task => builder.task(node.id),
                 NodeKind::Exclusive => builder.exclusive_gateway(node.id),
                 NodeKind::Parallel => builder.parallel_gateway(node.id),
                 NodeKind::EventBased => builder.event_based_gateway(node.id),
@@ -2100,6 +2122,42 @@ mod tests {
         assert_eq!(parse_iso8601_duration("PT"), None);
         assert_eq!(parse_iso8601_duration("P1Y"), None);
         assert_eq!(parse_iso8601_duration("PT5"), None);
+    }
+
+    #[test]
+    fn should_parse_abstract_task_and_manual_task_as_pass_through() {
+        // An abstract `bpmn:task` (and `manualTask`) has no execution semantics;
+        // Zeebe/C8 accept it as a pass-through. Nano must parse it (not drop it,
+        // which would dangle the inbound sequence flow with an
+        // "unknown target element" deploy error).
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="abstract" isExecutable="true">
+    <bpmn:startEvent id="start" />
+    <bpmn:task id="do-something" name="Do Something" />
+    <bpmn:manualTask id="do-manual" />
+    <bpmn:endEvent id="end" />
+    <bpmn:sequenceFlow id="f1" sourceRef="start" targetRef="do-something" />
+    <bpmn:sequenceFlow id="f2" sourceRef="do-something" targetRef="do-manual" />
+    <bpmn:sequenceFlow id="f3" sourceRef="do-manual" targetRef="end" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+
+        let defs = parse_bpmn(xml).expect("an abstract task must parse (Zeebe parity)");
+        let def = &defs[0];
+        assert_eq!(def.element("do-something").unwrap().kind, ElementKind::Task);
+        assert_eq!(def.element("do-manual").unwrap().kind, ElementKind::Task);
+        // The `name` attribute is captured like any other element.
+        assert_eq!(
+            def.element("do-something").unwrap().name.as_deref(),
+            Some("Do Something")
+        );
+        // The inbound flow resolves to the task (no dangling target).
+        assert_eq!(def.element("start").unwrap().outgoing[0].to, "do-something");
+        assert_eq!(
+            def.element("do-something").unwrap().outgoing[0].to,
+            "do-manual"
+        );
     }
 
     #[test]

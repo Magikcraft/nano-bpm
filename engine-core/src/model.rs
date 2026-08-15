@@ -616,6 +616,15 @@ pub enum ElementKind {
     /// don't block a forward path) and as the inert demotion target for the
     /// surplus start events of a process that declares more than one.
     IntermediateThrowEvent,
+    /// An abstract BPMN `task` (also `manualTask`): a task with no execution
+    /// semantics. Zeebe/C8 accept it and treat it as a **pass-through** — on
+    /// activation the token completes immediately and routes along the
+    /// element's outgoing flow, exactly like an [`IntermediateThrowEvent`]. No
+    /// job is created and no external work is performed; attaching behaviour
+    /// requires modelling a concrete task type (service/user/script/…). Kept as
+    /// a distinct kind (rather than demoted to `IntermediateThrowEvent`) so the
+    /// reversible IR round-trips it back to `<bpmn:task>`.
+    Task,
     /// A script task with an inline `zeebe:script` FEEL expression. On
     /// activation the engine evaluates `expression` against the instance
     /// variables (after any input mappings are applied), stores the result
@@ -722,6 +731,7 @@ impl ElementKind {
             | ElementKind::TimerStartEvent { .. } => "START_EVENT",
             ElementKind::EndEvent => "END_EVENT",
             ElementKind::IntermediateThrowEvent => "INTERMEDIATE_THROW_EVENT",
+            ElementKind::Task => "TASK",
             ElementKind::TimerIntermediateCatchEvent { .. }
             | ElementKind::MessageIntermediateCatchEvent { .. }
             | ElementKind::SignalIntermediateCatchEvent { .. }
@@ -1417,6 +1427,11 @@ impl ProcessBuilder {
     /// [`ElementKind::IntermediateThrowEvent`]).
     pub fn intermediate_throw_event(self, id: impl Into<String>) -> Self {
         self.add(id, ElementKind::IntermediateThrowEvent)
+    }
+
+    /// Adds an abstract `task` (a pass-through; see [`ElementKind::Task`]).
+    pub fn task(self, id: impl Into<String>) -> Self {
+        self.add(id, ElementKind::Task)
     }
 
     /// Adds an inline-FEEL script task (see [`ElementKind::ScriptTask`]): on

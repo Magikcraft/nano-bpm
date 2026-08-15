@@ -156,6 +156,7 @@ fn kind_keyword(kind: &ElementKind) -> &'static str {
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::Task => "task",
         ElementKind::ScriptTask { .. } => "scriptTask",
         ElementKind::CallActivity { .. } => "callActivity",
         ElementKind::SignalIntermediateCatchEvent { .. } => "signalIntermediateCatchEvent",
@@ -176,7 +177,8 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
         | ElementKind::ExclusiveGateway
         | ElementKind::ParallelGateway
         | ElementKind::EventBasedGateway
-        | ElementKind::IntermediateThrowEvent => {}
+        | ElementKind::IntermediateThrowEvent
+        | ElementKind::Task => {}
         ElementKind::ServiceTask {
             job_type,
             priority,
@@ -1088,6 +1090,7 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
         "parallelGateway" => ElementKind::ParallelGateway,
         "eventBasedGateway" => ElementKind::EventBasedGateway,
         "intermediateThrowEvent" => ElementKind::IntermediateThrowEvent,
+        "task" => ElementKind::Task,
         "serviceTask" => ElementKind::ServiceTask {
             job_type: attrs.require("jobType", id)?,
             priority: attrs.take("priority"),
@@ -1199,6 +1202,7 @@ fn attached_to(kind: &ElementKind) -> Option<&str> {
         | ElementKind::TimerStartEvent { .. }
         | ElementKind::SubProcess { .. }
         | ElementKind::IntermediateThrowEvent
+        | ElementKind::Task
         | ElementKind::ScriptTask { .. }
         | ElementKind::CallActivity { .. }
         | ElementKind::SignalIntermediateCatchEvent { .. }

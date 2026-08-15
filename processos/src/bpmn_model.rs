@@ -55,6 +55,7 @@ fn kind_label(kind: &ElementKind) -> &'static str {
         ElementKind::TimerStartEvent { .. } => "timerStartEvent",
         ElementKind::SubProcess { .. } => "subProcess",
         ElementKind::IntermediateThrowEvent => "intermediateThrowEvent",
+        ElementKind::Task => "task",
         ElementKind::ScriptTask { .. } => "scriptTask",
         ElementKind::CallActivity { .. } => "callActivity",
         ElementKind::SignalIntermediateCatchEvent { .. } => "signalIntermediateCatchEvent",
@@ -97,7 +98,7 @@ fn is_gateway(kind: &ElementKind) -> bool {
 fn is_task(kind: &ElementKind) -> bool {
     matches!(
         kind,
-        ElementKind::ServiceTask { .. } | ElementKind::UserTask(_)
+        ElementKind::ServiceTask { .. } | ElementKind::UserTask(_) | ElementKind::Task
     )
 }
 
@@ -1993,6 +1994,9 @@ fn emit_element(
                 "    <bpmn:intermediateThrowEvent id=\"{eid}\"{na}/>\n"
             ));
         }
+        ElementKind::Task => {
+            out.push_str(&format!("    <bpmn:task id=\"{eid}\"{na}/>\n"));
+        }
         ElementKind::ScriptTask {
             expression,
             result_variable,
@@ -2781,6 +2785,7 @@ fn node_dims(kind: &ElementKind) -> (f64, f64) {
     match kind {
         ElementKind::ServiceTask { .. }
         | ElementKind::UserTask(_)
+        | ElementKind::Task
         | ElementKind::CallActivity { .. }
         | ElementKind::SubProcess { .. } => (110.0, 80.0),
         ElementKind::ExclusiveGateway
