@@ -1888,3 +1888,140 @@ fn multi_partition_state_survives_a_restart() {
 
     restarted.shutdown();
 }
+
+/// Extracts the `items` array of a process-definition search response.
+fn search_pd_items(server: &ServerProcess, filter_json: &str) -> Vec<serde_json::Value> {
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-definitions/search"),
+        Some(filter_json),
+    );
+    assert_eq!(status, 200, "pd search failed: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
+    json["items"].as_array().cloned().unwrap_or_default()
+}
+
+/// Regression for Magikcraft/nano-bpm#792: process-definition search must honor
+/// the BPMN display `name` (exact + `$like` wildcard), the `version` filter
+/// across *every* deployed version (not just the latest), and `isLatestVersion`;
+/// and get-by-key must return full details for any version.
+#[test]
+fn process_definition_search_honours_name_wildcard_and_version() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+    let server = ServerProcess::boot(&journal);
+
+    // A process whose executable id ("main-process") differs from its modeller
+    // display name ("Main Process") — the case the name filter must key on.
+    let v1 = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="main-process" name="Main Process" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="t"><bpmn:extensionElements /></bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let (status, body) = deploy_bpmn(server.port, v1);
+    assert_eq!(status, 200, "deploy v1 failed: {body}");
+
+    // A second, differing deployment of the same id → version 2.
+    let v2 = v1
+        .replace("<bpmn:endEvent id=\"e\" />", "<bpmn:endEvent id=\"e2\" />")
+        .replace("targetRef=\"e\"", "targetRef=\"e2\"");
+    let (status, body) = deploy_bpmn(server.port, &v2);
+    assert_eq!(status, 200, "deploy v2 failed: {body}");
+
+    // Wait until both versions are projected.
+    server.request_until(
+        "POST",
+        &path("/process-definitions/search"),
+        Some(r#"{"filter":{"processDefinitionId":"main-process"}}"#),
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| j["items"].as_array().map(|i| i.len() >= 2))
+                    .unwrap_or(false)
+        },
+    );
+
+    // Exact display-name match resolves the id whose name is "Main Process".
+    let by_name = search_pd_items(&server, r#"{"filter":{"name":"Main Process"}}"#);
+    assert!(
+        by_name
+            .iter()
+            .any(|i| i["processDefinitionId"].as_str() == Some("main-process")),
+        "exact name filter must match the display name: {by_name:?}"
+    );
+    // The id-shaped value must NOT match the display-name filter.
+    let by_id_shaped_name = search_pd_items(&server, r#"{"filter":{"name":"main-process"}}"#);
+    assert!(
+        by_id_shaped_name.is_empty(),
+        "name filter matches the display name, not the id: {by_id_shaped_name:?}"
+    );
+
+    // `$like` wildcard on the display name.
+    let by_wildcard = search_pd_items(&server, r#"{"filter":{"name":{"$like":"*Process"}}}"#);
+    assert!(
+        by_wildcard
+            .iter()
+            .any(|i| i["processDefinitionId"].as_str() == Some("main-process")),
+        "wildcard name filter must match: {by_wildcard:?}"
+    );
+
+    // Version filter must find the *superseded* version 1, not just the latest.
+    let v1_items = search_pd_items(
+        &server,
+        r#"{"filter":{"processDefinitionId":"main-process","version":1}}"#,
+    );
+    assert_eq!(
+        v1_items.len(),
+        1,
+        "version=1 must be searchable: {v1_items:?}"
+    );
+    assert_eq!(v1_items[0]["version"].as_i64(), Some(1));
+    assert_eq!(v1_items[0]["name"].as_str(), Some("Main Process"));
+    let v1_key = v1_items[0]["processDefinitionKey"]
+        .as_str()
+        .expect("v1 key present")
+        .to_string();
+
+    let v2_items = search_pd_items(
+        &server,
+        r#"{"filter":{"processDefinitionId":"main-process","version":2}}"#,
+    );
+    assert_eq!(
+        v2_items.len(),
+        1,
+        "version=2 must be searchable: {v2_items:?}"
+    );
+    assert_eq!(v2_items[0]["version"].as_i64(), Some(2));
+
+    // isLatestVersion filters to the highest version per id.
+    let latest = search_pd_items(
+        &server,
+        r#"{"filter":{"processDefinitionId":"main-process","isLatestVersion":true}}"#,
+    );
+    assert_eq!(latest.len(), 1, "exactly one latest version: {latest:?}");
+    assert_eq!(latest[0]["version"].as_i64(), Some(2));
+
+    // Get-by-key resolves the superseded version 1 with full details.
+    let (status, body) = server.request(
+        "GET",
+        &path(&format!("/process-definitions/{v1_key}")),
+        None,
+    );
+    assert_eq!(status, 200, "get-by-key must succeed: {body}");
+    let def: serde_json::Value = serde_json::from_str(&body).expect("get response is JSON");
+    assert_eq!(def["processDefinitionKey"].as_str(), Some(v1_key.as_str()));
+    assert_eq!(def["processDefinitionId"].as_str(), Some("main-process"));
+    assert_eq!(def["version"].as_i64(), Some(1));
+    assert_eq!(def["name"].as_str(), Some("Main Process"));
+
+    // A get for an unknown key is a clean 404.
+    let (status, _) = server.request("GET", &path("/process-definitions/99999999"), None);
+    assert_eq!(status, 404, "unknown key must 404");
+
+    server.shutdown();
+}

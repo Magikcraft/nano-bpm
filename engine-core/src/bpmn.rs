@@ -215,7 +215,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 match local_name(name) {
                     "process" => {
                         let id = attr(attrs, "id").ok_or(ParseError::ProcessWithoutId)?;
-                        current = Some(ProcessAcc::new(id.to_string()));
+                        let mut acc = ProcessAcc::new(id.to_string());
+                        acc.name = attr(attrs, "name").map(str::to_string);
+                        current = Some(acc);
                     }
                     // Definitions-level error declarations live outside <process>.
                     "error" => {
@@ -1314,6 +1316,8 @@ struct MessageDecl {
 /// Accumulates the nodes and flows of one `<process>` as it is scanned.
 struct ProcessAcc {
     id: String,
+    /// The `<bpmn:process>` `name` attribute (modeller label), if present.
+    name: Option<String>,
     nodes: Vec<NodeAcc>,
     flows: Vec<FlowAcc>,
     boundaries: Vec<PendingBoundary>,
@@ -1325,6 +1329,7 @@ impl ProcessAcc {
     fn new(id: String) -> Self {
         Self {
             id,
+            name: None,
             nodes: Vec::new(),
             flows: Vec::new(),
             boundaries: Vec::new(),
@@ -1655,6 +1660,9 @@ impl ProcessAcc {
         }
 
         let mut builder = ProcessBuilder::new(self.id.clone());
+        if let Some(name) = &self.name {
+            builder = builder.name(name.clone());
+        }
         // Map each sub-process to its inner start event (a start node whose
         // parent is the sub-process).
         let sub_starts: HashMap<String, String> = self
@@ -2102,6 +2110,42 @@ mod tests {
     <bpmn:sequenceFlow id="f2" sourceRef="charge" targetRef="done" />
   </bpmn:process>
 </bpmn:definitions>"#;
+
+    #[test]
+    fn should_parse_the_process_name_attribute() {
+        // The `<bpmn:process>` `name` attribute (the modeller label) is captured
+        // as `ProcessDefinition::name`, distinct from the executable `id`. This
+        // is what the process-definition search `name` filter matches against and
+        // what read models surface as the definition `name`.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="main-process" name="Main Process" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.id, "main-process");
+        assert_eq!(def.name.as_deref(), Some("Main Process"));
+    }
+
+    #[test]
+    fn should_leave_process_name_none_when_absent() {
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="simple-process" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.id, "simple-process");
+        assert_eq!(def.name, None);
+    }
 
     #[test]
     fn should_parse_a_timer_intermediate_catch_event() {

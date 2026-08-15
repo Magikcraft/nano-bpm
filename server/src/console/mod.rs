@@ -2567,7 +2567,9 @@ fn deploy_status_of(server: &ServerImpl, xml: &str) -> ModelStatus {
             .store
             .process_definitions()
             .into_iter()
-            .find(|d| &d.process_id == id)
+            // Deploy status compares against the current (latest) version, so
+            // ignore superseded versions now that every version is surfaced.
+            .find(|d| &d.process_id == id && d.is_latest)
     });
     let (deploy_status, deployed_version, deployed_key) = match deployed {
         None => ("not_deployed", None, None),
