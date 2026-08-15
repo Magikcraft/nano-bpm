@@ -62,6 +62,11 @@ export default function TestRunPanel({
     setJobVars({});
     setMsgVars({});
     setSigVars({});
+    setFreeMsgName("");
+    setFreeMsgKey("");
+    setFreeMsgVars("{}");
+    setFreeSigName("");
+    setFreeSigVars("{}");
     setTraceKey(null);
   }, [processIds]);
 
@@ -103,10 +108,14 @@ export default function TestRunPanel({
     correlationKey: string,
     vars: string,
   ) {
-    correlateMessageCmd(messageName, correlationKey, vars.trim() || "{}");
+    correlateMessageCmd(
+      messageName.trim(),
+      correlationKey.trim(),
+      vars.trim() || "{}",
+    );
   }
   function broadcastSignal(signalName: string, vars: string) {
-    broadcastSignalCmd(signalName, vars.trim() || "{}");
+    broadcastSignalCmd(signalName.trim(), vars.trim() || "{}");
   }
   function advance() {
     const ms = Number(advanceMs);
