@@ -4194,7 +4194,12 @@ async fn regenerate_domain_types(name: &str) {
     // `project_dir`/`read_project_ref` I/O (or drift if the ref changes between
     // the two calls).
     let (is_urban, urban_available) = projects::project_dir(name)
-        .map(|d| (d.join("nano.app.json").is_file(), urban::urban_available_for(&d)))
+        .map(|d| {
+            (
+                d.join("nano.app.json").is_file(),
+                urban::urban_available_for(&d),
+            )
+        })
         .unwrap_or((false, false));
     match regen_path(is_urban, urban_available) {
         RegenPath::UrbanGen => {
