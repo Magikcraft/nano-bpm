@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import "bpmn-js/dist/assets/diagram-js.css";
 import "bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css";
 import { useBojtos, BpmnRuntimeView } from "@nanobpm/bojtos-react";
@@ -9,6 +9,8 @@ import {
   parseModelEnvelopes,
   scaffoldJobOutput,
   scaffoldStartVars,
+  prefillMessagePublish,
+  prefillSignalBroadcast,
 } from "../lib/testScaffold.ts";
 
 export default function TestRunPanel({
@@ -27,6 +29,8 @@ export default function TestRunPanel({
     createInstance,
     completeJob: completeJobCmd,
     failJob: failJobCmd,
+    correlateMessage: correlateMessageCmd,
+    broadcastSignal: broadcastSignalCmd,
     advanceTime,
     reset: resetEngine,
   } = useBojtos({ bpmn: xml });
@@ -34,6 +38,13 @@ export default function TestRunPanel({
   const [process, setProcess] = useState<string>("");
   const [startVars, setStartVars] = useState("{}");
   const [jobVars, setJobVars] = useState<Record<string, string>>({});
+  const [msgVars, setMsgVars] = useState<Record<string, string>>({});
+  const [sigVars, setSigVars] = useState<Record<string, string>>({});
+  const [freeMsgName, setFreeMsgName] = useState("");
+  const [freeMsgKey, setFreeMsgKey] = useState("");
+  const [freeMsgVars, setFreeMsgVars] = useState("{}");
+  const [freeSigName, setFreeSigName] = useState("");
+  const [freeSigVars, setFreeSigVars] = useState("{}");
   const [advanceMs, setAdvanceMs] = useState("60000");
   const [leftView, setLeftView] = useState<"diagram" | "trace">("diagram");
   const [traceKey, setTraceKey] = useState<string | null>(null);
@@ -43,14 +54,37 @@ export default function TestRunPanel({
   // typed start/completion payloads instead of leaving the maker to guess fields.
   const model = useMemo(() => parseModelEnvelopes(xml), [xml]);
 
+  // Clears the per-run draft/UI state — job/message/signal payload edits, the
+  // free-form message/signal inputs, and the pinned trace — so a fresh run never
+  // inherits a previous run's edits. Shared by the (re)deploy effect (below) and
+  // the manual "Reset" button, which resets the engine without changing
+  // `processIds`, so the effect alone would miss it.
+  const clearRunDraftState = useCallback(() => {
+    setJobVars({});
+    setMsgVars({});
+    setSigVars({});
+    setFreeMsgName("");
+    setFreeMsgKey("");
+    setFreeMsgVars("{}");
+    setFreeSigName("");
+    setFreeSigVars("{}");
+    setTraceKey(null);
+  }, []);
+
   // Each (re)deployment produces a fresh `processIds` array; when it changes,
   // default the process selection and clear the per-run UI state — matching the
   // original panel's `deployInto` reset.
   useEffect(() => {
     setProcess(processIds[0] ?? "");
-    setJobVars({});
-    setTraceKey(null);
-  }, [processIds]);
+    clearRunDraftState();
+  }, [processIds, clearRunDraftState]);
+
+  // "Reset" restarts the engine on the same deployment; `processIds` is
+  // unchanged, so we clear the per-run drafts explicitly here too.
+  const handleReset = useCallback(() => {
+    resetEngine();
+    clearRunDraftState();
+  }, [resetEngine, clearRunDraftState]);
 
   // Start variables are (re)seeded from the selected process's entry-task input
   // envelope whenever the model or the selected process changes, so switching
@@ -75,6 +109,29 @@ export default function TestRunPanel({
   }
   function failJob(key: string) {
     failJobCmd(key, 0, "Failed in test run");
+  }
+  // A subscription's publish/broadcast payload defaults to the empty object
+  // `"{}"` until the maker edits it (kept lazy so we never clobber an edit —
+  // mirroring `jobValue`).
+  function msgValue(key: string): string {
+    return msgVars[key] ?? "{}";
+  }
+  function sigValue(key: string): string {
+    return sigVars[key] ?? "{}";
+  }
+  function publishMessage(
+    messageName: string,
+    correlationKey: string,
+    vars: string,
+  ) {
+    correlateMessageCmd(
+      messageName.trim(),
+      correlationKey.trim(),
+      vars.trim() || "{}",
+    );
+  }
+  function broadcastSignal(signalName: string, vars: string) {
+    broadcastSignalCmd(signalName.trim(), vars.trim() || "{}");
   }
   function advance() {
     const ms = Number(advanceMs);
@@ -223,7 +280,7 @@ export default function TestRunPanel({
               </h3>
               {started && (
                 <button
-                  onClick={resetEngine}
+                  onClick={handleReset}
                   className="text-xs text-fg-muted hover:text-fg"
                 >
                   Reset
@@ -320,6 +377,194 @@ export default function TestRunPanel({
                     </div>
                   ))
                 )}
+              </section>
+
+              {/* Messages — correlate to a message catch/receive by name +
+                  correlation key. Messages ARE buffered: publishing one with no
+                  open subscription is retained until a matching subscription
+                  opens (engine-wasm correlateMessage). */}
+              <section className="space-y-2">
+                <SectionLabel>
+                  Messages ({snapshot!.messageSubscriptions.length})
+                </SectionLabel>
+                <p className="text-[11px] text-fg-faint">
+                  Correlated by message name + correlation key, and buffered — a
+                  message with no matching subscription yet is retained until
+                  one opens.
+                </p>
+                {snapshot!.messageSubscriptions.map((sub) => {
+                  const pre = prefillMessagePublish(sub);
+                  return (
+                    <div
+                      key={sub.key}
+                      className="rounded border border-edge bg-raised p-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-xs text-fg-muted">
+                          {sub.elementId}
+                        </span>
+                        <span className="rounded bg-hover px-1.5 py-0.5 font-mono text-[10px] text-fg-muted">
+                          {sub.kind}
+                        </span>
+                      </div>
+                      <div className="mt-1 font-mono text-[11px] text-fg">
+                        {pre.messageName}
+                        {pre.correlationKey && (
+                          <span className="text-fg-faint">
+                            {" "}
+                            · key {pre.correlationKey}
+                          </span>
+                        )}
+                      </div>
+                      <textarea
+                        value={msgValue(sub.key)}
+                        onChange={(e) =>
+                          setMsgVars((m) => ({
+                            ...m,
+                            [sub.key]: e.target.value,
+                          }))
+                        }
+                        rows={2}
+                        spellCheck={false}
+                        placeholder="correlation variables (JSON)"
+                        className="mt-1.5 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
+                      />
+                      <button
+                        onClick={() =>
+                          publishMessage(
+                            pre.messageName,
+                            pre.correlationKey,
+                            msgValue(sub.key),
+                          )
+                        }
+                        className="mt-1.5 w-full rounded border border-accent/30 bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent-strong hover:bg-accent/20"
+                      >
+                        Publish
+                      </button>
+                    </div>
+                  );
+                })}
+                {/* Free-form publish: a message the model hasn't subscribed to
+                    yet (e.g. a message start event, or to observe buffering). */}
+                <details className="rounded border border-edge bg-raised p-2 text-xs">
+                  <summary className="cursor-pointer text-fg-muted">
+                    Publish a message by hand
+                  </summary>
+                  <input
+                    value={freeMsgName}
+                    onChange={(e) => setFreeMsgName(e.target.value)}
+                    placeholder="message name"
+                    className="mt-1.5 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
+                  />
+                  <input
+                    value={freeMsgKey}
+                    onChange={(e) => setFreeMsgKey(e.target.value)}
+                    placeholder="correlation key"
+                    className="mt-1.5 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
+                  />
+                  <textarea
+                    value={freeMsgVars}
+                    onChange={(e) => setFreeMsgVars(e.target.value)}
+                    rows={2}
+                    spellCheck={false}
+                    placeholder="correlation variables (JSON)"
+                    className="mt-1.5 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
+                  />
+                  <button
+                    onClick={() =>
+                      publishMessage(freeMsgName, freeMsgKey, freeMsgVars)
+                    }
+                    disabled={!freeMsgName.trim()}
+                    className="mt-1.5 w-full rounded border border-accent/30 bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent-strong hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Publish
+                  </button>
+                </details>
+              </section>
+
+              {/* Signals — broadcast by name only; every matching open
+                  subscription across all instances is hit. Signals are NOT
+                  buffered: a broadcast with no live subscriber is a no-op
+                  (engine-wasm broadcastSignal). */}
+              <section className="space-y-2">
+                <SectionLabel>
+                  Signals ({snapshot!.signalSubscriptions.length})
+                </SectionLabel>
+                <p className="text-[11px] text-fg-faint">
+                  Broadcast by name only — every matching open subscription
+                  across all instances is hit. Not buffered: a broadcast with no
+                  live subscriber is a no-op.
+                </p>
+                {snapshot!.signalSubscriptions.map((sub) => {
+                  const pre = prefillSignalBroadcast(sub);
+                  return (
+                    <div
+                      key={sub.key}
+                      className="rounded border border-edge bg-raised p-2"
+                    >
+                      <div className="flex items-center justify-between">
+                        <span className="font-mono text-xs text-fg-muted">
+                          {sub.elementId}
+                        </span>
+                        <span className="rounded bg-hover px-1.5 py-0.5 font-mono text-[10px] text-fg-muted">
+                          {sub.kind}
+                        </span>
+                      </div>
+                      <div className="mt-1 font-mono text-[11px] text-fg">
+                        {pre.signalName}
+                      </div>
+                      <textarea
+                        value={sigValue(sub.key)}
+                        onChange={(e) =>
+                          setSigVars((m) => ({
+                            ...m,
+                            [sub.key]: e.target.value,
+                          }))
+                        }
+                        rows={2}
+                        spellCheck={false}
+                        placeholder="signal variables (JSON)"
+                        className="mt-1.5 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
+                      />
+                      <button
+                        onClick={() =>
+                          broadcastSignal(pre.signalName, sigValue(sub.key))
+                        }
+                        className="mt-1.5 w-full rounded border border-accent/30 bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent-strong hover:bg-accent/20"
+                      >
+                        Broadcast
+                      </button>
+                    </div>
+                  );
+                })}
+                {/* Free-form broadcast: a signal the model hasn't subscribed to
+                    yet (name-only correlation). */}
+                <details className="rounded border border-edge bg-raised p-2 text-xs">
+                  <summary className="cursor-pointer text-fg-muted">
+                    Broadcast a signal by hand
+                  </summary>
+                  <input
+                    value={freeSigName}
+                    onChange={(e) => setFreeSigName(e.target.value)}
+                    placeholder="signal name"
+                    className="mt-1.5 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
+                  />
+                  <textarea
+                    value={freeSigVars}
+                    onChange={(e) => setFreeSigVars(e.target.value)}
+                    rows={2}
+                    spellCheck={false}
+                    placeholder="signal variables (JSON)"
+                    className="mt-1.5 w-full rounded border border-edge-strong bg-inset px-2 py-1 font-mono text-[11px] text-fg outline-none focus:border-accent"
+                  />
+                  <button
+                    onClick={() => broadcastSignal(freeSigName, freeSigVars)}
+                    disabled={!freeSigName.trim()}
+                    className="mt-1.5 w-full rounded border border-accent/30 bg-accent/10 px-2 py-1 text-[11px] font-medium text-accent-strong hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Broadcast
+                  </button>
+                </details>
               </section>
 
               {/* Timers */}
