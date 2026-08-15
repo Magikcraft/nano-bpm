@@ -79,6 +79,7 @@
       "description": "Named LLM bindings usable as workers or as a chat surface agent (ADR 0022 §E).",
       "additionalProperties": { "$ref": "#/$defs/llmBinding" }
     },
+    "network": { "$ref": "#/$defs/network" },
     "security": { "$ref": "#/$defs/security" },
     "ui": { "$ref": "#/$defs/appUi" }
   },
@@ -604,6 +605,18 @@
         }
       }
     },
+    "network": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "App-level network settings (issue #235). Absent ⇒ loopback.",
+      "properties": {
+        "bind": {
+          "$ref": "#/$defs/bindMode",
+          "description": "Which interface the app's embedded HTTP server binds to. Default \"loopback\" (127.0.0.1 — secure by default, refuses off-box connections); \"all\" (0.0.0.0) exposes it on the LAN for a distributed worker fleet. The URBAN_BIND env var overrides this at runtime."
+        }
+      }
+    },
+    "bindMode": { "enum": ["loopback", "all"] },
     "security": {
       "type": "object",
       "additionalProperties": false,

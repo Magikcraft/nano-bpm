@@ -183,6 +183,7 @@ export interface AppManifest {
   llm?: {
     [k: string]: LlmBinding;
   };
+  network?: Network;
   security?: Security;
   ui?: AppUi;
 }
@@ -472,6 +473,15 @@ export interface LlmBinding {
    * Action-API tools the agent may call (e.g. start-process, complete-task, query-data).
    */
   tools?: string[];
+}
+/**
+ * App-level network settings (issue #235). Absent ⇒ loopback.
+ */
+export interface Network {
+  /**
+   * Which interface the app's embedded HTTP server binds to. Default "loopback" (127.0.0.1 — secure by default, refuses off-box connections); "all" (0.0.0.0) exposes it on the LAN for a distributed worker fleet. The URBAN_BIND env var overrides this at runtime.
+   */
+  bind?: "loopback" | "all";
 }
 /**
  * App-user auth/identity/authorization policy (ADR 0028). Default (block absent) is single-user, unsecured. Secrets are env templates resolved at boot, never persisted.

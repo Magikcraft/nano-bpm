@@ -37,6 +37,33 @@ test("schema errors fail closed with a JSON pointer, before cross-ref runs", () 
   assert.ok(result.diagnostics.some((d) => d.pointer === "/id"));
 });
 
+test("network.bind accepts the loopback/all enum (issue #235)", async () => {
+  const index = await buildSymbolIndex(models);
+  for (const bind of ["loopback", "all"]) {
+    const m = manifest();
+    m.network = { bind };
+    const result = validateManifest(m, index);
+    assert.deepEqual(result.diagnostics, [], `bind=${bind} should validate`);
+    assert.equal(result.ok, true);
+  }
+});
+
+test("network.bind rejects an out-of-enum value with a schema pointer", () => {
+  const m = manifest();
+  m.network = { bind: "public" }; // not a BindMode
+  const result = validateManifest(m);
+  assert.equal(result.ok, false);
+  assert.deepEqual(codesFor(result, "/network/bind"), ["schema"]);
+});
+
+test("network block rejects unknown keys (additionalProperties: false)", () => {
+  const m = manifest();
+  m.network = { bind: "loopback", nope: true };
+  const result = validateManifest(m);
+  assert.equal(result.ok, false);
+  assert.ok(result.diagnostics.every((d) => d.code === "schema"));
+});
+
 test("unknown process / message / decision are rejected with pointers", async () => {
   const index = await buildSymbolIndex(models);
   const m = manifest();
