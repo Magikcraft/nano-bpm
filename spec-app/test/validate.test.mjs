@@ -142,6 +142,60 @@ test("instanceTracking with statusField + activeStatuses is coherent", () => {
   assert.deepEqual(codesFor(result, "/instanceTracking/0/activeStatuses"), []);
 });
 
+test("instanceTracking with statusField + terminalStatuses is coherent (fail-open selector)", () => {
+  const m = manifest();
+  m.instanceTracking = [
+    {
+      table: "feature_runs",
+      keyField: "process_key",
+      statusField: "status",
+      terminalStatuses: ["merged", "abandoned"],
+      onTerminated: { set: { status: "abandoned" } },
+    },
+  ];
+  const result = validateManifest(m);
+  assert.equal(result.ok, true);
+  assert.deepEqual(codesFor(result, "/instanceTracking/0/terminalStatuses"), []);
+});
+
+test("instanceTracking terminalStatuses without statusField is incoherent", () => {
+  const m = manifest();
+  m.instanceTracking = [
+    {
+      table: "feature_runs",
+      keyField: "process_key",
+      terminalStatuses: ["merged"], // no statusField to read them from
+      onTerminated: { set: { status: "abandoned" } },
+    },
+  ];
+  const result = validateManifest(m); // intra-manifest rule; no index needed
+  assert.equal(result.ok, false);
+  assert.deepEqual(
+    codesFor(result, "/instanceTracking/0/terminalStatuses"),
+    ["instance-tracking-incoherent"],
+  );
+});
+
+test("instanceTracking activeStatuses + terminalStatuses are mutually exclusive", () => {
+  const m = manifest();
+  m.instanceTracking = [
+    {
+      table: "feature_runs",
+      keyField: "process_key",
+      statusField: "status",
+      activeStatuses: ["running"],
+      terminalStatuses: ["merged"],
+      onTerminated: { set: { status: "abandoned" } },
+    },
+  ];
+  const result = validateManifest(m);
+  assert.equal(result.ok, false);
+  assert.deepEqual(
+    codesFor(result, "/instanceTracking/0/terminalStatuses"),
+    ["instance-tracking-incoherent"],
+  );
+});
+
 // ── Domain type registry (ADR 0029 §4 / ADR 0031) ─────────────────────────────
 import { resolveDomainTypes } from "../src/domain-types.ts";
 
