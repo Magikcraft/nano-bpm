@@ -9659,12 +9659,7 @@ impl ServerImpl {
         // Resolve the task's form key: locally first, then from the owning node
         // for a task on a remote partition (forms are replicated to every node,
         // so the form itself is always resolvable locally once we know its key).
-        let form_key: Option<u64> = match self
-            .store
-            .user_tasks()
-            .iter()
-            .find(|t| t.key == user_task_key)
-        {
+        let form_key: Option<u64> = match self.store.user_task(user_task_key) {
             Some(task) => task.form_key,
             None => {
                 if let Some(node) = self.read_route(user_task_key) {

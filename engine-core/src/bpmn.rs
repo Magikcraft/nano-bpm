@@ -556,12 +556,16 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                         form_id
                                     };
                                 } else if let Some(idx) = cur_start {
-                                    // Start events surface only a deployed
-                                    // `formId` (resolved by GetStartProcessForm);
-                                    // an external start-form reference has no
-                                    // read-model/API surface, so it is
-                                    // deliberately not carried here.
+                                    // Start forms are formId-only by design: the
+                                    // `GetStartProcessForm` contract resolves a
+                                    // *deployed* form, which an external reference
+                                    // (an externally-hosted form) is not. We
+                                    // intentionally do not record
+                                    // `externalReference` for start events;
+                                    // external start forms are out of scope until
+                                    // there is a read-model/API surface for them.
                                     acc.nodes[idx].start_form_id = form_id;
+                                    let _ = external_reference;
                                 }
                             }
                             "adHoc" => {

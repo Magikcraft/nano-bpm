@@ -1544,6 +1544,23 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// A single user task by key, using the `key` primary-key index. Avoids
+    /// materializing every user task for a point lookup (e.g. the form endpoint).
+    pub fn user_task(&self, key: Key) -> Option<UserTaskRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT key, instance_key, element_instance_key, element_id, state, \
+             assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
+             priority, created_at_ms, process_definition_id, process_definition_key, \
+             process_definition_version, form_key, external_form_reference \
+             FROM user_tasks WHERE key = ?1",
+            params![key as i64],
+            map_user_task,
+        )
+        .optional()
+        .expect("query user_task")
+    }
+
     pub fn incidents(&self) -> Vec<IncidentRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
@@ -2248,6 +2265,10 @@ impl ReadModel {
 
     pub fn user_tasks(&self) -> Vec<UserTaskRow> {
         self.shards.iter().flat_map(|s| s.user_tasks()).collect()
+    }
+
+    pub fn user_task(&self, key: Key) -> Option<UserTaskRow> {
+        self.shards.iter().find_map(|s| s.user_task(key))
     }
 
     pub fn incidents(&self) -> Vec<IncidentRow> {
