@@ -2050,13 +2050,51 @@ fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
 /// A 400 is a client-side rejection → `INVALID_ARGUMENT`. Any other status
 /// (e.g. 502 owner-unreachable, 500) is an infrastructure failure, not a bad
 /// argument, so it keeps a generic deploy title.
+///
+/// `instance` is set to the deployments endpoint path for full Zeebe/C8 REST
+/// `ProblemDetail` wire-shape parity — the shape documented in #793 is
+/// `{ …, "instance": "/v2/deployments" }`; the generic `problem(...)` helper
+/// leaves `instance` empty.
 fn deploy_problem(status: u16, detail: String) -> models::ProblemDetail {
     let title = if status == 400 {
         "INVALID_ARGUMENT"
     } else {
         "Deployment failed"
     };
-    problem(title, status, detail)
+    models::ProblemDetail::new(
+        title.to_string(),
+        status,
+        detail,
+        DEPLOYMENTS_ENDPOINT_PATH.to_string(),
+    )
+}
+
+/// REST path of the deployments endpoint, used as the `ProblemDetail.instance`
+/// for deploy rejections (Zeebe/C8 wire-shape parity, #793).
+const DEPLOYMENTS_ENDPOINT_PATH: &str = "/v2/deployments";
+
+/// Maps the `(status, detail)` outcome of a forwarded deploy (`forward_deploy`)
+/// onto the generated `/v2/deployments` response. The endpoint models only a
+/// client-side `400` (invalid BPMN → `INVALID_ARGUMENT`) and an infrastructure
+/// `503`, so a genuine client rejection surfaces as `400` while any other
+/// failure (e.g. `502` partition-0 owner unreachable, a malformed forwarded
+/// body) surfaces as `503`. This keeps the HTTP status and `ProblemDetail.status`
+/// consistent — the old code always wrapped the error in the `400` variant, so a
+/// `502` produced HTTP 400 with a `502` body, breaking clients that key off the
+/// HTTP status.
+fn forward_deploy_response(
+    result: Result<models::DeploymentResult, (u16, String)>,
+) -> apis::resource::CreateDeploymentResponse {
+    use apis::resource::CreateDeploymentResponse as Resp;
+    match result {
+        Ok(result) => Resp::Status200_TheResourcesAreDeployed(result),
+        Err((400, detail)) => {
+            Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(400, detail))
+        }
+        Err((_, detail)) => {
+            Resp::Status503_TheServiceIsCurrentlyUnavailable(deploy_problem(503, detail))
+        }
+    }
 }
 
 /// Parses `host` and `port` from a peer base URL like `http://10.0.0.1:8080` (or
@@ -10101,17 +10139,14 @@ impl ServerImpl {
                     self.broadcast_deployment(&events).await;
                     Ok(Resp::Status200_TheResourcesAreDeployed(result))
                 }
-                Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(
-                    deploy_problem(400, detail),
-                )),
+                Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
+                    400, detail,
+                ))),
             }
         } else {
-            match self.forward_deploy(resources, tenant_id).await {
-                Ok(result) => Ok(Resp::Status200_TheResourcesAreDeployed(result)),
-                Err((status, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(
-                    deploy_problem(status, detail),
-                )),
-            }
+            Ok(forward_deploy_response(
+                self.forward_deploy(resources, tenant_id).await,
+            ))
         }
     }
 
@@ -27742,14 +27777,64 @@ mod subscription_placement_tests {
             "the actionable message is preserved in `detail`, got: {}",
             bad.detail
         );
+        assert_eq!(
+            bad.instance, "/v2/deployments",
+            "the C8 REST ProblemDetail shape sets `instance` to the deployments endpoint path"
+        );
 
-        let unreachable =
-            deploy_problem(502, "deploy-partition owner unreachable".to_string());
+        let unreachable = deploy_problem(502, "deploy-partition owner unreachable".to_string());
         assert_ne!(
             unreachable.title, "INVALID_ARGUMENT",
             "an infrastructure failure is not a client INVALID_ARGUMENT"
         );
         assert_eq!(unreachable.status, 502);
+    }
+
+    #[test]
+    fn forward_deploy_response_keeps_http_status_consistent_with_body() {
+        // Magikcraft/nano-bpm#793 (forward path): a forwarded deploy can fail
+        // either as a client-side rejection (400 → INVALID_ARGUMENT) or as an
+        // infrastructure failure (e.g. 502 partition-0 owner unreachable). The
+        // handler must not mislabel an infra failure as HTTP 400 — the HTTP
+        // status must match `ProblemDetail.status`, or clients that key off the
+        // HTTP status break. The `/v2/deployments` endpoint models only 400 and
+        // 503 errors, so any non-400 forward failure surfaces as a 503.
+        use apis::resource::CreateDeploymentResponse as Resp;
+
+        let rejected = forward_deploy_response(Err((
+            400,
+            "Failed to parse 'bad.bpmn': no process.".to_string(),
+        )));
+        match rejected {
+            Resp::Status400_TheProvidedDataIsNotValid(pd) => {
+                assert_eq!(pd.status, 400, "HTTP 400 body carries status 400");
+                assert_eq!(
+                    pd.title, "INVALID_ARGUMENT",
+                    "a forwarded client rejection keeps the INVALID_ARGUMENT title"
+                );
+                assert!(pd.detail.contains("bad.bpmn"));
+            }
+            other => panic!("a 400 forward rejection must map to the 400 response, got: {other:?}"),
+        }
+
+        let unreachable =
+            forward_deploy_response(Err((502, "deploy-partition owner unreachable".to_string())));
+        match unreachable {
+            Resp::Status503_TheServiceIsCurrentlyUnavailable(pd) => {
+                assert_eq!(
+                    pd.status, 503,
+                    "an infra failure surfaces as HTTP 503 with a matching body status, not a 400/502 mismatch"
+                );
+                assert!(
+                    pd.detail.contains("owner unreachable"),
+                    "the actionable message is preserved, got: {}",
+                    pd.detail
+                );
+            }
+            other => {
+                panic!("a non-400 forward failure must map to the 503 response, got: {other:?}")
+            }
+        }
     }
 
     #[tokio::test]
