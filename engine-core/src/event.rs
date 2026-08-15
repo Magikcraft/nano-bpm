@@ -401,7 +401,6 @@ pub enum Event {
         #[cfg_attr(feature = "serde", serde(default))]
         external_form_reference: Option<String>,
     },
-    /// A user task's assignee was set (or cleared, when `assignee` is `None`).
     UserTaskAssigned {
         user_task_key: Key,
         instance_key: Key,

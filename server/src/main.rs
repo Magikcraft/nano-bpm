@@ -9632,6 +9632,148 @@ impl ServerImpl {
         }
     }
 
+    /// The form linked to a user task (Camunda `GetUserTaskForm`). Resolves the
+    /// task's `form_key` (set at creation from its `zeebe:formDefinition formId`)
+    /// to the deployed form. Returns 204 when the task exists but declares no
+    /// form, and 404 when no such task exists.
+    async fn get_user_task_form_impl(
+        &self,
+        path_params: &models::GetUserTaskFormPathParams,
+    ) -> Result<apis::user_task::GetUserTaskFormResponse, ()> {
+        use apis::user_task::GetUserTaskFormResponse as Resp;
+
+        let user_task_key: u64 = match path_params.user_task_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_NotFound(problem(
+                    "User task not found",
+                    404,
+                    format!(
+                        "User task key '{}' is not a valid key.",
+                        path_params.user_task_key
+                    ),
+                )));
+            }
+        };
+
+        // Resolve the task's form key: locally first, then from the owning node
+        // for a task on a remote partition (forms are replicated to every node,
+        // so the form itself is always resolvable locally once we know its key).
+        let form_key: Option<u64> = match self
+            .store
+            .user_tasks()
+            .iter()
+            .find(|t| t.key == user_task_key)
+        {
+            Some(task) => task.form_key,
+            None => {
+                if let Some(node) = self.read_route(user_task_key) {
+                    let (status, body) = self
+                        .forward_get(node, crate::falcon::ReadKind::UserTask, user_task_key)
+                        .await;
+                    match (status, body) {
+                        (200, Some(b)) => match serde_json::from_value::<models::UserTaskResult>(b)
+                        {
+                            Ok(r) => match r.form_key {
+                                types::Nullable::Present(fk) => fk.0.parse().ok(),
+                                types::Nullable::Null => None,
+                            },
+                            Err(e) => {
+                                return Ok(
+                                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                        problem("Peer error", 500, e.to_string()),
+                                    ),
+                                );
+                            }
+                        },
+                        (404, _) => {
+                            return Ok(Resp::Status404_NotFound(problem(
+                                "User task not found",
+                                404,
+                                format!("No user task with key {user_task_key}."),
+                            )));
+                        }
+                        (s, _) => {
+                            return Ok(
+                                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                    problem(
+                                        "Peer error",
+                                        500,
+                                        format!("peer node {node} returned status {s}"),
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    return Ok(Resp::Status404_NotFound(problem(
+                        "User task not found",
+                        404,
+                        format!("No user task with key {user_task_key}."),
+                    )));
+                }
+            }
+        };
+
+        match form_key {
+            Some(fk) => match self.store.form_by_key(fk) {
+                Some(row) => Ok(Resp::Status200_TheFormIsSuccessfullyReturned(form_result(
+                    &row,
+                ))),
+                // The task references a form key that is not (yet) projected:
+                // treat as "found, no form" rather than a hard error.
+                None => Ok(Resp::Status204_TheUserTaskWasFound),
+            },
+            None => Ok(Resp::Status204_TheUserTaskWasFound),
+        }
+    }
+
+    /// The start form linked to a process definition (Camunda
+    /// `GetStartProcessForm`). Resolves the definition's `start_form_id` (its
+    /// start event's `zeebe:formDefinition formId`) to the latest deployed form.
+    /// Returns 204 when the process exists but declares no start form, and 404
+    /// when no such process definition exists.
+    async fn get_start_process_form_impl(
+        &self,
+        path_params: &models::GetStartProcessFormPathParams,
+    ) -> Result<apis::process_definition::GetStartProcessFormResponse, ()> {
+        use apis::process_definition::GetStartProcessFormResponse as Resp;
+
+        let key: u64 = match path_params.process_definition_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_NotFound(problem(
+                    "Process definition not found",
+                    404,
+                    format!(
+                        "Process definition key '{}' is not a valid key.",
+                        path_params.process_definition_key
+                    ),
+                )));
+            }
+        };
+
+        // Process definitions are replicated to every node, so a local lookup is
+        // authoritative. `None` => no such definition; `Some(None)` => the
+        // definition exists but declares no start form.
+        match self.store.process_definition_start_form_id(key) {
+            None => Ok(Resp::Status404_NotFound(problem(
+                "Process definition not found",
+                404,
+                format!("No process definition with key {key}."),
+            ))),
+            Some(None) => Ok(Resp::Status204_TheProcessWasFound),
+            Some(Some(form_id)) => match self.store.form_by_id(&form_id) {
+                Some(row) => Ok(Resp::Status200_TheFormIsSuccessfullyReturned(form_result(
+                    &row,
+                ))),
+                // The start form id is declared but no such form is deployed:
+                // treat as "found, no form".
+                None => Ok(Resp::Status204_TheProcessWasFound),
+            },
+        }
+    }
+
     /// Clears a user task's assignee.
     async fn unassign_user_task_impl(
         &self,
@@ -23028,6 +23170,184 @@ mod clustered_startup_tests {
             matches!(external.form_key, types::Nullable::Null),
             "an external-form task carries no numeric formKey"
         );
+    }
+
+    #[tokio::test]
+    async fn user_task_and_start_forms_are_retrievable_via_the_form_endpoints() {
+        use apis::process_definition::GetStartProcessFormResponse as StartForm;
+        use apis::user_task::GetUserTaskFormResponse as UtForm;
+        let server = ServerImpl::default();
+
+        // A process whose start event and user task each declare a form, plus a
+        // second process with no start form.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="forms-proc">
+              <bpmn:startEvent id="s">
+                <bpmn:extensionElements>
+                  <zeebe:formDefinition formId="start-form" />
+                </bpmn:extensionElements>
+              </bpmn:startEvent>
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let noform_xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="noform-proc">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review"><bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements></bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let mut processes = parse_bpmn(xml).expect("parse forms-proc");
+        processes.extend(parse_bpmn(noform_xml).expect("parse noform-proc"));
+
+        let form = |id: &str| nanobpmn_engine_core::FormResource {
+            id: id.to_string(),
+            resource_name: format!("{id}.form"),
+            schema: format!(r#"{{"id":"{id}","type":"default","components":[]}}"#),
+        };
+
+        server
+            .deploy_resources_locally_with_forms(
+                processes,
+                &std::collections::HashMap::new(),
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![form("start-form"), form("review-form")],
+                Vec::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy processes + forms");
+
+        let (instance, _) = server
+            .create_for_stream(Some("forms-proc".into()), None, Default::default())
+            .await
+            .expect("create the forms-proc instance");
+
+        // Poll for the parked user task (read model projects asynchronously).
+        let mut task_key = None;
+        for _ in 0..300 {
+            if let Some(t) = server
+                .store
+                .user_tasks()
+                .iter()
+                .find(|t| t.instance_key == instance)
+            {
+                task_key = Some(t.key);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let task_key = task_key.expect("the instance parks a user task");
+
+        // GetUserTaskForm returns the review form.
+        let resp = server
+            .get_user_task_form_impl(&models::GetUserTaskFormPathParams {
+                user_task_key: task_key.to_string(),
+            })
+            .await
+            .expect("get user task form");
+        let UtForm::Status200_TheFormIsSuccessfullyReturned(f) = resp else {
+            panic!("expected the user task form, got {resp:?}");
+        };
+        assert_eq!(f.form_id, "review-form");
+        assert!(!f.schema.is_empty());
+
+        // An unknown user task key is a 404; a malformed key too.
+        assert!(matches!(
+            server
+                .get_user_task_form_impl(&models::GetUserTaskFormPathParams {
+                    user_task_key: "999999".to_string(),
+                })
+                .await
+                .unwrap(),
+            UtForm::Status404_NotFound(_)
+        ));
+        assert!(matches!(
+            server
+                .get_user_task_form_impl(&models::GetUserTaskFormPathParams {
+                    user_task_key: "not-a-key".to_string(),
+                })
+                .await
+                .unwrap(),
+            UtForm::Status404_NotFound(_)
+        ));
+
+        // GetStartProcessForm: resolve each process definition's key from the
+        // read model, then assert the start form (present vs. absent).
+        let mut with_form = None;
+        let mut without_form = None;
+        for _ in 0..300 {
+            for pd in server.store.process_definitions() {
+                if pd.process_id == "forms-proc" {
+                    with_form = Some(pd.key);
+                } else if pd.process_id == "noform-proc" {
+                    without_form = Some(pd.key);
+                }
+            }
+            if with_form.is_some() && without_form.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let with_form = with_form.expect("forms-proc definition is projected");
+        let without_form = without_form.expect("noform-proc definition is projected");
+
+        let resp = server
+            .get_start_process_form_impl(&models::GetStartProcessFormPathParams {
+                process_definition_key: with_form.to_string(),
+            })
+            .await
+            .expect("get start form");
+        let StartForm::Status200_TheFormIsSuccessfullyReturned(f) = resp else {
+            panic!("expected the start form, got {resp:?}");
+        };
+        assert_eq!(f.form_id, "start-form");
+
+        // A process with no start form: 204 (found, no form).
+        assert!(matches!(
+            server
+                .get_start_process_form_impl(&models::GetStartProcessFormPathParams {
+                    process_definition_key: without_form.to_string(),
+                })
+                .await
+                .unwrap(),
+            StartForm::Status204_TheProcessWasFound
+        ));
+
+        // Unknown / malformed process definition keys are 404s.
+        assert!(matches!(
+            server
+                .get_start_process_form_impl(&models::GetStartProcessFormPathParams {
+                    process_definition_key: "999999".to_string(),
+                })
+                .await
+                .unwrap(),
+            StartForm::Status404_NotFound(_)
+        ));
+        assert!(matches!(
+            server
+                .get_start_process_form_impl(&models::GetStartProcessFormPathParams {
+                    process_definition_key: "not-a-key".to_string(),
+                })
+                .await
+                .unwrap(),
+            StartForm::Status404_NotFound(_)
+        ));
     }
 
     #[tokio::test]

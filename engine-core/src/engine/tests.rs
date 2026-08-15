@@ -3269,6 +3269,114 @@ fn should_create_a_user_task_with_resolved_attributes() {
 }
 
 #[test]
+fn should_link_a_user_task_to_its_deployed_form_key() {
+    use crate::command::FormResource;
+    // A user task declaring a zeebe:formDefinition formId, plus a start form on
+    // the process, both referencing deployed forms by id.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="forms-proc">
+          <bpmn:startEvent id="s">
+            <bpmn:extensionElements>
+              <zeebe:formDefinition formId="start-form" />
+            </bpmn:extensionElements>
+          </bpmn:startEvent>
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements>
+              <zeebe:userTask />
+              <zeebe:formDefinition formId="review-form" />
+            </bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    assert_eq!(def.start_form_id.as_deref(), Some("start-form"));
+
+    let form = |id: &str| FormResource {
+        id: id.to_string(),
+        resource_name: format!("{id}.form"),
+        schema: format!(r#"{{"id":"{id}","type":"default","components":[]}}"#),
+    };
+
+    let mut engine = Engine::new();
+    // Deploy the user-task form first so it is resolvable at task creation.
+    let form_events = engine
+        .apply_command(Command::DeployForms(vec![form("review-form")]))
+        .unwrap();
+    let review_form_key = form_events
+        .iter()
+        .find_map(|e| match e {
+            Event::FormDeployed { form_key, .. } => Some(*form_key),
+            _ => None,
+        })
+        .expect("review-form deployed");
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance("forms-proc"))
+        .unwrap();
+    let (user_task_key, event_form_key) = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                form_key,
+                ..
+            } => Some((*user_task_key, *form_key)),
+            _ => None,
+        })
+        .expect("user task created");
+    assert_eq!(
+        event_form_key,
+        Some(review_form_key),
+        "the event carries the resolved form key"
+    );
+    let task = &engine.state().user_tasks[&user_task_key];
+    assert_eq!(task.form_key, Some(review_form_key));
+    assert_eq!(task.external_form_reference, None);
+}
+
+#[test]
+fn should_leave_form_key_none_when_the_form_is_not_deployed() {
+    // A user task whose formId references a form that was never deployed: the
+    // task is still created, but with no resolved form key.
+    let xml = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="noform-proc">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements>
+              <zeebe:userTask />
+              <zeebe:formDefinition formId="missing-form" />
+            </bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    let created = engine
+        .apply_command(Command::create_instance("noform-proc"))
+        .unwrap();
+    let user_task_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated { user_task_key, .. } => Some(*user_task_key),
+            _ => None,
+        })
+        .expect("user task created");
+    assert_eq!(engine.state().user_tasks[&user_task_key].form_key, None);
+}
+
+#[test]
 fn should_default_user_task_priority_to_fifty() {
     let def = ProcessBuilder::new("approval")
         .start_event("start")

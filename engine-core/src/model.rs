@@ -1101,6 +1101,13 @@ pub struct ProcessDefinition {
     /// field existed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub adhoc: Vec<AdHocSubProcessDef>,
+    /// The `zeebe:formDefinition formId` declared on the process's start event,
+    /// referencing a deployed form by id — the process's *start form* (Camunda
+    /// `GetStartProcessForm`). Resolved to the latest deployed form's key at
+    /// query time. `None` when the start event declares no form. Defaulted
+    /// absent for definitions written before start forms were parsed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub start_form_id: Option<String>,
 }
 
 impl ProcessDefinition {
@@ -1150,6 +1157,7 @@ impl ProcessDefinition {
             start_event: self.start_event.clone(),
             xml: self.xml.clone(),
             adhoc: self.adhoc.clone(),
+            start_form_id: self.start_form_id.clone(),
         })
     }
 }
@@ -2173,6 +2181,7 @@ impl ProcessBuilder {
             // overwrites this with the verbatim resource for parsed deployments.
             xml: String::new(),
             adhoc: Vec::new(),
+            start_form_id: None,
         })
     }
 }
