@@ -326,7 +326,7 @@ export interface InstanceTracking {
    */
   statusField?: string;
   /**
-   * Values of `statusField` considered still-open. Only rows in one of these states are polled; a row already in a terminal status is skipped. When omitted, every row is polled (use with care on large tables). Fail-closed: a newly-added non-terminal status not listed here silently drops out of reconciliation. Mutually exclusive with `terminalStatuses`.
+   * Values of `statusField` considered still-open. Only rows in one of these states are polled; a row already in a terminal status is skipped. When omitted, every row is polled (use with care on large tables). Fail-closed: a newly-added non-terminal status not listed here silently drops out of reconciliation. Requires `statusField`. Mutually exclusive with `terminalStatuses`.
    *
    * @minItems 1
    */

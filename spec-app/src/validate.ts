@@ -251,8 +251,12 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
   // `statusField`, so declaring statuses without the column to read them against
   // is incoherent — the runtime would have no field to filter on and would poll
   // every row. Flag it here rather than let the mismatch surface as a silent
-  // full-table scan. The two selectors are also mutually exclusive: one is an
-  // allow-list (fail-closed), the other an exclusion-list (fail-open).
+  // full-table scan. The two selectors are also mutually exclusive (one is an
+  // allow-list, fail-closed; the other an exclusion-list, fail-open), but that
+  // constraint is enforced by the JSON-Schema `not` guard and is unreachable
+  // here — `crossReferenceDiagnostics` only runs after `validateManifest` has
+  // passed the schema — so we deliberately do not re-check it (single source of
+  // truth: the schema).
   const tracking: any[] = manifest.instanceTracking ?? [];
   tracking.forEach((t, i) => {
     if (t?.activeStatuses != null && t?.statusField == null) {
@@ -266,13 +270,6 @@ function crossReferenceDiagnostics(manifest: any, index?: SymbolIndex): Diagnost
       push(
         `/instanceTracking/${i}/terminalStatuses`,
         "terminalStatuses requires statusField (the column those statuses are read from)",
-        "instance-tracking-incoherent",
-      );
-    }
-    if (t?.activeStatuses != null && t?.terminalStatuses != null) {
-      push(
-        `/instanceTracking/${i}/terminalStatuses`,
-        "activeStatuses and terminalStatuses are mutually exclusive (allow-list vs. exclusion-list); set only one",
         "instance-tracking-incoherent",
       );
     }
