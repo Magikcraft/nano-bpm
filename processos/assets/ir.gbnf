@@ -12,7 +12,7 @@
 root      ::= ws "process" sp string sp "{" nl indent "start" sp id nl elements flows "}" ws
 elements  ::= element*
 flows     ::= flow*
-element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent
+element   ::= elem-startEvent | elem-endEvent | elem-serviceTask | elem-businessRuleTask | elem-userTask | elem-exclusiveGateway | elem-parallelGateway | elem-eventBasedGateway | elem-errorBoundaryEvent | elem-timerIntermediateCatchEvent | elem-timerBoundaryEvent | elem-messageIntermediateCatchEvent | elem-messageBoundaryEvent | elem-messageStartEvent | elem-timerStartEvent | elem-subProcess | elem-intermediateThrowEvent | elem-task | elem-scriptTask | elem-callActivity | elem-signalIntermediateCatchEvent | elem-signalBoundaryEvent | elem-conditionalIntermediateCatchEvent | elem-conditionalBoundaryEvent
 
 # startEvent — None start event. Pass-through; entry point of a process.
 elem-startEvent  ::= indent "startEvent" sp id (sp string)? (sp attrs-startEvent)? nl
@@ -125,6 +125,11 @@ attr-subProcess-startEvent  ::= "startEvent" sp attr-id   # Id of the sub-proces
 elem-intermediateThrowEvent  ::= indent "intermediateThrowEvent" sp id (sp string)? (sp attrs-intermediateThrowEvent)? nl
 attrs-intermediateThrowEvent   ::= "{" nl (indent2 attr-line-intermediateThrowEvent nl)+ indent "}"
 attr-line-intermediateThrowEvent  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+
+# task — Abstract task (also manualTask). No execution semantics — pure pass-through.
+elem-task  ::= indent "task" sp id (sp string)? (sp attrs-task)? nl
+attrs-task   ::= "{" nl (indent2 attr-line-task nl)+ indent "}"
+attr-line-task  ::= attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 
 # scriptTask — Inline FEEL script. Evaluates `expression`, stores in `resultVariable`, completes.
 elem-scriptTask  ::= indent "scriptTask" sp id (sp string)? (sp attrs-scriptTask)? nl

@@ -329,6 +329,11 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
         attrs: &[],
     },
     KindSpec {
+        keyword: "task",
+        doc: "Abstract task (also manualTask). No execution semantics — pure pass-through.",
+        attrs: &[],
+    },
+    KindSpec {
         keyword: "scriptTask",
         doc: "Inline FEEL script. Evaluates `expression`, stores in `resultVariable`, completes.",
         attrs: &[
@@ -792,6 +797,7 @@ fn variant_witness(k: &nanobpmn_engine_core::ElementKind) -> &'static str {
         TimerStartEvent { .. } => "timerStartEvent",
         SubProcess { .. } => "subProcess",
         IntermediateThrowEvent => "intermediateThrowEvent",
+        Task => "task",
         ScriptTask { .. } => "scriptTask",
         CallActivity { .. } => "callActivity",
         SignalIntermediateCatchEvent { .. } => "signalIntermediateCatchEvent",
@@ -901,6 +907,7 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
             "intermediateThrowEvent",
             ElementKind::IntermediateThrowEvent,
         ),
+        ("task", ElementKind::Task),
         (
             "scriptTask",
             ElementKind::ScriptTask {

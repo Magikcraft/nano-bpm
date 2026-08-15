@@ -412,6 +412,49 @@ fn create_instance_key(engine: &mut Engine, proc_id: &str) -> Key {
 }
 
 #[test]
+fn abstract_task_passes_through_to_completion() {
+    // An abstract `task` has no execution semantics: it must behave as a
+    // pass-through, so a `start -> task -> end` process runs to completion on
+    // instance creation, with no job ever created (Zeebe/C8 parity). Before
+    // support was added, the flow into the task dangled and deploy failed with
+    // "unknown target element".
+    let def = ProcessBuilder::new("passthrough")
+        .start_event("start")
+        .task("do-something")
+        .end_event("end")
+        .connect("start", "do-something")
+        .connect("do-something", "end")
+        .build()
+        .unwrap();
+    let mut engine = Engine::new();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let events = engine
+        .apply_command(Command::create_instance("passthrough"))
+        .unwrap();
+    let instance_key = events.iter().find_map(|e| e.instance_key()).unwrap();
+
+    assert!(
+        events.contains(&Event::ProcessInstanceCompleted { instance_key }),
+        "an abstract task must pass through so the instance completes immediately"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            Event::ElementCompleted { element_id, .. } if element_id == "do-something"
+        )),
+        "the abstract task element should complete as a pass-through"
+    );
+    // No job is ever emitted for an abstract task.
+    assert!(
+        engine
+            .activate_jobs("do-something", "W", 10, 1_000, 0)
+            .is_empty(),
+        "an abstract task must not create a job"
+    );
+}
+
+#[test]
 fn inflight_by_process_tracks_create_and_terminal_transitions() {
     // ADR-0020 Tier-2 signal L_P: per-definition in-flight instance count,
     // maintained at the logical lifecycle (create +1, terminal −1), with a
