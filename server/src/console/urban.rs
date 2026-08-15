@@ -239,7 +239,10 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
 /// before the entry lands (a bounded, benign duplication — help output is
 /// deterministic, so every racer computes the same text and the last insert
 /// wins). Every call after the cache is warm reuses the stored text without
-/// spawning. The entry is keyed on the binary path and lives for the process
+/// spawning. The help is stored as an `Arc<str>` so a warm hit is a cheap
+/// refcount bump rather than a full copy of the (potentially large) help output,
+/// even when `run_data_op` gates on it per Data-panel op. The entry is keyed on
+/// the binary path and lives for the process
 /// lifetime; we deliberately do **not** stat/mtime-invalidate it, to keep the hot
 /// capability-gate path a single lock-guarded map read. If a binary is replaced
 /// *in place* at the same path (an `npm install` bumping a project-local
@@ -250,9 +253,9 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
 /// capability going unused until the next restart, not an outage. A long-lived
 /// server outliving an in-place toolkit upgrade is the rare case, and the price is
 /// a restart. `None` means the binary could not be run.
-async fn urban_help_text(urban: &Path) -> Option<String> {
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<String>>>> =
+async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<Arc<str>>>>> =
         OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     // Recover from a poisoned mutex rather than propagating the panic: the lock
@@ -267,7 +270,7 @@ async fn urban_help_text(urban: &Path) -> Option<String> {
     {
         return hit;
     }
-    let help = tokio::process::Command::new(urban)
+    let help: Option<Arc<str>> = tokio::process::Command::new(urban)
         .arg("--help")
         .env("NO_COLOR", "1")
         .kill_on_drop(true)
@@ -277,7 +280,7 @@ async fn urban_help_text(urban: &Path) -> Option<String> {
         .map(|o| {
             let mut help = String::from_utf8_lossy(&o.stdout).into_owned();
             help.push_str(&String::from_utf8_lossy(&o.stderr));
-            help
+            Arc::from(help)
         });
     cache
         .lock()

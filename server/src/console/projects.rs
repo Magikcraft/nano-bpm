@@ -3405,11 +3405,21 @@ async fn pipe_data_gateway(
         .await
         .map_err(|e| DataError::Gateway(format!("await data gateway: {e}")))?;
     if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        // Some gateways emit their failure detail to stdout, not stderr; fall
+        // back to (or append) stdout so the real cause isn't hidden.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout = stdout.trim();
+        let detail = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, false) => format!("{stderr}; stdout: {stdout}"),
+            (false, true) => stderr.to_string(),
+            (true, false) => stdout.to_string(),
+            (true, true) => String::new(),
+        };
         return Err(DataError::Gateway(format!(
             "data gateway exited {}: {}",
-            out.status,
-            err.trim()
+            out.status, detail
         )));
     }
     let text = String::from_utf8_lossy(&out.stdout);
@@ -11065,6 +11075,48 @@ mod tests {
                 Some("urban-data"),
                 "op must not be served by the urban stub when it lacks the data op"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn pipe_data_gateway_surfaces_stdout_when_stderr_is_empty() {
+        // A gateway that fails but writes its failure detail to stdout (not
+        // stderr) must not have that detail hidden: the error should carry the
+        // stdout text so the real cause is debuggable.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'boom-on-stdout'; exit 7");
+        let err = pipe_data_gateway(cmd, &serde_json::json!({ "op": "schema" }))
+            .await
+            .expect_err("non-zero exit must be an error");
+        match err {
+            DataError::Gateway(msg) => {
+                assert!(
+                    msg.contains("boom-on-stdout"),
+                    "stdout detail must surface in the error, got: {msg}"
+                );
+            }
+            other => panic!("expected DataError::Gateway, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pipe_data_gateway_includes_both_streams_when_stderr_is_present() {
+        // When both streams carry text, stderr leads and stdout is appended so
+        // neither is lost.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf 'err-detail' 1>&2; printf 'out-detail'; exit 3");
+        let err = pipe_data_gateway(cmd, &serde_json::json!({ "op": "schema" }))
+            .await
+            .expect_err("non-zero exit must be an error");
+        match err {
+            DataError::Gateway(msg) => {
+                assert!(
+                    msg.contains("err-detail") && msg.contains("out-detail"),
+                    "both stderr and stdout must surface, got: {msg}"
+                );
+            }
+            other => panic!("expected DataError::Gateway, got {other:?}"),
         }
     }
 
