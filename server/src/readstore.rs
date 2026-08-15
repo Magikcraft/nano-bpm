@@ -100,7 +100,11 @@ impl ReadModel {
         let mut slot_by_partition = HashMap::with_capacity(shards.len());
         let mut list = Vec::with_capacity(shards.len());
         for (pid, store) in shards {
-            slot_by_partition.insert(pid, list.len());
+            let prev = slot_by_partition.insert(pid, list.len());
+            assert!(
+                prev.is_none(),
+                "read model got duplicate partition id {pid}; owned partition list must be unique"
+            );
             list.push(store);
         }
         Self {
@@ -442,3 +446,28 @@ impl ReadModel {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shard() -> Arc<ReadStore> {
+        Arc::new(ReadStore::open(None).expect("open in-memory read store"))
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate partition id")]
+    fn from_shards_rejects_duplicate_partition_ids() {
+        // A duplicate partition id would overwrite the slot mapping while still
+        // pushing both shard handles, leaving one shard unreachable/misrouted.
+        // The constructor must fail fast instead of silently misrouting.
+        ReadModel::from_shards(vec![(1, shard()), (1, shard())]);
+    }
+
+    #[test]
+    fn from_shards_accepts_distinct_partition_ids() {
+        let model = ReadModel::from_shards(vec![(0, shard()), (2, shard()), (5, shard())]);
+        let mut pids: Vec<u64> = model.shards().into_iter().map(|(pid, _)| pid).collect();
+        pids.sort_unstable();
+        assert_eq!(pids, vec![0, 2, 5]);
+    }
+}
