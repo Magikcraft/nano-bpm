@@ -8606,8 +8606,20 @@ impl ServerImpl {
                         &f.process_definition_key,
                         &inst.process_definition_key,
                     ) && query::match_string(&f.process_definition_id, &inst.process_definition_id)
+                        && query::match_integer(
+                            &f.process_definition_version,
+                            Some(i64::from(inst.version)),
+                        )
                         && query::match_process_instance_state(&f.state, &state_str)
                         && f.has_incident.is_none_or(|want| want == inst.has_incident)
+                        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
+                        // Nano does not yet project a process-instance completion
+                        // timestamp, so an `endDate` filter matches against an
+                        // absent value: range/equality operators correctly exclude
+                        // (honest, not silently ignored) while `$exists: false`
+                        // still matches.
+                        && query::match_date_time_ms(&f.end_date, None)
+                        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
                 }
             })
             .collect();

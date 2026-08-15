@@ -982,6 +982,117 @@ fn a_created_instance_reports_a_real_start_date() {
 }
 
 #[test]
+fn process_instance_search_honors_version_date_and_business_id_filters() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Regression (Magikcraft/nano-bpm#791): the process-instance search endpoint
+    // ignored the `processDefinitionVersion`, `startDate`/`endDate` (CLI
+    // `--between`) and `businessId` filters, returning matches regardless. It now
+    // applies them server-side for Zeebe/C8 parity.
+    let server = ServerProcess::boot(&journal);
+    let business_id = "order-791";
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(&format!(
+            r#"{{"processDefinitionId":"demo","businessId":"{business_id}"}}"#
+        )),
+    );
+    assert_eq!(status, 200, "create instance failed: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("create response is JSON");
+    let key = json["processInstanceKey"]
+        .as_str()
+        .expect("processInstanceKey present")
+        .to_string();
+
+    let contains_key = |body: &str, key: &str| -> bool {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|j| {
+                j["items"].as_array().map(|items| {
+                    items
+                        .iter()
+                        .any(|i| i["processInstanceKey"].as_str() == Some(key))
+                })
+            })
+            .unwrap_or(false)
+    };
+
+    // Wait until the created instance is projected and findable by its own key.
+    let (status, body) = server.request_until(
+        "POST",
+        &path("/process-instances/search"),
+        Some(&format!(r#"{{"filter":{{"processInstanceKey":"{key}"}}}}"#)),
+        |status, body| status == 200 && contains_key(body, &key),
+    );
+    assert_eq!(status, 200, "search failed: {body}");
+
+    // The demo definition is version 1: a version-2 filter must exclude it, a
+    // version-1 filter must include it.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{"filter":{"processDefinitionVersion":2}}"#),
+    );
+    assert_eq!(status, 200, "version-2 search failed: {body}");
+    assert!(
+        !contains_key(&body, &key),
+        "version-2 filter must exclude the version-1 instance: {body}"
+    );
+
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{"filter":{"processDefinitionVersion":1}}"#),
+    );
+    assert_eq!(status, 200, "version-1 search failed: {body}");
+    assert!(
+        contains_key(&body, &key),
+        "version-1 filter must include the version-1 instance: {body}"
+    );
+
+    // A far-past `startDate` window (CLI `--between 2000-...`) must return nothing.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(
+            r#"{"filter":{"startDate":{"$gte":"2000-01-01T00:00:00Z","$lte":"2000-01-02T00:00:00Z"}}}"#,
+        ),
+    );
+    assert_eq!(status, 200, "far-past startDate search failed: {body}");
+    assert!(
+        !contains_key(&body, &key),
+        "far-past startDate window must exclude a present-day instance: {body}"
+    );
+
+    // The instance is findable by its business id, and not by a different one.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(&format!(r#"{{"filter":{{"businessId":"{business_id}"}}}}"#)),
+    );
+    assert_eq!(status, 200, "businessId search failed: {body}");
+    assert!(
+        contains_key(&body, &key),
+        "instance must be findable by its business id: {body}"
+    );
+
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{"filter":{"businessId":"no-such-business-id"}}"#),
+    );
+    assert_eq!(status, 200, "wrong-businessId search failed: {body}");
+    assert!(
+        !contains_key(&body, &key),
+        "a non-matching business id must exclude the instance: {body}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
 fn searching_process_definitions_returns_the_deployed_demo() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();
