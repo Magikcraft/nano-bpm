@@ -321,6 +321,20 @@ pub struct UserTask {
     pub follow_up_date: Option<String>,
     /// The task priority (0..=100); defaults to 50.
     pub priority: i32,
+    /// The resolved numeric key of the task's form, if its
+    /// `zeebe:formDefinition` declared a `formId` that resolved against a
+    /// currently-deployed form (latest version) at creation. Surfaced as the v2
+    /// user-task `formKey`; downstream `GetFormByKey` serves the schema. `None`
+    /// when the task declares no embedded form (or its `formId` matched none).
+    /// Snapshots written before form linkage load as `None`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub form_key: Option<Key>,
+    /// The external form reference declared via `zeebe:formDefinition
+    /// externalReference`, surfaced verbatim as the v2 user-task
+    /// `externalFormReference`. `None` when the task declares no external form.
+    /// Snapshots written before form linkage load as `None`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub external_form_reference: Option<String>,
     /// The logical instant the task was created (the `now` carried on the
     /// activating command), in milliseconds since the Unix epoch.
     pub created_at: u64,
@@ -1938,6 +1952,8 @@ pub fn apply(state: &mut State, event: &Event) {
             due_date,
             follow_up_date,
             priority,
+            form_key,
+            external_form_reference,
         } => {
             state.user_tasks.insert(
                 *user_task_key,
@@ -1953,6 +1969,8 @@ pub fn apply(state: &mut State, event: &Event) {
                     due_date: due_date.clone(),
                     follow_up_date: follow_up_date.clone(),
                     priority: *priority,
+                    form_key: *form_key,
+                    external_form_reference: external_form_reference.clone(),
                     created_at: *created_at,
                     pending: None,
                 },

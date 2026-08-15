@@ -41,13 +41,15 @@ attr-businessRuleTask-resultVariable  ::= "resultVariable" sp attr-str   # Varia
 # userTask — Native user task. A human claims and completes it via the user-task API.
 elem-userTask  ::= indent "userTask" sp id (sp string)? (sp attrs-userTask)? nl
 attrs-userTask   ::= "{" nl (indent2 attr-line-userTask nl)+ indent "}"
-attr-line-userTask  ::= attr-userTask-assignee | attr-userTask-candidateGroups | attr-userTask-candidateUsers | attr-userTask-dueDate | attr-userTask-followUpDate | attr-userTask-priority | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
+attr-line-userTask  ::= attr-userTask-assignee | attr-userTask-candidateGroups | attr-userTask-candidateUsers | attr-userTask-dueDate | attr-userTask-followUpDate | attr-userTask-priority | attr-userTask-formId | attr-userTask-externalFormReference | attr-parent | attr-retries | attr-timer | attr-input | attr-output | attr-multiInstance
 attr-userTask-assignee  ::= "assignee" sp attr-str   # Raw assignee expression (literal or FEEL).
 attr-userTask-candidateGroups  ::= "candidateGroups" sp attr-str   # Comma-separated list or FEEL expression yielding a list.
 attr-userTask-candidateUsers  ::= "candidateUsers" sp attr-str   # Comma-separated list or FEEL expression yielding a list.
 attr-userTask-dueDate  ::= "dueDate" sp attr-str   # Raw due-date expression (literal or FEEL).
 attr-userTask-followUpDate  ::= "followUpDate" sp attr-str   # Raw follow-up-date expression (literal or FEEL).
 attr-userTask-priority  ::= "priority" sp attr-str   # Raw priority expression (literal or FEEL); default 50.
+attr-userTask-formId  ::= "formId" sp attr-str   # Embedded/deployment form id; resolved to a numeric form key at task creation.
+attr-userTask-externalFormReference  ::= "externalFormReference" sp attr-str   # External form reference, surfaced verbatim.
 
 # exclusiveGateway — XOR gateway. Takes exactly one outgoing flow (first matching condition; default is fallback).
 elem-exclusiveGateway  ::= indent "exclusiveGateway" sp id (sp string)? (sp attrs-exclusiveGateway)? nl

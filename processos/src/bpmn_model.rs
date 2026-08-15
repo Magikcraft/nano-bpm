@@ -2168,6 +2168,18 @@ resourceType=\"{}\" bindingType=\"{}\"{version_tag_attr}/>\n",
                     xml_escape(p)
                 ));
             }
+            if props.form_id.is_some() || props.external_form_reference.is_some() {
+                out.push_str("        <zeebe:formDefinition");
+                // Zeebe treats `formId` and `externalReference` as mutually
+                // exclusive; an external reference wins so a round-tripped model
+                // never carries both.
+                if let Some(r) = &props.external_form_reference {
+                    out.push_str(&format!(" externalReference=\"{}\"", xml_escape(r)));
+                } else if let Some(f) = &props.form_id {
+                    out.push_str(&format!(" formId=\"{}\"", xml_escape(f)));
+                }
+                out.push_str("/>\n");
+            }
             out.push_str("      </bpmn:extensionElements>\n");
             out.push_str("    </bpmn:userTask>\n");
         }
@@ -4955,5 +4967,50 @@ resourceType=\"GenericScript\" bindingType=\"versionTag\" versionTag=\"v3\"/>"
     fn preserve_nano_extensions_in_is_a_no_op_when_map_is_empty() {
         let same = preserve_nano_extensions_in("<bpmn:definitions/>".to_string(), &HashMap::new());
         assert_eq!(same, "<bpmn:definitions/>");
+    }
+
+    #[test]
+    fn form_definition_emission_lets_external_reference_win_over_form_id() {
+        // Zeebe treats formId and externalReference as mutually exclusive. When a
+        // UserTaskProps carries both (e.g. built programmatically), the emitter
+        // must surface only externalReference, so a re-parsed model never carries
+        // both a numeric formKey and an externalFormReference.
+        use nanobpmn_engine_core::{ProcessBuilder, UserTaskProps};
+        let def = ProcessBuilder::new("p")
+            .start_event("s")
+            .user_task_with(
+                "both",
+                UserTaskProps {
+                    form_id: Some("feature-escalation".into()),
+                    external_form_reference: Some("https://forms.example/x".into()),
+                    ..Default::default()
+                },
+            )
+            .end_event("e")
+            .connect("s", "both")
+            .connect("both", "e")
+            .build()
+            .expect("build");
+
+        let xml = definition_to_xml_labeled(&def, &HashMap::new());
+        assert!(
+            xml.contains(r#"externalReference="https://forms.example/x""#),
+            "external reference is emitted:\n{xml}"
+        );
+        assert!(
+            !xml.contains("formId="),
+            "formId is suppressed when an external reference is present:\n{xml}"
+        );
+
+        // And it round-trips to the mutually-exclusive shape.
+        let round = &parse_bpmn(&xml).unwrap()[0];
+        let ElementKind::UserTask(props) = &round.element("both").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(props.form_id, None);
+        assert_eq!(
+            props.external_form_reference.as_deref(),
+            Some("https://forms.example/x")
+        );
     }
 }

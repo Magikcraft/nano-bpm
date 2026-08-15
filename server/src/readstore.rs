@@ -131,7 +131,9 @@ CREATE TABLE user_tasks (
     created_at_ms          INTEGER NOT NULL,
     process_definition_id  TEXT NOT NULL,
     process_definition_key TEXT NOT NULL,
-    process_definition_version INTEGER NOT NULL
+    process_definition_version INTEGER NOT NULL,
+    form_key               INTEGER,
+    external_form_reference TEXT
 );
 CREATE TABLE variables (
     key                    INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -484,6 +486,8 @@ pub struct UserTaskRow {
     pub process_definition_id: String,
     pub process_definition_key: String,
     pub process_definition_version: i32,
+    pub form_key: Option<Key>,
+    pub external_form_reference: Option<String>,
 }
 
 pub struct IncidentRow {
@@ -1521,7 +1525,7 @@ impl ReadStore {
                 "SELECT key, instance_key, element_instance_key, element_id, state, \
                  assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
                  priority, created_at_ms, process_definition_id, process_definition_key, \
-                 process_definition_version \
+                 process_definition_version, form_key, external_form_reference \
                  FROM user_tasks",
             )
             .expect("prepare user_tasks");
@@ -2331,6 +2335,8 @@ fn map_user_task(r: &rusqlite::Row) -> rusqlite::Result<UserTaskRow> {
         process_definition_id: r.get(12)?,
         process_definition_key: r.get(13)?,
         process_definition_version: r.get(14)?,
+        form_key: r.get::<_, Option<i64>>(15)?.map(|k| k as Key),
+        external_form_reference: r.get(16)?,
     })
 }
 
@@ -2956,8 +2962,8 @@ fn project_engine_state(
             "INSERT INTO user_tasks (key, instance_key, element_instance_key, element_id, \
              state, assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
              priority, created_at_ms, process_definition_id, process_definition_key, \
-             process_definition_version) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+             process_definition_version, form_key, external_form_reference) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
              ON CONFLICT(key) DO UPDATE SET state = excluded.state",
             params![
                 ut.key as i64,
@@ -2975,6 +2981,8 @@ fn project_engine_state(
                 def_id,
                 def_key,
                 version,
+                ut.form_key.map(|k| k as i64),
+                ut.external_form_reference.as_ref(),
             ],
         )?;
     }
@@ -3553,6 +3561,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             due_date,
             follow_up_date,
             priority,
+            form_key,
+            external_form_reference,
         } => {
             let (def_id, def_key) = instance_def(tx, *instance_key);
             let version = instance_version(tx, *instance_key);
@@ -3562,8 +3572,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                 "INSERT INTO user_tasks (key, instance_key, element_instance_key, element_id, \
                  state, assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
                  priority, created_at_ms, process_definition_id, process_definition_key, \
-                 process_definition_version) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15) \
+                 process_definition_version, form_key, external_form_reference) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
                  ON CONFLICT(key) DO UPDATE SET state = excluded.state",
                 params![
                     *user_task_key as i64,
@@ -3581,6 +3591,8 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
                     def_id,
                     def_key,
                     version,
+                    form_key.map(|k| k as i64),
+                    external_form_reference.as_ref(),
                 ],
             )?;
         }

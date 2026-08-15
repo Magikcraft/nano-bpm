@@ -158,6 +158,19 @@ pub const ELEMENT_KIND_SPECS: &[KindSpec] = &[
                 ty: AttrType::Str,
                 doc: "Raw priority expression (literal or FEEL); default 50.",
             },
+            AttrSpec {
+                key: "formId",
+                required: false,
+                ty: AttrType::Str,
+                doc: "Embedded/deployment form id; resolved to a numeric form key at \
+                      task creation.",
+            },
+            AttrSpec {
+                key: "externalFormReference",
+                required: false,
+                ty: AttrType::Str,
+                doc: "External form reference, surfaced verbatim.",
+            },
         ],
     },
     KindSpec {
@@ -841,6 +854,8 @@ pub fn sample_instances() -> Vec<(&'static str, nanobpmn_engine_core::ElementKin
                 due_date: Some("=today() + duration(\"P1D\")".into()),
                 follow_up_date: Some("=today()".into()),
                 priority: Some("50".into()),
+                form_id: Some("feature-escalation".into()),
+                external_form_reference: Some("https://forms.example/x".into()),
             }),
         ),
         ("exclusiveGateway", ElementKind::ExclusiveGateway),

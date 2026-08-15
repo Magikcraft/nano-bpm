@@ -3217,6 +3217,8 @@ fn should_create_a_user_task_with_resolved_attributes() {
                 due_date: Some("2025-01-01T00:00:00Z".to_string()),
                 follow_up_date: None,
                 priority: Some("=urgency".to_string()),
+                form_id: None,
+                external_form_reference: None,
             },
         )
         .end_event("end")
@@ -8944,6 +8946,192 @@ fn deploy_forms_mints_a_form_key_versions_per_id_and_is_idempotent() {
     assert_eq!(bumped.1, 2, "a changed schema is version 2");
     assert_ne!(bumped.0, deployed.0, "a new form key is minted");
     assert_eq!(engine.state().forms["greeting-form"].version, 2);
+}
+
+#[test]
+fn user_task_resolves_form_id_to_the_latest_form_key_and_carries_external_reference() {
+    use crate::command::FormResource;
+    use crate::model::UserTaskProps;
+
+    let form = |schema: &str| FormResource {
+        id: "feature-escalation".to_string(),
+        resource_name: "feature-escalation.form".to_string(),
+        schema: schema.to_string(),
+    };
+    let v1 = r#"{"id":"feature-escalation","type":"default","components":[]}"#;
+
+    let mut engine = Engine::new();
+    let deployed = engine
+        .apply_command(Command::DeployForms(vec![form(v1)]))
+        .unwrap();
+    let form_key_v1 = deployed
+        .iter()
+        .find_map(|e| match e {
+            Event::FormDeployed { form_key, .. } => Some(*form_key),
+            _ => None,
+        })
+        .expect("a form key is minted");
+
+    // A process with two user tasks: one bound to the embedded form by id, one
+    // carrying an external form reference.
+    let def = ProcessBuilder::new("feature")
+        .start_event("start")
+        .user_task_with(
+            "escalation",
+            UserTaskProps {
+                form_id: Some("feature-escalation".to_string()),
+                ..Default::default()
+            },
+        )
+        .user_task_with(
+            "external",
+            UserTaskProps {
+                external_form_reference: Some("https://forms.example/x".to_string()),
+                ..Default::default()
+            },
+        )
+        .end_event("end")
+        .connect("start", "escalation")
+        .connect("escalation", "external")
+        .connect("external", "end")
+        .build()
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+
+    let created = engine
+        .apply_command(Command::create_instance("feature"))
+        .unwrap();
+
+    // The embedded-form task resolves its formId to the deployed form's key.
+    let escalation_key = created
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                user_task_key,
+                form_key: Some(k),
+                ..
+            } => Some((*user_task_key, *k)),
+            _ => None,
+        })
+        .expect("the escalation task carries a resolved form key");
+    assert_eq!(escalation_key.1, form_key_v1);
+    let task = &engine.state().user_tasks[&escalation_key.0];
+    assert_eq!(task.form_key, Some(form_key_v1));
+    assert_eq!(task.external_form_reference, None);
+
+    // Complete it to advance to the external-form task.
+    engine
+        .apply_command(Command::complete_user_task(escalation_key.0))
+        .unwrap();
+
+    let external = engine
+        .state()
+        .user_tasks
+        .values()
+        .find(|t| t.element_id == "external")
+        .expect("the external task exists");
+    assert_eq!(external.form_key, None);
+    assert_eq!(
+        external.external_form_reference.as_deref(),
+        Some("https://forms.example/x")
+    );
+    let external_key = external.key;
+    engine
+        .apply_command(Command::complete_user_task(external_key))
+        .unwrap();
+
+    // Latest binding: redeploy a newer form version, then a fresh instance's
+    // task resolves to the new key while the already-bound task keeps its key.
+    let v2 = r#"{"id":"feature-escalation","type":"default","components":[{"type":"textfield","key":"why"}]}"#;
+    let redeployed = engine
+        .apply_command(Command::DeployForms(vec![form(v2)]))
+        .unwrap();
+    let form_key_v2 = redeployed
+        .iter()
+        .find_map(|e| match e {
+            Event::FormDeployed { form_key, .. } => Some(*form_key),
+            _ => None,
+        })
+        .expect("a new form key is minted");
+    assert_ne!(form_key_v2, form_key_v1);
+
+    let created2 = engine
+        .apply_command(Command::create_instance("feature"))
+        .unwrap();
+    let escalation2 = created2
+        .iter()
+        .find_map(|e| match e {
+            Event::UserTaskCreated {
+                form_key: Some(k), ..
+            } => Some(*k),
+            _ => None,
+        })
+        .expect("the new instance's escalation task resolves a form key");
+    assert_eq!(
+        escalation2, form_key_v2,
+        "new tasks bind to the latest form"
+    );
+    // The first task's binding is unchanged (it kept its v1 key).
+    assert_eq!(
+        engine.state().user_tasks[&escalation_key.0].form_key,
+        Some(form_key_v1)
+    );
+}
+
+#[test]
+fn user_task_with_external_reference_never_resolves_a_form_key_even_if_form_id_is_set() {
+    use crate::command::FormResource;
+    use crate::model::UserTaskProps;
+
+    // A deployed form whose id would otherwise resolve, so this test proves the
+    // suppression is deliberate (the form is present but must NOT be bound).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployForms(vec![FormResource {
+            id: "feature-escalation".to_string(),
+            resource_name: "feature-escalation.form".to_string(),
+            schema: r#"{"id":"feature-escalation","type":"default","components":[]}"#.to_string(),
+        }]))
+        .unwrap();
+
+    // A user task built programmatically with BOTH form_id and
+    // external_form_reference set. Zeebe treats them as mutually exclusive, so
+    // the engine must let the external reference win and resolve no form_key —
+    // guarding the invariant independently of the BPMN parser.
+    let def = ProcessBuilder::new("feature")
+        .start_event("start")
+        .user_task_with(
+            "both",
+            UserTaskProps {
+                form_id: Some("feature-escalation".to_string()),
+                external_form_reference: Some("https://forms.example/x".to_string()),
+                ..Default::default()
+            },
+        )
+        .end_event("end")
+        .connect("start", "both")
+        .connect("both", "end")
+        .build()
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("feature"))
+        .unwrap();
+
+    let task = engine
+        .state()
+        .user_tasks
+        .values()
+        .find(|t| t.element_id == "both")
+        .expect("the task exists");
+    assert_eq!(
+        task.form_key, None,
+        "external reference suppresses form_key"
+    );
+    assert_eq!(
+        task.external_form_reference.as_deref(),
+        Some("https://forms.example/x")
+    );
 }
 
 #[test]

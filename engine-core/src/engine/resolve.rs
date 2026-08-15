@@ -479,6 +479,33 @@ impl Engine {
         value.clamp(0, 100)
     }
 
+    /// Resolves a user task's form linkage from its `zeebe:formDefinition`,
+    /// enforcing the Zeebe invariant that `formId` and `externalReference` are
+    /// mutually exclusive. An `externalReference` wins: it is surfaced verbatim
+    /// and suppresses numeric `form_key` resolution, so a task never surfaces
+    /// both a `formKey` and an `externalFormReference`. When no external
+    /// reference is present, `formId` binds to the latest deployed form version
+    /// (Zeebe `latest` binding), stamped as a numeric `form_key`; an unmatched
+    /// `formId` leaves the key unset.
+    ///
+    /// Returns `(form_key, external_form_reference)`.
+    pub(crate) fn resolve_user_task_form_linkage(
+        &self,
+        props: &crate::model::UserTaskProps,
+    ) -> (Option<Key>, Option<String>) {
+        let external_form_reference = props.external_form_reference.clone();
+        let form_key = if external_form_reference.is_some() {
+            None
+        } else {
+            props
+                .form_id
+                .as_deref()
+                .and_then(|id| self.state.forms.get(id))
+                .map(|f| f.key)
+        };
+        (form_key, external_form_reference)
+    }
+
     /// Resolves a timer's due time (and, for a cycle, its re-arm interval) at
     /// timer-creation time, honouring a FEEL timer expression
     /// ([`crate::model::TimerDef`]) when one is declared on the element, and

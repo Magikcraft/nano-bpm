@@ -100,7 +100,11 @@ ACTIVATING -> ACTIVATED -> COMPLETING -> COMPLETED --(take outgoing flow)--> ACT
   `Canceled` when its instance is terminated). The assignment, scheduling and
   priority expressions declared on the element (`zeebe:assignmentDefinition`,
   `zeebe:taskSchedule`, `zeebe:priorityDefinition`) are resolved against the
-  instance variables (FEEL or literal) at creation. While `Created` the task may
+  instance variables (FEEL or literal) at creation. Its form linkage
+  (`zeebe:formDefinition`) is also captured at creation: a `formId` is resolved
+  against the currently-deployed forms (latest version) to a numeric `form_key`,
+  and an `externalReference` is carried verbatim, so the v2 user-task search can
+  surface `formKey`/`externalFormReference`. While `Created` the task may
   be assigned (`AssignUserTask`, honouring `allowOverride`), unassigned
   (`UnassignUserTask`) and have its candidate groups/users, due/follow-up date
   and priority changed (`UpdateUserTask`). Completion merges its variables and

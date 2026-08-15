@@ -224,6 +224,12 @@ fn render_kind_attrs(kind: &ElementKind, attrs: &mut Vec<String>) {
             if let Some(v) = &props.priority {
                 attrs.push(format!("priority {}", quote(v)));
             }
+            if let Some(v) = &props.form_id {
+                attrs.push(format!("formId {}", quote(v)));
+            }
+            if let Some(v) = &props.external_form_reference {
+                attrs.push(format!("externalFormReference {}", quote(v)));
+            }
         }
         ElementKind::ErrorBoundaryEvent {
             attached_to,
@@ -1108,6 +1114,8 @@ fn build_kind(keyword: &str, id: &str, attrs: &mut NodeAttrs) -> Result<ElementK
             due_date: attrs.take("dueDate"),
             follow_up_date: attrs.take("followUpDate"),
             priority: attrs.take("priority"),
+            form_id: attrs.take("formId"),
+            external_form_reference: attrs.take("externalFormReference"),
         }),
         "errorBoundaryEvent" => ElementKind::ErrorBoundaryEvent {
             attached_to: attrs.require("attachedTo", id)?,

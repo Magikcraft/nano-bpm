@@ -389,7 +389,8 @@ pub struct MultiInstance {
 
 /// The (raw, un-evaluated) assignment, scheduling and priority expressions
 /// declared on a `userTask` BPMN element via its Zeebe extension elements
-/// (`zeebe:assignmentDefinition`, `zeebe:taskSchedule`, `zeebe:priorityDefinition`).
+/// (`zeebe:assignmentDefinition`, `zeebe:taskSchedule`, `zeebe:priorityDefinition`),
+/// together with its form linkage (`zeebe:formDefinition`).
 ///
 /// Each value may be a literal or a FEEL expression (a string beginning with
 /// `=`). They are resolved against the instance variables when the user task is
@@ -411,6 +412,20 @@ pub struct UserTaskProps {
     /// Raw priority expression (`zeebe:priorityDefinition priority`); defaults to
     /// `50` when absent or unresolvable.
     pub priority: Option<String>,
+    /// The embedded/deployment form id declared via `<zeebe:formDefinition
+    /// formId="…"/>`. Resolved against the currently-deployed forms (latest
+    /// version) to a numeric `form_key` when the user task is created, so the v2
+    /// user-task search can surface a `formKey` and downstream `GetFormByKey`
+    /// can serve the schema. `None` when the task declares no `formId` (or an
+    /// external form instead).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub form_id: Option<String>,
+    /// The external form reference declared via `<zeebe:formDefinition
+    /// externalReference="…"/>`. Surfaced verbatim as the task's
+    /// `externalFormReference`; the engine does not resolve it to a key. `None`
+    /// when the task declares no external reference.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub external_form_reference: Option<String>,
 }
 
 /// The kind of a BPMN flow node.

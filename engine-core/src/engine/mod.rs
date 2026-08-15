@@ -4129,6 +4129,11 @@ impl Engine {
                     .resolve_user_task_string(&element_vars, props.follow_up_date.as_deref())
                     .filter(|s| !s.is_empty());
                 let priority = self.resolve_priority(&element_vars, props.priority.as_deref());
+                // Resolve the form linkage, enforcing the Zeebe invariant that
+                // `formId` and `externalReference` are mutually exclusive (an
+                // external reference wins and suppresses `form_key` resolution).
+                let (form_key, external_form_reference) =
+                    self.resolve_user_task_form_linkage(&props);
                 // An initial assignee (zeebe:assignmentDefinition) must fire the
                 // `assigning` listeners exactly as a runtime assign does (Zeebe
                 // parity: the assignee is stripped off the CREATED record and
@@ -4161,6 +4166,8 @@ impl Engine {
                     due_date,
                     follow_up_date,
                     priority,
+                    form_key,
+                    external_form_reference,
                 });
                 // Creating task listeners (ADR 0037 §6): the task record exists
                 // but is not yet available for work until the creating chain
@@ -5376,6 +5383,8 @@ impl Engine {
                     .resolve_user_task_string(&child_vars, props.follow_up_date.as_deref())
                     .filter(|s| !s.is_empty());
                 let priority = self.resolve_priority(&child_vars, props.priority.as_deref());
+                let (form_key, external_form_reference) =
+                    self.resolve_user_task_form_linkage(&props);
                 events.push(Event::UserTaskCreated {
                     user_task_key,
                     instance_key,
@@ -5388,6 +5397,8 @@ impl Engine {
                     due_date,
                     follow_up_date,
                     priority,
+                    form_key,
+                    external_form_reference,
                 });
             }
             // CallActivity / Other / an unlisted id: no job or task to run, so the
