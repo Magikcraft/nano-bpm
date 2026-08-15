@@ -4426,11 +4426,16 @@ pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiRes
         .map(|d| d.join("nano.app.json").is_file() && urban::urban_available_for(&d))
         .unwrap_or(false);
     if urban_ready {
-        // Persist via the one deriver. Map a toolkit/gen failure to the same
-        // "urban unavailable / gen failed" surface the rest of the dry-out uses.
+        // Persist via the one deriver. This branch is already gated on
+        // `urban_available_for(&d)`, so the toolkit *is* present — a failure here
+        // is a real `urban gen` error (invalid manifest/models, toolkit error
+        // output), not a dependency outage. Map it to `500 INTERNAL_SERVER_ERROR`
+        // and reserve `503 SERVICE_UNAVAILABLE` for the pre-check/routing decision
+        // (the `urban_ready == false` path), so clients don't retry a genuine
+        // failure as if the toolkit were merely unreachable.
         projects::gen_via_urban(name)
             .await
-            .map_err(|m| (StatusCode::SERVICE_UNAVAILABLE, m))?;
+            .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, m))?;
         // Read-only introspection for the response contract. `write:false` never
         // writes files or migrates the DB, so this is a pure fetch of the emitted
         // text + table count (routed through `urban data`), and the full derived
