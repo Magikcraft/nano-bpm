@@ -1863,11 +1863,16 @@ fn activated_job_omits_linked_resources_header_when_nothing_resolves() {
 }
 
 #[test]
-fn bpmn_skips_linked_resource_missing_required_attributes() {
-    // resourceType and linkName are required by Zeebe; a linkedResource missing
-    // either is malformed and must be dropped at parse rather than fabricated
-    // with empty-string attributes that would surface as ambiguous entries.
-    let xml = r#"
+fn bpmn_rejects_linked_resource_missing_required_attributes() {
+    // Zeebe's design-time validator requires `resourceId`, `bindingType` and
+    // `resourceType` on every linkedResource and rejects the deployment
+    // (INVALID_ARGUMENT -> HTTP 400) when any is absent. Nano must match that
+    // parity: a link missing any required attribute is a hard parse error, not
+    // a silent drop that leaves the task's `linkedResources` header empty at
+    // activation. Guards the whole defect *class* (each required attribute).
+    let bpmn_with = |linked: &str| {
+        format!(
+            r#"
       <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                         xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
         <bpmn:process id="p">
@@ -1876,10 +1881,7 @@ fn bpmn_skips_linked_resource_missing_required_attributes() {
             <bpmn:extensionElements>
               <zeebe:taskDefinition type="run-agent" />
               <zeebe:linkedResources>
-                <zeebe:linkedResource resourceId="ok.md" resourceType="GenericScript"
-                                      linkName="prompt" />
-                <zeebe:linkedResource resourceId="no-type.md" linkName="x" />
-                <zeebe:linkedResource resourceId="no-name.md" resourceType="GenericScript" />
+                {linked}
               </zeebe:linkedResources>
             </bpmn:extensionElements>
           </bpmn:serviceTask>
@@ -1887,22 +1889,75 @@ fn bpmn_skips_linked_resource_missing_required_attributes() {
           <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="agent" />
           <bpmn:sequenceFlow id="b" sourceRef="agent" targetRef="e" />
         </bpmn:process>
-      </bpmn:definitions>"#;
-    let def = crate::bpmn::parse_bpmn(xml).unwrap().pop().unwrap();
+      </bpmn:definitions>"#
+        )
+    };
+
+    // Each of the three Zeebe-required attributes, when omitted, is rejected
+    // with an `InvalidLinkedResource` error naming the offending task and
+    // attribute — never silently dropped.
+    for (attribute, link) in [
+        (
+            "resourceType",
+            r#"<zeebe:linkedResource resourceId="x.md" bindingType="latest" linkName="prompt" />"#,
+        ),
+        (
+            "resourceId",
+            r#"<zeebe:linkedResource bindingType="latest" resourceType="GenericScript" linkName="prompt" />"#,
+        ),
+        (
+            "bindingType",
+            r#"<zeebe:linkedResource resourceId="x.md" resourceType="GenericScript" linkName="prompt" />"#,
+        ),
+    ] {
+        let err = crate::bpmn::parse_bpmn(&bpmn_with(link))
+            .expect_err(&format!("missing {attribute} must be rejected"));
+        match err {
+            crate::bpmn::ParseError::InvalidLinkedResource {
+                ref task_id,
+                attribute: ref attr,
+            } => {
+                assert_eq!(task_id, "agent");
+                assert_eq!(attr, attribute, "error names the missing attribute");
+            }
+            other => panic!("expected InvalidLinkedResource for {attribute}, got {other:?}"),
+        }
+        // The actionable message matches the issue's requested wording.
+        assert_eq!(
+            err.to_string(),
+            format!("linkedResource on 'agent' is missing required attribute '{attribute}'")
+        );
+    }
+
+    // An empty attribute value is treated as absent (Zeebe's `hasNonEmptyAttribute`).
+    let err = crate::bpmn::parse_bpmn(&bpmn_with(
+        r#"<zeebe:linkedResource resourceId="x.md" bindingType="latest" resourceType="" linkName="prompt" />"#,
+    ))
+    .expect_err("empty resourceType must be rejected");
+    assert!(matches!(
+        err,
+        crate::bpmn::ParseError::InvalidLinkedResource { .. }
+    ));
+
+    // A fully-specified linkedResource (Zeebe's required set present) parses,
+    // and `linkName` is optional per Zeebe's validator: its absence resolves to
+    // an empty link name rather than a rejection.
+    let def = crate::bpmn::parse_bpmn(&bpmn_with(
+        r#"<zeebe:linkedResource resourceId="ok.md" bindingType="latest" resourceType="GenericScript" />"#,
+    ))
+    .unwrap()
+    .pop()
+    .unwrap();
     let ElementKind::ServiceTask {
         linked_resources, ..
     } = &def.element("agent").unwrap().kind
     else {
         panic!("agent is a service task");
     };
-    assert_eq!(
-        linked_resources.len(),
-        1,
-        "only the well-formed entry survives"
-    );
+    assert_eq!(linked_resources.len(), 1);
     assert_eq!(linked_resources[0].resource_id, "ok.md");
     assert_eq!(linked_resources[0].resource_type, "GenericScript");
-    assert_eq!(linked_resources[0].link_name, "prompt");
+    assert_eq!(linked_resources[0].link_name, "");
 }
 
 #[test]
