@@ -5364,12 +5364,13 @@ mod read_surface_tests {
         assert!(store.form_by_key(999).is_none());
     }
 
-    /// `searchUserTasks` filtered to open tasks returns only open ones — the
-    /// spike's second assertion. The projection stores a `state` per task, so the
-    /// state filter the wasm engine applies distinguishes open (`Created`) from
-    /// completed tasks off the exact projected data.
+    /// The projection records a `state` per user task, distinguishing open
+    /// (`Created`) from completed tasks off the exact projected data — the spike's
+    /// second assertion. This validates the *state projection*: `user_tasks()` is
+    /// unfiltered, so the open/completed split is asserted here in Rust, which is
+    /// exactly the data `searchUserTasks({state:'CREATED'})` filters on downstream.
     #[test]
-    fn user_tasks_state_filter_returns_only_open_tasks() {
+    fn user_tasks_projection_records_open_and_completed_state() {
         let store = ReadStore::open(None).expect("in-memory read store opens");
 
         // Two user tasks are created (both open); one is then completed.
