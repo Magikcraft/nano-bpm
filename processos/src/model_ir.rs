@@ -880,6 +880,7 @@ impl<'a> Parser<'a> {
                 start_event,
                 xml: String::new(),
                 adhoc: Vec::new(),
+                start_form_id: None,
             },
             names,
         })
