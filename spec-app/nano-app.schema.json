@@ -29,10 +29,7 @@
       "description": "Informational codename, surfaced as App.CODENAME (ADR 0015). Optional."
     },
     "runtime": { "$ref": "#/$defs/runtime" },
-    "models": {
-      "$ref": "#/$defs/models",
-      "description": "OPTIONAL. By convention (ADR 0062) deployables live under `resources/` and need no declaration here; declare `models` only to override that layout for advanced/non-standard trees."
-    },
+    "models": { "$ref": "#/$defs/models" },
     "data": { "$ref": "#/$defs/data" },
     "types": {
       "type": "object",

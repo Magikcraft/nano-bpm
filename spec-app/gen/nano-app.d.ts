@@ -194,7 +194,7 @@ export interface Runtime {
   node?: "single" | "cluster";
 }
 /**
- * OPTIONAL. By convention (ADR 0062) deployables live under `resources/` and need no declaration here; declare `models` only to override that layout for advanced/non-standard trees.
+ * OPTIONAL override of the deploy-by-convention layout (ADR 0062). By convention an app keeps its deployables under `resources/` (the deploy root): Urban walks `resources/` and infers content-types by extension, and codegen defaults its BPMN scan to `resources/**\/*.bpmn` (and `.dmn`). Docs live outside `resources/`; the tree is one level deep by convention. Declare `models` only for advanced/non-standard layouts where the convention does not fit — each subkey then overrides the corresponding convention default. Each glob must resolve to at least one file (cross-reference rule, ADR 0027 §4).
  */
 export interface Models {
   processes?: GlobList;
