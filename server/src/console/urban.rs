@@ -534,8 +534,7 @@ urban — build and run Urban apps (nano.app.json)
     #[tokio::test]
     async fn urban_help_ignores_nonzero_exit() {
         use std::os::unix::fs::PermissionsExt;
-        let dir =
-            std::env::temp_dir().join(format!("nbpm-urban-help-nz-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("nbpm-urban-help-nz-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // A binary that prints a capability marker to stdout but exits non-zero.
