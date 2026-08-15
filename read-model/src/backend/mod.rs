@@ -20,15 +20,16 @@
 //!
 //! so [`crate::store::ReadStore::open`] is written once against it.
 
-// Exactly one backend must be selected. With neither `native` nor `wasm`, the
-// `open_connection` seam below is never defined and `rusqlite` (an optional dep
-// both features pull in) is absent, so every downstream use in [`crate::store`]
-// fails to compile with a diffuse "cannot find `open_connection`" cascade. Fail
-// fast here instead, with a message that names the actual misconfiguration.
+// At least one backend feature must be enabled. With neither `native` nor
+// `wasm`, the `open_connection` seam below is never defined, so every downstream
+// use in [`crate::store`] fails to compile with a diffuse "cannot find
+// `open_connection`" cascade. Fail fast here instead, with a message that names
+// the actual misconfiguration. (Both features may be on at once — `native` wins,
+// see below — so the constraint is "at least one", not "exactly one".)
 #[cfg(not(any(feature = "native", feature = "wasm")))]
 compile_error!(
     "nanobpmn-read-model requires a backend feature: enable `native` (the default) or `wasm`. \
-     With neither, the `open_connection` seam and its `rusqlite` dependency are absent."
+     With neither, the `open_connection` seam is never defined."
 );
 
 #[cfg(feature = "native")]
