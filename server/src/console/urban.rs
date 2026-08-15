@@ -52,9 +52,31 @@ fn pack_urban_bin() -> PathBuf {
         .join(URBAN_EXE)
 }
 
+/// The project-local `urban` binary path: `<project>/node_modules/.bin/urban`.
+/// This is the toolkit an Urban app declares in its own `package.json` and that
+/// a plain `npm install` (or the console's post-apply refresh) materialises —
+/// the exact version the app was authored/tested against. Returns the candidate
+/// path unconditionally (existence is checked by [`resolve_urban`]).
+///
+/// The nano server process's own `PATH` does not include a project's local
+/// `node_modules/.bin` (only an npm script's environment does), so without an
+/// explicit probe here a project-local install is invisible to the host — the
+/// bug behind #776.
+fn project_urban_bin(project_dir: &Path) -> PathBuf {
+    project_dir
+        .join("node_modules")
+        .join(".bin")
+        .join(URBAN_EXE)
+}
+
 /// Locates the `urban` CLI binary, mirroring [`super::workers::find_deno`].
 /// The resolution order is `NANOBPMN_URBAN_BIN` (explicit override) → the
 /// first-party marketplace pack ([`pack_urban_bin`]) → `PATH`.
+///
+/// This is the **host-global** lookup, used for the `urbanAvailable` capability
+/// flag and pack-install decisions. Project-scoped call sites (`urban gen` /
+/// `urban derive` for a specific app) should prefer [`find_urban_for`], which
+/// also consults the project's own `node_modules/.bin/urban`.
 ///
 /// Returns `None` when no binary is found; callers then report
 /// `urbanAvailable: false` so the Studio can prompt the user to install the
@@ -73,17 +95,44 @@ pub(crate) fn find_urban() -> Option<PathBuf> {
     resolve_urban(
         bin_override.as_deref(),
         Some(pack.as_path()),
+        None,
         path.as_deref(),
     )
 }
 
-/// Pure core of [`find_urban`]: given the `NANOBPMN_URBAN_BIN` override, the
-/// marketplace-pack bin candidate, and the `PATH` value, applies the
-/// `env → pack → PATH` resolution. Kept free of any global-env reads so it is
-/// deterministic and testable in parallel.
+/// Project-scoped variant of [`find_urban`] that also consults the project's own
+/// `<project_dir>/node_modules/.bin/urban`, ranked between the marketplace pack
+/// and `PATH`. Resolution order:
+///
+///   `NANOBPMN_URBAN_BIN` → marketplace pack → `<project>/node_modules/.bin/urban` → `PATH`
+///
+/// The project-local install (the version the app declares in its `package.json`
+/// and that its post-apply refresh `npm install`s) wins over a bare ambient
+/// `PATH` install — "run the version the app was authored/tested against" — but
+/// still yields to an explicit override and the Studio-pinned pack, preserving
+/// existing precedence (#776).
+pub(crate) fn find_urban_for(project_dir: &Path) -> Option<PathBuf> {
+    let bin_override = std::env::var("NANOBPMN_URBAN_BIN").ok();
+    let pack = pack_urban_bin();
+    let local = project_urban_bin(project_dir);
+    let path = std::env::var_os("PATH");
+    resolve_urban(
+        bin_override.as_deref(),
+        Some(pack.as_path()),
+        Some(local.as_path()),
+        path.as_deref(),
+    )
+}
+
+/// Pure core of [`find_urban`] / [`find_urban_for`]: given the
+/// `NANOBPMN_URBAN_BIN` override, the marketplace-pack bin candidate, the
+/// optional project-local bin candidate, and the `PATH` value, applies the
+/// `env → pack → project-local → PATH` resolution. Kept free of any global-env
+/// reads so it is deterministic and testable in parallel.
 fn resolve_urban(
     bin_override: Option<&str>,
     pack_bin: Option<&Path>,
+    local_bin: Option<&Path>,
     path: Option<&OsStr>,
 ) -> Option<PathBuf> {
     if let Some(p) = bin_override
@@ -95,11 +144,19 @@ fn resolve_urban(
         }
     }
     // #520 seam: the marketplace pack's `<pack>/node_modules/.bin/urban`, tried
-    // before `PATH` so a Studio-pinned pack install wins over an ambient one.
+    // before the project-local install and `PATH` so a Studio-pinned pack wins.
     if let Some(pack) = pack_bin
         && pack.is_file()
     {
         return Some(pack.to_path_buf());
+    }
+    // #776: the project's own `<project>/node_modules/.bin/urban` — the version
+    // the app declares — preferred over a bare ambient `PATH` install. Absent
+    // for host-global lookups ([`find_urban`]), present for project-scoped ones.
+    if let Some(local) = local_bin
+        && local.is_file()
+    {
+        return Some(local.to_path_buf());
     }
     if let Some(path) = path {
         for dir in std::env::split_paths(path) {
@@ -116,9 +173,18 @@ fn resolve_urban(
 /// `urbanAvailable` next to `denoAvailable`/`nodeAvailable` in the project
 /// status JSON so the Studio can gate urban-app affordances (mirrors
 /// [`super::workers::WorkerSupervisor::deno_available`]). Presence only; the
-/// binary is not executed.
+/// binary is not executed. Host-global (override/pack/`PATH`); a project-local
+/// install is not counted here — see [`urban_available_for`].
 pub(crate) fn urban_available() -> bool {
     find_urban().is_some()
+}
+
+/// Project-scoped counterpart of [`urban_available`]: whether an `urban` binary
+/// resolves for `project_dir`, including the project's own
+/// `node_modules/.bin/urban` (#776). Used to gate project codegen delegation so
+/// an app whose toolkit lives only in its local `node_modules` still gens.
+pub(crate) fn urban_available_for(project_dir: &Path) -> bool {
+    find_urban_for(project_dir).is_some()
 }
 
 /// Whether a resolved `urban` binary supports **model derivation** — the
@@ -199,17 +265,17 @@ mod tests {
 
         // Override wins outright, without consulting the pack or PATH.
         assert_eq!(
-            resolve_urban(Some(fake.to_str().unwrap()), None, None),
+            resolve_urban(Some(fake.to_str().unwrap()), None, None, None),
             Some(fake.clone())
         );
         // A bogus override falls through (here: to an empty pack/PATH → None),
         // and never returns the bogus path itself.
         assert_eq!(
-            resolve_urban(Some("/nonexistent/definitely/not/urban"), None, None),
+            resolve_urban(Some("/nonexistent/definitely/not/urban"), None, None, None),
             None
         );
         // An empty override is treated as unset.
-        assert_eq!(resolve_urban(Some(""), None, None), None);
+        assert_eq!(resolve_urban(Some(""), None, None, None), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -231,14 +297,86 @@ mod tests {
 
         // Pack present → pack wins over PATH.
         assert_eq!(
-            resolve_urban(None, Some(pack_bin.as_path()), Some(path.as_os_str())),
+            resolve_urban(None, Some(pack_bin.as_path()), None, Some(path.as_os_str())),
             Some(pack_bin.clone())
         );
         // Pack candidate does not exist → fall through to PATH.
         let missing_pack = pack_dir.join("does-not-exist").join(URBAN_EXE);
         assert_eq!(
-            resolve_urban(None, Some(missing_pack.as_path()), Some(path.as_os_str())),
+            resolve_urban(
+                None,
+                Some(missing_pack.as_path()),
+                None,
+                Some(path.as_os_str())
+            ),
             Some(path_bin)
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn resolve_urban_prefers_project_local_over_path() {
+        // #776: with no override and no pack, a project-local
+        // `node_modules/.bin/urban` is discovered and wins over a PATH install.
+        let base = std::env::temp_dir().join(format!("nbpm-urban-local-{}", std::process::id()));
+        let local_dir = base.join("local");
+        let path_dir = base.join("path");
+        std::fs::create_dir_all(&local_dir).unwrap();
+        std::fs::create_dir_all(&path_dir).unwrap();
+        let local_bin = local_dir.join(URBAN_EXE);
+        let path_bin = path_dir.join(URBAN_EXE);
+        std::fs::write(&local_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&path_bin, b"#!/bin/sh\n").unwrap();
+        let path = std::env::join_paths([path_dir.as_os_str()]).unwrap();
+
+        // Project-local present → wins over PATH.
+        assert_eq!(
+            resolve_urban(
+                None,
+                None,
+                Some(local_bin.as_path()),
+                Some(path.as_os_str())
+            ),
+            Some(local_bin.clone())
+        );
+        // Project-local candidate absent → fall through to PATH.
+        let missing_local = local_dir.join("does-not-exist").join(URBAN_EXE);
+        assert_eq!(
+            resolve_urban(
+                None,
+                None,
+                Some(missing_local.as_path()),
+                Some(path.as_os_str())
+            ),
+            Some(path_bin)
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn resolve_urban_prefers_pack_over_project_local() {
+        // The Studio-pinned pack still wins over a project-local install, so an
+        // explicit pack acquisition is authoritative (#520 precedence preserved).
+        let base = std::env::temp_dir().join(format!("nbpm-urban-pl-{}", std::process::id()));
+        let pack_dir = base.join("pack");
+        let local_dir = base.join("local");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::create_dir_all(&local_dir).unwrap();
+        let pack_bin = pack_dir.join(URBAN_EXE);
+        let local_bin = local_dir.join(URBAN_EXE);
+        std::fs::write(&pack_bin, b"#!/bin/sh\n").unwrap();
+        std::fs::write(&local_bin, b"#!/bin/sh\n").unwrap();
+
+        assert_eq!(
+            resolve_urban(
+                None,
+                Some(pack_bin.as_path()),
+                Some(local_bin.as_path()),
+                None
+            ),
+            Some(pack_bin)
         );
 
         std::fs::remove_dir_all(&base).ok();
@@ -253,9 +391,12 @@ mod tests {
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
 
         let path = std::env::join_paths([dir.as_os_str()]).unwrap();
-        assert_eq!(resolve_urban(None, None, Some(path.as_os_str())), Some(bin));
-        // Nothing on PATH, no override, no pack → not available.
-        assert_eq!(resolve_urban(None, None, None), None);
+        assert_eq!(
+            resolve_urban(None, None, None, Some(path.as_os_str())),
+            Some(bin)
+        );
+        // Nothing on PATH, no override, no pack, no project-local → not available.
+        assert_eq!(resolve_urban(None, None, None, None), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

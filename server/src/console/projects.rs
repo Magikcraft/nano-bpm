@@ -3258,7 +3258,11 @@ pub async fn gen_via_urban(name: &str) -> Result<(), String> {
     if !is_urban_app(name) {
         return Err("not an Urban-shaped app (no nano.app.json)".into());
     }
-    let urban = super::urban::find_urban().ok_or("urban CLI not available")?;
+    // #776: resolve project-scoped so the app's own `node_modules/.bin/urban`
+    // (the version it declares, materialised by the post-apply `npm install`) is
+    // found even when there is no global/pack/override install on the host.
+    let dir = project_dir(name).ok_or("invalid project name")?;
+    let urban = super::urban::find_urban_for(&dir).ok_or("urban CLI not available")?;
     // A derivation-capable toolkit (nano-ide#92) folds code→BPMN model
     // derivation into `gen`, so a bare `urban gen` would ALSO (re)write
     // `resources/processes/*.bpmn` as a side effect of a type-contract regen.
@@ -5201,7 +5205,10 @@ async fn urban_derive_capable(name: &str) -> Option<PathBuf> {
     if !is_urban_app(name) {
         return None;
     }
-    let urban = super::urban::find_urban()?;
+    // #776: project-scoped resolution so a project-local `node_modules/.bin/urban`
+    // is honoured, matching `gen_via_urban`.
+    let dir = project_dir(name)?;
+    let urban = super::urban::find_urban_for(&dir)?;
     if super::urban::urban_supports_derive(&urban).await {
         Some(urban)
     } else {
