@@ -1066,6 +1066,34 @@ fn process_instance_search_honors_version_date_and_business_id_filters() {
         "far-past startDate window must exclude a present-day instance: {body}"
     );
 
+    // Nano does not yet project a process-instance completion timestamp, so an
+    // `endDate` range/equality filter matches against an absent value and must
+    // exclude the still-running instance (honest, not silently ignored)...
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(
+            r#"{"filter":{"endDate":{"$gte":"2000-01-01T00:00:00Z","$lte":"2100-01-01T00:00:00Z"}}}"#,
+        ),
+    );
+    assert_eq!(status, 200, "endDate range search failed: {body}");
+    assert!(
+        !contains_key(&body, &key),
+        "an endDate range filter must exclude an instance with no completion timestamp: {body}"
+    );
+
+    // ...while `$exists: false` still matches the instance (its end date is absent).
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{"filter":{"endDate":{"$exists":false}}}"#),
+    );
+    assert_eq!(status, 200, "endDate $exists:false search failed: {body}");
+    assert!(
+        contains_key(&body, &key),
+        "endDate $exists:false must match an instance with no completion timestamp: {body}"
+    );
+
     // The instance is findable by its business id, and not by a different one.
     let (status, body) = server.request(
         "POST",
