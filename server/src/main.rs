@@ -16363,25 +16363,11 @@ pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
     }
 }
 
-/// Converts an engine [`Value`] tree back into JSON for the REST wire.
-pub(crate) fn value_to_json(value: &Value) -> serde_json::Value {
-    match value {
-        Value::Null => serde_json::Value::Null,
-        Value::Bool(b) => serde_json::Value::Bool(*b),
-        Value::Int(i) => serde_json::Value::Number((*i).into()),
-        Value::Double(d) => serde_json::Number::from_f64(*d)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
-        Value::Str(s) => serde_json::Value::String(s.clone()),
-        Value::List(items) => serde_json::Value::Array(items.iter().map(value_to_json).collect()),
-        Value::Map(entries) => serde_json::Value::Object(
-            entries
-                .iter()
-                .map(|(k, v)| (k.clone(), value_to_json(v)))
-                .collect(),
-        ),
-    }
-}
+/// Converts an engine [`Value`] into a `serde_json::Value` for the REST wire.
+/// Moved to the shared `nanobpmn-read-model` crate (the read-model projection
+/// needs the identical encoding); re-exported here so the gateway's REST mapping
+/// keeps a single source of truth with the projection.
+pub(crate) use nanobpmn_read_model::value_to_json;
 
 /// Serialises a DMN [`Value`] into the JSON-document string the REST decision
 /// evaluation result carries in its `output`/`inputValue`/`outputValue` fields
@@ -16390,21 +16376,10 @@ fn dmn_value_to_string(value: &Value) -> String {
     serde_json::to_string(&value_to_json(value)).unwrap_or_else(|_| "null".to_string())
 }
 
-/// The Zeebe/Camunda REST name for a DMN decision logic type.
-pub(crate) fn dmn_decision_type_name(
-    kind: &nanobpmn_engine_core::dmn::DecisionType,
-) -> &'static str {
-    use nanobpmn_engine_core::dmn::DecisionType::*;
-    match kind {
-        DecisionTable => "DECISION_TABLE",
-        LiteralExpression => "LITERAL_EXPRESSION",
-        Context => "CONTEXT",
-        Invocation => "INVOCATION",
-        List => "LIST",
-        Relation => "RELATION",
-        Unknown => "UNKNOWN",
-    }
-}
+/// The Zeebe/Camunda REST name for a DMN decision logic type. Moved to the shared
+/// `nanobpmn-read-model` crate (used by the decision-instance projection) and
+/// re-exported here for the gateway's REST mapping.
+pub(crate) use nanobpmn_read_model::dmn_decision_type_name;
 
 /// The minted message key from a `CorrelateMessage`'s events: the heading
 /// [`Event::MessagePublished`] always carries it.

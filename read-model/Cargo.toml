@@ -1,0 +1,63 @@
+[package]
+name = "nanobpmn-read-model"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The SQLite-backed read model (CQRS query side) for nanobpmn, extracted from the gateway server so the same projection + read-query surface can be compiled two ways: a real C SQLite (`native`, via rusqlite/bundled — what the server uses) and an in-memory SQLite for wasm32 (`wasm`, via sqlite-wasm-rs, implemented by a sibling task). It owns ONLY the schema, the FNV-1a schema fingerprint, the event projection/exporter and the read queries; server-only orchestration (sharding, WAL/checkpoint, pruning, on-disk file paths) lives behind the `native` submodule or in the server crate."
+license = "Apache-2.0"
+
+# `nanobpmn-read-model` deliberately does NOT depend on the `server` crate — it is
+# a leaf shared by both the gateway `server` (native) and the in-browser
+# `engine-wasm` test engine (wasm). The dependency edge is one-way.
+[dependencies]
+# The engine's event/model types the projection consumes. `serde` matches how the
+# server already builds engine-core (so cargo unifies the single build).
+nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
+# JSON serialisation for the projection: variable payloads, DMN decision
+# inputs/outputs and user-task group/user lists are stored as JSON strings and
+# reserialised on read, byte-for-byte as the server did before extraction.
+serde_json = { version = "1", features = ["raw_value"] }
+# The SQL driver. It is the shared query surface both backends speak and is used
+# unconditionally by `src/store.rs`, so it is a NON-optional hard dependency of
+# every build (unlike the backend-specific deps); only *how it is backed* differs
+# per feature:
+#   * `native` turns on the `bundled` C SQLite (what the server ships today).
+#   * `wasm` leaves `bundled` off and lets `sqlite-wasm-rs` supply SQLite for
+#     the `wasm32-unknown-unknown` target (implemented by the sibling backend).
+# Keeping it non-optional means a no-backend misconfiguration fails fast with the
+# single `compile_error!` in `src/backend/mod.rs`, not a diffuse cascade of
+# "unresolved import `rusqlite`" errors from every downstream query.
+rusqlite = { version = "0.32", default-features = false }
+
+# The in-memory SQLite backend for wasm32 (MemoryVFS). Optional + declared now so
+# the `wasm` feature and this exact dependency name are a FIXED CONTRACT siblings
+# build on; the actual backend body lands in `src/backend/wasm.rs`. Target-gated to
+# wasm32 so a *host* type-check of `--features wasm` (the scaffold acceptance) does
+# not try to compile a wasm32-only crate — the sibling's real build is
+# `--features wasm --target wasm32-unknown-unknown`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+sqlite-wasm-rs = { version = "0.5", optional = true }
+
+[features]
+default = ["native"]
+# Real C SQLite via rusqlite's `bundled` build — byte-for-byte the server's
+# current backend. This is the ONLY path the `server` crate consumes. `rusqlite`
+# itself is a non-optional dep (above); this feature only turns on `bundled`.
+native = ["rusqlite/bundled"]
+# In-memory SQLite for wasm32 via `sqlite-wasm-rs` (MemoryVFS). Declared here as a
+# fixed contract; the backend body is a compiling stub (`src/backend/wasm.rs`) a
+# sibling task fills in. `rusqlite` stays the shared query surface (no `bundled`;
+# SQLite is provided by `sqlite-wasm-rs`).
+wasm = ["dep:sqlite-wasm-rs"]
+
+[dev-dependencies]
+serde_json = "1"
+
+[lib]
+name = "nanobpmn_read_model"
+path = "src/lib.rs"
+
+[lints.rust]
+# Project policy: warnings are banned. `cargo build`/`check` fail on any rustc
+# warning (unused code, deprecations, future-incompat lints, etc.).
+warnings = "deny"
