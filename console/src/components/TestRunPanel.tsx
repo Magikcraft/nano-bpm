@@ -94,9 +94,9 @@ export default function TestRunPanel({
   function failJob(key: string) {
     failJobCmd(key, 0, "Failed in test run");
   }
-  // A subscription's publish/broadcast payload defaults to the empty object the
-  // prefill helper seeds until the maker edits it (kept lazy so we never clobber
-  // an edit — mirroring `jobValue`).
+  // A subscription's publish/broadcast payload defaults to the empty object
+  // `"{}"` until the maker edits it (kept lazy so we never clobber an edit —
+  // mirroring `jobValue`).
   function msgValue(key: string): string {
     return msgVars[key] ?? "{}";
   }
