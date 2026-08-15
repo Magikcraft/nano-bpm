@@ -198,12 +198,71 @@ pub(crate) fn urban_available_for(project_dir: &Path) -> bool {
 /// `urban derive --stdout`; `regenerate_domain_types` → `urban gen --no-models`)
 /// gate on this so an older toolkit that predates derivation falls back to the
 /// console's embedded Deno driver / bare `urban gen` — additive + non-regressing,
-/// exactly like #530. The result is memoised per binary path since a given
-/// binary's help output is stable for the process lifetime (a pack upgrade
-/// installs a new path, or the server restarts).
+/// exactly like #530. Derived from the memoised [`urban_help_text`] read, so we
+/// never re-spawn the binary per capability we gate on (see its doc for the
+/// bounded, benign duplication when several *concurrent first* calls race before
+/// the cache warms).
 pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, bool>>> = OnceLock::new();
+    urban_help_text(urban)
+        .await
+        .as_deref()
+        .map(help_indicates_derive)
+        .unwrap_or(false)
+}
+
+/// Whether a resolved `urban` binary carries the **`urban data` op gateway** —
+/// the ADR-0053 shared datasource seam (#522 slice b). A **capability probe, not
+/// a version check** (same rationale as [`urban_supports_derive`]): probing
+/// `urban --help` survives forks, backports and out-of-band installs.
+///
+/// The `run_data_op` seam gates on this so an Urban app whose resolved toolkit
+/// predates the `data` op falls back to the console's embedded `data-cli.ts`
+/// instead of failing — additive + non-regressing, exactly like the derive gate.
+/// Without it, an older `urban` found via `PATH`/project-local install would be
+/// routed to `urban data`, fail, and never reach the still-working embedded
+/// fallback. Derived from the memoised [`urban_help_text`] read.
+pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
+    urban_help_text(urban)
+        .await
+        .as_deref()
+        .map(help_indicates_data)
+        .unwrap_or(false)
+}
+
+/// The `urban --help` text for a resolved binary (stdout + stderr concatenated,
+/// `NO_COLOR`), memoised per binary path. This is the **single** place a toolkit
+/// is spawned to probe its capabilities: every `urban_supports_*` gate derives
+/// its answer from this one cached read via a pure `help_indicates_*` predicate,
+/// so a given binary's help is read once and shared across every capability gate
+/// — one cached read, no per-capability cache to drift out of sync.
+///
+/// The cache is populated by a check-then-insert, **not** single-flight: several
+/// *concurrent first* calls for the same path can each spawn `urban --help` once
+/// before the entry lands (a bounded, benign duplication — help output is
+/// deterministic, so every racer computes the same text and the last insert
+/// wins). Every call after the cache is warm reuses the stored text without
+/// spawning. The help is stored as an `Arc<str>` so a warm hit is a cheap
+/// refcount bump rather than a full copy of the (potentially large) help output,
+/// even when `run_data_op` gates on it per Data-panel op. The entry is keyed on
+/// the binary path and lives for the process
+/// lifetime; we deliberately do **not** stat/mtime-invalidate it, to keep the hot
+/// capability-gate path a single lock-guarded map read. If a binary is replaced
+/// *in place* at the same path (an `npm install` bumping a project-local
+/// `node_modules/.bin/urban`, a pack reinstall) the cached capability set can go
+/// stale until the server restarts — but that staleness is **benign and
+/// non-regressing**: a stale *miss* only routes to the still-working embedded
+/// fallback (never to a broken `urban <op>`), so the worst case is a newly-gained
+/// capability going unused until the next restart, not an outage. A long-lived
+/// server outliving an in-place toolkit upgrade is the rare case, and the price is
+/// a restart. `None` means the binary could not be run **or** `urban --help`
+/// exited non-zero: we only accept and cache help text on a successful exit, so a
+/// binary that errors out (or whose error message happens to contain a capability
+/// marker) cannot false-positive the gate into routing to a broken `urban <op>` —
+/// it falls back to the embedded path exactly like an absent binary.
+async fn urban_help_text(urban: &Path) -> Option<std::sync::Arc<str>> {
+    use std::sync::{Arc, Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<Arc<str>>>>> =
+        OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
     // Recover from a poisoned mutex rather than propagating the panic: the lock
     // only guards a tiny insert/get (no user code runs under it), so a poisoned
@@ -213,28 +272,28 @@ pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(urban)
-        .copied()
+        .cloned()
     {
         return hit;
     }
-    let supported = tokio::process::Command::new(urban)
+    let help: Option<Arc<str>> = tokio::process::Command::new(urban)
         .arg("--help")
         .env("NO_COLOR", "1")
         .kill_on_drop(true)
         .output()
         .await
         .ok()
+        .filter(|o| o.status.success())
         .map(|o| {
             let mut help = String::from_utf8_lossy(&o.stdout).into_owned();
             help.push_str(&String::from_utf8_lossy(&o.stderr));
-            help_indicates_derive(&help)
-        })
-        .unwrap_or(false);
+            Arc::from(help)
+        });
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(urban.to_path_buf(), supported);
-    supported
+        .insert(urban.to_path_buf(), help.clone());
+    help
 }
 
 /// Pure predicate over `urban --help` text: does this toolkit expose model
@@ -249,6 +308,16 @@ pub(crate) async fn urban_supports_derive(urban: &Path) -> bool {
 /// toolkit.
 fn help_indicates_derive(help: &str) -> bool {
     help.contains("--no-models") && (help.contains("--stdout") || help.contains("urban derive"))
+}
+
+/// Pure predicate over `urban --help` text: does this toolkit expose the shared
+/// `urban data` op gateway (#522 slice b, ADR 0053)? Matches the `urban data`
+/// usage/subcommand marker — the same "subcommand appears in help" shape as the
+/// `urban derive` half of [`help_indicates_derive`]. A pre-`data` toolkit lists
+/// only `gen`/`run`, so this stays false and routing falls back to the embedded
+/// gateway.
+fn help_indicates_data(help: &str) -> bool {
+    help.contains("urban data")
 }
 
 #[cfg(test)]
@@ -432,5 +501,64 @@ urban — build and run Urban apps (nano.app.json)
         assert!(help_indicates_derive(
             "gen [--no-models]\nurban derive [--stdout]"
         ));
+    }
+
+    #[test]
+    fn help_indicates_data_discriminates_new_from_old_toolkit() {
+        // A pre-`data` toolkit lists only `gen`/`run` — no `urban data` gateway,
+        // so routing must fall back to the embedded `data-cli.ts`.
+        let old_help = "\
+urban — build and run Urban apps (nano.app.json)
+  urban gen [--check]               derive artifacts (migrations, worker-io)
+  urban run                         materialize + serve the app";
+        assert!(
+            !help_indicates_data(old_help),
+            "old help must not be read as data-op-capable"
+        );
+
+        // The `data`-capable toolkit (#522 slice b) lists the `urban data` op
+        // gateway subcommand.
+        let new_help = "\
+urban — build and run Urban apps (nano.app.json)
+  urban gen [--check]               derive artifacts (migrations, worker-io)
+  urban data                        run a datasource op through the gateway";
+        assert!(help_indicates_data(new_help));
+    }
+
+    /// Guards the failure mode where a *failed* `urban --help` (non-zero exit)
+    /// gets cached and its error text mis-detected as a capability, routing to a
+    /// broken `urban <op>` instead of the embedded fallback. A binary that exits
+    /// non-zero — even one whose output contains a capability marker — must be
+    /// treated exactly like an absent binary: `urban_supports_data` stays `false`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn urban_help_ignores_nonzero_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nbpm-urban-help-nz-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // A binary that prints a capability marker to stdout but exits non-zero.
+        let failing = dir.join("urban-failing");
+        std::fs::write(&failing, b"#!/bin/sh\necho 'urban data'\nexit 1\n").unwrap();
+        std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            urban_help_text(&failing).await.is_none(),
+            "non-zero --help exit must not be cached as valid help"
+        );
+        assert!(
+            !urban_supports_data(&failing).await,
+            "a failing binary must not be read as data-op-capable"
+        );
+
+        // The same marker on a *successful* exit is honoured.
+        let ok = dir.join("urban-ok");
+        std::fs::write(&ok, b"#!/bin/sh\necho 'urban data'\nexit 0\n").unwrap();
+        std::fs::set_permissions(&ok, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            urban_supports_data(&ok).await,
+            "a successful --help exposing the marker must be read as capable"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
