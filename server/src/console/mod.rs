@@ -4138,38 +4138,99 @@ fn sql_is_ddl(sql: &str) -> bool {
     s.starts_with("CREATE ") || s.starts_with("ALTER ") || s.starts_with("DROP ")
 }
 
+/// Which regeneration path a project takes, decided purely from its shape and
+/// toolkit availability so the routing invariant is unit-testable in isolation.
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum RegenPath {
+    /// Urban-shaped app: `urban gen` is the sole, authoritative deriver.
+    UrbanGen,
+    /// Urban-shaped app whose toolkit is unavailable — skip and let the Studio
+    /// surface the install prompt (#524). Crucially **not** the embedded path:
+    /// ADR 0053 forbids a second deriver for an Urban app.
+    SkipUrbanUnavailable,
+    /// Legacy-shaped app (no `nano.app.json`): the console's embedded emitter.
+    Embedded,
+}
+
+/// The ADR-0053 "one deriver" routing rule, factored out as a pure function: an
+/// Urban-shaped app derives **only** through `urban gen` and never falls back to
+/// the embedded emitter — regardless of toolkit availability — so the console can
+/// never run a second, divergent deriver against it.
+fn regen_path(is_urban: bool, urban_available: bool) -> RegenPath {
+    match (is_urban, urban_available) {
+        (true, true) => RegenPath::UrbanGen,
+        (true, false) => RegenPath::SkipUrbanUnavailable,
+        (false, _) => RegenPath::Embedded,
+    }
+}
+
 /// Best-effort regeneration of a project's derived type artifacts after a
 /// structural change, so typed workers track the current shape (ADR 0029 §4.1/§6).
 /// The path depends on the project shape: an **Urban-shaped app** (`nano.app.json`)
-/// delegates to `urban gen` (which derives the full `nano-generated/*` artifact set
-/// from the manifest, #514 dry-out) when `urban` is available; a legacy-shaped
-/// project regenerates `domain-rows.d.ts` from the default datasource's live schema
-/// via the embedded emitter. Failure is logged, never surfaced — the maker's
-/// operation already succeeded and the types are an authoring-time contract only.
+/// delegates to `urban gen` (the sole, authoritative deriver of the full
+/// `nano-generated/*` artifact set — no embedded fallback, #514 dry-out); a
+/// legacy-shaped project regenerates `domain-rows.d.ts` from the default
+/// datasource's live schema via the embedded emitter. Failure is logged, never
+/// surfaced — the maker's operation already succeeded and the types are an
+/// authoring-time contract only.
 async fn regenerate_domain_types(name: &str) {
-    // #514 dry-out: an Urban-shaped app (`nano.app.json`) delegates artifact
-    // generation to the shared `@nanobpm/urban` toolkit (`urban gen`) when the
-    // binary is available, instead of running the console's embedded emitters —
-    // the manifest is the single contract and urban is the one deriver (ADR
-    // 0052/0053/0054). Delegation is best-effort like the embedded path: on
-    // failure we fall through to the embedded op so a project is never left worse
-    // off than before urban was reachable (the derived artifacts are always
-    // regenerable). Legacy-shaped projects (no `nano.app.json`) always take the
-    // embedded path.
-    if projects::is_urban_app(name) && urban::urban_available() {
-        match projects::gen_via_urban(name).await {
-            Ok(()) => return,
-            Err(msg) => {
-                tracing::debug!(
-                    project = name,
-                    error = %msg,
-                    "urban gen delegation failed, falling back to embedded codegen"
-                );
+    // #514 dry-out (ADR 0052/0053/0054): an Urban-shaped app (`nano.app.json`)
+    // delegates artifact generation to the shared `@nanobpm/urban` toolkit
+    // (`urban gen`) — the manifest is the single contract and urban is the *one*
+    // deriver. `urban gen` is **authoritative**: there is no embedded fallback,
+    // because the embedded emitter writes the legacy vendored-runtime shape, so
+    // falling back to it would re-introduce the very parallel implementation ADR
+    // 0053 exists to eliminate (a second deriver producing a divergent artifact
+    // set). Regeneration is a best-effort, authoring-time convenience (the
+    // artifacts are always regenerable), so skipping on an unreachable toolkit is
+    // safe — the Studio already surfaces an install prompt (#524).
+    match regen_path(projects::is_urban_app(name), urban::urban_available()) {
+        RegenPath::UrbanGen => {
+            if let Err(msg) = projects::gen_via_urban(name).await {
+                tracing::debug!(project = name, error = %msg, "urban gen failed");
+            }
+        }
+        RegenPath::SkipUrbanUnavailable => {
+            tracing::debug!(
+                project = name,
+                "urban gen skipped: urban CLI unavailable (Studio surfaces the install prompt)"
+            );
+        }
+        // Legacy-shaped projects keep the embedded emitter until they are migrated
+        // to the Urban shape (#522 follow-ups).
+        RegenPath::Embedded => {
+            if let Err((_, msg)) =
+                project_data_op(name, serde_json::json!({ "op": "domaintypes" })).await
+            {
+                tracing::debug!(project = name, "domain-rows.d.ts regen skipped: {msg}");
             }
         }
     }
-    if let Err((_, msg)) = project_data_op(name, serde_json::json!({ "op": "domaintypes" })).await {
-        tracing::debug!(project = name, "domain-rows.d.ts regen skipped: {msg}");
+}
+
+#[cfg(test)]
+mod regen_path_tests {
+    use super::{RegenPath, regen_path};
+
+    /// The ADR-0053 invariant, as a truth table: an Urban-shaped app derives only
+    /// through `urban gen` and **never** routes to the embedded emitter — even
+    /// when the toolkit is unavailable it skips rather than falling back, so the
+    /// console can never run a second deriver against an Urban app.
+    #[test]
+    fn urban_app_never_routes_to_embedded() {
+        assert_eq!(regen_path(true, true), RegenPath::UrbanGen);
+        assert_eq!(regen_path(true, false), RegenPath::SkipUrbanUnavailable);
+        // The load-bearing assertion: neither Urban branch is `Embedded`.
+        assert_ne!(regen_path(true, true), RegenPath::Embedded);
+        assert_ne!(regen_path(true, false), RegenPath::Embedded);
+    }
+
+    /// A legacy-shaped project (no `nano.app.json`) always uses the embedded
+    /// emitter, independent of whether the Urban toolkit happens to be installed.
+    #[test]
+    fn legacy_app_always_uses_embedded() {
+        assert_eq!(regen_path(false, true), RegenPath::Embedded);
+        assert_eq!(regen_path(false, false), RegenPath::Embedded);
     }
 }
 
