@@ -201,6 +201,14 @@ fn compile_minimal_wsqlite3(out_dir: &Path) {
         .iter()
         .map(|s| shim.join("musl").join(s))
         .collect();
+    for musl_source in &musl_sources {
+        assert!(
+            musl_source.exists(),
+            "expected sqlite-wasm-rs musl shim source at {} — the vendored shim layout may have \
+             changed; set SQLITE_WASM_RS_SRC_DIR to the crate root or update MUSL_SHIM_SOURCES",
+            musl_source.display()
+        );
+    }
     for input in [&wasm_shim_h, &printf_c, &sqlite3_c]
         .into_iter()
         .chain(musl_sources.iter())
@@ -210,7 +218,11 @@ fn compile_minimal_wsqlite3(out_dir: &Path) {
 
     let mut cc = cc::Build::new();
     cc.warnings(false)
-        .flag("-Wno-macro-redefined")
+        // `-Wno-macro-redefined` is a Clang-specific flag; a non-Clang
+        // `CC_wasm32_unknown_unknown` may treat an unknown `-Wno-*` as a hard
+        // error, so probe support rather than forcing it (`warnings(false)`
+        // already suppresses the diagnostics where it is unavailable).
+        .flag_if_supported("-Wno-macro-redefined")
         .include(&shim)
         .include(shim.join("musl/arch/generic"))
         .include(shim.join("musl/include"))
