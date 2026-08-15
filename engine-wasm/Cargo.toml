@@ -14,6 +14,23 @@ nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The shared SQLite read model (CQRS query side), compiled with its in-memory
+# `wasm` backend so the in-browser test engine can serve the gateway's REST read
+# channel (forms, user tasks, process instances, resources, variables) from the
+# SAME projection the server uses — letting downstream consumers drop their
+# shadow stores. OFF BY DEFAULT and fully optional: with the `read-model` feature
+# disabled this dependency is not linked and the engine build stays byte-identical
+# to today's lean baseline (see the `read-model` feature below).
+nanobpmn-read-model = { path = "../read-model", default-features = false, features = ["wasm"], optional = true }
+
+[features]
+# Off-by-default. When enabled, `TestEngine` holds an in-memory `ReadStore` fed
+# from the same event log and exposes the REST read methods (`getFormByKey`,
+# `searchUserTasks`, `searchProcessInstances`, `getResourceByKey`,
+# `searchVariables`). Every field, import and method it adds is gated behind
+# `#[cfg(feature = "read-model")]`, so the feature-OFF build links no new
+# dependency and remains byte-identical to the baseline engine.
+read-model = ["dep:nanobpmn-read-model"]
 
 [profile.release]
 opt-level = "z"

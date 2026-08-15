@@ -24,6 +24,14 @@ use nanobpmn_engine_core::{
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
+/// The shared read-model surface, compiled with its in-memory wasm SQLite
+/// backend. Behind the off-by-default `read-model` feature so the baseline engine
+/// stays byte-identical; everything it touches is `#[cfg(feature = "read-model")]`.
+#[cfg(feature = "read-model")]
+use nanobpmn_read_model::{
+    FormRow, ProcessInstanceRow, ReadStore, ResourceRow, UserTaskRow, VariableRow,
+};
+
 /// Compile-time parity gate: an exhaustive match over `engine-core`'s `Command`
 /// surface that fails the build when a new engine capability is added without a
 /// conscious decision about whether to expose it here. See the module docs.
@@ -53,6 +61,12 @@ pub struct TestEngine {
     /// live `self.now` at fold time — keeping the mirrored log identical to a
     /// plain command even if the clock were to move between steps.
     debug_now: u64,
+    /// The in-memory read model (CQRS query side), fed the same events as `log`
+    /// after every applied command so the REST read methods answer from the SAME
+    /// projection the gateway serves. Behind the `read-model` feature; absent
+    /// (and unlinked) in the baseline engine.
+    #[cfg(feature = "read-model")]
+    read_model: ReadStore,
 }
 
 /// The log-derived, monotonically-growing parts of a snapshot, accumulated once
@@ -86,6 +100,8 @@ impl TestEngine {
             debug: None,
             debug_folded: 0,
             debug_now: 0,
+            #[cfg(feature = "read-model")]
+            read_model: open_read_model(),
         }
     }
 
@@ -109,6 +125,10 @@ impl TestEngine {
         self.debug = None;
         self.debug_folded = 0;
         self.debug_now = 0;
+        #[cfg(feature = "read-model")]
+        {
+            self.read_model = open_read_model();
+        }
     }
 
     /// Parse and deploy a BPMN resource. Returns a JSON object
@@ -755,6 +775,294 @@ impl TestEngine {
     }
 }
 
+/// The REST read channel: the gateway's read-side queries served from the SAME
+/// shared `nanobpmn-read-model` projection the server uses, so downstream
+/// consumers (e.g. the console/testkit) can drop their bespoke shadow stores and
+/// read forms, user tasks, process instances, resources and variables straight
+/// off the in-browser test engine. Every method delegates to the in-memory
+/// [`ReadStore`] and serialises the read-model `*Row` types into the same JSON
+/// shapes the Camunda v2 REST surface returns.
+///
+/// Behind the off-by-default `read-model` feature — the baseline engine build
+/// links none of this and stays byte-identical.
+#[cfg(feature = "read-model")]
+#[wasm_bindgen]
+impl TestEngine {
+    /// The latest deployed form for `form_key`, as a `FormResult` JSON object
+    /// (`{ tenantId, formId, schema, version, formKey }`), or JSON `null` when no
+    /// form with that key exists. Mirrors `GET /forms/{formKey}`.
+    #[wasm_bindgen(js_name = getFormByKey)]
+    pub fn get_form_by_key(&self, form_key: &str) -> Result<String, JsValue> {
+        let key = parse_key(form_key)?;
+        match self.read_model.form_by_key(key) {
+            Some(row) => to_json(&form_result(&row)),
+            None => Ok("null".to_string()),
+        }
+    }
+
+    /// The user tasks matching an optional `{ state? }` filter, as a
+    /// `UserTaskSearchQueryResult` JSON object (`{ items: [...], page: {...} }`).
+    /// The `state` filter (e.g. `"CREATED"`) is honoured through the read model,
+    /// not hardcoded. Mirrors `POST /user-tasks/search`.
+    #[wasm_bindgen(js_name = searchUserTasks)]
+    pub fn search_user_tasks(&self, filter_json: &str) -> Result<String, JsValue> {
+        let state = parse_state_filter(filter_json, "state")?;
+        let items: Vec<serde_json::Value> = self
+            .read_model
+            .user_tasks()
+            .iter()
+            .filter(|row| match &state {
+                Some(want) => user_task_state_rest(row.state) == want.as_str(),
+                None => true,
+            })
+            .map(user_task_result)
+            .collect();
+        to_json(&search_result(items))
+    }
+
+    /// The process instances, as a `ProcessInstanceSearchQueryResult` JSON object
+    /// (`{ items: [...], page: {...} }`). Mirrors `POST /process-instances/search`.
+    #[wasm_bindgen(js_name = searchProcessInstances)]
+    pub fn search_process_instances(&self, _filter_json: &str) -> Result<String, JsValue> {
+        let items: Vec<serde_json::Value> = self
+            .read_model
+            .process_instances()
+            .iter()
+            .map(process_instance_result)
+            .collect();
+        to_json(&search_result(items))
+    }
+
+    /// The generic resource for `resource_key`, as a `ResourceResult` JSON object,
+    /// or JSON `null` when no resource with that key exists. Mirrors
+    /// `GET /resources/{resourceKey}`.
+    #[wasm_bindgen(js_name = getResourceByKey)]
+    pub fn get_resource_by_key(&self, resource_key: &str) -> Result<String, JsValue> {
+        let key = parse_key(resource_key)?;
+        match self.read_model.resource_by_key(key) {
+            Some(row) => to_json(&resource_result(&row)),
+            None => Ok("null".to_string()),
+        }
+    }
+
+    /// The variables, as a `VariableSearchQueryResult` JSON object
+    /// (`{ items: [...], page: {...} }`). Mirrors `POST /variables/search`.
+    #[wasm_bindgen(js_name = searchVariables)]
+    pub fn search_variables(&self, _filter_json: &str) -> Result<String, JsValue> {
+        let items: Vec<serde_json::Value> = self
+            .read_model
+            .variables()
+            .iter()
+            .map(variable_search_result)
+            .collect();
+        to_json(&search_result(items))
+    }
+}
+
+#[cfg(feature = "read-model")]
+impl TestEngine {
+    /// Fold the newly-emitted `events` into the in-memory read model so the REST
+    /// read methods stay consistent with `self.log`. Best-effort: a projection
+    /// error must never abort a simulation step (the read channel is auxiliary),
+    /// so it is swallowed here rather than propagated.
+    fn project_read_model(&self, events: &[Event]) {
+        if events.is_empty() {
+            return;
+        }
+        let refs: Vec<&Event> = events.iter().collect();
+        let _ = self.read_model.export(&refs);
+    }
+}
+
+/// Open a fresh in-memory read model for the test engine. `ReadStore::open(None)`
+/// uses the wasm MemoryVFS backend (an ephemeral `:memory:` SQLite); opening a
+/// pristine in-RAM database cannot fail in practice, so a failure here is an
+/// unrecoverable environment bug and is surfaced as a panic.
+#[cfg(feature = "read-model")]
+fn open_read_model() -> ReadStore {
+    ReadStore::open(None).expect("open in-memory read model")
+}
+
+/// The REST string spelling of a [`UserTaskState`] (Camunda v2 enum), used to
+/// honour `searchUserTasks`' `state` filter through the read model.
+#[cfg(feature = "read-model")]
+fn user_task_state_rest(state: UserTaskState) -> &'static str {
+    match state {
+        UserTaskState::Created => "CREATED",
+        UserTaskState::Completed => "COMPLETED",
+        UserTaskState::Canceled => "CANCELED",
+    }
+}
+
+/// Extract an optional string field (e.g. `state`) from a search filter argument.
+/// Empty/whitespace input, a missing field, or an explicit JSON `null` all yield
+/// `None` (no filter); a non-string value is rejected.
+#[cfg(feature = "read-model")]
+fn parse_state_filter(filter_json: &str, field: &str) -> Result<Option<String>, JsValue> {
+    let t = filter_json.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let json: serde_json::Value =
+        serde_json::from_str(t).map_err(|e| js_err(&format!("invalid filter JSON: {e}")))?;
+    match json.get(field) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(js_err(&format!("filter `{field}` must be a string"))),
+    }
+}
+
+/// Wrap a list of result items in the Camunda search-query envelope
+/// `{ items, page: { totalItems, hasMoreTotalItems, startCursor, endCursor } }`.
+/// The in-browser engine returns every match in one page (no cursoring), so
+/// `totalItems == items.len()` and the cursors are null.
+#[cfg(feature = "read-model")]
+fn search_result(items: Vec<serde_json::Value>) -> serde_json::Value {
+    let total = items.len();
+    serde_json::json!({
+        "items": items,
+        "page": {
+            "totalItems": total,
+            "hasMoreTotalItems": false,
+            "startCursor": serde_json::Value::Null,
+            "endCursor": serde_json::Value::Null,
+        },
+    })
+}
+
+/// An ISO-8601 / RFC-3339 UTC timestamp (`YYYY-MM-DDThh:mm:ss.sssZ`) from epoch
+/// milliseconds, matching the `date-time` strings the gateway emits — computed
+/// without `chrono` to avoid pulling a date crate into the wasm engine.
+#[cfg(feature = "read-model")]
+fn iso8601_from_ms(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let millis = ms % 1000;
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let (hour, min, sec) = (
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60,
+    );
+    // days since 1970-01-01 -> civil (y, m, d), Howard Hinnant's algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}.{millis:03}Z")
+}
+
+/// Serialise a [`FormRow`] as the gateway's `FormResult` JSON shape.
+#[cfg(feature = "read-model")]
+fn form_result(row: &FormRow) -> serde_json::Value {
+    serde_json::json!({
+        "tenantId": row.tenant_id,
+        "formId": row.form_id,
+        "schema": row.schema,
+        "version": row.version as i64,
+        "formKey": row.form_key.to_string(),
+    })
+}
+
+/// Serialise a [`ResourceRow`] as the gateway's `ResourceResult` JSON shape.
+#[cfg(feature = "read-model")]
+fn resource_result(row: &ResourceRow) -> serde_json::Value {
+    serde_json::json!({
+        "resourceName": row.resource_name,
+        "version": row.version,
+        "versionTag": row.version_tag,
+        "resourceId": row.resource_id,
+        "tenantId": row.tenant_id,
+        "resourceKey": row.resource_key.to_string(),
+    })
+}
+
+/// Serialise a [`ProcessInstanceRow`] as the gateway's `ProcessInstanceResult`
+/// JSON shape. Fields the engine does not retain (name, version tag, parent/root
+/// keys) are null, exactly as the gateway projects them.
+#[cfg(feature = "read-model")]
+fn process_instance_result(row: &ProcessInstanceRow) -> serde_json::Value {
+    let state = match row.state {
+        ProcessInstanceState::Active => "ACTIVE",
+        ProcessInstanceState::Completed => "COMPLETED",
+        ProcessInstanceState::Terminated | ProcessInstanceState::Terminating => "TERMINATED",
+    };
+    serde_json::json!({
+        "processDefinitionId": row.process_definition_id,
+        "processDefinitionName": serde_json::Value::Null,
+        "processDefinitionVersion": row.version,
+        "processDefinitionVersionTag": serde_json::Value::Null,
+        "startDate": iso8601_from_ms(row.start_date_ms),
+        "endDate": serde_json::Value::Null,
+        "state": state,
+        "hasIncident": row.has_incident,
+        "tenantId": "<default>",
+        "processInstanceKey": row.key.to_string(),
+        "processDefinitionKey": row.process_definition_key,
+        "parentProcessInstanceKey": serde_json::Value::Null,
+        "parentElementInstanceKey": serde_json::Value::Null,
+        "rootProcessInstanceKey": serde_json::Value::Null,
+        "tags": row.tags,
+        "businessId": row.business_id,
+    })
+}
+
+/// Serialise a [`VariableRow`] as the gateway's `VariableSearchResult` JSON shape.
+/// The in-browser engine never truncates, so `isTruncated` is always false.
+#[cfg(feature = "read-model")]
+fn variable_search_result(v: &VariableRow) -> serde_json::Value {
+    serde_json::json!({
+        "name": v.name,
+        "tenantId": "<default>",
+        "variableKey": v.key.to_string(),
+        "scopeKey": v.scope_key.to_string(),
+        "processInstanceKey": v.instance_key.to_string(),
+        "rootProcessInstanceKey": serde_json::Value::Null,
+        "value": v.value,
+        "isTruncated": false,
+    })
+}
+
+/// Serialise a [`UserTaskRow`] as the gateway's `UserTaskResult` JSON shape. The
+/// `state` is the Camunda v2 enum spelling; dates are ISO-8601 UTC; fields the
+/// engine does not retain (name, process name, completion date, root key) are
+/// null; `priority` is clamped to `0..=100` exactly as the gateway does.
+#[cfg(feature = "read-model")]
+fn user_task_result(task: &UserTaskRow) -> serde_json::Value {
+    serde_json::json!({
+        "name": serde_json::Value::Null,
+        "state": user_task_state_rest(task.state),
+        "assignee": task.assignee,
+        "elementId": task.element_id,
+        "candidateGroups": task.candidate_groups,
+        "candidateUsers": task.candidate_users,
+        "processDefinitionId": task.process_definition_id,
+        "creationDate": iso8601_from_ms(task.created_at_ms),
+        "completionDate": serde_json::Value::Null,
+        "followUpDate": task.follow_up_date,
+        "dueDate": task.due_date,
+        "tenantId": "<default>",
+        "externalFormReference": task.external_form_reference,
+        "processDefinitionVersion": task.process_definition_version,
+        "customHeaders": serde_json::Map::new(),
+        "userTaskKey": task.key.to_string(),
+        "elementInstanceKey": task.element_instance_key.to_string(),
+        "processName": serde_json::Value::Null,
+        "processDefinitionKey": task.process_definition_key,
+        "processInstanceKey": task.instance_key.to_string(),
+        "rootProcessInstanceKey": serde_json::Value::Null,
+        "formKey": task.form_key.map(|k| k.to_string()),
+        "priority": task.priority.clamp(0, 100),
+        "tags": Vec::<String>::new(),
+    })
+}
+
 impl Default for TestEngine {
     fn default() -> Self {
         Self::new()
@@ -801,6 +1109,8 @@ impl TestEngine {
                 event: ev.clone(),
             });
         }
+        #[cfg(feature = "read-model")]
+        self.project_read_model(&events);
         Ok(events)
     }
 
@@ -822,6 +1132,8 @@ impl TestEngine {
         let now = self.debug_now;
         let new_events: Vec<Event> = full[self.debug_folded..].to_vec();
         self.debug_folded = full.len();
+        #[cfg(feature = "read-model")]
+        self.project_read_model(&new_events);
         for ev in new_events {
             self.seq += 1;
             self.fold_history(&ev);
@@ -2332,6 +2644,149 @@ mod tests {
         assert!(
             eng.advance_time(1000.0).is_ok(),
             "a real mutator succeeds once unblocked"
+        );
+    }
+}
+
+/// Acceptance tests for the feature-gated REST read channel: proves the shared
+/// `nanobpmn-read-model` projection, fed the same events as `self.log`, answers
+/// the gateway's readstore-shaped queries from inside the in-browser test engine.
+///
+/// Runs on the host (`cargo test -p nanobpmn-engine-wasm --features read-model`)
+/// where the read model links the platform SQLite; the same code path is the one
+/// compiled to `wasm32` with the in-memory MemoryVFS backend.
+#[cfg(all(test, feature = "read-model"))]
+mod read_channel_tests {
+    use nanobpmn_engine_core::{Command, Event, FormResource};
+    use serde_json::Value as J;
+
+    use super::*;
+
+    fn parse(s: &str) -> J {
+        serde_json::from_str(s).expect("valid JSON")
+    }
+
+    const USER_TASK_XML: &str = r#"
+      <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                        xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+        <bpmn:process id="p">
+          <bpmn:startEvent id="s" />
+          <bpmn:userTask id="review">
+            <bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements>
+          </bpmn:userTask>
+          <bpmn:endEvent id="e" />
+          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+          <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+        </bpmn:process>
+      </bpmn:definitions>"#;
+
+    fn form_key_of(events: &[Event]) -> u64 {
+        events
+            .iter()
+            .find_map(|e| match e {
+                Event::FormDeployed { form_key, .. } => Some(*form_key),
+                _ => None,
+            })
+            .expect("a FormDeployed event")
+    }
+
+    #[test]
+    fn get_form_by_key_returns_the_latest_schema() {
+        let mut eng = TestEngine::new();
+
+        // Deploy two versions of the same form id; each version gets its own key.
+        let v1 = eng
+            .apply(Command::DeployForms(vec![FormResource {
+                id: "greeting".into(),
+                resource_name: "greeting.form".into(),
+                schema: r#"{"components":[],"v":1}"#.into(),
+            }]))
+            .expect("deploy form v1");
+        let v1_key = form_key_of(&v1);
+        let v2 = eng
+            .apply(Command::DeployForms(vec![FormResource {
+                id: "greeting".into(),
+                resource_name: "greeting.form".into(),
+                schema: r#"{"components":[],"v":2}"#.into(),
+            }]))
+            .expect("deploy form v2");
+        let v2_key = form_key_of(&v2);
+        assert_ne!(v1_key, v2_key, "each form version gets a distinct key");
+
+        // The latest version's key resolves to the latest schema, in the gateway's
+        // FormResult JSON shape.
+        let latest = parse(&eng.get_form_by_key(&v2_key.to_string()).unwrap());
+        assert_eq!(latest["formId"], "greeting");
+        assert_eq!(latest["version"], 2);
+        assert_eq!(latest["schema"], r#"{"components":[],"v":2}"#);
+        assert_eq!(latest["formKey"], v2_key.to_string());
+        assert_eq!(latest["tenantId"], "<default>");
+
+        // The older key still resolves to its own (v1) schema.
+        let old = parse(&eng.get_form_by_key(&v1_key.to_string()).unwrap());
+        assert_eq!(old["version"], 1);
+        assert_eq!(old["schema"], r#"{"components":[],"v":1}"#);
+
+        // An unknown key is JSON null (the gateway 404 has no body to mirror).
+        assert_eq!(eng.get_form_by_key("999999").unwrap(), "null");
+    }
+
+    #[test]
+    fn search_user_tasks_honours_the_state_filter() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        let snap = parse(&eng.create_instance("p", "{}", None).unwrap());
+        let key = snap["userTasks"][0]["key"].as_str().unwrap().to_string();
+
+        // An open task shows up under CREATED (state filtered via the read model)…
+        let created = parse(&eng.search_user_tasks(r#"{"state":"CREATED"}"#).unwrap());
+        assert_eq!(created["items"].as_array().unwrap().len(), 1);
+        assert_eq!(created["items"][0]["elementId"], "review");
+        assert_eq!(created["items"][0]["state"], "CREATED");
+        assert_eq!(created["items"][0]["userTaskKey"], key);
+        assert_eq!(created["page"]["totalItems"], 1);
+
+        // …and NOT under COMPLETED.
+        let completed = parse(&eng.search_user_tasks(r#"{"state":"COMPLETED"}"#).unwrap());
+        assert_eq!(completed["items"].as_array().unwrap().len(), 0);
+
+        // No filter returns every task.
+        let all = parse(&eng.search_user_tasks("").unwrap());
+        assert_eq!(all["items"].as_array().unwrap().len(), 1);
+
+        // After completion the task leaves the CREATED (open) set entirely.
+        eng.complete_user_task(&key, r#"{"approved":true}"#)
+            .unwrap();
+        let open = parse(&eng.search_user_tasks(r#"{"state":"CREATED"}"#).unwrap());
+        assert_eq!(
+            open["items"].as_array().unwrap().len(),
+            0,
+            "a completed task is no longer CREATED"
+        );
+        let done = parse(&eng.search_user_tasks(r#"{"state":"COMPLETED"}"#).unwrap());
+        assert_eq!(done["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reset_clears_the_read_model() {
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+        assert_eq!(
+            parse(&eng.search_user_tasks("").unwrap())["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        eng.reset();
+        assert_eq!(
+            parse(&eng.search_user_tasks("").unwrap())["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0,
+            "reset re-opens a fresh, empty read model"
         );
     }
 }
