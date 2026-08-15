@@ -219,3 +219,54 @@ export function scaffoldStartVars(
   if (targets.length !== 1) return "{}";
   return scaffoldForType(model, model.tasks.get(targets[0])?.in);
 }
+
+// Message-publish / signal-broadcast scaffolding ----------------------------
+//
+// The test view drives message-catch / receive tasks and signal catch/boundary
+// events by hand, mirroring the "Waiting jobs" affordance. These pure helpers
+// turn an open subscription (carried on the snapshot) into the prefilled form a
+// maker edits before publishing/broadcasting, so the UI never re-derives the
+// mapping inline (and it stays unit-testable under `node --test`).
+
+/** The prefilled fields for publishing a message to an open subscription. */
+export interface MessagePublishForm {
+  messageName: string;
+  correlationKey: string;
+  /** Correlation variables (JSON), defaulted empty for the maker to edit. */
+  variables: string;
+}
+
+/** The prefilled fields for broadcasting a signal to an open subscription. */
+export interface SignalBroadcastForm {
+  signalName: string;
+  /** Signal variables (JSON), defaulted empty for the maker to edit. */
+  variables: string;
+}
+
+/**
+ * Prefill a message-publish form from an open message subscription: the engine
+ * correlates by `messageName` + `correlationKey`, so both are seeded from the
+ * subscription (a missing/empty key stays an empty string). Variables default to
+ * `"{}"` — a message carries no in-model payload envelope to scaffold from.
+ */
+export function prefillMessagePublish(sub: {
+  messageName: string;
+  correlationKey?: string;
+}): MessagePublishForm {
+  return {
+    messageName: sub.messageName,
+    correlationKey: sub.correlationKey ?? "",
+    variables: "{}",
+  };
+}
+
+/**
+ * Prefill a signal-broadcast form from an open signal subscription: signals
+ * correlate by **name only**, so only `signalName` is seeded. Variables default
+ * to `"{}"`.
+ */
+export function prefillSignalBroadcast(sub: {
+  signalName: string;
+}): SignalBroadcastForm {
+  return { signalName: sub.signalName, variables: "{}" };
+}

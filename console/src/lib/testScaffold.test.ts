@@ -8,6 +8,8 @@ import {
   scaffoldForType,
   scaffoldJobOutput,
   scaffoldStartVars,
+  prefillMessagePublish,
+  prefillSignalBroadcast,
 } from "./testScaffold.ts";
 
 // A compact model that mirrors the migrated urban-pr-review shape: payload types
@@ -176,4 +178,28 @@ test("parseModelEnvelopes tolerates a model with no shapes or envelopes", () => 
   );
   assert.equal(m.shapes.size, 0);
   assert.equal(m.tasks.size, 0);
+});
+
+test("prefillMessagePublish seeds name + correlation key from the subscription", () => {
+  const form = prefillMessagePublish({
+    messageName: "review-ready",
+    correlationKey: "pr-42",
+  });
+  assert.deepEqual(form, {
+    messageName: "review-ready",
+    correlationKey: "pr-42",
+    variables: "{}",
+  });
+});
+
+test("prefillMessagePublish tolerates a missing correlation key", () => {
+  const form = prefillMessagePublish({ messageName: "kickoff" });
+  assert.equal(form.messageName, "kickoff");
+  assert.equal(form.correlationKey, "");
+  assert.equal(form.variables, "{}");
+});
+
+test("prefillSignalBroadcast seeds the signal name only (name-only correlation)", () => {
+  const form = prefillSignalBroadcast({ signalName: "cancel-all" });
+  assert.deepEqual(form, { signalName: "cancel-all", variables: "{}" });
 });
