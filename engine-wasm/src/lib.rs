@@ -32,6 +32,16 @@ use nanobpmn_read_model::{
     FormRow, ProcessInstanceRow, ReadStore, ResourceRow, UserTaskRow, VariableRow,
 };
 
+/// `console.error` binding used to surface (never abort on) best-effort read-model
+/// projection failures, so a broken projection is debuggable instead of silently
+/// serving stale/empty read results. Zero new crate deps — a direct JS binding.
+#[cfg(feature = "read-model")]
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console, js_name = error)]
+    fn console_error(msg: &str);
+}
+
 /// Compile-time parity gate: an exhaustive match over `engine-core`'s `Command`
 /// surface that fails the build when a new engine capability is added without a
 /// conscious decision about whether to expose it here. See the module docs.
@@ -864,13 +874,16 @@ impl TestEngine {
     /// Fold the newly-emitted `events` into the in-memory read model so the REST
     /// read methods stay consistent with `self.log`. Best-effort: a projection
     /// error must never abort a simulation step (the read channel is auxiliary),
-    /// so it is swallowed here rather than propagated.
+    /// so it is surfaced to `console.error` for debuggability rather than
+    /// propagated.
     fn project_read_model(&self, events: &[Event]) {
         if events.is_empty() {
             return;
         }
         let refs: Vec<&Event> = events.iter().collect();
-        let _ = self.read_model.export(&refs);
+        if let Err(e) = self.read_model.export(&refs) {
+            console_error(&format!("nano read-model projection failed: {e}"));
+        }
     }
 }
 
@@ -896,19 +909,33 @@ fn user_task_state_rest(state: UserTaskState) -> &'static str {
 
 /// Extract an optional string field (e.g. `state`) from a search filter argument.
 /// Empty/whitespace input, a missing field, or an explicit JSON `null` all yield
-/// `None` (no filter); a non-string value is rejected.
+/// `None` (no filter); a non-string value is rejected. The filter body must be a
+/// JSON object (or root `null`): a non-object root (`[]`, `"x"`, `42`, …) is
+/// rejected rather than silently treated as "no filter", matching the gateway's
+/// request parsing.
 #[cfg(feature = "read-model")]
 fn parse_state_filter(filter_json: &str, field: &str) -> Result<Option<String>, JsValue> {
+    parse_state_filter_inner(filter_json, field).map_err(|e| js_err(&e))
+}
+
+/// Pure core of [`parse_state_filter`] (host-testable: constructs no `JsValue`).
+#[cfg(feature = "read-model")]
+fn parse_state_filter_inner(filter_json: &str, field: &str) -> Result<Option<String>, String> {
     let t = filter_json.trim();
     if t.is_empty() {
         return Ok(None);
     }
     let json: serde_json::Value =
-        serde_json::from_str(t).map_err(|e| js_err(&format!("invalid filter JSON: {e}")))?;
-    match json.get(field) {
+        serde_json::from_str(t).map_err(|e| format!("invalid filter JSON: {e}"))?;
+    let obj = match &json {
+        serde_json::Value::Null => return Ok(None),
+        serde_json::Value::Object(map) => map,
+        _ => return Err("filter body must be a JSON object".to_string()),
+    };
+    match obj.get(field) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
-        Some(_) => Err(js_err(&format!("filter `{field}` must be a string"))),
+        Some(_) => Err(format!("filter `{field}` must be a string")),
     }
 }
 
@@ -1029,6 +1056,101 @@ fn variable_search_result(v: &VariableRow) -> serde_json::Value {
     })
 }
 
+/// Coerce an optional user-task date (`followUpDate` / `dueDate`) to the JSON the
+/// gateway would emit: the string when it is a valid RFC-3339 `date-time`, else
+/// JSON `null`. Mirrors the gateway's `parse_date`, which parses these as
+/// `chrono::DateTime<Utc>` and coerces any unparseable value to `null` rather
+/// than forwarding an invalid date string to clients.
+#[cfg(feature = "read-model")]
+fn rfc3339_or_null(value: &Option<String>) -> serde_json::Value {
+    match value.as_deref() {
+        Some(s) if is_rfc3339_date_time(s) => serde_json::Value::String(s.to_string()),
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// True when `s` is a valid RFC-3339 `date-time` — the shape
+/// `str::parse::<chrono::DateTime<Utc>>()` accepts on the gateway:
+/// `YYYY-MM-DDThh:mm:ss`, an optional `.fraction`, and a `Z`/`±hh:mm` offset.
+/// Component ranges are checked so out-of-range values (month 13, hour 25, …) are
+/// rejected the same way chrono rejects them. Validation only (no date crate).
+#[cfg(feature = "read-model")]
+fn is_rfc3339_date_time(s: &str) -> bool {
+    let b = s.as_bytes();
+    // Shortest valid form "1970-01-01T00:00:00Z" is 20 bytes.
+    if b.len() < 20 {
+        return false;
+    }
+    let digit = |c: u8| c.is_ascii_digit();
+    let num = |slice: &[u8]| -> u32 {
+        slice
+            .iter()
+            .fold(0u32, |acc, &c| acc * 10 + u32::from(c - b'0'))
+    };
+    let fixed = digit(b[0])
+        && digit(b[1])
+        && digit(b[2])
+        && digit(b[3])
+        && b[4] == b'-'
+        && digit(b[5])
+        && digit(b[6])
+        && b[7] == b'-'
+        && digit(b[8])
+        && digit(b[9])
+        && (b[10] == b'T' || b[10] == b't')
+        && digit(b[11])
+        && digit(b[12])
+        && b[13] == b':'
+        && digit(b[14])
+        && digit(b[15])
+        && b[16] == b':'
+        && digit(b[17])
+        && digit(b[18]);
+    if !fixed {
+        return false;
+    }
+    let month = num(&b[5..7]);
+    let day = num(&b[8..10]);
+    let hour = num(&b[11..13]);
+    let min = num(&b[14..16]);
+    let sec = num(&b[17..19]);
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
+        return false;
+    }
+    let mut i = 19;
+    // Optional fractional seconds: a dot followed by at least one digit.
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let start = i;
+        while i < b.len() && digit(b[i]) {
+            i += 1;
+        }
+        if i == start {
+            return false;
+        }
+    }
+    // Mandatory timezone: `Z`/`z` or a `±hh:mm` offset.
+    match b.get(i) {
+        Some(&c) if c == b'Z' || c == b'z' => i + 1 == b.len(),
+        Some(&c) if c == b'+' || c == b'-' => {
+            i + 6 == b.len()
+                && digit(b[i + 1])
+                && digit(b[i + 2])
+                && b[i + 3] == b':'
+                && digit(b[i + 4])
+                && digit(b[i + 5])
+                && num(&b[i + 1..i + 3]) <= 23
+                && num(&b[i + 4..i + 6]) <= 59
+        }
+        _ => false,
+    }
+}
+
 /// Serialise a [`UserTaskRow`] as the gateway's `UserTaskResult` JSON shape. The
 /// `state` is the Camunda v2 enum spelling; dates are ISO-8601 UTC; fields the
 /// engine does not retain (name, process name, completion date, root key) are
@@ -1045,8 +1167,8 @@ fn user_task_result(task: &UserTaskRow) -> serde_json::Value {
         "processDefinitionId": task.process_definition_id,
         "creationDate": iso8601_from_ms(task.created_at_ms),
         "completionDate": serde_json::Value::Null,
-        "followUpDate": task.follow_up_date,
-        "dueDate": task.due_date,
+        "followUpDate": rfc3339_or_null(&task.follow_up_date),
+        "dueDate": rfc3339_or_null(&task.due_date),
         "tenantId": "<default>",
         "externalFormReference": task.external_form_reference,
         "processDefinitionVersion": task.process_definition_version,
@@ -2788,5 +2910,73 @@ mod read_channel_tests {
             0,
             "reset re-opens a fresh, empty read model"
         );
+    }
+
+    #[test]
+    fn state_filter_rejects_a_non_object_body() {
+        // A non-object JSON root must be rejected rather than silently broadening
+        // the query (which is what `json.get(field)` on a non-object would do).
+        for body in [r#"[]"#, r#""CREATED""#, r#"42"#, r#"true"#] {
+            let err = parse_state_filter_inner(body, "state").unwrap_err();
+            assert!(
+                err.contains("must be a JSON object"),
+                "body {body:?} should be rejected as non-object, got {err:?}"
+            );
+        }
+        // Root `null`, an empty body, and a missing field are all "no filter".
+        assert_eq!(parse_state_filter_inner("null", "state").unwrap(), None);
+        assert_eq!(parse_state_filter_inner("", "state").unwrap(), None);
+        assert_eq!(parse_state_filter_inner("{}", "state").unwrap(), None);
+        assert_eq!(
+            parse_state_filter_inner(r#"{"state":null}"#, "state").unwrap(),
+            None
+        );
+        // A well-formed object yields the value; a non-string value is rejected.
+        assert_eq!(
+            parse_state_filter_inner(r#"{"state":"CREATED"}"#, "state").unwrap(),
+            Some("CREATED".to_string())
+        );
+        assert!(parse_state_filter_inner(r#"{"state":42}"#, "state").is_err());
+        // Malformed JSON is rejected too.
+        assert!(parse_state_filter_inner(r#"{"state":"#, "state").is_err());
+    }
+
+    #[test]
+    fn user_task_dates_are_validated_as_rfc3339() {
+        // Valid RFC-3339 date-times pass through unchanged.
+        for ok in [
+            "1970-01-01T00:00:00Z",
+            "2026-08-16T11:36:36.344Z",
+            "2026-08-16t11:36:36z",
+            "2026-01-01T00:00:00+13:00",
+            "2026-12-31T23:59:60-05:30",
+        ] {
+            assert!(is_rfc3339_date_time(ok), "{ok:?} should be valid");
+            assert_eq!(
+                rfc3339_or_null(&Some(ok.to_string())),
+                serde_json::Value::String(ok.to_string())
+            );
+        }
+        // Invalid values (bare date, missing offset, out-of-range, garbage) become
+        // null — matching the gateway's `parse_date` coercion.
+        for bad in [
+            "2026-01-01",
+            "2026-08-16T11:36:36",
+            "2026-13-01T00:00:00Z",
+            "2026-01-01T25:00:00Z",
+            "2026-01-01T00:60:00Z",
+            "2026-01-01T00:00:00.Z",
+            "2026-01-01T00:00:00+24:00",
+            "not-a-date",
+            "",
+        ] {
+            assert!(!is_rfc3339_date_time(bad), "{bad:?} should be invalid");
+            assert_eq!(
+                rfc3339_or_null(&Some(bad.to_string())),
+                serde_json::Value::Null
+            );
+        }
+        // Absent dates are null.
+        assert_eq!(rfc3339_or_null(&None), serde_json::Value::Null);
     }
 }
