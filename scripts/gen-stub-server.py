@@ -62,6 +62,7 @@ OVERRIDES: dict[tuple[str, str], str] = {
     ("incident", "search_incidents"): "self.search_incidents_impl(body).await",
     ("process_instance", "search_process_instances"): "self.search_process_instances_impl(body).await",
     ("process_definition", "search_process_definitions"): "self.search_process_definitions_impl(body).await",
+    ("process_definition", "get_process_definition"): "self.get_process_definition_impl(path_params).await",
     ("process_definition", "get_process_definition_xml"): "self.get_process_definition_xml_impl(path_params).await",
     ("job", "search_jobs"): "self.search_jobs_impl(body).await",
     ("process_instance", "get_process_instance"): "self.get_process_instance_impl(path_params).await",

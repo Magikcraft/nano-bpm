@@ -9982,10 +9982,10 @@ impl ServerImpl {
         }
     }
 
-    /// Searches deployed process definitions. The engine keeps only the latest
-    /// version of each process id (in `state.processes`), so every entry is the
-    /// latest version; older versions are not retained and therefore not
-    /// searchable.
+    /// Searches deployed process definitions. Every deployed version of each
+    /// process id is retained and searchable (Camunda/Zeebe parity); the
+    /// `isLatestVersion` filter narrows to the highest version per id via the
+    /// `is_latest` discriminator computed by the read store.
     async fn search_process_definitions_impl(
         &self,
         body: &Option<models::ProcessDefinitionSearchQuery>,
@@ -10001,10 +10001,12 @@ impl ServerImpl {
                 None => true,
                 Some(f) => {
                     let id = &d.process_id;
-                    // The engine stores no display name, resource name, or
-                    // version tag, so those filters match against the best
-                    // available proxy (the id) or exclude when we hold no value.
-                    query::match_string(&f.name, id)
+                    // `name` matches against the BPMN process display name (which
+                    // may be absent, i.e. no match for a value/`$like` filter),
+                    // distinct from the id. `resourceName` and `versionTag` are
+                    // not projected by the engine, so those filters match their
+                    // best proxy or exclude when we hold no value.
+                    query::match_string_opt(&f.name, d.name.as_deref())
                         && query::match_string(&f.process_definition_id, id)
                         && f.process_definition_key
                             .as_ref()
@@ -10015,10 +10017,10 @@ impl ServerImpl {
                             .is_none_or(|r| *r == resource_name(id))
                         && f.version_tag.is_none()
                         && f.has_start_form.is_none_or(|want| !want)
-                        // `process_definitions()` returns only the latest version
-                        // per id, so every result is "latest"; an explicit
-                        // `false` therefore matches none.
-                        && f.is_latest_version.is_none_or(|want| want)
+                        // Every deployed version is searchable; `isLatestVersion`
+                        // filters to the highest version per id (computed by the
+                        // read store).
+                        && f.is_latest_version.is_none_or(|want| want == d.is_latest)
                 }
             })
             .collect();
@@ -10031,7 +10033,10 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |d, field| match field {
-                "processDefinitionId" | "name" => query::SortVal::Str(d.process_id.clone()),
+                "processDefinitionId" => query::SortVal::Str(d.process_id.clone()),
+                "name" => {
+                    query::SortVal::Str(d.name.clone().unwrap_or_else(|| d.process_id.clone()))
+                }
                 "version" => query::SortVal::Num(d.version as i64),
                 _ => query::SortVal::Num(d.key as i64),
             },
@@ -10050,6 +10055,46 @@ impl ServerImpl {
         Ok(Resp::Status200_TheProcessDefinitionSearchResult(
             models::ProcessDefinitionSearchQueryResult::new(page.response, items),
         ))
+    }
+
+    /// Returns a single process definition by its `processDefinitionKey`
+    /// (Camunda `getProcessDefinition`). Resolves any deployed version — not just
+    /// the latest — since every version is retained and independently
+    /// addressable by key. A malformed or unknown key yields 404.
+    async fn get_process_definition_impl(
+        &self,
+        path_params: &models::GetProcessDefinitionPathParams,
+    ) -> Result<apis::process_definition::GetProcessDefinitionResponse, ()> {
+        use apis::process_definition::GetProcessDefinitionResponse as Resp;
+
+        let key: u64 = match path_params.process_definition_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(problem(
+                        "Process definition not found",
+                        404,
+                        format!(
+                            "Process definition key '{}' is not a valid key.",
+                            path_params.process_definition_key
+                        ),
+                    )),
+                );
+            }
+        };
+
+        match self.store.process_definition_by_key(key) {
+            Some(row) => Ok(Resp::Status200_TheProcessDefinitionIsSuccessfullyReturned(
+                process_definition_result(&row),
+            )),
+            None => Ok(
+                Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(problem(
+                    "Process definition not found",
+                    404,
+                    format!("No process definition with key {key}."),
+                )),
+            ),
+        }
     }
 
     async fn create_deployment_impl(
@@ -15582,14 +15627,20 @@ fn resource_name(process_id: &str) -> String {
 }
 
 /// Projects a [`ProcessDefinitionRow`] into the generated
-/// `ProcessDefinitionResult`. The engine stores no display name or version tag,
-/// so `name` mirrors the id and `versionTag` is null.
+/// `ProcessDefinitionResult`. The `name` is the BPMN process display name when
+/// the deployed `<bpmn:process>` carried one (null otherwise, per Camunda, where
+/// `name` and `processDefinitionId` are independent). The engine stores no
+/// version tag, so `versionTag` is null.
 fn process_definition_result(
     deployed: &readstore::ProcessDefinitionRow,
 ) -> models::ProcessDefinitionResult {
     let id = deployed.process_id.clone();
+    let name = match &deployed.name {
+        Some(n) => types::Nullable::Present(n.clone()),
+        None => types::Nullable::Null,
+    };
     models::ProcessDefinitionResult::new(
-        types::Nullable::Present(id.clone()),
+        name,
         resource_name(&id),
         deployed.version,
         types::Nullable::Null,
