@@ -6,11 +6,11 @@
  * (from spec-app/) or  make generate-app-manifest  (from the repo root).
  */
 /**
- * BPMN process globs. Overrides the convention default (`resources/** /*.bpmn`).
+ * BPMN process globs. Overrides the convention default (`resources/**\/*.bpmn`).
  */
 export type GlobList = string[];
 /**
- * DMN decision globs. Overrides the convention default (`resources/** /*.dmn`).
+ * DMN decision globs. Overrides the convention default (`resources/**\/*.dmn`).
  */
 export type GlobList1 = string[];
 /**
