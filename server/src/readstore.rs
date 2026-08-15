@@ -69,7 +69,8 @@ CREATE TABLE process_definitions (
     process_id TEXT NOT NULL,
     version    INTEGER NOT NULL,
     name       TEXT,
-    xml        TEXT NOT NULL DEFAULT ''
+    xml        TEXT NOT NULL DEFAULT '',
+    start_form_id TEXT
 );
 -- UNIQUE enforces one row per (process_id, version) so a redeploy of the same
 -- version can never create ambiguous \"latest version per id\" rows, and the
@@ -1543,6 +1544,23 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// A single user task by key, using the `key` primary-key index. Avoids
+    /// materializing every user task for a point lookup (e.g. the form endpoint).
+    pub fn user_task(&self, key: Key) -> Option<UserTaskRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT key, instance_key, element_instance_key, element_id, state, \
+             assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
+             priority, created_at_ms, process_definition_id, process_definition_key, \
+             process_definition_version, form_key, external_form_reference \
+             FROM user_tasks WHERE key = ?1",
+            params![key as i64],
+            map_user_task,
+        )
+        .optional()
+        .expect("query user_task")
+    }
+
     pub fn incidents(&self) -> Vec<IncidentRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
@@ -1845,6 +1863,23 @@ impl ReadStore {
         .expect("query form_by_key")
     }
 
+    /// The latest deployed form for a given form id (highest version), used to
+    /// resolve a process start form (`GetStartProcessForm`) by its declared
+    /// `formId`. `None` when no form with that id is projected.
+    pub fn form_by_id(&self, form_id: &str) -> Option<FormRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!(
+                "SELECT {FORM_COLS} FROM forms WHERE form_id = ?1 \
+                 ORDER BY version DESC LIMIT 1"
+            ),
+            params![form_id],
+            map_form,
+        )
+        .optional()
+        .expect("query form_by_id")
+    }
+
     /// A single deployed generic resource by its per-version numeric key. Each
     /// deployed version is retained under its own `resource_key`, so a redeploy
     /// that mints a new key never invalidates an earlier one. `None` when no such
@@ -1902,6 +1937,21 @@ impl ReadStore {
         )
         .optional()
         .expect("query process_definition_xml")
+    }
+
+    /// The `zeebe:formDefinition formId` declared on a process definition's start
+    /// event (its start form), by process-definition key. The outer `Option` is
+    /// `None` when no such definition is projected; the inner is `None` when the
+    /// definition exists but declares no start form.
+    pub fn process_definition_start_form_id(&self, key: Key) -> Option<Option<String>> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT start_form_id FROM process_definitions WHERE key = ?1",
+            params![key as i64],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .expect("query process_definition_start_form_id")
     }
 
     pub fn variables(&self) -> Vec<VariableRow> {
@@ -2094,6 +2144,15 @@ impl ReadModel {
         None
     }
 
+    pub fn process_definition_start_form_id(&self, key: Key) -> Option<Option<String>> {
+        for s in &self.shards {
+            if let Some(row) = s.process_definition_start_form_id(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
     pub fn decision_requirements(&self) -> Vec<DecisionRequirementsRow> {
         for s in &self.shards {
             let defs = s.decision_requirements();
@@ -2159,6 +2218,15 @@ impl ReadModel {
         None
     }
 
+    pub fn form_by_id(&self, form_id: &str) -> Option<FormRow> {
+        for s in &self.shards {
+            if let Some(row) = s.form_by_id(form_id) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
     pub fn resource_by_key(&self, key: Key) -> Option<ResourceRow> {
         for s in &self.shards {
             if let Some(row) = s.resource_by_key(key) {
@@ -2197,6 +2265,10 @@ impl ReadModel {
 
     pub fn user_tasks(&self) -> Vec<UserTaskRow> {
         self.shards.iter().flat_map(|s| s.user_tasks()).collect()
+    }
+
+    pub fn user_task(&self, key: Key) -> Option<UserTaskRow> {
+        self.shards.iter().find_map(|s| s.user_task(key))
     }
 
     pub fn incidents(&self) -> Vec<IncidentRow> {
@@ -2783,9 +2855,9 @@ fn project_engine_state(
     for deployed in deployed_defs {
         let def = &deployed.definition;
         tx.cexecute(
-            "INSERT INTO process_definitions (process_id, key, version, name, xml) VALUES (?1, ?2, ?3, ?4, ?5) \
-             ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, name = excluded.name, xml = excluded.xml",
-            params![def.id, deployed.key as i64, deployed.version, def.name, def.xml],
+            "INSERT INTO process_definitions (process_id, key, version, name, xml, start_form_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, name = excluded.name, xml = excluded.xml, start_form_id = excluded.start_form_id",
+            params![def.id, deployed.key as i64, deployed.version, def.name, def.xml, def.start_form_id.as_ref()],
         )?;
         for (element_id, element) in &def.elements {
             tx.cexecute(
@@ -3119,9 +3191,9 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // `version`/`isLatestVersion` discriminators). `ON CONFLICT(key)` refreshes
             // idempotently on replay/re-delivery of the same ProcessDeployed event.
             tx.cexecute(
-                "INSERT INTO process_definitions (process_id, key, version, name, xml) VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, name = excluded.name, xml = excluded.xml",
-                params![process.id, *process_definition_key as i64, version, process.name, process.xml],
+                "INSERT INTO process_definitions (process_id, key, version, name, xml, start_form_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, name = excluded.name, xml = excluded.xml, start_form_id = excluded.start_form_id",
+                params![process.id, *process_definition_key as i64, version, process.name, process.xml, process.start_form_id.as_ref()],
             )?;
             // Element metadata (type + BPMN name) keyed by (definition, element
             // id): the per-element lifecycle events carry only an element id, so
