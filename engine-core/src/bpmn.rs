@@ -78,10 +78,7 @@ pub enum ParseError {
     /// (`resourceId`, `bindingType` or `resourceType`). Zeebe rejects such a
     /// deployment (`INVALID_ARGUMENT` → HTTP 400) rather than silently dropping
     /// the link, so Nano surfaces it as a hard parse error for parity.
-    InvalidLinkedResource {
-        task_id: String,
-        attribute: String,
-    },
+    InvalidLinkedResource { task_id: String, attribute: String },
 }
 
 impl std::fmt::Display for ParseError {

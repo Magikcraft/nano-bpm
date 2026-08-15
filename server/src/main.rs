@@ -27507,7 +27507,9 @@ mod subscription_placement_tests {
                 "<default>".into(),
             )
             .await
-            .expect_err("a linkedResource missing resourceType must be rejected, not silently dropped");
+            .expect_err(
+                "a linkedResource missing resourceType must be rejected, not silently dropped",
+            );
         assert_eq!(status, 400, "Zeebe maps INVALID_ARGUMENT to HTTP 400");
         assert!(
             detail.contains("run-agent") && detail.contains("resourceType"),
