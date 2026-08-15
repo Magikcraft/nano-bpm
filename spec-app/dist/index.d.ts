@@ -767,15 +767,24 @@ export interface InstanceTracking {
 	 */
 	keyField: string;
 	/**
-	 * Column governing whether a row is still active. Combined with `activeStatuses` to select the rows worth polling; when omitted, every row of `table` is polled.
+	 * Column governing whether a row is still active. Combined with `activeStatuses` (allow-list) or `terminalStatuses` (exclusion list) to select the rows worth polling; when omitted, every row of `table` is polled.
 	 */
 	statusField?: string;
 	/**
-	 * Values of `statusField` considered still-open. Only rows in one of these states are polled; a row already in a terminal status is skipped. When omitted, every row is polled (use with care on large tables).
+	 * Values of `statusField` considered still-open. Only rows in one of these states are polled; a row already in a terminal status is skipped. FAIL-CLOSED: a non-terminal status omitted here is silently dropped from reconciliation — prefer `terminalStatuses` for a fail-open selector. When neither is set, every row is polled (use with care on large tables). Requires `statusField`; mutually exclusive with `terminalStatuses`.
 	 *
 	 * @minItems 1
 	 */
 	activeStatuses?: [
+		string,
+		...string[]
+	];
+	/**
+	 * Values of `statusField` considered FINISHED. Fail-open alternative to `activeStatuses`: every row whose `statusField` is NOT one of these is polled, so a newly-added non-terminal status is reconciled by default instead of being silently dropped. Prefer this and mirror the app's terminal-status enum. Requires `statusField`; mutually exclusive with `activeStatuses`.
+	 *
+	 * @minItems 1
+	 */
+	terminalStatuses?: [
 		string,
 		...string[]
 	];

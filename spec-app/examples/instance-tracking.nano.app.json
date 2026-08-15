@@ -29,6 +29,18 @@
         }
       },
       "pollMs": 15000
+    },
+    {
+      "table": "feature_runs",
+      "keyField": "process_key",
+      "statusField": "status",
+      "terminalStatuses": ["opened", "merged", "converged", "blocked", "skipped", "failed", "abandoned"],
+      "onTerminated": {
+        "set": {
+          "status": "abandoned"
+        }
+      },
+      "pollMs": 5000
     }
   ]
 }
