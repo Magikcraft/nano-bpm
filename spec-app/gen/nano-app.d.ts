@@ -6,21 +6,17 @@
  * (from spec-app/) or  make generate-app-manifest  (from the repo root).
  */
 /**
- * BPMN process globs.
+ * BPMN process globs. Overrides the convention default (`resources/** /*.bpmn`).
  */
 export type GlobList = string[];
 /**
- * DMN decision globs.
+ * DMN decision globs. Overrides the convention default (`resources/** /*.dmn`).
  */
 export type GlobList1 = string[];
 /**
- * form-js form globs.
+ * form-js form globs. Overrides the convention default (form files under `resources/`).
  */
 export type GlobList2 = string[];
-/**
- * `{{name}}` template sources substituted into model resources at deploy time (e.g. `prompts/*.md`). A template's name is its file stem (`prompts/review-round.md` → `{{review-round}}`).
- */
-export type GlobList3 = string[];
 /**
  * A ${VAR} or ${VAR:-default} boot-time substitution reference (ADR 0027 §5). Resolved at App boot / IDE Run, never persisted. The validator checks the reference shape, not the resolved value.
  */
@@ -198,13 +194,12 @@ export interface Runtime {
   node?: "single" | "cluster";
 }
 /**
- * Glob references to the models the editors produce (ADR 0027 §2). Each glob must resolve to at least one file (cross-reference rule, ADR 0027 §4).
+ * OPTIONAL. By convention (ADR 0062) deployables live under `resources/` and need no declaration here; declare `models` only to override that layout for advanced/non-standard trees.
  */
 export interface Models {
   processes?: GlobList;
   decisions?: GlobList1;
   forms?: GlobList2;
-  templates?: GlobList3;
 }
 /**
  * Named datasources — the BDE-alias abstraction (ADR 0024). Consumers bind by name, never by driver, so the same bundle runs on SQLite in the IDE and Postgres in production by flipping env only.
