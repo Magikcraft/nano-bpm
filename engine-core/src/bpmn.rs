@@ -535,12 +535,18 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 // against the deployed forms at task creation);
                                 // `externalReference` names an external form
                                 // (surfaced verbatim). Zeebe declares exactly one
-                                // of the two.
+                                // of the two, so an `externalReference` wins and
+                                // suppresses `formId` to keep them mutually
+                                // exclusive downstream.
                                 if let Some(idx) = cur_user_task {
                                     let props = &mut acc.nodes[idx].user_task;
-                                    props.form_id = attr(attrs, "formId").map(str::to_string);
                                     props.external_form_reference =
                                         attr(attrs, "externalReference").map(str::to_string);
+                                    props.form_id = if props.external_form_reference.is_some() {
+                                        None
+                                    } else {
+                                        attr(attrs, "formId").map(str::to_string)
+                                    };
                                 }
                             }
                             "adHoc" => {
@@ -2829,6 +2835,44 @@ mod tests {
         assert_eq!(external.form_id, None);
         assert_eq!(
             external.external_form_reference.as_deref(),
+            Some("https://forms.example/x")
+        );
+    }
+
+    #[test]
+    fn should_let_external_reference_win_when_form_definition_declares_both() {
+        // given: a (malformed but tolerated) zeebe:formDefinition that declares
+        // BOTH formId and externalReference. Zeebe treats these as mutually
+        // exclusive, so the parser must keep them so downstream — an external
+        // reference wins and suppresses the form id, ensuring a task never
+        // surfaces both a numeric formKey and an externalFormReference.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="both">
+                <bpmn:extensionElements>
+                  <zeebe:formDefinition formId="feature-escalation"
+                                        externalReference="https://forms.example/x" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="both" />
+              <bpmn:sequenceFlow id="b" sourceRef="both" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then: the external reference wins; the form id is suppressed.
+        let ElementKind::UserTask(both) = &def.element("both").unwrap().kind else {
+            panic!("expected a user task");
+        };
+        assert_eq!(both.form_id, None);
+        assert_eq!(
+            both.external_form_reference.as_deref(),
             Some("https://forms.example/x")
         );
     }

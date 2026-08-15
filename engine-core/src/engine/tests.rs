@@ -9077,6 +9077,59 @@ fn user_task_resolves_form_id_to_the_latest_form_key_and_carries_external_refere
 }
 
 #[test]
+fn user_task_with_external_reference_never_resolves_a_form_key_even_if_form_id_is_set() {
+    use crate::command::FormResource;
+    use crate::model::UserTaskProps;
+
+    // A deployed form whose id would otherwise resolve, so this test proves the
+    // suppression is deliberate (the form is present but must NOT be bound).
+    let mut engine = Engine::new();
+    engine
+        .apply_command(Command::DeployForms(vec![FormResource {
+            id: "feature-escalation".to_string(),
+            resource_name: "feature-escalation.form".to_string(),
+            schema: r#"{"id":"feature-escalation","type":"default","components":[]}"#.to_string(),
+        }]))
+        .unwrap();
+
+    // A user task built programmatically with BOTH form_id and
+    // external_form_reference set. Zeebe treats them as mutually exclusive, so
+    // the engine must let the external reference win and resolve no form_key —
+    // guarding the invariant independently of the BPMN parser.
+    let def = ProcessBuilder::new("feature")
+        .start_event("start")
+        .user_task_with(
+            "both",
+            UserTaskProps {
+                form_id: Some("feature-escalation".to_string()),
+                external_form_reference: Some("https://forms.example/x".to_string()),
+                ..Default::default()
+            },
+        )
+        .end_event("end")
+        .connect("start", "both")
+        .connect("both", "end")
+        .build()
+        .unwrap();
+    engine.apply_command(Command::DeployProcess(def)).unwrap();
+    engine
+        .apply_command(Command::create_instance("feature"))
+        .unwrap();
+
+    let task = engine
+        .state()
+        .user_tasks
+        .values()
+        .find(|t| t.element_id == "both")
+        .expect("the task exists");
+    assert_eq!(task.form_key, None, "external reference suppresses form_key");
+    assert_eq!(
+        task.external_form_reference.as_deref(),
+        Some("https://forms.example/x")
+    );
+}
+
+#[test]
 fn deploy_generic_resources_mints_a_resource_key_versions_per_id_and_is_idempotent() {
     use crate::command::GenericResource;
     let mut engine = Engine::new();
