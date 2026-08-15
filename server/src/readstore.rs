@@ -1705,9 +1705,8 @@ impl ReadStore {
         let mut stmt = conn
             .prepare(
                 "SELECT key, process_id, version, name, \
-                 (version = (SELECT MAX(version) FROM process_definitions \
-                             WHERE process_id = pd.process_id)) AS is_latest \
-                 FROM process_definitions pd",
+                 (version = MAX(version) OVER (PARTITION BY process_id)) AS is_latest \
+                 FROM process_definitions",
             )
             .expect("prepare process_definitions");
         let rows = stmt
@@ -1746,7 +1745,8 @@ impl ReadStore {
                 is_latest: r.get::<_, i64>(4)? != 0,
             })
         })
-        .ok()
+        .optional()
+        .expect("query process_definition_by_key")
     }
 
     pub fn decision_requirements(&self) -> Vec<DecisionRequirementsRow> {

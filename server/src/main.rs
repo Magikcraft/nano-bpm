@@ -9909,10 +9909,10 @@ impl ServerImpl {
         }
     }
 
-    /// Searches deployed process definitions. The engine keeps only the latest
-    /// version of each process id (in `state.processes`), so every entry is the
-    /// latest version; older versions are not retained and therefore not
-    /// searchable.
+    /// Searches deployed process definitions. Every deployed version of each
+    /// process id is retained and searchable (Camunda/Zeebe parity); the
+    /// `isLatestVersion` filter narrows to the highest version per id via the
+    /// `is_latest` discriminator computed by the read store.
     async fn search_process_definitions_impl(
         &self,
         body: &Option<models::ProcessDefinitionSearchQuery>,
