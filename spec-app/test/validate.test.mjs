@@ -37,7 +37,7 @@ test("schema errors fail closed with a JSON pointer, before cross-ref runs", () 
   assert.ok(result.diagnostics.some((d) => d.pointer === "/id"));
 });
 
-test("network.bind accepts the loopback/all enum (issue #235)", async () => {
+test("network.bind accepts the loopback/all enum (nanobpm/nano-ide#235)", async () => {
   const index = await buildSymbolIndex(models);
   for (const bind of ["loopback", "all"]) {
     const m = manifest();

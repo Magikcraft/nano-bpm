@@ -481,7 +481,7 @@ export interface LlmBinding {
   tools?: string[];
 }
 /**
- * App-level network settings (issue #235). Absent ⇒ loopback.
+ * App-level network settings (nanobpm/nano-ide#235). The loopback default applies when this block is absent, when it is `{}`, or when `bind` is omitted.
  */
 export interface Network {
   /**

@@ -614,10 +614,11 @@
     "network": {
       "type": "object",
       "additionalProperties": false,
-      "description": "App-level network settings (issue #235). Absent ⇒ loopback.",
+      "description": "App-level network settings (nanobpm/nano-ide#235). The loopback default applies when this block is absent, when it is `{}`, or when `bind` is omitted.",
       "properties": {
         "bind": {
           "$ref": "#/$defs/bindMode",
+          "default": "loopback",
           "description": "Which interface the app's embedded HTTP server binds to. Default \"loopback\" (127.0.0.1 — secure by default, refuses off-box connections); \"all\" (0.0.0.0) exposes it on the LAN for a distributed worker fleet. The URBAN_BIND env var overrides this at runtime."
         }
       }
