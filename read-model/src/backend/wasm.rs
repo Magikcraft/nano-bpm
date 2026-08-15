@@ -35,11 +35,21 @@ use sqlite_wasm_rs as _;
 ///
 /// `sqlite-wasm-rs` registers its `MemoryVFS` as the default VFS, so a plain
 /// `:memory:` connection is entirely RAM-backed — exactly right for the ephemeral
-/// in-browser test engine (no OPFS/persistence). `path` is ignored: the wasm read
-/// model has no on-disk file and is always opened with `None` by
-/// [`crate::store::ReadStore::open`]; the parameter exists only to keep the seam
-/// identical to [`super::native::open_connection`], which then applies the shared
-/// [`crate::store::SCHEMA`].
-pub(crate) fn open_connection(_path: Option<&Path>) -> rusqlite::Result<Connection> {
+/// in-browser test engine (no OPFS/persistence). The wasm read model has no
+/// on-disk file and is always opened with `None` by
+/// [`crate::store::ReadStore::open`]; the `path` parameter exists only to keep the
+/// seam identical to [`super::native::open_connection`], which then applies the
+/// shared [`crate::store::SCHEMA`].
+///
+/// A `Some(path)` is rejected rather than silently ignored: on wasm it can only be
+/// a caller bug (there is no file system to back it). Accepting it would open an
+/// in-memory DB while [`crate::store::ReadStore::open`] recorded `self.path =
+/// Some(..)`, so the persistent-store paths (`check_writable`, WAL checkpointing,
+/// on-disk metadata probes) would run against a file that does not exist —
+/// misleading and apt to hide the bug. Failing fast keeps the seam honest.
+pub(crate) fn open_connection(path: Option<&Path>) -> rusqlite::Result<Connection> {
+    if let Some(path) = path {
+        return Err(rusqlite::Error::InvalidPath(path.to_path_buf()));
+    }
     Connection::open_in_memory()
 }
