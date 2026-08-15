@@ -66,6 +66,7 @@ jobs:
     outputs:
       processos: ${{ steps.filter.outputs.processos }}
       console: ${{ steps.filter.outputs.console }}
+      specapp: ${{ steps.filter.outputs.specapp }}
       docs: ${{ steps.filter.outputs.docs }}
       dapadapter: ${{ steps.filter.outputs.dapadapter }}
       code: ${{ steps.filter.outputs.code }}
@@ -93,6 +94,20 @@ jobs:
             console:
               - 'console/**'
               - 'spec-console/**'
+              # The console SPA imports spec-app's committed `dist/` (the Urban
+              # App manifest types), so a spec-app change can alter the console
+              # typecheck surface — re-run the console job to validate against it.
+              - 'spec-app/**'
+              - '.github/workflows/ci.yml'
+            # The Urban App manifest schema/types package (@nanobpm/nano-app-schema).
+            # Owns its own job (`spec-app`) and is deliberately excluded from the
+            # `code` filter below: no Rust crate compiles against it (no Cargo dep,
+            # no include_str! of the schema, no build.rs codegen), so the heavy
+            # Rust/engine suite need not re-run on a spec-app-only change. The
+            # `console` filter above still picks it up because the SPA imports its
+            # built `dist/`.
+            specapp:
+              - 'spec-app/**'
               - '.github/workflows/ci.yml'
             # Documentation prose consumed only by the console docs/whitepaper
             # build (scripts/build-docs.mjs reads USERGUIDE.md + docs/*.md;
@@ -115,18 +130,22 @@ jobs:
             # any test), the console SPA (`console/**`; its built bundle is
             # rust-embedded but CI stubs `console/dist`, so the SPA source never
             # affects the Rust build/tests — the `console`/`console-e2e` jobs own
-            # it), or documentation markdown (`docs/**/*.md` + `USERGUIDE.md`;
-            # owned by the `docs` filter). The heavy Rust/engine/npm jobs gate on
-            # this so a website-, SPA-, or docs-only PR skips them (a skipped
-            # required check counts as success for branch protection) and still
-            # merges. `spec-console/**` is intentionally NOT excluded: an API
-            # spec change alters the generated Rust axum traits, so the server
-            # build must re-validate that `generated_api.rs` still satisfies them.
+            # it), the Urban App manifest schema package (`spec-app/**`; no Rust
+            # crate compiles against it — owned by the `spec-app` job, and picked
+            # up by `console` for the SPA typecheck), or documentation markdown
+            # (`docs/**/*.md` + `USERGUIDE.md`; owned by the `docs` filter). The
+            # heavy Rust/engine/npm jobs gate on this so a website-, SPA-,
+            # spec-app-, or docs-only PR skips them (a skipped required check
+            # counts as success for branch protection) and still merges.
+            # `spec-console/**` is intentionally NOT excluded: an API spec change
+            # alters the generated Rust axum traits, so the server build must
+            # re-validate that `generated_api.rs` still satisfies them.
             code:
               - '**'
               - '!website/**'
               - '!server/src/console/landing.html'
               - '!console/**'
+              - '!spec-app/**'
               - '!docs/**/*.md'
               - '!USERGUIDE.md'
       - name: Guard landing.html removal while still referenced by include_str!
@@ -298,7 +317,11 @@ jobs:
     name: spec-app (Urban App manifest)
     runs-on: ubuntu-24.04
     needs: changes
-    if: *code_gate
+    # Gated on its own `specapp` filter, not `*code_gate`: no Rust crate compiles
+    # against this package, so a spec-app-only change runs this job (which owns
+    # its validation) without the heavy Rust suite, and a Rust-only change no
+    # longer spins up this Node lane.
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.specapp == 'true' }}
     defaults:
       run:
         working-directory: spec-app
