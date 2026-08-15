@@ -239,9 +239,17 @@ pub(crate) async fn urban_supports_data(urban: &Path) -> bool {
 /// before the entry lands (a bounded, benign duplication — help output is
 /// deterministic, so every racer computes the same text and the last insert
 /// wins). Every call after the cache is warm reuses the stored text without
-/// spawning. Memoisation is safe because a binary's help output is stable for the
-/// process lifetime (a pack upgrade installs a new path, or the server restarts).
-/// `None` means the binary could not be run.
+/// spawning. The entry is keyed on the binary path and lives for the process
+/// lifetime; we deliberately do **not** stat/mtime-invalidate it, to keep the hot
+/// capability-gate path a single lock-guarded map read. If a binary is replaced
+/// *in place* at the same path (an `npm install` bumping a project-local
+/// `node_modules/.bin/urban`, a pack reinstall) the cached capability set can go
+/// stale until the server restarts — but that staleness is **benign and
+/// non-regressing**: a stale *miss* only routes to the still-working embedded
+/// fallback (never to a broken `urban <op>`), so the worst case is a newly-gained
+/// capability going unused until the next restart, not an outage. A long-lived
+/// server outliving an in-place toolkit upgrade is the rare case, and the price is
+/// a restart. `None` means the binary could not be run.
 async fn urban_help_text(urban: &Path) -> Option<String> {
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, Option<String>>>> =
