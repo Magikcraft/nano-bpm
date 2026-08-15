@@ -2765,13 +2765,22 @@ fn project_engine_state(
     state: &nanobpmn_engine_core::State,
     now_ms: u64,
 ) -> rusqlite::Result<()> {
-    // 1) Process definitions + their element metadata. `state.processes` holds
-    //    only the latest deployed version per id (the engine retains no older
-    //    definitions), so older-version rows the event log once projected are not
-    //    reconstructable — an in-flight instance on a superseded version resolves
-    //    to the latest, exactly as the event projector's "latest so far" lookup
-    //    would if only the latest definition were on record.
-    for deployed in state.processes.values() {
+    // 1) Process definitions + their element metadata. `state.process_versions`
+    //    retains EVERY deployed version keyed by process-definition key, while
+    //    `state.processes` is only the latest-by-id index over it. Project the
+    //    full version-retention map so superseded definitions survive a
+    //    compaction-floor recovery — matching the read model's "every version is
+    //    searchable / get-by-key resolves superseded versions" semantics. A
+    //    pre-retention snapshot deserializes `process_versions` empty
+    //    (`serde(default)`); fall back to the latest-by-id index there, where the
+    //    latest version per id is the only version that was ever preserved.
+    let deployed_defs: Vec<&nanobpmn_engine_core::DeployedProcess> =
+        if state.process_versions.is_empty() {
+            state.processes.values().collect()
+        } else {
+            state.process_versions.values().collect()
+        };
+    for deployed in deployed_defs {
         let def = &deployed.definition;
         tx.cexecute(
             "INSERT INTO process_definitions (process_id, key, version, name, xml) VALUES (?1, ?2, ?3, ?4, ?5) \
@@ -3105,9 +3114,10 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // later redeploy has superseded but whose instances are still around
             // (a redeploy no longer overwrites the prior version's XML, which
             // previously blanked the Explorer diagram of every older-version
-            // instance). Search stays scoped to the latest version per id (see
-            // `process_definitions`). `ON CONFLICT(key)` refreshes idempotently on
-            // replay/re-delivery of the same ProcessDeployed event.
+            // instance). Every version is retained and searchable — `process_definitions`
+            // returns all of them and the search endpoint exposes them (with the
+            // `version`/`isLatestVersion` discriminators). `ON CONFLICT(key)` refreshes
+            // idempotently on replay/re-delivery of the same ProcessDeployed event.
             tx.cexecute(
                 "INSERT INTO process_definitions (process_id, key, version, name, xml) VALUES (?1, ?2, ?3, ?4, ?5) \
                  ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, name = excluded.name, xml = excluded.xml",
@@ -4561,6 +4571,105 @@ mod definition_xml_tests {
         assert_eq!(v1_row.version, 1);
         assert!(!v1_row.is_latest);
         assert!(store.process_definition_by_key(999).is_none());
+    }
+
+    #[test]
+    fn seed_from_engine_state_projects_every_retained_version() {
+        use nanobpmn_engine_core::{DeployedProcess, State};
+
+        // A below-compaction-floor recovery rebuilds the read model from the live
+        // engine snapshot. `State::process_versions` retains EVERY deployed
+        // version; the projection must surface all of them (not just the
+        // latest-by-id index in `state.processes`), or a superseded definition
+        // would silently vanish from search / get-by-key after recovery.
+        let mk = |key: u64, version: i32, xml: &str| {
+            let mut def: ProcessDefinition = ProcessBuilder::new("p")
+                .start_event("s")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .unwrap();
+            def.xml = xml.to_string();
+            DeployedProcess {
+                key,
+                version,
+                definition: def,
+            }
+        };
+
+        let mut state = State::default();
+        let v1 = mk(6, 1, "<xml>v1</xml>");
+        let v2 = mk(297, 2, "<xml>v2</xml>");
+        state.process_versions.insert(6, v1.clone());
+        state.process_versions.insert(297, v2.clone());
+        // `processes` is the latest-by-id index — v2 only. If the projection read
+        // this instead of `process_versions`, v1 would be dropped.
+        state.processes.insert("p".to_string(), v2.clone());
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+
+        let mut defs = store.process_definitions();
+        defs.sort_by_key(|d| d.version);
+        assert_eq!(defs.len(), 2, "both retained versions must be projected");
+        assert_eq!(
+            (defs[0].version, defs[0].key, defs[0].is_latest),
+            (1, 6, false)
+        );
+        assert_eq!(
+            (defs[1].version, defs[1].key, defs[1].is_latest),
+            (2, 297, true)
+        );
+        // The superseded version resolves by key after recovery.
+        assert_eq!(
+            store.process_definition_xml(6).as_deref(),
+            Some("<xml>v1</xml>")
+        );
+        assert_eq!(
+            store.process_definition_by_key(6).map(|d| d.version),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn seed_from_engine_state_falls_back_to_latest_index_for_legacy_snapshots() {
+        use nanobpmn_engine_core::{DeployedProcess, State};
+
+        // A pre-retention snapshot deserializes `process_versions` empty
+        // (`serde(default)`); the projection must fall back to the latest-by-id
+        // index so the latest definition still recovers.
+        let mut def: ProcessDefinition = ProcessBuilder::new("p")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .unwrap();
+        def.xml = "<xml>latest</xml>".to_string();
+
+        let mut state = State::default();
+        state.processes.insert(
+            "p".to_string(),
+            DeployedProcess {
+                key: 42,
+                version: 3,
+                definition: def,
+            },
+        );
+        assert!(state.process_versions.is_empty());
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+
+        let defs = store.process_definitions();
+        assert_eq!(defs.len(), 1);
+        assert_eq!(
+            (defs[0].version, defs[0].key, defs[0].is_latest),
+            (3, 42, true)
+        );
+        assert_eq!(
+            store.process_definition_xml(42).as_deref(),
+            Some("<xml>latest</xml>")
+        );
     }
 
     #[test]
