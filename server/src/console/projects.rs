@@ -3386,7 +3386,8 @@ async fn pipe_data_gateway(
     let mut child = cmd
         .spawn()
         .map_err(|e| DataError::Gateway(format!("spawn data gateway: {e}")))?;
-    let body = serde_json::to_vec(request).unwrap_or_default();
+    let body = serde_json::to_vec(request)
+        .map_err(|e| DataError::Gateway(format!("serialize request: {e}")))?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
             .write_all(&body)
@@ -3527,7 +3528,12 @@ pub async fn run_data_op(
     };
     match data_gateway_path(is_urban, urban.is_some()) {
         DataGatewayPath::UrbanData => {
-            let urban = urban.expect("UrbanData path implies a resolved urban binary");
+            let urban = urban.ok_or_else(|| {
+                DataError::Gateway(
+                    "internal routing error: UrbanData path without a resolved urban binary"
+                        .to_string(),
+                )
+            })?;
             let mut cmd = Command::new(&urban);
             // `urban data` reads the JSON request on stdin (root "." + manifest
             // "nano.app.json" default), anchored at the project dir as CWD.
