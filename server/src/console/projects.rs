@@ -3335,20 +3335,137 @@ async fn gen_with_urban(name: &str, urban: &Path, no_models: bool) -> Result<(),
     Ok(())
 }
 
-/// Run one datasource operation for `project` by invoking the materialised
-/// `nano-generated/data-cli.ts` under Deno (or the Node >= 22.6 fallback, ADR 0036/
-/// 0037; ADR 0024 §4). The panel's every read/write
-/// goes through this one seam so it targets whatever the named datasource
-/// resolves to — SQLite today, a server driver once a `nano-ide-data-*` pack is
-/// installed — never a parallel SQLite-only path. `request` is the CLI's JSON
-/// protocol object (`{ op, source?, sql?, params? }`); the resolved result
-/// object is returned on success.
+/// Which gateway a datasource op is routed to, decided purely from the project
+/// shape and toolkit availability so the routing invariant is unit-testable in
+/// isolation (mirrors [`super::RegenPath`] for `urban gen`).
+#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+enum DataGatewayPath {
+    /// Urban-shaped app with a resolvable, `data`-capable toolkit: the shared
+    /// `urban data` op gateway — the ADR-0053 target seam. Serves the
+    /// datasource's full read *and* write ops (the panel's every read/write);
+    /// only persisting derivation is withheld (that stays with `urban gen`).
+    UrbanData,
+    /// The console's embedded `data-cli.ts`, materialised and spawned locally.
+    /// Taken by legacy-shaped apps (no `nano.app.json`) and — *transitionally*
+    /// (#522 slice b) — by an Urban app whose toolkit doesn't yet resolve *or is
+    /// too old to carry the `data` op*, so the Data panel keeps working before the
+    /// marketplace pack ships a `urban` carrying `data`. Slice c retires this
+    /// fallback (and deletes the vendored `data-cli.ts`) once the pack guarantees
+    /// the toolkit.
+    Embedded,
+}
+
+/// The #522 dry-out routing rule for datasource ops, factored out as a pure
+/// function so the invariant is unit-testable in isolation (mirrors
+/// [`super::RegenPath`] for `urban gen`): an Urban-shaped app runs through the
+/// shared `urban data` gateway **when a `data`-capable toolkit resolves**, and
+/// otherwise falls back to the embedded `data-cli.ts` during the transition; a
+/// legacy app always keeps the embedded gateway. `urban_data_available` folds
+/// both "an `urban` resolves" and "it carries the `data` op" (probed at the call
+/// site via [`super::urban::urban_supports_data`]).
+fn data_gateway_path(is_urban: bool, urban_data_available: bool) -> DataGatewayPath {
+    match (is_urban, urban_data_available) {
+        (true, true) => DataGatewayPath::UrbanData,
+        _ => DataGatewayPath::Embedded,
+    }
+}
+
+/// Drive one datasource op through an already-configured gateway subprocess: pipe
+/// the JSON `request` on stdin, await the child, and parse its `{ ok, … }` reply.
+/// Shared by both the `urban data` and the embedded `data-cli.ts` paths so the
+/// stdin/stdout protocol has a single implementation (no drift between seams).
+/// The caller sets the command + CWD + any runtime-specific env; this adds the
+/// common subprocess hygiene (`NO_COLOR`, piped stdio, `kill_on_drop`).
+async fn pipe_data_gateway(
+    mut cmd: Command,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, DataError> {
+    use tokio::io::AsyncWriteExt;
+
+    cmd.env("NO_COLOR", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| DataError::Gateway(format!("spawn data gateway: {e}")))?;
+    let body = serde_json::to_vec(request)
+        .map_err(|e| DataError::Gateway(format!("serialize request: {e}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        // A gateway that fails fast can exit before (or while) reading its
+        // request, closing the read end of the pipe. The write then fails with
+        // `BrokenPipe` (EPIPE) — that is not the real error, it is a symptom of
+        // the child having already exited. Swallow it and fall through to
+        // `wait_with_output` so the child's actual stdout/stderr and exit status
+        // surface the true cause instead of being masked by "write request:
+        // Broken pipe".
+        match stdin.write_all(&body).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(DataError::Gateway(format!("write request: {e}"))),
+        }
+        // Drop stdin (via scope) so the gateway's stdin reader sees EOF.
+    }
+    let out = child
+        .wait_with_output()
+        .await
+        .map_err(|e| DataError::Gateway(format!("await data gateway: {e}")))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = stderr.trim();
+        // Some gateways emit their failure detail to stdout, not stderr; fall
+        // back to (or append) stdout so the real cause isn't hidden.
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stdout = stdout.trim();
+        let detail = match (stderr.is_empty(), stdout.is_empty()) {
+            (false, false) => format!("{stderr}; stdout: {stdout}"),
+            (false, true) => stderr.to_string(),
+            (true, false) => stdout.to_string(),
+            (true, true) => String::new(),
+        };
+        let base = format!("data gateway exited {}", out.status);
+        return Err(DataError::Gateway(if detail.is_empty() {
+            base
+        } else {
+            format!("{base}: {detail}")
+        }));
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut val: serde_json::Value = serde_json::from_str(text.trim())
+        .map_err(|e| DataError::Gateway(format!("bad gateway output: {e}: {}", text.trim())))?;
+    let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !ok {
+        let msg = val
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("datasource operation failed")
+            .to_string();
+        return Err(DataError::Op(msg));
+    }
+    if let Some(obj) = val.as_object_mut() {
+        obj.remove("ok");
+    }
+    Ok(val)
+}
+
+/// Run one datasource operation for `project`. The seam depends on the project
+/// shape (#522 dry-out slice b, ADR 0052/0053): an **Urban-shaped app**
+/// (`nano.app.json`) routes every op to the shared `urban data`
+/// gateway — the host never materialises or spawns the vendored
+/// `nano-generated/data-cli.ts` for it, and persisting derivation stays with
+/// `urban gen` (the one deriver). A **legacy** project keeps the embedded
+/// `data-cli.ts` under Deno (or the Node >= 22.6 fallback, ADR 0036/0037; ADR
+/// 0024 §4). Either way the panel's every read/write goes through this one seam
+/// so it targets whatever the named datasource resolves to — never a parallel
+/// SQLite-only path. `request` is the gateway's JSON protocol object
+/// (`{ op, source?, sql?, params? }`); the resolved result object is returned on
+/// success.
 pub async fn run_data_op(
     project: &str,
     request: serde_json::Value,
 ) -> Result<serde_json::Value, DataError> {
-    use tokio::io::AsyncWriteExt;
-
     let mut request = request;
     let dir = project_dir(project).ok_or(DataError::NoProject)?;
     if !dir.is_dir() {
@@ -3412,6 +3529,58 @@ pub async fn run_data_op(
             }
         }
     }
+    // Canonicalize once so both gateways resolve the manifest/DB against the same
+    // real directory (e.g. macOS /tmp -> /private/tmp), matching `gen_with_urban`
+    // and the embedded CLI's --allow-read/-write scope.
+    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
+
+    // #522 dry-out slice (b): an Urban-shaped app's data seam is the shared
+    // toolkit's `urban data` op gateway — not the console's embedded, vendored
+    // `data-cli.ts`. When the app's own `@nanobpm/urban` (project-local, pack, or
+    // PATH — #776 `find_urban_for`) resolves *and* carries the `data` op, every op
+    // runs through it. Persisting derivation is deliberately NOT done here: it
+    // stays with `urban gen` (the one deriver, ADR 0053) via
+    // `regenerate_domain_types`, so this path carries the datasource's own read
+    // *and* write DB ops + the `write:false` composer preview, but never
+    // re-derives/persists types. During the transition — before the marketplace
+    // pack ships a `urban` carrying the `data` op — an Urban app whose toolkit
+    // doesn't yet resolve (or is too old for `data`) keeps working via the
+    // embedded fallback; slice c retires that fallback (and deletes `data-cli.ts`)
+    // once the pack guarantees the toolkit.
+    let is_urban = dir.join("nano.app.json").is_file();
+    let urban = if is_urban {
+        super::urban::find_urban_for(&dir)
+    } else {
+        None
+    };
+    // Gate the `urban data` route on the toolkit actually carrying the `data` op
+    // (not merely resolving): an older `urban` found via PATH/project-local
+    // install that predates the gateway must fall back to the embedded
+    // `data-cli.ts` rather than fail — additive + non-regressing, mirroring the
+    // `urban_supports_derive` gate for `gen`/`derive`.
+    let urban = match urban {
+        Some(u) if super::urban::urban_supports_data(&u).await => Some(u),
+        _ => None,
+    };
+    match data_gateway_path(is_urban, urban.is_some()) {
+        DataGatewayPath::UrbanData => {
+            let urban = urban.ok_or_else(|| {
+                DataError::Gateway(
+                    "internal routing error: UrbanData path without a resolved urban binary"
+                        .to_string(),
+                )
+            })?;
+            let mut cmd = Command::new(&urban);
+            // `urban data` reads the JSON request on stdin (root "." + manifest
+            // "nano.app.json" default), anchored at the project dir as CWD.
+            cmd.current_dir(&dir).arg("data");
+            return pipe_data_gateway(cmd, &request).await;
+        }
+        DataGatewayPath::Embedded => {}
+    }
+
+    // Embedded `data-cli.ts` (legacy-shaped project, or transitional Urban
+    // fallback while the pack's toolkit is unresolved).
     // The gateway runs the data CLI Node-first: Node (>= 22.6) is always present
     // (the npm launcher is Node), so it is the primary path; Deno is an equal
     // alternative. Both the CLI and the `@nanobpm/data` SDK carry the runtime
@@ -3429,15 +3598,11 @@ pub async fn run_data_op(
     };
     ensure_project_sdk(project).map_err(|e| DataError::Gateway(format!("materialise SDK: {e}")))?;
 
-    // Canonicalize so the --allow-read/-write scope matches the path Deno
-    // resolves (e.g. macOS /tmp -> /private/tmp); otherwise findManifest can't
-    // read nano.app.json and every op fails with "manifest not found".
-    let dir = dunce::canonicalize(&dir).unwrap_or(dir);
     let cache = dir.join(".deno-cache");
     let _ = std::fs::create_dir_all(&cache);
     let cli = dir.join(GEN_DIR).join("data-cli.ts");
 
-    let mut cmd = match &runtime {
+    let cmd = match &runtime {
         CliRuntime::Deno(deno) => {
             let mut c = Command::new(deno);
             c.current_dir(&dir)
@@ -3462,51 +3627,7 @@ pub async fn run_data_op(
             c
         }
     };
-    cmd.env("NO_COLOR", "1")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| DataError::Gateway(format!("spawn data gateway: {e}")))?;
-    let body = serde_json::to_vec(&request).unwrap_or_default();
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&body)
-            .await
-            .map_err(|e| DataError::Gateway(format!("write request: {e}")))?;
-        // Drop stdin (via scope) so the CLI's stdin reader sees EOF.
-    }
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| DataError::Gateway(format!("await deno: {e}")))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(DataError::Gateway(format!(
-            "deno exited {}: {}",
-            out.status,
-            err.trim()
-        )));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut val: serde_json::Value = serde_json::from_str(text.trim())
-        .map_err(|e| DataError::Gateway(format!("bad gateway output: {e}: {}", text.trim())))?;
-    let ok = val.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-    if !ok {
-        let msg = val
-            .get("error")
-            .and_then(|v| v.as_str())
-            .unwrap_or("datasource operation failed")
-            .to_string();
-        return Err(DataError::Op(msg));
-    }
-    if let Some(obj) = val.as_object_mut() {
-        obj.remove("ok");
-    }
-    Ok(val)
+    pipe_data_gateway(cmd, &request).await
 }
 
 /// Case-insensitive project-name collision guard, the server-side half of the
@@ -7542,8 +7663,10 @@ mod tests {
     fn synthesize_import_map_defaults_sdk_when_project_omits_it() {
         // A project with no deno.json imports still gets both defaults so the
         // derivation driver's own `@nanobpm/workflow` + `bpmn-auto-layout` imports
-        // resolve.
-        let dir = temp_root();
+        // resolve. Uses `scratch_dir` (not `temp_root`) so it doesn't mutate the
+        // process-global `NANOBPMN_PROJECTS_DIR` without holding `lock()` — that
+        // would race the env-serialized tests under in-process `cargo test`.
+        let dir = scratch_dir("import-map-defaults");
         let map: serde_json::Value =
             serde_json::from_str(&synthesize_generate_import_map(&dir)).unwrap();
         let imports = map.get("imports").and_then(|v| v.as_object()).unwrap();
@@ -10823,6 +10946,190 @@ mod tests {
             err.contains("not an Urban-shaped app"),
             "unexpected error: {err}"
         );
+    }
+
+    // #522 slice (b): the `run_data_op` seam-routing invariant, exercised on the
+    // pure decision function so it needs no filesystem/toolkit. Mirrors the
+    // `regen_path` tests for `urban gen`.
+    #[test]
+    fn data_gateway_urban_app_prefers_urban_when_resolvable() {
+        // An Urban-shaped app runs through `urban data` when the toolkit resolves;
+        // otherwise it transitionally falls back to the embedded `data-cli.ts` so
+        // the Data panel keeps working until the pack ships a `urban` with `data`
+        // (slice c then removes the fallback).
+        assert_eq!(
+            data_gateway_path(true, true),
+            DataGatewayPath::UrbanData,
+            "urban app + toolkit → urban data"
+        );
+        assert_eq!(
+            data_gateway_path(true, false),
+            DataGatewayPath::Embedded,
+            "urban app + no toolkit → transitional embedded fallback"
+        );
+    }
+
+    #[test]
+    fn data_gateway_legacy_app_always_uses_embedded() {
+        // A legacy-shaped project keeps the embedded gateway regardless of whether
+        // an urban binary happens to be resolvable on the host.
+        assert_eq!(data_gateway_path(false, false), DataGatewayPath::Embedded);
+        assert_eq!(data_gateway_path(false, true), DataGatewayPath::Embedded);
+    }
+
+    /// #522 slice (b) end-to-end: an Urban-shaped app whose toolkit resolves *and*
+    /// carries the `data` op runs its data ops through `urban data` (spawned in the
+    /// project dir) — the host never materialises or spawns the vendored
+    /// `data-cli.ts`. A stub `urban` (via `NANOBPMN_URBAN_BIN`) advertises `urban
+    /// data` in `--help` (so the capability probe passes), drains stdin and replies
+    /// `{ok:true,…}`, standing in for the pack's toolkit so this needs no real
+    /// `@nanobpm/urban`.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn run_data_op_routes_urban_app_to_urban_data() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "urban-data-app";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"urban-data-app"}"#,
+        )
+        .unwrap();
+
+        // The stub advertises the `urban data` op in `--help` (so the capability
+        // probe routes here), records its subcommand (`data`) + CWD, drains the
+        // request on stdin, and emits the gateway's `{ok:true,…}` reply.
+        let stub = root.join("urban-data-stub.sh");
+        write_urban_stub(
+            &stub,
+            "case \"$*\" in *--help*) printf 'urban data — datasource op gateway\\n'; exit 0;; esac\ncat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"urban-data\"}\\n'\n",
+        );
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+
+        let res = run_data_op(name, serde_json::json!({ "op": "schema" })).await;
+
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+
+        let val = res.expect("urban data routing should succeed");
+        assert_eq!(
+            val.get("routed").and_then(|v| v.as_str()),
+            Some("urban-data"),
+            "op was not served by the urban data stub: {val:?}"
+        );
+        // The stub was invoked as `urban data` in the project dir…
+        let sentinel = std::fs::read_to_string(dir.join("urban-ran.txt")).unwrap();
+        assert_eq!(
+            sentinel.lines().next(),
+            Some("data"),
+            "urban not invoked with `data`: {sentinel:?}"
+        );
+        // …and the embedded `data-cli.ts` was never materialised for the Urban app.
+        assert!(
+            !dir.join(GEN_DIR).join("data-cli.ts").exists(),
+            "embedded data-cli.ts must not be materialised for an Urban app"
+        );
+    }
+
+    /// #522 slice (b): an Urban-shaped app whose resolved `urban` *predates* the
+    /// `data` op (its `--help` advertises only `gen`/`run`) must fall back to the
+    /// embedded gateway rather than be routed to a `urban data` it can't serve —
+    /// additive + non-regressing, mirroring the `urban_supports_derive` gate. The
+    /// capability probe is what makes this fallback happen, so the stub is never
+    /// spawned as `data` in the project dir.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // serialises on the shared PROJECTS_DIR env
+    async fn run_data_op_falls_back_to_embedded_when_urban_lacks_data_op() {
+        let _g = lock();
+        let root = temp_root();
+        let name = "urban-old-toolkit-app";
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nano.app.json"),
+            r#"{"schemaVersion":1,"id":"urban-old-toolkit-app"}"#,
+        )
+        .unwrap();
+
+        // A pre-`data` toolkit: `--help` lists only `gen`/`run`. Were it ever
+        // (wrongly) routed to as `urban data`, it would write the `data` sentinel
+        // in the project dir + reply with the urban marker — both asserted absent.
+        let stub = root.join("urban-old-stub.sh");
+        write_urban_stub(
+            &stub,
+            "case \"$*\" in *--help*) printf 'urban gen [--check]\\nurban run\\n'; exit 0;; esac\ncat >/dev/null\nprintf '{\"ok\":true,\"routed\":\"urban-data\"}\\n'\n",
+        );
+        unsafe { std::env::set_var("NANOBPMN_URBAN_BIN", &stub) };
+
+        let res = run_data_op(name, serde_json::json!({ "op": "schema" })).await;
+
+        unsafe { std::env::remove_var("NANOBPMN_URBAN_BIN") };
+
+        // The capability probe saw no `urban data` in `--help`, so routing fell
+        // back to the embedded gateway: the stub was never spawned as `data` in
+        // the project dir (a `data` invocation sets `current_dir(&dir)` and would
+        // have written the sentinel there — the `--help` probe writes elsewhere).
+        assert!(
+            !dir.join("urban-ran.txt").exists(),
+            "urban stub must not be invoked as `data` when it lacks the data op"
+        );
+        // The response is therefore never the urban stub's marker reply (whether
+        // the embedded path then succeeds or errors depends on the host runtime,
+        // which is irrelevant to the routing decision under test).
+        if let Ok(val) = &res {
+            assert_ne!(
+                val.get("routed").and_then(|v| v.as_str()),
+                Some("urban-data"),
+                "op must not be served by the urban stub when it lacks the data op"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_data_gateway_surfaces_stdout_when_stderr_is_empty() {
+        // A gateway that fails but writes its failure detail to stdout (not
+        // stderr) must not have that detail hidden: the error should carry the
+        // stdout text so the real cause is debuggable.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("printf 'boom-on-stdout'; exit 7");
+        let err = pipe_data_gateway(cmd, &serde_json::json!({ "op": "schema" }))
+            .await
+            .expect_err("non-zero exit must be an error");
+        match err {
+            DataError::Gateway(msg) => {
+                assert!(
+                    msg.contains("boom-on-stdout"),
+                    "stdout detail must surface in the error, got: {msg}"
+                );
+            }
+            other => panic!("expected DataError::Gateway, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_data_gateway_includes_both_streams_when_stderr_is_present() {
+        // When both streams carry text, stderr leads and stdout is appended so
+        // neither is lost.
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c")
+            .arg("printf 'err-detail' 1>&2; printf 'out-detail'; exit 3");
+        let err = pipe_data_gateway(cmd, &serde_json::json!({ "op": "schema" }))
+            .await
+            .expect_err("non-zero exit must be an error");
+        match err {
+            DataError::Gateway(msg) => {
+                assert!(
+                    msg.contains("err-detail") && msg.contains("out-detail"),
+                    "both stderr and stdout must surface, got: {msg}"
+                );
+            }
+            other => panic!("expected DataError::Gateway, got {other:?}"),
+        }
     }
 
     #[tokio::test]

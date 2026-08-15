@@ -22,9 +22,10 @@ SPEC_REL="spec-console/console-api.yaml"
 OUTPUT_REL="generated-console"
 CONFIG_REL="openapi-generator-config-console.yaml"
 
-TOOLS_DIR="${PROJECT_ROOT}/build/tools"
-JAR="${TOOLS_DIR}/openapi-generator-cli-${OPENAPI_GENERATOR_VERSION}.jar"
-JAR_URL="https://repo1.maven.org/maven2/org/openapitools/openapi-generator-cli/${OPENAPI_GENERATOR_VERSION}/openapi-generator-cli-${OPENAPI_GENERATOR_VERSION}.jar"
+# JAR location and (rate-limit tolerant) download live in the shared helper so
+# generate.sh and generate-console.sh never drift apart.
+# shellcheck source=scripts/lib-openapi-generator.sh
+source "${SCRIPT_DIR}/lib-openapi-generator.sh"
 
 if ! command -v java >/dev/null 2>&1; then
   echo "error: 'java' not found on PATH. Install a JRE/JDK (Java 11+) to run the" >&2
@@ -40,19 +41,7 @@ else
 fi
 
 # Fetch the generator JAR once, into the build cache (shared with generate.sh).
-if [[ ! -f "${JAR}" ]]; then
-  echo "Downloading openapi-generator-cli ${OPENAPI_GENERATOR_VERSION} into build/tools"
-  mkdir -p "${TOOLS_DIR}"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "${JAR}.tmp" "${JAR_URL}"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -q -O "${JAR}.tmp" "${JAR_URL}"
-  else
-    echo "error: neither 'curl' nor 'wget' is available to download the generator JAR." >&2
-    exit 1
-  fi
-  mv "${JAR}.tmp" "${JAR}"
-fi
+ensure_openapi_generator_jar
 
 echo "Generating console API Rust layer with openapi-generator-cli ${OPENAPI_GENERATOR_VERSION} (local Java)"
 echo "  spec:   ${SPEC_REL}"

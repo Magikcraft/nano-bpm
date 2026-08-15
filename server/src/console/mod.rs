@@ -4402,9 +4402,76 @@ pub(super) async fn project_data_migrate(name: &str, source: &str) -> ApiResult 
 }
 
 /// `POST /console/api/projects/{name}/data/{source}/domaintypes` — the maker's
-/// explicit "regenerate now" affordance (ADR 0029 §4.1/§6). Reifies `source`'s
-/// live schema into `nano-generated/domain-rows.d.ts`, returning `{ path, text, tables }`.
+/// explicit "regenerate now" affordance (ADR 0029 §4.1/§6).
+///
+/// For a **legacy** project this reifies `source`'s live schema into
+/// `nano-generated/domain-rows.d.ts` through the embedded gateway, returning
+/// `{ path, text, tables }`.
+///
+/// For an **Urban-shaped app** (#522 slice b) persisting derivation is
+/// `urban gen`'s job — the one authoritative deriver (ADR 0053) — not a second
+/// `urban data domaintypes` emit. So we run `urban gen` (which writes the full
+/// `nano-generated/*` artifact set from the manifest + models), then read back the
+/// `{ text, tables, shapeDiagnostics, migrated }` for the panel via a read-only
+/// `urban data` introspection (`write:false`, no second write) and report the
+/// path `urban gen` persisted. The editor's cached SDK typings are invalidated
+/// client-side either way.
 pub(super) async fn project_data_domaintypes(name: &str, source: &str) -> ApiResult {
+    // Route to the one deriver (`urban gen`) only when the app is Urban-shaped
+    // *and* its toolkit resolves *and* that toolkit actually carries the `data`
+    // op. During the transition — before the marketplace pack ships a `urban`
+    // carrying the `data`/`gen` ops — an Urban app whose toolkit is unresolved
+    // (or too old for `data`) keeps the embedded write path so "Regenerate types"
+    // still works; slice c removes this fallback once the pack guarantees urban.
+    //
+    // The `data`-capability gate matters here, not just `urban_available_for`:
+    // the branch runs `urban gen` (persist) and then reads back through
+    // `urban data` introspection. An `urban` that has `gen` but predates `data`
+    // would otherwise persist via `urban gen` yet fall back to the *embedded*
+    // introspection inside `run_data_op` — re-introducing a Node/Deno dependency
+    // and contradicting this doc comment. Gating the whole branch on
+    // `urban_supports_data` keeps it atomic (all-urban or all-embedded), mirroring
+    // the capability gate in `run_data_op`.
+    let urban_ready = match projects::project_dir(name) {
+        Some(d) if d.join("nano.app.json").is_file() => match urban::find_urban_for(&d) {
+            Some(u) => urban::urban_supports_data(&u).await,
+            None => false,
+        },
+        _ => false,
+    };
+    if urban_ready {
+        // Persist via the one deriver. This branch is gated on the toolkit
+        // resolving *and* carrying the `data` op, so the toolkit *is* present — a
+        // failure here is a real `urban gen` error (invalid manifest/models,
+        // toolkit error output), not a dependency outage, so map it to
+        // `500 INTERNAL_SERVER_ERROR`
+        // rather than `503`. There is no `503 SERVICE_UNAVAILABLE` path here: an
+        // unresolved (or too-old-for-`data`) toolkit doesn't error out — the
+        // `urban_ready == false` branch falls back to the embedded write path
+        // above — so clients never see a transient-outage status for a genuine
+        // gen failure.
+        projects::gen_via_urban(name)
+            .await
+            .map_err(|m| (StatusCode::INTERNAL_SERVER_ERROR, m))?;
+        // Read-only introspection for the response contract. `write:false` never
+        // writes files or migrates the DB, so this is a pure fetch of the emitted
+        // text + table count (routed through `urban data`), and the full derived
+        // maps are scanned server-side in `run_data_op` (no maps supplied here).
+        let mut res = project_data_op(
+            name,
+            serde_json::json!({ "op": "domaintypes", "source": source, "write": false }),
+        )
+        .await?;
+        // `urban gen` did persist the artifacts, so report the real written path
+        // (the `write:false` fetch returns `path: null`).
+        if let Some(obj) = res.as_object_mut() {
+            obj.insert(
+                "path".to_string(),
+                serde_json::json!(format!("{}/domain-rows.d.ts", projects::GEN_DIR)),
+            );
+        }
+        return Ok(res);
+    }
     project_data_op(
         name,
         serde_json::json!({ "op": "domaintypes", "source": source }),
