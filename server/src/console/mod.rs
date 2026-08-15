@@ -4184,7 +4184,24 @@ async fn regenerate_domain_types(name: &str) {
     // set). Regeneration is a best-effort, authoring-time convenience (the
     // artifacts are always regenerable), so skipping on an unreachable toolkit is
     // safe — the Studio already surfaces an install prompt (#524).
-    match regen_path(projects::is_urban_app(name), urban::urban_available()) {
+    //
+    // #776: resolve the toolkit availability **project-scoped** so an app whose
+    // `@nanobpm/urban` lives only in its own `node_modules/.bin/urban` still
+    // routes to `UrbanGen` (the host-global `urban_available()` never saw the
+    // project-local install), while the ADR-0053 no-embedded-fallback routing
+    // is preserved. Resolve the project directory once and reuse it for the
+    // Urban-shape check and the availability probe, so we don't repeat
+    // `project_dir`/`read_project_ref` I/O (or drift if the ref changes between
+    // the two calls).
+    let (is_urban, urban_available) = projects::project_dir(name)
+        .map(|d| {
+            (
+                d.join("nano.app.json").is_file(),
+                urban::urban_available_for(&d),
+            )
+        })
+        .unwrap_or((false, false));
+    match regen_path(is_urban, urban_available) {
         RegenPath::UrbanGen => {
             if let Err(msg) = projects::gen_via_urban(name).await {
                 tracing::debug!(project = name, error = %msg, "urban gen failed");

@@ -3239,7 +3239,8 @@ pub fn is_urban_app(name: &str) -> bool {
 /// interchangeable front-ends over the same library instead of parallel
 /// re-implementations of it.
 ///
-/// The binary is resolved through the single [`super::urban::find_urban`] seam;
+/// The binary is resolved through the project-scoped [`super::urban::find_urban_for`]
+/// seam (so the app's own `node_modules/.bin/urban` is honoured, #776);
 /// `gen` runs with the project directory as CWD (urban reads `nano.app.json` and
 /// resolves the `models.processes` globs + writes `nano-generated/` relative to
 /// it). Returns an error when urban is unavailable or `gen` fails, so the caller
@@ -3247,18 +3248,21 @@ pub fn is_urban_app(name: &str) -> bool {
 pub async fn gen_via_urban(name: &str) -> Result<(), String> {
     // Belt-and-suspenders shape gate: this is a public entrypoint, so guard the
     // `nano.app.json` shape here too (not only at the `regenerate_domain_types`
-    // call site). Validate the name up front so an invalid/unsafe name reports
-    // "invalid project name" rather than the less accurate shape error, then
-    // reject a legacy-shaped project before any `urban gen` spawn — spawning it
-    // would clobber the project's `nano-generated/` with Urban outputs it
-    // doesn't expect.
-    if project_dir(name).is_none() {
-        return Err("invalid project name".into());
-    }
-    if !is_urban_app(name) {
+    // call site), rejecting a legacy-shaped project before any `urban gen` spawn
+    // — spawning it would clobber the project's `nano-generated/` with Urban
+    // outputs it doesn't expect. Resolve the project directory once up front and
+    // reuse it for the shape gate and the urban lookup below: an invalid/unsafe
+    // name then reports "invalid project name" rather than the less accurate
+    // shape error, and we don't repeat `project_dir`/`read_project_ref` I/O (or
+    // risk drift if the ref changes between calls).
+    let dir = project_dir(name).ok_or("invalid project name")?;
+    if !dir.join("nano.app.json").is_file() {
         return Err("not an Urban-shaped app (no nano.app.json)".into());
     }
-    let urban = super::urban::find_urban().ok_or("urban CLI not available")?;
+    // #776: resolve project-scoped so the app's own `node_modules/.bin/urban`
+    // (the version it declares, materialised by the post-apply `npm install`) is
+    // found even when there is no global/pack/override install on the host.
+    let urban = super::urban::find_urban_for(&dir).ok_or("urban CLI not available")?;
     // A derivation-capable toolkit (nano-ide#92) folds code→BPMN model
     // derivation into `gen`, so a bare `urban gen` would ALSO (re)write
     // `resources/processes/*.bpmn` as a side effect of a type-contract regen.
@@ -3269,7 +3273,7 @@ pub async fn gen_via_urban(name: &str) -> Result<(), String> {
 }
 
 /// Pure-ish core of [`gen_via_urban`]: run a resolved `urban` binary's `gen`
-/// subcommand for `name`. Split out from the [`super::urban::find_urban`] lookup
+/// subcommand for `name`. Split out from the [`super::urban::find_urban_for`] lookup
 /// so the spawn + CWD + error mapping can be unit-tested with a stub binary,
 /// without depending on a real `urban` install or mutating the global
 /// `NANOBPMN_URBAN_BIN`/`PATH` environment. `no_models` adds `--no-models` so a
@@ -5198,10 +5202,15 @@ struct GenerateResult {
 /// **additive + non-regressing** (issue #522): a legacy project, a missing
 /// toolkit, or an older toolkit all take the pre-existing path unchanged.
 async fn urban_derive_capable(name: &str) -> Option<PathBuf> {
-    if !is_urban_app(name) {
+    // #776: project-scoped resolution so a project-local `node_modules/.bin/urban`
+    // is honoured, matching `gen_via_urban`. Resolve `dir` once and reuse it for
+    // the Urban-shape check and the lookup, rather than calling `project_dir`
+    // (once via `is_urban_app`, once directly) twice.
+    let dir = project_dir(name)?;
+    if !dir.join("nano.app.json").is_file() {
         return None;
     }
-    let urban = super::urban::find_urban()?;
+    let urban = super::urban::find_urban_for(&dir)?;
     if super::urban::urban_supports_derive(&urban).await {
         Some(urban)
     } else {
