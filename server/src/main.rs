@@ -16363,11 +16363,10 @@ pub(crate) fn json_to_value(json: &serde_json::Value) -> Value {
     }
 }
 
-/// Converts an engine [`Value`] tree back into JSON for the REST wire.
-/// Converts an engine [`Value`] into a `serde_json::Value`. Moved to the shared
-/// `nanobpmn-read-model` crate (the read-model projection needs the identical
-/// encoding); re-exported here so the gateway's REST mapping keeps a single
-/// source of truth with the projection.
+/// Converts an engine [`Value`] into a `serde_json::Value` for the REST wire.
+/// Moved to the shared `nanobpmn-read-model` crate (the read-model projection
+/// needs the identical encoding); re-exported here so the gateway's REST mapping
+/// keeps a single source of truth with the projection.
 pub(crate) use nanobpmn_read_model::value_to_json;
 
 /// Serialises a DMN [`Value`] into the JSON-document string the REST decision
