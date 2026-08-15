@@ -1995,7 +1995,25 @@ fn emit_element(
             ));
         }
         ElementKind::Task => {
-            out.push_str(&format!("    <bpmn:task id=\"{eid}\"{na}/>\n"));
+            // An abstract task is a pass-through, but — like the typed tasks — it
+            // still round-trips a `zeebe:ioMapping` and/or
+            // `multiInstanceLoopCharacteristics` when the model carries them (the
+            // parser pushes it onto the io_stack, so both attach to the element).
+            // Emit an open tag only when there is something to nest; otherwise a
+            // self-closing tag keeps the common case terse.
+            let has_io = !el.io.inputs.is_empty() || !el.io.outputs.is_empty();
+            if !has_io && el.multi_instance.is_none() {
+                out.push_str(&format!("    <bpmn:task id=\"{eid}\"{na}/>\n"));
+            } else {
+                out.push_str(&format!("    <bpmn:task id=\"{eid}\"{na}>\n"));
+                if has_io {
+                    out.push_str("      <bpmn:extensionElements>\n");
+                    emit_io_mapping(el, out);
+                    out.push_str("      </bpmn:extensionElements>\n");
+                }
+                emit_multi_instance(el, out);
+                out.push_str("    </bpmn:task>\n");
+            }
         }
         ElementKind::ScriptTask {
             expression,
@@ -4025,6 +4043,62 @@ mod tests {
             .outgoing
             .iter()
             .any(|f| f.to == "Approve" && f.condition.is_some()));
+    }
+
+    #[test]
+    fn definition_to_xml_round_trips_an_abstract_task_with_io_and_multi_instance() {
+        // An abstract `<bpmn:task>` is a pass-through, but it still carries a
+        // `zeebe:ioMapping` and `multiInstanceLoopCharacteristics` when modelled
+        // (the parser pushes it onto the io_stack, so both attach to the
+        // element). The serializer must emit an OPEN tag nesting those children —
+        // a self-closing `<bpmn:task/>` would silently drop them on a round-trip.
+        use nanobpmn_engine_core::{Mapping, MultiInstance};
+        let mut def = nanobpmn_engine_core::ProcessBuilder::new("Passthrough")
+            .start_event("Start")
+            .task("Work")
+            .end_event("Done")
+            .connect("Start", "Work")
+            .connect("Work", "Done")
+            .build()
+            .unwrap();
+        {
+            let work = def.elements.get_mut("Work").unwrap();
+            work.io.inputs.push(Mapping {
+                source: "= order.id".to_string(),
+                target: "orderId".to_string(),
+            });
+            work.io.outputs.push(Mapping {
+                source: "= result".to_string(),
+                target: "outcome".to_string(),
+            });
+            work.multi_instance = Some(MultiInstance {
+                input_collection: "= items".to_string(),
+                input_element: Some("item".to_string()),
+                ..Default::default()
+            });
+        }
+
+        let xml = definition_to_xml(&def);
+        assert!(
+            xml.contains("<bpmn:task id=\"Work\"") && xml.contains("</bpmn:task>"),
+            "abstract task with io/MI must emit an OPEN tag, got:\n{xml}"
+        );
+        assert!(
+            xml.contains("<zeebe:ioMapping>"),
+            "must emit ioMapping:\n{xml}"
+        );
+        assert!(
+            xml.contains("multiInstanceLoopCharacteristics"),
+            "must emit multi-instance:\n{xml}"
+        );
+
+        let reparsed = parse_bpmn(&xml).expect("serialized abstract task re-parses");
+        assert_same_structure(&def, &reparsed[0]);
+        let work = &reparsed[0].elements["Work"];
+        assert_eq!(work.kind, ElementKind::Task);
+        assert_eq!(work.io.inputs.len(), 1, "input mapping preserved");
+        assert_eq!(work.io.outputs.len(), 1, "output mapping preserved");
+        assert!(work.multi_instance.is_some(), "multi-instance preserved");
     }
 
     #[test]
