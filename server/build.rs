@@ -21,10 +21,8 @@ fn main() {
     // file). When git is unavailable (release tarball), no paths are emitted and the
     // explicit `NANOBPM_VERSION` env — already watched above — governs.
     for git_ref in ["logs/HEAD", "HEAD"] {
-        if let Some(path) = git_path(git_ref) {
-            if Path::new(&path).exists() {
-                println!("cargo:rerun-if-changed={path}");
-            }
+        if let Some(path) = git_path(git_ref).filter(|p| Path::new(p).exists()) {
+            println!("cargo:rerun-if-changed={path}");
         }
     }
     let version = resolve_version();
