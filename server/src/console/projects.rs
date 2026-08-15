@@ -3239,7 +3239,8 @@ pub fn is_urban_app(name: &str) -> bool {
 /// interchangeable front-ends over the same library instead of parallel
 /// re-implementations of it.
 ///
-/// The binary is resolved through the single [`super::urban::find_urban`] seam;
+/// The binary is resolved through the project-scoped [`super::urban::find_urban_for`]
+/// seam (so the app's own `node_modules/.bin/urban` is honoured, #776);
 /// `gen` runs with the project directory as CWD (urban reads `nano.app.json` and
 /// resolves the `models.processes` globs + writes `nano-generated/` relative to
 /// it). Returns an error when urban is unavailable or `gen` fails, so the caller
@@ -3273,7 +3274,7 @@ pub async fn gen_via_urban(name: &str) -> Result<(), String> {
 }
 
 /// Pure-ish core of [`gen_via_urban`]: run a resolved `urban` binary's `gen`
-/// subcommand for `name`. Split out from the [`super::urban::find_urban`] lookup
+/// subcommand for `name`. Split out from the [`super::urban::find_urban_for`] lookup
 /// so the spawn + CWD + error mapping can be unit-tested with a stub binary,
 /// without depending on a real `urban` install or mutating the global
 /// `NANOBPMN_URBAN_BIN`/`PATH` environment. `no_models` adds `--no-models` so a
