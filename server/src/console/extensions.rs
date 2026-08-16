@@ -1825,10 +1825,12 @@ pub struct PackChangelog {
     pub delta: bool,
 }
 
-/// The changelog (markdown) for an extension pack. For an installed pack this
-/// reads the bundled `CHANGELOG.md`; otherwise it downloads the published
-/// registry tarball (`npm pack <pkg>@<to>`) and reads the changelog from it —
-/// npm does not expose `changelog` via `npm view` the way it does `readme`.
+/// The changelog (markdown) for an extension pack. Reads the bundled
+/// `CHANGELOG.md` of an installed pack, or downloads the published registry
+/// tarball (`npm pack <pkg>@<to>`) and reads the changelog from it — npm does
+/// not expose `changelog` via `npm view` the way it does `readme`. Which source
+/// is preferred depends on whether a delta is wanted; see
+/// [`select_changelog_source`].
 ///
 /// When `from` (the installed version) is given and the changelog's version
 /// headings are parseable, the result is scoped to the delta between `from` and
@@ -1836,17 +1838,19 @@ pub struct PackChangelog {
 /// "What's changed" update affordance. Falls back to the full changelog when
 /// the headings can't be parsed. `None` when no changelog can be resolved
 /// (unknown pack, ships none, or offline) — mirroring [`pack_readme`].
+///
+/// See [`select_changelog_source`] for why the *update* case (`from` set)
+/// prefers the published tarball over the installed copy.
 pub fn pack_changelog(pkg: &str, from: Option<&str>, to: Option<&str>) -> Option<PackChangelog> {
-    // Prefer the installed copy: it matches what's running, works offline, and
-    // needs no network round-trip.
-    let (raw, installed) = if let Some(path) = installed_changelog_path(pkg) {
-        match std::fs::read_to_string(&path) {
-            Ok(txt) if !txt.trim().is_empty() => (txt, true),
-            _ => (fetch_published_changelog(pkg, to)?, false),
-        }
-    } else {
-        (fetch_published_changelog(pkg, to)?, false)
+    let read_installed = || {
+        installed_changelog_path(pkg).and_then(|path| {
+            std::fs::read_to_string(&path)
+                .ok()
+                .filter(|txt| !txt.trim().is_empty())
+        })
     };
+    let fetch_published = || fetch_published_changelog(pkg, to);
+    let (raw, installed) = select_changelog_source(from.is_some(), read_installed, fetch_published)?;
     // Scope to the installed→latest delta when we know the installed version and
     // the headings parse; otherwise show the whole changelog.
     let (changelog, delta) = match from.and_then(|f| changelog_delta(&raw, f)) {
@@ -1858,6 +1862,42 @@ pub fn pack_changelog(pkg: &str, from: Option<&str>, to: Option<&str>) -> Option
         installed,
         delta,
     })
+}
+
+/// Pick which changelog source to read and in what order, returning
+/// `(markdown, installed_flag)`.
+///
+/// The order flips on whether we need an installed→latest *delta*
+/// (`want_delta`, i.e. the caller supplied a `from` version):
+///
+/// * **Update case (`want_delta`):** prefer the *published* tarball. The
+///   installed pack's `CHANGELOG.md` only carries headings up to the version
+///   that is currently running, so it can never contain the newer releases the
+///   delta is supposed to surface — reading it would make `changelog_delta`
+///   return `None` and collapse the "What's changed" affordance to the old,
+///   full changelog. Fall back to the installed copy only when the registry
+///   fetch fails (offline), so we still show *something*.
+/// * **Full-changelog case (no `want_delta`):** prefer the installed copy — it
+///   matches what's running, works offline, and needs no network round-trip.
+///
+/// Split out from [`pack_changelog`] so the source-ordering logic is unit
+/// testable without touching the filesystem or the network.
+fn select_changelog_source(
+    want_delta: bool,
+    read_installed: impl FnOnce() -> Option<String>,
+    fetch_published: impl FnOnce() -> Option<String>,
+) -> Option<(String, bool)> {
+    if want_delta {
+        match fetch_published() {
+            Some(txt) => Some((txt, false)),
+            None => read_installed().map(|txt| (txt, true)),
+        }
+    } else {
+        match read_installed() {
+            Some(txt) => Some((txt, true)),
+            None => fetch_published().map(|txt| (txt, false)),
+        }
+    }
 }
 
 /// Download a package's published registry tarball and read its changelog
@@ -2681,21 +2721,60 @@ mod tests {
         // The installed pack ships a changelog → the availability probe sees it.
         assert!(installed_changelog_path(pkg).is_some());
 
-        // Full changelog when no installed version is supplied.
+        // Full changelog (no `from`) prefers the installed copy — offline, no
+        // network round-trip.
         let full = pack_changelog(pkg, None, None).expect("changelog present");
         assert!(full.installed);
         assert!(!full.delta);
         assert!(full.changelog.contains("baseline release"));
 
-        // Delta-scoped when the installed version is supplied.
-        let delta = pack_changelog(pkg, Some("0.70.2"), Some("0.72.0")).expect("changelog");
-        assert!(delta.installed);
-        assert!(delta.delta);
-        assert!(delta.changelog.contains("0.72.0"));
-        assert!(!delta.changelog.contains("baseline release"));
+        // (The update/delta case — `from` set — prefers the *published* tarball
+        // and is exercised network-free by `select_changelog_source_*` below.)
 
         let _ = std::fs::remove_dir_all(&root);
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    #[test]
+    fn select_changelog_source_prefers_published_for_delta() {
+        // Regression: an installed pack's CHANGELOG.md only carries headings up
+        // to the *installed* version, so the update/delta case must NOT read it
+        // first — doing so makes `changelog_delta` return `None` and wedges the
+        // "What's changed" affordance to the old, full changelog. When a delta
+        // is wanted we prefer the published tarball, marking the result as not
+        // installed.
+        let src = select_changelog_source(
+            true,
+            || Some("installed (old)".to_string()),
+            || Some("published (latest)".to_string()),
+        );
+        assert_eq!(src, Some(("published (latest)".to_string(), false)));
+
+        // Offline (published fetch fails) falls back to the installed copy so we
+        // still surface *something*.
+        let fallback =
+            select_changelog_source(true, || Some("installed (old)".to_string()), || None);
+        assert_eq!(fallback, Some(("installed (old)".to_string(), true)));
+
+        // Nothing anywhere → nothing to show.
+        assert_eq!(select_changelog_source(true, || None, || None), None);
+    }
+
+    #[test]
+    fn select_changelog_source_prefers_installed_for_full_view() {
+        // No delta wanted (full changelog view): prefer the installed copy —
+        // offline, fast, matches what's running.
+        let src = select_changelog_source(
+            false,
+            || Some("installed".to_string()),
+            || Some("published".to_string()),
+        );
+        assert_eq!(src, Some(("installed".to_string(), true)));
+
+        // Not installed → fall back to the published tarball.
+        let published =
+            select_changelog_source(false, || None, || Some("published".to_string()));
+        assert_eq!(published, Some(("published".to_string(), false)));
     }
 
     #[test]
