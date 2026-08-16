@@ -18,10 +18,50 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nanobpmn_engine_core::{Event, Key, partition_of};
+use nanobpmn_engine_core::{Event, Key, ReadQuery, partition_of};
 // Re-export the shared read-model surface so `crate::readstore::ProcessInstanceRow`
 // (and friends) resolve exactly as before the extraction.
 pub use nanobpmn_read_model::*;
+
+/// Names the [`ReadStore`] query method each gateway REST read routes through.
+///
+/// This is the gateway-side anchor for the shared [`ReadQuery`] surface enum
+/// (defined in `engine-core` alongside `Command`). It exists so the gateway
+/// *references* every read it serves through the one shared enum: the match is
+/// exhaustive and wildcard-free, so adding a `ReadQuery` variant — the gateway
+/// beginning to serve a new read — forces this map to be extended here as well
+/// as classified in the wasm parity gate (`engine-wasm/src/surface_parity.rs`).
+/// It changes no observable REST behaviour; the concrete handlers still call the
+/// named [`ReadStore`] methods directly.
+#[allow(dead_code)]
+pub(crate) fn read_store_method(query: ReadQuery) -> &'static str {
+    match query {
+        ReadQuery::GetFormByKey => "form_by_key",
+        ReadQuery::GetResourceByKey => "resource_by_key",
+        ReadQuery::SearchResources => "resources_meta",
+        ReadQuery::SearchProcessInstances => "process_instances",
+        ReadQuery::GetProcessInstance => "process_instance",
+        ReadQuery::SearchUserTasks => "user_tasks",
+        ReadQuery::GetUserTask => "user_tasks",
+        ReadQuery::SearchVariables => "variables",
+        ReadQuery::GetVariable => "variable",
+        ReadQuery::SearchJobs => "jobs",
+        ReadQuery::SearchIncidents => "incidents",
+        ReadQuery::GetIncident => "incident",
+        ReadQuery::SearchElementInstances => "element_instances",
+        ReadQuery::GetElementInstance => "element_instance",
+        ReadQuery::SearchMessageSubscriptions => "message_subscriptions",
+        ReadQuery::SearchCorrelatedMessageSubscriptions => "correlated_message_subscriptions",
+        ReadQuery::SearchProcessDefinitions => "process_definitions",
+        ReadQuery::GetProcessDefinitionXml => "process_definition_xml",
+        ReadQuery::SearchDecisionInstances => "decision_instances",
+        ReadQuery::GetDecisionInstance => "decision_instance",
+        ReadQuery::SearchDecisionDefinitions => "decision_definitions",
+        ReadQuery::GetDecisionDefinitionXml => "decision_definition_xml",
+        ReadQuery::SearchDecisionRequirements => "decision_requirements",
+        ReadQuery::GetDecisionRequirementsXml => "decision_requirements_xml",
+    }
+}
 
 /// The projection sink the per-shard exporter thread writes into. Abstracts the
 /// read model behind the single `export` seam so the sink can be the built-in
