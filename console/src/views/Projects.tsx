@@ -260,7 +260,9 @@ export default function Projects() {
   };
 
   // The page error banner surfaces both this view's own operations and the
-  // shared update flow's errors (dismissing clears whichever is set).
+  // shared update flow's errors. It has no dismiss control — each is cleared
+  // when its source starts a fresh operation (this view's handlers reset
+  // `error`; the update hook clears `updateError` on the next update).
   const bannerError = error ?? updateError;
   const errorBanner = bannerError && (
     <div className="mb-4 rounded-md border border-danger/40 bg-danger/10 px-4 py-2 text-sm text-danger">

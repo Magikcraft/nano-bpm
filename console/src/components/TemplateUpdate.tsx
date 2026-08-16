@@ -84,6 +84,11 @@ export function useTemplateUpdate(opts?: {
     async (target: UpdateTarget) => {
       setBusy(true);
       setPreviewName(target.name);
+      // Clear any stale error / modal state from a prior attempt so a new
+      // update never opens on top of a leftover banner or dialog.
+      setError(null);
+      setConfirm(null);
+      setReviewPlan(null);
       try {
         const plan = await dryRun(target);
         if (planIsClean(plan)) {
@@ -106,6 +111,7 @@ export function useTemplateUpdate(opts?: {
   const applyOne = useCallback(
     async (target: UpdateTarget) => {
       setBusy(true);
+      setError(null);
       try {
         const plan = await apply(target);
         setConfirm(null);
@@ -128,6 +134,7 @@ export function useTemplateUpdate(opts?: {
     async (targets: UpdateTarget[]): Promise<BatchItemResult[]> => {
       const results: BatchItemResult[] = [];
       setBusy(true);
+      setError(null);
       try {
         for (const target of targets) {
           setPreviewName(target.name);
