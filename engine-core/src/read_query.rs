@@ -32,9 +32,13 @@
 
 /// The read-model-backed REST read operations the gateway serves.
 ///
-/// One unit variant per distinct REST read operation, named after its OpenAPI
-/// `operationId` (equivalently, the `TestEngine` JS method where one exists).
-/// Each corresponds to a `nanobpmn_read_model::ReadStore` query method; the
+/// One unit variant per distinct read-model-backed query surface, keyed to its
+/// backing `nanobpmn_read_model::ReadStore` query method. A variant is named
+/// after a representative OpenAPI `operationId` (equivalently, the `TestEngine`
+/// JS method where one exists), but a single variant may back **several** REST
+/// operations that share one read path (e.g. `GetResourceByKey` serves
+/// `getResource` / `getResourceContent` / `getResourceContentBinary`) — the doc
+/// on each variant lists the operations it covers. The
 /// variant set is intentionally scoped to the reads a read model can answer (the
 /// same surface the in-browser test engine can serve), not the gateway's
 /// identity/admin/statistics endpoints.
@@ -52,8 +56,8 @@ pub enum ReadQuery {
     /// `getFormByKey` — the deployed form schema for a form key
     /// (`ReadStore::form_by_key`).
     GetFormByKey,
-    /// `getResource` / `getResourceContent` — a deployed generic resource by key
-    /// (`ReadStore::resource_by_key`).
+    /// `getResource` / `getResourceContent` / `getResourceContentBinary` — a
+    /// deployed generic resource by key (`ReadStore::resource_by_key`).
     GetResourceByKey,
     /// `searchResources` — deployed resource metadata (`ReadStore::resources_meta`).
     SearchResources,
