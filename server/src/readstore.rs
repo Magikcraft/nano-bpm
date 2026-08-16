@@ -19,7 +19,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nanobpmn_engine_core::{Event, Key, partition_of};
-
 // Re-export the shared read-model surface so `crate::readstore::ProcessInstanceRow`
 // (and friends) resolve exactly as before the extraction.
 pub use nanobpmn_read_model::*;

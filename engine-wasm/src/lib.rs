@@ -21,9 +21,6 @@ use nanobpmn_engine_core::{
     MessageSubscriptionKind, MessageSubscriptionState, ProcessInstanceState, TimerState,
     UserTaskChangeset, UserTaskState, Value,
 };
-use serde::Serialize;
-use wasm_bindgen::prelude::*;
-
 /// The shared read-model surface, compiled with its in-memory wasm SQLite
 /// backend. Behind the off-by-default `read-model` feature so the baseline engine
 /// links none of the read-model/SQLite deps and keeps its lean baseline size;
@@ -31,7 +28,10 @@ use wasm_bindgen::prelude::*;
 #[cfg(feature = "read-model")]
 use nanobpmn_read_model::{
     FormRow, ProcessInstanceRow, ReadStore, ResourceRow, UserTaskRow, VariableRow,
+    VARIABLE_VALUE_PREVIEW_LEN,
 };
+use serde::Serialize;
+use wasm_bindgen::prelude::*;
 
 /// `console.error` binding used to surface (never abort on) best-effort read-model
 /// projection failures, so a broken projection is debuggable instead of silently
@@ -855,7 +855,8 @@ impl TestEngine {
     /// The process instances, as a `ProcessInstanceSearchQueryResult` JSON object
     /// (`{ items: [...], page: {...} }`). Mirrors `POST /process-instances/search`.
     #[wasm_bindgen(js_name = searchProcessInstances)]
-    pub fn search_process_instances(&self, _filter_json: &str) -> Result<String, JsValue> {
+    pub fn search_process_instances(&self, filter_json: &str) -> Result<String, JsValue> {
+        validate_search_filter_body(filter_json)?;
         let items: Vec<serde_json::Value> = self
             .read_model
             .process_instances()
@@ -880,7 +881,8 @@ impl TestEngine {
     /// The variables, as a `VariableSearchQueryResult` JSON object
     /// (`{ items: [...], page: {...} }`). Mirrors `POST /variables/search`.
     #[wasm_bindgen(js_name = searchVariables)]
-    pub fn search_variables(&self, _filter_json: &str) -> Result<String, JsValue> {
+    pub fn search_variables(&self, filter_json: &str) -> Result<String, JsValue> {
+        validate_search_filter_body(filter_json)?;
         let items: Vec<serde_json::Value> = self
             .read_model
             .variables()
@@ -978,6 +980,27 @@ fn user_task_state_spellings() -> String {
 #[cfg(feature = "read-model")]
 fn parse_state_filter(filter_json: &str, field: &str) -> Result<Option<String>, JsValue> {
     parse_state_filter_inner(filter_json, field).map_err(|e| js_err(&e))
+}
+
+/// Shape-validate a `search*` filter body against the gateway's REST contract:
+/// accept empty/whitespace, JSON `null`, or a JSON object (with an optional nested
+/// `filter` object); reject a non-object root (`[]`, `"x"`, `42`, …) or a
+/// present-but-non-object `filter`, and reject syntactically invalid JSON. The
+/// `searchProcessInstances` / `searchVariables` methods don't filter on any field
+/// yet, but still call this so a malformed body is rejected exactly as the gateway
+/// rejects it at request deserialization, instead of being silently accepted.
+#[cfg(feature = "read-model")]
+fn validate_search_filter_body(filter_json: &str) -> Result<(), JsValue> {
+    validate_search_filter_body_inner(filter_json).map_err(|e| js_err(&e))
+}
+
+/// Pure core of [`validate_search_filter_body`] (host-testable: constructs no
+/// `JsValue`). Delegates to [`parse_state_filter_inner`] with a field that is
+/// never present, so the body-shape contract has a single implementation shared
+/// with the field-reading callers (`searchUserTasks`) and the two can't drift.
+#[cfg(feature = "read-model")]
+fn validate_search_filter_body_inner(filter_json: &str) -> Result<(), String> {
+    parse_state_filter_inner(filter_json, "\0__nano_validate_shape_only__").map(|_| ())
 }
 
 /// Pure core of [`parse_state_filter`] (host-testable: constructs no `JsValue`).
@@ -1111,18 +1134,12 @@ fn process_instance_result(row: &ProcessInstanceRow) -> serde_json::Value {
     })
 }
 
-/// The byte length beyond which `searchVariables` truncates a variable value and
-/// flags `isTruncated`, mirroring the gateway's `truncateValues`-on default. Kept
-/// in lockstep with the gateway's canonical `VARIABLE_VALUE_PREVIEW_LEN`
-/// (`server/src/main.rs`); nano's in-browser values are far shorter, so this only
-/// fires for pathologically large payloads.
-#[cfg(feature = "read-model")]
-const VARIABLE_VALUE_PREVIEW_LEN: usize = 8192;
-
 /// Serialise a [`VariableRow`] as the gateway's `VariableSearchResult` JSON shape.
-/// Long values are truncated to the preview length on a char boundary and
-/// `isTruncated` is set, mirroring the gateway, whose `truncateValues` defaults to
-/// on. (A single-variable get returns the full untruncated value there and here.)
+/// Long values are truncated to [`VARIABLE_VALUE_PREVIEW_LEN`] (the shared
+/// canonical preview length, imported from `nanobpmn-read-model` so the gateway
+/// and TestEngine can't drift) on a char boundary and `isTruncated` is set,
+/// mirroring the gateway, whose `truncateValues` defaults to on. (A
+/// single-variable get returns the full untruncated value there and here.)
 #[cfg(feature = "read-model")]
 fn variable_search_result(v: &VariableRow) -> serde_json::Value {
     let (value, is_truncated) = if v.value.len() > VARIABLE_VALUE_PREVIEW_LEN {
@@ -2990,7 +3007,10 @@ mod read_channel_tests {
         assert_eq!(all["items"].as_array().unwrap().len(), 1);
 
         // The canonical nested REST body shape filters identically to the shorthand.
-        let nested = parse(&eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#).unwrap());
+        let nested = parse(
+            &eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#)
+                .unwrap(),
+        );
         assert_eq!(nested["items"].as_array().unwrap().len(), 1);
         assert_eq!(nested["items"][0]["userTaskKey"], key);
 
@@ -3060,6 +3080,47 @@ mod read_channel_tests {
     }
 
     #[test]
+    fn search_instances_and_variables_reject_malformed_filter_bodies() {
+        // `searchProcessInstances` / `searchVariables` don't filter on any field,
+        // but they must still reject a malformed/non-object body exactly as the
+        // gateway rejects it at deserialization, rather than silently accepting it.
+        let mut eng = TestEngine::new();
+        eng.deploy(USER_TASK_XML).unwrap();
+        eng.create_instance("p", "{}", None).unwrap();
+
+        // Well-formed "no filter" bodies (empty, root null, empty/nested object)
+        // are accepted by both surfaces.
+        for body in ["", "  ", "null", "{}", r#"{"filter":{}}"#] {
+            assert!(
+                eng.search_process_instances(body).is_ok(),
+                "searchProcessInstances should accept {body:?}"
+            );
+            assert!(
+                eng.search_variables(body).is_ok(),
+                "searchVariables should accept {body:?}"
+            );
+        }
+
+        // A non-object root, a non-object nested `filter`, and syntactically
+        // invalid JSON are all rejected. Exercise the rejection through the shared
+        // host-testable validator the search methods call (the `search*` methods
+        // surface the error as a `JsValue`, which can't be constructed off-wasm).
+        for body in [
+            r#"[]"#,
+            r#""x""#,
+            r#"42"#,
+            r#"true"#,
+            r#"{"filter":[]}"#,
+            r#"{"#,
+        ] {
+            assert!(
+                validate_search_filter_body_inner(body).is_err(),
+                "filter body {body:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn state_filter_honours_the_nested_rest_filter_shape() {
         // The canonical REST body nests the filter under `filter`
         // (`UserTaskSearchQuery`), so a caller pasting the real gateway body must
@@ -3089,7 +3150,11 @@ mod read_channel_tests {
         // A non-string nested value is rejected, as at the top level.
         assert!(parse_state_filter_inner(r#"{"filter":{"state":42}}"#, "state").is_err());
         // A present-but-non-object `filter` is malformed, not "no filter".
-        for bad in [r#"{"filter":[]}"#, r#"{"filter":"CREATED"}"#, r#"{"filter":42}"#] {
+        for bad in [
+            r#"{"filter":[]}"#,
+            r#"{"filter":"CREATED"}"#,
+            r#"{"filter":42}"#,
+        ] {
             let err = parse_state_filter_inner(bad, "state").unwrap_err();
             assert!(
                 err.contains("`filter` must be a JSON object"),
@@ -3118,7 +3183,10 @@ mod read_channel_tests {
         // A value at the boundary is not truncated.
         let at_limit = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN);
         let boundary = variable_search_result(&row(at_limit.clone()));
-        assert_eq!(boundary["value"].as_str().unwrap().len(), VARIABLE_VALUE_PREVIEW_LEN);
+        assert_eq!(
+            boundary["value"].as_str().unwrap().len(),
+            VARIABLE_VALUE_PREVIEW_LEN
+        );
         assert_eq!(boundary["isTruncated"], false);
 
         // One byte over the limit is truncated to the preview length and flagged.
@@ -3148,7 +3216,11 @@ mod read_channel_tests {
         // the valid spellings — tested at the pure layer because the wrapper's
         // `JsValue` error cannot be inspected on the host target.
         assert_eq!(user_task_state_from_rest("FOO"), None);
-        assert_eq!(user_task_state_from_rest("created"), None, "spelling is case-sensitive");
+        assert_eq!(
+            user_task_state_from_rest("created"),
+            None,
+            "spelling is case-sensitive"
+        );
         assert_eq!(user_task_state_from_rest(""), None);
         let spellings = user_task_state_spellings();
         assert!(
@@ -3167,7 +3239,10 @@ mod read_channel_tests {
         assert_eq!(ALL_USER_TASK_STATES.len(), 3);
         for st in ALL_USER_TASK_STATES {
             // Every listed variant round-trips through its REST spelling.
-            assert_eq!(user_task_state_from_rest(user_task_state_rest(st)), Some(st));
+            assert_eq!(
+                user_task_state_from_rest(user_task_state_rest(st)),
+                Some(st)
+            );
         }
         assert_eq!(user_task_state_from_rest("nope"), None);
     }

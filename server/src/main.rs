@@ -15537,9 +15537,10 @@ fn process_definition_result(
 }
 
 /// The byte length beyond which a variable value is truncated in search results
-/// (when `truncateValues` is on). Mirrors the order of magnitude of Camunda's
-/// variable value preview; nano's typical values are far shorter.
-const VARIABLE_VALUE_PREVIEW_LEN: usize = 8192;
+/// (when `truncateValues` is on). Moved to the shared `nanobpmn-read-model` crate
+/// and re-exported here so the gateway and the in-browser `engine-wasm`
+/// `TestEngine` share a single source of truth for the preview length (no drift).
+pub(crate) use nanobpmn_read_model::VARIABLE_VALUE_PREVIEW_LEN;
 
 /// Whether `value` would be truncated given the current `truncate` setting.
 fn value_is_truncated(value: &str, truncate: bool) -> bool {
