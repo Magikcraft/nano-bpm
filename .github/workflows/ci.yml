@@ -293,7 +293,7 @@ jobs:
           sudo apt-get install -y llvm clang
           cc_bin=""
           for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
-            if [ -n "$c" ] && "$c" -print-targets | grep -q wasm32; then cc_bin="$c"; break; fi
+            if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
           done
           ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
           if [ -z "$cc_bin" ] || [ -z "$ar_bin" ]; then
