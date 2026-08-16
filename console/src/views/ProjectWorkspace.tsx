@@ -37,6 +37,7 @@ import {
   getDataSchema,
   getDataSources,
   listProjectFiles,
+  listProjects,
   previewDomainTypes,
   runProject,
   saveProjectConfig,
@@ -46,6 +47,7 @@ import {
   type FileNode,
   type ProjectDetail,
   type ProjectConfig,
+  type ProjectSummary,
   type RunState,
 } from "../gen";
 import {
@@ -59,6 +61,8 @@ import {
   type ProjectFile,
 } from "../lib/api";
 import { Button, inputClass } from "../components/ui";
+import { useTemplateUpdate } from "../components/TemplateUpdate";
+import { toUpdateTarget } from "../lib/templateUpdate";
 import { decisionFeelVariables } from "../lib/dmnDomainVariables";
 import { TOUR_ANCHOR } from "../lib/tour/tourAnchors";
 import {
@@ -218,9 +222,41 @@ export default function ProjectWorkspace() {
     }
   }, [name]);
 
+  // The open project's listing summary — the single source of the computed
+  // `updateAvailable` / `latestVersion` signal (the detail endpoint returns the
+  // stored config only). Fetched alongside the detail so the toolbar can offer
+  // the same "Update possible" affordance as the projects list, wired to the
+  // shared review-and-apply flow. Refreshed after an apply so the badge clears.
+  const [summary, setSummary] = useState<ProjectSummary | null>(null);
+  const loadSummary = useCallback(async () => {
+    try {
+      const list = (await listProjects({ throwOnError: true })).data.projects;
+      setSummary(list.find((p) => p.name === name) ?? null);
+    } catch {
+      /* non-fatal: the affordance just stays hidden */
+    }
+  }, [name]);
+  const {
+    startUpdate,
+    previewName,
+    busy: updateBusy,
+    error: updateError,
+    modals: updateModals,
+  } = useTemplateUpdate({
+    onApplied: async () => {
+      await load();
+      await loadSummary();
+    },
+  });
+  const canUpdate = !!summary?.updateAvailable && summary.source !== "path";
+
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    void loadSummary();
+  }, [loadSummary]);
 
   // Drop a remembered open-file selection if that file no longer exists (e.g.
   // it was deleted since the last visit), so we don't render a 404 editor pane.
@@ -457,6 +493,19 @@ export default function ProjectWorkspace() {
             compiling…
           </span>
         )}
+        {canUpdate && summary && (
+          <button
+            type="button"
+            onClick={() => void startUpdate(toUpdateTarget(summary))}
+            disabled={updateBusy}
+            aria-busy={previewName === name}
+            title={`A newer template is available${summary.latestVersion ? ` (v${summary.latestVersion})` : ""} — click to review and apply the update`}
+            aria-label={`Update ${detail.config.displayName ?? detail.config.name} from template`}
+            className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-accent hover:bg-accent/20 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {previewName === name ? "checking…" : "↑ update possible"}
+          </button>
+        )}
         <div className="flex-1" />
         {runConfigs.length > 0 && (
           <label
@@ -546,6 +595,13 @@ export default function ProjectWorkspace() {
           Export
         </ToolbarButton>
       </div>
+
+      {updateError && (
+        <div className="border-b border-danger/30 bg-danger/10 px-4 py-1.5 text-xs text-danger">
+          {updateError}
+        </div>
+      )}
+      {updateModals}
 
       {!runnable && (
         <div className="border-b border-warn/30 bg-warn/10 px-4 py-1.5 text-xs text-warn">
