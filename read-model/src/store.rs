@@ -2128,6 +2128,15 @@ fn json_value(value: &Value) -> String {
     crate::value_to_json(value).to_string()
 }
 
+/// The byte length beyond which a variable value is truncated in search results
+/// (when `truncateValues` is on), and `isTruncated` is flagged. Single source of
+/// truth for the gateway's `server` crate and the in-browser `engine-wasm`
+/// `TestEngine`, both of which import this rather than redeclaring it, so the two
+/// REST surfaces can never drift on the preview length. Mirrors the order of
+/// magnitude of Camunda's variable value preview; nano's typical values are far
+/// shorter, so it only fires for pathologically large payloads.
+pub const VARIABLE_VALUE_PREVIEW_LEN: usize = 8192;
+
 /// Converts an engine [`Value`] into a `serde_json::Value`. Shared by the read
 /// model's projection (variable/DMN JSON encoding here) and the gateway's REST
 /// result mapping in the `server` crate, which re-exports this as
