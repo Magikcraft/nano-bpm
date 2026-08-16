@@ -311,6 +311,10 @@ engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest in
 engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)
 	cd $(WASM_DIR) && cargo check --target wasm32-unknown-unknown
 
+.PHONY: engine-wasm-check-read-model
+engine-wasm-check-read-model: ## Type-check engine-wasm with the off-by-default `read-model` feature for wasm32. Compiles a trimmed SQLite C amalgamation, so it needs the wasm32 target AND an LLVM clang with a wasm backend (Apple/GCC clang have none): point CC_wasm32_unknown_unknown/AR_wasm32_unknown_unknown at llvm clang/llvm-ar (e.g. Homebrew LLVM on macOS, the distro `llvm`/`clang` on CI).
+	cd $(WASM_DIR) && cargo check --features read-model --target wasm32-unknown-unknown
+
 .PHONY: release-engine-wasm
 release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-v<pkg version> on the current commit and push it (CI OIDC-publishes). Run on `main` after the version bump + `make console-wasm` have merged.
 	@set -eu; \

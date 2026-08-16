@@ -261,6 +261,49 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  engine-wasm-read-model:
+    name: engine-wasm (read-model wasm32 type-check)
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      RUSTC_WRAPPER: 'sccache'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-wasm
+          # Cache-key rider so this job doesn't fight the feature-off wasm caches
+          # (same crate, different feature set + a C toolchain build).
+          key: wasm32-read-model
+      - name: Install LLVM clang (wasm backend) + point cc at it
+        # The off-by-default `read-model` feature compiles a trimmed SQLite C
+        # amalgamation (via the `cc` crate + read-model/build.rs) to wasm32. GCC
+        # and Apple clang have no wasm backend; upstream LLVM clang does. The `cc`
+        # crate reads these per-target knobs to pick the compiler + archiver.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y llvm clang
+          cc_bin="$(command -v clang || command -v clang-18 || true)"
+          ar_bin="$(command -v llvm-ar || command -v llvm-ar-18 || true)"
+          if [ -z "$cc_bin" ] || [ -z "$ar_bin" ]; then
+            echo "::error::could not locate llvm clang/llvm-ar after 'apt-get install llvm clang'"; exit 1
+          fi
+          if ! "$cc_bin" -print-targets | grep -q wasm32; then
+            echo "::error::$cc_bin has no wasm32 backend"; exit 1
+          fi
+          echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
+      - name: Type-check engine-wasm --features read-model (wasm32)
+        run: make engine-wasm-check-read-model
+
   nano-bernd-npm:
     name: '@nanobpm/nano-bernd (build + test)'
     runs-on: ubuntu-24.04
