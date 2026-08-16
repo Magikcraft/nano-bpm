@@ -573,7 +573,7 @@ export const getExtensionChangelog = <ThrowOnError extends boolean = false>(opti
  * Install an extension pack from npm
  */
 export const installExtension = <ThrowOnError extends boolean = false>(options: Options<InstallExtensionData, ThrowOnError>): RequestResult<InstallExtensionResponses, InstallExtensionErrors, ThrowOnError> => (options.client ?? client).post<InstallExtensionResponses, InstallExtensionErrors, ThrowOnError>({
-    url: '/extensions/changelog',
+    url: '/extensions/install',
     ...options,
     headers: {
         'Content-Type': 'application/json',

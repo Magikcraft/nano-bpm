@@ -1179,6 +1179,8 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ExtensionChangelog' }
         '404': { $ref: '#/components/responses/NotFound' }
+
+  /extensions/install:
     post:
       operationId: installExtension
       tags: [extensions]

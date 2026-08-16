@@ -215,7 +215,7 @@ export default function Extensions() {
     setChangelogErr(null);
     setChangelogDelta(false);
     setDrawerTab(tab);
-    if (tab === "changelog") void fetchChangelog(m);
+    if (tab === "changelog") void fetchChangelog(m, true);
     try {
       setReadmeMd(
         (
@@ -233,9 +233,12 @@ export default function Extensions() {
   // Lazily fetch a pack's changelog for the "What's changed" tab. For an
   // installed pack with an update available we pass the installed version so the
   // server scopes the view to the delta (installed → latest), else the full
-  // changelog. Only fetches once per drawer open.
-  const fetchChangelog = async (m: MarketEntry) => {
-    if (changelogMd !== null || changelogErr !== null) return;
+  // changelog. Guarded so a manual tab click only fetches once per drawer open;
+  // callers that have just reset the changelog state (e.g. `openReadme`) pass
+  // `force` to bypass the guard, since the state resets are async and the stale
+  // closure values would otherwise skip the fetch and wedge on "Loading…".
+  const fetchChangelog = async (m: MarketEntry, force = false) => {
+    if (!force && (changelogMd !== null || changelogErr !== null)) return;
     try {
       const res = (
         await getExtensionChangelog({
@@ -565,9 +568,12 @@ export default function Extensions() {
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
-              {(readmePkg.changelogAvailable ||
-                changelogMd !== null ||
-                changelogErr !== null) && (
+              {/* Always offer the Changelog tab, including for not-yet-installed
+                  marketplace entries: `changelogAvailable` is an installed-only
+                  offline probe, so gating on it hid the tab for market packs
+                  (and installed packs whose changelog only lives in the tarball).
+                  The server returns 404 gracefully when a pack has none. */}
+              {readmePkg && (
                 <div className="sticky top-0 z-10 flex gap-1 border-b border-edge bg-panel px-4 pt-2">
                   <button
                     type="button"

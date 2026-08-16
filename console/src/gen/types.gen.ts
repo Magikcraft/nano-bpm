@@ -3392,7 +3392,7 @@ export type InstallExtensionData = {
     body: ExtPkgRequest;
     path?: never;
     query?: never;
-    url: '/extensions/changelog';
+    url: '/extensions/install';
 };
 
 export type InstallExtensionErrors = {

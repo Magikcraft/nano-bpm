@@ -1866,17 +1866,9 @@ pub fn pack_changelog(pkg: &str, from: Option<&str>, to: Option<&str>) -> Option
 /// any failure (npm/tar missing, offline, no changelog in the tarball).
 fn fetch_published_changelog(pkg: &str, version: Option<&str>) -> Option<String> {
     // A dedicated scratch dir under the OS temp dir, torn down before we return.
-    let scratch = std::env::temp_dir().join(format!(
-        "nano-ext-changelog-{}-{}",
-        std::process::id(),
-        // A monotonic-ish suffix so concurrent probes for different packs don't
-        // collide on the same scratch dir.
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&scratch).ok()?;
+    // Use exclusive, unpredictable creation (`secure_temp_dir`) so a shared host
+    // can't win a symlink/TOCTOU race on a guessable path.
+    let scratch = secure_temp_dir("nano-ext-changelog").ok()?;
     let spec = match version.filter(|v| !v.is_empty()) {
         Some(v) => format!("{pkg}@{v}"),
         None => pkg.to_string(),
