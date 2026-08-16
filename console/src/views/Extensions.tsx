@@ -4,12 +4,20 @@ import {
   getExtensions,
   getMarketplace,
   installExtension,
+  listProjects,
   removeExtension,
   trustExtension,
   type ExtensionsOverview,
   type MarketEntry,
+  type ProjectSummary,
 } from "../gen";
 import MarkdownPreview from "../components/MarkdownPreview";
+import { useTemplateUpdate } from "../components/TemplateUpdate";
+import {
+  summarizeBatch,
+  toUpdateTarget,
+  updatableProjectsUsingPack,
+} from "../lib/templateUpdate";
 import { registerFileTypesFromOverview } from "../lib/editorLang";
 import { setIntellisenseFromOverview } from "../lib/langIntellisense";
 import { useTheme } from "../theme/ThemeProvider";
@@ -105,6 +113,42 @@ export default function Extensions() {
   const [readmeErr, setReadmeErr] = useState<string | null>(null);
   const { selection, select } = useTheme();
 
+  // Every project, so the installed section can invert the `scaffoldedFrom.pack`
+  // breadcrumb and show, per pack, which projects can now be overlaid with a
+  // newer template (the reverse index of the per-project `updateAvailable`
+  // signal). Refreshed whenever a pack is installed/updated/removed — those
+  // bump the installed pack version that decides `updateAvailable`.
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const loadProjects = async () => {
+    try {
+      setProjects((await listProjects({ throwOnError: true })).data.projects);
+    } catch {
+      /* non-fatal: the reverse index just stays empty */
+    }
+  };
+  // The shared review-and-apply flow, so a per-project "Update" here behaves
+  // exactly like the projects list and the IDE. `applyBatch` powers "Update
+  // all" (sequential, stop-and-report on conflict); the summary is shown inline.
+  const {
+    startUpdate,
+    applyBatch,
+    previewName,
+    busy: updateBusy,
+    error: updateError,
+    modals: updateModals,
+  } = useTemplateUpdate({ onApplied: () => loadProjects() });
+  const [batchSummary, setBatchSummary] = useState<{
+    pack: string;
+    updated: string[];
+    conflicted: string[];
+    errored: string[];
+  } | null>(null);
+  const updateAllForPack = async (pack: string, targets: ProjectSummary[]) => {
+    setBatchSummary(null);
+    const results = await applyBatch(targets.map(toUpdateTarget));
+    setBatchSummary({ pack, ...summarizeBatch(results) });
+  };
+
   const load = async () => {
     const next = (await getExtensions({ throwOnError: true })).data;
     setOv(next);
@@ -124,6 +168,7 @@ export default function Extensions() {
   useEffect(() => {
     void load();
     void loadMarket();
+    void loadProjects();
   }, []);
 
   // Poll the marketplace every 30s while this view is mounted so freshly
@@ -151,6 +196,9 @@ export default function Extensions() {
       await installExtension({ body: { pkg }, throwOnError: true });
       await load();
       await loadMarket();
+      // A freshly installed/updated pack version may make projects scaffolded
+      // from it eligible for a template update — refresh the reverse index.
+      await loadProjects();
     } catch (e) {
       setErr(String(e));
     } finally {
@@ -184,6 +232,7 @@ export default function Extensions() {
       await removeExtension({ body: { pkg: id }, throwOnError: true });
       await load();
       await loadMarket();
+      await loadProjects();
     } catch (e) {
       setErr(String(e));
     }
@@ -459,10 +508,25 @@ export default function Extensions() {
                   })}
                 </div>
               )}
+              <PackUpdatableProjects
+                projects={updatableProjectsUsingPack(projects, e.id)}
+                previewName={previewName}
+                busy={updateBusy}
+                summary={batchSummary?.pack === e.id ? batchSummary : undefined}
+                onUpdate={(p) => void startUpdate(toUpdateTarget(p))}
+                onUpdateAll={(targets) => void updateAllForPack(e.id, targets)}
+              />
             </Card>
           ))}
         </div>
       </CollapsibleSection>
+
+      {updateError && (
+        <div className="mt-4">
+          <ErrorText>{updateError}</ErrorText>
+        </div>
+      )}
+      {updateModals}
 
       {readmePkg && (
         <div
@@ -572,6 +636,114 @@ export default function Extensions() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/// The reverse index for one installed pack: the projects scaffolded from it
+/// that can now be overlaid with the newer template. Each row shows the recorded
+/// scaffold version → the update target and a per-project "Update" wired to the
+/// shared review-and-apply flow; "Update all" applies them in turn (stopping at
+/// the first conflict). Renders nothing when no project is affected.
+function PackUpdatableProjects({
+  projects,
+  previewName,
+  busy,
+  summary,
+  onUpdate,
+  onUpdateAll,
+}: {
+  projects: ProjectSummary[];
+  previewName: string | null;
+  busy: boolean;
+  summary?: { updated: string[]; conflicted: string[]; errored: string[] };
+  onUpdate: (project: ProjectSummary) => void;
+  onUpdateAll: (projects: ProjectSummary[]) => void;
+}) {
+  if (projects.length === 0) return null;
+  return (
+    <div className="mt-3 rounded-md border border-accent/30 bg-accent/5 p-2.5">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs font-semibold text-accent">
+          {projects.length} project{projects.length === 1 ? "" : "s"} can be
+          updated from this extension
+        </span>
+        {projects.length > 1 && (
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => onUpdateAll(projects)}
+            disabled={busy}
+          >
+            {busy ? (
+              <>
+                <Spinner /> Updating…
+              </>
+            ) : (
+              "Update all"
+            )}
+          </Button>
+        )}
+      </div>
+      <ul className="grid gap-1.5">
+        {projects.map((p) => {
+          const title = p.displayName ?? p.name;
+          const from = p.scaffoldedFrom?.version;
+          return (
+            <li
+              key={p.name}
+              className="flex items-center justify-between gap-3 rounded border border-edge bg-panel px-2.5 py-1.5"
+            >
+              <div className="min-w-0">
+                <div className="truncate text-sm text-fg" title={p.name}>
+                  {title}
+                </div>
+                <div className="text-[11px] text-fg-faint">
+                  {from ? `v${from}` : "unversioned"}
+                  {p.latestVersion ? ` → v${p.latestVersion}` : ""}
+                </div>
+              </div>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="shrink-0 border-accent/40 text-accent"
+                onClick={() => onUpdate(p)}
+                disabled={busy}
+                aria-busy={previewName === p.name}
+              >
+                {previewName === p.name ? (
+                  <>
+                    <Spinner /> Checking…
+                  </>
+                ) : (
+                  "Update"
+                )}
+              </Button>
+            </li>
+          );
+        })}
+      </ul>
+      {summary &&
+        (summary.updated.length > 0 ||
+          summary.conflicted.length > 0 ||
+          summary.errored.length > 0) && (
+          <div className="mt-2 space-y-1 text-[11px]">
+            {summary.updated.length > 0 && (
+              <p className="text-ok">✓ Updated {summary.updated.join(", ")}.</p>
+            )}
+            {summary.conflicted.length > 0 && (
+              <p className="text-danger">
+                ⚠ Conflicts in {summary.conflicted.join(", ")} — resolve by hand
+                and re-run (batch stopped here).
+              </p>
+            )}
+            {summary.errored.length > 0 && (
+              <p className="text-danger">
+                ⚠ Failed to update {summary.errored.join(", ")}.
+              </p>
+            )}
+          </div>
+        )}
     </div>
   );
 }
