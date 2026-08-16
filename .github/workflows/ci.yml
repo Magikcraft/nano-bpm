@@ -291,13 +291,13 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y llvm clang
-          cc_bin="$(command -v clang || command -v clang-18 || true)"
-          ar_bin="$(command -v llvm-ar || command -v llvm-ar-18 || true)"
+          cc_bin=""
+          for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
+            if [ -n "$c" ] && "$c" -print-targets | grep -q wasm32; then cc_bin="$c"; break; fi
+          done
+          ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
           if [ -z "$cc_bin" ] || [ -z "$ar_bin" ]; then
-            echo "::error::could not locate llvm clang/llvm-ar after 'apt-get install llvm clang'"; exit 1
-          fi
-          if ! "$cc_bin" -print-targets | grep -q wasm32; then
-            echo "::error::$cc_bin has no wasm32 backend"; exit 1
+            echo "::error::could not locate an LLVM clang with a wasm32 backend + llvm-ar after 'apt-get install llvm clang'"; exit 1
           fi
           echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
           echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
