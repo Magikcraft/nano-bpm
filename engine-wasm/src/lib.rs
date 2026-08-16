@@ -968,6 +968,12 @@ fn user_task_state_spellings() -> String {
 /// JSON object (or root `null`): a non-object root (`[]`, `"x"`, `42`, …) is
 /// rejected rather than silently treated as "no filter", matching the gateway's
 /// request parsing.
+///
+/// The field is looked up under a nested `filter` object when present
+/// (`{ "filter": { "state": … } }`, the canonical REST body shape for
+/// `UserTaskSearchQuery`) as well as at the top level (`{ "state": … }`, the
+/// convenience shorthand). A present-but-non-object `filter` is a malformed body
+/// and is rejected rather than silently ignored.
 #[cfg(feature = "read-model")]
 fn parse_state_filter(filter_json: &str, field: &str) -> Result<Option<String>, JsValue> {
     parse_state_filter_inner(filter_json, field).map_err(|e| js_err(&e))
@@ -987,7 +993,16 @@ fn parse_state_filter_inner(filter_json: &str, field: &str) -> Result<Option<Str
         serde_json::Value::Object(map) => map,
         _ => return Err("filter body must be a JSON object".to_string()),
     };
-    match obj.get(field) {
+    // The canonical REST body nests the filter fields under `filter`
+    // (`{ "filter": { "state": … } }`, matching `UserTaskSearchQuery`), so honour
+    // that shape as well as the top-level `{ "state": … }` shorthand. A
+    // present-but-non-object `filter` is malformed and is rejected.
+    let target = match obj.get("filter") {
+        None | Some(serde_json::Value::Null) => obj,
+        Some(serde_json::Value::Object(nested)) => nested,
+        Some(_) => return Err("filter `filter` must be a JSON object".to_string()),
+    };
+    match target.get(field) {
         None | Some(serde_json::Value::Null) => Ok(None),
         Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
         Some(_) => Err(format!("filter `{field}` must be a string")),
@@ -1095,10 +1110,29 @@ fn process_instance_result(row: &ProcessInstanceRow) -> serde_json::Value {
     })
 }
 
+/// The byte length beyond which `searchVariables` truncates a variable value and
+/// flags `isTruncated`, mirroring the gateway's `truncateValues`-on default. Kept
+/// in lockstep with the gateway's canonical `VARIABLE_VALUE_PREVIEW_LEN`
+/// (`server/src/main.rs`); nano's in-browser values are far shorter, so this only
+/// fires for pathologically large payloads.
+#[cfg(feature = "read-model")]
+const VARIABLE_VALUE_PREVIEW_LEN: usize = 8192;
+
 /// Serialise a [`VariableRow`] as the gateway's `VariableSearchResult` JSON shape.
-/// The in-browser engine never truncates, so `isTruncated` is always false.
+/// Long values are truncated to the preview length on a char boundary and
+/// `isTruncated` is set, mirroring the gateway, whose `truncateValues` defaults to
+/// on. (A single-variable get returns the full untruncated value there and here.)
 #[cfg(feature = "read-model")]
 fn variable_search_result(v: &VariableRow) -> serde_json::Value {
+    let (value, is_truncated) = if v.value.len() > VARIABLE_VALUE_PREVIEW_LEN {
+        let mut end = VARIABLE_VALUE_PREVIEW_LEN;
+        while !v.value.is_char_boundary(end) {
+            end -= 1;
+        }
+        (v.value[..end].to_string(), true)
+    } else {
+        (v.value.clone(), false)
+    };
     serde_json::json!({
         "name": v.name,
         "tenantId": "<default>",
@@ -1106,8 +1140,8 @@ fn variable_search_result(v: &VariableRow) -> serde_json::Value {
         "scopeKey": v.scope_key.to_string(),
         "processInstanceKey": v.instance_key.to_string(),
         "rootProcessInstanceKey": serde_json::Value::Null,
-        "value": v.value,
-        "isTruncated": false,
+        "value": value,
+        "isTruncated": is_truncated,
     })
 }
 
@@ -2954,6 +2988,11 @@ mod read_channel_tests {
         let all = parse(&eng.search_user_tasks("").unwrap());
         assert_eq!(all["items"].as_array().unwrap().len(), 1);
 
+        // The canonical nested REST body shape filters identically to the shorthand.
+        let nested = parse(&eng.search_user_tasks(r#"{"filter":{"state":"CREATED"}}"#).unwrap());
+        assert_eq!(nested["items"].as_array().unwrap().len(), 1);
+        assert_eq!(nested["items"][0]["userTaskKey"], key);
+
         // After completion the task leaves the CREATED (open) set entirely.
         eng.complete_user_task(&key, r#"{"approved":true}"#)
             .unwrap();
@@ -3017,6 +3056,86 @@ mod read_channel_tests {
         assert!(parse_state_filter_inner(r#"{"state":42}"#, "state").is_err());
         // Malformed JSON is rejected too.
         assert!(parse_state_filter_inner(r#"{"state":"#, "state").is_err());
+    }
+
+    #[test]
+    fn state_filter_honours_the_nested_rest_filter_shape() {
+        // The canonical REST body nests the filter under `filter`
+        // (`UserTaskSearchQuery`), so a caller pasting the real gateway body must
+        // filter, not silently broaden to "no filter".
+        assert_eq!(
+            parse_state_filter_inner(r#"{"filter":{"state":"CREATED"}}"#, "state").unwrap(),
+            Some("CREATED".to_string())
+        );
+        // Top-level shorthand still works.
+        assert_eq!(
+            parse_state_filter_inner(r#"{"state":"COMPLETED"}"#, "state").unwrap(),
+            Some("COMPLETED".to_string())
+        );
+        // An empty / null nested filter is "no filter", not an error.
+        assert_eq!(
+            parse_state_filter_inner(r#"{"filter":{}}"#, "state").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_state_filter_inner(r#"{"filter":null}"#, "state").unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_state_filter_inner(r#"{"filter":{"state":null}}"#, "state").unwrap(),
+            None
+        );
+        // A non-string nested value is rejected, as at the top level.
+        assert!(parse_state_filter_inner(r#"{"filter":{"state":42}}"#, "state").is_err());
+        // A present-but-non-object `filter` is malformed, not "no filter".
+        for bad in [r#"{"filter":[]}"#, r#"{"filter":"CREATED"}"#, r#"{"filter":42}"#] {
+            let err = parse_state_filter_inner(bad, "state").unwrap_err();
+            assert!(
+                err.contains("`filter` must be a JSON object"),
+                "body {bad:?} should be rejected as non-object filter, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_search_truncates_long_values_like_the_gateway() {
+        let row = |value: String| VariableRow {
+            key: 1,
+            instance_key: 2,
+            scope_key: 2,
+            name: "big".to_string(),
+            value,
+            process_definition_id: "p".to_string(),
+            process_definition_key: "3".to_string(),
+        };
+
+        // A short value passes through untouched, `isTruncated: false`.
+        let short = variable_search_result(&row("\"hi\"".to_string()));
+        assert_eq!(short["value"], "\"hi\"");
+        assert_eq!(short["isTruncated"], false);
+
+        // A value at the boundary is not truncated.
+        let at_limit = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN);
+        let boundary = variable_search_result(&row(at_limit.clone()));
+        assert_eq!(boundary["value"].as_str().unwrap().len(), VARIABLE_VALUE_PREVIEW_LEN);
+        assert_eq!(boundary["isTruncated"], false);
+
+        // One byte over the limit is truncated to the preview length and flagged.
+        let over = "a".repeat(VARIABLE_VALUE_PREVIEW_LEN + 1);
+        let truncated = variable_search_result(&row(over));
+        assert_eq!(
+            truncated["value"].as_str().unwrap().len(),
+            VARIABLE_VALUE_PREVIEW_LEN
+        );
+        assert_eq!(truncated["isTruncated"], true);
+
+        // Truncation lands on a char boundary (never splits a multi-byte char).
+        let multibyte = "é".repeat(VARIABLE_VALUE_PREVIEW_LEN); // each 'é' is 2 bytes
+        let cut = variable_search_result(&row(multibyte));
+        let out = cut["value"].as_str().unwrap();
+        assert!(out.len() <= VARIABLE_VALUE_PREVIEW_LEN);
+        assert!(out.is_char_boundary(out.len()));
+        assert_eq!(cut["isTruncated"], true);
     }
 
     #[test]
