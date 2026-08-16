@@ -3362,6 +3362,38 @@ pub(super) async fn extensions_readme(pkg: String) -> ApiResult {
     }
 }
 
+/// `GET /console/api/extensions/changelog?pkg=<name>&from=<installed>&to=<latest>`
+/// — a pack's changelog (markdown). Reads an installed pack's bundled
+/// `CHANGELOG.md`, else downloads the published registry tarball and reads it.
+/// When `from` (the installed version) is supplied and the headings parse, the
+/// result is scoped to the delta between `from` and the latest — i.e. what
+/// changed since the running version. Returns 404 when no changelog can be
+/// found. Shells out (`npm pack`), so run it off the async worker threads.
+pub(super) async fn extensions_changelog(
+    pkg: String,
+    from: Option<String>,
+    to: Option<String>,
+) -> ApiResult {
+    let name = pkg.clone();
+    match tokio::task::spawn_blocking(move || {
+        extensions::pack_changelog(&name, from.as_deref(), to.as_deref())
+    })
+    .await
+    {
+        Ok(Some(c)) => Ok(serde_json::json!({
+            "pkg": pkg,
+            "changelog": c.changelog,
+            "installed": c.installed,
+            "delta": c.delta,
+        })),
+        Ok(None) => Err((
+            StatusCode::NOT_FOUND,
+            "no changelog for that pack".to_string(),
+        )),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+    }
+}
+
 /// `GET /console/api/server/update` — server version + self-update status.
 pub(super) async fn server_update() -> ApiResult {
     Ok(

@@ -950,6 +950,10 @@ export type MarketEntry = {
      * The package's page on the npm registry.
      */
     npmUrl?: string;
+    /**
+     * True when the installed pack ships a `CHANGELOG.md`, so the console can offer a "What's changed" affordance only when there is something to show. A cheap offline probe of the installed copy — stays `false` for packs the user has not installed (their published changelog is resolved on demand via `/extensions/changelog`).
+     */
+    changelogAvailable: boolean;
 };
 
 export type Marketplace = {
@@ -966,6 +970,22 @@ export type ExtensionReadme = {
      * True when the README came from an installed pack (vs npm).
      */
     installed: boolean;
+};
+
+export type ExtensionChangelog = {
+    pkg: string;
+    /**
+     * The pack's changelog as raw markdown. Scoped to the installed→latest delta when `delta` is true, else the full changelog.
+     */
+    changelog: string;
+    /**
+     * True when the changelog came from an installed pack (vs the downloaded registry tarball).
+     */
+    installed: boolean;
+    /**
+     * True when `changelog` was narrowed to just the entries between the installed and latest versions (vs the full history).
+     */
+    delta: boolean;
 };
 
 export type ServerUpdateStatus = {
@@ -3330,11 +3350,49 @@ export type GetExtensionReadmeResponses = {
 
 export type GetExtensionReadmeResponse = GetExtensionReadmeResponses[keyof GetExtensionReadmeResponses];
 
+export type GetExtensionChangelogData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * The npm package name (e.g. `@nanobpm/nano-workforce`).
+         */
+        pkg: string;
+        /**
+         * The installed version. When present (and the headings parse) the changelog is scoped to the entries newer than this version.
+         */
+        from?: string;
+        /**
+         * The latest version to fetch when the pack is not installed locally (pins the registry tarball). Defaults to the `latest` tag.
+         */
+        to?: string;
+    };
+    url: '/extensions/changelog';
+};
+
+export type GetExtensionChangelogErrors = {
+    /**
+     * Not found
+     */
+    404: string;
+};
+
+export type GetExtensionChangelogError = GetExtensionChangelogErrors[keyof GetExtensionChangelogErrors];
+
+export type GetExtensionChangelogResponses = {
+    /**
+     * Pack changelog
+     */
+    200: ExtensionChangelog;
+};
+
+export type GetExtensionChangelogResponse = GetExtensionChangelogResponses[keyof GetExtensionChangelogResponses];
+
 export type InstallExtensionData = {
     body: ExtPkgRequest;
     path?: never;
     query?: never;
-    url: '/extensions/install';
+    url: '/extensions/changelog';
 };
 
 export type InstallExtensionErrors = {

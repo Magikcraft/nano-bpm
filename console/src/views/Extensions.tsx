@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
+  getExtensionChangelog,
   getExtensionReadme,
   getExtensions,
   getMarketplace,
@@ -103,6 +104,11 @@ export default function Extensions() {
   const [readmePkg, setReadmePkg] = useState<MarketEntry | null>(null);
   const [readmeMd, setReadmeMd] = useState<string | null>(null);
   const [readmeErr, setReadmeErr] = useState<string | null>(null);
+  // Pack-detail drawer tab + lazily-fetched changelog ("What's changed").
+  const [drawerTab, setDrawerTab] = useState<"readme" | "changelog">("readme");
+  const [changelogMd, setChangelogMd] = useState<string | null>(null);
+  const [changelogErr, setChangelogErr] = useState<string | null>(null);
+  const [changelogDelta, setChangelogDelta] = useState(false);
   const { selection, select } = useTheme();
 
   const load = async () => {
@@ -198,10 +204,18 @@ export default function Extensions() {
 
   // Open the pack-detail drawer and lazily fetch its README markdown (from the
   // installed copy, else npm). Re-fetches each open so an update's new docs show.
-  const openReadme = async (m: MarketEntry) => {
+  const openReadme = async (
+    m: MarketEntry,
+    tab: "readme" | "changelog" = "readme",
+  ) => {
     setReadmePkg(m);
     setReadmeMd(null);
     setReadmeErr(null);
+    setChangelogMd(null);
+    setChangelogErr(null);
+    setChangelogDelta(false);
+    setDrawerTab(tab);
+    if (tab === "changelog") void fetchChangelog(m);
     try {
       setReadmeMd(
         (
@@ -214,6 +228,37 @@ export default function Extensions() {
     } catch {
       setReadmeErr("No README available for this pack.");
     }
+  };
+
+  // Lazily fetch a pack's changelog for the "What's changed" tab. For an
+  // installed pack with an update available we pass the installed version so the
+  // server scopes the view to the delta (installed → latest), else the full
+  // changelog. Only fetches once per drawer open.
+  const fetchChangelog = async (m: MarketEntry) => {
+    if (changelogMd !== null || changelogErr !== null) return;
+    try {
+      const res = (
+        await getExtensionChangelog({
+          query: {
+            pkg: m.name,
+            from: m.updateAvailable
+              ? (m.installedVersion ?? undefined)
+              : undefined,
+            to: m.version,
+          },
+          throwOnError: true,
+        })
+      ).data;
+      setChangelogMd(res.changelog);
+      setChangelogDelta(res.delta);
+    } catch {
+      setChangelogErr("No changelog available for this pack.");
+    }
+  };
+
+  const selectDrawerTab = (tab: "readme" | "changelog") => {
+    setDrawerTab(tab);
+    if (tab === "changelog" && readmePkg) void fetchChangelog(readmePkg);
   };
 
   const marketCard = (m: MarketEntry) => (
@@ -245,6 +290,16 @@ export default function Extensions() {
       </div>
       {m.updateAvailable ? (
         <div className="flex shrink-0 items-center gap-3">
+          {m.changelogAvailable && (
+            <button
+              type="button"
+              onClick={() => void openReadme(m, "changelog")}
+              className="text-xs text-accent hover:underline"
+              title="See what changed between your version and the latest"
+            >
+              What's changed
+            </button>
+          )}
           <Button
             variant="secondary"
             size="sm"
@@ -510,7 +565,58 @@ export default function Extensions() {
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
-              {readmeErr ? (
+              {(readmePkg.changelogAvailable ||
+                changelogMd !== null ||
+                changelogErr !== null) && (
+                <div className="sticky top-0 z-10 flex gap-1 border-b border-edge bg-panel px-4 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => selectDrawerTab("readme")}
+                    className={`rounded-t px-3 py-1.5 text-xs font-medium ${
+                      drawerTab === "readme"
+                        ? "border-b-2 border-accent text-fg"
+                        : "text-fg-faint hover:text-fg"
+                    }`}
+                  >
+                    README
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => selectDrawerTab("changelog")}
+                    className={`rounded-t px-3 py-1.5 text-xs font-medium ${
+                      drawerTab === "changelog"
+                        ? "border-b-2 border-accent text-fg"
+                        : "text-fg-faint hover:text-fg"
+                    }`}
+                  >
+                    {readmePkg.updateAvailable ? "What's changed" : "Changelog"}
+                  </button>
+                </div>
+              )}
+              {drawerTab === "changelog" ? (
+                changelogErr ? (
+                  <div className="px-6 py-5 text-sm text-fg-faint">
+                    {changelogErr}
+                  </div>
+                ) : changelogMd === null ? (
+                  <div className="px-6 py-5 text-sm text-fg-faint">
+                    Loading changelog…
+                  </div>
+                ) : (
+                  <>
+                    {changelogDelta && (
+                      <div className="px-6 pt-4 text-xs text-fg-faint">
+                        Showing changes since your installed version
+                        {readmePkg.installedVersion
+                          ? ` (${readmePkg.installedVersion} → ${readmePkg.version})`
+                          : ""}
+                        .
+                      </div>
+                    )}
+                    <MarkdownPreview source={changelogMd} />
+                  </>
+                )
+              ) : readmeErr ? (
                 <div className="px-6 py-5 text-sm text-fg-faint">
                   {readmeErr}
                 </div>

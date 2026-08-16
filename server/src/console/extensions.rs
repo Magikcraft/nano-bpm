@@ -1546,6 +1546,12 @@ pub struct MarketEntry {
     /// The package's page on the npm registry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_url: Option<String>,
+    /// True when the installed pack ships a `CHANGELOG.md`, so the console can
+    /// offer a "What's changed" affordance only when there is something to show.
+    /// Cheap, offline probe of the installed copy — a not-installed pack's
+    /// published changelog is only resolved on demand (see [`pack_changelog`]),
+    /// so this stays `false` for packs the user has not installed.
+    pub changelog_available: bool,
 }
 
 /// Accept a URL only when it uses an `http`/`https` scheme, rejecting anything
@@ -1665,6 +1671,7 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
             let repository = links["repository"].as_str().and_then(normalize_repo_url);
             let homepage = links["homepage"].as_str().and_then(safe_http_url);
             let npm_url = links["npm"].as_str().and_then(safe_http_url);
+            let changelog_available = installed && installed_changelog_path(&name).is_some();
             MarketEntry {
                 installed,
                 version: latest,
@@ -1676,6 +1683,7 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                 repository,
                 homepage,
                 npm_url,
+                changelog_available,
                 name,
             }
         })
@@ -1780,6 +1788,195 @@ pub fn pack_readme(pkg: &str) -> Option<PackReadme> {
         readme: txt,
         installed: false,
     })
+}
+
+/// Candidate `CHANGELOG` filenames, most-common first. Shared by the
+/// installed-pack availability probe and [`pack_changelog`] so the two never
+/// drift on which names count as a changelog.
+const CHANGELOG_FILENAMES: [&str; 5] = [
+    "CHANGELOG.md",
+    "changelog.md",
+    "CHANGELOG",
+    "Changelog.md",
+    "HISTORY.md",
+];
+
+/// Path to an installed pack's bundled changelog file, if it ships one. `None`
+/// when the pack is not installed or carries no changelog. Offline, no network.
+fn installed_changelog_path(pkg: &str) -> Option<PathBuf> {
+    let dir = safe_pkg_dir(pkg).filter(|d| d.is_dir())?;
+    CHANGELOG_FILENAMES
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+}
+
+/// A pack's changelog (release notes) and where it came from — surfaced in the
+/// marketplace/update UI so a user can see *what changed* before updating.
+pub struct PackChangelog {
+    /// The changelog markdown. Scoped to the installed→latest delta when
+    /// [`PackChangelog::delta`] is true, else the full changelog.
+    pub changelog: String,
+    /// True when the changelog was read from an installed pack (vs fetched from
+    /// the registry tarball).
+    pub installed: bool,
+    /// True when `changelog` was narrowed to just the entries between the
+    /// installed and latest versions (vs the full history).
+    pub delta: bool,
+}
+
+/// The changelog (markdown) for an extension pack. For an installed pack this
+/// reads the bundled `CHANGELOG.md`; otherwise it downloads the published
+/// registry tarball (`npm pack <pkg>@<to>`) and reads the changelog from it —
+/// npm does not expose `changelog` via `npm view` the way it does `readme`.
+///
+/// When `from` (the installed version) is given and the changelog's version
+/// headings are parseable, the result is scoped to the delta between `from` and
+/// the latest — the entries newer than what the user is running — matching the
+/// "What's changed" update affordance. Falls back to the full changelog when
+/// the headings can't be parsed. `None` when no changelog can be resolved
+/// (unknown pack, ships none, or offline) — mirroring [`pack_readme`].
+pub fn pack_changelog(pkg: &str, from: Option<&str>, to: Option<&str>) -> Option<PackChangelog> {
+    // Prefer the installed copy: it matches what's running, works offline, and
+    // needs no network round-trip.
+    let (raw, installed) = if let Some(path) = installed_changelog_path(pkg) {
+        match std::fs::read_to_string(&path) {
+            Ok(txt) if !txt.trim().is_empty() => (txt, true),
+            _ => (fetch_published_changelog(pkg, to)?, false),
+        }
+    } else {
+        (fetch_published_changelog(pkg, to)?, false)
+    };
+    // Scope to the installed→latest delta when we know the installed version and
+    // the headings parse; otherwise show the whole changelog.
+    let (changelog, delta) = match from.and_then(|f| changelog_delta(&raw, f)) {
+        Some(d) => (d, true),
+        None => (raw, false),
+    };
+    Some(PackChangelog {
+        changelog,
+        installed,
+        delta,
+    })
+}
+
+/// Download a package's published registry tarball and read its changelog
+/// markdown. `version` pins the exact published version (e.g. the latest);
+/// `None` takes the registry's default (`latest`) tag. Best-effort — `None` on
+/// any failure (npm/tar missing, offline, no changelog in the tarball).
+fn fetch_published_changelog(pkg: &str, version: Option<&str>) -> Option<String> {
+    // A dedicated scratch dir under the OS temp dir, torn down before we return.
+    let scratch = std::env::temp_dir().join(format!(
+        "nano-ext-changelog-{}-{}",
+        std::process::id(),
+        // A monotonic-ish suffix so concurrent probes for different packs don't
+        // collide on the same scratch dir.
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&scratch).ok()?;
+    let spec = match version.filter(|v| !v.is_empty()) {
+        Some(v) => format!("{pkg}@{v}"),
+        None => pkg.to_string(),
+    };
+    let result = (|| {
+        npm_pack_extract(&scratch, &spec).ok()?;
+        for name in CHANGELOG_FILENAMES {
+            if let Ok(txt) = std::fs::read_to_string(scratch.join(name))
+                && !txt.trim().is_empty()
+            {
+                return Some(txt);
+            }
+        }
+        None
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// Extract the first semver-like token (`x.y.z`, optionally with a
+/// `-prerelease` / `+build` suffix) from a line. Used to read the release
+/// version out of a changelog heading like `## [1.2.3] - 2024-01-01` or
+/// `# [0.71.0](…/compare/v0.70.2...v0.71.0) (2024-…)` — the first token is the
+/// heading's own release, not the compare-range endpoints that follow.
+fn heading_version(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            let mut dots = 0;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c == b'.' {
+                    dots += 1;
+                    i += 1;
+                } else if c.is_ascii_digit() || c == b'-' || c == b'+' || c.is_ascii_alphabetic() {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // Require at least major.minor.patch so a bare year/date (e.g.
+            // `2024`) or `x.y` never masquerades as a release heading.
+            if dots >= 2 {
+                let tok = line[start..i].trim_end_matches(['.', '-']);
+                if !tok.is_empty() {
+                    return Some(tok.to_string());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Compare a changelog heading's version against a package version for
+/// equality, tolerating a leading `v` on either side (`v0.71.0` == `0.71.0`).
+fn versions_match(a: &str, b: &str) -> bool {
+    a.trim().trim_start_matches('v') == b.trim().trim_start_matches('v')
+}
+
+/// Narrow a changelog to just the entries newer than `installed` — the delta a
+/// user gains by updating. Changelogs are written newest-first (semantic-release
+/// and Keep-a-Changelog both prepend), so the entries above the installed
+/// version's heading are exactly the new ones.
+///
+/// `None` (caller falls back to the full changelog) when the changelog has no
+/// parseable version headings, the installed version's heading isn't found, or
+/// the installed version is already the newest heading (nothing new to show).
+fn changelog_delta(md: &str, installed: &str) -> Option<String> {
+    // Index each version heading by its line number, in file order.
+    let lines: Vec<&str> = md.lines().collect();
+    let headings: Vec<(usize, String)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().starts_with('#'))
+        .filter_map(|(i, l)| heading_version(l).map(|v| (i, v)))
+        .collect();
+    if headings.is_empty() {
+        return None;
+    }
+    // Position of the installed version among the headings (newest-first).
+    let pos = headings
+        .iter()
+        .position(|(_, v)| versions_match(v, installed))?;
+    // Already on the newest changelog entry — no delta to surface.
+    if pos == 0 {
+        return None;
+    }
+    // Everything from the top down to (but not including) the installed heading.
+    let end_line = headings[pos].0;
+    let delta = lines[..end_line].join("\n");
+    let trimmed = delta.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Find a program on PATH (plus the usual per-user tool bin dirs). Mirrors
@@ -2407,6 +2604,120 @@ mod tests {
         // this pkg name won't resolve on npm in the hermetic test env).
         let bare = "@nanobpm/nano-ide-trigger-bare-xyz";
         std::fs::create_dir_all(safe_pkg_dir(bare).unwrap()).unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    // A representative semantic-release CHANGELOG: newest-first, with compare
+    // URLs in the headings (so the parser must pick the heading's own version,
+    // not a compare-range endpoint).
+    const SAMPLE_CHANGELOG: &str = "\
+# [0.72.0](https://github.com/nanobpm/nano-workforce/compare/v0.71.0...v0.72.0) (2024-06-01)\n\
+\n\
+### Features\n\
+\n\
+* add the shiny new thing\n\
+\n\
+## [0.71.0](https://github.com/nanobpm/nano-workforce/compare/v0.70.2...v0.71.0) (2024-05-01)\n\
+\n\
+### Bug Fixes\n\
+\n\
+* fix the older thing\n\
+\n\
+## [0.70.2](https://github.com/nanobpm/nano-workforce/compare/v0.70.1...v0.70.2) (2024-04-01)\n\
+\n\
+* baseline release\n";
+
+    #[test]
+    fn heading_version_extracts_release_not_compare_range() {
+        // The heading's own version is the FIRST semver token, ahead of the
+        // `compare/vX...vY` endpoints that follow.
+        assert_eq!(
+            heading_version("# [0.72.0](https://x/compare/v0.71.0...v0.72.0) (2024-06-01)")
+                .as_deref(),
+            Some("0.72.0")
+        );
+        assert_eq!(
+            heading_version("## [1.2.3] - 2024-01-01").as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            heading_version("## [2.0.0-beta.1] notes").as_deref(),
+            Some("2.0.0-beta.1")
+        );
+        // A bare date/year must not masquerade as a release (needs x.y.z).
+        assert_eq!(heading_version("## Unreleased 2024"), None);
+        assert_eq!(heading_version("## [1.2] partial"), None);
+    }
+
+    #[test]
+    fn changelog_delta_scopes_to_entries_newer_than_installed() {
+        // Installed 0.70.2, latest 0.72.0 → the delta is 0.72.0 + 0.71.0, and
+        // must NOT include the installed 0.70.2 section or anything older.
+        let delta = changelog_delta(SAMPLE_CHANGELOG, "0.70.2").expect("delta");
+        assert!(delta.contains("0.72.0"));
+        assert!(delta.contains("add the shiny new thing"));
+        assert!(delta.contains("0.71.0"));
+        assert!(delta.contains("fix the older thing"));
+        assert!(!delta.contains("baseline release"));
+
+        // A leading `v` on the installed version is tolerated.
+        assert_eq!(changelog_delta(SAMPLE_CHANGELOG, "v0.70.2"), Some(delta));
+    }
+
+    #[test]
+    fn changelog_delta_falls_back_when_installed_is_newest_or_missing() {
+        // Already on the newest entry → no delta (caller shows the full log).
+        assert_eq!(changelog_delta(SAMPLE_CHANGELOG, "0.72.0"), None);
+        // Installed version not present in the changelog → None (full fallback).
+        assert_eq!(changelog_delta(SAMPLE_CHANGELOG, "0.69.0"), None);
+        // No parseable headings at all → None.
+        assert_eq!(changelog_delta("just prose, no versions", "1.0.0"), None);
+    }
+
+    #[test]
+    fn pack_changelog_reads_installed_and_scopes_delta() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-changelog-{}", std::process::id()));
+        let pkg = "@nanobpm/nano-workforce";
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        let dir = safe_pkg_dir(pkg).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CHANGELOG.md"), SAMPLE_CHANGELOG).unwrap();
+
+        // The installed pack ships a changelog → the availability probe sees it.
+        assert!(installed_changelog_path(pkg).is_some());
+
+        // Full changelog when no installed version is supplied.
+        let full = pack_changelog(pkg, None, None).expect("changelog present");
+        assert!(full.installed);
+        assert!(!full.delta);
+        assert!(full.changelog.contains("baseline release"));
+
+        // Delta-scoped when the installed version is supplied.
+        let delta = pack_changelog(pkg, Some("0.70.2"), Some("0.72.0")).expect("changelog");
+        assert!(delta.installed);
+        assert!(delta.delta);
+        assert!(delta.changelog.contains("0.72.0"));
+        assert!(!delta.changelog.contains("baseline release"));
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    #[test]
+    fn changelog_available_false_without_bundled_changelog() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("nano-ext-nochangelog-{}", std::process::id()));
+        let pkg = "@nanobpm/nano-ide-trigger-mqtt";
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        std::fs::create_dir_all(safe_pkg_dir(pkg).unwrap()).unwrap();
+
+        // Installed pack with no CHANGELOG.md → no availability, no installed
+        // changelog path.
+        assert!(installed_changelog_path(pkg).is_none());
 
         let _ = std::fs::remove_dir_all(&root);
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
