@@ -40,8 +40,13 @@ exactly this reason.
 
 ## Usage (VS Code)
 
-Build the adapter, then point a launch config at it. See
-[`examples/launch.json`](examples/launch.json):
+The one-install path is the **nanobpm.vscode-bpmn-debug** Marketplace extension.
+It bundles this adapter inline with the wasm bytes, so users do not need npm,
+`program`, or a sibling checkout.
+
+For headless clients or adapter development, build the adapter and launch the
+stdio binary (`nanobpmn-dap` / `dist/index.js`). A VS Code launch config still
+uses the `nanobpmn` debug type:
 
 ```jsonc
 {
@@ -54,8 +59,9 @@ Build the adapter, then point a launch config at it. See
 }
 ```
 
-The adapter binary is `dist/index.js` (stdio transport). A VS Code extension
-contributing the `nanobpmn` debug type would register it as its `program`.
+The adapter package is publishable as `@nanobpm/dap-adapter`. Its npm release
+workflow rewrites the local `file:../engine-wasm/pkg` dependency to the
+published `@nanobpm/engine-wasm` semver range at publish time.
 
 ## Develop
 

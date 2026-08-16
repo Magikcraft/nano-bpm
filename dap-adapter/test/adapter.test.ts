@@ -9,6 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { DebugClient } from '@vscode/debugadapter-testsupport';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import { ACTIVE_ELEMENTS_EVENT } from '../src/events.js';
+
 const ADAPTER = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 const FIXTURE = fileURLToPath(new URL('./fixtures/two-tasks.bpmn', import.meta.url));
 /** `<bpmn:startEvent id="s" />` is line 4 of the fixture. */
@@ -40,9 +42,11 @@ describe('nanobpmn DAP adapter', () => {
     expect(bp.body.breakpoints[0]?.verified).toBe(true);
 
     // configurationDone starts the run; it should stop at the start event.
+    const active = client.waitForEvent(ACTIVE_ELEMENTS_EVENT);
     const stopped = client.waitForEvent('stopped');
     await client.configurationDoneRequest();
     await launched;
+    expect((await active).body).toEqual({ elements: ['s'] });
     const stop = await stopped;
     expect(stop.body.reason).toBe('breakpoint');
     const threadId = stop.body.threadId ?? 1;

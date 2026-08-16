@@ -1,4 +1,4 @@
-# @nanobpm/vscode-bpmn-debug
+# vscode-bpmn-debug
 
 A VS Code extension that renders the BPMN **diagram** for a nanobpmn debug session
 and **highlights the element the debugger is paused on** — because for a process,
@@ -21,6 +21,10 @@ and **highlights the element the debugger is paused on** — because for a proce
   `SourceBreakpoint` at that element's source line (resolved with the same BPMN
   source map the adapter uses) — the element-anchored UX that beats text lines.
   Breakpoints set anywhere (diagram or gutter) are reflected back onto the diagram.
+- **DI-free BPMN rendering:** if a process has no `bpmndi:BPMNDiagram`, the
+  webview runs `bpmn-auto-layout` before importing it into `bpmn-js`.
+- **First-run sample:** run `nanobpmn: Create BPMN debug sample` to create a
+  deployable sample BPMN and matching `.vscode/launch.json`.
 
 ## How it wires together
 
@@ -36,21 +40,31 @@ and **highlights the element the debugger is paused on** — because for a proce
         └───── breakpoints ◄── click-to-breakpoint ◄──────────────┘
 ```
 
-The extension contributes the `nanobpmn` debug type; its adapter `program` points
-at the sibling `dap-adapter` package's `dist/index.js`.
+The Marketplace extension contributes the `nanobpmn` debug type and embeds the
+DAP adapter inline. There is no relative adapter `program` to build or install:
+esbuild bundles `@nanobpm/dap-adapter`, and `dist/nanobpmn_engine_bg.wasm` ships
+beside the extension host bundle.
+
+## Install
+
+Install **nanobpm.vscode-bpmn-debug** from the VS Code Marketplace, then:
+
+1. Open a workspace folder.
+2. Run `nanobpmn: Create BPMN debug sample`.
+3. Press **F5** and choose `Debug sample BPMN process`.
 
 ## Develop
 
 ```bash
 npm install
-npm run build      # esbuild → dist/extension.js (node) + dist/webview.js (browser)
+npm run build      # esbuild → dist/extension.js + dist/webview.js + copied wasm
 npm test           # vitest — pure protocol/marker-diff logic
 npm run typecheck  # tsc (src + test)
 ```
 
-Then press **F5** in VS Code to launch an Extension Development Host, open a
-workspace containing a `.bpmn`, and start a `nanobpmn` launch config (see the
-adapter's `examples/launch.json`).
+Then press **F5** in VS Code to launch an Extension Development Host and run the
+sample command, or open a workspace containing a `.bpmn` and start a `nanobpmn`
+launch config.
 
 > **PoC scope.** The VS Code-API glue (webview lifecycle, breakpoint toggling,
 > event forwarding) can only be exercised in an Extension Development Host, so the

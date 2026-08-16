@@ -1,22 +1,35 @@
 {
-  "name": "@nanobpm/vscode-bpmn-debug",
+  "name": "vscode-bpmn-debug",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "description": "VS Code BPMN debug view: renders the process diagram and highlights the element the nanobpmn debugger is paused on (issue #652).",
   "license": "Apache-2.0",
   "publisher": "nanobpm",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Magikcraft/nano-bpm.git",
+    "directory": "vscode-bpmn-debug"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
   "type": "commonjs",
   "main": "./dist/extension.js",
   "categories": ["Debuggers"],
-  "activationEvents": ["onDebugResolve:nanobpmn", "onCommand:nanobpmn.showDiagram"],
+  "activationEvents": [
+    "onDebugResolve:nanobpmn",
+    "onCommand:nanobpmn.showDiagram",
+    "onCommand:nanobpmn.createDebugSample"
+  ],
   "contributes": {
     "commands": [
       {
         "command": "nanobpmn.showDiagram",
         "title": "nanobpmn: Show BPMN debug diagram"
+      },
+      {
+        "command": "nanobpmn.createDebugSample",
+        "title": "nanobpmn: Create BPMN debug sample"
       }
     ],
     "breakpoints": [{ "language": "xml" }],
@@ -24,8 +37,6 @@
       {
         "type": "nanobpmn",
         "label": "nanobpmn BPMN",
-        "program": "../dap-adapter/dist/index.js",
-        "runtime": "node",
         "languages": ["xml"],
         "configurationAttributes": {
           "launch": {
@@ -62,12 +73,14 @@
   },
   "scripts": {
     "build": "node build.mjs",
+    "vscode:prepublish": "npm run build",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json",
     "pretest": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run"
   },
   "dependencies": {
     "@nanobpm/dap-adapter": "file:../dap-adapter",
+    "bpmn-auto-layout": "^1.3.0",
     "bpmn-js": "^17.0.0"
   },
   "devDependencies": {

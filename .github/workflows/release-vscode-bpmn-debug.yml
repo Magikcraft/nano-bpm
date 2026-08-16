@@ -1,0 +1,81 @@
+name: release-vscode-bpmn-debug
+
+# Triggered by tags of the form `vscode-ext-v0.1.0`. Packages and publishes the
+# nanobpm BPMN debugger extension to the VS Code Marketplace and Open VSX.
+#
+# Marketplace tokens come from GitHub Actions repository secrets (the same
+# pattern the other release workflows in this repo use). Maintainers must add:
+#   - VSCE_PAT   — Azure DevOps PAT with VS Code Marketplace publish scope
+#   - OVSX_TOKEN — Open VSX publish token
+#
+# The VSIX is self-contained: esbuild bundles the DAP adapter and the build copies
+# the wasm bytes into dist/, so packaging uses --no-dependencies.
+
+on:
+  push:
+    tags:
+      - 'vscode-ext-v*'
+  workflow_dispatch: {}
+
+jobs:
+  publish:
+    name: Publish vscode-bpmn-debug
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Install adapter workspace dependency
+        working-directory: dap-adapter
+        run: npm ci
+
+      - name: Install extension dependencies
+        working-directory: vscode-bpmn-debug
+        run: npm ci
+
+      - name: Verify tag matches package version
+        working-directory: vscode-bpmn-debug
+        run: |
+          set -euo pipefail
+          pkg_version=$(node -p "require('./package.json').version")
+          tag_version="${GITHUB_REF_NAME#vscode-ext-v}"
+          if [[ "$pkg_version" != "$tag_version" ]]; then
+            echo "::error::tag $tag_version does not match package.json version $pkg_version"
+            exit 1
+          fi
+          echo "releasing nanobpm.vscode-bpmn-debug $pkg_version"
+
+      - name: Build extension
+        working-directory: vscode-bpmn-debug
+        run: npm run build
+
+      - name: Install marketplace CLIs
+        run: npm install -g @vscode/vsce ovsx
+
+      - name: Package VSIX
+        working-directory: vscode-bpmn-debug
+        run: vsce package --no-dependencies
+
+      - name: Publish to VS Code Marketplace
+        working-directory: vscode-bpmn-debug
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: vsce publish --packagePath *.vsix -p "$VSCE_PAT"
+
+      - name: Publish to Open VSX
+        working-directory: vscode-bpmn-debug
+        env:
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+        run: ovsx publish *.vsix -p "$OVSX_TOKEN"
+
+      - name: Attach VSIX to GitHub Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: vscode-bpmn-debug/*.vsix

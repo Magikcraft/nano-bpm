@@ -11,6 +11,7 @@ import bpmnFontCss from 'bpmn-js/dist/assets/bpmn-font/css/bpmn-embedded.css';
 
 import { markerDelta } from '../protocol.js';
 import type { HostToWebview, WebviewToHost } from '../protocol.js';
+import { renderableXml } from './renderableXml.js';
 
 const ACTIVE_MARKER = 'nano-active';
 const BREAKPOINT_MARKER = 'nano-breakpoint';
@@ -59,7 +60,7 @@ function safe(fn: () => void): void {
 }
 
 async function load(xml: string): Promise<void> {
-  await viewer.importXML(xml);
+  await viewer.importXML(await renderableXml(xml));
   const canvas = viewer.get<Canvas>('canvas');
   canvas.zoom('fit-viewport');
   // Reset the highlight state for the freshly loaded diagram.
