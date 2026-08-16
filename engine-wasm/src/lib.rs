@@ -1111,11 +1111,32 @@ fn rfc3339_or_null(value: &Option<String>) -> serde_json::Value {
     }
 }
 
+/// Number of days in `month` (1-12) of `year`, honouring the proleptic Gregorian
+/// leap-year rule chrono uses (divisible by 4, except centuries not divisible by
+/// 400). Callers must pass a `month` already validated into `1..=12`; any other
+/// value falls through to 31 and is rejected by the surrounding range check.
+#[cfg(feature = "read-model")]
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        2 => {
+            if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) {
+                29
+            } else {
+                28
+            }
+        }
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
 /// True when `s` is a valid RFC-3339 `date-time` — the shape
 /// `str::parse::<chrono::DateTime<Utc>>()` accepts on the gateway:
 /// `YYYY-MM-DDThh:mm:ss`, an optional `.fraction`, and a `Z`/`±hh:mm` offset.
 /// Component ranges are checked so out-of-range values (month 13, hour 25, …) are
-/// rejected the same way chrono rejects them. Validation only (no date crate).
+/// rejected the same way chrono rejects them, including the day against the
+/// actual length of the given month/year (so `2026-02-31` is rejected and leap
+/// days like `2024-02-29` are accepted). Validation only (no date crate).
 #[cfg(feature = "read-model")]
 fn is_rfc3339_date_time(s: &str) -> bool {
     let b = s.as_bytes();
@@ -1151,13 +1172,15 @@ fn is_rfc3339_date_time(s: &str) -> bool {
     if !fixed {
         return false;
     }
+    let year = num(&b[0..4]);
     let month = num(&b[5..7]);
     let day = num(&b[8..10]);
     let hour = num(&b[11..13]);
     let min = num(&b[14..16]);
     let sec = num(&b[17..19]);
     if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
+        || day < 1
+        || day > days_in_month(year, month)
         || hour > 23
         || min > 59
         || sec > 60
@@ -3025,6 +3048,8 @@ mod read_channel_tests {
             "2026-08-16t11:36:36z",
             "2026-01-01T00:00:00+13:00",
             "2026-12-31T23:59:60-05:30",
+            "2024-02-29T00:00:00Z",
+            "2000-02-29T00:00:00Z",
         ] {
             assert!(is_rfc3339_date_time(ok), "{ok:?} should be valid");
             assert_eq!(
@@ -3042,6 +3067,11 @@ mod read_channel_tests {
             "2026-01-01T00:60:00Z",
             "2026-01-01T00:00:00.Z",
             "2026-01-01T00:00:00+24:00",
+            "2026-02-31T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2100-02-29T00:00:00Z",
+            "2026-01-00T00:00:00Z",
             "not-a-date",
             "",
         ] {
