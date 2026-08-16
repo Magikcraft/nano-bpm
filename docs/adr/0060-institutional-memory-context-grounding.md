@@ -2,7 +2,7 @@
 
 Status: Proposed
 Date: 2026-08-17
-Relates to: ADR 0051 (agent authoring brief / `/agent` + `/llms.txt`), ADR 0053 (derivation is a shared library), ADR 0040 (fused domain model / `nano:meta`), ADR 0033 §3 (worker I/O deriver), ADR 0056 (agent relay / command-stream plane), ADR 0059 (supervisor enrolment), ADR 0061 (ecosystem knowledge plane — the budgeted retrieval boundary)
+Relates to: ADR 0051 (agent authoring brief / `/agent` + `/llms.txt`), ADR 0053 (derivation is a shared library), ADR 0040 (fused domain model / `nano:meta`), ADR 0033 §3 (worker I/O deriver), ADR 0056 (agent relay / command-stream plane), ADR 0059 (supervisor enrolment), ADR 0061 (ecosystem knowledge plane — the budgeted retrieval boundary; *planned/TBD, not yet merged*)
 Repo: Magikcraft/nano-bpm (`server/src/console/agent_brief.rs`, `spec-app/`), nanobpm/nano-ide (`packages/urban`), nanobpm/nano-workforce (retro / feed-forward)
 
 ## Context
@@ -140,7 +140,7 @@ The machine-readable `system-brief.json` becomes a **first-class input** to two 
 1. **Scoping the injection.** Whole-app brief per session, or only the sub-graph reachable from the
    process/service the session touches? Start whole-app (simple, compact); add reachability-scoping
    if prompt budget bites. (The budgeted, placement-aware retrieval boundary this shares with all
-   agent prompts is specified in ADR 0061 §4.)
+   agent prompts is specified in ADR 0061 §4 — *planned/TBD, not yet merged*.)
 2. **Ownership vocabulary.** Which reserved `nano:meta` keys are blessed (`owner`, `team`, `slack`,
    `runbook`, `adr`, `since`) and how are multi-valued ones (multiple ADR refs) encoded — repeated
    `nano:meta` vs. a delimited value? Lean on repeated entries (matches the existing scan, no new
