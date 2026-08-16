@@ -9,7 +9,7 @@
 //! or record why it is left out. That gate is structurally blind to **reads**.
 //!
 //! The gateway serves a rich C8-style REST *read* surface (`getFormByKey`,
-//! `searchUserTasks({state})`, `searchProcessInstances`, `getResourceByKey`,
+//! `searchUserTasks({state})`, `searchProcessInstances`, `getResource`,
 //! `searchVariables`, …) from **secondary storage** — the SQLite read model in
 //! `server/src/readstore.rs`, fed by the read-model exporter — *not* from engine
 //! state. Those reads are plain REST handlers with **no `Query`/`Command`-style
@@ -58,6 +58,9 @@ pub(crate) enum RestRead {
     // ---- Process instances ----
     GetProcessInstance,
     SearchProcessInstances,
+    // ---- Process definitions ----
+    GetProcessDefinitionXml,
+    SearchProcessDefinitions,
     // ---- Element instances (flow nodes) ----
     GetElementInstance,
     SearchElementInstances,
@@ -70,6 +73,9 @@ pub(crate) enum RestRead {
     SearchVariables,
     // ---- Jobs ----
     SearchJobs,
+    // ---- Message subscriptions ----
+    SearchMessageSubscriptions,
+    SearchCorrelatedMessageSubscriptions,
     // ---- Incidents ----
     GetIncident,
     SearchIncidents,
@@ -124,6 +130,12 @@ pub(crate) fn classify(read: &RestRead) -> ReadSurface {
         RestRead::SearchProcessInstances => ReadSurface::NotSurfaced {
             reason: READ_CHANNEL_PENDING,
         },
+        RestRead::GetProcessDefinitionXml => ReadSurface::NotSurfaced {
+            reason: READ_CHANNEL_PENDING,
+        },
+        RestRead::SearchProcessDefinitions => ReadSurface::NotSurfaced {
+            reason: READ_CHANNEL_PENDING,
+        },
         RestRead::GetElementInstance => ReadSurface::NotSurfaced {
             reason: READ_CHANNEL_PENDING,
         },
@@ -146,6 +158,12 @@ pub(crate) fn classify(read: &RestRead) -> ReadSurface {
             reason: READ_CHANNEL_PENDING,
         },
         RestRead::SearchJobs => ReadSurface::NotSurfaced {
+            reason: READ_CHANNEL_PENDING,
+        },
+        RestRead::SearchMessageSubscriptions => ReadSurface::NotSurfaced {
+            reason: READ_CHANNEL_PENDING,
+        },
+        RestRead::SearchCorrelatedMessageSubscriptions => ReadSurface::NotSurfaced {
             reason: READ_CHANNEL_PENDING,
         },
         RestRead::GetIncident => ReadSurface::NotSurfaced {
@@ -213,6 +231,8 @@ mod tests {
         let reads = [
             RestRead::GetProcessInstance,
             RestRead::SearchProcessInstances,
+            RestRead::GetProcessDefinitionXml,
+            RestRead::SearchProcessDefinitions,
             RestRead::GetElementInstance,
             RestRead::SearchElementInstances,
             RestRead::SearchElementInstanceWaitStates,
@@ -221,6 +241,8 @@ mod tests {
             RestRead::GetVariable,
             RestRead::SearchVariables,
             RestRead::SearchJobs,
+            RestRead::SearchMessageSubscriptions,
+            RestRead::SearchCorrelatedMessageSubscriptions,
             RestRead::GetIncident,
             RestRead::SearchIncidents,
             RestRead::SearchElementInstanceIncidents,
