@@ -884,9 +884,9 @@ impl TestEngine {
     /// All variables, as a `VariableSearchQueryResult` JSON object
     /// (`{ items: [...], page: {...} }`). The request body is shape-validated like
     /// `POST /variables/search`, but filter/sort/page fields are not yet honoured —
-    /// every variable is returned. Values are always truncated to
-    /// `VARIABLE_VALUE_PREVIEW_LEN` with `isTruncated` set; there is no
-    /// `truncateValues` opt-out yet.
+    /// every variable is returned. Values longer than `VARIABLE_VALUE_PREVIEW_LEN`
+    /// are truncated with `isTruncated: true`; shorter values pass through intact
+    /// with `isTruncated: false`. There is no `truncateValues` opt-out yet.
     #[wasm_bindgen(js_name = searchVariables)]
     pub fn search_variables(&self, filter_json: &str) -> Result<String, JsValue> {
         validate_search_filter_body(filter_json)?;
