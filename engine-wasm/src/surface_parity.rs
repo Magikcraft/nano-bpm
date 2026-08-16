@@ -137,17 +137,26 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
         Command::DeployDecisionRequirements(..) => Surface::NotSurfaced {
             reason: "DMN deployment; the in-browser test engine exercises BPMN execution only",
         },
-        Command::DeployForms(..) => Surface::Surfaced {
-            // Forms are now served: deployed via the DeployResources superset
-            // (`deploy`) and read back through getFormByKey against the embedded
-            // read model.
-            js_method: "deploy/getFormByKey",
+        Command::DeployForms(..) => Surface::NotSurfaced {
+            // DeployResources is Vec<ProcessDefinition> and does NOT extract
+            // embedded forms/resources, so there is no JS deploy path: deploy(xml)
+            // emits only Command::DeployResources (BPMN process defs); DeployForms
+            // has no #[wasm_bindgen] entry (Rust-test only), so a form cannot enter
+            // the in-browser read model.
+            reason: "no JS deploy path: TestEngine::deploy(xml) emits only \
+                     Command::DeployResources (BPMN process defs); DeployForms has \
+                     no #[wasm_bindgen] entry (Rust-test only), so a form cannot \
+                     enter the in-browser read model. Surface when a deployForm JS \
+                     entry lands (see #815).",
         },
-        Command::DeployGenericResources(..) => Surface::Surfaced {
-            // Generic resources (e.g. Markdown agent prompts) are now served:
-            // deployed via the DeployResources superset (`deploy`) and read back
-            // through getResourceByKey against the embedded read model.
-            js_method: "deploy/getResourceByKey",
+        Command::DeployGenericResources(..) => Surface::NotSurfaced {
+            // DeployResources does NOT extract embedded generic resources, so there
+            // is no JS deploy path for them either.
+            reason: "no JS deploy path: deploy(xml) emits only \
+                     Command::DeployResources; DeployGenericResources has no \
+                     #[wasm_bindgen] entry, so a generic resource cannot enter the \
+                     in-browser read model. Surface when a deployResource JS entry \
+                     lands (see #815).",
         },
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
@@ -313,17 +322,19 @@ mod tests {
         ));
     }
 
-    // Forms and generic resources are now served through the embedded read model,
-    // so their deploy commands are surfaced rather than excluded.
+    // Forms and generic resources have no JS deploy path (deploy(xml) emits only
+    // Command::DeployResources, which does not extract embedded forms/resources),
+    // so their deploy commands are not surfaced until a deployForm/deployResource
+    // JS entry lands (see #815).
     #[test]
-    fn deploy_forms_and_resources_are_surfaced() {
+    fn deploy_forms_and_resources_are_not_surfaced() {
         assert!(matches!(
             classify(&Command::DeployForms(Vec::new())),
-            Surface::Surfaced { .. }
+            Surface::NotSurfaced { .. }
         ));
         assert!(matches!(
             classify(&Command::DeployGenericResources(Vec::new())),
-            Surface::Surfaced { .. }
+            Surface::NotSurfaced { .. }
         ));
     }
 
