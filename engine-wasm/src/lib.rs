@@ -26,7 +26,8 @@ use wasm_bindgen::prelude::*;
 
 /// The shared read-model surface, compiled with its in-memory wasm SQLite
 /// backend. Behind the off-by-default `read-model` feature so the baseline engine
-/// stays byte-identical; everything it touches is `#[cfg(feature = "read-model")]`.
+/// links none of the read-model/SQLite deps and keeps its lean baseline size;
+/// everything it touches is `#[cfg(feature = "read-model")]`.
 #[cfg(feature = "read-model")]
 use nanobpmn_read_model::{
     FormRow, ProcessInstanceRow, ReadStore, ResourceRow, UserTaskRow, VariableRow,
@@ -807,7 +808,7 @@ impl TestEngine {
 /// shapes the Camunda v2 REST surface returns.
 ///
 /// Behind the off-by-default `read-model` feature — the baseline engine build
-/// links none of this and stays byte-identical.
+/// links none of the read-model/SQLite deps and keeps its lean baseline size.
 #[cfg(feature = "read-model")]
 #[wasm_bindgen]
 impl TestEngine {
