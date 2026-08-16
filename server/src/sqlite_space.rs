@@ -28,8 +28,6 @@
 //! guard. [`crate::varspill`] therefore drives them from a background thread that
 //! only fires while the store is quiescent.
 
-use rusqlite::Connection;
-
 /// Reads a SQLite database's size as `(file_bytes, live_bytes)` from its header.
 ///
 /// The canonical implementation now lives in the shared `nanobpmn-read-model`
@@ -37,6 +35,7 @@ use rusqlite::Connection;
 /// here so this module — and its var-spill caller — reuse the exact same
 /// derivation with no drift. See [`nanobpmn_read_model::page_stats`].
 pub use nanobpmn_read_model::page_stats;
+use rusqlite::Connection;
 
 /// Freelist bytes currently reclaimable: `file_bytes − live_bytes` (see
 /// [`page_stats`]). O(1) header reads, cheap enough to poll.
