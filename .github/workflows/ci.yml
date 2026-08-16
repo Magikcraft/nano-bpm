@@ -296,8 +296,11 @@ jobs:
             if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
           done
           ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
-          if [ -z "$cc_bin" ] || [ -z "$ar_bin" ]; then
-            echo "::error::could not locate an LLVM clang with a wasm32 backend + llvm-ar after 'apt-get install llvm clang'"; exit 1
+          if [ -z "$cc_bin" ]; then
+            echo "::error::no LLVM clang with a wasm32 backend found after 'apt-get install llvm clang'"; exit 1
+          fi
+          if [ -z "$ar_bin" ]; then
+            echo "::error::could not locate llvm-ar after 'apt-get install llvm clang'"; exit 1
           fi
           echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
           echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
