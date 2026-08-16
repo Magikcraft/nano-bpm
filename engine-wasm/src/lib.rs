@@ -912,9 +912,11 @@ impl TestEngine {
 }
 
 /// Open a fresh in-memory read model for the test engine. `ReadStore::open(None)`
-/// uses the wasm MemoryVFS backend (an ephemeral `:memory:` SQLite); opening a
-/// pristine in-RAM database cannot fail in practice, so a failure here is an
-/// unrecoverable environment bug and is surfaced as a panic.
+/// opens an ephemeral `:memory:` SQLite on every target — backed by the wasm
+/// MemoryVFS on `wasm32` and by the native (bundled) C SQLite on host builds (the
+/// backend is selected per target in `Cargo.toml`). Opening a pristine in-RAM
+/// database cannot fail in practice, so a failure here is an unrecoverable
+/// environment bug and is surfaced as a panic.
 #[cfg(feature = "read-model")]
 fn open_read_model() -> ReadStore {
     ReadStore::open(None).expect("open in-memory read model")
