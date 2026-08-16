@@ -35,11 +35,24 @@ use nanobpmn_read_model::{
 /// `console.error` binding used to surface (never abort on) best-effort read-model
 /// projection failures, so a broken projection is debuggable instead of silently
 /// serving stale/empty read results. Zero new crate deps — a direct JS binding.
-#[cfg(feature = "read-model")]
+///
+/// The JS import only exists on the `wasm32` target; the host build (used by
+/// `cargo test --features read-model`) has no JS runtime, so calling the import
+/// there would abort. A native `eprintln!` fallback keeps the same
+/// never-abort contract off-wasm.
+#[cfg(all(feature = "read-model", target_arch = "wasm32"))]
 #[wasm_bindgen]
 extern "C" {
     #[wasm_bindgen(js_namespace = console, js_name = error)]
     fn console_error(msg: &str);
+}
+
+/// Native fallback for the `console.error` binding on non-wasm targets (host
+/// tests), where the JS import is absent. Logs to stderr so the never-abort
+/// contract holds off-wasm too.
+#[cfg(all(feature = "read-model", not(target_arch = "wasm32")))]
+fn console_error(msg: &str) {
+    eprintln!("{msg}");
 }
 
 /// Compile-time parity gate: an exhaustive match over `engine-core`'s `Command`
