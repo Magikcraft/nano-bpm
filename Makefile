@@ -258,7 +258,8 @@ console-frontend: console-wasm ## Build the web console SPA (console/ -> console
 
 .PHONY: console-wasm
 console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine-wasm/pkg, the @nanobpm/engine-wasm package). Builds BOTH subpath variants: lean (pkg/lean) and read-model (pkg/readmodel). Needs wasm-pack; the read-model build also needs an LLVM clang with a wasm backend (see below). Falls back to the committed artifacts if wasm-pack is absent.
-	@if command -v wasm-pack >/dev/null 2>&1; then \
+	@set -e; \
+	if command -v wasm-pack >/dev/null 2>&1; then \
 		echo "Regenerating engine-wasm/pkg (@nanobpm/engine-wasm) via wasm-pack (lean + read-model)..."; \
 		echo "  -> lean  (pkg/lean)"; \
 		cd $(PROJECT_ROOT)/engine-wasm && wasm-pack build --target web --release --no-pack --out-dir pkg/lean --out-name nanobpmn_engine \

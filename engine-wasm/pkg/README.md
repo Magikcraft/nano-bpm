@@ -3,7 +3,7 @@
 The nanobpmn engine (`engine-core`) compiled to **WebAssembly** for in-browser
 BPMN execution. Deploy a diagram, start instances, activate/complete jobs, drive
 the virtual clock, and read live snapshots/traces — all client-side, with no
-gateway. It is the substrate for the [Bojtos](https://github.com/Magikcraft/nano-bpm)
+gateway. It is the substrate for the [Bojtos](https://github.com/nanobpm/bojtos)
 demo framework (ADR 0043) and the console test-run panel.
 
 The package ships **two independent engines** from one install, selectable by
