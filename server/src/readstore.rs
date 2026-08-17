@@ -29,23 +29,45 @@ use nanobpmn_engine_core::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// The read store is a *derived* projection, so its on-disk schema needs no
-/// hand-maintained version number to bump — and that number was exactly the
-/// thing that drifted: columns were added to [`SCHEMA`] without incrementing it,
-/// so a live database kept a "matching" version yet lacked the new columns, and
-/// the first query for one panicked (poisoning the connection mutex, which
-/// bricked every subsequent read — metrics, explorer, everything).
+/// Monotonic read-model schema version, recorded in `meta(schema_version)`.
 ///
-/// Instead the schema *identity* is **derived** from [`SCHEMA`]: a stable
-/// content fingerprint. Any edit to `SCHEMA` — a new column, table, or type —
-/// changes the fingerprint, so [`ReadStore::ensure_schema`] recreates the
-/// projection automatically on the next open. There is nothing to remember to
-/// bump and nothing to keep in sync, so this drift class cannot recur.
+/// **Bump this by one whenever [`SCHEMA`] changes** (the CI drift guard
+/// `schema_edit_requires_version_bump` fails the build if you forget). It lets an
+/// already-current database short-circuit the additive reconcile on open, and it
+/// is the monotonic ladder the issue #831 fix is built around.
+const SCHEMA_VERSION: i64 = 1;
+
+/// The content fingerprint of [`SCHEMA`] as of the current [`SCHEMA_VERSION`].
 ///
-/// FNV-1a (64-bit) is used because it is dependency-free and deterministic
-/// across runs, Rust versions, and architectures — unlike `DefaultHasher`,
-/// whose algorithm may change between toolchains and would then spuriously
-/// rebuild every store on a compiler upgrade.
+/// This is **only** a CI/test drift assertion — the guard test
+/// `schema_edit_requires_version_bump` asserts `schema_fingerprint()` still
+/// equals this constant, so any edit to `SCHEMA` fails the build until the author
+/// bumps [`SCHEMA_VERSION`] and refreshes this value. It is **never** a runtime
+/// wipe trigger (that destructive behaviour was the root cause of issue #831).
+#[cfg(test)]
+const SCHEMA_FINGERPRINT: i64 = 7783537158940815705;
+
+/// The read model is a SQLite projection of the engine's event stream. Its
+/// on-disk schema used to be identified by a content fingerprint of [`SCHEMA`],
+/// and **any** edit to `SCHEMA` (even a purely additive column) made
+/// [`ReadStore::ensure_schema`] DROP every table and recreate from scratch on the
+/// next open. That was the root cause of issue #831: once the journal has
+/// compacted (the steady state), a wiped read model sits below the compaction
+/// floor, so the #732 boot recovery can only reproject *live* instances from the
+/// engine snapshot — every completed/terminal instance, which lived **only** in
+/// the read model, is silently and unrecoverably lost. It recurred on every
+/// schema-changing release.
+///
+/// The schema now evolves via **non-destructive additive migration**
+/// ([`ReadStore::reconcile_to_schema`]): on open the live database is brought
+/// *up to* [`SCHEMA`] by adding any missing tables, columns and indexes
+/// (`CREATE TABLE`, `ALTER TABLE ADD COLUMN`, `CREATE INDEX`) — **existing rows
+/// are never dropped**. The target shape is *derived* from `SCHEMA` itself
+/// (introspected from a throwaway in-memory database built from it), so there is
+/// no hand-maintained migration ladder to drift out of sync: adding a column or
+/// table to `SCHEMA` *is* the migration. Destructive rebuild is reserved for the
+/// explicit [`ReadStore::reset`] path (a corrupt/truncated journal forcing a full
+/// replay), where a reprojection restores the data anyway.
 fn schema_fingerprint() -> i64 {
     fnv1a_64(SCHEMA.as_bytes())
 }
@@ -256,6 +278,268 @@ CREATE TABLE resources (
 );
 CREATE INDEX idx_resources_id ON resources(resource_id);
 ";
+
+// --- read-model schema migration (issue #831) ---
+//
+// The additive-migration machinery below is deliberately *derivation-based*: the
+// target shape is introspected from a throwaway in-memory database built from
+// [`SCHEMA`], so there is a single source of truth (`SCHEMA`) and no
+// hand-maintained migration ladder that could drift out of sync with it.
+
+/// A column as reported by `PRAGMA table_info` — enough to reconstruct a legal
+/// `ALTER TABLE ADD COLUMN` for any *additive* column.
+struct ColumnShape {
+    name: String,
+    decl_type: String,
+    notnull: bool,
+    dflt: Option<String>,
+}
+
+/// The introspected shape of a database: table name -> (create statement, columns
+/// in declared order), plus non-auto index name -> create statement.
+struct SchemaShape {
+    tables: std::collections::BTreeMap<String, (String, Vec<ColumnShape>)>,
+    indexes: std::collections::BTreeMap<String, String>,
+}
+
+/// Introspects the shape of the database behind `conn` (its user tables, their
+/// columns, and their explicit indexes).
+fn introspect_shape(conn: &Connection) -> rusqlite::Result<SchemaShape> {
+    let mut tables = std::collections::BTreeMap::new();
+    let table_meta: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (name, create_sql) in table_meta {
+        let mut cols = Vec::new();
+        let mut stmt = conn.prepare(&format!(
+            "PRAGMA table_info(\"{}\")",
+            name.replace('"', "\"\"")
+        ))?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ColumnShape {
+                name: r.get::<_, String>(1)?,
+                decl_type: r.get::<_, String>(2)?,
+                notnull: r.get::<_, i64>(3)? != 0,
+                dflt: r.get::<_, Option<String>>(4)?,
+            })
+        })?;
+        for col in rows {
+            cols.push(col?);
+        }
+        tables.insert(name, (create_sql, cols));
+    }
+    let mut indexes = std::collections::BTreeMap::new();
+    {
+        // Only indexes with an explicit `sql` (created by a CREATE INDEX
+        // statement); auto-indexes backing UNIQUE/PRIMARY KEY have a NULL sql and
+        // are recreated implicitly with their table.
+        let mut stmt = conn.prepare(
+            "SELECT name, sql FROM sqlite_master \
+             WHERE type = 'index' AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        for row in rows {
+            let (name, sql) = row?;
+            indexes.insert(name, sql);
+        }
+    }
+    Ok(SchemaShape { tables, indexes })
+}
+
+/// The introspected shape of [`SCHEMA`], built by executing it into a throwaway
+/// in-memory database. This is the migration *target* (single source of truth).
+fn target_shape() -> rusqlite::Result<SchemaShape> {
+    let conn = Connection::open_in_memory()?;
+    conn.execute_batch(SCHEMA)?;
+    introspect_shape(&conn)
+}
+
+/// Non-destructively brings the live database at `conn` up to [`SCHEMA`]: creates
+/// any missing table, adds any missing column (`ALTER TABLE ADD COLUMN`), and
+/// creates any missing index. **Never drops or rewrites existing data** — this is
+/// the core of the issue #831 fix. Idempotent: a partially-applied run is
+/// completed on the next open.
+fn reconcile_to_schema(conn: &Connection) -> rusqlite::Result<()> {
+    let target = target_shape()?;
+    let live = introspect_shape(conn)?;
+    let mut ddl = String::new();
+    for (table, (create_sql, target_cols)) in &target.tables {
+        match live.tables.get(table) {
+            None => {
+                // Missing table: create it verbatim from the target statement,
+                // preserving UNIQUE / AUTOINCREMENT / PRIMARY KEY that a
+                // reconstructed DDL would lose.
+                ddl.push_str(create_sql);
+                ddl.push_str(";\n");
+            }
+            Some((_, live_cols)) => {
+                let have: std::collections::HashSet<&str> =
+                    live_cols.iter().map(|c| c.name.as_str()).collect();
+                for col in target_cols {
+                    if !have.contains(col.name.as_str()) {
+                        ddl.push_str(&add_column_ddl(table, col));
+                        ddl.push('\n');
+                    }
+                }
+            }
+        }
+    }
+    for (name, create_sql) in &target.indexes {
+        if !live.indexes.contains_key(name) {
+            ddl.push_str(create_sql);
+            ddl.push_str(";\n");
+        }
+    }
+    if !ddl.is_empty() {
+        conn.execute_batch(&ddl)?;
+    }
+    Ok(())
+}
+
+/// Builds a legal `ALTER TABLE ADD COLUMN` for an additive column. SQLite
+/// requires a NOT NULL column added to a (possibly non-empty) table to carry a
+/// non-NULL default; an additive `SCHEMA` change must therefore give new NOT NULL
+/// columns a `DEFAULT`, which this faithfully reproduces from the target shape.
+fn add_column_ddl(table: &str, col: &ColumnShape) -> String {
+    let mut s = format!(
+        "ALTER TABLE \"{}\" ADD COLUMN \"{}\" {}",
+        table.replace('"', "\"\""),
+        col.name.replace('"', "\"\""),
+        col.decl_type
+    );
+    if let Some(d) = &col.dflt {
+        s.push_str(" DEFAULT ");
+        s.push_str(d);
+    }
+    if col.notnull {
+        s.push_str(" NOT NULL");
+    }
+    s.push(';');
+    s
+}
+
+/// User tables (excluding SQLite's internal `sqlite_%` tables) present in `conn`.
+fn list_user_tables(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master \
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    names.collect::<rusqlite::Result<Vec<_>>>()
+}
+
+/// Drops every user table in `conn` (derived from `sqlite_master`, so it can
+/// never fall behind `SCHEMA`). Used only by the destructive [`ReadStore::reset`].
+fn drop_all_user_tables(conn: &Connection) -> rusqlite::Result<()> {
+    let mut drop_sql = String::new();
+    for name in list_user_tables(conn)? {
+        drop_sql.push_str(&format!(
+            "DROP TABLE IF EXISTS \"{}\";",
+            name.replace('"', "\"\"")
+        ));
+    }
+    if !drop_sql.is_empty() {
+        conn.execute_batch(&drop_sql)?;
+    }
+    Ok(())
+}
+
+/// Creates the full [`SCHEMA`] on an empty database and stamps the current
+/// version/fingerprint with `exported_position = 0`.
+fn create_fresh_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(SCHEMA)?;
+    conn.execute(
+        "INSERT INTO meta (k, v) VALUES ('schema_version', ?1) \
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        params![SCHEMA_VERSION],
+    )?;
+    conn.execute(
+        "INSERT INTO meta (k, v) VALUES ('schema_fingerprint', ?1) \
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        params![schema_fingerprint()],
+    )?;
+    conn.execute(
+        "INSERT INTO meta (k, v) VALUES ('exported_position', 0) \
+         ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+        [],
+    )?;
+    Ok(())
+}
+
+// --- durable terminal-audit archive (issue #831) ---
+//
+// Completed/terminal instances live ONLY in the read model, so a below-floor
+// snapshot reprojection (#732 — which recovers only *live* instances from the
+// engine snapshot) silently loses them. The archive is a co-located SQLite file
+// sharing [`SCHEMA`] (so it evolves via the same additive migrations and is never
+// destructively wiped) into which terminal instances are copied as they become
+// terminal, and replayed back on top of a reprojection.
+
+/// Instance-scoped dependent tables copied alongside a terminal
+/// `process_instances` row (keyed by `instance_key`).
+const TERMINAL_ARCHIVE_DEP_TABLES: [&str; 3] = ["user_tasks", "variables", "decision_instances"];
+
+/// Attaches the terminal-audit archive database at `archive` to `conn` under the
+/// schema name `terminal_archive`. The filename is bound as a parameter so no
+/// path escaping is needed.
+fn attach_archive(conn: &Connection, archive: &Path) -> rusqlite::Result<()> {
+    conn.execute(
+        "ATTACH DATABASE ?1 AS terminal_archive",
+        params![archive.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
+/// Copies the given terminal instances (and their instance-scoped dependent rows)
+/// from the live store on `conn` into the durable archive at `archive`
+/// (`INSERT OR REPLACE`, append-only in effect since keys are unique and
+/// monotonic). Runs outside the export transaction as autocommit statements: the
+/// archive is a best-effort durability backstop, so cross-file atomicity is not
+/// required (a torn capture is simply re-captured, and reprojection degrades to
+/// the prior #732 behaviour for anything unarchived).
+fn copy_terminal_to_archive(
+    conn: &Connection,
+    archive: &Path,
+    keys: &[Key],
+) -> rusqlite::Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    let in_list = keys
+        .iter()
+        .map(|k| k.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    attach_archive(conn, archive)?;
+    let result = (|| -> rusqlite::Result<()> {
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO terminal_archive.process_instances \
+                 SELECT * FROM main.process_instances WHERE key IN ({in_list})"
+            ),
+            [],
+        )?;
+        for table in TERMINAL_ARCHIVE_DEP_TABLES {
+            conn.execute(
+                &format!(
+                    "INSERT OR REPLACE INTO terminal_archive.{table} \
+                     SELECT * FROM main.{table} WHERE instance_key IN ({in_list})"
+                ),
+                [],
+            )?;
+        }
+        Ok(())
+    })();
+    // Always detach, even on error, so a later attach does not fail with
+    // "database terminal_archive is already in use".
+    let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
+    result
+}
 
 // --- enum <-> integer code mappings (kept beside the engine enums) ---
 
@@ -817,6 +1101,15 @@ pub struct ReadStore {
     /// evict on an independent schedule, rather than competing for CPU with
     /// projection inside the single exporter thread.
     path: Option<PathBuf>,
+    /// Path of the co-located **durable terminal-audit archive** (issue #831), or
+    /// `None` for `:memory:` stores and for the archive store itself (which never
+    /// nests an archive). Completed/terminal instances are copied here as they
+    /// become terminal, so that history survives a below-floor snapshot
+    /// reprojection (#732) — the reprojection only recovers *live* instances from
+    /// the engine snapshot, and terminal instances lived **only** in the read
+    /// model. See [`ReadStore::archive_terminal_instances`] /
+    /// [`ReadStore::replay_terminal_archive`].
+    archive_path: Option<PathBuf>,
 }
 
 /// Result of projecting a batch of events into the read model.
@@ -886,6 +1179,28 @@ impl ReadStore {
     /// that cannot be read) is dropped and recreated, so a rebuild from the
     /// journal repopulates it.
     pub fn open(path: Option<&Path>) -> rusqlite::Result<Self> {
+        Self::open_inner(path, true)
+    }
+
+    /// Co-located durable terminal-audit archive path for a read-model file:
+    /// `read-model.sqlite` -> `read-model.terminal-archive.sqlite` (issue #831).
+    fn terminal_archive_path(base: &Path) -> PathBuf {
+        let stem = base
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "read-model".into());
+        let name = match base.extension() {
+            Some(ext) => format!("{stem}.terminal-archive.{}", ext.to_string_lossy()),
+            None => format!("{stem}.terminal-archive"),
+        };
+        base.with_file_name(name)
+    }
+
+    /// Opens the read store. When `with_archive` and the store is file-backed, a
+    /// co-located durable terminal-audit archive is opened once (creating/migrating
+    /// its schema — it shares [`SCHEMA`], so it benefits from the same additive
+    /// migrations and is never destructively wiped) and its path is retained.
+    fn open_inner(path: Option<&Path>, with_archive: bool) -> rusqlite::Result<Self> {
         let conn = match path {
             Some(p) => Connection::open(p)?,
             None => Connection::open_in_memory()?,
@@ -920,10 +1235,21 @@ impl ReadStore {
             conn.pragma_update(None, "wal_autocheckpoint", read_wal_autocheckpoint_pages())?;
             conn.busy_timeout(std::time::Duration::from_secs(5))?;
         }
+        let archive_path = match (with_archive, path) {
+            (true, Some(p)) => {
+                let ap = Self::terminal_archive_path(p);
+                // Open once to create/migrate the archive schema and prove it is
+                // writable, then drop the connection — capture/replay re-attach it.
+                Self::open_inner(Some(&ap), false)?;
+                Some(ap)
+            }
+            _ => None,
+        };
         let store = Self {
             conn: Mutex::new(conn),
             write_lock: Mutex::new(()),
             path: path.map(|p| p.to_path_buf()),
+            archive_path,
         };
         store.ensure_schema()?;
         // A persistent store whose schema already matched is opened without any
@@ -933,6 +1259,11 @@ impl ReadStore {
         // model. Probe writability now so that case fails fast at startup.
         if path.is_some() {
             store.check_writable()?;
+        }
+        // One-time capture of any terminal history that predates the archive, so
+        // it is durable from the first boot of this fix (issue #831).
+        if with_archive && path.is_some() {
+            store.backfill_terminal_archive();
         }
         Ok(store)
     }
@@ -949,53 +1280,70 @@ impl ReadStore {
 
     fn ensure_schema(&self) -> rusqlite::Result<()> {
         let conn = self.conn.lock().expect("read store poisoned");
-        let want = schema_fingerprint();
-        let current: Option<i64> = conn
-            .query_row(
-                "SELECT v FROM meta WHERE k = 'schema_fingerprint'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()
-            .unwrap_or(None);
-        if current == Some(want) {
+        Self::ensure_schema_on(&conn)
+    }
+
+    /// Brings the database at `conn` up to [`SCHEMA`] **non-destructively**
+    /// (issue #831). Three cases:
+    ///
+    /// * **Fresh** (no user tables): create the whole schema from [`SCHEMA`] and
+    ///   stamp `schema_version`/`exported_position = 0`.
+    /// * **Already current** (`meta.schema_version == SCHEMA_VERSION`): nothing to
+    ///   do — the fast path on every warm restart.
+    /// * **Older, or a legacy fingerprint-only database**: additively reconcile
+    ///   the live schema up to [`SCHEMA`] (add missing tables/columns/indexes,
+    ///   never dropping data) and stamp the new version. `exported_position` is
+    ///   preserved, so the projection is **not** reset below the compaction floor
+    ///   — this is exactly the case that used to wipe completed history.
+    fn ensure_schema_on(conn: &Connection) -> rusqlite::Result<()> {
+        let user_tables = list_user_tables(conn)?;
+        if user_tables.is_empty() {
+            create_fresh_schema(conn)?;
             return Ok(());
         }
-        // Fresh, or a stale/foreign schema: (re)create from scratch. The read
-        // store is a derived projection rebuilt from the journal, so wiping it is
-        // always safe. We drop *every* existing user table discovered in
-        // `sqlite_master` rather than a hand-maintained list: a static list
-        // silently drifts as `SCHEMA` gains tables (it previously omitted the
-        // `decision_*` tables), and a missed drop makes the subsequent
-        // `CREATE TABLE` fail with "table already exists", bricking startup. This
-        // is the durable structural guard against that drift class — the drop set
-        // is derived from the live database, so it can never fall behind `SCHEMA`.
-        let existing_tables: Vec<String> = {
-            let mut stmt = conn.prepare(
-                "SELECT name FROM sqlite_master \
-                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-            )?;
-            let names = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            names.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut drop_sql = String::new();
-        for name in &existing_tables {
-            // Names come from sqlite_master (our own tables); quote defensively.
-            drop_sql.push_str(&format!(
-                "DROP TABLE IF EXISTS \"{}\";",
-                name.replace('"', "\"\"")
-            ));
+        let stored_version: Option<i64> = conn
+            .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap_or(None);
+        if stored_version == Some(SCHEMA_VERSION) {
+            return Ok(());
         }
-        if !drop_sql.is_empty() {
-            conn.execute_batch(&drop_sql)?;
+        // Older (or legacy fingerprint-only) database: migrate forward without
+        // dropping any data. If the live schema is genuinely incompatible with an
+        // additive migration (e.g. a foreign table missing a NOT NULL column that
+        // cannot be back-filled), fall back to a destructive rebuild — the #732
+        // below-floor recovery then reprojects live instances from the engine
+        // snapshot. Additive evolution (the common case) never reaches this.
+        if let Err(migrate_err) = reconcile_to_schema(conn) {
+            tracing::warn!(
+                error = %migrate_err,
+                "read-model schema could not be additively migrated to the current \
+                 version; rebuilding from scratch (live instances are recovered by the \
+                 engine-snapshot reprojection, issue #732/#831)"
+            );
+            drop_all_user_tables(conn)?;
+            create_fresh_schema(conn)?;
+            return Ok(());
         }
-        conn.execute_batch(SCHEMA)?;
+        // Stamp version monotonically (never downgrade a database written by a
+        // newer binary) and keep the fingerprint row in sync for tooling. Seed
+        // `exported_position` only if absent — a warm database keeps its cursor,
+        // so the projection is never reset below the compaction floor.
+        let new_version = stored_version.map_or(SCHEMA_VERSION, |v| v.max(SCHEMA_VERSION));
         conn.execute(
-            "INSERT INTO meta (k, v) VALUES ('schema_fingerprint', ?1)",
-            params![want],
+            "INSERT INTO meta (k, v) VALUES ('schema_version', ?1) \
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![new_version],
         )?;
         conn.execute(
-            "INSERT INTO meta (k, v) VALUES ('exported_position', 0)",
+            "INSERT INTO meta (k, v) VALUES ('schema_fingerprint', ?1) \
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            params![schema_fingerprint()],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO meta (k, v) VALUES ('exported_position', 0)",
             [],
         )?;
         Ok(())
@@ -1044,27 +1392,21 @@ impl ReadStore {
         Ok(())
     }
 
-    /// Drops and recreates the schema, resetting `exported_position` to 0. Used
-    /// when the persisted position is ahead of the journal (a corrupt or
-    /// truncated log), forcing a full rebuild by replay.
+    /// Drops **every** user table and recreates the schema from scratch,
+    /// resetting `exported_position` to 0. This is the sole remaining
+    /// *destructive* rebuild path (contrast [`ReadStore::ensure_schema`], which is
+    /// now additive — issue #831). It is used only when the persisted position is
+    /// ahead of the journal (a corrupt or truncated log), forcing a full rebuild
+    /// by replay, or by the below-floor reprojection recovery (issue #732), which
+    /// immediately reseeds from the authoritative engine snapshot afterwards.
+    ///
+    /// The drop set is derived from `sqlite_master` (not a hand-maintained list,
+    /// which silently drifts as `SCHEMA` gains tables), so it can never fall
+    /// behind `SCHEMA`.
     pub fn reset(&self) -> rusqlite::Result<()> {
-        {
-            let conn = self.conn.lock().expect("read store poisoned");
-            conn.execute_batch(
-                "DROP TABLE IF EXISTS process_definitions;
-                 DROP TABLE IF EXISTS process_instances;
-                 DROP TABLE IF EXISTS jobs;
-                 DROP TABLE IF EXISTS incidents;
-             DROP TABLE IF EXISTS user_tasks;
-                 DROP TABLE IF EXISTS variables;
-             DROP TABLE IF EXISTS definition_elements;
-             DROP TABLE IF EXISTS element_instances;
-             DROP TABLE IF EXISTS message_subscriptions;
-                 DROP TABLE IF EXISTS correlated_message_subscriptions;
-             DROP TABLE IF EXISTS meta;",
-            )?;
-        }
-        self.ensure_schema()?;
+        let conn = self.conn.lock().expect("read store poisoned");
+        drop_all_user_tables(&conn)?;
+        create_fresh_schema(&conn)?;
         Ok(())
     }
 
@@ -1105,10 +1447,130 @@ impl ReadStore {
             params![events.len() as i64],
         )?;
         tx.commit()?;
+        // Durably archive any newly-terminal instances (issue #831) so their
+        // audit history survives a below-floor snapshot reprojection, which can
+        // only recover *live* instances from the engine snapshot. Best-effort: a
+        // capture failure must never fail the (already-committed) projection or
+        // stall the exporter, so it is logged and swallowed — the read model still
+        // holds the terminal rows until they are pruned, and the next reprojection
+        // path degrades to the prior (#732) behaviour for anything unarchived.
+        if !terminal_keys.is_empty()
+            && let Some(archive) = &self.archive_path
+            && let Err(e) = copy_terminal_to_archive(&conn, archive, &terminal_keys)
+        {
+            tracing::warn!(
+                error = %e,
+                count = terminal_keys.len(),
+                "failed to write terminal instances to the durable audit archive \
+                 (issue #831); the read model still holds them until pruned"
+            );
+        }
         Ok(ExportOutcome {
             terminal_keys,
             inflight_delta,
         })
+    }
+
+    /// Copies every terminal instance currently in the read model into the
+    /// durable archive **once** (issue #831), gated by a `meta` flag so it runs a
+    /// single time per (re)built read model. This captures history that completed
+    /// *before* the archive existed — the exact merlin.local data that was
+    /// unrecoverable — so it becomes durable on the first boot of a binary carrying
+    /// this fix, not only for instances that complete afterwards. Best-effort: a
+    /// failure is logged and swallowed so it never blocks startup.
+    fn backfill_terminal_archive(&self) {
+        let Some(archive) = &self.archive_path else {
+            return;
+        };
+        let conn = self.conn.lock().expect("read store poisoned");
+        let done: i64 = conn
+            .query_row(
+                "SELECT v FROM meta WHERE k = 'terminal_archive_backfilled'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None)
+            .unwrap_or(0);
+        if done != 0 {
+            return;
+        }
+        let result = (|| -> rusqlite::Result<()> {
+            attach_archive(&conn, archive)?;
+            let copy = (|| -> rusqlite::Result<()> {
+                conn.execute(
+                    "INSERT OR IGNORE INTO terminal_archive.process_instances \
+                     SELECT * FROM main.process_instances WHERE state IN (1, 2)",
+                    [],
+                )?;
+                for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                    conn.execute(
+                        &format!(
+                            "INSERT OR IGNORE INTO terminal_archive.{table} \
+                             SELECT * FROM main.{table} WHERE instance_key IN \
+                             (SELECT key FROM main.process_instances WHERE state IN (1, 2))"
+                        ),
+                        [],
+                    )?;
+                }
+                Ok(())
+            })();
+            let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
+            copy?;
+            conn.execute(
+                "INSERT INTO meta (k, v) VALUES ('terminal_archive_backfilled', 1) \
+                 ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+                [],
+            )?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            tracing::warn!(
+                error = %e,
+                "failed to backfill pre-existing terminal history into the durable \
+                 audit archive (issue #831); newly-completing instances are still archived"
+            );
+        }
+    }
+
+    /// Replays the durable terminal-audit archive (issue #831) into this shard,
+    /// restoring completed/terminal instances (and their user tasks, variables and
+    /// decision evaluations) that a snapshot reprojection could not recover from
+    /// the live-only engine snapshot. `INSERT OR IGNORE` so a live row from the
+    /// snapshot is never clobbered by an older archived copy. Returns the number
+    /// of process instances restored. A no-op for `:memory:` stores or when the
+    /// archive file does not yet exist.
+    pub fn replay_terminal_archive(&self) -> rusqlite::Result<usize> {
+        let Some(archive) = &self.archive_path else {
+            return Ok(0);
+        };
+        if !archive.exists() {
+            return Ok(0);
+        }
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("read store write lock poisoned");
+        let conn = self.conn.lock().expect("read store poisoned");
+        attach_archive(&conn, archive)?;
+        let restored = (|| -> rusqlite::Result<usize> {
+            let n = conn.execute(
+                "INSERT OR IGNORE INTO main.process_instances \
+                 SELECT * FROM terminal_archive.process_instances",
+                [],
+            )?;
+            for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                conn.execute(
+                    &format!(
+                        "INSERT OR IGNORE INTO main.{table} SELECT * FROM terminal_archive.{table}"
+                    ),
+                    [],
+                )?;
+            }
+            Ok(n)
+        })();
+        let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
+        restored
     }
 
     /// Rebuilds this (reset) shard's rows from a boot engine [`State`] snapshot,
@@ -4463,6 +4925,130 @@ mod writability_tests {
     }
 
     #[test]
+    fn schema_edit_requires_version_bump() {
+        // CI drift guard (issue #831): the fingerprint is no longer a runtime wipe
+        // trigger, but it still pins SCHEMA to a recorded value. If you edit
+        // SCHEMA, this fails until you bump SCHEMA_VERSION and update
+        // SCHEMA_FINGERPRINT — the "fingerprint changed => a migration was added"
+        // invariant, enforced in the test suite instead of by dropping tables.
+        assert_eq!(
+            super::schema_fingerprint(),
+            super::SCHEMA_FINGERPRINT,
+            "SCHEMA changed: bump SCHEMA_VERSION (currently {}) and set \
+             SCHEMA_FINGERPRINT = {}",
+            super::SCHEMA_VERSION,
+            super::schema_fingerprint(),
+        );
+    }
+
+    #[test]
+    fn additive_schema_change_preserves_rows() {
+        // The core issue #831 guarantee: an additive SCHEMA change across an
+        // upgrade preserves every existing read-model row (and does not reset the
+        // exported_position below the compaction floor). Seed rows under a vN
+        // schema, then reopen after an additive (ADD COLUMN + new TABLE) change and
+        // assert nothing was dropped.
+        let path = scratch_db();
+        {
+            let store = ReadStore::open(Some(&path)).expect("fresh open");
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO process_instances \
+                 (key, process_id, process_definition_id, process_definition_key, \
+                  version, state, start_date_ms, has_incident, tags, business_id) \
+                 VALUES (7, 'p', 'p', '1', 1, 1, 0, 0, '[]', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute("UPDATE meta SET v = 500 WHERE k = 'exported_position'", [])
+                .unwrap();
+        }
+
+        // Simulate the vN+1 binary: additively evolve the live database exactly as
+        // `reconcile_to_schema` would for an additive SCHEMA edit.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE process_instances ADD COLUMN priority INTEGER NOT NULL DEFAULT 50;
+                 CREATE TABLE new_feature (id INTEGER PRIMARY KEY, note TEXT);",
+            )
+            .unwrap();
+        }
+
+        // Reopen with the current binary: the additive columns/tables are kept and
+        // the seeded row + cursor survive (no destructive wipe).
+        let store = ReadStore::open(Some(&path)).expect("additive reopen self-heals");
+        let count: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM process_instances", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count, 1, "additive migration must preserve existing rows");
+        assert_eq!(
+            store.exported_position(),
+            500,
+            "additive migration must NOT reset the exported_position (compaction floor)"
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn ensure_schema_migrates_additively_without_dropping() {
+        // Guard: a database missing a purely-additive column (a genuine prior-nano
+        // read model) is brought up to SCHEMA by ADD COLUMN — never by dropping the
+        // table (which is what silently destroyed completed history, issue #831).
+        // We reproduce a jobs table lacking only the additive `listener_event_type`
+        // column (which carries a DEFAULT) and assert its row survives.
+        let path = scratch_db();
+        {
+            let store = ReadStore::open(Some(&path)).expect("fresh open");
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO jobs \
+                 (key, instance_key, element_instance_key, element_id, job_type, \
+                  state, retries, process_definition_id, process_definition_key) \
+                 VALUES (11, 1, 1, 'e', 't', 0, 3, 'p', '1')",
+                [],
+            )
+            .unwrap();
+        }
+        // Regress the schema to before an additive column existed, and clear the
+        // version stamp so the next open runs the migration path.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE jobs DROP COLUMN listener_event_type;
+                 DELETE FROM meta WHERE k = 'schema_version';",
+            )
+            .unwrap();
+        }
+        let store = ReadStore::open(Some(&path)).expect("additive migration on open");
+        let cols: Vec<String> = {
+            let conn = store.conn.lock().unwrap();
+            let mut stmt = conn.prepare("PRAGMA table_info(jobs)").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            cols.iter().any(|c| c == "listener_event_type"),
+            "migrated jobs table must regain listener_event_type, got {cols:?}"
+        );
+        let count: i64 = {
+            let conn = store.conn.lock().unwrap();
+            conn.query_row("SELECT COUNT(*) FROM jobs", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count, 1, "additive migration must preserve the jobs row");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
     fn schema_fingerprint_is_stable_within_a_build() {
         // Derived purely from SCHEMA, so it is constant across calls and never
         // hand-maintained.
@@ -4470,13 +5056,13 @@ mod writability_tests {
     }
 
     #[test]
-    fn stale_on_disk_schema_is_rebuilt() {
+    fn incompatible_schema_is_rebuilt() {
         // Reproduces the production incident: a database left behind by an older
         // build whose `jobs` table lacks the `job_kind`/`listener_event_type`
-        // columns, yet whose stored identity looks "current". Opening it must
-        // rebuild the projection (SCHEMA drift is detected via the derived
-        // fingerprint), NOT leave a half-shaped table that panics — and poisons
-        // the connection — on the first query for a missing column.
+        // columns *and* several NOT NULL columns that cannot be back-filled
+        // additively. Such a genuinely-incompatible schema falls back to a
+        // destructive rebuild (which #732 reprojection then recovers live data
+        // for), NOT a half-shaped table that panics on the first query.
         let path = scratch_db();
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
@@ -4493,7 +5079,7 @@ mod writability_tests {
             .unwrap();
         }
 
-        let store = ReadStore::open(Some(&path)).expect("stale schema self-heals on open");
+        let store = ReadStore::open(Some(&path)).expect("incompatible schema self-heals on open");
 
         // The rebuilt `jobs` table carries the current columns...
         let cols: Vec<String> = {
@@ -4514,28 +5100,26 @@ mod writability_tests {
         assert_eq!(store.active_instance_count(), 0);
         // ...the stale projection state was reset for a clean journal re-replay...
         assert_eq!(store.exported_position(), 0);
-        // ...and the stored identity now equals the derived fingerprint, so a
-        // second open is a no-op (no rebuild).
+        // ...and the stored version now equals the current one, so a second open is
+        // a no-op (no rebuild).
         drop(store);
         let store2 = ReadStore::open(Some(&path)).unwrap();
         let stored: Option<i64> = {
             let conn = store2.conn.lock().unwrap();
-            conn.query_row(
-                "SELECT v FROM meta WHERE k = 'schema_fingerprint'",
-                [],
-                |r| r.get(0),
-            )
+            conn.query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |r| {
+                r.get(0)
+            })
             .ok()
         };
-        assert_eq!(stored, Some(super::schema_fingerprint()));
+        assert_eq!(stored, Some(super::SCHEMA_VERSION));
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
     }
 
     #[test]
-    fn matching_fingerprint_does_not_rebuild() {
-        // When the stored fingerprint already matches, open must NOT drop the
+    fn matching_version_does_not_rebuild() {
+        // When the stored version already matches, open must NOT drop the
         // projection: durable derived state (e.g. exported_position) has to
         // survive a restart, or every boot would needlessly re-replay the journal.
         let path = scratch_db();
@@ -4823,6 +5407,141 @@ mod definition_xml_tests {
         assert_eq!(out.inflight_delta, 1);
         assert_eq!(out.terminal_keys, vec![2]);
         assert_eq!(store.active_instance_count(), 1);
+    }
+
+    #[test]
+    fn preexisting_terminal_history_is_backfilled_into_the_archive() {
+        // History that completed BEFORE the archive existed (the merlin.local data)
+        // is captured once on the first boot carrying this fix, so it too survives a
+        // later reprojection — not only instances that complete afterwards.
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-backfill-{}-{}.sqlite",
+            std::process::id(),
+            n
+        ));
+        let cleanup = |p: &std::path::Path| {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(p.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(p.with_extension("sqlite-shm"));
+        };
+        cleanup(&path);
+
+        // A read model that already holds a terminal instance which was NEVER
+        // captured (inserted directly, as if it completed under an older binary),
+        // and whose backfill has not run.
+        {
+            let store = ReadStore::open(Some(&path)).unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO process_instances \
+                 (key, process_id, process_definition_id, process_definition_key, \
+                  version, state, start_date_ms, has_incident, tags, business_id) \
+                 VALUES (77, 'legacy', 'legacy', '1', 1, 1, 0, 0, '[]', NULL)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "DELETE FROM meta WHERE k = 'terminal_archive_backfilled'",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Reopen: the one-time backfill copies the pre-existing terminal instance
+        // into the durable archive.
+        let store = ReadStore::open(Some(&path)).unwrap();
+        // Wipe (reprojection stand-in) and replay: the legacy history is restored.
+        store.reset().unwrap();
+        assert!(store.process_instance(77).is_none());
+        let restored = store.replay_terminal_archive().unwrap();
+        assert_eq!(
+            restored, 1,
+            "the pre-existing terminal instance was backfilled"
+        );
+        assert_eq!(
+            store.process_instance(77).map(|r| r.state),
+            Some(nanobpmn_engine_core::ProcessInstanceState::Completed),
+            "legacy completed history survives reprojection after backfill (issue #831)"
+        );
+
+        drop(store);
+        cleanup(&path);
+        let archive = path.with_file_name(format!(
+            "{}.terminal-archive.sqlite",
+            path.file_stem().unwrap().to_string_lossy()
+        ));
+        cleanup(&archive);
+    }
+
+    #[test]
+    fn terminal_history_survives_reprojection_via_durable_archive() {
+        // The issue #831 durability guarantee: a terminal instance is copied to the
+        // durable terminal-audit archive as it completes, so that after a below-floor
+        // snapshot reprojection wipes the read model (which the engine snapshot can
+        // only refill with *live* instances), the completed history is restored from
+        // the archive. Reproduces the merlin.local loss and asserts it no longer
+        // occurs.
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-archive-{}-{}.sqlite",
+            std::process::id(),
+            n
+        ));
+        let cleanup = |p: &std::path::Path| {
+            let _ = std::fs::remove_file(p);
+            let _ = std::fs::remove_file(p.with_extension("sqlite-wal"));
+            let _ = std::fs::remove_file(p.with_extension("sqlite-shm"));
+        };
+        cleanup(&path);
+
+        let store = ReadStore::open(Some(&path)).unwrap();
+        // Create and complete an instance: the completion is a genuine terminal
+        // transition, so `export` archives it durably.
+        let created = created_event(42);
+        let done = Event::ProcessInstanceCompleted { instance_key: 42 };
+        let out = store.export(&[&created, &done]).unwrap();
+        assert_eq!(out.terminal_keys, vec![42]);
+        assert_eq!(
+            store.process_instance(42).map(|r| r.state),
+            Some(nanobpmn_engine_core::ProcessInstanceState::Completed),
+            "instance completed and present before the wipe"
+        );
+
+        // Simulate the below-floor reprojection: the read model is reset (wiped),
+        // and the engine snapshot holds only live instances — so the terminal
+        // instance is NOT reprojected and would be lost without the archive.
+        store.reset().unwrap();
+        assert!(
+            store.process_instance(42).is_none(),
+            "reset wipes the read model (stands in for the reprojection)"
+        );
+
+        // Replaying the durable archive restores the completed history.
+        let restored = store.replay_terminal_archive().unwrap();
+        assert_eq!(
+            restored, 1,
+            "one terminal instance restored from the archive"
+        );
+        assert_eq!(
+            store.process_instance(42).map(|r| r.state),
+            Some(nanobpmn_engine_core::ProcessInstanceState::Completed),
+            "terminal/completed history is queryable again after reprojection (issue #831)"
+        );
+
+        drop(store);
+        cleanup(&path);
+        let archive = path.with_file_name(format!(
+            "{}.terminal-archive.sqlite",
+            path.file_stem().unwrap().to_string_lossy()
+        ));
+        cleanup(&archive);
     }
 
     fn created_event(instance_key: super::Key) -> Event {
