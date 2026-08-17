@@ -189,6 +189,27 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
     }
 }
 
+/// Verdict for a read-model-backed read whose `#[wasm_bindgen]` getter lives
+/// behind the off-by-default `read-model` feature.
+///
+/// It is [`Surface::Surfaced`] only in the `read-model` build — the build that
+/// actually compiles the getter onto `TestEngine`; in the lean feature-off build
+/// the getter is absent, so the read is *not* on the exported surface and the
+/// verdict is [`Surface::NotSurfaced`]. This keeps [`classify_read`] honest to
+/// what each build ships while leaving its exhaustiveness guard firing in both.
+#[cfg(feature = "read-model")]
+fn read_model_read(js_method: &'static str) -> Surface {
+    Surface::Surfaced { js_method }
+}
+
+#[cfg(not(feature = "read-model"))]
+fn read_model_read(_js_method: &'static str) -> Surface {
+    Surface::NotSurfaced {
+        reason: "read-model-backed getter compiled only under the `read-model` feature; \
+                 absent from the lean feature-off build's exported surface",
+    }
+}
+
 /// Exhaustive, wildcard-free classification of every gateway REST **read** the
 /// read model serves ([`ReadQuery`]).
 ///
@@ -202,27 +223,24 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
 ///
 /// Like [`classify`], this is a build-time sentinel: never called at runtime, its
 /// only value is that the match body is type-checked so the exhaustiveness error
-/// fires. It references no `read-model` types, so it type-checks under the
-/// feature-off `wasm32` build and links nothing new.
+/// fires. It references no `read-model` types, so it type-checks — and its
+/// exhaustiveness guard fires — under *both* the lean feature-off and the
+/// `read-model` `wasm32` builds, linking nothing new.
+///
+/// The `Surfaced` verdict is kept honest to each build: the five read-model reads
+/// resolve through [`read_model_read`], which reports [`Surface::Surfaced`] only
+/// in the `read-model` build (where the `#[wasm_bindgen]` getter is actually
+/// compiled) and [`Surface::NotSurfaced`] in the lean build (where it is absent).
 pub(crate) fn classify_read(query: &ReadQuery) -> Surface {
     match query {
-        // ---- Surfaced: each has a #[wasm_bindgen] read method on TestEngine
-        // (present under the `read-model` feature) ----
-        ReadQuery::GetFormByKey => Surface::Surfaced {
-            js_method: "getFormByKey",
-        },
-        ReadQuery::GetResourceByKey => Surface::Surfaced {
-            js_method: "getResourceByKey",
-        },
-        ReadQuery::SearchProcessInstances => Surface::Surfaced {
-            js_method: "searchProcessInstances",
-        },
-        ReadQuery::SearchUserTasks => Surface::Surfaced {
-            js_method: "searchUserTasks",
-        },
-        ReadQuery::SearchVariables => Surface::Surfaced {
-            js_method: "searchVariables",
-        },
+        // ---- Surfaced only in the `read-model` build: each has a
+        // #[wasm_bindgen] read method on TestEngine compiled behind the
+        // `read-model` feature (see `read_model_read`). ----
+        ReadQuery::GetFormByKey => read_model_read("getFormByKey"),
+        ReadQuery::GetResourceByKey => read_model_read("getResourceByKey"),
+        ReadQuery::SearchProcessInstances => read_model_read("searchProcessInstances"),
+        ReadQuery::SearchUserTasks => read_model_read("searchUserTasks"),
+        ReadQuery::SearchVariables => read_model_read("searchVariables"),
 
         // ---- Not surfaced: conscious exclusions from the modeler test engine.
         // Revisit each if the modeler grows a need for it; the read model already
@@ -340,11 +358,19 @@ mod tests {
 
     // Read counterpart: a representative surfaced + not-surfaced pair over the
     // REST read surface. The real guard is the exhaustiveness of `classify_read`.
+    // A read-model-backed read is only `Surfaced` in the `read-model` build,
+    // where its getter is compiled; in the lean build it is `NotSurfaced`.
     #[test]
     fn classifies_known_reads() {
+        #[cfg(feature = "read-model")]
         assert!(matches!(
             classify_read(&ReadQuery::GetFormByKey),
             Surface::Surfaced { .. }
+        ));
+        #[cfg(not(feature = "read-model"))]
+        assert!(matches!(
+            classify_read(&ReadQuery::GetFormByKey),
+            Surface::NotSurfaced { .. }
         ));
         assert!(matches!(
             classify_read(&ReadQuery::SearchDecisionInstances),
