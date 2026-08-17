@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from "react";
 import {
   getExtensionChangelog,
   getExtensionReadme,
@@ -278,6 +285,42 @@ export default function Extensions() {
   const selectDrawerTab = (tab: "readme" | "changelog") => {
     setDrawerTab(tab);
     if (tab === "changelog" && readmePkg) void fetchChangelog(readmePkg);
+  };
+
+  // Roving keyboard navigation for the README/Changelog tablist, per the
+  // WAI-ARIA tabs pattern (automatic activation): Arrow keys move between the
+  // two tabs, Home/End jump to the first/last, and focus follows the selection.
+  const onDrawerTabKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const order: ("readme" | "changelog")[] = ["readme", "changelog"];
+    const idx = order.indexOf(drawerTab);
+    let next: "readme" | "changelog" | null = null;
+    switch (e.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        next = order[(idx + 1) % order.length];
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        next = order[(idx - 1 + order.length) % order.length];
+        break;
+      case "Home":
+        next = order[0];
+        break;
+      case "End":
+        next = order[order.length - 1];
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+    selectDrawerTab(next);
+    document
+      .getElementById(
+        next === "readme"
+          ? "pack-drawer-tab-readme"
+          : "pack-drawer-tab-changelog",
+      )
+      ?.focus();
   };
 
   const marketCard = (m: MarketEntry) => (
@@ -597,6 +640,7 @@ export default function Extensions() {
                 <div
                   role="tablist"
                   aria-label="Package details"
+                  onKeyDown={onDrawerTabKeyDown}
                   className="sticky top-0 z-10 flex gap-1 border-b border-edge bg-panel px-4 pt-2"
                 >
                   <button
