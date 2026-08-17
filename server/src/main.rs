@@ -2036,6 +2036,67 @@ fn problem(title: &str, status: u16, detail: String) -> models::ProblemDetail {
     models::ProblemDetail::new(title.to_string(), status, detail, String::new())
 }
 
+/// Builds the `ProblemDetail` for a **deployment** rejection with Zeebe/C8
+/// parity (Magikcraft/nano-bpm#793).
+///
+/// Real Zeebe/Camunda 8 maps every client-side deploy rejection to the gRPC
+/// `INVALID_ARGUMENT` status and, on the REST `/v2/deployments` endpoint,
+/// surfaces that status **name** as the `ProblemDetail.title` (with the
+/// actionable message in `detail`). Clients — notably `c8ctl watch` — key on the
+/// `INVALID_ARGUMENT` title to recognise and render a deployment error; a
+/// non-parity title (e.g. "Invalid BPMN") is unrecognised, so the rejection is
+/// silently swallowed and the watch hangs to its timeout.
+///
+/// A 400 is a client-side rejection → `INVALID_ARGUMENT`. Any other status
+/// (e.g. 502 owner-unreachable, 500) is an infrastructure failure, not a bad
+/// argument, so it keeps a generic deploy title.
+///
+/// `instance` is set to the deployments endpoint path for full Zeebe/C8 REST
+/// `ProblemDetail` wire-shape parity — the shape documented in #793 is
+/// `{ …, "instance": "/v2/deployments" }`; the generic `problem(...)` helper
+/// leaves `instance` empty.
+fn deploy_problem(status: u16, detail: String) -> models::ProblemDetail {
+    let title = if status == 400 {
+        "INVALID_ARGUMENT"
+    } else {
+        "Deployment failed"
+    };
+    models::ProblemDetail::new(
+        title.to_string(),
+        status,
+        detail,
+        DEPLOYMENTS_ENDPOINT_PATH.to_string(),
+    )
+}
+
+/// REST path of the deployments endpoint, used as the `ProblemDetail.instance`
+/// for deploy rejections (Zeebe/C8 wire-shape parity, #793).
+const DEPLOYMENTS_ENDPOINT_PATH: &str = "/v2/deployments";
+
+/// Maps the `(status, detail)` outcome of a forwarded deploy (`forward_deploy`)
+/// onto the generated `/v2/deployments` response. The endpoint models only a
+/// client-side `400` (invalid BPMN → `INVALID_ARGUMENT`) and an infrastructure
+/// `503`, so a genuine client rejection surfaces as `400` while any other
+/// failure (e.g. `502` partition-0 owner unreachable, a malformed forwarded
+/// body) surfaces as `503`. This keeps the HTTP status and `ProblemDetail.status`
+/// consistent — the old code always wrapped the error in the `400` variant, so a
+/// `502` produced HTTP 400 with a `502` body, breaking clients that key off the
+/// HTTP status.
+fn forward_deploy_response(
+    result: Result<models::DeploymentResult, (u16, String)>,
+) -> apis::resource::CreateDeploymentResponse {
+    use apis::resource::CreateDeploymentResponse as Resp;
+    match result {
+        Ok(result) => Resp::Status200_TheResourcesAreDeployed(result),
+        Err((400, detail)) => {
+            Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(400, detail))
+        }
+        Err((_, detail)) => {
+            Resp::Status503_TheServiceIsCurrentlyUnavailable(deploy_problem(503, detail))
+        }
+    }
+}
+
 /// Parses `host` and `port` from a peer base URL like `http://10.0.0.1:8080` (or
 /// bare `10.0.0.1:8080`). Returns `None` when no host/port can be extracted (e.g.
 /// the empty self-address of a single-node topology), so the caller can fall back.
@@ -8606,8 +8667,20 @@ impl ServerImpl {
                         &f.process_definition_key,
                         &inst.process_definition_key,
                     ) && query::match_string(&f.process_definition_id, &inst.process_definition_id)
+                        && query::match_integer(
+                            &f.process_definition_version,
+                            Some(i64::from(inst.version)),
+                        )
                         && query::match_process_instance_state(&f.state, &state_str)
                         && f.has_incident.is_none_or(|want| want == inst.has_incident)
+                        && query::match_date_time_ms(&f.start_date, Some(inst.start_date_ms as i64))
+                        // Nano does not yet project a process-instance completion
+                        // timestamp, so an `endDate` filter matches against an
+                        // absent value: range/equality operators correctly exclude
+                        // (honest, not silently ignored) while `$exists: false`
+                        // still matches.
+                        && query::match_date_time_ms(&f.end_date, None)
+                        && query::match_string_opt(&f.business_id, inst.business_id.as_deref())
                 }
             })
             .collect();
@@ -9559,6 +9632,163 @@ impl ServerImpl {
         }
     }
 
+    /// The form linked to a user task (Camunda `GetUserTaskForm`). Resolves the
+    /// task's `form_key` (set at creation from its `zeebe:formDefinition formId`)
+    /// to the deployed form. Returns 204 when the task exists but declares no
+    /// form, and 404 when no such task exists.
+    async fn get_user_task_form_impl(
+        &self,
+        path_params: &models::GetUserTaskFormPathParams,
+    ) -> Result<apis::user_task::GetUserTaskFormResponse, ()> {
+        use apis::user_task::GetUserTaskFormResponse as Resp;
+
+        let user_task_key: u64 = match path_params.user_task_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_NotFound(problem(
+                    "User task not found",
+                    404,
+                    format!(
+                        "User task key '{}' is not a valid key.",
+                        path_params.user_task_key
+                    ),
+                )));
+            }
+        };
+
+        // Resolve the task's form key: locally first, then from the owning node
+        // for a task on a remote partition (forms are replicated to every node,
+        // so the form itself is always resolvable locally once we know its key).
+        let form_key: Option<u64> = match self.store.user_task(user_task_key) {
+            Some(task) => task.form_key,
+            None => {
+                if let Some(node) = self.read_route(user_task_key) {
+                    let (status, body) = self
+                        .forward_get(node, crate::falcon::ReadKind::UserTask, user_task_key)
+                        .await;
+                    match (status, body) {
+                        (200, Some(b)) => match serde_json::from_value::<models::UserTaskResult>(b)
+                        {
+                            Ok(r) => match r.form_key {
+                                types::Nullable::Present(fk) => match fk.0.parse::<u64>() {
+                                    Ok(k) => Some(k),
+                                    // A peer that reports a non-numeric form key
+                                    // is corrupted or schema-incompatible;
+                                    // surface it as a 500 rather than silently
+                                    // masking it as "found, no form" (204).
+                                    Err(_) => {
+                                        return Ok(
+                                            Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                                problem(
+                                                    "Peer error",
+                                                    500,
+                                                    format!(
+                                                        "peer node {node} returned a non-numeric form key '{}'",
+                                                        fk.0
+                                                    ),
+                                                ),
+                                            ),
+                                        );
+                                    }
+                                },
+                                types::Nullable::Null => None,
+                            },
+                            Err(e) => {
+                                return Ok(
+                                    Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                        problem("Peer error", 500, e.to_string()),
+                                    ),
+                                );
+                            }
+                        },
+                        (404, _) => {
+                            return Ok(Resp::Status404_NotFound(problem(
+                                "User task not found",
+                                404,
+                                format!("No user task with key {user_task_key}."),
+                            )));
+                        }
+                        (s, _) => {
+                            return Ok(
+                                Resp::Status500_AnInternalErrorOccurredWhileProcessingTheRequest(
+                                    problem(
+                                        "Peer error",
+                                        500,
+                                        format!("peer node {node} returned status {s}"),
+                                    ),
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    return Ok(Resp::Status404_NotFound(problem(
+                        "User task not found",
+                        404,
+                        format!("No user task with key {user_task_key}."),
+                    )));
+                }
+            }
+        };
+
+        match form_key {
+            Some(fk) => match self.store.form_by_key(fk) {
+                Some(row) => Ok(Resp::Status200_TheFormIsSuccessfullyReturned(form_result(
+                    &row,
+                ))),
+                // The task references a form key that is not (yet) projected:
+                // treat as "found, no form" rather than a hard error.
+                None => Ok(Resp::Status204_TheUserTaskWasFound),
+            },
+            None => Ok(Resp::Status204_TheUserTaskWasFound),
+        }
+    }
+
+    /// The start form linked to a process definition (Camunda
+    /// `GetStartProcessForm`). Resolves the definition's `start_form_id` (its
+    /// start event's `zeebe:formDefinition formId`) to the latest deployed form.
+    /// Returns 204 when the process exists but declares no start form, and 404
+    /// when no such process definition exists.
+    async fn get_start_process_form_impl(
+        &self,
+        path_params: &models::GetStartProcessFormPathParams,
+    ) -> Result<apis::process_definition::GetStartProcessFormResponse, ()> {
+        use apis::process_definition::GetStartProcessFormResponse as Resp;
+
+        let key: u64 = match path_params.process_definition_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(Resp::Status404_NotFound(problem(
+                    "Process definition not found",
+                    404,
+                    format!(
+                        "Process definition key '{}' is not a valid key.",
+                        path_params.process_definition_key
+                    ),
+                )));
+            }
+        };
+
+        // Process definitions are replicated to every node, so a local lookup is
+        // authoritative. `None` => no such definition; `Some(None)` => the
+        // definition exists but declares no start form.
+        match self.store.process_definition_start_form_id(key) {
+            None => Ok(Resp::Status404_NotFound(problem(
+                "Process definition not found",
+                404,
+                format!("No process definition with key {key}."),
+            ))),
+            Some(None) => Ok(Resp::Status204_TheProcessWasFound),
+            Some(Some(form_id)) => match self.store.form_by_id(&form_id) {
+                Some(row) => Ok(Resp::Status200_TheFormIsSuccessfullyReturned(form_result(
+                    &row,
+                ))),
+                // The start form id is declared but no such form is deployed:
+                // treat as "found, no form".
+                None => Ok(Resp::Status204_TheProcessWasFound),
+            },
+        }
+    }
+
     /// Clears a user task's assignee.
     async fn unassign_user_task_impl(
         &self,
@@ -9909,10 +10139,10 @@ impl ServerImpl {
         }
     }
 
-    /// Searches deployed process definitions. The engine keeps only the latest
-    /// version of each process id (in `state.processes`), so every entry is the
-    /// latest version; older versions are not retained and therefore not
-    /// searchable.
+    /// Searches deployed process definitions. Every deployed version of each
+    /// process id is retained and searchable (Camunda/Zeebe parity); the
+    /// `isLatestVersion` filter narrows to the highest version per id via the
+    /// `is_latest` discriminator computed by the read store.
     async fn search_process_definitions_impl(
         &self,
         body: &Option<models::ProcessDefinitionSearchQuery>,
@@ -9928,10 +10158,12 @@ impl ServerImpl {
                 None => true,
                 Some(f) => {
                     let id = &d.process_id;
-                    // The engine stores no display name, resource name, or
-                    // version tag, so those filters match against the best
-                    // available proxy (the id) or exclude when we hold no value.
-                    query::match_string(&f.name, id)
+                    // `name` matches against the BPMN process display name (which
+                    // may be absent, i.e. no match for a value/`$like` filter),
+                    // distinct from the id. `resourceName` and `versionTag` are
+                    // not projected by the engine, so those filters match their
+                    // best proxy or exclude when we hold no value.
+                    query::match_string_opt(&f.name, d.name.as_deref())
                         && query::match_string(&f.process_definition_id, id)
                         && f.process_definition_key
                             .as_ref()
@@ -9942,10 +10174,10 @@ impl ServerImpl {
                             .is_none_or(|r| *r == resource_name(id))
                         && f.version_tag.is_none()
                         && f.has_start_form.is_none_or(|want| !want)
-                        // `process_definitions()` returns only the latest version
-                        // per id, so every result is "latest"; an explicit
-                        // `false` therefore matches none.
-                        && f.is_latest_version.is_none_or(|want| want)
+                        // Every deployed version is searchable; `isLatestVersion`
+                        // filters to the highest version per id (computed by the
+                        // read store).
+                        && f.is_latest_version.is_none_or(|want| want == d.is_latest)
                 }
             })
             .collect();
@@ -9958,7 +10190,10 @@ impl ServerImpl {
             &mut matched,
             &sort,
             |d, field| match field {
-                "processDefinitionId" | "name" => query::SortVal::Str(d.process_id.clone()),
+                "processDefinitionId" => query::SortVal::Str(d.process_id.clone()),
+                "name" => {
+                    query::SortVal::Str(d.name.clone().unwrap_or_else(|| d.process_id.clone()))
+                }
                 "version" => query::SortVal::Num(d.version as i64),
                 _ => query::SortVal::Num(d.key as i64),
             },
@@ -9977,6 +10212,46 @@ impl ServerImpl {
         Ok(Resp::Status200_TheProcessDefinitionSearchResult(
             models::ProcessDefinitionSearchQueryResult::new(page.response, items),
         ))
+    }
+
+    /// Returns a single process definition by its `processDefinitionKey`
+    /// (Camunda `getProcessDefinition`). Resolves any deployed version — not just
+    /// the latest — since every version is retained and independently
+    /// addressable by key. A malformed or unknown key yields 404.
+    async fn get_process_definition_impl(
+        &self,
+        path_params: &models::GetProcessDefinitionPathParams,
+    ) -> Result<apis::process_definition::GetProcessDefinitionResponse, ()> {
+        use apis::process_definition::GetProcessDefinitionResponse as Resp;
+
+        let key: u64 = match path_params.process_definition_key.parse() {
+            Ok(k) => k,
+            Err(_) => {
+                return Ok(
+                    Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(problem(
+                        "Process definition not found",
+                        404,
+                        format!(
+                            "Process definition key '{}' is not a valid key.",
+                            path_params.process_definition_key
+                        ),
+                    )),
+                );
+            }
+        };
+
+        match self.store.process_definition_by_key(key) {
+            Some(row) => Ok(Resp::Status200_TheProcessDefinitionIsSuccessfullyReturned(
+                process_definition_result(&row),
+            )),
+            None => Ok(
+                Resp::Status404_TheProcessDefinitionWithTheGivenKeyWasNotFound(problem(
+                    "Process definition not found",
+                    404,
+                    format!("No process definition with key {key}."),
+                )),
+            ),
+        }
     }
 
     async fn create_deployment_impl(
@@ -10013,8 +10288,7 @@ impl ServerImpl {
                                     }
                                     Err(_) => {
                                         return Ok(Resp::Status400_TheProvidedDataIsNotValid(
-                                            problem(
-                                                "Invalid resource",
+                                            deploy_problem(
                                                 400,
                                                 "A deployment resource was not valid UTF-8 BPMN XML.".to_string(),
                                             ),
@@ -10024,8 +10298,7 @@ impl ServerImpl {
                             }
                         }
                         Err(e) => {
-                            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                                "Invalid request",
+                            return Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
                                 400,
                                 format!("Could not read a deployment resource: {e}."),
                             )));
@@ -10034,8 +10307,7 @@ impl ServerImpl {
                 }
                 Ok(None) => break,
                 Err(e) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        "Invalid request",
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
                         400,
                         format!("Malformed multipart request: {e}."),
                     )));
@@ -10044,8 +10316,7 @@ impl ServerImpl {
         }
 
         if resources.is_empty() {
-            return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                "No resources",
+            return Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
                 400,
                 "At least one deployment resource is required.".to_string(),
             )));
@@ -10060,9 +10331,9 @@ impl ServerImpl {
         if self.engine.topology().is_local(0) {
             let parsed = match parse_deploy_resources(&resources) {
                 Ok(parsed) => parsed,
-                Err((title, detail)) => {
-                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                        title, 400, detail,
+                Err((_, detail)) => {
+                    return Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
+                        400, detail,
                     )));
                 }
             };
@@ -10082,19 +10353,14 @@ impl ServerImpl {
                     self.broadcast_deployment(&events).await;
                     Ok(Resp::Status200_TheResourcesAreDeployed(result))
                 }
-                Err((title, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    title, 400, detail,
+                Err((_, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(deploy_problem(
+                    400, detail,
                 ))),
             }
         } else {
-            match self.forward_deploy(resources, tenant_id).await {
-                Ok(result) => Ok(Resp::Status200_TheResourcesAreDeployed(result)),
-                Err((status, detail)) => Ok(Resp::Status400_TheProvidedDataIsNotValid(problem(
-                    "Deployment failed",
-                    status,
-                    detail,
-                ))),
-            }
+            Ok(forward_deploy_response(
+                self.forward_deploy(resources, tenant_id).await,
+            ))
         }
     }
 
@@ -15518,14 +15784,20 @@ fn resource_name(process_id: &str) -> String {
 }
 
 /// Projects a [`ProcessDefinitionRow`] into the generated
-/// `ProcessDefinitionResult`. The engine stores no display name or version tag,
-/// so `name` mirrors the id and `versionTag` is null.
+/// `ProcessDefinitionResult`. The `name` is the BPMN process display name when
+/// the deployed `<bpmn:process>` carried one (null otherwise, per Camunda, where
+/// `name` and `processDefinitionId` are independent). The engine stores no
+/// version tag, so `versionTag` is null.
 fn process_definition_result(
     deployed: &readstore::ProcessDefinitionRow,
 ) -> models::ProcessDefinitionResult {
     let id = deployed.process_id.clone();
+    let name = match &deployed.name {
+        Some(n) => types::Nullable::Present(n.clone()),
+        None => types::Nullable::Null,
+    };
     models::ProcessDefinitionResult::new(
-        types::Nullable::Present(id.clone()),
+        name,
         resource_name(&id),
         deployed.version,
         types::Nullable::Null,
@@ -22892,6 +23164,184 @@ mod clustered_startup_tests {
     }
 
     #[tokio::test]
+    async fn user_task_and_start_forms_are_retrievable_via_the_form_endpoints() {
+        use apis::process_definition::GetStartProcessFormResponse as StartForm;
+        use apis::user_task::GetUserTaskFormResponse as UtForm;
+        let server = ServerImpl::default();
+
+        // A process whose start event and user task each declare a form, plus a
+        // second process with no start form.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="forms-proc">
+              <bpmn:startEvent id="s">
+                <bpmn:extensionElements>
+                  <zeebe:formDefinition formId="start-form" />
+                </bpmn:extensionElements>
+              </bpmn:startEvent>
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let noform_xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="noform-proc">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review"><bpmn:extensionElements><zeebe:userTask /></bpmn:extensionElements></bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+        let mut processes = parse_bpmn(xml).expect("parse forms-proc");
+        processes.extend(parse_bpmn(noform_xml).expect("parse noform-proc"));
+
+        let form = |id: &str| nanobpmn_engine_core::FormResource {
+            id: id.to_string(),
+            resource_name: format!("{id}.form"),
+            schema: format!(r#"{{"id":"{id}","type":"default","components":[]}}"#),
+        };
+
+        server
+            .deploy_resources_locally_with_forms(
+                processes,
+                &std::collections::HashMap::new(),
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                vec![form("start-form"), form("review-form")],
+                Vec::new(),
+                "<default>",
+            )
+            .await
+            .expect("deploy processes + forms");
+
+        let (instance, _) = server
+            .create_for_stream(Some("forms-proc".into()), None, Default::default())
+            .await
+            .expect("create the forms-proc instance");
+
+        // Poll for the parked user task (read model projects asynchronously).
+        let mut task_key = None;
+        for _ in 0..300 {
+            if let Some(t) = server
+                .store
+                .user_tasks()
+                .iter()
+                .find(|t| t.instance_key == instance)
+            {
+                task_key = Some(t.key);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let task_key = task_key.expect("the instance parks a user task");
+
+        // GetUserTaskForm returns the review form.
+        let resp = server
+            .get_user_task_form_impl(&models::GetUserTaskFormPathParams {
+                user_task_key: task_key.to_string(),
+            })
+            .await
+            .expect("get user task form");
+        let UtForm::Status200_TheFormIsSuccessfullyReturned(f) = resp else {
+            panic!("expected the user task form, got {resp:?}");
+        };
+        assert_eq!(f.form_id, "review-form");
+        assert!(!f.schema.is_empty());
+
+        // An unknown user task key is a 404; a malformed key too.
+        assert!(matches!(
+            server
+                .get_user_task_form_impl(&models::GetUserTaskFormPathParams {
+                    user_task_key: "999999".to_string(),
+                })
+                .await
+                .unwrap(),
+            UtForm::Status404_NotFound(_)
+        ));
+        assert!(matches!(
+            server
+                .get_user_task_form_impl(&models::GetUserTaskFormPathParams {
+                    user_task_key: "not-a-key".to_string(),
+                })
+                .await
+                .unwrap(),
+            UtForm::Status404_NotFound(_)
+        ));
+
+        // GetStartProcessForm: resolve each process definition's key from the
+        // read model, then assert the start form (present vs. absent).
+        let mut with_form = None;
+        let mut without_form = None;
+        for _ in 0..300 {
+            for pd in server.store.process_definitions() {
+                if pd.process_id == "forms-proc" {
+                    with_form = Some(pd.key);
+                } else if pd.process_id == "noform-proc" {
+                    without_form = Some(pd.key);
+                }
+            }
+            if with_form.is_some() && without_form.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let with_form = with_form.expect("forms-proc definition is projected");
+        let without_form = without_form.expect("noform-proc definition is projected");
+
+        let resp = server
+            .get_start_process_form_impl(&models::GetStartProcessFormPathParams {
+                process_definition_key: with_form.to_string(),
+            })
+            .await
+            .expect("get start form");
+        let StartForm::Status200_TheFormIsSuccessfullyReturned(f) = resp else {
+            panic!("expected the start form, got {resp:?}");
+        };
+        assert_eq!(f.form_id, "start-form");
+
+        // A process with no start form: 204 (found, no form).
+        assert!(matches!(
+            server
+                .get_start_process_form_impl(&models::GetStartProcessFormPathParams {
+                    process_definition_key: without_form.to_string(),
+                })
+                .await
+                .unwrap(),
+            StartForm::Status204_TheProcessWasFound
+        ));
+
+        // Unknown / malformed process definition keys are 404s.
+        assert!(matches!(
+            server
+                .get_start_process_form_impl(&models::GetStartProcessFormPathParams {
+                    process_definition_key: "999999".to_string(),
+                })
+                .await
+                .unwrap(),
+            StartForm::Status404_NotFound(_)
+        ));
+        assert!(matches!(
+            server
+                .get_start_process_form_impl(&models::GetStartProcessFormPathParams {
+                    process_definition_key: "not-a-key".to_string(),
+                })
+                .await
+                .unwrap(),
+            StartForm::Status404_NotFound(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn message_start_dispatches_instances_across_the_node_boundary() {
         // Message-start subscriptions live only on the deploy owner (node 0). The
         // round-robin start dispatcher must spread the created instances over the
@@ -27676,6 +28126,121 @@ mod subscription_placement_tests {
         assert!(
             detail.contains("run-agent") && detail.contains("resourceType"),
             "the problem detail names the offending task and attribute, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn deploy_rejection_problem_detail_matches_zeebe_invalid_argument_shape() {
+        // Magikcraft/nano-bpm#793: deploying invalid BPMN must surface a
+        // structured rejection whose `ProblemDetail.title` is Zeebe/C8's
+        // `INVALID_ARGUMENT` (with the actionable message in `detail`). Clients
+        // such as `c8ctl watch` key on that title to render the deployment error;
+        // a non-parity title (the old "Invalid BPMN") is unrecognised, so the
+        // rejection is swallowed and the watch hangs to its timeout. A
+        // client-side rejection is HTTP 400 → `INVALID_ARGUMENT`; an
+        // infrastructure failure (e.g. 502 owner-unreachable) is not a bad
+        // argument and keeps a generic title.
+        let bad = deploy_problem(400, "Failed to parse 'bad.bpmn': no process.".to_string());
+        assert_eq!(
+            bad.title, "INVALID_ARGUMENT",
+            "a 400 deploy rejection uses Zeebe's INVALID_ARGUMENT title"
+        );
+        assert_eq!(bad.status, 400, "Zeebe maps INVALID_ARGUMENT to HTTP 400");
+        assert!(
+            bad.detail.contains("bad.bpmn"),
+            "the actionable message is preserved in `detail`, got: {}",
+            bad.detail
+        );
+        assert_eq!(
+            bad.instance, "/v2/deployments",
+            "the C8 REST ProblemDetail shape sets `instance` to the deployments endpoint path"
+        );
+
+        let unreachable = deploy_problem(502, "deploy-partition owner unreachable".to_string());
+        assert_ne!(
+            unreachable.title, "INVALID_ARGUMENT",
+            "an infrastructure failure is not a client INVALID_ARGUMENT"
+        );
+        assert_eq!(unreachable.status, 502);
+    }
+
+    #[test]
+    fn forward_deploy_response_keeps_http_status_consistent_with_body() {
+        // Magikcraft/nano-bpm#793 (forward path): a forwarded deploy can fail
+        // either as a client-side rejection (400 → INVALID_ARGUMENT) or as an
+        // infrastructure failure (e.g. 502 partition-0 owner unreachable). The
+        // handler must not mislabel an infra failure as HTTP 400 — the HTTP
+        // status must match `ProblemDetail.status`, or clients that key off the
+        // HTTP status break. The `/v2/deployments` endpoint models only 400 and
+        // 503 errors, so any non-400 forward failure surfaces as a 503.
+        use apis::resource::CreateDeploymentResponse as Resp;
+
+        let rejected = forward_deploy_response(Err((
+            400,
+            "Failed to parse 'bad.bpmn': no process.".to_string(),
+        )));
+        match rejected {
+            Resp::Status400_TheProvidedDataIsNotValid(pd) => {
+                assert_eq!(pd.status, 400, "HTTP 400 body carries status 400");
+                assert_eq!(
+                    pd.title, "INVALID_ARGUMENT",
+                    "a forwarded client rejection keeps the INVALID_ARGUMENT title"
+                );
+                assert!(pd.detail.contains("bad.bpmn"));
+            }
+            other => panic!("a 400 forward rejection must map to the 400 response, got: {other:?}"),
+        }
+
+        let unreachable =
+            forward_deploy_response(Err((502, "deploy-partition owner unreachable".to_string())));
+        match unreachable {
+            Resp::Status503_TheServiceIsCurrentlyUnavailable(pd) => {
+                assert_eq!(
+                    pd.status, 503,
+                    "an infra failure surfaces as HTTP 503 with a matching body status, not a 400/502 mismatch"
+                );
+                assert!(
+                    pd.detail.contains("owner unreachable"),
+                    "the actionable message is preserved, got: {}",
+                    pd.detail
+                );
+            }
+            other => {
+                panic!("a non-400 forward failure must map to the 503 response, got: {other:?}")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_rejects_invalid_bpmn_with_invalid_argument_parity() {
+        // Magikcraft/nano-bpm#793 (end-to-end over the centralized deploy path):
+        // genuinely invalid BPMN is rejected as HTTP 400 with an actionable
+        // detail, and the REST handler surfaces that rejection with Zeebe's
+        // `INVALID_ARGUMENT` title so a watching client can render it.
+        const NOT_BPMN: &str = "<not-bpmn>this is not a BPMN document</not-bpmn>";
+
+        let server = single_node_multi_partition();
+        let (status, detail) = server
+            .deploy_centralized(
+                vec![("bad.bpmn".into(), NOT_BPMN.into())],
+                "<default>".into(),
+            )
+            .await
+            .expect_err("a resource that is not a BPMN process must be rejected");
+        assert_eq!(status, 400, "Zeebe maps INVALID_ARGUMENT to HTTP 400");
+
+        // The REST handler wraps the `(status, detail)` from the deploy path into
+        // the client-facing ProblemDetail via `deploy_problem` — assert that same
+        // mapping here so the parity title is guaranteed on the wire.
+        let pd = deploy_problem(status, detail);
+        assert_eq!(
+            pd.title, "INVALID_ARGUMENT",
+            "invalid BPMN surfaces as INVALID_ARGUMENT for c8ctl-watch parity"
+        );
+        assert!(
+            pd.detail.contains("bad.bpmn"),
+            "the rejection names the offending resource, got: {}",
+            pd.detail
         );
     }
 

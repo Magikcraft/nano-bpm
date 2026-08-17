@@ -71,8 +71,7 @@ pub enum ReadQuery {
     /// `searchUserTasks` — user tasks, honouring the `state` filter
     /// (`ReadStore::user_tasks`).
     SearchUserTasks,
-    /// `getUserTask` — a single user task by key. Served by a filtered scan of
-    /// `ReadStore::user_tasks` (there is no dedicated point-lookup method).
+    /// `getUserTask` — a single user task by key (`ReadStore::user_task`).
     GetUserTask,
 
     /// `searchVariables` — process/element variables (`ReadStore::variables`).

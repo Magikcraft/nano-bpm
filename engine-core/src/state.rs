@@ -345,7 +345,6 @@ pub struct UserTask {
     #[cfg_attr(feature = "serde", serde(default))]
     pub pending: Option<PendingUserTaskTransition>,
 }
-
 /// A running (or completed) process instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

@@ -875,10 +875,12 @@ impl<'a> Parser<'a> {
         Ok(ParsedIr {
             definition: ProcessDefinition {
                 id: process_id,
+                name: None,
                 elements,
                 start_event,
                 xml: String::new(),
                 adhoc: Vec::new(),
+                start_form_id: None,
             },
             names,
         })

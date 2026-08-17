@@ -1075,6 +1075,15 @@ impl TaskListenerJobResult {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ProcessDefinition {
     pub id: String,
+    /// The process's BPMN `name` attribute (the modeller's human-readable
+    /// label, distinct from the executable `id`), if present. Non-executable
+    /// metadata: read models surface it as the process definition `name`
+    /// (Camunda/Zeebe semantics, where `name` and `processDefinitionId` are
+    /// independent), and the search API's `name` filter matches against it.
+    /// `None` when the `<bpmn:process>` carries no `name`, and defaulted `None`
+    /// when deserializing journals/snapshots written before this field existed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub name: Option<String>,
     pub elements: HashMap<ElementId, Element>,
     pub start_event: ElementId,
     /// The original BPMN XML this definition was parsed from, retained verbatim
@@ -1092,6 +1101,13 @@ pub struct ProcessDefinition {
     /// field existed.
     #[cfg_attr(feature = "serde", serde(default))]
     pub adhoc: Vec<AdHocSubProcessDef>,
+    /// The `zeebe:formDefinition formId` declared on the process's start event,
+    /// referencing a deployed form by id — the process's *start form* (Camunda
+    /// `GetStartProcessForm`). Resolved to the latest deployed form's key at
+    /// query time. `None` when the start event declares no form. Defaulted
+    /// absent for definitions written before start forms were parsed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub start_form_id: Option<String>,
 }
 
 impl ProcessDefinition {
@@ -1136,10 +1152,12 @@ impl ProcessDefinition {
         splice_call_activities(&mut elements, &self.elements, "", None, library, &mut stack)?;
         Ok(ProcessDefinition {
             id: self.id.clone(),
+            name: self.name.clone(),
             elements,
             start_event: self.start_event.clone(),
             xml: self.xml.clone(),
             adhoc: self.adhoc.clone(),
+            start_form_id: self.start_form_id.clone(),
         })
     }
 }
@@ -1316,6 +1334,9 @@ fn remap_kind_ids(kind: &ElementKind, pfx: &impl Fn(&str) -> String) -> ElementK
 #[derive(Debug, Default)]
 pub struct ProcessBuilder {
     id: String,
+    /// The process's BPMN `name` attribute (modeller label), applied verbatim to
+    /// the built [`ProcessDefinition::name`]. Set via [`ProcessBuilder::name`].
+    name: Option<String>,
     elements: Vec<Element>,
     edges: Vec<(ElementId, SequenceFlow)>,
     /// Recorded `(child, parent sub-process)` containment, applied in [`build`].
@@ -1358,6 +1379,7 @@ impl ProcessBuilder {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            name: None,
             elements: Vec::new(),
             edges: Vec::new(),
             parents: Vec::new(),
@@ -1369,6 +1391,13 @@ impl ProcessBuilder {
             task_listeners: Vec::new(),
             names: Vec::new(),
         }
+    }
+
+    /// Sets the process's BPMN `name` attribute (the modeller label surfaced as
+    /// the process definition `name`). Distinct from the executable `id`.
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     fn add(mut self, id: impl Into<String>, kind: ElementKind) -> Self {
@@ -2145,12 +2174,14 @@ impl ProcessBuilder {
 
         Ok(ProcessDefinition {
             id: self.id,
+            name: self.name,
             elements,
             start_event,
             // Programmatically built definitions have no source XML; parse_bpmn
             // overwrites this with the verbatim resource for parsed deployments.
             xml: String::new(),
             adhoc: Vec::new(),
+            start_form_id: None,
         })
     }
 }

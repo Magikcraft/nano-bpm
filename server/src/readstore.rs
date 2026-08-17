@@ -42,7 +42,7 @@ pub(crate) fn read_store_method(query: ReadQuery) -> &'static str {
         ReadQuery::SearchProcessInstances => "process_instances",
         ReadQuery::GetProcessInstance => "process_instance",
         ReadQuery::SearchUserTasks => "user_tasks",
-        ReadQuery::GetUserTask => "user_tasks",
+        ReadQuery::GetUserTask => "user_task",
         ReadQuery::SearchVariables => "variables",
         ReadQuery::GetVariable => "variable",
         ReadQuery::SearchJobs => "jobs",
@@ -242,10 +242,30 @@ impl ReadModel {
         Vec::new()
     }
 
+    /// Fetches a single process definition by key across shards (every shard
+    /// holds every definition, so the first shard that knows the key answers).
+    pub fn process_definition_by_key(&self, key: Key) -> Option<ProcessDefinitionRow> {
+        for s in &self.shards {
+            if let Some(row) = s.process_definition_by_key(key) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
     pub fn process_definition_xml(&self, key: Key) -> Option<String> {
         for s in &self.shards {
             if let Some(xml) = s.process_definition_xml(key) {
                 return Some(xml);
+            }
+        }
+        None
+    }
+
+    pub fn process_definition_start_form_id(&self, key: Key) -> Option<Option<String>> {
+        for s in &self.shards {
+            if let Some(row) = s.process_definition_start_form_id(key) {
+                return Some(row);
             }
         }
         None
@@ -316,6 +336,15 @@ impl ReadModel {
         None
     }
 
+    pub fn form_by_id(&self, form_id: &str) -> Option<FormRow> {
+        for s in &self.shards {
+            if let Some(row) = s.form_by_id(form_id) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
     pub fn resource_by_key(&self, key: Key) -> Option<ResourceRow> {
         for s in &self.shards {
             if let Some(row) = s.resource_by_key(key) {
@@ -354,6 +383,10 @@ impl ReadModel {
 
     pub fn user_tasks(&self) -> Vec<UserTaskRow> {
         self.shards.iter().flat_map(|s| s.user_tasks()).collect()
+    }
+
+    pub fn user_task(&self, key: Key) -> Option<UserTaskRow> {
+        self.shards.iter().find_map(|s| s.user_task(key))
     }
 
     pub fn incidents(&self) -> Vec<IncidentRow> {

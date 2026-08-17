@@ -69,7 +69,9 @@ CREATE TABLE process_definitions (
     key        INTEGER PRIMARY KEY,
     process_id TEXT NOT NULL,
     version    INTEGER NOT NULL,
-    xml        TEXT NOT NULL DEFAULT ''
+    name       TEXT,
+    xml        TEXT NOT NULL DEFAULT '',
+    start_form_id TEXT
 );
 -- UNIQUE enforces one row per (process_id, version) so a redeploy of the same
 -- version can never create ambiguous \"latest version per id\" rows, and the
@@ -596,6 +598,8 @@ pub struct ProcessDefinitionRow {
     pub key: Key,
     pub process_id: String,
     pub version: i32,
+    pub name: Option<String>,
+    pub is_latest: bool,
 }
 
 pub struct VariableRow {
@@ -1492,6 +1496,21 @@ impl ReadStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    pub fn user_task(&self, key: Key) -> Option<UserTaskRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT key, instance_key, element_instance_key, element_id, state, \
+             assignee, candidate_groups, candidate_users, due_date, follow_up_date, \
+             priority, created_at_ms, process_definition_id, process_definition_key, \
+             process_definition_version, form_key, external_form_reference \
+             FROM user_tasks WHERE key = ?1",
+            params![key as i64],
+            map_user_task,
+        )
+        .optional()
+        .expect("query user_task")
+    }
+
     pub fn incidents(&self) -> Vec<IncidentRow> {
         let conn = self.conn.lock().expect("read store poisoned");
         let mut stmt = conn
@@ -1647,14 +1666,15 @@ impl ReadStore {
 
     pub fn process_definitions(&self) -> Vec<ProcessDefinitionRow> {
         let conn = self.conn.lock().expect("read store poisoned");
-        // Search surfaces only the latest version per process id (the endpoint's
-        // `isLatestVersion` filter and Zeebe-parity list semantics), even though
-        // every version's XML is retained for by-key diagram lookups.
+        // Return EVERY deployed version (Camunda/Zeebe parity: each version is a
+        // distinct, searchable process definition, e.g. so `version` filters and
+        // by-key lookups resolve superseded versions). `is_latest` marks the
+        // highest version per id for callers that want only the current one.
         let mut stmt = conn
             .prepare(
-                "SELECT key, process_id, version FROM process_definitions pd \
-                 WHERE version = (SELECT MAX(version) FROM process_definitions \
-                                  WHERE process_id = pd.process_id)",
+                "SELECT key, process_id, version, name, \
+                 (version = MAX(version) OVER (PARTITION BY process_id)) AS is_latest \
+                 FROM process_definitions",
             )
             .expect("prepare process_definitions");
         let rows = stmt
@@ -1663,10 +1683,38 @@ impl ReadStore {
                     key: r.get::<_, i64>(0)? as Key,
                     process_id: r.get(1)?,
                     version: r.get(2)?,
+                    name: r.get(3)?,
+                    is_latest: r.get::<_, i64>(4)? != 0,
                 })
             })
             .expect("query process_definitions");
         rows.filter_map(Result::ok).collect()
+    }
+
+    /// Fetches a single process definition by its `processDefinitionKey`,
+    /// resolving any version (not just the latest), or `None` if no such key was
+    /// ever deployed. Backs the get-by-key endpoint.
+    pub fn process_definition_by_key(&self, key: Key) -> Option<ProcessDefinitionRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT key, process_id, version, name, \
+                 (version = (SELECT MAX(version) FROM process_definitions \
+                             WHERE process_id = pd.process_id)) AS is_latest \
+                 FROM process_definitions pd WHERE key = ?1",
+            )
+            .expect("prepare process_definition_by_key");
+        stmt.query_row([key as i64], |r| {
+            Ok(ProcessDefinitionRow {
+                key: r.get::<_, i64>(0)? as Key,
+                process_id: r.get(1)?,
+                version: r.get(2)?,
+                name: r.get(3)?,
+                is_latest: r.get::<_, i64>(4)? != 0,
+            })
+        })
+        .optional()
+        .expect("query process_definition_by_key")
     }
 
     pub fn decision_requirements(&self) -> Vec<DecisionRequirementsRow> {
@@ -1765,6 +1813,23 @@ impl ReadStore {
         .expect("query form_by_key")
     }
 
+    /// The latest deployed form for a given form id (highest version), used to
+    /// resolve a process start form (`GetStartProcessForm`) by its declared
+    /// `formId`. `None` when no form with that id is projected.
+    pub fn form_by_id(&self, form_id: &str) -> Option<FormRow> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            &format!(
+                "SELECT {FORM_COLS} FROM forms WHERE form_id = ?1 \
+                 ORDER BY version DESC LIMIT 1"
+            ),
+            params![form_id],
+            map_form,
+        )
+        .optional()
+        .expect("query form_by_id")
+    }
+
     /// A single deployed generic resource by its per-version numeric key. Each
     /// deployed version is retained under its own `resource_key`, so a redeploy
     /// that mints a new key never invalidates an earlier one. `None` when no such
@@ -1822,6 +1887,21 @@ impl ReadStore {
         )
         .optional()
         .expect("query process_definition_xml")
+    }
+
+    /// The `zeebe:formDefinition formId` declared on a process definition's start
+    /// event (its start form), by process-definition key. The outer `Option` is
+    /// `None` when no such definition is projected; the inner is `None` when the
+    /// definition exists but declares no start form.
+    pub fn process_definition_start_form_id(&self, key: Key) -> Option<Option<String>> {
+        let conn = self.conn.lock().expect("read store poisoned");
+        conn.query_row(
+            "SELECT start_form_id FROM process_definitions WHERE key = ?1",
+            params![key as i64],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .expect("query process_definition_start_form_id")
     }
 
     pub fn variables(&self) -> Vec<VariableRow> {
@@ -2353,18 +2433,34 @@ fn project_engine_state(
     state: &nanobpmn_engine_core::State,
     now_ms: u64,
 ) -> rusqlite::Result<()> {
-    // 1) Process definitions + their element metadata. `state.processes` holds
-    //    only the latest deployed version per id (the engine retains no older
-    //    definitions), so older-version rows the event log once projected are not
-    //    reconstructable — an in-flight instance on a superseded version resolves
-    //    to the latest, exactly as the event projector's "latest so far" lookup
-    //    would if only the latest definition were on record.
-    for deployed in state.processes.values() {
+    // 1) Process definitions + their element metadata. `state.process_versions`
+    //    retains EVERY deployed version keyed by process-definition key, while
+    //    `state.processes` is only the latest-by-id index over it. Project the
+    //    full version-retention map so superseded definitions survive a
+    //    compaction-floor recovery — matching the read model's "every version is
+    //    searchable / get-by-key resolves superseded versions" semantics. A
+    //    pre-retention snapshot deserializes `process_versions` empty
+    //    (`serde(default)`); fall back to the latest-by-id index there, where the
+    //    latest version per id is the only version that was ever preserved.
+    let deployed_defs: Vec<&nanobpmn_engine_core::DeployedProcess> =
+        if state.process_versions.is_empty() {
+            state.processes.values().collect()
+        } else {
+            state.process_versions.values().collect()
+        };
+    for deployed in deployed_defs {
         let def = &deployed.definition;
         tx.cexecute(
-            "INSERT INTO process_definitions (process_id, key, version, xml) VALUES (?1, ?2, ?3, ?4) \
-             ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, xml = excluded.xml",
-            params![def.id, deployed.key as i64, deployed.version, def.xml],
+            "INSERT INTO process_definitions (process_id, key, version, name, xml, start_form_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, name = excluded.name, xml = excluded.xml, start_form_id = excluded.start_form_id",
+            params![
+                def.id,
+                deployed.key as i64,
+                deployed.version,
+                def.name.as_ref(),
+                def.xml,
+                def.start_form_id.as_ref()
+            ],
         )?;
         for (element_id, element) in &def.elements {
             tx.cexecute(
@@ -2693,13 +2789,20 @@ fn project(tx: &rusqlite::Transaction, event: &Event, now_ms: u64) -> rusqlite::
             // later redeploy has superseded but whose instances are still around
             // (a redeploy no longer overwrites the prior version's XML, which
             // previously blanked the Explorer diagram of every older-version
-            // instance). Search stays scoped to the latest version per id (see
-            // `process_definitions`). `ON CONFLICT(key)` refreshes idempotently on
+            // instance). Search returns every retained version and marks the latest
+            // per id with `is_latest`. `ON CONFLICT(key)` refreshes idempotently on
             // replay/re-delivery of the same ProcessDeployed event.
             tx.cexecute(
-                "INSERT INTO process_definitions (process_id, key, version, xml) VALUES (?1, ?2, ?3, ?4) \
-                 ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, xml = excluded.xml",
-                params![process.id, *process_definition_key as i64, version, process.xml],
+                "INSERT INTO process_definitions (process_id, key, version, name, xml, start_form_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(key) DO UPDATE SET process_id = excluded.process_id, version = excluded.version, name = excluded.name, xml = excluded.xml, start_form_id = excluded.start_form_id",
+                params![
+                    process.id,
+                    *process_definition_key as i64,
+                    version,
+                    process.name.as_ref(),
+                    process.xml,
+                    process.start_form_id.as_ref()
+                ],
             )?;
             // Element metadata (type + BPMN name) keyed by (definition, element
             // id): the per-element lifecycle events carry only an element id, so
@@ -4132,11 +4235,121 @@ mod definition_xml_tests {
             Some("<xml>v2</xml>")
         );
 
-        // Search remains scoped to the latest version per id.
+        // Search now surfaces every version (Camunda parity), with `is_latest`
+        // marking the highest version per id.
+        let mut defs = store.process_definitions();
+        defs.sort_by_key(|d| d.version);
+        assert_eq!(defs.len(), 2);
+        assert_eq!(defs[0].version, 1);
+        assert_eq!(defs[0].key, 6);
+        assert!(!defs[0].is_latest);
+        assert_eq!(defs[1].version, 2);
+        assert_eq!(defs[1].key, 297);
+        assert!(defs[1].is_latest);
+
+        // Get-by-key resolves any version, including the superseded one.
+        let v1_row = store.process_definition_by_key(6).expect("v1 by key");
+        assert_eq!(v1_row.version, 1);
+        assert!(!v1_row.is_latest);
+        assert!(store.process_definition_by_key(999).is_none());
+    }
+
+    #[test]
+    fn seed_from_engine_state_projects_every_retained_version() {
+        use nanobpmn_engine_core::{DeployedProcess, State};
+
+        // A below-compaction-floor recovery rebuilds the read model from the live
+        // engine snapshot. `State::process_versions` retains EVERY deployed
+        // version; the projection must surface all of them (not just the
+        // latest-by-id index in `state.processes`), or a superseded definition
+        // would silently vanish from search / get-by-key after recovery.
+        let mk = |key: u64, version: i32, xml: &str| {
+            let mut def: ProcessDefinition = ProcessBuilder::new("p")
+                .start_event("s")
+                .end_event("e")
+                .connect("s", "e")
+                .build()
+                .unwrap();
+            def.xml = xml.to_string();
+            DeployedProcess {
+                key,
+                version,
+                definition: def,
+            }
+        };
+
+        let mut state = State::default();
+        let v1 = mk(6, 1, "<xml>v1</xml>");
+        let v2 = mk(297, 2, "<xml>v2</xml>");
+        state.process_versions.insert(6, v1.clone());
+        state.process_versions.insert(297, v2.clone());
+        // `processes` is the latest-by-id index — v2 only. If the projection read
+        // this instead of `process_versions`, v1 would be dropped.
+        state.processes.insert("p".to_string(), v2.clone());
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+
+        let mut defs = store.process_definitions();
+        defs.sort_by_key(|d| d.version);
+        assert_eq!(defs.len(), 2, "both retained versions must be projected");
+        assert_eq!(
+            (defs[0].version, defs[0].key, defs[0].is_latest),
+            (1, 6, false)
+        );
+        assert_eq!(
+            (defs[1].version, defs[1].key, defs[1].is_latest),
+            (2, 297, true)
+        );
+        // The superseded version resolves by key after recovery.
+        assert_eq!(
+            store.process_definition_xml(6).as_deref(),
+            Some("<xml>v1</xml>")
+        );
+        assert_eq!(
+            store.process_definition_by_key(6).map(|d| d.version),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn seed_from_engine_state_falls_back_to_latest_index_for_legacy_snapshots() {
+        use nanobpmn_engine_core::{DeployedProcess, State};
+
+        // A pre-retention snapshot deserializes `process_versions` empty
+        // (`serde(default)`); the projection must fall back to the latest-by-id
+        // index so the latest definition still recovers.
+        let mut def: ProcessDefinition = ProcessBuilder::new("p")
+            .start_event("s")
+            .end_event("e")
+            .connect("s", "e")
+            .build()
+            .unwrap();
+        def.xml = "<xml>latest</xml>".to_string();
+
+        let mut state = State::default();
+        state.processes.insert(
+            "p".to_string(),
+            DeployedProcess {
+                key: 42,
+                version: 3,
+                definition: def,
+            },
+        );
+        assert!(state.process_versions.is_empty());
+
+        let store = ReadStore::open(None).unwrap();
+        store.seed_from_engine_state(&state).unwrap();
+
         let defs = store.process_definitions();
         assert_eq!(defs.len(), 1);
-        assert_eq!(defs[0].key, 297);
-        assert_eq!(defs[0].version, 2);
+        assert_eq!(defs[0].key, 42);
+        assert_eq!(defs[0].version, 3);
+        assert!(defs[0].is_latest);
+        assert_eq!(
+            store.process_definition_xml(42).as_deref(),
+            Some("<xml>latest</xml>")
+        );
     }
 
     #[test]
@@ -5365,7 +5578,9 @@ mod read_surface_tests {
         assert_eq!(latest.schema, r#"{"schemaVersion":2}"#);
 
         // Every prior version remains servable by its own key (Zeebe parity).
-        let older = store.form_by_key(10).expect("older form version still resolves");
+        let older = store
+            .form_by_key(10)
+            .expect("older form version still resolves");
         assert_eq!(older.version, 1);
         assert_eq!(older.schema, r#"{"schemaVersion":1}"#);
 

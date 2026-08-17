@@ -69,6 +69,8 @@ New ADRs take the next free number and follow the house shape: a `# ADR NNNN —
 | [0057](0057-console-app-view-embedded-urban-apps.md) | Console App View: mounting bespoke Urban app UIs (iframe-sandboxed) | Proposed | 2026-08-09 |
 | [0058](0058-openapi-endpoint-surface.md) | OpenAPI endpoint surface (contract-first controllers, ejectable to imperative) | Proposed | 2026-08-09 |
 | [0059](0059-supervisor-enrolment-app-driven-fleet-configuration.md) | Supervisor enrolment: app-driven fleet configuration | Proposed | 2026-08-13 |
+| [0060](0060-institutional-memory-context-grounding.md) | Institutional memory: model-grounded context for agent sessions | Proposed | 2026-08-17 |
+| [0061](0061-ecosystem-knowledge-plane.md) | Ecosystem knowledge plane: the context/memory split above AGENTS.md | Proposed | 2026-08-17 |
 
 ## Reading paths
 

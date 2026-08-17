@@ -61,6 +61,13 @@ fn console_error(msg: &str) {
 /// conscious decision about whether to expose it here. See the module docs.
 mod surface_parity;
 
+/// Compile-time parity gate for the gateway's C8-style REST **read** surface: an
+/// exhaustive match over the enumerated read operations that fails the build when
+/// a new gateway read is recorded without a conscious decision about whether to
+/// expose it on the wasm read channel. The read analogue of `surface_parity`; see
+/// the module docs.
+mod read_surface_parity;
+
 /// A simulated engine instance bound to one modeler session.
 #[wasm_bindgen]
 pub struct TestEngine {

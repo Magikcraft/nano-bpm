@@ -215,7 +215,9 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                 match local_name(name) {
                     "process" => {
                         let id = attr(attrs, "id").ok_or(ParseError::ProcessWithoutId)?;
-                        current = Some(ProcessAcc::new(id.to_string()));
+                        let mut acc = ProcessAcc::new(id.to_string());
+                        acc.name = attr(attrs, "name").map(str::to_string);
+                        current = Some(acc);
                     }
                     // Definitions-level error declarations live outside <process>.
                     "error" => {
@@ -529,24 +531,41 @@ pub fn parse_bpmn(xml: &str) -> Result<Vec<ProcessDefinition>, ParseError> {
                                 }
                             }
                             "formDefinition" => {
-                                // zeebe:formDefinition inside a user task: the
-                                // form linkage. `formId` names an embedded /
-                                // deployment form (resolved to a numeric form_key
-                                // against the deployed forms at task creation);
+                                // zeebe:formDefinition inside a user task (its
+                                // form) or a start event (the process start form).
+                                // `formId` names an embedded / deployment form
+                                // (resolved to a numeric form_key against the
+                                // deployed forms at task creation);
                                 // `externalReference` names an external form
                                 // (surfaced verbatim). Zeebe declares exactly one
                                 // of the two, so an `externalReference` wins and
                                 // suppresses `formId` to keep them mutually
                                 // exclusive downstream.
+                                let form_id = attr(attrs, "formId")
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string);
+                                let external_reference = attr(attrs, "externalReference")
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_string);
                                 if let Some(idx) = cur_user_task {
                                     let props = &mut acc.nodes[idx].user_task;
-                                    props.external_form_reference =
-                                        attr(attrs, "externalReference").map(str::to_string);
+                                    props.external_form_reference = external_reference;
                                     props.form_id = if props.external_form_reference.is_some() {
                                         None
                                     } else {
-                                        attr(attrs, "formId").map(str::to_string)
+                                        form_id
                                     };
+                                } else if let Some(idx) = cur_start {
+                                    // Start forms are formId-only by design: the
+                                    // `GetStartProcessForm` contract resolves a
+                                    // *deployed* form, which an external reference
+                                    // (an externally-hosted form) is not. We
+                                    // intentionally do not record
+                                    // `externalReference` for start events;
+                                    // external start forms are out of scope until
+                                    // there is a read-model/API surface for them.
+                                    acc.nodes[idx].start_form_id = form_id;
+                                    let _ = external_reference;
                                 }
                             }
                             "adHoc" => {
@@ -1251,6 +1270,9 @@ struct NodeAcc {
     /// order. Resolved to concrete resource keys at job activation and delivered
     /// in the `linkedResources` custom header. Empty when none.
     linked_resources: Vec<crate::model::LinkedResource>,
+    /// For a start event: the `zeebe:formDefinition formId` declared on it — the
+    /// process's start form. `None` on other nodes and start events with no form.
+    start_form_id: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1314,6 +1336,8 @@ struct MessageDecl {
 /// Accumulates the nodes and flows of one `<process>` as it is scanned.
 struct ProcessAcc {
     id: String,
+    /// The `<bpmn:process>` `name` attribute (modeller label), if present.
+    name: Option<String>,
     nodes: Vec<NodeAcc>,
     flows: Vec<FlowAcc>,
     boundaries: Vec<PendingBoundary>,
@@ -1325,6 +1349,7 @@ impl ProcessAcc {
     fn new(id: String) -> Self {
         Self {
             id,
+            name: None,
             nodes: Vec::new(),
             flows: Vec::new(),
             boundaries: Vec::new(),
@@ -1369,6 +1394,7 @@ impl ProcessAcc {
             task_listeners: Vec::new(),
             task_headers: std::collections::BTreeMap::new(),
             linked_resources: Vec::new(),
+            start_form_id: None,
         });
         Some(self.nodes.len() - 1)
     }
@@ -1655,6 +1681,9 @@ impl ProcessAcc {
         }
 
         let mut builder = ProcessBuilder::new(self.id.clone());
+        if let Some(name) = &self.name {
+            builder = builder.name(name.clone());
+        }
         // Map each sub-process to its inner start event (a start node whose
         // parent is the sub-process).
         let sub_starts: HashMap<String, String> = self
@@ -1666,6 +1695,9 @@ impl ProcessAcc {
         // Ids of sequence flows declared as a gateway `default` flow.
         let mut default_flow_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        // The process-level start event's form id (`zeebe:formDefinition formId`),
+        // captured as nodes are consumed and set on the built definition below.
+        let mut start_form_id: Option<String> = None;
         for node in self.nodes {
             let node_id = node.id.clone();
             let io_id = node.id.clone();
@@ -1691,6 +1723,9 @@ impl ProcessAcc {
                 .clone()
                 .filter(|mi| !mi.input_collection.trim().is_empty());
             let parent = node.parent.clone();
+            if matches!(node.kind, NodeKind::Start) && parent.is_none() {
+                start_form_id = node.start_form_id.clone();
+            }
             if let Some(d) = node.default_flow.clone() {
                 default_flow_ids.insert(d);
             }
@@ -1984,6 +2019,7 @@ impl ProcessAcc {
             reason: e.to_string(),
         })?;
         def.adhoc = adhoc_catalog;
+        def.start_form_id = start_form_id;
         Ok(def)
     }
 }
@@ -2102,6 +2138,42 @@ mod tests {
     <bpmn:sequenceFlow id="f2" sourceRef="charge" targetRef="done" />
   </bpmn:process>
 </bpmn:definitions>"#;
+
+    #[test]
+    fn should_parse_the_process_name_attribute() {
+        // The `<bpmn:process>` `name` attribute (the modeller label) is captured
+        // as `ProcessDefinition::name`, distinct from the executable `id`. This
+        // is what the process-definition search `name` filter matches against and
+        // what read models surface as the definition `name`.
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="main-process" name="Main Process" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.id, "main-process");
+        assert_eq!(def.name.as_deref(), Some("Main Process"));
+    }
+
+    #[test]
+    fn should_leave_process_name_none_when_absent() {
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+            <bpmn:process id="simple-process" isExecutable="true">
+              <bpmn:startEvent id="s" />
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        let def = &parse_bpmn(xml).unwrap()[0];
+        assert_eq!(def.id, "simple-process");
+        assert_eq!(def.name, None);
+    }
 
     #[test]
     fn should_parse_a_timer_intermediate_catch_event() {
@@ -2792,51 +2864,76 @@ mod tests {
     }
 
     #[test]
-    fn should_parse_user_task_form_definition() {
-        // given: user tasks carrying a zeebe:formDefinition — one an embedded
-        // form (formId), one an external form (externalReference), as the
-        // Camunda modeler emits them.
+    fn should_parse_form_definitions_on_user_task_and_start_event() {
+        // given: a start event carrying a start form and a user task carrying its
+        // own form, both via zeebe:formDefinition (as the Camunda modeler emits).
         let xml = r#"
           <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
                             xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
             <bpmn:process id="p">
-              <bpmn:startEvent id="s" />
-              <bpmn:userTask id="embedded">
+              <bpmn:startEvent id="s">
                 <bpmn:extensionElements>
-                  <zeebe:formDefinition formId="feature-escalation" />
+                  <zeebe:formDefinition formId="start-form" />
                 </bpmn:extensionElements>
-              </bpmn:userTask>
-              <bpmn:userTask id="external">
+              </bpmn:startEvent>
+              <bpmn:userTask id="review">
                 <bpmn:extensionElements>
-                  <zeebe:formDefinition externalReference="https://forms.example/x" />
+                  <zeebe:userTask />
+                  <zeebe:formDefinition formId="review-form" />
                 </bpmn:extensionElements>
               </bpmn:userTask>
               <bpmn:endEvent id="e" />
-              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="embedded" />
-              <bpmn:sequenceFlow id="b" sourceRef="embedded" targetRef="external" />
-              <bpmn:sequenceFlow id="c" sourceRef="external" targetRef="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
             </bpmn:process>
           </bpmn:definitions>"#;
 
         // when
         let def = &parse_bpmn(xml).unwrap()[0];
 
-        // then: the embedded task carries the form id (no external reference).
-        let ElementKind::UserTask(embedded) = &def.element("embedded").unwrap().kind else {
+        // then: the start form rides on the definition, and the user-task form on
+        // its props.
+        assert_eq!(def.start_form_id.as_deref(), Some("start-form"));
+        let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
             panic!("expected a user task");
         };
-        assert_eq!(embedded.form_id.as_deref(), Some("feature-escalation"));
-        assert_eq!(embedded.external_form_reference, None);
+        assert_eq!(props.form_id.as_deref(), Some("review-form"));
+        assert_eq!(props.external_form_reference, None);
+    }
 
-        // and: the external task carries the external reference (no form id).
-        let ElementKind::UserTask(external) = &def.element("external").unwrap().kind else {
+    #[test]
+    fn should_parse_external_form_reference_on_user_task() {
+        // given: a user task referencing an external form (no deployed formId).
+        let xml = r#"
+          <bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                            xmlns:zeebe="http://camunda.org/schema/zeebe/1.0">
+            <bpmn:process id="p">
+              <bpmn:startEvent id="s" />
+              <bpmn:userTask id="review">
+                <bpmn:extensionElements>
+                  <zeebe:userTask />
+                  <zeebe:formDefinition externalReference="https://forms.example/x" />
+                </bpmn:extensionElements>
+              </bpmn:userTask>
+              <bpmn:endEvent id="e" />
+              <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="review" />
+              <bpmn:sequenceFlow id="b" sourceRef="review" targetRef="e" />
+            </bpmn:process>
+          </bpmn:definitions>"#;
+
+        // when
+        let def = &parse_bpmn(xml).unwrap()[0];
+
+        // then
+        let ElementKind::UserTask(props) = &def.element("review").unwrap().kind else {
             panic!("expected a user task");
         };
-        assert_eq!(external.form_id, None);
+        assert_eq!(props.form_id, None);
         assert_eq!(
-            external.external_form_reference.as_deref(),
+            props.external_form_reference.as_deref(),
             Some("https://forms.example/x")
         );
+        assert_eq!(def.start_form_id, None);
     }
 
     #[test]

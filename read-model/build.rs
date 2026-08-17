@@ -67,8 +67,9 @@ fn main() {
         return;
     }
 
-    let out_dir =
-        PathBuf::from(std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR for a build script"));
+    let out_dir = PathBuf::from(
+        std::env::var("OUT_DIR").expect("cargo always sets OUT_DIR for a build script"),
+    );
 
     // (1) Empty `libsqlite3.a` stub so `libsqlite3-sys`'s bare `-lsqlite3`
     //     resolves without shadowing the real `sqlite3_*` symbols.
@@ -272,14 +273,14 @@ fn locate_sqlite_wasm_rs_src() -> PathBuf {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
-                if let Some(ver) = name.strip_prefix("sqlite-wasm-rs-") {
-                    if entry.path().join("sqlite3/sqlite3.c").exists() {
-                        // Prefer the exact locked version when we could read it.
-                        if want_version.as_deref() == Some(ver) {
-                            return entry.path();
-                        }
-                        candidates.push(entry.path());
+                if let Some(ver) = name.strip_prefix("sqlite-wasm-rs-")
+                    && entry.path().join("sqlite3/sqlite3.c").exists()
+                {
+                    // Prefer the exact locked version when we could read it.
+                    if want_version.as_deref() == Some(ver) {
+                        return entry.path();
                     }
+                    candidates.push(entry.path());
                 }
             }
         }
@@ -325,10 +326,8 @@ fn locked_sqlite_wasm_rs_version() -> Option<String> {
             in_pkg = true;
             continue;
         }
-        if in_pkg {
-            if let Some(rest) = line.strip_prefix("version = \"") {
-                return rest.strip_suffix('"').map(str::to_string);
-            }
+        if in_pkg && let Some(rest) = line.strip_prefix("version = \"") {
+            return rest.strip_suffix('"').map(str::to_string);
         }
     }
     None

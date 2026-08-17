@@ -982,6 +982,145 @@ fn a_created_instance_reports_a_real_start_date() {
 }
 
 #[test]
+fn process_instance_search_honors_version_date_and_business_id_filters() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+
+    // Regression (Magikcraft/nano-bpm#791): the process-instance search endpoint
+    // ignored the `processDefinitionVersion`, `startDate`/`endDate` (CLI
+    // `--between`) and `businessId` filters, returning matches regardless. It now
+    // applies them server-side for Zeebe/C8 parity.
+    let server = ServerProcess::boot(&journal);
+    let business_id = "order-791";
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances"),
+        Some(&format!(
+            r#"{{"processDefinitionId":"demo","businessId":"{business_id}"}}"#
+        )),
+    );
+    assert_eq!(status, 200, "create instance failed: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("create response is JSON");
+    let key = json["processInstanceKey"]
+        .as_str()
+        .expect("processInstanceKey present")
+        .to_string();
+
+    let contains_key = |body: &str, key: &str| -> bool {
+        serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|j| {
+                j["items"].as_array().map(|items| {
+                    items
+                        .iter()
+                        .any(|i| i["processInstanceKey"].as_str() == Some(key))
+                })
+            })
+            .unwrap_or(false)
+    };
+
+    // Wait until the created instance is projected and findable by its own key.
+    let (status, body) = server.request_until(
+        "POST",
+        &path("/process-instances/search"),
+        Some(&format!(r#"{{"filter":{{"processInstanceKey":"{key}"}}}}"#)),
+        |status, body| status == 200 && contains_key(body, &key),
+    );
+    assert_eq!(status, 200, "search failed: {body}");
+
+    // The demo definition is version 1: a version-2 filter must exclude it, a
+    // version-1 filter must include it.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{"filter":{"processDefinitionVersion":2}}"#),
+    );
+    assert_eq!(status, 200, "version-2 search failed: {body}");
+    assert!(
+        !contains_key(&body, &key),
+        "version-2 filter must exclude the version-1 instance: {body}"
+    );
+
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{"filter":{"processDefinitionVersion":1}}"#),
+    );
+    assert_eq!(status, 200, "version-1 search failed: {body}");
+    assert!(
+        contains_key(&body, &key),
+        "version-1 filter must include the version-1 instance: {body}"
+    );
+
+    // A far-past `startDate` window (CLI `--between 2000-...`) must return nothing.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(
+            r#"{"filter":{"startDate":{"$gte":"2000-01-01T00:00:00Z","$lte":"2000-01-02T00:00:00Z"}}}"#,
+        ),
+    );
+    assert_eq!(status, 200, "far-past startDate search failed: {body}");
+    assert!(
+        !contains_key(&body, &key),
+        "far-past startDate window must exclude a present-day instance: {body}"
+    );
+
+    // Nano does not yet project a process-instance completion timestamp, so an
+    // `endDate` range/equality filter matches against an absent value and must
+    // exclude the still-running instance (honest, not silently ignored)...
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(
+            r#"{"filter":{"endDate":{"$gte":"2000-01-01T00:00:00Z","$lte":"2100-01-01T00:00:00Z"}}}"#,
+        ),
+    );
+    assert_eq!(status, 200, "endDate range search failed: {body}");
+    assert!(
+        !contains_key(&body, &key),
+        "an endDate range filter must exclude an instance with no completion timestamp: {body}"
+    );
+
+    // ...while `$exists: false` still matches the instance (its end date is absent).
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{"filter":{"endDate":{"$exists":false}}}"#),
+    );
+    assert_eq!(status, 200, "endDate $exists:false search failed: {body}");
+    assert!(
+        contains_key(&body, &key),
+        "endDate $exists:false must match an instance with no completion timestamp: {body}"
+    );
+
+    // The instance is findable by its business id, and not by a different one.
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(&format!(r#"{{"filter":{{"businessId":"{business_id}"}}}}"#)),
+    );
+    assert_eq!(status, 200, "businessId search failed: {body}");
+    assert!(
+        contains_key(&body, &key),
+        "instance must be findable by its business id: {body}"
+    );
+
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-instances/search"),
+        Some(r#"{"filter":{"businessId":"no-such-business-id"}}"#),
+    );
+    assert_eq!(status, 200, "wrong-businessId search failed: {body}");
+    assert!(
+        !contains_key(&body, &key),
+        "a non-matching business id must exclude the instance: {body}"
+    );
+
+    server.shutdown();
+}
+
+#[test]
 fn searching_process_definitions_returns_the_deployed_demo() {
     let scratch = ScratchDir::new();
     let journal = scratch.journal_path();
@@ -1887,4 +2026,141 @@ fn multi_partition_state_survives_a_restart() {
     );
 
     restarted.shutdown();
+}
+
+/// Extracts the `items` array of a process-definition search response.
+fn search_pd_items(server: &ServerProcess, filter_json: &str) -> Vec<serde_json::Value> {
+    let (status, body) = server.request(
+        "POST",
+        &path("/process-definitions/search"),
+        Some(filter_json),
+    );
+    assert_eq!(status, 200, "pd search failed: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("search response is JSON");
+    json["items"].as_array().cloned().unwrap_or_default()
+}
+
+/// Regression for Magikcraft/nano-bpm#792: process-definition search must honor
+/// the BPMN display `name` (exact + `$like` wildcard), the `version` filter
+/// across *every* deployed version (not just the latest), and `isLatestVersion`;
+/// and get-by-key must return full details for any version.
+#[test]
+fn process_definition_search_honours_name_wildcard_and_version() {
+    let scratch = ScratchDir::new();
+    let journal = scratch.journal_path();
+    let server = ServerProcess::boot(&journal);
+
+    // A process whose executable id ("main-process") differs from its modeller
+    // display name ("Main Process") — the case the name filter must key on.
+    let v1 = r#"<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL">
+  <bpmn:process id="main-process" name="Main Process" isExecutable="true">
+    <bpmn:startEvent id="s" />
+    <bpmn:serviceTask id="t"><bpmn:extensionElements /></bpmn:serviceTask>
+    <bpmn:endEvent id="e" />
+    <bpmn:sequenceFlow id="f1" sourceRef="s" targetRef="t" />
+    <bpmn:sequenceFlow id="f2" sourceRef="t" targetRef="e" />
+  </bpmn:process>
+</bpmn:definitions>"#;
+    let (status, body) = deploy_bpmn(server.port, v1);
+    assert_eq!(status, 200, "deploy v1 failed: {body}");
+
+    // A second, differing deployment of the same id → version 2.
+    let v2 = v1
+        .replace("<bpmn:endEvent id=\"e\" />", "<bpmn:endEvent id=\"e2\" />")
+        .replace("targetRef=\"e\"", "targetRef=\"e2\"");
+    let (status, body) = deploy_bpmn(server.port, &v2);
+    assert_eq!(status, 200, "deploy v2 failed: {body}");
+
+    // Wait until both versions are projected.
+    server.request_until(
+        "POST",
+        &path("/process-definitions/search"),
+        Some(r#"{"filter":{"processDefinitionId":"main-process"}}"#),
+        |status, body| {
+            status == 200
+                && serde_json::from_str::<serde_json::Value>(body)
+                    .ok()
+                    .and_then(|j| j["items"].as_array().map(|i| i.len() >= 2))
+                    .unwrap_or(false)
+        },
+    );
+
+    // Exact display-name match resolves the id whose name is "Main Process".
+    let by_name = search_pd_items(&server, r#"{"filter":{"name":"Main Process"}}"#);
+    assert!(
+        by_name
+            .iter()
+            .any(|i| i["processDefinitionId"].as_str() == Some("main-process")),
+        "exact name filter must match the display name: {by_name:?}"
+    );
+    // The id-shaped value must NOT match the display-name filter.
+    let by_id_shaped_name = search_pd_items(&server, r#"{"filter":{"name":"main-process"}}"#);
+    assert!(
+        by_id_shaped_name.is_empty(),
+        "name filter matches the display name, not the id: {by_id_shaped_name:?}"
+    );
+
+    // `$like` wildcard on the display name.
+    let by_wildcard = search_pd_items(&server, r#"{"filter":{"name":{"$like":"*Process"}}}"#);
+    assert!(
+        by_wildcard
+            .iter()
+            .any(|i| i["processDefinitionId"].as_str() == Some("main-process")),
+        "wildcard name filter must match: {by_wildcard:?}"
+    );
+
+    // Version filter must find the *superseded* version 1, not just the latest.
+    let v1_items = search_pd_items(
+        &server,
+        r#"{"filter":{"processDefinitionId":"main-process","version":1}}"#,
+    );
+    assert_eq!(
+        v1_items.len(),
+        1,
+        "version=1 must be searchable: {v1_items:?}"
+    );
+    assert_eq!(v1_items[0]["version"].as_i64(), Some(1));
+    assert_eq!(v1_items[0]["name"].as_str(), Some("Main Process"));
+    let v1_key = v1_items[0]["processDefinitionKey"]
+        .as_str()
+        .expect("v1 key present")
+        .to_string();
+
+    let v2_items = search_pd_items(
+        &server,
+        r#"{"filter":{"processDefinitionId":"main-process","version":2}}"#,
+    );
+    assert_eq!(
+        v2_items.len(),
+        1,
+        "version=2 must be searchable: {v2_items:?}"
+    );
+    assert_eq!(v2_items[0]["version"].as_i64(), Some(2));
+
+    // isLatestVersion filters to the highest version per id.
+    let latest = search_pd_items(
+        &server,
+        r#"{"filter":{"processDefinitionId":"main-process","isLatestVersion":true}}"#,
+    );
+    assert_eq!(latest.len(), 1, "exactly one latest version: {latest:?}");
+    assert_eq!(latest[0]["version"].as_i64(), Some(2));
+
+    // Get-by-key resolves the superseded version 1 with full details.
+    let (status, body) = server.request(
+        "GET",
+        &path(&format!("/process-definitions/{v1_key}")),
+        None,
+    );
+    assert_eq!(status, 200, "get-by-key must succeed: {body}");
+    let def: serde_json::Value = serde_json::from_str(&body).expect("get response is JSON");
+    assert_eq!(def["processDefinitionKey"].as_str(), Some(v1_key.as_str()));
+    assert_eq!(def["processDefinitionId"].as_str(), Some("main-process"));
+    assert_eq!(def["version"].as_i64(), Some(1));
+    assert_eq!(def["name"].as_str(), Some("Main Process"));
+
+    // A get for an unknown key is a clean 404.
+    let (status, _) = server.request("GET", &path("/process-definitions/99999999"), None);
+    assert_eq!(status, 404, "unknown key must 404");
+
+    server.shutdown();
 }
