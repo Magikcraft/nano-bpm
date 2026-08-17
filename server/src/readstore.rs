@@ -586,7 +586,8 @@ fn copy_terminal_to_archive(
              DELETE FROM _terminal_copy;",
         )?;
         {
-            let mut insert = conn.prepare("INSERT OR IGNORE INTO _terminal_copy(key) VALUES (?1)")?;
+            let mut insert =
+                conn.prepare("INSERT OR IGNORE INTO _terminal_copy(key) VALUES (?1)")?;
             for k in keys {
                 insert.execute(params![*k as i64])?;
             }
@@ -622,7 +623,7 @@ fn copy_terminal_to_archive(
 
 // --- enum <-> integer code mappings (kept beside the engine enums) ---
 
-fn instance_state_code(s: ProcessInstanceState) -> i64 {
+const fn instance_state_code(s: ProcessInstanceState) -> i64 {
     match s {
         ProcessInstanceState::Active => 0,
         ProcessInstanceState::Completed => 1,
@@ -633,6 +634,25 @@ fn instance_state_code(s: ProcessInstanceState) -> i64 {
         // show "cancelling".
         ProcessInstanceState::Terminating => 3,
     }
+}
+
+/// The terminal process-instance state codes (`Completed`, `Terminated`),
+/// **derived** from the canonical [`instance_state_code`] mapping rather than
+/// hard-coded. Every terminal-selection query (eviction, adaptive pruning,
+/// terminal-archive copy/backfill — issue #831) builds its `state IN (...)`
+/// predicate from this single source via [`terminal_state_predicate`], so the
+/// SQL can never drift from the enum-to-int codes.
+const TERMINAL_INSTANCE_STATE_CODES: [i64; 2] = [
+    instance_state_code(ProcessInstanceState::Completed),
+    instance_state_code(ProcessInstanceState::Terminated),
+];
+
+/// Builds a `<column> IN (<terminal codes>)` SQL predicate from
+/// [`TERMINAL_INSTANCE_STATE_CODES`]. Use this instead of writing a literal
+/// `state IN (1, 2)`, so the terminal-state code set has one source of truth.
+fn terminal_state_predicate(column: &str) -> String {
+    let [completed, terminated] = TERMINAL_INSTANCE_STATE_CODES;
+    format!("{column} IN ({completed}, {terminated})")
 }
 fn instance_state_from(code: i64) -> ProcessInstanceState {
     match code {
@@ -1131,9 +1151,12 @@ fn prune_oldest_terminal(conn: &mut Connection, batch: usize) -> rusqlite::Resul
          DELETE FROM _evict;",
     )?;
     let evicted = tx.execute(
-        "INSERT INTO _evict(key) \
-         SELECT key FROM process_instances WHERE state IN (1, 2) \
-         ORDER BY key ASC LIMIT ?1",
+        &format!(
+            "INSERT INTO _evict(key) \
+             SELECT key FROM process_instances WHERE {} \
+             ORDER BY key ASC LIMIT ?1",
+            terminal_state_predicate("state")
+        ),
         params![batch as i64],
     )?;
     if evicted == 0 {
@@ -1486,6 +1509,15 @@ impl ReadStore {
     /// which silently drifts as `SCHEMA` gains tables), so it can never fall
     /// behind `SCHEMA`.
     pub fn reset(&self) -> rusqlite::Result<()> {
+        // Serialize against the adaptive pruner's separate connection in-process
+        // (see `write_lock`), exactly like `export`/`advance_exported`: `reset`
+        // performs destructive DDL, so running it concurrently with a pruning /
+        // export / replay WAL writer would race SQLite's lock and trip
+        // `database is locked`.
+        let _write = self
+            .write_lock
+            .lock()
+            .expect("read store write lock poisoned");
         let conn = self.conn.lock().expect("read store poisoned");
         drop_all_user_tables(&conn)?;
         create_fresh_schema(&conn)?;
@@ -1580,12 +1612,13 @@ impl ReadStore {
         let result = (|| -> rusqlite::Result<()> {
             attach_archive(&conn, archive)?;
             let copy = (|| -> rusqlite::Result<()> {
+                let terminal = terminal_state_predicate("state");
                 let pi_cols =
                     shared_column_list(&conn, "main", "terminal_archive", "process_instances")?;
                 conn.execute(
                     &format!(
                         "INSERT OR IGNORE INTO terminal_archive.process_instances ({pi_cols}) \
-                         SELECT {pi_cols} FROM main.process_instances WHERE state IN (1, 2)"
+                         SELECT {pi_cols} FROM main.process_instances WHERE {terminal}"
                     ),
                     [],
                 )?;
@@ -1595,7 +1628,7 @@ impl ReadStore {
                         &format!(
                             "INSERT OR IGNORE INTO terminal_archive.{table} ({cols}) \
                              SELECT {cols} FROM main.{table} WHERE instance_key IN \
-                             (SELECT key FROM main.process_instances WHERE state IN (1, 2))"
+                             (SELECT key FROM main.process_instances WHERE {terminal})"
                         ),
                         [],
                     )?;
@@ -1744,11 +1777,14 @@ impl ReadStore {
             max_delete as i64
         };
         let evicted = tx.execute(
-            "INSERT INTO _evict(key) \
-             SELECT key FROM ( \
-               SELECT key FROM process_instances WHERE state IN (1, 2) \
-               ORDER BY key DESC LIMIT -1 OFFSET ?1 \
-             ) ORDER BY key ASC LIMIT ?2",
+            &format!(
+                "INSERT INTO _evict(key) \
+                 SELECT key FROM ( \
+                   SELECT key FROM process_instances WHERE {} \
+                   ORDER BY key DESC LIMIT -1 OFFSET ?1 \
+                 ) ORDER BY key ASC LIMIT ?2",
+                terminal_state_predicate("state")
+            ),
             params![max_keep as i64, del_limit],
         )?;
         if evicted == 0 {
@@ -4990,7 +5026,10 @@ mod writability_tests {
             let main_sync = conn
                 .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
                 .unwrap();
-            assert_eq!(main_sync, 1, "precondition: main read model runs NORMAL (1)");
+            assert_eq!(
+                main_sync, 1,
+                "precondition: main read model runs NORMAL (1)"
+            );
             super::attach_archive(&conn, &archive).expect("attach archive");
             let s = conn
                 .query_row("PRAGMA terminal_archive.synchronous", [], |r| {
@@ -5972,6 +6011,89 @@ mod definition_xml_tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn reset_waits_on_the_shared_write_lock_instead_of_erroring() {
+        // Regression guard: `reset` runs destructive DDL (drop-all + recreate)
+        // and is one more independent WAL writer alongside the exporter and the
+        // adaptive pruner. Like `export`/`advance_exported` it must serialize on
+        // the shared in-process `write_lock`, so a `reset` racing a pruner mid
+        // delete+checkpoint blocks cleanly instead of tripping
+        // `database is locked`.
+        let path = std::env::temp_dir().join(format!(
+            "nanobpm-resetlock-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = std::sync::Arc::new(ReadStore::open(Some(&path)).unwrap());
+
+        let guard = store.write_lock.lock().expect("write lock");
+
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handle = {
+            let store = store.clone();
+            let done = done.clone();
+            std::thread::spawn(move || {
+                store.reset().expect("reset must not error");
+                done.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "reset completed while the write lock was held — it did not serialize"
+        );
+
+        drop(guard);
+        handle.join().expect("reset thread panicked");
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+
+        drop(store);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
+        std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn terminal_state_predicate_is_derived_from_the_canonical_state_codes() {
+        use nanobpmn_engine_core::ProcessInstanceState;
+
+        use super::{
+            TERMINAL_INSTANCE_STATE_CODES, instance_state_code, instance_state_from,
+            terminal_state_predicate,
+        };
+
+        // Drift guard (issue #831): every terminal-selection query (eviction,
+        // adaptive pruning, terminal-archive copy/backfill) must build its
+        // `state IN (...)` predicate from `TERMINAL_INSTANCE_STATE_CODES`, which
+        // is itself derived from `instance_state_code`. If the enum-to-int codes
+        // ever change, this predicate follows automatically instead of a magic
+        // `state IN (1, 2)` literal silently drifting out of sync.
+        assert_eq!(
+            TERMINAL_INSTANCE_STATE_CODES,
+            [
+                instance_state_code(ProcessInstanceState::Completed),
+                instance_state_code(ProcessInstanceState::Terminated),
+            ]
+        );
+        // The two codes must map back to genuinely terminal states, never to a
+        // live (`Active`) or transient (`Terminating`) one.
+        for code in TERMINAL_INSTANCE_STATE_CODES {
+            assert!(matches!(
+                instance_state_from(code),
+                ProcessInstanceState::Completed | ProcessInstanceState::Terminated
+            ));
+        }
+        let [completed, terminated] = TERMINAL_INSTANCE_STATE_CODES;
+        assert_eq!(
+            terminal_state_predicate("state"),
+            format!("state IN ({completed}, {terminated})")
+        );
     }
 
     #[test]
