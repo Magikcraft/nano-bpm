@@ -1288,10 +1288,19 @@ fn safe_pkg_dir(pkg: &str) -> Option<PathBuf> {
     if !is_valid_pkg_name(pkg) {
         return None;
     }
-    // npm package -> safe dir name (`@scope/name` -> `scope__name`). Safe to
-    // flatten only because `is_valid_pkg_name` already guaranteed the raw shape
-    // (unscoped = no `/`; scoped = exactly one `/`), so the mapping is
-    // unambiguous and cannot fold a local path spec into a bare dir name.
+    // npm package -> safe dir name (`@scope/name` -> `scope__name`). The
+    // security property this flatten guarantees is *path confinement*, not
+    // injectivity: because `is_valid_pkg_name` already pinned the raw shape
+    // (unscoped = no `/`; scoped = exactly one `/`, no traversal, npm alphabet),
+    // no input can fold a local path spec (`/etc`, `some/local/path`, `..`) into
+    // a bare dir name — the result is always a single component under
+    // `extensions_root()`. It is *not* injective: a scoped `@scope/name` and an
+    // unscoped package literally named `scope__name` both map here to
+    // `scope__name`. That is an accepted limitation, not a path-escape bug — the
+    // dir is a content store addressed by the validated package name (install
+    // and remove use the *same* mapping, so a given name always round-trips to
+    // its own dir), and packs are identified downstream by their manifest `id`,
+    // never by this directory name.
     let flat = pkg.trim_start_matches('@').replace('/', "__");
     Some(extensions_root().join(flat))
 }
