@@ -1027,23 +1027,54 @@ fn npm_pack_download(dir: &Path, pkg_spec: &str) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Hard cap on how many bytes we buffer from a single tar member. The tarballs
+/// this reads come from an untrusted registry, so an extremely large member
+/// (e.g. a pathological `CHANGELOG.md`) would otherwise balloon memory and the
+/// JSON response — a resource-exhaustion vector. 4 MiB dwarfs any real changelog
+/// while keeping a hostile input bounded; a member past the cap is treated as
+/// unreadable (`None`).
+const MAX_TAR_MEMBER_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Stream a single named member out of the gzip tarball `tgz` (relative to
 /// `dir`) to memory via `tar -xzO -f <tgz> <member>`, writing **no** archive
 /// paths to the filesystem. `None` when the member is absent, `tar` is missing
-/// or fails, or the bytes are not valid UTF-8. Reading just the one file we need
-/// is a smaller attack surface (and less I/O) than unpacking a whole untrusted
-/// registry archive to disk.
+/// or fails, the member exceeds [`MAX_TAR_MEMBER_BYTES`], or the bytes are not
+/// valid UTF-8. Reading just the one file we need is a smaller attack surface
+/// (and less I/O) than unpacking a whole untrusted registry archive to disk, and
+/// the byte cap keeps a hostile oversized member from exhausting memory: stdout
+/// is streamed with a hard limit rather than captured whole via `output()`.
 fn tar_read_member(dir: &Path, tgz: &str, member: &str) -> Option<String> {
+    use std::io::Read;
     let tar = find_program("tar")?;
-    let out = std::process::Command::new(&tar)
+    let mut child = std::process::Command::new(&tar)
         .args(["xzOf", tgz, member])
         .current_dir(dir)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
+    let mut stdout = child.stdout.take()?;
+    // Read one byte past the cap so an over-limit member is detectable without
+    // ever buffering the whole thing.
+    let mut buf = Vec::new();
+    let read = stdout
+        .by_ref()
+        .take(MAX_TAR_MEMBER_BYTES + 1)
+        .read_to_end(&mut buf)
+        .is_ok();
+    if !read || buf.len() as u64 > MAX_TAR_MEMBER_BYTES {
+        // Read error or over the cap: stop `tar` (rather than draining a
+        // pathologically large member) and treat it as unreadable.
+        let _ = child.kill();
+        let _ = child.wait();
         return None;
     }
-    String::from_utf8(out.stdout).ok()
+    // The member fit under the cap, so its stdout is at EOF and `tar` has
+    // finished; reap it and honour its exit status.
+    if !child.wait().ok()?.success() {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 /// Create a fresh, uniquely-named temp directory under the system temp root
@@ -2988,6 +3019,46 @@ mod tests {
         assert!(is_valid_pkg_name("nano-ide-ext-foo")); // plain unscoped name
         assert!(is_valid_pkg_version("1.2.3-beta.1+build"));
         assert!(!is_valid_pkg_version("1 2"));
+    }
+
+    #[test]
+    fn tar_read_member_caps_oversized_members() {
+        // Regression (resource exhaustion): `tar_read_member` reads members out
+        // of untrusted registry tarballs, so it must not buffer an arbitrarily
+        // large member into memory. A member at/under the cap reads fine; one
+        // past the cap is rejected (`None`) instead of ballooning memory.
+        if find_program("tar").is_none() {
+            return; // no tar on this host — the fn degrades to None anyway
+        }
+        let dir = secure_temp_dir("nano-tar-member-test").unwrap();
+        let pkg = dir.join("package");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("CHANGELOG.md"), b"# Changelog\n\nsmall\n").unwrap();
+        // One byte over the cap must be rejected.
+        let big = vec![b'a'; (MAX_TAR_MEMBER_BYTES + 1) as usize];
+        std::fs::write(pkg.join("BIG.md"), &big).unwrap();
+
+        let tar = find_program("tar").unwrap();
+        let ok = std::process::Command::new(&tar)
+            .args(["czf", "t.tgz", "package"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "failed to build test tarball");
+
+        let small = tar_read_member(&dir, "t.tgz", "package/CHANGELOG.md");
+        assert_eq!(small.as_deref(), Some("# Changelog\n\nsmall\n"));
+        assert!(
+            tar_read_member(&dir, "t.tgz", "package/BIG.md").is_none(),
+            "a member past MAX_TAR_MEMBER_BYTES must be rejected, not buffered"
+        );
+        assert!(
+            tar_read_member(&dir, "t.tgz", "package/ABSENT.md").is_none(),
+            "an absent member must return None"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
