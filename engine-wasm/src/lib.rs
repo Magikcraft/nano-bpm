@@ -59,14 +59,12 @@ fn console_error(msg: &str) {
 /// Compile-time parity gate: an exhaustive match over `engine-core`'s `Command`
 /// surface that fails the build when a new engine capability is added without a
 /// conscious decision about whether to expose it here. See the module docs.
+///
+/// Its twin `classify_read` (same module) is the read-surface analogue: an
+/// exhaustive match over `engine-core`'s `ReadQuery` enum — the single canonical
+/// read surface — that fails the build when a newly served read is recorded
+/// without a conscious `TestEngine` decision.
 mod surface_parity;
-
-/// Compile-time parity gate for the gateway's C8-style REST **read** surface: an
-/// exhaustive match over the enumerated read operations that fails the build when
-/// a new gateway read is recorded without a conscious decision about whether to
-/// expose it on the wasm read channel. The read analogue of `surface_parity`; see
-/// the module docs.
-mod read_surface_parity;
 
 /// A simulated engine instance bound to one modeler session.
 #[wasm_bindgen]
