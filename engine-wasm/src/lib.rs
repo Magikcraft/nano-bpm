@@ -1257,6 +1257,9 @@ fn is_rfc3339_date_time(s: &str) -> bool {
     let hour = num(&b[11..13]);
     let min = num(&b[14..16]);
     let sec = num(&b[17..19]);
+    // `sec == 60` is intentionally accepted: chrono's `DateTime<Utc>` parse (the
+    // gateway's `parse_date`) accepts leap seconds at any hh:mm (e.g. `12:30:60Z`)
+    // and rejects `61`, so `sec > 60` mirrors it exactly. Do not tighten to `> 59`.
     if !(1..=12).contains(&month)
         || day < 1
         || day > days_in_month(year, month)
@@ -3269,6 +3272,7 @@ mod read_channel_tests {
             "2026-08-16T11:36:36.344Z",
             "2026-08-16t11:36:36z",
             "2026-01-01T00:00:00+13:00",
+            // Leap second: chrono accepts `:60`, so parity requires we accept it too.
             "2026-12-31T23:59:60-05:30",
             "2024-02-29T00:00:00Z",
             "2000-02-29T00:00:00Z",
