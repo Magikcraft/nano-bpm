@@ -45,6 +45,5 @@ pub(crate) mod wasm;
 
 #[cfg(feature = "native")]
 pub(crate) use native::open_connection;
-
 #[cfg(all(feature = "wasm", not(feature = "native")))]
 pub(crate) use wasm::open_connection;
