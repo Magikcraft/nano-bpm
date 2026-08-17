@@ -1,5 +1,13 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
 import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from "react";
+import {
+  getExtensionChangelog,
   getExtensionReadme,
   getExtensions,
   getMarketplace,
@@ -111,6 +119,17 @@ export default function Extensions() {
   const [readmePkg, setReadmePkg] = useState<MarketEntry | null>(null);
   const [readmeMd, setReadmeMd] = useState<string | null>(null);
   const [readmeErr, setReadmeErr] = useState<string | null>(null);
+  // Pack-detail drawer tab + lazily-fetched changelog ("What's changed").
+  const [drawerTab, setDrawerTab] = useState<"readme" | "changelog">("readme");
+  const [changelogMd, setChangelogMd] = useState<string | null>(null);
+  const [changelogErr, setChangelogErr] = useState<string | null>(null);
+  const [changelogDelta, setChangelogDelta] = useState(false);
+  // Monotonic token identifying the currently-open drawer request. Each
+  // `openPackDrawer` bumps it; awaited README/changelog responses capture the token
+  // at call time and drop their state writes if the drawer has since moved to a
+  // different pack — otherwise a slow response for pack A could overwrite the
+  // newer pack B's content.
+  const drawerReqRef = useRef(0);
   const { selection, select } = useTheme();
 
   // Every project, so the installed section can invert the `scaffoldedFrom.pack`
@@ -245,24 +264,112 @@ export default function Extensions() {
     );
   }, [market, q]);
 
-  // Open the pack-detail drawer and lazily fetch its README markdown (from the
-  // installed copy, else npm). Re-fetches each open so an update's new docs show.
-  const openReadme = async (m: MarketEntry) => {
+  // Open the pack-detail drawer on the given tab (default README) and lazily
+  // fetch its README markdown (from the installed copy, else npm); when opened
+  // on the changelog tab it also triggers the "What's changed" fetch.
+  // Re-fetches each open so an update's new docs show.
+  const openPackDrawer = async (
+    m: MarketEntry,
+    tab: "readme" | "changelog" = "readme",
+  ) => {
+    const token = ++drawerReqRef.current;
     setReadmePkg(m);
     setReadmeMd(null);
     setReadmeErr(null);
+    setChangelogMd(null);
+    setChangelogErr(null);
+    setChangelogDelta(false);
+    setDrawerTab(tab);
+    if (tab === "changelog") void fetchChangelog(m, true, token);
     try {
-      setReadmeMd(
-        (
-          await getExtensionReadme({
-            query: { pkg: m.name },
-            throwOnError: true,
-          })
-        ).data.readme,
-      );
+      const readme = (
+        await getExtensionReadme({
+          query: { pkg: m.name },
+          throwOnError: true,
+        })
+      ).data.readme;
+      if (drawerReqRef.current !== token) return;
+      setReadmeMd(readme);
     } catch {
+      if (drawerReqRef.current !== token) return;
       setReadmeErr("No README available for this pack.");
     }
+  };
+
+  // Lazily fetch a pack's changelog for the "What's changed" tab. For an
+  // installed pack with an update available we pass the installed version so the
+  // server scopes the view to the delta (installed → latest), else the full
+  // changelog. Guarded so a manual tab click only fetches once per drawer open;
+  // callers that have just reset the changelog state (e.g. `openPackDrawer`) pass
+  // `force` to bypass the guard, since the state resets are async and the stale
+  // closure values would otherwise skip the fetch and wedge on "Loading…".
+  const fetchChangelog = async (
+    m: MarketEntry,
+    force = false,
+    token = drawerReqRef.current,
+  ) => {
+    if (!force && (changelogMd !== null || changelogErr !== null)) return;
+    try {
+      const res = (
+        await getExtensionChangelog({
+          query: {
+            pkg: m.name,
+            from: m.updateAvailable
+              ? (m.installedVersion ?? undefined)
+              : undefined,
+            to: m.version,
+          },
+          throwOnError: true,
+        })
+      ).data;
+      if (drawerReqRef.current !== token) return;
+      setChangelogMd(res.changelog);
+      setChangelogDelta(res.delta);
+    } catch {
+      if (drawerReqRef.current !== token) return;
+      setChangelogErr("No changelog available for this pack.");
+    }
+  };
+
+  const selectDrawerTab = (tab: "readme" | "changelog") => {
+    setDrawerTab(tab);
+    if (tab === "changelog" && readmePkg) void fetchChangelog(readmePkg);
+  };
+
+  // Roving keyboard navigation for the README/Changelog tablist, per the
+  // WAI-ARIA tabs pattern (automatic activation): Arrow keys move between the
+  // two tabs, Home/End jump to the first/last, and focus follows the selection.
+  const onDrawerTabKeyDown = (e: ReactKeyboardEvent<HTMLDivElement>) => {
+    const order: ("readme" | "changelog")[] = ["readme", "changelog"];
+    const idx = order.indexOf(drawerTab);
+    let next: "readme" | "changelog" | null = null;
+    switch (e.key) {
+      case "ArrowRight":
+      case "ArrowDown":
+        next = order[(idx + 1) % order.length];
+        break;
+      case "ArrowLeft":
+      case "ArrowUp":
+        next = order[(idx - 1 + order.length) % order.length];
+        break;
+      case "Home":
+        next = order[0];
+        break;
+      case "End":
+        next = order[order.length - 1];
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+    selectDrawerTab(next);
+    document
+      .getElementById(
+        next === "readme"
+          ? "pack-drawer-tab-readme"
+          : "pack-drawer-tab-changelog",
+      )
+      ?.focus();
   };
 
   const marketCard = (m: MarketEntry) => (
@@ -274,7 +381,7 @@ export default function Extensions() {
         <div className="flex flex-wrap items-baseline gap-x-2">
           <button
             type="button"
-            onClick={() => void openReadme(m)}
+            onClick={() => void openPackDrawer(m)}
             className="break-all text-left font-medium text-fg hover:text-accent hover:underline"
             title="View README"
           >
@@ -294,6 +401,20 @@ export default function Extensions() {
       </div>
       {m.updateAvailable ? (
         <div className="flex shrink-0 items-center gap-3">
+          {/* Always offer "What's changed" on an available update: the gate
+              used to be `m.changelogAvailable`, but that is an installed-pack
+              *offline* probe, so it wrongly hid the link whenever the running
+              version shipped no changelog but the published update adds one. The
+              server prefers the published tarball for the delta and the drawer
+              shows "No changelog available" on a 404, so showing it is safe. */}
+          <button
+            type="button"
+            onClick={() => void openPackDrawer(m, "changelog")}
+            className="text-xs text-accent hover:underline"
+            title="See what changed between your version and the latest"
+          >
+            What's changed
+          </button>
           <Button
             variant="secondary"
             size="sm"
@@ -574,17 +695,96 @@ export default function Extensions() {
               </div>
             </div>
             <div className="min-h-0 flex-1 overflow-auto">
-              {readmeErr ? (
-                <div className="px-6 py-5 text-sm text-fg-faint">
-                  {readmeErr}
+              {/* Always offer the Changelog tab, including for not-yet-installed
+                  marketplace entries: `changelogAvailable` is an installed-only
+                  offline probe, so gating on it hid the tab for market packs
+                  (and installed packs whose changelog only lives in the tarball).
+                  The server returns 404 gracefully when a pack has none. */}
+              {readmePkg && (
+                <div
+                  role="tablist"
+                  aria-label="Package details"
+                  onKeyDown={onDrawerTabKeyDown}
+                  className="sticky top-0 z-10 flex gap-1 border-b border-edge bg-panel px-4 pt-2"
+                >
+                  <button
+                    type="button"
+                    role="tab"
+                    id="pack-drawer-tab-readme"
+                    aria-selected={drawerTab === "readme"}
+                    aria-controls="pack-drawer-panel"
+                    tabIndex={drawerTab === "readme" ? 0 : -1}
+                    onClick={() => selectDrawerTab("readme")}
+                    className={`rounded-t px-3 py-1.5 text-xs font-medium ${
+                      drawerTab === "readme"
+                        ? "border-b-2 border-accent text-fg"
+                        : "text-fg-faint hover:text-fg"
+                    }`}
+                  >
+                    README
+                  </button>
+                  <button
+                    type="button"
+                    role="tab"
+                    id="pack-drawer-tab-changelog"
+                    aria-selected={drawerTab === "changelog"}
+                    aria-controls="pack-drawer-panel"
+                    tabIndex={drawerTab === "changelog" ? 0 : -1}
+                    onClick={() => selectDrawerTab("changelog")}
+                    className={`rounded-t px-3 py-1.5 text-xs font-medium ${
+                      drawerTab === "changelog"
+                        ? "border-b-2 border-accent text-fg"
+                        : "text-fg-faint hover:text-fg"
+                    }`}
+                  >
+                    {readmePkg.updateAvailable ? "What's changed" : "Changelog"}
+                  </button>
                 </div>
-              ) : readmeMd === null ? (
-                <div className="px-6 py-5 text-sm text-fg-faint">
-                  Loading README…
-                </div>
-              ) : (
-                <MarkdownPreview source={readmeMd} />
               )}
+              <div
+                role="tabpanel"
+                id="pack-drawer-panel"
+                aria-labelledby={
+                  drawerTab === "changelog"
+                    ? "pack-drawer-tab-changelog"
+                    : "pack-drawer-tab-readme"
+                }
+              >
+                {drawerTab === "changelog" ? (
+                  changelogErr ? (
+                    <div className="px-6 py-5 text-sm text-fg-faint">
+                      {changelogErr}
+                    </div>
+                  ) : changelogMd === null ? (
+                    <div className="px-6 py-5 text-sm text-fg-faint">
+                      Loading changelog…
+                    </div>
+                  ) : (
+                    <>
+                      {changelogDelta && (
+                        <div className="px-6 pt-4 text-xs text-fg-faint">
+                          Showing changes since your installed version
+                          {readmePkg.installedVersion
+                            ? ` (${readmePkg.installedVersion} → ${readmePkg.version})`
+                            : ""}
+                          .
+                        </div>
+                      )}
+                      <MarkdownPreview source={changelogMd} />
+                    </>
+                  )
+                ) : readmeErr ? (
+                  <div className="px-6 py-5 text-sm text-fg-faint">
+                    {readmeErr}
+                  </div>
+                ) : readmeMd === null ? (
+                  <div className="px-6 py-5 text-sm text-fg-faint">
+                    Loading README…
+                  </div>
+                ) : (
+                  <MarkdownPreview source={readmeMd} />
+                )}
+              </div>
             </div>
             {(readmePkg.repository ||
               readmePkg.homepage ||
