@@ -74,6 +74,7 @@ mod engine;
 mod event;
 mod json;
 mod model;
+mod read_query;
 mod state;
 
 pub mod bpmn;
@@ -102,6 +103,7 @@ pub use model::{
     ProcessBuilder, ProcessDefinition, SequenceFlow, TaskListener, TaskListenerEventType,
     TaskListenerJobResult, TimerDef, TimerDefKind, UserTaskCorrections, UserTaskProps, Value,
 };
+pub use read_query::ReadQuery;
 pub use state::{
     compose_key, local_of, partition_of, stable_hash, subscription_partition, DeployedProcess,
     Incident, IncidentKind, IncidentState, InstanceSnapshot, Job, JobKind, JobState, Key,

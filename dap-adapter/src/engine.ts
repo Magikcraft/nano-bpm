@@ -46,7 +46,7 @@ function safeJsonParse(json: string): unknown {
 function ensureWasm(): void {
   if (wasmReady) return;
   const require = createRequire(import.meta.url);
-  const wasmPath = require.resolve('@nanobpm/engine-wasm/nanobpmn_engine_bg.wasm');
+  const wasmPath = require.resolve('@nanobpm/engine-wasm/lean/nanobpmn_engine_bg.wasm');
   initSync({ module: readFileSync(wasmPath) });
   // Reference the default export so bundlers keep it; harmless at runtime.
   void initSyncDefault;

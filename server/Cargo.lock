@@ -1499,6 +1499,7 @@ dependencies = [
  "nanobpm-console-api",
  "nanobpm-gateway-rest",
  "nanobpmn-engine-core",
+ "nanobpmn-read-model",
  "openraft",
  "portable-pty",
  "prometheus",
@@ -1525,6 +1526,17 @@ name = "nanobpmn-engine-core"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "nanobpmn-read-model"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "js-sys",
+ "nanobpmn-engine-core",
+ "rusqlite",
+ "serde_json",
 ]
 
 [[package]]

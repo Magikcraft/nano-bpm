@@ -11,3 +11,20 @@
 #   sudo apt-get install -y mold          # Debian/Ubuntu
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Trim the wasm SQLite footprint (epic #796). `sqlite-wasm-rs` declares
+# `links = "wsqlite3"` and its build script compiles a FULL-featured SQLite
+# (FTS5/RTREE/SESSION/geopoly/math) that the read model never uses and that
+# `wasm-opt` cannot strip. This *empty* build-script override suppresses that C
+# build entirely: Cargo does not run `sqlite-wasm-rs`'s build script and it
+# contributes no link metadata of its own. The actual (trimmed, core-SQL-only)
+# `libwsqlite3.a` is compiled by `read-model`'s own `build.rs`, which emits both
+# the `rustc-link-lib=static=wsqlite3` and the `rustc-link-search` that locates
+# it — resolved at `read-model`'s compile and propagated to the final link. So
+# only the minimal archive is ever built or linked.
+#
+# Scoped to the `wsqlite3` links key on the wasm32 target, so it is completely
+# inert for every other build: the `native`/server build (not wasm32) and the
+# feature-off `engine-wasm` wasm build (which never pulls `sqlite-wasm-rs`) do not
+# declare `links = "wsqlite3"`, so this override does nothing there.
+[target.wasm32-unknown-unknown.wsqlite3]

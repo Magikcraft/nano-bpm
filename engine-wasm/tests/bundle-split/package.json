@@ -1,0 +1,16 @@
+{
+  "name": "engine-wasm-bundle-split-test",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Asserts the @nanobpm/engine-wasm subpath split: bundling the default (.) entry emits only the lean _bg.wasm; bundling /readmodel emits only the readmodel _bg.wasm. Static module-graph reachability — wasm can't be tree-shaken out of a single fat build.",
+  "scripts": {
+    "test": "node verify.mjs"
+  },
+  "dependencies": {
+    "@nanobpm/engine-wasm": "file:../../pkg"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}

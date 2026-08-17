@@ -28,6 +28,13 @@
 //! guard. [`crate::varspill`] therefore drives them from a background thread that
 //! only fires while the store is quiescent.
 
+/// Reads a SQLite database's size as `(file_bytes, live_bytes)` from its header.
+///
+/// The canonical implementation now lives in the shared `nanobpmn-read-model`
+/// crate (it underpins the read model's own pruning/sizing) and is re-exported
+/// here so this module — and its var-spill caller — reuse the exact same
+/// derivation with no drift. See [`nanobpmn_read_model::page_stats`].
+pub use nanobpmn_read_model::page_stats;
 use rusqlite::Connection;
 
 /// Freelist bytes currently reclaimable: `file_bytes − live_bytes` (see
@@ -35,27 +42,6 @@ use rusqlite::Connection;
 pub fn freelist_bytes(conn: &Connection) -> u64 {
     let (file, live) = page_stats(conn);
     file.saturating_sub(live)
-}
-
-/// Reads a SQLite database's size as `(file_bytes, live_bytes)` from its header:
-/// `file_bytes = page_count × page_size` (the whole allocated file, freelist
-/// included) and `live_bytes = (page_count − freelist_count) × page_size` (the
-/// pages holding actual data). All three PRAGMAs are O(1) header reads, so this is
-/// cheap enough for a hot loop.
-pub fn page_stats(conn: &Connection) -> (u64, u64) {
-    let page_count: i64 = conn
-        .query_row("PRAGMA page_count", [], |r| r.get(0))
-        .unwrap_or(0);
-    let freelist: i64 = conn
-        .query_row("PRAGMA freelist_count", [], |r| r.get(0))
-        .unwrap_or(0);
-    let page_size: i64 = conn
-        .query_row("PRAGMA page_size", [], |r| r.get(0))
-        .unwrap_or(4096);
-    let ps = page_size.max(0) as u64;
-    let file = page_count.max(0) as u64 * ps;
-    let live = (page_count - freelist).max(0) as u64 * ps;
-    (file, live)
 }
 
 /// Puts `conn` into `INCREMENTAL` auto-vacuum mode so that deleted rows move their

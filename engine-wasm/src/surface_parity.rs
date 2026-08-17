@@ -32,9 +32,20 @@
 //! (snapshots/events) new fields flow through serde automatically; where it maps
 //! fields by hand in `lib.rs`, destructure without `..` so a new field also
 //! breaks the build.
+//!
+//! # The read surface
+//!
+//! [`classify`] guards the **write** surface ([`Command`]). Its twin
+//! [`classify_read`] guards the **read** surface: an exhaustive, wildcard-free
+//! `match` over [`ReadQuery`] — the gateway's read-model-backed REST reads,
+//! defined in `engine-core` alongside `Command`. Now that `TestEngine` answers
+//! reads from an embedded read model (`getFormByKey`, `searchUserTasks`,
+//! `searchProcessInstances`, `getResourceByKey`, `searchVariables`), a newly
+//! served read must be classified here too, or the `wasm32` type-check fails —
+//! the same conscious-decision gate `Command` has always had.
 #![allow(dead_code)]
 
-use nanobpmn_engine_core::Command;
+use nanobpmn_engine_core::{Command, ReadQuery};
 
 /// How a given [`Command`] variant relates to the `TestEngine` wasm surface.
 pub(crate) enum Surface {
@@ -127,11 +138,25 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
             reason: "DMN deployment; the in-browser test engine exercises BPMN execution only",
         },
         Command::DeployForms(..) => Surface::NotSurfaced {
-            reason: "form storage; the in-browser test engine exercises BPMN execution only",
+            // DeployResources is Vec<ProcessDefinition> and does NOT extract
+            // embedded forms/resources, so there is no JS deploy path: deploy(xml)
+            // emits only Command::DeployResources (BPMN process defs); DeployForms
+            // has no #[wasm_bindgen] entry (Rust-test only), so a form cannot enter
+            // the in-browser read model.
+            reason: "no JS deploy path: TestEngine::deploy(xml) emits only \
+                     Command::DeployResources (BPMN process defs); DeployForms has \
+                     no #[wasm_bindgen] entry (Rust-test only), so a form cannot \
+                     enter the in-browser read model. Surface when a deployForm JS \
+                     entry lands (see #815).",
         },
         Command::DeployGenericResources(..) => Surface::NotSurfaced {
-            reason: "verbatim generic-resource storage (e.g. Markdown agent prompts); the \
-                     in-browser test engine exercises BPMN execution only",
+            // DeployResources does NOT extract embedded generic resources, so there
+            // is no JS deploy path for them either.
+            reason: "no JS deploy path: deploy(xml) emits only \
+                     Command::DeployResources; DeployGenericResources has no \
+                     #[wasm_bindgen] entry, so a generic resource cannot enter the \
+                     in-browser read model. Surface when a deployResource JS entry \
+                     lands (see #815).",
         },
         Command::DeleteDecisionInstance { .. } => Surface::NotSurfaced {
             reason: "audit-only read-model deletion; no core engine state, irrelevant in-browser",
@@ -164,6 +189,142 @@ pub(crate) fn classify(cmd: &Command) -> Surface {
     }
 }
 
+/// Verdict for a read-model-backed read whose `#[wasm_bindgen]` getter lives
+/// behind the off-by-default `read-model` feature.
+///
+/// It is [`Surface::Surfaced`] only in the `read-model` build — the build that
+/// actually compiles the getter onto `TestEngine`; in the lean feature-off build
+/// the getter is absent, so the read is *not* on the exported surface and the
+/// verdict is [`Surface::NotSurfaced`]. This keeps [`classify_read`] honest to
+/// what each build ships while leaving its exhaustiveness guard firing in both.
+#[cfg(feature = "read-model")]
+fn read_model_read(js_method: &'static str) -> Surface {
+    Surface::Surfaced { js_method }
+}
+
+#[cfg(not(feature = "read-model"))]
+fn read_model_read(_js_method: &'static str) -> Surface {
+    Surface::NotSurfaced {
+        reason: "read-model-backed getter compiled only under the `read-model` feature; \
+                 absent from the lean feature-off build's exported surface",
+    }
+}
+
+/// Exhaustive, wildcard-free classification of every gateway REST **read** the
+/// read model serves ([`ReadQuery`]).
+///
+/// This is the read counterpart of [`classify`]. Adding a [`ReadQuery`] variant
+/// in `engine-core` (i.e. the gateway begins serving a new read) without
+/// extending this match is a hard compile error (`E0004: non-exhaustive
+/// patterns`) — that is the guard. The author is then forced to decide, at the
+/// exact PR that serves the read, whether `TestEngine` surfaces it (mapping it to
+/// a `#[wasm_bindgen]` method, [`Surface::Surfaced`]) or records *why* it stays
+/// out ([`Surface::NotSurfaced`]).
+///
+/// Like [`classify`], this is a build-time sentinel: never called at runtime, its
+/// only value is that the match body is type-checked so the exhaustiveness error
+/// fires. It references no `read-model` types, so it type-checks — and its
+/// exhaustiveness guard fires — under *both* the lean feature-off and the
+/// `read-model` `wasm32` builds, linking nothing new.
+///
+/// The `Surfaced` verdict is kept honest to each build: the five read-model reads
+/// resolve through [`read_model_read`], which reports [`Surface::Surfaced`] only
+/// in the `read-model` build (where the `#[wasm_bindgen]` getter is actually
+/// compiled) and [`Surface::NotSurfaced`] in the lean build (where it is absent).
+pub(crate) fn classify_read(query: &ReadQuery) -> Surface {
+    match query {
+        // ---- Surfaced only in the `read-model` build: each has a
+        // #[wasm_bindgen] read method on TestEngine compiled behind the
+        // `read-model` feature (see `read_model_read`). ----
+        ReadQuery::GetFormByKey => read_model_read("getFormByKey"),
+        ReadQuery::GetResourceByKey => read_model_read("getResourceByKey"),
+        ReadQuery::SearchProcessInstances => read_model_read("searchProcessInstances"),
+        ReadQuery::SearchUserTasks => read_model_read("searchUserTasks"),
+        ReadQuery::SearchVariables => read_model_read("searchVariables"),
+
+        // ---- Not surfaced: conscious exclusions from the modeler test engine.
+        // Revisit each if the modeler grows a need for it; the read model already
+        // holds the data, so surfacing is a mechanical addition of a
+        // #[wasm_bindgen] getter, not new engine work. ----
+        ReadQuery::SearchResources => Surface::NotSurfaced {
+            reason: "resource-metadata listing; the modeler resolves resources by key \
+                     (getResourceByKey), not by browsing the deployed catalogue",
+        },
+        ReadQuery::GetProcessInstance => Surface::NotSurfaced {
+            reason: "single-instance lookup by key; the modeler drives one simulated instance it \
+                     already holds the key for and reads it via the debug snapshot",
+        },
+        ReadQuery::GetUserTask => Surface::NotSurfaced {
+            reason: "single user-task lookup by key; the modeler enumerates via searchUserTasks",
+        },
+        ReadQuery::GetVariable => Surface::NotSurfaced {
+            reason: "single-variable lookup by key; the modeler enumerates via searchVariables",
+        },
+        ReadQuery::SearchJobs => Surface::NotSurfaced {
+            reason: "job inventory listing; the modeler activates/completes jobs directly \
+                     (activateJobs/completeJob) rather than browsing the job table",
+        },
+        ReadQuery::SearchIncidents => Surface::NotSurfaced {
+            reason: "incident listing; incidents surface inline in the simulation's debug state, \
+                     and are resolved via resolveIncident",
+        },
+        ReadQuery::GetIncident => Surface::NotSurfaced {
+            reason: "single-incident lookup by key; not needed by the in-browser test engine",
+        },
+        ReadQuery::SearchElementInstances => Surface::NotSurfaced {
+            reason: "flow-node instance listing; the modeler reads element activation from the \
+                     debug snapshot/event stream, not this read-model query",
+        },
+        ReadQuery::GetElementInstance => Surface::NotSurfaced {
+            reason: "single element-instance lookup by key; covered by the debug snapshot",
+        },
+        ReadQuery::SearchElementInstanceIncidents => Surface::NotSurfaced {
+            reason: "element-instance-scoped incident subtree query; incidents surface inline in \
+                     the simulation's debug state (and via searchIncidents), so the modeler has no \
+                     need to scope them by element-instance subtree",
+        },
+        ReadQuery::SearchElementInstanceWaitStates => Surface::NotSurfaced {
+            reason: "element-instance wait-state listing; the modeler reads wait/activation state \
+                     from the debug snapshot/event stream, not this composite read-model query",
+        },
+        ReadQuery::SearchMessageSubscriptions => Surface::NotSurfaced {
+            reason:
+                "subscription inventory; the modeler correlates via correlateMessage and reads \
+                     subscription state from the debug snapshot",
+        },
+        ReadQuery::SearchCorrelatedMessageSubscriptions => Surface::NotSurfaced {
+            reason: "audit-oriented correlated-subscription listing; not needed in-browser",
+        },
+        ReadQuery::SearchProcessDefinitions => Surface::NotSurfaced {
+            reason: "deployment catalogue listing; the modeler deploys and drives a single known \
+                     definition rather than browsing the catalogue",
+        },
+        ReadQuery::GetProcessDefinitionXml => Surface::NotSurfaced {
+            reason: "the modeler already holds the BPMN XML it deployed; no need to read it back",
+        },
+        ReadQuery::SearchDecisionInstances => Surface::NotSurfaced {
+            reason: "DMN evaluation history; the in-browser test engine exercises BPMN execution \
+                     only",
+        },
+        ReadQuery::GetDecisionInstance => Surface::NotSurfaced {
+            reason: "single DMN evaluation lookup; the in-browser test engine exercises BPMN only",
+        },
+        ReadQuery::SearchDecisionDefinitions => Surface::NotSurfaced {
+            reason: "DMN definition catalogue; the in-browser test engine exercises BPMN only",
+        },
+        ReadQuery::GetDecisionDefinitionXml => Surface::NotSurfaced {
+            reason: "DMN definition XML; the in-browser test engine exercises BPMN only",
+        },
+        ReadQuery::SearchDecisionRequirements => Surface::NotSurfaced {
+            reason: "DMN requirements-graph catalogue; the in-browser test engine exercises BPMN \
+                     only",
+        },
+        ReadQuery::GetDecisionRequirementsXml => Surface::NotSurfaced {
+            reason: "DMN requirements-graph XML; the in-browser test engine exercises BPMN only",
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +345,44 @@ mod tests {
                 timeout: 0,
                 operation_reference: None,
             }),
+            Surface::NotSurfaced { .. }
+        ));
+    }
+
+    // Forms and generic resources have no JS deploy path (deploy(xml) emits only
+    // Command::DeployResources, which does not extract embedded forms/resources),
+    // so their deploy commands are not surfaced until a deployForm/deployResource
+    // JS entry lands (see #815).
+    #[test]
+    fn deploy_forms_and_resources_are_not_surfaced() {
+        assert!(matches!(
+            classify(&Command::DeployForms(Vec::new())),
+            Surface::NotSurfaced { .. }
+        ));
+        assert!(matches!(
+            classify(&Command::DeployGenericResources(Vec::new())),
+            Surface::NotSurfaced { .. }
+        ));
+    }
+
+    // Read counterpart: a representative surfaced + not-surfaced pair over the
+    // REST read surface. The real guard is the exhaustiveness of `classify_read`.
+    // A read-model-backed read is only `Surfaced` in the `read-model` build,
+    // where its getter is compiled; in the lean build it is `NotSurfaced`.
+    #[test]
+    fn classifies_known_reads() {
+        #[cfg(feature = "read-model")]
+        assert!(matches!(
+            classify_read(&ReadQuery::GetFormByKey),
+            Surface::Surfaced { .. }
+        ));
+        #[cfg(not(feature = "read-model"))]
+        assert!(matches!(
+            classify_read(&ReadQuery::GetFormByKey),
+            Surface::NotSurfaced { .. }
+        ));
+        assert!(matches!(
+            classify_read(&ReadQuery::SearchDecisionInstances),
             Surface::NotSurfaced { .. }
         ));
     }
