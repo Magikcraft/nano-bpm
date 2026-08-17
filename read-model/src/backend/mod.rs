@@ -10,7 +10,7 @@
 //!   with the read model's file/WAL tuning. Wins if both features are enabled
 //!   (the server never enables `wasm`).
 //! * `wasm` (only, no `native`) — [`wasm::open_connection`], an in-memory SQLite
-//!   for `wasm32` via `sqlite-wasm-rs` (MemoryVFS). A compiling stub today.
+//!   for `wasm32` via `sqlite-wasm-rs` (MemoryVFS).
 //!
 //! Both expose the identical seam:
 //!
@@ -39,7 +39,7 @@ pub(crate) mod native;
 // two are mutually usable independently, and when both happen to be on (not a
 // configuration the server or engine-wasm use) `native` is the one selected
 // below, so the wasm module would otherwise be dead code that still has to
-// type-check its (stubbed) body.
+// type-check its body.
 #[cfg(all(feature = "wasm", not(feature = "native")))]
 pub(crate) mod wasm;
 

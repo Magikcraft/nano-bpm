@@ -8,8 +8,9 @@
 //!   checkpointing, adaptive pruning, on-disk file paths) is either kept in the
 //!   `server` crate or gated behind `#[cfg(feature = "native")]` here.
 //! * feature `wasm` — an in-memory SQLite for `wasm32-unknown-unknown` via the
-//!   optional `sqlite-wasm-rs` dependency (MemoryVFS). Declared now with a
-//!   compiling stub backend ([`backend::wasm`]); a sibling task fills the body in.
+//!   optional `sqlite-wasm-rs` dependency (MemoryVFS), implemented in
+//!   [`backend::wasm`] (opens a RAM-backed `:memory:` connection and links
+//!   `sqlite-wasm-rs` on the real target via `build.rs`).
 //!
 //! The public projection/query API ([`ReadStore`] and the `*Row` result types)
 //! is backend-agnostic — it speaks `rusqlite` regardless of which SQLite
