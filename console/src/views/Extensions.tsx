@@ -293,16 +293,20 @@ export default function Extensions() {
       </div>
       {m.updateAvailable ? (
         <div className="flex shrink-0 items-center gap-3">
-          {m.changelogAvailable && (
-            <button
-              type="button"
-              onClick={() => void openReadme(m, "changelog")}
-              className="text-xs text-accent hover:underline"
-              title="See what changed between your version and the latest"
-            >
-              What's changed
-            </button>
-          )}
+          {/* Always offer "What's changed" on an available update: the gate
+              used to be `m.changelogAvailable`, but that is an installed-pack
+              *offline* probe, so it wrongly hid the link whenever the running
+              version shipped no changelog but the published update adds one. The
+              server prefers the published tarball for the delta and the drawer
+              shows "No changelog available" on a 404, so showing it is safe. */}
+          <button
+            type="button"
+            onClick={() => void openReadme(m, "changelog")}
+            className="text-xs text-accent hover:underline"
+            title="See what changed between your version and the latest"
+          >
+            What's changed
+          </button>
           <Button
             variant="secondary"
             size="sm"

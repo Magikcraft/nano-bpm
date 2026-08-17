@@ -1281,17 +1281,39 @@ fn install_scripts_trusted(trust: &TrustStore, id: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn safe_pkg_dir(pkg: &str) -> Option<PathBuf> {
-    // npm package -> safe dir name (`@scope/name` -> `scope__name`).
-    let flat = pkg.trim_start_matches('@').replace('/', "__");
-    if flat.is_empty()
-        || flat.contains("..")
-        || !flat
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    {
+    if !is_valid_pkg_name(pkg) {
         return None;
     }
+    // npm package -> safe dir name (`@scope/name` -> `scope__name`).
+    let flat = pkg.trim_start_matches('@').replace('/', "__");
     Some(extensions_root().join(flat))
+}
+
+/// Whether `pkg` is a syntactically valid npm package **name** we will accept
+/// from untrusted input. The single gate shared by [`safe_pkg_dir`] (which maps
+/// it to an install dir) and [`fetch_published_changelog`] (which builds an
+/// `npm pack` registry spec): rejecting path traversal (`..`) and any character
+/// outside the npm name alphabet blocks non-registry specifiers such as
+/// `../local-path`, `file:/…`, or a URL from ever reaching `npm pack` — those
+/// could otherwise be abused to read local files or trigger arbitrary fetches.
+fn is_valid_pkg_name(pkg: &str) -> bool {
+    // `@scope/name` -> `scope__name`, mirroring `safe_pkg_dir`'s flattening.
+    let flat = pkg.trim_start_matches('@').replace('/', "__");
+    !flat.is_empty()
+        && !flat.contains("..")
+        && flat
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Whether a version / dist-tag token is safe to interpolate into an
+/// `npm pack <pkg>@<v>` spec. Restricts to the semver + dist-tag alphabet so a
+/// query param can't smuggle a second spec or a non-registry source via spaces,
+/// slashes, or specifier punctuation (`@`, `:`).
+fn is_valid_pkg_version(v: &str) -> bool {
+    !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
 }
 
 /// Install a `nano-ide-ext-*` package from npm via `npm pack` + extract. The
@@ -1909,11 +1931,25 @@ fn select_changelog_source(
 /// `None` takes the registry's default (`latest`) tag. Best-effort — `None` on
 /// any failure (npm/tar missing, offline, no changelog in the tarball).
 fn fetch_published_changelog(pkg: &str, version: Option<&str>) -> Option<String> {
+    // Gate the untrusted `pkg`/`version` query params before they reach
+    // `npm pack`: `npm pack` accepts far more than a registry name (`../local`,
+    // `file:/…`, URLs, git specs), so an unvalidated spec could be coerced into
+    // reading local files or fetching arbitrary sources. Reuse the same name
+    // check the install path uses, and restrict the version to a safe alphabet
+    // (a stray space/`@` would otherwise smuggle a second spec).
+    let pkg = pkg.trim();
+    if !is_valid_pkg_name(pkg) {
+        return None;
+    }
+    let version = version.map(str::trim).filter(|v| !v.is_empty());
+    if version.is_some_and(|v| !is_valid_pkg_version(v)) {
+        return None;
+    }
     // A dedicated scratch dir under the OS temp dir, torn down before we return.
     // Use exclusive, unpredictable creation (`secure_temp_dir`) so a shared host
     // can't win a symlink/TOCTOU race on a guessable path.
     let scratch = secure_temp_dir("nano-ext-changelog").ok()?;
-    let spec = match version.filter(|v| !v.is_empty()) {
+    let spec = match version {
         Some(v) => format!("{pkg}@{v}"),
         None => pkg.to_string(),
     };
@@ -2808,6 +2844,48 @@ mod tests {
         let published =
             select_changelog_source(false, || None, || Some("published".to_string()));
         assert_eq!(published, Some(("published".to_string(), false)));
+    }
+
+    #[test]
+    fn fetch_published_changelog_rejects_non_registry_specs() {
+        // Regression (security): the changelog fetch builds an `npm pack` spec
+        // from the untrusted `pkg`/`version` query params. `npm pack` accepts
+        // far more than a registry name, so any non-registry specifier — path
+        // traversal, `file:`, a URL, or a version that smuggles a second spec —
+        // must be rejected *before* it can reach `npm pack` (which would run no
+        // network here because validation bails first, returning `None`).
+        for bad in [
+            "../evil",
+            "..",
+            "file:/etc/passwd",
+            "https://example.com/x.tgz",
+            "a b",
+            "@scope/../x",
+            "pkg@1.0.0", // an embedded specifier must not slip through the name
+            "",
+            "   ",
+        ] {
+            assert!(
+                fetch_published_changelog(bad, None).is_none(),
+                "must reject non-registry pkg spec {bad:?}"
+            );
+        }
+
+        // A malicious version token would otherwise smuggle a second spec into
+        // `<pkg>@<v>`; it is validated (and rejected) before any `npm pack` runs.
+        for bad_ver in ["1 ../evil", "latest;rm", "../../x", "file:/x", "1.0/../y"] {
+            assert!(
+                fetch_published_changelog("@nanobpm/nano-ide-lang-rust", Some(bad_ver)).is_none(),
+                "must reject non-registry version {bad_ver:?}"
+            );
+        }
+
+        // The name validator and the version validator agree with the install
+        // path's `safe_pkg_dir` gate (single source of truth for the alphabet).
+        assert!(!is_valid_pkg_name("../evil"));
+        assert!(is_valid_pkg_name("@nanobpm/nano-ide-lang-rust"));
+        assert!(is_valid_pkg_version("1.2.3-beta.1+build"));
+        assert!(!is_valid_pkg_version("1 2"));
     }
 
     #[test]
