@@ -173,6 +173,7 @@ dependencies = [
 name = "nanobpmn-read-model"
 version = "0.1.0"
 dependencies = [
+ "cc",
  "js-sys",
  "nanobpmn-engine-core",
  "rusqlite",

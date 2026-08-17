@@ -28,7 +28,7 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const PACKAGE = {
   name: "@nanobpm/engine-wasm",
   dir: "engine-wasm/pkg",
-  artifact: "nanobpmn_engine_bg.wasm",
+  artifacts: ["lean/nanobpmn_engine_bg.wasm", "readmodel/nanobpmn_engine_bg.wasm"],
 };
 
 function parseArgs(argv) {
@@ -75,13 +75,16 @@ function main() {
     process.exit(1);
   }
 
-  // Fail early if the build artifact is missing (engine-wasm ships the prebuilt
+  // Fail early if a build artifact is missing (engine-wasm ships the prebuilt
   // wasm; a forgotten `make console-wasm` would otherwise publish an empty one).
-  if (!existsSync(join(root, PACKAGE.dir, PACKAGE.artifact))) {
-    console.error(
-      `Missing ${PACKAGE.dir}/${PACKAGE.artifact} — run \`make console-wasm\` before releasing.`,
-    );
-    process.exit(1);
+  // Both subpath variants — lean (`.`) and read-model (`/readmodel`) — must ship.
+  for (const artifact of PACKAGE.artifacts) {
+    if (!existsSync(join(root, PACKAGE.dir, artifact))) {
+      console.error(
+        `Missing ${PACKAGE.dir}/${artifact} — run \`make console-wasm\` before releasing.`,
+      );
+      process.exit(1);
+    }
   }
 
   console.log(

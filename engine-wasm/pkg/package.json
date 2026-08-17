@@ -1,7 +1,7 @@
 {
   "name": "@nanobpm/engine-wasm",
-  "version": "0.4.1",
-  "description": "The nanobpmn engine (engine-core) compiled to WebAssembly for in-browser BPMN execution: deploy a diagram, start instances, activate/complete jobs, and read live snapshots/traces. The substrate for the Bojtos demo framework (ADR 0043) and the console test-run panel.",
+  "version": "0.5.0",
+  "description": "The nanobpmn engine (engine-core) compiled to WebAssembly for in-browser BPMN execution: deploy a diagram, start instances, activate/complete jobs, and read live snapshots/traces. Published as two subpath entrypoints — a lean baseline engine (default) and a read-model engine (the gateway's C8-style REST read surface). The substrate for the Bojtos demo framework (ADR 0043) and the console test-run panel.",
   "type": "module",
   "license": "Apache-2.0",
   "repository": {
@@ -9,21 +9,31 @@
     "url": "https://github.com/Magikcraft/nano-bpm",
     "directory": "engine-wasm/pkg"
   },
-  "main": "./nanobpmn_engine.js",
-  "module": "./nanobpmn_engine.js",
-  "types": "./nanobpmn_engine.d.ts",
+  "main": "./lean/nanobpmn_engine.js",
+  "module": "./lean/nanobpmn_engine.js",
+  "types": "./lean/nanobpmn_engine.d.ts",
   "exports": {
     ".": {
-      "types": "./nanobpmn_engine.d.ts",
-      "default": "./nanobpmn_engine.js"
+      "types": "./lean/nanobpmn_engine.d.ts",
+      "default": "./lean/nanobpmn_engine.js"
     },
-    "./nanobpmn_engine_bg.wasm": "./nanobpmn_engine_bg.wasm"
+    "./readmodel": {
+      "types": "./readmodel/nanobpmn_engine.d.ts",
+      "default": "./readmodel/nanobpmn_engine.js"
+    },
+    "./lean/nanobpmn_engine_bg.wasm": "./lean/nanobpmn_engine_bg.wasm",
+    "./readmodel/nanobpmn_engine_bg.wasm": "./readmodel/nanobpmn_engine_bg.wasm"
   },
   "files": [
-    "nanobpmn_engine.js",
-    "nanobpmn_engine.d.ts",
-    "nanobpmn_engine_bg.wasm",
-    "nanobpmn_engine_bg.wasm.d.ts"
+    "lean/nanobpmn_engine.js",
+    "lean/nanobpmn_engine.d.ts",
+    "lean/nanobpmn_engine_bg.wasm",
+    "lean/nanobpmn_engine_bg.wasm.d.ts",
+    "readmodel/nanobpmn_engine.js",
+    "readmodel/nanobpmn_engine.d.ts",
+    "readmodel/nanobpmn_engine_bg.wasm",
+    "readmodel/nanobpmn_engine_bg.wasm.d.ts",
+    "README.md"
   ],
   "sideEffects": [
     "./snippets/*"

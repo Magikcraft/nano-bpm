@@ -83,11 +83,13 @@ export class TestEngine {
     correlateMessage(message_name: string, correlation_key: string, variables_json: string): string;
     /**
      * Start a new instance of `process_id`, seeding it with the given variables
-     * (a JSON object string; pass `"{}"` or `""` for none). Returns the
-     * post-run [`Snapshot`] with a top-level `created` field holding the new
-     * instance key.
+     * (a JSON object string; pass `"{}"` or `""` for none). `version` selects a
+     * specific process **version** number (Zeebe by-id semantics); pass
+     * `undefined`/`null` (or a non-positive value) for the latest version.
+     * Returns the post-run [`Snapshot`] with a top-level `created` field holding
+     * the new instance key.
      */
-    createInstance(process_id: string, variables_json: string): string;
+    createInstance(process_id: string, variables_json: string, version?: number | null): string;
     /**
      * Stop debugging, keeping the state the run produced. If the run is paused
      * mid-command, that in-flight command is first **finished normally** (its
@@ -143,6 +145,15 @@ export class TestEngine {
      * With no retries left this raises an incident (visible in the snapshot).
      */
     failJob(job_key: string, retries: number, message: string): string;
+    /**
+     * Migrate a running process instance to a target process definition (Zeebe
+     * "migrate process instance"): re-point every active element instance at the
+     * mapped element of `target_process_definition_key` and re-home the instance.
+     * `mapping_instructions_json` is a JSON array of
+     * `{ sourceElementId: string, targetElementId: string }`. Returns the
+     * snapshot.
+     */
+    migrate(instance_key: string, target_process_definition_key: string, mapping_instructions_json: string): string;
     /**
      * Modify a running process instance (Zeebe "modify process instance"): move
      * tokens by terminating existing element instances and/or activating new
@@ -242,7 +253,7 @@ export interface InitOutput {
     readonly testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_completeUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
     readonly testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
-    readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+    readonly testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
     readonly testengine_debugClear: (a: number) => void;
     readonly testengine_debugCreateInstance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_debugIsPaused: (a: number) => number;
@@ -251,6 +262,7 @@ export interface InitOutput {
     readonly testengine_deploy: (a: number, b: number, c: number, d: number) => void;
     readonly testengine_events: (a: number, b: number) => void;
     readonly testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+    readonly testengine_migrate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_modify: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly testengine_new: () => number;
     readonly testengine_now: (a: number) => number;
