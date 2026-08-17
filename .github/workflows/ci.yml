@@ -251,6 +251,14 @@ jobs:
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
         run: make engine-wasm-check
+      - name: Bundle-split test (each subpath emits only its own _bg.wasm)
+        # Guards the dual-publish acceptance criterion (#825): bundles the lean
+        # (`.`) and `/readmodel` entrypoints of the committed engine-wasm/pkg and
+        # asserts each module graph reaches exactly one variant's glue directory.
+        # Catches regressions in pkg.package.json's `exports` map / pkg layout
+        # that wasm32 type-checks can't see.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/bundle-split
       - name: Show manifest
         run: cat dist/engine-wasm-ffi/manifest.json
       - name: Upload dist artifact
