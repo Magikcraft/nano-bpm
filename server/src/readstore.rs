@@ -1175,9 +1175,12 @@ impl ProjectionSink for ReadStore {
 
 impl ReadStore {
     /// Opens the read store at `path`, or an in-memory database when `path` is
-    /// `None`. A persistent database whose schema version does not match (or
-    /// that cannot be read) is dropped and recreated, so a rebuild from the
-    /// journal repopulates it.
+    /// `None`. A persistent database whose schema version lags is brought current
+    /// via **non-destructive additive migration** ([`reconcile_to_schema`]), so
+    /// existing rows are preserved (issue #831). A destructive drop-and-recreate
+    /// is reserved for the case where the live schema is genuinely incompatible
+    /// with an additive migration (or cannot be read); a subsequent rebuild from
+    /// the journal then repopulates it.
     pub fn open(path: Option<&Path>) -> rusqlite::Result<Self> {
         Self::open_inner(path, true)
     }
