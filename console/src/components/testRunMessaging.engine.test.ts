@@ -34,7 +34,7 @@ const require = createRequire(import.meta.url);
 // (the same `WasmSource` escape hatch the react binding exposes for non-Vite
 // bundlers). In the browser panel Vite serves the `.wasm` as a hashed asset.
 const WASM_BYTES = readFileSync(
-  require.resolve("@nanobpm/engine-wasm/nanobpmn_engine_bg.wasm"),
+  require.resolve("@nanobpm/engine-wasm/lean/nanobpmn_engine_bg.wasm"),
 );
 
 // A model that parks on BOTH a message intermediate-catch and a signal catch at
