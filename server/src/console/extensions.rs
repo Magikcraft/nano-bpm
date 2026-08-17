@@ -1940,12 +1940,22 @@ fn heading_version(line: &str) -> Option<String> {
         if bytes[i].is_ascii_digit() {
             let start = i;
             let mut dots = 0;
+            // Only dots in the core `major.minor.patch` count toward the
+            // release requirement; dots inside a `-prerelease` / `+build`
+            // suffix (e.g. the `.1` in `2.0-beta.1`) must not, or a `x.y`
+            // core would masquerade as a full release.
+            let mut in_meta = false;
             while i < bytes.len() {
                 let c = bytes[i];
                 if c == b'.' {
-                    dots += 1;
+                    if !in_meta {
+                        dots += 1;
+                    }
                     i += 1;
-                } else if c.is_ascii_digit() || c == b'-' || c == b'+' || c.is_ascii_alphabetic() {
+                } else if c == b'-' || c == b'+' {
+                    in_meta = true;
+                    i += 1;
+                } else if c.is_ascii_digit() || c.is_ascii_alphabetic() {
                     i += 1;
                 } else {
                     break;
@@ -2681,6 +2691,15 @@ mod tests {
         // A bare date/year must not masquerade as a release (needs x.y.z).
         assert_eq!(heading_version("## Unreleased 2024"), None);
         assert_eq!(heading_version("## [1.2] partial"), None);
+        // Prerelease/build dots must NOT satisfy the x.y.z requirement: a
+        // `x.y` core with metadata (e.g. `2.0-beta.1`) is not a full release.
+        assert_eq!(heading_version("## [2.0-beta.1] notes"), None);
+        assert_eq!(heading_version("## 1.2+build.7"), None);
+        // But a genuine x.y.z core with prerelease metadata still parses.
+        assert_eq!(
+            heading_version("## [1.2.0-rc.1] notes").as_deref(),
+            Some("1.2.0-rc.1")
+        );
     }
 
     #[test]
