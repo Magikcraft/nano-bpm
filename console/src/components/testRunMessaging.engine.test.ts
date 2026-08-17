@@ -33,6 +33,14 @@ const require = createRequire(import.meta.url);
 // the binary from a URL, which Node can't do — so we hand it the bytes directly
 // (the same `WasmSource` escape hatch the react binding exposes for non-Vite
 // bundlers). In the browser panel Vite serves the `.wasm` as a hashed asset.
+//
+// These bytes MUST come from the same `@nanobpm/engine-wasm` build that
+// `@nanobpm/bojtos-kit` loads its glue from: the JS import object and the binary
+// are a wasm-bindgen pair, so a `.wasm` from a different engine-wasm build fails
+// to instantiate against the session's glue ("function import requires a
+// callable"). bojtos-kit pins engine-wasm to a single (hoisted) copy that the
+// console shares, whose binary is the package-root `nanobpmn_engine_bg.wasm` —
+// not a `lean/`/`readmodel/` subpath of a newer, unrelated build.
 const WASM_BYTES = readFileSync(
   require.resolve("@nanobpm/engine-wasm/nanobpmn_engine_bg.wasm"),
 );

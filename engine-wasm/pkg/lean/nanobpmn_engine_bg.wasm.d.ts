@@ -11,7 +11,7 @@ export const testengine_completeAgentJob: (a: number, b: number, c: number, d: n
 export const testengine_completeJob: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const testengine_completeUserTask: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
 export const testengine_correlateMessage: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
-export const testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
+export const testengine_createInstance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
 export const testengine_debugClear: (a: number) => void;
 export const testengine_debugCreateInstance: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const testengine_debugIsPaused: (a: number) => number;
@@ -20,6 +20,7 @@ export const testengine_debugStep: (a: number, b: number) => void;
 export const testengine_deploy: (a: number, b: number, c: number, d: number) => void;
 export const testengine_events: (a: number, b: number) => void;
 export const testengine_failJob: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+export const testengine_migrate: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const testengine_modify: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
 export const testengine_new: () => number;
 export const testengine_now: (a: number) => number;

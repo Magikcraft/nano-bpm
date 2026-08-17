@@ -25,6 +25,7 @@ ENGINE_DIR := $(PROJECT_ROOT)/engine-core
 CONSOLE_DIR := $(PROJECT_ROOT)/console
 PROCESSOS_DIR := $(PROJECT_ROOT)/processos
 WASM_DIR := $(PROJECT_ROOT)/engine-wasm
+READ_MODEL_DIR := $(PROJECT_ROOT)/read-model
 UV := uv
 
 # Spec inputs for the generated crates. Listing these as prerequisites of the
@@ -46,7 +47,7 @@ CONSOLE_SPEC_SRCS := $(PROJECT_ROOT)/spec-console/console-api.yaml \
 # producing import-ordering drift. Always format via this toolchain so the tree
 # matches the `make fmt-check` CI gate. Bump deliberately (single style commit).
 FMT_TOOLCHAIN := nightly-2026-06-26
-FMT_CRATES := $(ENGINE_DIR) $(PROJECT_ROOT)/server $(PROCESSOS_DIR) $(WASM_DIR)
+FMT_CRATES := $(ENGINE_DIR) $(PROJECT_ROOT)/server $(PROCESSOS_DIR) $(WASM_DIR) $(READ_MODEL_DIR)
 
 .DEFAULT_GOAL := build
 
@@ -257,15 +258,34 @@ console-frontend: console-wasm ## Build the web console SPA (console/ -> console
 	cd $(CONSOLE_DIR) && npm install && npm run build
 
 .PHONY: console-wasm
-console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine-wasm/pkg, the @nanobpm/engine-wasm package). Needs wasm-pack; falls back to the committed artifacts if absent.
-	@if command -v wasm-pack >/dev/null 2>&1; then \
-		echo "Regenerating engine-wasm/pkg (@nanobpm/engine-wasm) via wasm-pack..."; \
-		cd $(PROJECT_ROOT)/engine-wasm && wasm-pack build --target web --release --no-pack --out-dir pkg --out-name nanobpmn_engine \
-		&& rm -f $(PROJECT_ROOT)/engine-wasm/pkg/.gitignore \
-		&& cp $(PROJECT_ROOT)/engine-wasm/pkg.package.json $(PROJECT_ROOT)/engine-wasm/pkg/package.json; \
+console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine-wasm/pkg, the @nanobpm/engine-wasm package). Builds BOTH subpath variants: lean (pkg/lean) and read-model (pkg/readmodel). Needs wasm-pack; the read-model build also needs an LLVM clang with a wasm backend (see below). Falls back to the committed artifacts if wasm-pack is absent.
+	@set -e; \
+	if command -v wasm-pack >/dev/null 2>&1; then \
+		echo "Regenerating engine-wasm/pkg (@nanobpm/engine-wasm) via wasm-pack (lean + read-model)..."; \
+		echo "  -> lean  (pkg/lean)"; \
+		cd $(PROJECT_ROOT)/engine-wasm; \
+		wasm-pack build --target web --release --no-pack --out-dir pkg/lean --out-name nanobpmn_engine; \
+		rm -f $(PROJECT_ROOT)/engine-wasm/pkg/lean/.gitignore; \
+		echo "  -> read-model (pkg/readmodel, --features read-model)"; \
+		$(WASM_READ_MODEL_ENV) wasm-pack build --target web --release --no-pack --out-dir pkg/readmodel --out-name nanobpmn_engine -- --features read-model; \
+		rm -f $(PROJECT_ROOT)/engine-wasm/pkg/readmodel/.gitignore; \
+		cp $(PROJECT_ROOT)/engine-wasm/pkg.package.json $(PROJECT_ROOT)/engine-wasm/pkg/package.json; \
+		cp $(PROJECT_ROOT)/engine-wasm/README.md $(PROJECT_ROOT)/engine-wasm/pkg/README.md; \
 	else \
 		echo "wasm-pack not found; using the committed engine-wasm/pkg artifacts (run 'cargo install wasm-pack' to regenerate)."; \
 	fi
+
+# The read-model variant compiles a trimmed SQLite C amalgamation (via the `cc`
+# crate + read-model/build.rs) to wasm32. Apple clang and GCC have no wasm
+# backend; upstream LLVM clang does. The `cc` crate reads these per-target knobs
+# to pick the compiler + archiver. On macOS, default to Homebrew LLVM when the
+# caller has not already exported CC_wasm32_unknown_unknown/AR_wasm32_unknown_unknown.
+WASM_READ_MODEL_ENV =
+ifeq ($(origin CC_wasm32_unknown_unknown),undefined)
+ifneq ($(wildcard /opt/homebrew/opt/llvm/bin/clang),)
+WASM_READ_MODEL_ENV += CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar
+endif
+endif
 
 .PHONY: console
 console: release ## Alias for `release` (the self-contained single-node distribution)
@@ -310,6 +330,10 @@ engine-wasm-ffi-dist: engine-wasm-ffi ## Emit the release FFI wasm + manifest in
 .PHONY: engine-wasm-check
 engine-wasm-check: ## Type-check the console wasm-bindgen crate for wasm32 (guards the `make release` console-wasm build; needs the wasm32 target)
 	cd $(WASM_DIR) && cargo check --target wasm32-unknown-unknown
+
+.PHONY: engine-wasm-check-read-model
+engine-wasm-check-read-model: ## Type-check engine-wasm with the off-by-default `read-model` feature for wasm32. Compiles a trimmed SQLite C amalgamation, so it needs the wasm32 target AND an LLVM clang with a wasm backend (Apple/GCC clang have none): point CC_wasm32_unknown_unknown/AR_wasm32_unknown_unknown at llvm clang/llvm-ar (e.g. Homebrew LLVM on macOS, the distro `llvm`/`clang` on CI).
+	cd $(WASM_DIR) && $(WASM_READ_MODEL_ENV) cargo check --features read-model --target wasm32-unknown-unknown
 
 .PHONY: release-engine-wasm
 release-engine-wasm: ## Cut an @nanobpm/engine-wasm npm release: tag bojtos-npm-v<pkg version> on the current commit and push it (CI OIDC-publishes). Run on `main` after the version bump + `make console-wasm` have merged.

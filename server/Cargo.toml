@@ -11,6 +11,10 @@ nanobpm-gateway-rest = { path = "../generated" }
 # spec-console/console-api.yaml. Only needed with the `console` feature.
 nanobpm-console-api = { path = "../generated-console", optional = true }
 nanobpmn-engine-core = { path = "../engine-core", features = ["serde"] }
+# The shared SQLite read model (CQRS query side), extracted so the same
+# projection + read queries compile both here (native/bundled C SQLite) and for
+# the in-browser WASM test engine. The gateway consumes the `native` backend.
+nanobpmn-read-model = { path = "../read-model", features = ["native"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
 axum-extra = { version = "0.12", features = ["cookie", "query", "typed-header"] }

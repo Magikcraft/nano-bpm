@@ -251,6 +251,14 @@ jobs:
         run: make engine-wasm-ffi-dist
       - name: Type-check console engine-wasm crate (wasm32)
         run: make engine-wasm-check
+      - name: Bundle-split test (each subpath emits only its own _bg.wasm)
+        # Guards the dual-publish acceptance criterion (#825): bundles the lean
+        # (`.`) and `/readmodel` entrypoints of the committed engine-wasm/pkg and
+        # asserts each module graph reaches exactly one variant's glue directory.
+        # Catches regressions in pkg.package.json's `exports` map / pkg layout
+        # that wasm32 type-checks can't see.
+        run: npm install && npm test
+        working-directory: engine-wasm/tests/bundle-split
       - name: Show manifest
         run: cat dist/engine-wasm-ffi/manifest.json
       - name: Upload dist artifact
@@ -260,6 +268,52 @@ jobs:
           path: dist/engine-wasm-ffi/
           if-no-files-found: error
           retention-days: 14
+
+  engine-wasm-read-model:
+    name: engine-wasm (read-model wasm32 type-check)
+    runs-on: ubuntu-24.04
+    needs: changes
+    if: *code_gate
+    env:
+      SCCACHE_GHA_ENABLED: 'true'
+      RUSTC_WRAPPER: 'sccache'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: engine-wasm
+          # Cache-key rider so this job doesn't fight the feature-off wasm caches
+          # (same crate, different feature set + a C toolchain build).
+          key: wasm32-read-model
+      - name: Install LLVM clang (wasm backend) + point cc at it
+        # The off-by-default `read-model` feature compiles a trimmed SQLite C
+        # amalgamation (via the `cc` crate + read-model/build.rs) to wasm32. GCC
+        # and Apple clang have no wasm backend; upstream LLVM clang does. The `cc`
+        # crate reads these per-target knobs to pick the compiler + archiver.
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y llvm clang
+          cc_bin=""
+          for c in "$(command -v clang-18 || true)" "$(command -v clang || true)"; do
+            if [ -n "$c" ] && "$c" --print-targets 2>/dev/null | grep -q wasm32; then cc_bin="$c"; break; fi
+          done
+          ar_bin="$(command -v llvm-ar-18 || command -v llvm-ar || true)"
+          if [ -z "$cc_bin" ]; then
+            echo "::error::no LLVM clang with a wasm32 backend found after 'apt-get install llvm clang'"; exit 1
+          fi
+          if [ -z "$ar_bin" ]; then
+            echo "::error::could not locate llvm-ar after 'apt-get install llvm clang'"; exit 1
+          fi
+          echo "CC_wasm32_unknown_unknown=$cc_bin" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$ar_bin" >> "$GITHUB_ENV"
+      - name: Type-check engine-wasm --features read-model (wasm32)
+        run: make engine-wasm-check-read-model
 
   nano-bernd-npm:
     name: '@nanobpm/nano-bernd (build + test)'
