@@ -495,6 +495,43 @@ fn attach_archive(conn: &Connection, archive: &Path) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Column names common to the `table` copies in the two attached databases
+/// `src_schema` and `dst_schema` (e.g. `main` and `terminal_archive`), quoted
+/// and comma-joined for use in a cross-database `INSERT (<cols>) SELECT <cols>`.
+///
+/// Additive migrations (`ALTER TABLE ADD COLUMN`) append columns to *existing*
+/// tables, so two copies of the same logical table — a freshly-created archive
+/// vs. a migrated live DB, or vice versa — can end up with different *physical*
+/// column orders, or one may (transiently) carry a column the other lacks. A
+/// positional `SELECT *` copy would then silently write values into the wrong
+/// columns and corrupt the destination; enumerating the shared columns by name
+/// makes the copy order-independent and drift-safe (issue #831).
+fn shared_column_list(
+    conn: &Connection,
+    src_schema: &str,
+    dst_schema: &str,
+    table: &str,
+) -> rusqlite::Result<String> {
+    let columns_of = |schema: &str| -> rusqlite::Result<Vec<String>> {
+        let mut stmt = conn.prepare(&format!(
+            "PRAGMA {schema}.table_info(\"{}\")",
+            table.replace('"', "\"\"")
+        ))?;
+        let cols = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(cols)
+    };
+    let dst: std::collections::HashSet<String> = columns_of(dst_schema)?.into_iter().collect();
+    let list = columns_of(src_schema)?
+        .into_iter()
+        .filter(|c| dst.contains(c))
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(list)
+}
+
 /// Copies the given terminal instances (and their instance-scoped dependent rows)
 /// from the live store on `conn` into the durable archive at `archive`
 /// (`INSERT OR REPLACE`, append-only in effect since keys are unique and
@@ -517,18 +554,20 @@ fn copy_terminal_to_archive(
         .join(",");
     attach_archive(conn, archive)?;
     let result = (|| -> rusqlite::Result<()> {
+        let pi_cols = shared_column_list(conn, "main", "terminal_archive", "process_instances")?;
         conn.execute(
             &format!(
-                "INSERT OR REPLACE INTO terminal_archive.process_instances \
-                 SELECT * FROM main.process_instances WHERE key IN ({in_list})"
+                "INSERT OR REPLACE INTO terminal_archive.process_instances ({pi_cols}) \
+                 SELECT {pi_cols} FROM main.process_instances WHERE key IN ({in_list})"
             ),
             [],
         )?;
         for table in TERMINAL_ARCHIVE_DEP_TABLES {
+            let cols = shared_column_list(conn, "main", "terminal_archive", table)?;
             conn.execute(
                 &format!(
-                    "INSERT OR REPLACE INTO terminal_archive.{table} \
-                     SELECT * FROM main.{table} WHERE instance_key IN ({in_list})"
+                    "INSERT OR REPLACE INTO terminal_archive.{table} ({cols}) \
+                     SELECT {cols} FROM main.{table} WHERE instance_key IN ({in_list})"
                 ),
                 [],
             )?;
@@ -1501,16 +1540,21 @@ impl ReadStore {
         let result = (|| -> rusqlite::Result<()> {
             attach_archive(&conn, archive)?;
             let copy = (|| -> rusqlite::Result<()> {
+                let pi_cols =
+                    shared_column_list(&conn, "main", "terminal_archive", "process_instances")?;
                 conn.execute(
-                    "INSERT OR IGNORE INTO terminal_archive.process_instances \
-                     SELECT * FROM main.process_instances WHERE state IN (1, 2)",
+                    &format!(
+                        "INSERT OR IGNORE INTO terminal_archive.process_instances ({pi_cols}) \
+                         SELECT {pi_cols} FROM main.process_instances WHERE state IN (1, 2)"
+                    ),
                     [],
                 )?;
                 for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                    let cols = shared_column_list(&conn, "main", "terminal_archive", table)?;
                     conn.execute(
                         &format!(
-                            "INSERT OR IGNORE INTO terminal_archive.{table} \
-                             SELECT * FROM main.{table} WHERE instance_key IN \
+                            "INSERT OR IGNORE INTO terminal_archive.{table} ({cols}) \
+                             SELECT {cols} FROM main.{table} WHERE instance_key IN \
                              (SELECT key FROM main.process_instances WHERE state IN (1, 2))"
                         ),
                         [],
@@ -1557,15 +1601,21 @@ impl ReadStore {
         let conn = self.conn.lock().expect("read store poisoned");
         attach_archive(&conn, archive)?;
         let restored = (|| -> rusqlite::Result<usize> {
+            let pi_cols =
+                shared_column_list(&conn, "terminal_archive", "main", "process_instances")?;
             let n = conn.execute(
-                "INSERT OR IGNORE INTO main.process_instances \
-                 SELECT * FROM terminal_archive.process_instances",
+                &format!(
+                    "INSERT OR IGNORE INTO main.process_instances ({pi_cols}) \
+                     SELECT {pi_cols} FROM terminal_archive.process_instances"
+                ),
                 [],
             )?;
             for table in TERMINAL_ARCHIVE_DEP_TABLES {
+                let cols = shared_column_list(&conn, "terminal_archive", "main", table)?;
                 conn.execute(
                     &format!(
-                        "INSERT OR IGNORE INTO main.{table} SELECT * FROM terminal_archive.{table}"
+                        "INSERT OR IGNORE INTO main.{table} ({cols}) \
+                         SELECT {cols} FROM terminal_archive.{table}"
                     ),
                     [],
                 )?;
@@ -4968,25 +5018,44 @@ mod writability_tests {
         }
 
         // Simulate the vN+1 binary: additively evolve the live database exactly as
-        // `reconcile_to_schema` would for an additive SCHEMA edit.
+        // `reconcile_to_schema` would for an additive SCHEMA edit, and clear the
+        // stored `schema_version` so the next open actually takes the migration
+        // (reconcile) branch of `ensure_schema_on` rather than the "already
+        // current" fast path — otherwise this test never exercises the invariant
+        // it claims to (that an additive reconcile preserves `exported_position`
+        // while stamping the new version).
         {
             let conn = rusqlite::Connection::open(&path).unwrap();
             conn.execute_batch(
                 "ALTER TABLE process_instances ADD COLUMN priority INTEGER NOT NULL DEFAULT 50;
-                 CREATE TABLE new_feature (id INTEGER PRIMARY KEY, note TEXT);",
+                 CREATE TABLE new_feature (id INTEGER PRIMARY KEY, note TEXT);
+                 DELETE FROM meta WHERE k = 'schema_version';",
             )
             .unwrap();
         }
 
         // Reopen with the current binary: the additive columns/tables are kept and
-        // the seeded row + cursor survive (no destructive wipe).
+        // the seeded row + cursor survive (no destructive wipe), and the reconcile
+        // path re-stamps the current schema version.
         let store = ReadStore::open(Some(&path)).expect("additive reopen self-heals");
-        let count: i64 = {
+        let (count, stamped_version): (i64, i64) = {
             let conn = store.conn.lock().unwrap();
-            conn.query_row("SELECT COUNT(*) FROM process_instances", [], |r| r.get(0))
-                .unwrap()
+            let count = conn
+                .query_row("SELECT COUNT(*) FROM process_instances", [], |r| r.get(0))
+                .unwrap();
+            let version = conn
+                .query_row("SELECT v FROM meta WHERE k = 'schema_version'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            (count, version)
         };
         assert_eq!(count, 1, "additive migration must preserve existing rows");
+        assert_eq!(
+            stamped_version,
+            super::SCHEMA_VERSION,
+            "additive reconcile must stamp the current schema version"
+        );
         assert_eq!(
             store.exported_position(),
             500,
