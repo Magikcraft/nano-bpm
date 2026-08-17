@@ -991,6 +991,27 @@ pub fn installed_pack_versions() -> std::collections::HashMap<String, String> {
 /// error — the caller owns `dir`'s lifecycle. Best-effort: requires `npm` and
 /// `tar` on PATH.
 fn npm_pack_extract(dir: &Path, pkg_spec: &str) -> Result<(), String> {
+    let tgz = npm_pack_download(dir, pkg_spec)?;
+    let tar = find_program("tar").ok_or("tar not found")?;
+    let st = std::process::Command::new(&tar)
+        .args(["xzf", &tgz, "--strip-components=1"])
+        .current_dir(dir)
+        .status()
+        .map_err(|e| format!("tar: {e}"))?;
+    if !st.success() {
+        return Err("tar extract failed".into());
+    }
+    let _ = std::fs::remove_file(dir.join(&tgz));
+    Ok(())
+}
+
+/// Run `npm pack <pkg_spec>` inside `dir`, fetching the tarball there, and
+/// return the created `.tgz` filename (relative to `dir`). Does **not** extract
+/// or remove it — the caller owns the tarball's lifecycle. Split out of
+/// [`npm_pack_extract`] as the single `npm pack` invocation both it and callers
+/// that only need one member (e.g. [`fetch_published_changelog`]) share, so the
+/// download step can't drift between them. Requires `npm` on PATH.
+fn npm_pack_download(dir: &Path, pkg_spec: &str) -> Result<String, String> {
     let npm = find_program("npm").ok_or("npm not found on PATH")?;
     let out = std::process::Command::new(&npm)
         .args(["pack", pkg_spec, "--silent"])
@@ -1003,18 +1024,26 @@ fn npm_pack_extract(dir: &Path, pkg_spec: &str) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let tgz = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let tar = find_program("tar").ok_or("tar not found")?;
-    let st = std::process::Command::new(&tar)
-        .args(["xzf", &tgz, "--strip-components=1"])
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Stream a single named member out of the gzip tarball `tgz` (relative to
+/// `dir`) to memory via `tar -xzO -f <tgz> <member>`, writing **no** archive
+/// paths to the filesystem. `None` when the member is absent, `tar` is missing
+/// or fails, or the bytes are not valid UTF-8. Reading just the one file we need
+/// is a smaller attack surface (and less I/O) than unpacking a whole untrusted
+/// registry archive to disk.
+fn tar_read_member(dir: &Path, tgz: &str, member: &str) -> Option<String> {
+    let tar = find_program("tar")?;
+    let out = std::process::Command::new(&tar)
+        .args(["xzOf", tgz, member])
         .current_dir(dir)
-        .status()
-        .map_err(|e| format!("tar: {e}"))?;
-    if !st.success() {
-        return Err("tar extract failed".into());
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
     }
-    let _ = std::fs::remove_file(dir.join(&tgz));
-    Ok(())
+    String::from_utf8(out.stdout).ok()
 }
 
 /// Create a fresh, uniquely-named temp directory under the system temp root
@@ -2003,9 +2032,14 @@ fn fetch_published_changelog(pkg: &str, version: Option<&str>) -> Option<String>
         None => pkg.to_string(),
     };
     let result = (|| {
-        npm_pack_extract(&scratch, &spec).ok()?;
+        let tgz = npm_pack_download(&scratch, &spec).ok()?;
+        // npm tarballs nest every file under a single top-level `package/` dir
+        // (the same invariant `npm_pack_extract` relies on via
+        // `--strip-components=1`). We only need the changelog, so stream just
+        // that member straight to memory instead of unpacking the whole
+        // untrusted archive to disk — smaller attack surface, less I/O.
         for name in CHANGELOG_FILENAMES {
-            if let Ok(txt) = std::fs::read_to_string(scratch.join(name))
+            if let Some(txt) = tar_read_member(&scratch, &tgz, &format!("package/{name}"))
                 && !txt.trim().is_empty()
             {
                 return Some(txt);
