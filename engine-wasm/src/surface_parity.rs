@@ -278,6 +278,15 @@ pub(crate) fn classify_read(query: &ReadQuery) -> Surface {
         ReadQuery::GetElementInstance => Surface::NotSurfaced {
             reason: "single element-instance lookup by key; covered by the debug snapshot",
         },
+        ReadQuery::SearchElementInstanceIncidents => Surface::NotSurfaced {
+            reason: "element-instance-scoped incident subtree query; incidents surface inline in \
+                     the simulation's debug state (and via searchIncidents), so the modeler has no \
+                     need to scope them by element-instance subtree",
+        },
+        ReadQuery::SearchElementInstanceWaitStates => Surface::NotSurfaced {
+            reason: "element-instance wait-state listing; the modeler reads wait/activation state \
+                     from the debug snapshot/event stream, not this composite read-model query",
+        },
         ReadQuery::SearchMessageSubscriptions => Surface::NotSurfaced {
             reason:
                 "subscription inventory; the modeler correlates via correlateMessage and reads \

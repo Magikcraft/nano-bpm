@@ -41,10 +41,17 @@ use std::path::{Path, PathBuf};
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=SQLITE_WASM_RS_SRC_DIR");
-    // Dependency resolution feeds `locate_sqlite_wasm_rs_src` (it reads the locked
-    // `sqlite-wasm-rs` version from `Cargo.lock`), so a change to either manifest
-    // must re-run this script — otherwise Cargo reuses a stale build-script output
-    // and keeps linking a `libwsqlite3.a` compiled against the previous checkout.
+    // Dependency resolution feeds `locate_sqlite_wasm_rs_src` (it makes a
+    // best-effort read of the locked `sqlite-wasm-rs` version from *this crate's
+    // own* `Cargo.lock`), so a change to either manifest must re-run this script —
+    // otherwise Cargo reuses a stale build-script output and keeps linking a
+    // `libwsqlite3.a` compiled against the previous checkout. Note this local read
+    // is authoritative only when `read-model` is built standalone: when it is a
+    // path dependency (e.g. from `engine-wasm`) Cargo resolves `sqlite-wasm-rs`
+    // from the *downstream* crate's lockfile and no `read-model/Cargo.lock` need
+    // exist, so the read may miss — which is exactly why the version is only a
+    // disambiguation hint and the locator fails closed on ambiguity rather than
+    // trusting it (see `locked_sqlite_wasm_rs_version`).
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=Cargo.toml");
 

@@ -32,8 +32,11 @@
 
 /// The read-model-backed REST read operations the gateway serves.
 ///
-/// One unit variant per distinct read-model-backed query surface, keyed to its
-/// backing `nanobpmn_read_model::ReadStore` query method. A variant is named
+/// One unit variant per distinct read-model-backed query surface. Most are keyed
+/// to a single backing `nanobpmn_read_model::ReadStore` query method; a few are
+/// *derived* reads that compose several `ReadStore` methods (e.g.
+/// `SearchElementInstanceWaitStates`) and are documented as such. A variant is
+/// named
 /// after a representative OpenAPI `operationId` (equivalently, the `TestEngine`
 /// JS method where one exists), but a single variant may back **several** REST
 /// operations that share one read path (e.g. `GetResourceByKey` serves
@@ -93,6 +96,16 @@ pub enum ReadQuery {
     /// `getElementInstance` — a single element instance by key
     /// (`ReadStore::element_instance`).
     GetElementInstance,
+    /// `searchElementInstanceIncidents` — incidents within an element instance's
+    /// scope subtree. A *derived* read: it has no single backing `ReadStore`
+    /// method, composing `ReadStore::element_instances` (to close the scope
+    /// subtree) with `ReadStore::incidents`.
+    SearchElementInstanceIncidents,
+    /// `searchElementInstanceWaitStates` — the wait states (job/message) parked
+    /// under element instances. Another *derived* read: it composes
+    /// `ReadStore::element_instances`, `ReadStore::jobs` and
+    /// `ReadStore::message_subscriptions` rather than backing a single method.
+    SearchElementInstanceWaitStates,
 
     /// `searchMessageSubscriptions` — open message subscriptions
     /// (`ReadStore::message_subscriptions`).

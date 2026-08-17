@@ -33,6 +33,11 @@ pub use nanobpmn_read_model::*;
 /// as classified in the wasm parity gate (`engine-wasm/src/surface_parity.rs`).
 /// It changes no observable REST behaviour; the concrete handlers still call the
 /// named [`ReadStore`] methods directly.
+///
+/// A few reads are *derived* — they have no single backing method but compose
+/// several. Their entry names the composed methods joined with `+` (documented
+/// on the corresponding `ReadQuery` variant); the value is illustrative, the
+/// anchoring purpose is the exhaustive match.
 #[allow(dead_code)]
 pub(crate) fn read_store_method(query: ReadQuery) -> &'static str {
     match query {
@@ -50,6 +55,11 @@ pub(crate) fn read_store_method(query: ReadQuery) -> &'static str {
         ReadQuery::GetIncident => "incident",
         ReadQuery::SearchElementInstances => "element_instances",
         ReadQuery::GetElementInstance => "element_instance",
+        // Derived reads (composite; see `ReadQuery` docs).
+        ReadQuery::SearchElementInstanceIncidents => "element_instances+incidents",
+        ReadQuery::SearchElementInstanceWaitStates => {
+            "element_instances+jobs+message_subscriptions"
+        }
         ReadQuery::SearchMessageSubscriptions => "message_subscriptions",
         ReadQuery::SearchCorrelatedMessageSubscriptions => "correlated_message_subscriptions",
         ReadQuery::SearchProcessDefinitions => "process_definitions",
