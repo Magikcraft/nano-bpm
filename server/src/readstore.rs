@@ -547,18 +547,30 @@ fn copy_terminal_to_archive(
     if keys.is_empty() {
         return Ok(());
     }
-    let in_list = keys
-        .iter()
-        .map(|k| k.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
     attach_archive(conn, archive)?;
     let result = (|| -> rusqlite::Result<()> {
+        // Materialize the keys into a temp table rather than string-joining them
+        // into a single inline `IN (...)` literal: a large catch-up/rebuild batch
+        // can hold very many terminal keys, and an inline list would build an
+        // enormous SQL statement (slow, and eventually past SQLite's SQL-length
+        // limit). A temp table keeps every copy statement a fixed size regardless
+        // of batch size, mirroring the eviction path's `_evict` pattern.
+        conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS _terminal_copy(key INTEGER PRIMARY KEY);
+             DELETE FROM _terminal_copy;",
+        )?;
+        {
+            let mut insert = conn.prepare("INSERT OR IGNORE INTO _terminal_copy(key) VALUES (?1)")?;
+            for k in keys {
+                insert.execute(params![*k as i64])?;
+            }
+        }
         let pi_cols = shared_column_list(conn, "main", "terminal_archive", "process_instances")?;
         conn.execute(
             &format!(
                 "INSERT OR REPLACE INTO terminal_archive.process_instances ({pi_cols}) \
-                 SELECT {pi_cols} FROM main.process_instances WHERE key IN ({in_list})"
+                 SELECT {pi_cols} FROM main.process_instances \
+                 WHERE key IN (SELECT key FROM _terminal_copy)"
             ),
             [],
         )?;
@@ -567,11 +579,13 @@ fn copy_terminal_to_archive(
             conn.execute(
                 &format!(
                     "INSERT OR REPLACE INTO terminal_archive.{table} ({cols}) \
-                     SELECT {cols} FROM main.{table} WHERE instance_key IN ({in_list})"
+                     SELECT {cols} FROM main.{table} \
+                     WHERE instance_key IN (SELECT key FROM _terminal_copy)"
                 ),
                 [],
             )?;
         }
+        conn.execute_batch("DELETE FROM _terminal_copy")?;
         Ok(())
     })();
     // Always detach, even on error, so a later attach does not fail with
