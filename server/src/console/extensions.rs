@@ -1311,9 +1311,16 @@ fn safe_pkg_dir(pkg: &str) -> Option<PathBuf> {
 /// the alphabet check.
 fn is_valid_pkg_name(pkg: &str) -> bool {
     // A single npm name segment (scope or name): non-empty, no path traversal,
-    // restricted to the npm name alphabet.
+    // restricted to the npm name alphabet, and — like npm itself — never
+    // starting with `.` or `_`. Blocking a leading `.`/`_` keeps `safe_pkg_dir`
+    // from mapping a crafted name to a dotfile or, worse, to the extensions
+    // root itself: `.` alone would otherwise flatten to `extensions_root()/.`
+    // (the root), letting `install_from_npm`/`remove` overwrite or delete the
+    // whole extensions directory.
     fn is_valid_segment(seg: &str) -> bool {
         !seg.is_empty()
+            && !seg.starts_with('.')
+            && !seg.starts_with('_')
             && !seg.contains("..")
             && seg
                 .chars()
@@ -2916,6 +2923,15 @@ mod tests {
         assert!(!is_valid_pkg_name("/etc")); // absolute local path, no `..`
         assert!(!is_valid_pkg_name("some/local/path")); // relative local path
         assert!(!is_valid_pkg_name("@scope/name/extra")); // extra `/`
+        // Dot-/underscore-prefixed segments must be rejected: `.` alone would
+        // otherwise make `safe_pkg_dir` resolve to the extensions root itself,
+        // and `.hidden` / `_hidden` map to dotfiles under it.
+        assert!(!is_valid_pkg_name(".")); // maps to extensions root via safe_pkg_dir
+        assert!(safe_pkg_dir(".").is_none());
+        assert!(!is_valid_pkg_name(".hidden")); // leading-dot segment
+        assert!(!is_valid_pkg_name("_hidden")); // leading-underscore segment
+        assert!(!is_valid_pkg_name("@.scope/name")); // leading-dot scope
+        assert!(!is_valid_pkg_name("@scope/.name")); // leading-dot name
         assert!(is_valid_pkg_name("@nanobpm/nano-ide-lang-rust"));
         assert!(is_valid_pkg_name("nano-ide-ext-foo")); // plain unscoped name
         assert!(is_valid_pkg_version("1.2.3-beta.1+build"));
