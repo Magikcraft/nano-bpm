@@ -3390,7 +3390,13 @@ pub(super) async fn extensions_changelog(
             StatusCode::NOT_FOUND,
             "no changelog for that pack".to_string(),
         )),
-        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
+        // Join failure (the blocking task panicked). Return a generic message —
+        // never surface the internal `JoinError` string to the client — and let
+        // the API layer map the 500 status to a distinct InternalError response.
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error reading changelog".to_string(),
+        )),
     }
 }
 

@@ -1179,6 +1179,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/ExtensionChangelog' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
 
   /extensions/install:
     post:

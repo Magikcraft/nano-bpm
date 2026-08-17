@@ -1842,6 +1842,10 @@ pub struct PackChangelog {
 /// See [`select_changelog_source`] for why the *update* case (`from` set)
 /// prefers the published tarball over the installed copy.
 pub fn pack_changelog(pkg: &str, from: Option<&str>, to: Option<&str>) -> Option<PackChangelog> {
+    // Treat an empty/whitespace `from` (e.g. `?from=`) as absent: there is no
+    // usable installed version to delta against, so it must not force the
+    // registry-tarball fetch that the update case triggers.
+    let from = from.filter(|f| !f.trim().is_empty());
     let read_installed = || {
         installed_changelog_path(pkg).and_then(|path| {
             std::fs::read_to_string(&path)
@@ -2746,6 +2750,16 @@ mod tests {
         assert!(full.installed);
         assert!(!full.delta);
         assert!(full.changelog.contains("baseline release"));
+
+        // Regression: an empty/whitespace `from` (e.g. `?from=`) is treated as
+        // absent — it must behave exactly like the full-changelog case above and
+        // NOT force the update-case published-tarball fetch (no delta scoping).
+        for empty in ["", "   "] {
+            let c = pack_changelog(pkg, Some(empty), None).expect("changelog present");
+            assert!(c.installed, "empty `from`={empty:?} must read the installed copy");
+            assert!(!c.delta, "empty `from`={empty:?} must not scope a delta");
+            assert!(c.changelog.contains("baseline release"));
+        }
 
         // (The update/delta case — `from` set — prefers the *published* tarball
         // and is exercised network-free by `select_changelog_source_*` below.)

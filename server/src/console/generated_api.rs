@@ -258,8 +258,13 @@ impl apis::extensions::Extensions for ServerImpl {
                     v,
                 )),
             ),
-            Err((_, msg)) => {
-                Ok(apis::extensions::GetExtensionChangelogResponse::Status404_NotFound(msg))
+            Err((status, msg)) => {
+                use apis::extensions::GetExtensionChangelogResponse as Resp;
+                if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+                    Ok(Resp::Status500_InternalError(msg))
+                } else {
+                    Ok(Resp::Status404_NotFound(msg))
+                }
             }
         }
     }

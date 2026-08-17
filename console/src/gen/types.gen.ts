@@ -3375,6 +3375,10 @@ export type GetExtensionChangelogErrors = {
      * Not found
      */
     404: string;
+    /**
+     * Internal error
+     */
+    500: string;
 };
 
 export type GetExtensionChangelogError = GetExtensionChangelogErrors[keyof GetExtensionChangelogErrors];
