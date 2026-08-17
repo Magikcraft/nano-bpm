@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   getExtensionChangelog,
   getExtensionReadme,
@@ -109,6 +115,12 @@ export default function Extensions() {
   const [changelogMd, setChangelogMd] = useState<string | null>(null);
   const [changelogErr, setChangelogErr] = useState<string | null>(null);
   const [changelogDelta, setChangelogDelta] = useState(false);
+  // Monotonic token identifying the currently-open drawer request. Each
+  // `openReadme` bumps it; awaited README/changelog responses capture the token
+  // at call time and drop their state writes if the drawer has since moved to a
+  // different pack — otherwise a slow response for pack A could overwrite the
+  // newer pack B's content.
+  const drawerReqRef = useRef(0);
   const { selection, select } = useTheme();
 
   const load = async () => {
@@ -208,6 +220,7 @@ export default function Extensions() {
     m: MarketEntry,
     tab: "readme" | "changelog" = "readme",
   ) => {
+    const token = ++drawerReqRef.current;
     setReadmePkg(m);
     setReadmeMd(null);
     setReadmeErr(null);
@@ -215,17 +228,18 @@ export default function Extensions() {
     setChangelogErr(null);
     setChangelogDelta(false);
     setDrawerTab(tab);
-    if (tab === "changelog") void fetchChangelog(m, true);
+    if (tab === "changelog") void fetchChangelog(m, true, token);
     try {
-      setReadmeMd(
-        (
-          await getExtensionReadme({
-            query: { pkg: m.name },
-            throwOnError: true,
-          })
-        ).data.readme,
-      );
+      const readme = (
+        await getExtensionReadme({
+          query: { pkg: m.name },
+          throwOnError: true,
+        })
+      ).data.readme;
+      if (drawerReqRef.current !== token) return;
+      setReadmeMd(readme);
     } catch {
+      if (drawerReqRef.current !== token) return;
       setReadmeErr("No README available for this pack.");
     }
   };
@@ -237,7 +251,11 @@ export default function Extensions() {
   // callers that have just reset the changelog state (e.g. `openReadme`) pass
   // `force` to bypass the guard, since the state resets are async and the stale
   // closure values would otherwise skip the fetch and wedge on "Loading…".
-  const fetchChangelog = async (m: MarketEntry, force = false) => {
+  const fetchChangelog = async (
+    m: MarketEntry,
+    force = false,
+    token = drawerReqRef.current,
+  ) => {
     if (!force && (changelogMd !== null || changelogErr !== null)) return;
     try {
       const res = (
@@ -252,9 +270,11 @@ export default function Extensions() {
           throwOnError: true,
         })
       ).data;
+      if (drawerReqRef.current !== token) return;
       setChangelogMd(res.changelog);
       setChangelogDelta(res.delta);
     } catch {
+      if (drawerReqRef.current !== token) return;
       setChangelogErr("No changelog available for this pack.");
     }
   };
