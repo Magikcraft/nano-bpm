@@ -1281,10 +1281,17 @@ fn install_scripts_trusted(trust: &TrustStore, id: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn safe_pkg_dir(pkg: &str) -> Option<PathBuf> {
+    // Trim once here so validation and flattening operate on the *same*
+    // canonical string — otherwise a caller that passed untrimmed input could
+    // validate one string but flatten another (a validator/flatten mismatch).
+    let pkg = pkg.trim();
     if !is_valid_pkg_name(pkg) {
         return None;
     }
-    // npm package -> safe dir name (`@scope/name` -> `scope__name`).
+    // npm package -> safe dir name (`@scope/name` -> `scope__name`). Safe to
+    // flatten only because `is_valid_pkg_name` already guaranteed the raw shape
+    // (unscoped = no `/`; scoped = exactly one `/`), so the mapping is
+    // unambiguous and cannot fold a local path spec into a bare dir name.
     let flat = pkg.trim_start_matches('@').replace('/', "__");
     Some(extensions_root().join(flat))
 }
@@ -1292,18 +1299,37 @@ fn safe_pkg_dir(pkg: &str) -> Option<PathBuf> {
 /// Whether `pkg` is a syntactically valid npm package **name** we will accept
 /// from untrusted input. The single gate shared by [`safe_pkg_dir`] (which maps
 /// it to an install dir) and [`fetch_published_changelog`] (which builds an
-/// `npm pack` registry spec): rejecting path traversal (`..`) and any character
-/// outside the npm name alphabet blocks non-registry specifiers such as
-/// `../local-path`, `file:/…`, or a URL from ever reaching `npm pack` — those
-/// could otherwise be abused to read local files or trigger arbitrary fetches.
+/// `npm pack` registry spec): it blocks non-registry specifiers such as
+/// `../local-path`, `/etc`, `some/local/path`, `file:/…`, or a URL from ever
+/// reaching `npm pack` — those could otherwise be abused to pack/read local
+/// directories or trigger arbitrary fetches.
+///
+/// It validates the **raw** name shape, not the flattened dir name: an unscoped
+/// name has **no** `/`; a scoped name is exactly `@scope/name` with a **single**
+/// `/`. Validating the flattened form (`/` -> `__`) would wrongly accept local
+/// path specs like `/etc` or `some/local/path`, since the slashes vanish before
+/// the alphabet check.
 fn is_valid_pkg_name(pkg: &str) -> bool {
-    // `@scope/name` -> `scope__name`, mirroring `safe_pkg_dir`'s flattening.
-    let flat = pkg.trim_start_matches('@').replace('/', "__");
-    !flat.is_empty()
-        && !flat.contains("..")
-        && flat
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    // A single npm name segment (scope or name): non-empty, no path traversal,
+    // restricted to the npm name alphabet.
+    fn is_valid_segment(seg: &str) -> bool {
+        !seg.is_empty()
+            && !seg.contains("..")
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    }
+    match pkg.strip_prefix('@') {
+        // Scoped `@scope/name`: exactly one `/`, both segments valid.
+        Some(scoped) => match scoped.split_once('/') {
+            Some((scope, name)) => {
+                !name.contains('/') && is_valid_segment(scope) && is_valid_segment(name)
+            }
+            None => false,
+        },
+        // Unscoped: no `/` at all.
+        None => !pkg.contains('/') && is_valid_segment(pkg),
+    }
 }
 
 /// Whether a version / dist-tag token is safe to interpolate into an
@@ -2862,6 +2888,10 @@ mod tests {
             "a b",
             "@scope/../x",
             "pkg@1.0.0", // an embedded specifier must not slip through the name
+            "/etc",              // absolute local path (no `..`) must not pack a local dir
+            "/home/foo/console", // absolute local path with a nested dir
+            "some/local/path",   // relative local path (no `..`, no leading `/`)
+            "@scope/name/extra", // scoped form with an extra `/` (two slashes)
             "",
             "   ",
         ] {
@@ -2883,7 +2913,11 @@ mod tests {
         // The name validator and the version validator agree with the install
         // path's `safe_pkg_dir` gate (single source of truth for the alphabet).
         assert!(!is_valid_pkg_name("../evil"));
+        assert!(!is_valid_pkg_name("/etc")); // absolute local path, no `..`
+        assert!(!is_valid_pkg_name("some/local/path")); // relative local path
+        assert!(!is_valid_pkg_name("@scope/name/extra")); // extra `/`
         assert!(is_valid_pkg_name("@nanobpm/nano-ide-lang-rust"));
+        assert!(is_valid_pkg_name("nano-ide-ext-foo")); // plain unscoped name
         assert!(is_valid_pkg_version("1.2.3-beta.1+build"));
         assert!(!is_valid_pkg_version("1 2"));
     }
