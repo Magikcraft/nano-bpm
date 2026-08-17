@@ -1360,8 +1360,10 @@ pub fn catch_up_shard(
                      journal and cannot be replayed. Reprojecting the read model from the \
                      authoritative engine snapshot instead (issue #732) — all live process \
                      instances, jobs, incidents, user tasks, variables, subscriptions and \
-                     definitions are recovered; terminal/completed audit history that predates \
-                     this boot (already evicted from the engine) is NOT restored."
+                     definitions are recovered. Terminal/completed audit history that predates \
+                     this boot is then restored from the durable terminal-audit archive where \
+                     available (issue #831); any history never written to the archive (e.g. \
+                     completed before the archive existed) is NOT restored."
                 );
                 reseed_from_engine_state(shard, total, state);
             } else if read_model_lossy_rebuild_enabled() {
@@ -1416,6 +1418,24 @@ fn reseed_from_engine_state(
     shard
         .seed_from_engine_state(state)
         .expect("reproject read model from engine snapshot");
+    // Replay the durable terminal-audit archive on top of the live snapshot
+    // (issue #831): the snapshot only carries live instances, so completed/
+    // terminal history — which lived only in the read model — is restored here
+    // from its durable home. Best-effort: an archive read failure must not abort
+    // boot recovery of the (already reprojected) live state.
+    match shard.replay_terminal_archive() {
+        Ok(restored) if restored > 0 => tracing::info!(
+            restored,
+            "restored {restored} terminal/completed process instances from the durable \
+             terminal-audit archive on top of the engine-snapshot reprojection (issue #831)"
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not replay the durable terminal-audit archive during reprojection \
+             (issue #831); live instances are still recovered from the engine snapshot"
+        ),
+    }
     if total > 0 {
         shard
             .advance_exported(total as usize)
@@ -2555,5 +2575,65 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reprojection_restores_terminal_history_from_durable_archive() {
+        // Issue #831 end-to-end at the reprojection entrypoint: a terminal instance
+        // is archived durably when it completes, and a below-floor reprojection
+        // (whose engine snapshot holds only live state) restores that completed
+        // history from the archive rather than losing it (the merlin.local defect).
+        use crate::readstore::ReadStore;
+
+        let dir = temp_dir("readmodel-archive-reproject-831");
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let store_path = dir.join("read-model.sqlite");
+        let store = ReadStore::open(Some(&store_path)).expect("file-backed read store");
+
+        // Complete an instance so `export` writes it to the durable archive.
+        let created = Event::ProcessInstanceCreated {
+            instance_key: 999,
+            process_id: "demo".to_string(),
+            variables: std::collections::HashMap::new(),
+            created_at: 0,
+            tags: Vec::new(),
+            business_id: None,
+            process_definition_key: 0,
+            version: 0,
+        };
+        let done = Event::ProcessInstanceCompleted { instance_key: 999 };
+        store
+            .export(&[&created, &done])
+            .expect("export terminal instance");
+        assert_eq!(
+            store.process_instance(999).map(|r| r.state),
+            Some(nanobpmn_engine_core::ProcessInstanceState::Completed)
+        );
+
+        // Wipe the read model (stand-in for the fingerprint/upgrade wipe) so it
+        // sits below the compaction floor, exactly the CompactedGap condition.
+        store.reset().expect("wipe read model");
+        assert!(store.process_instance(999).is_none());
+        assert_eq!(store.exported_position(), 0);
+
+        // The engine snapshot for the reprojection holds NO live instances (the
+        // terminal one was long evicted), so only the archive can restore it.
+        let empty_dir = temp_dir("readmodel-archive-reproject-831-engine");
+        let (engine, _recovery) =
+            crate::journal::Journal::open_segmented(&empty_dir).expect("open empty engine");
+        assert!(engine.engine_state().instances.is_empty());
+
+        // Drive the public reprojection entrypoint with a non-zero floor.
+        catch_up_shard(&store, 100, &[], Some(engine.engine_state()));
+
+        assert_eq!(
+            store.process_instance(999).map(|r| r.state),
+            Some(nanobpmn_engine_core::ProcessInstanceState::Completed),
+            "terminal/completed history must be restored from the durable archive \
+             during a below-floor reprojection (issue #831)"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&empty_dir);
     }
 }

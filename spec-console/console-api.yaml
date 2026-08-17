@@ -1138,6 +1138,49 @@ paths:
               schema: { $ref: '#/components/schemas/ExtensionReadme' }
         '404': { $ref: '#/components/responses/NotFound' }
 
+  /extensions/changelog:
+    get:
+      operationId: getExtensionChangelog
+      tags: [extensions]
+      summary: Changelog (markdown) for an extension pack
+      description: >
+        Returns the pack's changelog as raw markdown so the marketplace/update
+        panel can show *what changed*. For an installed pack this is read from
+        the bundled `CHANGELOG.md`; otherwise the published registry tarball is
+        downloaded (`npm pack <pkg>@<to>`) and its changelog read — npm does not
+        expose `changelog` via `npm view` the way it does `readme`. When `from`
+        (the installed version) is supplied and the changelog's version headings
+        parse, the result is scoped to the delta between `from` and the latest
+        version, falling back to the full changelog otherwise.
+      parameters:
+        - name: pkg
+          in: query
+          required: true
+          description: The npm package name (e.g. `@nanobpm/nano-workforce`).
+          schema: { type: string }
+        - name: from
+          in: query
+          required: false
+          description: >-
+            The installed version. When present (and the headings parse) the
+            changelog is scoped to the entries newer than this version.
+          schema: { type: string }
+        - name: to
+          in: query
+          required: false
+          description: >-
+            The latest version to fetch when the pack is not installed locally
+            (pins the registry tarball). Defaults to the `latest` tag.
+          schema: { type: string }
+      responses:
+        '200':
+          description: Pack changelog
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ExtensionChangelog' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/InternalError' }
+
   /extensions/install:
     post:
       operationId: installExtension
@@ -2728,7 +2771,7 @@ components:
         yolo: { type: boolean }
     MarketEntry:
       type: object
-      required: [name, version, description, category, official, installed, updateAvailable]
+      required: [name, version, description, category, official, installed, updateAvailable, changelogAvailable]
       properties:
         name: { type: string }
         version: { type: string }
@@ -2757,6 +2800,14 @@ components:
         npmUrl:
           type: string
           description: The package's page on the npm registry.
+        changelogAvailable:
+          type: boolean
+          description: >-
+            True when the installed pack ships a `CHANGELOG.md`, so the console
+            can offer a "What's changed" affordance only when there is something
+            to show. A cheap offline probe of the installed copy — stays `false`
+            for packs the user has not installed (their published changelog is
+            resolved on demand via `/extensions/changelog`).
     Marketplace:
       type: object
       required: [entries]
@@ -2775,6 +2826,26 @@ components:
         installed:
           type: boolean
           description: True when the README came from an installed pack (vs npm).
+    ExtensionChangelog:
+      type: object
+      required: [pkg, changelog, installed, delta]
+      properties:
+        pkg: { type: string }
+        changelog:
+          type: string
+          description: >-
+            The pack's changelog as raw markdown. Scoped to the installed→latest
+            delta when `delta` is true, else the full changelog.
+        installed:
+          type: boolean
+          description: >-
+            True when the changelog came from an installed pack (vs the
+            downloaded registry tarball).
+        delta:
+          type: boolean
+          description: >-
+            True when `changelog` was narrowed to just the entries between the
+            installed and latest versions (vs the full history).
     ServerUpdateStatus:
       type: object
       required: [current, updateAvailable, canSelfUpdate, installMethod]

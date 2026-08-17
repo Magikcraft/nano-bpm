@@ -28,6 +28,13 @@ serde_json = { version = "1", features = ["raw_value"] }
 # single `compile_error!` in `src/backend/mod.rs`, not a diffuse cascade of
 # "unresolved import `rusqlite`" errors from every downstream query.
 rusqlite = { version = "0.32", default-features = false }
+# Diagnostics facade for the #831 non-destructive-migration/terminal-archive
+# recovery paths (schema migration falling back to a rebuild, an unwritable
+# archive). `default-features = false` links only the macro facade — no
+# subscriber, no `std`/`attributes` — so it stays wasm32-safe and adds no
+# runtime unless a consumer installs a subscriber (the gateway `server` does,
+# and captures these `warn!`s exactly as before the read-model extraction).
+tracing = { version = "0.1", default-features = false }
 
 # The in-memory SQLite backend for wasm32 (MemoryVFS). Optional + declared now so
 # the `wasm` feature and this exact dependency name are a FIXED CONTRACT siblings

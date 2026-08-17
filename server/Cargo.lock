@@ -1537,6 +1537,7 @@ dependencies = [
  "nanobpmn-engine-core",
  "rusqlite",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
