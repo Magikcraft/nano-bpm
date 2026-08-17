@@ -1,10 +1,4 @@
-import {
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   getExtensionChangelog,
   getExtensionReadme,
@@ -600,9 +594,18 @@ export default function Extensions() {
                   (and installed packs whose changelog only lives in the tarball).
                   The server returns 404 gracefully when a pack has none. */}
               {readmePkg && (
-                <div className="sticky top-0 z-10 flex gap-1 border-b border-edge bg-panel px-4 pt-2">
+                <div
+                  role="tablist"
+                  aria-label="Package details"
+                  className="sticky top-0 z-10 flex gap-1 border-b border-edge bg-panel px-4 pt-2"
+                >
                   <button
                     type="button"
+                    role="tab"
+                    id="pack-drawer-tab-readme"
+                    aria-selected={drawerTab === "readme"}
+                    aria-controls="pack-drawer-panel"
+                    tabIndex={drawerTab === "readme" ? 0 : -1}
                     onClick={() => selectDrawerTab("readme")}
                     className={`rounded-t px-3 py-1.5 text-xs font-medium ${
                       drawerTab === "readme"
@@ -614,6 +617,11 @@ export default function Extensions() {
                   </button>
                   <button
                     type="button"
+                    role="tab"
+                    id="pack-drawer-tab-changelog"
+                    aria-selected={drawerTab === "changelog"}
+                    aria-controls="pack-drawer-panel"
+                    tabIndex={drawerTab === "changelog" ? 0 : -1}
                     onClick={() => selectDrawerTab("changelog")}
                     className={`rounded-t px-3 py-1.5 text-xs font-medium ${
                       drawerTab === "changelog"
@@ -625,40 +633,50 @@ export default function Extensions() {
                   </button>
                 </div>
               )}
-              {drawerTab === "changelog" ? (
-                changelogErr ? (
+              <div
+                role="tabpanel"
+                id="pack-drawer-panel"
+                aria-labelledby={
+                  drawerTab === "changelog"
+                    ? "pack-drawer-tab-changelog"
+                    : "pack-drawer-tab-readme"
+                }
+              >
+                {drawerTab === "changelog" ? (
+                  changelogErr ? (
+                    <div className="px-6 py-5 text-sm text-fg-faint">
+                      {changelogErr}
+                    </div>
+                  ) : changelogMd === null ? (
+                    <div className="px-6 py-5 text-sm text-fg-faint">
+                      Loading changelog…
+                    </div>
+                  ) : (
+                    <>
+                      {changelogDelta && (
+                        <div className="px-6 pt-4 text-xs text-fg-faint">
+                          Showing changes since your installed version
+                          {readmePkg.installedVersion
+                            ? ` (${readmePkg.installedVersion} → ${readmePkg.version})`
+                            : ""}
+                          .
+                        </div>
+                      )}
+                      <MarkdownPreview source={changelogMd} />
+                    </>
+                  )
+                ) : readmeErr ? (
                   <div className="px-6 py-5 text-sm text-fg-faint">
-                    {changelogErr}
+                    {readmeErr}
                   </div>
-                ) : changelogMd === null ? (
+                ) : readmeMd === null ? (
                   <div className="px-6 py-5 text-sm text-fg-faint">
-                    Loading changelog…
+                    Loading README…
                   </div>
                 ) : (
-                  <>
-                    {changelogDelta && (
-                      <div className="px-6 pt-4 text-xs text-fg-faint">
-                        Showing changes since your installed version
-                        {readmePkg.installedVersion
-                          ? ` (${readmePkg.installedVersion} → ${readmePkg.version})`
-                          : ""}
-                        .
-                      </div>
-                    )}
-                    <MarkdownPreview source={changelogMd} />
-                  </>
-                )
-              ) : readmeErr ? (
-                <div className="px-6 py-5 text-sm text-fg-faint">
-                  {readmeErr}
-                </div>
-              ) : readmeMd === null ? (
-                <div className="px-6 py-5 text-sm text-fg-faint">
-                  Loading README…
-                </div>
-              ) : (
-                <MarkdownPreview source={readmeMd} />
-              )}
+                  <MarkdownPreview source={readmeMd} />
+                )}
+              </div>
             </div>
             {(readmePkg.repository ||
               readmePkg.homepage ||

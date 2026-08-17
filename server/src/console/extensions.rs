@@ -1362,6 +1362,12 @@ fn is_valid_pkg_version(v: &str) -> bool {
 /// package must carry a `nano-ide.ext.json` manifest. Returns its parsed
 /// manifest. Best-effort: requires `npm` on PATH.
 pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
+    // Canonicalise the spec once so validation, the install-dir mapping, and the
+    // external `npm pack` invocation all operate on the *same* string.
+    // `safe_pkg_dir` trims internally, so an untrimmed `pkg` could validate/pick
+    // a dir yet still be handed whitespace-padded to `npm pack` (which then
+    // fails). Trimming here keeps validation and the npm call consistent.
+    let pkg = pkg.trim();
     let dir = safe_pkg_dir(pkg).ok_or("invalid package name")?;
     // Clean install: clear any prior copy so a re-install (i.e. an update to a
     // newer npm version) never leaves stale files from the old version behind.
@@ -1918,7 +1924,8 @@ pub fn pack_changelog(pkg: &str, from: Option<&str>, to: Option<&str>) -> Option
         })
     };
     let fetch_published = || fetch_published_changelog(pkg, to);
-    let (raw, installed) = select_changelog_source(from.is_some(), read_installed, fetch_published)?;
+    let (raw, installed) =
+        select_changelog_source(from.is_some(), read_installed, fetch_published)?;
     // Scope to the installed→latest delta when we know the installed version and
     // the headings parse; otherwise show the whole changelog.
     let (changelog, delta) = match from.and_then(|f| changelog_delta(&raw, f)) {
@@ -2834,7 +2841,10 @@ mod tests {
         // NOT force the update-case published-tarball fetch (no delta scoping).
         for empty in ["", "   "] {
             let c = pack_changelog(pkg, Some(empty), None).expect("changelog present");
-            assert!(c.installed, "empty `from`={empty:?} must read the installed copy");
+            assert!(
+                c.installed,
+                "empty `from`={empty:?} must read the installed copy"
+            );
             assert!(!c.delta, "empty `from`={empty:?} must not scope a delta");
             assert!(c.changelog.contains("baseline release"));
         }
@@ -2883,8 +2893,7 @@ mod tests {
         assert_eq!(src, Some(("installed".to_string(), true)));
 
         // Not installed → fall back to the published tarball.
-        let published =
-            select_changelog_source(false, || None, || Some("published".to_string()));
+        let published = select_changelog_source(false, || None, || Some("published".to_string()));
         assert_eq!(published, Some(("published".to_string(), false)));
     }
 
@@ -2903,7 +2912,7 @@ mod tests {
             "https://example.com/x.tgz",
             "a b",
             "@scope/../x",
-            "pkg@1.0.0", // an embedded specifier must not slip through the name
+            "pkg@1.0.0",         // an embedded specifier must not slip through the name
             "/etc",              // absolute local path (no `..`) must not pack a local dir
             "/home/foo/console", // absolute local path with a nested dir
             "some/local/path",   // relative local path (no `..`, no leading `/`)
