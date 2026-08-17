@@ -21,7 +21,6 @@
 use std::path::Path;
 
 use rusqlite::Connection;
-
 // Force `sqlite-wasm-rs` into the link on the real wasm target: nothing in this
 // crate names it (the read model speaks only the `libsqlite3-sys` C API), so
 // without a reference it would be dropped as unused and every `sqlite3_*` symbol

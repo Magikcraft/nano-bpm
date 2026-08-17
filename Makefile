@@ -25,6 +25,7 @@ ENGINE_DIR := $(PROJECT_ROOT)/engine-core
 CONSOLE_DIR := $(PROJECT_ROOT)/console
 PROCESSOS_DIR := $(PROJECT_ROOT)/processos
 WASM_DIR := $(PROJECT_ROOT)/engine-wasm
+READ_MODEL_DIR := $(PROJECT_ROOT)/read-model
 UV := uv
 
 # Spec inputs for the generated crates. Listing these as prerequisites of the
@@ -46,7 +47,7 @@ CONSOLE_SPEC_SRCS := $(PROJECT_ROOT)/spec-console/console-api.yaml \
 # producing import-ordering drift. Always format via this toolchain so the tree
 # matches the `make fmt-check` CI gate. Bump deliberately (single style commit).
 FMT_TOOLCHAIN := nightly-2026-06-26
-FMT_CRATES := $(ENGINE_DIR) $(PROJECT_ROOT)/server $(PROCESSOS_DIR) $(WASM_DIR)
+FMT_CRATES := $(ENGINE_DIR) $(PROJECT_ROOT)/server $(PROCESSOS_DIR) $(WASM_DIR) $(READ_MODEL_DIR)
 
 .DEFAULT_GOAL := build
 
