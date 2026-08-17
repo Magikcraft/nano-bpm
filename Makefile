@@ -262,11 +262,12 @@ console-wasm: ## Regenerate the in-browser engine package (engine-wasm -> engine
 	if command -v wasm-pack >/dev/null 2>&1; then \
 		echo "Regenerating engine-wasm/pkg (@nanobpm/engine-wasm) via wasm-pack (lean + read-model)..."; \
 		echo "  -> lean  (pkg/lean)"; \
-		cd $(PROJECT_ROOT)/engine-wasm && wasm-pack build --target web --release --no-pack --out-dir pkg/lean --out-name nanobpmn_engine \
-		&& rm -f $(PROJECT_ROOT)/engine-wasm/pkg/lean/.gitignore; \
+		cd $(PROJECT_ROOT)/engine-wasm; \
+		wasm-pack build --target web --release --no-pack --out-dir pkg/lean --out-name nanobpmn_engine; \
+		rm -f $(PROJECT_ROOT)/engine-wasm/pkg/lean/.gitignore; \
 		echo "  -> read-model (pkg/readmodel, --features read-model)"; \
-		cd $(PROJECT_ROOT)/engine-wasm && $(WASM_READ_MODEL_ENV) wasm-pack build --target web --release --no-pack --out-dir pkg/readmodel --out-name nanobpmn_engine -- --features read-model \
-		&& rm -f $(PROJECT_ROOT)/engine-wasm/pkg/readmodel/.gitignore; \
+		$(WASM_READ_MODEL_ENV) wasm-pack build --target web --release --no-pack --out-dir pkg/readmodel --out-name nanobpmn_engine -- --features read-model; \
+		rm -f $(PROJECT_ROOT)/engine-wasm/pkg/readmodel/.gitignore; \
 		cp $(PROJECT_ROOT)/engine-wasm/pkg.package.json $(PROJECT_ROOT)/engine-wasm/pkg/package.json; \
 		cp $(PROJECT_ROOT)/engine-wasm/README.md $(PROJECT_ROOT)/engine-wasm/pkg/README.md; \
 	else \
