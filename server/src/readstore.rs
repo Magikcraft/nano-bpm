@@ -492,7 +492,33 @@ fn attach_archive(conn: &Connection, archive: &Path) -> rusqlite::Result<()> {
         "ATTACH DATABASE ?1 AS terminal_archive",
         params![archive.to_string_lossy()],
     )?;
+    // The archive is the *durable source of truth* for completed history: unlike
+    // the derived read model (rebuildable from the journal), a terminal instance
+    // evicted below the snapshot floor lives ONLY here, so losing a recently
+    // archived commit on power/OS loss is unrecoverable. `synchronous` is a
+    // per-attached-database setting, so we give `terminal_archive` its own
+    // power-safe profile (default FULL) on every attach rather than inheriting the
+    // read model's throughput-tuned NORMAL from the main connection. Harmless on
+    // the read-only replay path; archive writes are infrequent (only as instances
+    // become terminal), so the per-commit fsync is off the read model's hot path.
+    // See `archive_sync_pragma`.
+    conn.pragma_update(
+        Some(rusqlite::DatabaseName::Attached("terminal_archive")),
+        "synchronous",
+        archive_sync_pragma(),
+    )?;
     Ok(())
+}
+
+/// `synchronous` durability level for the terminal-audit archive (issue #831).
+/// Defaults to `FULL` (per-commit fsync, power-loss safe) because the archive is
+/// the durable source of truth for completed history and is *not* rebuildable
+/// from the journal once an instance has been evicted below the snapshot floor —
+/// so it must not inherit the read model's throughput-tuned `NORMAL`.
+/// `NANOBPMN_ARCHIVE_SYNC` overrides (e.g. `NORMAL` to trade archive durability
+/// for speed, matching the read model).
+fn archive_sync_pragma() -> String {
+    std::env::var("NANOBPMN_ARCHIVE_SYNC").unwrap_or_else(|_| "FULL".into())
 }
 
 /// Column names common to the `table` copies in the two attached databases
@@ -4944,6 +4970,48 @@ mod writability_tests {
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(path.with_extension("sqlite-wal")).ok();
         std::fs::remove_file(path.with_extension("sqlite-shm")).ok();
+    }
+
+    #[test]
+    fn archive_attaches_with_power_safe_full_synchronous() {
+        // Defect-class guard (issue #831): the terminal-audit archive is the
+        // durable source of truth for completed history and — unlike the derived
+        // read model — is NOT rebuildable from the journal once an instance is
+        // evicted below the snapshot floor. It must therefore NOT silently inherit
+        // the read model's throughput-tuned synchronous=NORMAL (which can drop a
+        // recently-archived completion on power/OS loss). `attach_archive` must
+        // give the attached archive its own power-safe FULL profile regardless of
+        // the main connection's NORMAL.
+        let path = scratch_db();
+        let store = ReadStore::open(Some(&path)).expect("open file-backed db (creates archive)");
+        let archive = ReadStore::terminal_archive_path(&path);
+        let archive_sync: i64 = {
+            let conn = store.conn.lock().unwrap();
+            let main_sync = conn
+                .query_row("PRAGMA synchronous", [], |r| r.get::<_, i64>(0))
+                .unwrap();
+            assert_eq!(main_sync, 1, "precondition: main read model runs NORMAL (1)");
+            super::attach_archive(&conn, &archive).expect("attach archive");
+            let s = conn
+                .query_row("PRAGMA terminal_archive.synchronous", [], |r| {
+                    r.get::<_, i64>(0)
+                })
+                .unwrap();
+            let _ = conn.execute_batch("DETACH DATABASE terminal_archive");
+            s
+        };
+        assert_eq!(
+            archive_sync, 2,
+            "archive must attach with power-safe synchronous=FULL (2), not the read model's NORMAL (1)"
+        );
+        drop(store);
+        let cleanup = |p: &std::path::Path| {
+            std::fs::remove_file(p).ok();
+            std::fs::remove_file(p.with_extension("sqlite-wal")).ok();
+            std::fs::remove_file(p.with_extension("sqlite-shm")).ok();
+        };
+        cleanup(&path);
+        cleanup(&archive);
     }
 
     #[cfg(unix)]
