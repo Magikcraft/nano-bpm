@@ -991,6 +991,27 @@ pub fn installed_pack_versions() -> std::collections::HashMap<String, String> {
 /// error — the caller owns `dir`'s lifecycle. Best-effort: requires `npm` and
 /// `tar` on PATH.
 fn npm_pack_extract(dir: &Path, pkg_spec: &str) -> Result<(), String> {
+    let tgz = npm_pack_download(dir, pkg_spec)?;
+    let tar = find_program("tar").ok_or("tar not found")?;
+    let st = std::process::Command::new(&tar)
+        .args(["xzf", &tgz, "--strip-components=1"])
+        .current_dir(dir)
+        .status()
+        .map_err(|e| format!("tar: {e}"))?;
+    if !st.success() {
+        return Err("tar extract failed".into());
+    }
+    let _ = std::fs::remove_file(dir.join(&tgz));
+    Ok(())
+}
+
+/// Run `npm pack <pkg_spec>` inside `dir`, fetching the tarball there, and
+/// return the created `.tgz` filename (relative to `dir`). Does **not** extract
+/// or remove it — the caller owns the tarball's lifecycle. Split out of
+/// [`npm_pack_extract`] as the single `npm pack` invocation both it and callers
+/// that only need one member (e.g. [`fetch_published_changelog`]) share, so the
+/// download step can't drift between them. Requires `npm` on PATH.
+fn npm_pack_download(dir: &Path, pkg_spec: &str) -> Result<String, String> {
     let npm = find_program("npm").ok_or("npm not found on PATH")?;
     let out = std::process::Command::new(&npm)
         .args(["pack", pkg_spec, "--silent"])
@@ -1003,18 +1024,57 @@ fn npm_pack_extract(dir: &Path, pkg_spec: &str) -> Result<(), String> {
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    let tgz = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let tar = find_program("tar").ok_or("tar not found")?;
-    let st = std::process::Command::new(&tar)
-        .args(["xzf", &tgz, "--strip-components=1"])
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Hard cap on how many bytes we buffer from a single tar member. The tarballs
+/// this reads come from an untrusted registry, so an extremely large member
+/// (e.g. a pathological `CHANGELOG.md`) would otherwise balloon memory and the
+/// JSON response — a resource-exhaustion vector. 4 MiB dwarfs any real changelog
+/// while keeping a hostile input bounded; a member past the cap is treated as
+/// unreadable (`None`).
+const MAX_TAR_MEMBER_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Stream a single named member out of the gzip tarball `tgz` (relative to
+/// `dir`) to memory via `tar -xzO -f <tgz> <member>`, writing **no** archive
+/// paths to the filesystem. `None` when the member is absent, `tar` is missing
+/// or fails, the member exceeds [`MAX_TAR_MEMBER_BYTES`], or the bytes are not
+/// valid UTF-8. Reading just the one file we need is a smaller attack surface
+/// (and less I/O) than unpacking a whole untrusted registry archive to disk, and
+/// the byte cap keeps a hostile oversized member from exhausting memory: stdout
+/// is streamed with a hard limit rather than captured whole via `output()`.
+fn tar_read_member(dir: &Path, tgz: &str, member: &str) -> Option<String> {
+    use std::io::Read;
+    let tar = find_program("tar")?;
+    let mut child = std::process::Command::new(&tar)
+        .args(["xzOf", tgz, member])
         .current_dir(dir)
-        .status()
-        .map_err(|e| format!("tar: {e}"))?;
-    if !st.success() {
-        return Err("tar extract failed".into());
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Read one byte past the cap so an over-limit member is detectable without
+    // ever buffering the whole thing.
+    let mut buf = Vec::new();
+    let read = stdout
+        .by_ref()
+        .take(MAX_TAR_MEMBER_BYTES + 1)
+        .read_to_end(&mut buf)
+        .is_ok();
+    if !read || buf.len() as u64 > MAX_TAR_MEMBER_BYTES {
+        // Read error or over the cap: stop `tar` (rather than draining a
+        // pathologically large member) and treat it as unreadable.
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
     }
-    let _ = std::fs::remove_file(dir.join(&tgz));
-    Ok(())
+    // The member fit under the cap, so its stdout is at EOF and `tar` has
+    // finished; reap it and honour its exit status.
+    if !child.wait().ok()?.success() {
+        return None;
+    }
+    String::from_utf8(buf).ok()
 }
 
 /// Create a fresh, uniquely-named temp directory under the system temp root
@@ -1281,23 +1341,93 @@ fn install_scripts_trusted(trust: &TrustStore, id: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 fn safe_pkg_dir(pkg: &str) -> Option<PathBuf> {
-    // npm package -> safe dir name (`@scope/name` -> `scope__name`).
-    let flat = pkg.trim_start_matches('@').replace('/', "__");
-    if flat.is_empty()
-        || flat.contains("..")
-        || !flat
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-    {
+    // Trim once here so validation and flattening operate on the *same*
+    // canonical string — otherwise a caller that passed untrimmed input could
+    // validate one string but flatten another (a validator/flatten mismatch).
+    let pkg = pkg.trim();
+    if !is_valid_pkg_name(pkg) {
         return None;
     }
+    // npm package -> safe dir name (`@scope/name` -> `scope__name`). The
+    // security property this flatten guarantees is *path confinement*, not
+    // injectivity: because `is_valid_pkg_name` already pinned the raw shape
+    // (unscoped = no `/`; scoped = exactly one `/`, no traversal, npm alphabet),
+    // no input can fold a local path spec (`/etc`, `some/local/path`, `..`) into
+    // a bare dir name — the result is always a single component under
+    // `extensions_root()`. It is *not* injective: a scoped `@scope/name` and an
+    // unscoped package literally named `scope__name` both map here to
+    // `scope__name`. That is an accepted limitation, not a path-escape bug — the
+    // dir is a content store addressed by the validated package name (install
+    // and remove use the *same* mapping, so a given name always round-trips to
+    // its own dir), and packs are identified downstream by their manifest `id`,
+    // never by this directory name.
+    let flat = pkg.trim_start_matches('@').replace('/', "__");
     Some(extensions_root().join(flat))
+}
+
+/// Whether `pkg` is a syntactically valid npm package **name** we will accept
+/// from untrusted input. The single gate shared by [`safe_pkg_dir`] (which maps
+/// it to an install dir) and [`fetch_published_changelog`] (which builds an
+/// `npm pack` registry spec): it blocks non-registry specifiers such as
+/// `../local-path`, `/etc`, `some/local/path`, `file:/…`, or a URL from ever
+/// reaching `npm pack` — those could otherwise be abused to pack/read local
+/// directories or trigger arbitrary fetches.
+///
+/// It validates the **raw** name shape, not the flattened dir name: an unscoped
+/// name has **no** `/`; a scoped name is exactly `@scope/name` with a **single**
+/// `/`. Validating the flattened form (`/` -> `__`) would wrongly accept local
+/// path specs like `/etc` or `some/local/path`, since the slashes vanish before
+/// the alphabet check.
+fn is_valid_pkg_name(pkg: &str) -> bool {
+    // A single npm name segment (scope or name): non-empty, no path traversal,
+    // restricted to the npm name alphabet, and — like npm itself — never
+    // starting with `.` or `_`. Blocking a leading `.`/`_` keeps `safe_pkg_dir`
+    // from mapping a crafted name to a dotfile or, worse, to the extensions
+    // root itself: `.` alone would otherwise flatten to `extensions_root()/.`
+    // (the root), letting `install_from_npm`/`remove` overwrite or delete the
+    // whole extensions directory.
+    fn is_valid_segment(seg: &str) -> bool {
+        !seg.is_empty()
+            && !seg.starts_with('.')
+            && !seg.starts_with('_')
+            && !seg.contains("..")
+            && seg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+    }
+    match pkg.strip_prefix('@') {
+        // Scoped `@scope/name`: exactly one `/`, both segments valid.
+        Some(scoped) => match scoped.split_once('/') {
+            Some((scope, name)) => {
+                !name.contains('/') && is_valid_segment(scope) && is_valid_segment(name)
+            }
+            None => false,
+        },
+        // Unscoped: no `/` at all.
+        None => !pkg.contains('/') && is_valid_segment(pkg),
+    }
+}
+
+/// Whether a version / dist-tag token is safe to interpolate into an
+/// `npm pack <pkg>@<v>` spec. Restricts to the semver + dist-tag alphabet so a
+/// query param can't smuggle a second spec or a non-registry source via spaces,
+/// slashes, or specifier punctuation (`@`, `:`).
+fn is_valid_pkg_version(v: &str) -> bool {
+    !v.is_empty()
+        && v.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
 }
 
 /// Install a `nano-ide-ext-*` package from npm via `npm pack` + extract. The
 /// package must carry a `nano-ide.ext.json` manifest. Returns its parsed
 /// manifest. Best-effort: requires `npm` on PATH.
 pub fn install_from_npm(pkg: &str) -> Result<ExtManifest, String> {
+    // Canonicalise the spec once so validation, the install-dir mapping, and the
+    // external `npm pack` invocation all operate on the *same* string.
+    // `safe_pkg_dir` trims internally, so an untrimmed `pkg` could validate/pick
+    // a dir yet still be handed whitespace-padded to `npm pack` (which then
+    // fails). Trimming here keeps validation and the npm call consistent.
+    let pkg = pkg.trim();
     let dir = safe_pkg_dir(pkg).ok_or("invalid package name")?;
     // Clean install: clear any prior copy so a re-install (i.e. an update to a
     // newer npm version) never leaves stale files from the old version behind.
@@ -1546,6 +1676,12 @@ pub struct MarketEntry {
     /// The package's page on the npm registry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub npm_url: Option<String>,
+    /// True when the installed pack ships a `CHANGELOG.md`, so the console can
+    /// offer a "What's changed" affordance only when there is something to show.
+    /// Cheap, offline probe of the installed copy — a not-installed pack's
+    /// published changelog is only resolved on demand (see [`pack_changelog`]),
+    /// so this stays `false` for packs the user has not installed.
+    pub changelog_available: bool,
 }
 
 /// Accept a URL only when it uses an `http`/`https` scheme, rejecting anything
@@ -1665,6 +1801,7 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
             let repository = links["repository"].as_str().and_then(normalize_repo_url);
             let homepage = links["homepage"].as_str().and_then(safe_http_url);
             let npm_url = links["npm"].as_str().and_then(safe_http_url);
+            let changelog_available = installed && installed_changelog_path(&name).is_some();
             MarketEntry {
                 installed,
                 version: latest,
@@ -1676,6 +1813,7 @@ pub fn marketplace() -> Result<Vec<MarketEntry>, String> {
                 repository,
                 homepage,
                 npm_url,
+                changelog_available,
                 name,
             }
         })
@@ -1780,6 +1918,261 @@ pub fn pack_readme(pkg: &str) -> Option<PackReadme> {
         readme: txt,
         installed: false,
     })
+}
+
+/// Candidate `CHANGELOG` filenames, most-common first. Shared by the
+/// installed-pack availability probe and [`pack_changelog`] so the two never
+/// drift on which names count as a changelog.
+const CHANGELOG_FILENAMES: [&str; 5] = [
+    "CHANGELOG.md",
+    "changelog.md",
+    "CHANGELOG",
+    "Changelog.md",
+    "HISTORY.md",
+];
+
+/// Path to an installed pack's bundled changelog file, if it ships one. `None`
+/// when the pack is not installed or carries no changelog. Offline, no network.
+fn installed_changelog_path(pkg: &str) -> Option<PathBuf> {
+    let dir = safe_pkg_dir(pkg).filter(|d| d.is_dir())?;
+    CHANGELOG_FILENAMES
+        .iter()
+        .map(|n| dir.join(n))
+        .find(|p| p.is_file())
+}
+
+/// A pack's changelog (release notes) and where it came from — surfaced in the
+/// marketplace/update UI so a user can see *what changed* before updating.
+pub struct PackChangelog {
+    /// The changelog markdown. Scoped to the installed→latest delta when
+    /// [`PackChangelog::delta`] is true, else the full changelog.
+    pub changelog: String,
+    /// True when the changelog was read from an installed pack (vs fetched from
+    /// the registry tarball).
+    pub installed: bool,
+    /// True when `changelog` was narrowed to just the entries between the
+    /// installed and latest versions (vs the full history).
+    pub delta: bool,
+}
+
+/// The changelog (markdown) for an extension pack. Reads the bundled
+/// `CHANGELOG.md` of an installed pack, or downloads the published registry
+/// tarball (`npm pack <pkg>@<to>`) and reads the changelog from it — npm does
+/// not expose `changelog` via `npm view` the way it does `readme`. Which source
+/// is preferred depends on whether a delta is wanted; see
+/// [`select_changelog_source`].
+///
+/// When `from` (the installed version) is given and the changelog's version
+/// headings are parseable, the result is scoped to the delta between `from` and
+/// the latest — the entries newer than what the user is running — matching the
+/// "What's changed" update affordance. Falls back to the full changelog when
+/// the headings can't be parsed. `None` when no changelog can be resolved
+/// (unknown pack, ships none, or offline) — mirroring [`pack_readme`].
+///
+/// See [`select_changelog_source`] for why the *update* case (`from` set)
+/// prefers the published tarball over the installed copy.
+pub fn pack_changelog(pkg: &str, from: Option<&str>, to: Option<&str>) -> Option<PackChangelog> {
+    // Treat an empty/whitespace `from` (e.g. `?from=`) as absent: there is no
+    // usable installed version to delta against, so it must not force the
+    // registry-tarball fetch that the update case triggers.
+    let from = from.filter(|f| !f.trim().is_empty());
+    let read_installed = || {
+        installed_changelog_path(pkg).and_then(|path| {
+            std::fs::read_to_string(&path)
+                .ok()
+                .filter(|txt| !txt.trim().is_empty())
+        })
+    };
+    let fetch_published = || fetch_published_changelog(pkg, to);
+    let (raw, installed) =
+        select_changelog_source(from.is_some(), read_installed, fetch_published)?;
+    // Scope to the installed→latest delta when we know the installed version and
+    // the headings parse; otherwise show the whole changelog.
+    let (changelog, delta) = match from.and_then(|f| changelog_delta(&raw, f)) {
+        Some(d) => (d, true),
+        None => (raw, false),
+    };
+    Some(PackChangelog {
+        changelog,
+        installed,
+        delta,
+    })
+}
+
+/// Pick which changelog source to read and in what order, returning
+/// `(markdown, installed_flag)`.
+///
+/// The order flips on whether we need an installed→latest *delta*
+/// (`want_delta`, i.e. the caller supplied a `from` version):
+///
+/// * **Update case (`want_delta`):** prefer the *published* tarball. The
+///   installed pack's `CHANGELOG.md` only carries headings up to the version
+///   that is currently running, so it can never contain the newer releases the
+///   delta is supposed to surface — reading it would make `changelog_delta`
+///   return `None` and collapse the "What's changed" affordance to the old,
+///   full changelog. Fall back to the installed copy only when the registry
+///   fetch fails (offline), so we still show *something*.
+/// * **Full-changelog case (no `want_delta`):** prefer the installed copy — it
+///   matches what's running, works offline, and needs no network round-trip.
+///
+/// Split out from [`pack_changelog`] so the source-ordering logic is unit
+/// testable without touching the filesystem or the network.
+fn select_changelog_source(
+    want_delta: bool,
+    read_installed: impl FnOnce() -> Option<String>,
+    fetch_published: impl FnOnce() -> Option<String>,
+) -> Option<(String, bool)> {
+    if want_delta {
+        match fetch_published() {
+            Some(txt) => Some((txt, false)),
+            None => read_installed().map(|txt| (txt, true)),
+        }
+    } else {
+        match read_installed() {
+            Some(txt) => Some((txt, true)),
+            None => fetch_published().map(|txt| (txt, false)),
+        }
+    }
+}
+
+/// Download a package's published registry tarball and read its changelog
+/// markdown. `version` pins the exact published version (e.g. the latest);
+/// `None` takes the registry's default (`latest`) tag. Best-effort — `None` on
+/// any failure (npm/tar missing, offline, no changelog in the tarball).
+fn fetch_published_changelog(pkg: &str, version: Option<&str>) -> Option<String> {
+    // Gate the untrusted `pkg`/`version` query params before they reach
+    // `npm pack`: `npm pack` accepts far more than a registry name (`../local`,
+    // `file:/…`, URLs, git specs), so an unvalidated spec could be coerced into
+    // reading local files or fetching arbitrary sources. Reuse the same name
+    // check the install path uses, and restrict the version to a safe alphabet
+    // (a stray space/`@` would otherwise smuggle a second spec).
+    let pkg = pkg.trim();
+    if !is_valid_pkg_name(pkg) {
+        return None;
+    }
+    let version = version.map(str::trim).filter(|v| !v.is_empty());
+    if version.is_some_and(|v| !is_valid_pkg_version(v)) {
+        return None;
+    }
+    // A dedicated scratch dir under the OS temp dir, torn down before we return.
+    // Use exclusive, unpredictable creation (`secure_temp_dir`) so a shared host
+    // can't win a symlink/TOCTOU race on a guessable path.
+    let scratch = secure_temp_dir("nano-ext-changelog").ok()?;
+    let spec = match version {
+        Some(v) => format!("{pkg}@{v}"),
+        None => pkg.to_string(),
+    };
+    let result = (|| {
+        let tgz = npm_pack_download(&scratch, &spec).ok()?;
+        // npm tarballs nest every file under a single top-level `package/` dir
+        // (the same invariant `npm_pack_extract` relies on via
+        // `--strip-components=1`). We only need the changelog, so stream just
+        // that member straight to memory instead of unpacking the whole
+        // untrusted archive to disk — smaller attack surface, less I/O.
+        for name in CHANGELOG_FILENAMES {
+            if let Some(txt) = tar_read_member(&scratch, &tgz, &format!("package/{name}"))
+                && !txt.trim().is_empty()
+            {
+                return Some(txt);
+            }
+        }
+        None
+    })();
+    let _ = std::fs::remove_dir_all(&scratch);
+    result
+}
+
+/// Extract the first semver-like token (`x.y.z`, optionally with a
+/// `-prerelease` / `+build` suffix) from a line. Used to read the release
+/// version out of a changelog heading like `## [1.2.3] - 2024-01-01` or
+/// `# [0.71.0](…/compare/v0.70.2...v0.71.0) (2024-…)` — the first token is the
+/// heading's own release, not the compare-range endpoints that follow.
+fn heading_version(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let start = i;
+            let mut dots = 0;
+            // Only dots in the core `major.minor.patch` count toward the
+            // release requirement; dots inside a `-prerelease` / `+build`
+            // suffix (e.g. the `.1` in `2.0-beta.1`) must not, or a `x.y`
+            // core would masquerade as a full release.
+            let mut in_meta = false;
+            while i < bytes.len() {
+                let c = bytes[i];
+                if c == b'.' {
+                    if !in_meta {
+                        dots += 1;
+                    }
+                    i += 1;
+                } else if c == b'-' || c == b'+' {
+                    in_meta = true;
+                    i += 1;
+                } else if c.is_ascii_digit() || c.is_ascii_alphabetic() {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            // Require at least major.minor.patch so a bare year/date (e.g.
+            // `2024`) or `x.y` never masquerades as a release heading.
+            if dots >= 2 {
+                let tok = line[start..i].trim_end_matches(['.', '-']);
+                if !tok.is_empty() {
+                    return Some(tok.to_string());
+                }
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Compare a changelog heading's version against a package version for
+/// equality, tolerating a leading `v` on either side (`v0.71.0` == `0.71.0`).
+fn versions_match(a: &str, b: &str) -> bool {
+    a.trim().trim_start_matches('v') == b.trim().trim_start_matches('v')
+}
+
+/// Narrow a changelog to just the entries newer than `installed` — the delta a
+/// user gains by updating. Changelogs are written newest-first (semantic-release
+/// and Keep-a-Changelog both prepend), so the entries above the installed
+/// version's heading are exactly the new ones.
+///
+/// `None` (caller falls back to the full changelog) when the changelog has no
+/// parseable version headings, the installed version's heading isn't found, or
+/// the installed version is already the newest heading (nothing new to show).
+fn changelog_delta(md: &str, installed: &str) -> Option<String> {
+    // Index each version heading by its line number, in file order.
+    let lines: Vec<&str> = md.lines().collect();
+    let headings: Vec<(usize, String)> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim_start().starts_with('#'))
+        .filter_map(|(i, l)| heading_version(l).map(|v| (i, v)))
+        .collect();
+    if headings.is_empty() {
+        return None;
+    }
+    // Position of the installed version among the headings (newest-first).
+    let pos = headings
+        .iter()
+        .position(|(_, v)| versions_match(v, installed))?;
+    // Already on the newest changelog entry — no delta to surface.
+    if pos == 0 {
+        return None;
+    }
+    // Everything from the top down to (but not including) the installed heading.
+    let end_line = headings[pos].0;
+    let delta = lines[..end_line].join("\n");
+    let trimmed = delta.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Find a program on PATH (plus the usual per-user tool bin dirs). Mirrors
@@ -2407,6 +2800,279 @@ mod tests {
         // this pkg name won't resolve on npm in the hermetic test env).
         let bare = "@nanobpm/nano-ide-trigger-bare-xyz";
         std::fs::create_dir_all(safe_pkg_dir(bare).unwrap()).unwrap();
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    // A representative semantic-release CHANGELOG: newest-first, with compare
+    // URLs in the headings (so the parser must pick the heading's own version,
+    // not a compare-range endpoint).
+    const SAMPLE_CHANGELOG: &str = "\
+# [0.72.0](https://github.com/nanobpm/nano-workforce/compare/v0.71.0...v0.72.0) (2024-06-01)\n\
+\n\
+### Features\n\
+\n\
+* add the shiny new thing\n\
+\n\
+## [0.71.0](https://github.com/nanobpm/nano-workforce/compare/v0.70.2...v0.71.0) (2024-05-01)\n\
+\n\
+### Bug Fixes\n\
+\n\
+* fix the older thing\n\
+\n\
+## [0.70.2](https://github.com/nanobpm/nano-workforce/compare/v0.70.1...v0.70.2) (2024-04-01)\n\
+\n\
+* baseline release\n";
+
+    #[test]
+    fn heading_version_extracts_release_not_compare_range() {
+        // The heading's own version is the FIRST semver token, ahead of the
+        // `compare/vX...vY` endpoints that follow.
+        assert_eq!(
+            heading_version("# [0.72.0](https://x/compare/v0.71.0...v0.72.0) (2024-06-01)")
+                .as_deref(),
+            Some("0.72.0")
+        );
+        assert_eq!(
+            heading_version("## [1.2.3] - 2024-01-01").as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            heading_version("## [2.0.0-beta.1] notes").as_deref(),
+            Some("2.0.0-beta.1")
+        );
+        // A bare date/year must not masquerade as a release (needs x.y.z).
+        assert_eq!(heading_version("## Unreleased 2024"), None);
+        assert_eq!(heading_version("## [1.2] partial"), None);
+        // Prerelease/build dots must NOT satisfy the x.y.z requirement: a
+        // `x.y` core with metadata (e.g. `2.0-beta.1`) is not a full release.
+        assert_eq!(heading_version("## [2.0-beta.1] notes"), None);
+        assert_eq!(heading_version("## 1.2+build.7"), None);
+        // But a genuine x.y.z core with prerelease metadata still parses.
+        assert_eq!(
+            heading_version("## [1.2.0-rc.1] notes").as_deref(),
+            Some("1.2.0-rc.1")
+        );
+    }
+
+    #[test]
+    fn changelog_delta_scopes_to_entries_newer_than_installed() {
+        // Installed 0.70.2, latest 0.72.0 → the delta is 0.72.0 + 0.71.0, and
+        // must NOT include the installed 0.70.2 section or anything older.
+        let delta = changelog_delta(SAMPLE_CHANGELOG, "0.70.2").expect("delta");
+        assert!(delta.contains("0.72.0"));
+        assert!(delta.contains("add the shiny new thing"));
+        assert!(delta.contains("0.71.0"));
+        assert!(delta.contains("fix the older thing"));
+        assert!(!delta.contains("baseline release"));
+
+        // A leading `v` on the installed version is tolerated.
+        assert_eq!(changelog_delta(SAMPLE_CHANGELOG, "v0.70.2"), Some(delta));
+    }
+
+    #[test]
+    fn changelog_delta_falls_back_when_installed_is_newest_or_missing() {
+        // Already on the newest entry → no delta (caller shows the full log).
+        assert_eq!(changelog_delta(SAMPLE_CHANGELOG, "0.72.0"), None);
+        // Installed version not present in the changelog → None (full fallback).
+        assert_eq!(changelog_delta(SAMPLE_CHANGELOG, "0.69.0"), None);
+        // No parseable headings at all → None.
+        assert_eq!(changelog_delta("just prose, no versions", "1.0.0"), None);
+    }
+
+    #[test]
+    fn pack_changelog_reads_installed_and_scopes_delta() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root = std::env::temp_dir().join(format!("nano-ext-changelog-{}", std::process::id()));
+        let pkg = "@nanobpm/nano-workforce";
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        let dir = safe_pkg_dir(pkg).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CHANGELOG.md"), SAMPLE_CHANGELOG).unwrap();
+
+        // The installed pack ships a changelog → the availability probe sees it.
+        assert!(installed_changelog_path(pkg).is_some());
+
+        // Full changelog (no `from`) prefers the installed copy — offline, no
+        // network round-trip.
+        let full = pack_changelog(pkg, None, None).expect("changelog present");
+        assert!(full.installed);
+        assert!(!full.delta);
+        assert!(full.changelog.contains("baseline release"));
+
+        // Regression: an empty/whitespace `from` (e.g. `?from=`) is treated as
+        // absent — it must behave exactly like the full-changelog case above and
+        // NOT force the update-case published-tarball fetch (no delta scoping).
+        for empty in ["", "   "] {
+            let c = pack_changelog(pkg, Some(empty), None).expect("changelog present");
+            assert!(
+                c.installed,
+                "empty `from`={empty:?} must read the installed copy"
+            );
+            assert!(!c.delta, "empty `from`={empty:?} must not scope a delta");
+            assert!(c.changelog.contains("baseline release"));
+        }
+
+        // (The update/delta case — `from` set — prefers the *published* tarball
+        // and is exercised network-free by `select_changelog_source_*` below.)
+
+        let _ = std::fs::remove_dir_all(&root);
+        unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };
+    }
+
+    #[test]
+    fn select_changelog_source_prefers_published_for_delta() {
+        // Regression: an installed pack's CHANGELOG.md only carries headings up
+        // to the *installed* version, so the update/delta case must NOT read it
+        // first — doing so makes `changelog_delta` return `None` and wedges the
+        // "What's changed" affordance to the old, full changelog. When a delta
+        // is wanted we prefer the published tarball, marking the result as not
+        // installed.
+        let src = select_changelog_source(
+            true,
+            || Some("installed (old)".to_string()),
+            || Some("published (latest)".to_string()),
+        );
+        assert_eq!(src, Some(("published (latest)".to_string(), false)));
+
+        // Offline (published fetch fails) falls back to the installed copy so we
+        // still surface *something*.
+        let fallback =
+            select_changelog_source(true, || Some("installed (old)".to_string()), || None);
+        assert_eq!(fallback, Some(("installed (old)".to_string(), true)));
+
+        // Nothing anywhere → nothing to show.
+        assert_eq!(select_changelog_source(true, || None, || None), None);
+    }
+
+    #[test]
+    fn select_changelog_source_prefers_installed_for_full_view() {
+        // No delta wanted (full changelog view): prefer the installed copy —
+        // offline, fast, matches what's running.
+        let src = select_changelog_source(
+            false,
+            || Some("installed".to_string()),
+            || Some("published".to_string()),
+        );
+        assert_eq!(src, Some(("installed".to_string(), true)));
+
+        // Not installed → fall back to the published tarball.
+        let published = select_changelog_source(false, || None, || Some("published".to_string()));
+        assert_eq!(published, Some(("published".to_string(), false)));
+    }
+
+    #[test]
+    fn fetch_published_changelog_rejects_non_registry_specs() {
+        // Regression (security): the changelog fetch builds an `npm pack` spec
+        // from the untrusted `pkg`/`version` query params. `npm pack` accepts
+        // far more than a registry name, so any non-registry specifier — path
+        // traversal, `file:`, a URL, or a version that smuggles a second spec —
+        // must be rejected *before* it can reach `npm pack` (which would run no
+        // network here because validation bails first, returning `None`).
+        for bad in [
+            "../evil",
+            "..",
+            "file:/etc/passwd",
+            "https://example.com/x.tgz",
+            "a b",
+            "@scope/../x",
+            "pkg@1.0.0",         // an embedded specifier must not slip through the name
+            "/etc",              // absolute local path (no `..`) must not pack a local dir
+            "/home/foo/console", // absolute local path with a nested dir
+            "some/local/path",   // relative local path (no `..`, no leading `/`)
+            "@scope/name/extra", // scoped form with an extra `/` (two slashes)
+            "",
+            "   ",
+        ] {
+            assert!(
+                fetch_published_changelog(bad, None).is_none(),
+                "must reject non-registry pkg spec {bad:?}"
+            );
+        }
+
+        // A malicious version token would otherwise smuggle a second spec into
+        // `<pkg>@<v>`; it is validated (and rejected) before any `npm pack` runs.
+        for bad_ver in ["1 ../evil", "latest;rm", "../../x", "file:/x", "1.0/../y"] {
+            assert!(
+                fetch_published_changelog("@nanobpm/nano-ide-lang-rust", Some(bad_ver)).is_none(),
+                "must reject non-registry version {bad_ver:?}"
+            );
+        }
+
+        // The name validator and the version validator agree with the install
+        // path's `safe_pkg_dir` gate (single source of truth for the alphabet).
+        assert!(!is_valid_pkg_name("../evil"));
+        assert!(!is_valid_pkg_name("/etc")); // absolute local path, no `..`
+        assert!(!is_valid_pkg_name("some/local/path")); // relative local path
+        assert!(!is_valid_pkg_name("@scope/name/extra")); // extra `/`
+        // Dot-/underscore-prefixed segments must be rejected: `.` alone would
+        // otherwise make `safe_pkg_dir` resolve to the extensions root itself,
+        // and `.hidden` / `_hidden` map to dotfiles under it.
+        assert!(!is_valid_pkg_name(".")); // maps to extensions root via safe_pkg_dir
+        assert!(safe_pkg_dir(".").is_none());
+        assert!(!is_valid_pkg_name(".hidden")); // leading-dot segment
+        assert!(!is_valid_pkg_name("_hidden")); // leading-underscore segment
+        assert!(!is_valid_pkg_name("@.scope/name")); // leading-dot scope
+        assert!(!is_valid_pkg_name("@scope/.name")); // leading-dot name
+        assert!(is_valid_pkg_name("@nanobpm/nano-ide-lang-rust"));
+        assert!(is_valid_pkg_name("nano-ide-ext-foo")); // plain unscoped name
+        assert!(is_valid_pkg_version("1.2.3-beta.1+build"));
+        assert!(!is_valid_pkg_version("1 2"));
+    }
+
+    #[test]
+    fn tar_read_member_caps_oversized_members() {
+        // Regression (resource exhaustion): `tar_read_member` reads members out
+        // of untrusted registry tarballs, so it must not buffer an arbitrarily
+        // large member into memory. A member at/under the cap reads fine; one
+        // past the cap is rejected (`None`) instead of ballooning memory.
+        if find_program("tar").is_none() {
+            return; // no tar on this host — the fn degrades to None anyway
+        }
+        let dir = secure_temp_dir("nano-tar-member-test").unwrap();
+        let pkg = dir.join("package");
+        std::fs::create_dir(&pkg).unwrap();
+        std::fs::write(pkg.join("CHANGELOG.md"), b"# Changelog\n\nsmall\n").unwrap();
+        // One byte over the cap must be rejected.
+        let big = vec![b'a'; (MAX_TAR_MEMBER_BYTES + 1) as usize];
+        std::fs::write(pkg.join("BIG.md"), &big).unwrap();
+
+        let tar = find_program("tar").unwrap();
+        let ok = std::process::Command::new(&tar)
+            .args(["czf", "t.tgz", "package"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "failed to build test tarball");
+
+        let small = tar_read_member(&dir, "t.tgz", "package/CHANGELOG.md");
+        assert_eq!(small.as_deref(), Some("# Changelog\n\nsmall\n"));
+        assert!(
+            tar_read_member(&dir, "t.tgz", "package/BIG.md").is_none(),
+            "a member past MAX_TAR_MEMBER_BYTES must be rejected, not buffered"
+        );
+        assert!(
+            tar_read_member(&dir, "t.tgz", "package/ABSENT.md").is_none(),
+            "an absent member must return None"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn changelog_available_false_without_bundled_changelog() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("nano-ext-nochangelog-{}", std::process::id()));
+        let pkg = "@nanobpm/nano-ide-trigger-mqtt";
+        unsafe { std::env::set_var("NANOBPMN_EXTENSIONS_DIR", &root) };
+        std::fs::create_dir_all(safe_pkg_dir(pkg).unwrap()).unwrap();
+
+        // Installed pack with no CHANGELOG.md → no availability, no installed
+        // changelog path.
+        assert!(installed_changelog_path(pkg).is_none());
 
         let _ = std::fs::remove_dir_all(&root);
         unsafe { std::env::remove_var("NANOBPMN_EXTENSIONS_DIR") };

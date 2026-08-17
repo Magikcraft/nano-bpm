@@ -239,6 +239,36 @@ impl apis::extensions::Extensions for ServerImpl {
         }
     }
 
+    async fn get_extension_changelog(
+        &self,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        query_params: &models::GetExtensionChangelogQueryParams,
+    ) -> Result<apis::extensions::GetExtensionChangelogResponse, ()> {
+        match super::extensions_changelog(
+            query_params.pkg.clone(),
+            query_params.from.clone(),
+            query_params.to.clone(),
+        )
+        .await
+        {
+            Ok(v) => Ok(
+                apis::extensions::GetExtensionChangelogResponse::Status200_PackChangelog(from_val(
+                    v,
+                )),
+            ),
+            Err((status, msg)) => {
+                use apis::extensions::GetExtensionChangelogResponse as Resp;
+                if status == http::StatusCode::INTERNAL_SERVER_ERROR {
+                    Ok(Resp::Status500_InternalError(msg))
+                } else {
+                    Ok(Resp::Status404_NotFound(msg))
+                }
+            }
+        }
+    }
+
     async fn install_extension(
         &self,
         _method: &Method,
