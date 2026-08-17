@@ -116,7 +116,7 @@ export default function Extensions() {
   const [changelogErr, setChangelogErr] = useState<string | null>(null);
   const [changelogDelta, setChangelogDelta] = useState(false);
   // Monotonic token identifying the currently-open drawer request. Each
-  // `openReadme` bumps it; awaited README/changelog responses capture the token
+  // `openPackDrawer` bumps it; awaited README/changelog responses capture the token
   // at call time and drop their state writes if the drawer has since moved to a
   // different pack — otherwise a slow response for pack A could overwrite the
   // newer pack B's content.
@@ -214,9 +214,11 @@ export default function Extensions() {
     );
   }, [market, q]);
 
-  // Open the pack-detail drawer and lazily fetch its README markdown (from the
-  // installed copy, else npm). Re-fetches each open so an update's new docs show.
-  const openReadme = async (
+  // Open the pack-detail drawer on the given tab (default README) and lazily
+  // fetch its README markdown (from the installed copy, else npm); when opened
+  // on the changelog tab it also triggers the "What's changed" fetch.
+  // Re-fetches each open so an update's new docs show.
+  const openPackDrawer = async (
     m: MarketEntry,
     tab: "readme" | "changelog" = "readme",
   ) => {
@@ -248,7 +250,7 @@ export default function Extensions() {
   // installed pack with an update available we pass the installed version so the
   // server scopes the view to the delta (installed → latest), else the full
   // changelog. Guarded so a manual tab click only fetches once per drawer open;
-  // callers that have just reset the changelog state (e.g. `openReadme`) pass
+  // callers that have just reset the changelog state (e.g. `openPackDrawer`) pass
   // `force` to bypass the guard, since the state resets are async and the stale
   // closure values would otherwise skip the fetch and wedge on "Loading…".
   const fetchChangelog = async (
@@ -293,7 +295,7 @@ export default function Extensions() {
         <div className="flex flex-wrap items-baseline gap-x-2">
           <button
             type="button"
-            onClick={() => void openReadme(m)}
+            onClick={() => void openPackDrawer(m)}
             className="break-all text-left font-medium text-fg hover:text-accent hover:underline"
             title="View README"
           >
@@ -321,7 +323,7 @@ export default function Extensions() {
               shows "No changelog available" on a 404, so showing it is safe. */}
           <button
             type="button"
-            onClick={() => void openReadme(m, "changelog")}
+            onClick={() => void openPackDrawer(m, "changelog")}
             className="text-xs text-accent hover:underline"
             title="See what changed between your version and the latest"
           >
