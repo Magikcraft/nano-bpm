@@ -840,8 +840,8 @@ function siteNav() {
     ${whitepaperPresent ? '<a href="/whitepaper/">Whitepaper</a>' : ""}
     ${docsPresent ? '<a href="/docs/">Docs</a>' : ""}
     <a href="/schemas/">Schemas</a>
-    <a class="ext" href="https://github.com/nanobpm" rel="noopener" aria-label="Nano BPM on GitHub">${ICON_GITHUB}<span>GitHub</span></a>
-    <a class="ext" href="https://discord.gg/W5dBe2D8y" rel="noopener" aria-label="Nano BPM on Discord">${ICON_DISCORD}<span>Discord</span></a>
+    <a class="ext" href="https://github.com/nanobpm" rel="noopener noreferrer" target="_blank" aria-label="Nano BPM on GitHub">${ICON_GITHUB}<span>GitHub</span></a>
+    <a class="ext" href="https://discord.gg/W5dBe2D8y" rel="noopener noreferrer" target="_blank" aria-label="Nano BPM on Discord">${ICON_DISCORD}<span>Discord</span></a>
   </nav>
 </header>`;
 }
