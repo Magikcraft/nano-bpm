@@ -7,6 +7,11 @@
 // v1 is a titled, ordered, flat list of typed nodes (no nesting — see ADR 0042
 // Increment 2). Every rule here is pure and unit-testable.
 
+import {
+  PAGE_NODE_TYPES as SHARED_PAGE_NODE_TYPES,
+  type PageNodeType,
+} from "@nanobpm/nano-app-schema";
+
 export const PAGE_SCHEMA_VERSION = "1.0" as const;
 
 /** A field on an `actionForm` (a labelled input contributing one start variable). */
@@ -263,7 +268,25 @@ export interface DataGridNode {
 
 export type PageNode =
   TextNode | NavNode | ActionFormNode | DataGridNode | ProseNode | ButtonNode;
-export type PageNodeType = PageNode["type"];
+
+// `PageNodeType` is the shared registry's union (single source of truth, #843),
+// re-exported so the rest of the console keeps importing it from here. The two
+// assertions below prove the composer's `PageNode` discriminated union stays in
+// exact lockstep with that registry: if a type is added to one but not the other,
+// one assignment fails to compile. This is what makes the local surfaces
+// (validator, palette, Craft resolver) unable to silently drift from the runtime.
+export type { PageNodeType };
+type AssertRegistryCoversUnion = PageNode["type"] extends PageNodeType
+  ? true
+  : never;
+type AssertUnionCoversRegistry = PageNodeType extends PageNode["type"]
+  ? true
+  : never;
+const _pageNodeTypeParity: [
+  AssertRegistryCoversUnion,
+  AssertUnionCoversRegistry,
+] = [true, true];
+void _pageNodeTypeParity;
 
 /** A data-bound prose/markdown list (#274). Binds a datasource like `dataGrid`,
  * but renders each row as a stacked prose block — a header template over one body
@@ -314,14 +337,7 @@ export interface ButtonNode {
   };
 }
 
-export const PAGE_NODE_TYPES: PageNodeType[] = [
-  "text",
-  "nav",
-  "actionForm",
-  "dataGrid",
-  "prose",
-  "button",
-];
+export const PAGE_NODE_TYPES: readonly PageNodeType[] = SHARED_PAGE_NODE_TYPES;
 
 export interface PageDoc {
   schemaVersion: typeof PAGE_SCHEMA_VERSION;

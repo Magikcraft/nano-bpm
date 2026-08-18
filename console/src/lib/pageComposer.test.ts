@@ -9,6 +9,7 @@ import {
   PAGE_SCHEMA_VERSION,
   type PageDoc,
 } from "./pageSchema.ts";
+import { PAGE_NODE_TYPES as REGISTRY_PAGE_NODE_TYPES } from "@nanobpm/nano-app-schema";
 import {
   fromPageDoc,
   loadPageJson,
@@ -708,12 +709,17 @@ test("makeNode produces a validatable node for every declared type", () => {
   }
 });
 
-// Drift guard (issue #843 P0): the composer's editable node-type set MUST equal
-// the runtime renderer's set. The runtime source of truth is `RENDERERS` in
-// nano-ide `packages/urban/src/runtime/core/modules/pages.ts`. If a type is added
-// to one surface and not the other, this fails loudly — until P1/P2 make both
-// derive from a single shared registry (`@nanobpm/nano-app-schema`).
-test("composer node types match the runtime renderer set (no drift)", () => {
+// Drift guard (issue #843): the composer's editable node-type set is now DERIVED
+// from the shared registry `PAGE_NODE_TYPES` in `@nanobpm/nano-app-schema` (P1) —
+// the console can no longer restate it, and a type present in the registry but
+// unhandled by the composer's `PageNode` union / `CRAFT_NAME` / `defaultProps`
+// fails to *compile* (see the parity assertion in pageSchema.ts). What remains is
+// the cross-repo edge: the App-side runtime renderer (`RENDERERS` in nano-ide
+// `packages/urban/src/runtime/core/modules/pages.ts`) lives in another repo and
+// consumes the *published* registry. P2 adds the authoritative in-repo runtime
+// guard there (asserting `Object.keys(RENDERERS)` equals the shared set). This
+// test keeps a cross-repo mirror of that set as an early-warning until P2 lands.
+test("shared registry matches the runtime renderer set (no drift)", () => {
   const RUNTIME_RENDERER_TYPES = [
     "actionForm",
     "button",
@@ -726,6 +732,13 @@ test("composer node types match the runtime renderer set (no drift)", () => {
     [...PAGE_NODE_TYPES].sort(),
     [...RUNTIME_RENDERER_TYPES].sort(),
   );
+});
+
+// The composer's `PAGE_NODE_TYPES` must be the shared registry itself (a
+// derivation), not a hand-maintained copy that could drift from it (#843 P1).
+test("composer PAGE_NODE_TYPES is derived from the shared registry", () => {
+  assert.deepEqual([...PAGE_NODE_TYPES], [...REGISTRY_PAGE_NODE_TYPES]);
+  assert.equal(PAGE_NODE_TYPES, REGISTRY_PAGE_NODE_TYPES);
 });
 
 // Regressions for the parse-canonicalization edge cases (issue #843 review):
