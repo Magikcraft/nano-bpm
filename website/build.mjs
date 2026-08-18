@@ -144,6 +144,10 @@ const published = [];
 // published schema/namespace URLs are unaffected (they own their own paths).
 write(join(outDir, "index.html"), homeHtml());
 write(join(outDir, "architecture", "index.html"), architectureHtml());
+write(join(outDir, "blog", "index.html"), blogIndexHtml());
+for (const post of blogPosts()) {
+  write(join(outDir, "blog", post.slug, "index.html"), blogPostHtml(post));
+}
 write(join(outDir, "schemas", "index.html"), schemasHtml(published));
 
 // The console /stack page (served by the gateway binary, NOT part of this site)
@@ -836,6 +840,7 @@ function siteNav() {
   <nav>
     <a href="/architecture/">Architecture</a>
     <a href="/architecture/#landscape">Compare</a>
+    <a href="/blog/">Blog</a>
     <a href="/demo/">Demo</a>
     ${whitepaperPresent ? '<a href="/whitepaper/">Whitepaper</a>' : ""}
     ${docsPresent ? '<a href="/docs/">Docs</a>' : ""}
@@ -1023,6 +1028,51 @@ ${layers}
   harness without rewriting the workflow; the plan / review / merge graph stays the same.</p>
 </section>
 
+<section class="arch-section wrap" id="effect">
+  <h2>Effect for the process; Nano for the workflow</h2>
+  <p class="lede">People ask how Nano relates to <a href="https://effect.website" rel="noopener noreferrer" target="_blank">Effect</a>,
+  TypeScript&rsquo;s structured-concurrency and typed-error runtime. They live on
+  different axes &mdash; and they compose.</p>
+  <p class="lede" style="margin-top:1rem">Effect is the best way to make one
+  <em>process</em> robust: fibers, typed errors, and resource safety <em>inside</em>
+  a running program. Nano makes the <em>workflow</em> robust: the same plan &rarr;
+  review &rarr; merge graph survives the process dying, the machine rebooting, and
+  a redeploy in the middle &mdash; then resumes at the exact step it left off.
+  In-memory structured concurrency ends when the memory does; a durable graph
+  doesn&rsquo;t.</p>
+  <div class="table-wrap">
+    <table class="landscape">
+      <thead><tr>
+        <th>Concern</th>
+        <th>Effect <small>in-process</small></th>
+        <th class="nano">Nano <small>durable</small></th>
+      </tr></thead>
+      <tbody>
+        <tr><th class="feature">Unit of execution</th><td>Fiber (in one process)</td><td class="nano">Journalled graph step</td></tr>
+        <tr><th class="feature">Survives crash / reboot / redeploy</th><td class="no">No &mdash; state is in memory</td><td class="nano"><span class="yes">Yes</span> &mdash; resumes at the last committed step</td></tr>
+        <tr><th class="feature">Retries &amp; timeouts</th><td>Per run, in memory</td><td class="nano">Durable, at-least-once with idempotent recovery</td></tr>
+        <tr><th class="feature">Concurrency model</th><td class="yes">Fibers, first-class</td><td class="nano">Parallel &amp; multi-instance branches; correlation</td></tr>
+        <tr><th class="feature">Error model</th><td class="yes">Typed error channel</td><td class="nano">Incidents &amp; boundary events on the graph</td></tr>
+        <tr><th class="feature">Time horizon</th><td>Milliseconds &ndash; minutes</td><td class="nano">Seconds &ndash; weeks (timers, human tasks)</td></tr>
+        <tr><th class="feature">Where it runs</th><td>Any TS/JS runtime</td><td class="nano">Rust engine, Camunda&nbsp;8 API compatible</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="lede" style="margin-top:1.4rem">So it isn&rsquo;t &ldquo;Nano <em>or</em>
+  Effect?&rdquo; If you love the Effect model, keep it <em>inside</em> your workers
+  &mdash; and let Nano carry the run across everything that outlives the process.
+  We love that model enough that Urban&rsquo;s own glue code uses a tiny,
+  zero-dependency distillation of it:</p>
+  <blockquote class="crib">
+    &ldquo;effectlite &mdash; a tiny, zero-dependency, Effect-<em>like</em> core for
+    Urban glue code &hellip; the three Effect ergonomics we actually reach for:
+    typed-error <code>Result</code> with generator do-notation, tagged errors with
+    exhaustive matching, and <code>scoped</code> resource release &mdash; in ~100
+    lines with no runtime dependencies.&rdquo;
+    <span class="src">&mdash; <code>@nanobpm/urban</code>, <code>src/effect</code></span>
+  </blockquote>
+</section>
+
 <section class="arch-foot wrap">
   <p class="muted">Nano is the load-bearing runtime; every layer above is optional and composes on top of it.</p>
   <div class="cta">
@@ -1068,6 +1118,337 @@ function highlightTs(src) {
 
 function tok(cls, text) {
   return `<span class="tok-${cls}">${esc(text)}</span>`;
+}
+
+// --- Blog ---------------------------------------------------------------------
+// Single source of truth for the blog: the index cards and each post page are
+// both derived from BLOG_POSTS(), so they can never disagree. A post's `body` is
+// a function returning the article HTML (rendered inside the branded homePage
+// shell, so it inherits siteNav, the token colours, and figure.code styling —
+// no per-post CSS duplication). Newest first.
+function blogPosts() {
+  return [
+    {
+      slug: "the-bottleneck-moved-from-code-to-coordination",
+      title: "The bottleneck moved from code to coordination",
+      subtitle:
+        "When agents can write the code, most of a ten-agent workforce is spent waiting — and waiting is a process-engineering problem",
+      date: "2026-08-19",
+      dek:
+        "Reliable agents, codebases architected for safety, and real CI made writing code " +
+        "cheap. The friction didn’t vanish — it moved to coordination: dependency graphs, " +
+        "review cycles, wait states. That’s process engineering.",
+      body: coordinationPostBody,
+    },
+    {
+      slug: "effect-for-the-process-nano-for-the-workflow",
+      title: "We love Effect so much we shipped 100 lines of it",
+      subtitle:
+        "Why Urban distills Effect instead of depending on it — and where Nano picks up where Effect leaves off",
+      date: "2026-08-19",
+      dek:
+        "Effect v4 is a great way to make a process robust. Nano makes the workflow " +
+        "robust. Here’s why Urban ships a ~100-line distillation of Effect instead of " +
+        "the dependency — and how the two compose.",
+      body: effectlitePostBody,
+    },
+  ];
+}
+
+function fmtDate(iso) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  return d.toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric", timeZone: "UTC" });
+}
+
+// Shared article typography, scoped to `.post` / the blog index. A function (not a
+// module-level const) so it is hoisted past the temporal dead zone: the emit at the
+// top of the file calls blogIndexHtml() before a const would initialize.
+function blogStyle() {
+  return `<style>
+  .post, .blog-index { max-width: 44rem; margin-inline: auto; padding: 2.6rem 1.4rem 1rem; }
+  .post-head { margin-bottom: 2.2rem; }
+  .post-head .eyebrow, .blog-index .eyebrow { text-transform: uppercase; letter-spacing: .16em; font-size: .74rem; font-weight: 700; color: var(--sky); margin: 0 0 .8rem; }
+  .post-head h1 { font-size: clamp(1.9rem, 4.6vw, 2.7rem); margin: 0 0 .7rem; font-weight: 700; }
+  .post-head .sub { font-size: clamp(1.05rem, 2.2vw, 1.2rem); color: var(--muted); margin: 0 0 .8rem; }
+  .post-head .meta { font-size: .86rem; color: var(--muted); opacity: .8; }
+  .post p { color: var(--ink); font-size: 1.06rem; margin: 1.1rem 0; }
+  .post h2 { font-size: 1.5rem; margin: 2.4rem 0 .6rem; }
+  .post ol, .post ul { color: var(--ink); font-size: 1.06rem; padding-left: 1.3rem; }
+  .post li { margin: .5rem 0; }
+  .post li strong { color: var(--ink); }
+  .post a { color: var(--accent); }
+  .post code { background: rgba(255,255,255,.06); border: 1px solid var(--line); padding: .08em .34em; border-radius: 5px; font-size: .92em; }
+  .post figure.code { margin: 1.8rem 0; max-width: 100%; }
+  .post blockquote { margin: 1.6rem 0; padding: .3rem 0 .3rem 1.2rem; border-left: 3px solid rgba(52,211,153,.5); color: var(--ink); font-style: italic; }
+  .post .kicker { color: var(--emerald); font-weight: 700; font-style: normal; }
+  .post hr { border: none; border-top: 1px solid var(--line); margin: 2.6rem 0 1.6rem; }
+  .post .tail { font-size: .96rem; color: var(--muted); }
+  .blog-index h1 { font-size: clamp(2rem, 5vw, 3rem); margin: .2rem 0 .4rem; font-weight: 700; }
+  .blog-index > .lede { color: var(--muted); font-size: 1.1rem; margin: 0 0 2rem; }
+  .post-card { display: block; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); backdrop-filter: blur(6px); padding: 1.3rem 1.5rem; margin: 0 0 1.1rem; transition: transform .12s ease, box-shadow .12s; }
+  .post-card:hover { text-decoration: none; transform: translateY(-2px); box-shadow: 0 18px 50px -30px rgba(56,189,248,.5); }
+  .post-card .date { font-size: .8rem; color: var(--sky); text-transform: uppercase; letter-spacing: .1em; font-weight: 700; }
+  .post-card h2 { font-size: 1.3rem; margin: .4rem 0 .4rem; color: var(--ink); }
+  .post-card p { color: var(--muted); margin: 0; font-size: .98rem; }
+</style>`;
+}
+
+function blogIndexHtml() {
+  const cards = blogPosts()
+    .map(
+      (p) => `  <a class="post-card" href="/blog/${esc(p.slug)}/">
+    <span class="date">${esc(fmtDate(p.date))}</span>
+    <h2>${esc(p.title)}</h2>
+    <p>${esc(p.dek)}</p>
+  </a>`,
+    )
+    .join("\n");
+  const body = `${siteNav()}
+${blogStyle()}
+<section class="blog-index">
+  <p class="eyebrow">Blog</p>
+  <h1>From the <span class="grad">Nano</span> team</h1>
+  <p class="lede">Notes on durable agent orchestration, the engine, and the framework.</p>
+${cards}
+</section>
+
+<footer class="site-foot wrap">
+  <p><a href="/">Home</a> · <a href="/architecture/">Architecture</a> · <a href="/demo/">Browser demo</a> · <a href="/schemas/">Published schemas</a></p>
+  <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
+</footer>`;
+  return homePage("nanobpm.io — Blog", body);
+}
+
+function blogPostHtml(post) {
+  const body = `${siteNav()}
+${blogStyle()}
+<article class="post">
+  <header class="post-head">
+    <p class="eyebrow"><a href="/blog/" style="color:inherit">Blog</a></p>
+    <h1>${esc(post.title)}</h1>
+    <p class="sub">${esc(post.subtitle)}</p>
+    <p class="meta">${esc(fmtDate(post.date))} · the Nano team</p>
+  </header>
+${post.body()}
+</article>
+
+<footer class="site-foot wrap">
+  <p><a href="/blog/">← All posts</a> · <a href="/architecture/#effect">Architecture: Effect &amp; Nano</a> · <a href="/demo/">Browser demo</a></p>
+  <p class="muted">Nano is an Advanced Research Prototype. Free for personal or evaluation use.</p>
+</footer>`;
+  return homePage(`${post.title} — nanobpm.io`, body);
+}
+
+// The article body for the "code to coordination" post.
+function coordinationPostBody() {
+  return `  <p>For two years the whole industry optimized one number: how good is the model at
+  writing code. It worked. Cross a threshold — reliable enough agents, a codebase
+  <em>architected</em> so that mistakes are contained rather than catastrophic, and CI plus
+  integration tests that actually catch regressions — and something quietly flips.
+  <strong>Writing the code stops being the hard part.</strong></p>
+
+  <p>That’s not a prediction; plenty of teams are already there on well-shaped repos. And the
+  interesting thing about clearing a bottleneck is that it doesn’t end the story — it just
+  <em>reveals the next one</em>. When any single change is cheap to produce and safe to land, the
+  friction doesn’t disappear. It moves. It moves to <strong>coordination</strong>.</p>
+
+  <h2>What made the code cheap</h2>
+  <p>Three things have to be true at once, and each is doing real work:</p>
+  <ol>
+    <li><strong>Agents are reliable enough.</strong> A competent agent, given a well-scoped task,
+    lands a correct change most of the time — and knows when it’s stuck.</li>
+    <li><strong>The codebase is architected for safety.</strong> Clear seams, narrow interfaces,
+    idempotent operations, blast-radius limits. A wrong edit fails loudly and locally instead of
+    corrupting something three modules away.</li>
+    <li><strong>CI and integration testing are a real safety net.</strong> Regressions get caught
+    before they merge, so you can let many hands move quickly without holding your breath.</li>
+  </ol>
+  <p>Get those three and you can point <em>ten</em> agents at a backlog. Which is exactly when the
+  new problem shows up.</p>
+
+  <h2>So where did the friction go? Watch the agents wait.</h2>
+  <p>Put ten-plus agents on one product and watch what they actually spend time on. A surprising
+  amount of it is <strong>nothing</strong>. Waiting:</p>
+  <ul>
+    <li>Agent B needs the interface Agent A is still writing — so B waits on A’s merge.</li>
+    <li>A pull request sits through a <strong>review cycle</strong>: request review, get comments,
+    fix, re-request, converge. Round-trips, not keystrokes.</li>
+    <li>A fan-out of twelve slices has to <strong>fan back in</strong> — the integration step can’t
+    start until the slowest slice lands.</li>
+    <li>Two agents reach for the same file and one has to back off, rebase, and retry.</li>
+    <li>A change needs a human decision — a product tradeoff, an approval — and everything
+    downstream <strong>blocks on a person</strong> who isn’t looking yet.</li>
+  </ul>
+  <p>None of that is a coding problem. You cannot fix it with a smarter model. It is the shape of
+  the <em>dependency graph</em> and the <em>latency of the hand-offs</em> between agents.</p>
+
+  <blockquote>With ten agents, the constraint isn’t how fast any one of them writes code. It’s how
+  much of the time the other nine are blocked on it.</blockquote>
+
+  <h2>Waiting is a first-class thing, not an accident</h2>
+  <p>The instinct is to treat waiting as a bug — spin faster, poll harder, add a retry. But most of
+  these waits are <em>legitimate</em>: the review genuinely has to happen; the dependency genuinely
+  has to land first; the human genuinely has to decide. The problem isn’t that the wait exists. It’s
+  that nothing in the system is designed to <strong>represent</strong> a wait, reason about it, and
+  wake up cleanly when it resolves.</p>
+  <p>So teams reinvent it, badly: a script that sleeps and re-checks; a spreadsheet of “who’s blocked
+  on whom”; an agent burning tokens re-reading a PR every minute to see if review came back; state
+  that lives only in one process, so a restart loses the whole plan. That’s a scheduler and a
+  dependency resolver, hand-rolled and leaky, once per team.</p>
+
+  <h2>This is a process-engineering problem</h2>
+  <p>Step back and the shape is familiar. You have units of work with dependencies between them. Some
+  run in parallel, some must serialize. Some pause on an external signal — a review verdict, a merge,
+  a human approval — and resume when it arrives. Some fan out into N instances and join when all N
+  finish. You want the whole thing to survive a process dying or a machine rebooting, and pick up
+  exactly where it left off.</p>
+  <p>That is not a novel AI problem. It is the <strong>oldest problem in workflow orchestration</strong>,
+  and the field has a mature vocabulary for it: tasks and dependencies, parallel and multi-instance
+  branches, message correlation, timers, and — crucially — <strong>wait states</strong> as a
+  first-class primitive. A durable process engine doesn’t poll for a review to come back; it parks the
+  branch on a wait state and is woken by the event. It doesn’t lose the plan on restart; the plan is a
+  journalled graph, not a variable in memory.</p>
+  <p>This is the bet behind <a href="/">Nano</a>. <strong>Nano Workforce</strong> models the software
+  lifecycle — plan, implement, review, test, merge, QA, retro — as a durable graph, and the agents are
+  workers it schedules against that graph. Dependencies are edges. Review cycles are wait states with
+  timeouts and escalation. Fan-out/fan-in is a multi-instance activity with a join. A human decision is
+  a user task the graph blocks on without burning a single token while it waits. The engine is Rust,
+  Camunda&nbsp;8 API compatible, and small enough to run on a workstation — because coordinating ten
+  agents shouldn’t require a cluster.</p>
+  <p>The point isn’t “use a workflow engine because workflow engines exist.” It’s that the problem you
+  hit at ten agents <em>is</em> a workflow problem, and rebuilding a durable scheduler by hand — one
+  team at a time, one sleep-loop at a time — is the actual tax.</p>
+
+  <h2>The takeaway</h2>
+  <p>The next 10x in agent-assisted development probably isn’t a model that writes better functions.
+  On a codebase that’s already safe to change, the functions are cheap. The next 10x is in the
+  <em>gaps between the agents</em>: scheduling the work, representing the waits, resolving the
+  dependencies, and never losing the plan when a process dies.</p>
+  <p><span class="kicker">When the code writes itself, coordination is the job.</span></p>
+
+  <hr>
+  <p class="tail">See how the layers fit together on the
+  <a href="/architecture/">Nano architecture page</a>, or try the durable engine in your browser at
+  <a href="/demo/">nanobpm.io/demo</a>.</p>`;
+}
+
+// The article body for the effectlite post. Real code is highlighted with the
+// same zero-dep highlighter the home hero uses.
+function effectlitePostBody() {
+  const snippet = `import { gen, ok, fail, tag, matchTags } from "@nanobpm/urban/effect";
+
+const result = gen(function* () {
+  const repo = yield* cloneRepo(url);   // yields Fail<CloneError> on failure
+  const built = yield* build(repo);     // yields Fail<BuildError> on failure
+  return built;                         // Result<Artifact, CloneError | BuildError>
+});
+
+// The compiler forces a handler for EVERY failure mode — omit one and it won't compile.
+matchTags(result.error, {
+  CloneError: (e) => retryLater(e),
+  BuildError: (e) => report(e),
+});`;
+  return `  <p><a href="https://effect.website" rel="noopener noreferrer" target="_blank">Effect</a>
+  is having a moment, and deservedly so. v4 lands the clearest version yet of an idea
+  TypeScript has needed for years: make effects — errors, async, resources, concurrency —
+  <em>first-class values</em> the compiler can reason about, instead of exceptions you hope
+  someone remembers to catch.</p>
+
+  <p>We build <a href="/">Nano</a> and its application framework, <strong>Urban</strong>, in
+  TypeScript. So people ask the obvious question: <em>are you using Effect?</em></p>
+
+  <p>The honest answer is more interesting than yes or no. <strong>We looked hard at Effect,
+  loved the model, and shipped ~100 lines of it into Urban instead of taking the
+  dependency.</strong> Here’s the reasoning — and why, for our layer of the stack, that was
+  the right call rather than a compromise.</p>
+
+  <h2>What we actually reach for</h2>
+  <p>Strip Effect down to what a framework’s <em>glue code</em> — workers, provisioning,
+  resource lifecycles — reaches for every day, and it’s a short list:</p>
+  <ol>
+    <li><strong>A typed error channel.</strong> A function that can fail should say so in its
+    type, and the failure should compose automatically through a sequence of steps,
+    short-circuiting on the first error. <code>Effect.gen</code> + <code>yield*</code> is the
+    canonical ergonomic here.</li>
+    <li><strong>Tagged errors with exhaustive handling.</strong> Model each failure mode as a
+    discriminated variant, then let the compiler <em>force</em> you to handle every one — no
+    silently dropped case. That’s <code>Data.TaggedError</code> + <code>catchTags</code>.</li>
+    <li><strong>Scoped resources.</strong> Acquire something, guarantee its release on
+    <em>every</em> exit path — success, failure, or a thrown exception. That’s
+    <code>Effect.scoped</code> + <code>acquireRelease</code>.</li>
+  </ol>
+
+  <p>Those three carry the vast majority of the day-to-day value. So we built exactly those
+  three, and nothing else, as <strong>effectlite</strong>: a zero-dependency, Effect-<em>like</em>
+  core that lives in <code>@nanobpm/urban</code>’s <code>src/effect</code>.
+  <code>Result&lt;A, E&gt;</code> with generator do-notation whose <code>E</code> composes through
+  <code>yield*</code> just like the real thing; <code>tag()</code> + exhaustive
+  <code>matchTags</code>; and <code>scoped</code> + <code>acquireRelease</code>. About a hundred
+  lines of implementation, no runtime deps.</p>
+
+  <figure class="code">
+    <figcaption>Typed errors that compose through <code>yield*</code> — and an exhaustive match the compiler enforces.</figcaption>
+    <pre><code>${highlightTs(snippet)}</code></pre>
+  </figure>
+
+  <p>If you know Effect, that reads like home. That’s the point.</p>
+
+  <h2>Why not just depend on <code>effect</code>?</h2>
+  <p>Two reasons, and neither is a knock on Effect — they’re about <em>our</em> layer.</p>
+  <p><strong>1. Bundle weight against a polyglot, embed-everywhere surface.</strong> Urban’s
+  published value isn’t a TS runtime — it’s a portable app model plus a client renderer that
+  ships to <em>many</em> runtimes: Node, and embedded hosts on the JVM, GraalVM, and Deno,
+  feeding language kits for Java, Rust, Python, C# and more. The imperative glue that benefits
+  from Effect’s ergonomics is a <em>thin seam</em> around a declarative core. Pulling a full
+  effect runtime into that seam is weight in exactly the place we work hardest to keep light.</p>
+  <p><strong>2. The viral paradigm.</strong> Effect’s greatest strength —
+  <code>Effect&lt;A, E, R&gt;</code> colouring every signature so the compiler tracks errors and
+  requirements end-to-end — is also a whole-codebase commitment. It pays off spectacularly when
+  your <em>entire</em> application is written in it. It pays off far less when you want three
+  ergonomics in the 5% of your surface that’s imperative, while keeping the other 95% plain,
+  portable, and dependency-free. Adopting the paradigm halfway is the worst of both worlds;
+  distilling the three pieces we use is the best of both.</p>
+  <p>This isn’t “Effect is too heavy.” It’s “Effect is a runtime for making an <em>entire
+  application</em> robust, and our application’s robustness lives one layer down — in the engine,
+  not the language.”</p>
+
+  <h2>The real story: durable &gt; in-process</h2>
+  <p>Here’s the part worth internalizing, because it’s where Nano and Effect genuinely
+  <em>complement</em> each other rather than compete.</p>
+  <p>Effect makes a <strong>process</strong> robust. Fibers, typed errors, resource safety — all
+  of it operates <em>inside a running program</em>. It is the best-in-class answer to “how do I
+  make this program correct and resilient while it runs.”</p>
+  <p>Nano makes the <strong>workflow</strong> robust. Nano Workforce orchestrates the whole
+  software lifecycle — plan, implement, review, test, merge — as a durable graph on a Rust engine
+  that’s Camunda&nbsp;8 API compatible. When the process crashes, the machine reboots, or you
+  redeploy mid-run, the graph <em>resumes at the exact step it left off</em>; journal-committed
+  steps are never replayed.</p>
+  <p>That’s a different axis. In-memory structured concurrency — however elegant — ends when the
+  memory does. A fiber does not survive <code>kill -9</code>. A durable graph does. For work that
+  spans minutes to weeks, waits on humans, and must outlive every process that touches it,
+  durability isn’t a nicer error channel — it’s the whole game.</p>
+  <p>So the two compose cleanly:</p>
+  <ul>
+    <li><strong>Effect, inside your workers</strong> — make each activity correct and resilient
+    while it runs.</li>
+    <li><strong>Nano, around the workers</strong> — carry the <em>run</em> across everything that
+    outlives the process.</li>
+  </ul>
+  <p>You lose nothing by loving both. If you want the Effect model in the code Nano drives, use it
+  — and let Nano own the part Effect was never trying to own.</p>
+
+  <h2>The takeaway</h2>
+  <p>We’re not on the Effect bandwagon, and we’re not going to pretend to be — the community would
+  spot a missing <code>import { Effect }</code> in about four seconds. What we <em>are</em> is a
+  team that admired the model enough to distill its best ideas into a hundred honest lines, and a
+  stack that picks up exactly where an in-process effect system has to stop: at the boundary of the
+  process itself.</p>
+  <p><span class="kicker">Effect for the process. Nano for the workflow.</span></p>
+
+  <hr>
+  <p class="tail">See where this fits in the stack on the
+  <a href="/architecture/#effect">Nano architecture page</a>, or try the durable engine in your
+  browser at <a href="/demo/">nanobpm.io/demo</a>.</p>`;
 }
 
 function homePage(title, body) {
