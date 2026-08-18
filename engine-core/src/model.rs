@@ -2169,6 +2169,12 @@ impl ProcessBuilder {
         // `start_events` validator, #855). The engine begins a CreateInstance at a
         // single process-entry start, so designate one deterministically: prefer
         // the none start, else fall back to a typed start, tie-broken by id.
+        //
+        // Only message and timer starts survive here as distinct typed kinds
+        // (`ElementKind::is_start_event`). A signal start carries no dedicated
+        // element kind: a surviving signal start is modelled as a plain
+        // `ElementKind::StartEvent`, so the `find(StartEvent)` preference below
+        // selects it as though it were the none start.
         let mut starts: Vec<&Element> = elements
             .values()
             .filter(|e| e.kind.is_start_event() && e.parent.is_none())
