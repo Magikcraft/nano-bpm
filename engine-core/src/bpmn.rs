@@ -766,8 +766,9 @@ fn parse_with_captures(
                             // (Zeebe `ModelUtil.verifyLinkIntermediateEvents`).
                             "linkEventDefinition" => {
                                 let link_name = attr(attrs, "name").unwrap_or("").to_string();
-                                if cur_throw.is_some() {
-                                    acc.link_throws.push(link_name);
+                                if let Some(idx) = cur_throw {
+                                    let from_node = acc.nodes[idx].id.clone();
+                                    acc.link_throws.push((link_name, from_node));
                                 } else if cur_intermediate.is_some() {
                                     acc.link_catches.push(link_name);
                                 }
@@ -1799,9 +1800,10 @@ struct ProcessAcc {
     /// error_ref)`. Boundary `errorRef`s are resolved in `build`; these are the
     /// extra sites the reference-integrity validator (#851) generalises over.
     error_refs_extra: Vec<(String, String)>,
-    /// Link names declared on `linkEventDefinition`s of intermediate *throw*
-    /// events (consumed by #851's throw↔catch pairing check).
-    link_throws: Vec<String>,
+    /// `(link name, throwing element id)` for each `linkEventDefinition` on an
+    /// intermediate *throw* event (consumed by #851's throw↔catch pairing
+    /// check; the element id is the `from_node` on a rejected unpaired throw).
+    link_throws: Vec<(String, String)>,
     /// Link names declared on `linkEventDefinition`s of intermediate *catch*
     /// events (consumed by #851's throw↔catch pairing check).
     link_catches: Vec<String>,

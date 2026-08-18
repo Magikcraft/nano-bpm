@@ -47,11 +47,21 @@ use crate::bpmn::ParseError;
 pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     let capture = input.capture;
 
-    // Every declared activity id an `attachedToRef` may resolve against. Built
-    // from the executable graph, unioned with the ad-hoc catalog so a boundary
-    // attached to an ad-hoc inner element (pruned from the graph but genuinely
-    // declared) is not mistaken for a dangling reference.
-    let mut activity_ids: HashSet<&str> = input.def.elements.keys().map(String::as_str).collect();
+    // Every declared activity id an `attachedToRef` may resolve against. A
+    // boundary event legally attaches only to an *activity*
+    // (task/sub-process/call activity), so the graph elements are filtered to
+    // those (via `ElementKind::is_activity`) — a boundary pointing at a
+    // gateway/event id is a dangling `attachedToRef`, not "resolved". Unioned
+    // with the ad-hoc catalog so a boundary attached to an ad-hoc inner element
+    // (pruned from the graph but genuinely declared) is not mistaken for a
+    // dangling reference.
+    let mut activity_ids: HashSet<&str> = input
+        .def
+        .elements
+        .iter()
+        .filter(|(_, element)| element.kind.is_activity())
+        .map(|(id, _)| id.as_str())
+        .collect();
     for adhoc in &input.def.adhoc {
         activity_ids.insert(adhoc.container_id.as_str());
         for tool in &adhoc.tools {
@@ -85,13 +95,13 @@ pub(crate) fn validate(input: &ValidationInput<'_>) -> Result<(), ParseError> {
     // intermediate *catch* link of the same name in the process
     // (Zeebe `ModelUtil.verifyLinkIntermediateEvents`).
     let catch_names: HashSet<&str> = capture.link_catches.iter().map(String::as_str).collect();
-    for throw_name in &capture.link_throws {
+    for (throw_name, from_node) in &capture.link_throws {
         if !catch_names.contains(throw_name.as_str()) {
             return Err(ParseError::UnresolvedReference {
                 kind: "linkThrow".to_string(),
                 id: throw_name.clone(),
                 process_id: capture.process_id.clone(),
-                from_node: throw_name.clone(),
+                from_node: from_node.clone(),
             });
         }
     }
@@ -216,7 +226,27 @@ mod tests {
                </bpmn:intermediateThrowEvent>
                <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="thr"/>"#,
         );
-        assert_unresolved(&xml, "linkThrow", "L1", "L1");
+        assert_unresolved(&xml, "linkThrow", "L1", "thr");
+    }
+
+    #[test]
+    fn should_reject_an_attached_to_ref_pointing_at_a_non_activity() {
+        // A boundary event may attach only to an *activity*; an `attachedToRef`
+        // naming a gateway (or any non-activity element) is a dangling
+        // reference even though the id is declared. The `errorRef` here is
+        // declared so the boundary is otherwise valid.
+        let xml = model(
+            r#"<bpmn:error id="Err" errorCode="E1"/>"#,
+            r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+               <bpmn:exclusiveGateway id="g"><bpmn:incoming>a</bpmn:incoming><bpmn:outgoing>b</bpmn:outgoing></bpmn:exclusiveGateway>
+               <bpmn:endEvent id="e"><bpmn:incoming>b</bpmn:incoming></bpmn:endEvent>
+               <bpmn:boundaryEvent id="bnd" attachedToRef="g">
+                 <bpmn:errorEventDefinition errorRef="Err"/>
+               </bpmn:boundaryEvent>
+               <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="g"/>
+               <bpmn:sequenceFlow id="b" sourceRef="g" targetRef="e"/>"#,
+        );
+        assert_unresolved(&xml, "attachedToRef", "g", "bnd");
     }
 
     #[test]
@@ -320,12 +350,23 @@ mod tests {
                 expect: Expect::Accepted,
             },
             Case {
+                name: "attachedToRef pointing at a non-activity (gateway)",
+                defs: r#"<bpmn:error id="Err" errorCode="E1"/>"#,
+                body: r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
+                         <bpmn:exclusiveGateway id="g"><bpmn:incoming>a</bpmn:incoming><bpmn:outgoing>b</bpmn:outgoing></bpmn:exclusiveGateway>
+                         <bpmn:endEvent id="e"><bpmn:incoming>b</bpmn:incoming></bpmn:endEvent>
+                         <bpmn:boundaryEvent id="bnd" attachedToRef="g"><bpmn:errorEventDefinition errorRef="Err"/></bpmn:boundaryEvent>
+                         <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="g"/>
+                         <bpmn:sequenceFlow id="b" sourceRef="g" targetRef="e"/>"#,
+                expect: Expect::Unresolved("attachedToRef", "g", "bnd"),
+            },
+            Case {
                 name: "unpaired throw link",
                 defs: "",
                 body: r#"<bpmn:startEvent id="s"><bpmn:outgoing>a</bpmn:outgoing></bpmn:startEvent>
                          <bpmn:intermediateThrowEvent id="thr"><bpmn:incoming>a</bpmn:incoming><bpmn:linkEventDefinition name="L1"/></bpmn:intermediateThrowEvent>
                          <bpmn:sequenceFlow id="a" sourceRef="s" targetRef="thr"/>"#,
-                expect: Expect::Unresolved("linkThrow", "L1", "L1"),
+                expect: Expect::Unresolved("linkThrow", "L1", "thr"),
             },
             Case {
                 name: "paired throw/catch links",
