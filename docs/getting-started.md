@@ -171,14 +171,20 @@ on as many boxes as you like.
 ## Updating Nano Workforce
 
 Nano Workforce is published as a versioned package, so updates arrive through the
-same marketplace you installed it from.
+same marketplace you installed it from. Updating is two steps — refresh the
+extension, then apply it to your project:
 
 1. **Update the extension.** In the console's **Extensions** tab, a newer version
-   shows an **Update** action — select it to replace the pack cleanly.
-2. **Update your project.** Because your project is a *copy* taken at create time,
-   updating the extension does not touch it. Create a fresh project from the
-   updated template to get the new app, then port your customisations across (or,
-   if you never modified it, just switch to the new project).
+   shows an **Update** action — select it to pull the new pack.
+2. **Update your project in place.** Updating the extension refreshes the
+   installed pack, not the project you created from it, so apply the update to the
+   project as a second step. Your project's **configuration is preserved** across
+   an in-place update — on a deployed box where you only change config (env
+   pointers, `NANO_WORKFORCE_BASE_URL`, ports) and never touch the code, this just
+   brings the app code up to date and keeps your settings. If you *have* edited
+   the project's code, an in-place update can conflict with your changes — see
+   *Making Nano Workforce your own* below for how to keep a clean, updatable
+   project alongside your customised one.
 3. **Restart Nano Workforce** so the running app and its workers pick up the new
    code.
 
@@ -190,15 +196,20 @@ moment the project is *yours*: a normal directory of files — BPMN models, the
 worker code under `workers/`, prompts and forms under `resources/`, and
 `nano.app.json` — that you can edit freely and keep under version control.
 
-A copy is a snapshot, not a live link, so a good pattern is to keep **two
-projects**:
+A copy is a snapshot, not a live link. **Changing configuration** — env pointers,
+`NANO_WORKFORCE_BASE_URL`, ports, which workers you hire — does *not* count as
+editing the app, so a config-only project updates cleanly in place (see
+*Updating Nano Workforce*). **Editing the code** is what diverges a project from
+the template and can make a later in-place update conflict, so a good pattern is
+to keep **two projects**:
 
-- **A vanilla project** you leave untouched. It always matches the published
-  template, so you can re-create it cleanly on every update and diff it against
-  your customised one to see what changed upstream.
+- **A vanilla project** whose code you leave untouched (config-only). It always
+  tracks the published template, updates in place cleanly every release, and
+  gives you a clean baseline to diff your customised one against.
 - **A customised project** where you make it your own — tune the agent prompts,
   swap models or ranks, adjust the BPMN convergence graph, or add your own
-  worker capabilities.
+  worker capabilities. Manage its updates deliberately (merge the new template in,
+  or re-create and re-apply your changes).
 
 If you'd rather manage the app in your own repository, **fork it** and point Nano
 at your fork directly: because an example is just an app directory, you can work
